@@ -25,6 +25,9 @@ pub const constants = @import("constants.zig");
 /// Fixed connection pool + Phase-0 echo server (docs/DESIGN.md §4).
 pub const connection = @import("net/connection.zig");
 
+/// Zero-copy HTTP/1.1 request parser (docs/DESIGN.md §5).
+pub const h1 = @import("http/h1.zig");
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
@@ -33,4 +36,5 @@ test {
     _ = io;
     _ = @import("net/listener.zig");
     _ = connection;
+    _ = h1;
 }

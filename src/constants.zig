@@ -15,3 +15,7 @@ pub const io_ring_entries: u16 = 4096;
 
 /// listen(2) backlog per worker listener.
 pub const accept_backlog: u32 = 1024;
+
+/// Maximum request header lines. Beyond this a request is rejected (431),
+/// never grown. The head must also fit within `read_buf_bytes`.
+pub const headers_max: usize = 64;
