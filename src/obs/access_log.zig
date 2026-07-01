@@ -59,9 +59,10 @@ pub fn formatLine(out: []u8, entry: Entry) []const u8 {
         target,
         entry.outcome.text(),
         entry.bytes_to_client,
-    }) catch unreachable; // bounded inputs always fit (line_max asserted above)
-    assert(line.len <= line_max);
-    return line;
+    }) catch null; // out.len >= line_max (asserted) and inputs are bounded, so it fits
+    assert(line != null);
+    assert(line.?.len <= line_max);
+    return line.?;
 }
 
 pub const AccessLog = struct {

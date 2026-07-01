@@ -259,7 +259,10 @@ pub const IO = struct {
         io.prep(completion) catch |err| switch (err) {
             error.SubmissionQueueFull => {
                 io.flush_submissions();
-                io.prep(completion) catch unreachable; // room was just made
+                // flush_submissions() drains the SQ to the kernel, so prep() now
+                // has room for this one entry.
+                const has_room = if (io.prep(completion)) |_| true else |_| false;
+                assert(has_room);
             },
         };
         io.queued += 1;
