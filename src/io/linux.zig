@@ -243,19 +243,23 @@ pub const IO = struct {
         io.run_completed();
     }
 
-    /// Drive the loop until `done.*` is set. Returns `error.WouldBlockForever`
-    /// if there is no pending work and `done` is still false (a caller bug).
-    pub fn run_until_done(io: *IO, done: *const bool) !void {
-        while (!done.*) {
-            io.flush_submissions();
-            if (io.queued == 0 and io.in_kernel == 0 and io.completed.count == 0) {
-                return error.WouldBlockForever;
-            }
-            // Only block in the kernel when there are no callbacks ready to run;
-            // a callback may enqueue more work (TigerBeetle's run_for_ns rule).
-            try io.reap(if (io.completed.count == 0) 1 else 0);
-            io.run_completed();
+    /// Submit queued work, then process one batch of completions — blocking for
+    /// at least one if none are already ready. Returns `error.WouldBlockForever`
+    /// if there is nothing in flight to wait on (a caller bug).
+    pub fn run_once(io: *IO) !void {
+        io.flush_submissions();
+        if (io.queued == 0 and io.in_kernel == 0 and io.completed.count == 0) {
+            return error.WouldBlockForever;
         }
+        // Only block in the kernel when no callbacks are ready to run; a callback
+        // may enqueue more work (TigerBeetle's run_for_ns rule).
+        try io.reap(if (io.completed.count == 0) 1 else 0);
+        io.run_completed();
+    }
+
+    /// Drive the loop until `done.*` is set.
+    pub fn run_until_done(io: *IO, done: *const bool) !void {
+        while (!done.*) try io.run_once();
     }
 
     fn flush_submissions(io: *IO) void {

@@ -19,6 +19,12 @@ pub const io = @import("io/io.zig");
 /// A SO_REUSEPORT TCP listener (docs/DESIGN.md §2).
 pub const Listener = @import("net/listener.zig").Listener;
 
+/// Static limits (docs/TIGER_STYLE.md: "put a limit on everything").
+pub const constants = @import("constants.zig");
+
+/// Fixed connection pool + Phase-0 echo server (docs/DESIGN.md §4).
+pub const connection = @import("net/connection.zig");
+
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
 }
@@ -26,4 +32,5 @@ test "basic add functionality" {
 test {
     _ = io;
     _ = @import("net/listener.zig");
+    _ = connection;
 }
