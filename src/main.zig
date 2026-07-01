@@ -58,7 +58,7 @@ fn runWorker(listen: Ip4Address, pool: *Pool, router: *const Router, cpu: usize)
     var listener = Listener.open(listen, constants.accept_backlog) catch |err| return logWorkerError("listen", err);
     defer listener.close();
 
-    var server = ProxyServer.init(&io, pool, listener, router);
+    var server = ProxyServer.init(&io, pool, listener, router, constants.connection_timeout_ns);
     server.start();
     while (true) io.run_once() catch |err| return logWorkerError("io run", err);
 }

@@ -2,6 +2,8 @@
 //! the number of things"). Sizing the proxy is choosing these numbers; total
 //! memory is a function of them and is reserved up front.
 
+const std = @import("std");
+
 /// Maximum concurrent downstream connections per worker. Beyond this, new
 /// connections are rejected (backpressure), never queued via allocation.
 pub const connections_max: u32 = 256;
@@ -22,3 +24,7 @@ pub const headers_max: usize = 64;
 
 /// Per-direction relay buffer for streaming request bodies and responses.
 pub const relay_buf_bytes: usize = 16 * 1024;
+
+/// Overall per-connection deadline. Backstops slow-loris clients and stalled
+/// relays: a connection that lives longer than this is torn down.
+pub const connection_timeout_ns: u63 = 30 * std.time.ns_per_s;

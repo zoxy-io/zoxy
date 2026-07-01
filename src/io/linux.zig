@@ -56,6 +56,8 @@ pub const CloseError = error{Unexpected};
 
 pub const TimeoutError = error{ Canceled, Unexpected };
 
+pub const CancelError = error{Unexpected};
+
 /// The kind of io_uring operation, plus the parameters that must stay alive
 /// until completion. Stored inline in the caller's `Completion`.
 const Operation = union(enum) {
@@ -65,6 +67,9 @@ const Operation = union(enum) {
     connect: struct { socket: posix.socket_t, addr: linux.sockaddr.in },
     close: struct { fd: posix.fd_t },
     timeout: struct { expires: linux.kernel_timespec },
+    /// Cancel the in-flight operation whose completion is at `target` (its
+    /// io_uring user_data). Cancelling a non-existent op completes with ENOENT.
+    cancel: struct { target: u64 },
 };
 
 /// Type-erased callback stored in a `Completion`. `result` points at the typed
@@ -218,6 +223,19 @@ pub const IO = struct {
         });
     }
 
+    pub fn cancel(
+        io: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (context: Context, completion: *Completion, result: CancelError!void) void,
+        completion: *Completion,
+        target: *const Completion,
+    ) void {
+        io.submit(Context, context, CancelError!void, callback, completion, .{
+            .cancel = .{ .target = @intFromPtr(target) },
+        });
+    }
+
     fn submit(
         io: *IO,
         comptime Context: type,
@@ -256,6 +274,7 @@ pub const IO = struct {
             .connect => |*op| _ = try io.ring.connect(user_data, op.socket, @ptrCast(&op.addr), @sizeOf(linux.sockaddr.in)),
             .close => |op| _ = try io.ring.close(user_data, op.fd),
             .timeout => |*op| _ = try io.ring.timeout(user_data, &op.expires, 0, 0),
+            .cancel => |op| _ = try io.ring.cancel(user_data, op.target, 0),
         }
     }
 
@@ -354,6 +373,10 @@ pub const IO = struct {
                 const result = decode_timeout(completion.result);
                 completion.callback(completion.context, completion, &result);
             },
+            .cancel => {
+                const result = decode_cancel(completion.result);
+                completion.callback(completion.context, completion, &result);
+            },
         }
     }
 };
@@ -421,6 +444,14 @@ fn decode_timeout(result: i32) TimeoutError!void {
     return switch (to_errno(result)) {
         .TIME => {}, // normal expiry
         .CANCELED => error.Canceled,
+        else => error.Unexpected,
+    };
+}
+
+fn decode_cancel(result: i32) CancelError!void {
+    if (result >= 0) return;
+    return switch (to_errno(result)) {
+        .NOENT, .ALREADY => {}, // nothing to cancel / already completing — fine
         else => error.Unexpected,
     };
 }

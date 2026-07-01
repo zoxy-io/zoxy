@@ -18,6 +18,7 @@ pub const SendError = impl.SendError;
 pub const ConnectError = impl.ConnectError;
 pub const CloseError = impl.CloseError;
 pub const TimeoutError = impl.TimeoutError;
+pub const CancelError = impl.CancelError;
 
 test {
     _ = impl;

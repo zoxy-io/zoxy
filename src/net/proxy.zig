@@ -98,6 +98,9 @@ pub const ProxyConn = struct {
     closing: bool,
     /// In-flight io_uring operations for this connection.
     refs: u32,
+    /// Overall deadline; the timer is armed for the connection's whole life.
+    timeout_ns: u63,
+    timeout_armed: bool,
 
     head_buf: [constants.read_buf_bytes]u8,
     head_filled: usize,
@@ -109,6 +112,9 @@ pub const ProxyConn = struct {
     aux_completion: Completion, // prime send / error-response send
     close_down_completion: Completion,
     close_up_completion: Completion,
+    timeout_completion: Completion,
+    timeout_cancel_completion: Completion,
+    connect_cancel_completion: Completion,
 
     d2u: Pipe,
     u2d: Pipe,
@@ -122,6 +128,7 @@ pub const ProxyConn = struct {
         router: *const Router,
         rr: *RoundRobin,
         down_fd: posix.socket_t,
+        timeout_ns: u63,
     ) void {
         assert(down_fd >= 0);
         conn.io = io;
@@ -132,9 +139,26 @@ pub const ProxyConn = struct {
         conn.up_fd = -1;
         conn.closing = false;
         conn.refs = 0;
+        conn.timeout_ns = timeout_ns;
+        conn.timeout_armed = false;
         conn.head_filled = 0;
         conn.prime_sent = 0;
+        conn.armTimeout();
         conn.armRecvHead();
+    }
+
+    fn armTimeout(conn: *ProxyConn) void {
+        assert(!conn.timeout_armed);
+        conn.retain();
+        conn.timeout_armed = true;
+        conn.io.timeout(*ProxyConn, conn, onTimeout, &conn.timeout_completion, conn.timeout_ns);
+    }
+
+    fn onTimeout(conn: *ProxyConn, _: *Completion, _: io_mod.TimeoutError!void) void {
+        defer conn.releaseRef();
+        conn.timeout_armed = false;
+        if (conn.closing) return; // fired late / we cancelled it
+        conn.teardown(); // deadline exceeded
     }
 
     fn retain(conn: *ProxyConn) void {
@@ -150,9 +174,17 @@ pub const ProxyConn = struct {
     fn teardown(conn: *ProxyConn) void {
         if (conn.closing) return;
         conn.closing = true;
-        // Closing an fd does NOT cancel a recv already pending on it in io_uring.
-        // shutdown() forces those pending recvs to complete (EOF) so their
-        // completions fire and the refcount drains; then we close the fd.
+        // Cancel the ops that shutdown() cannot reach: the deadline timer (no fd)
+        // and any in-flight connect (shutdown of a connecting socket is a no-op).
+        // A cancel that matches nothing returns ENOENT — harmless.
+        if (conn.timeout_armed) {
+            conn.timeout_armed = false;
+            conn.cancelOp(&conn.timeout_cancel_completion, &conn.timeout_completion);
+        }
+        conn.cancelOp(&conn.connect_cancel_completion, &conn.connect_completion);
+        // Closing an fd does NOT cancel a recv/send already pending on it in
+        // io_uring. shutdown() forces those to complete so the refcount drains;
+        // then we close the fd.
         if (conn.down_fd >= 0) {
             _ = linux.shutdown(conn.down_fd, linux.SHUT.RDWR);
             conn.retain();
@@ -165,6 +197,15 @@ pub const ProxyConn = struct {
             conn.io.close(*ProxyConn, conn, onClosed, &conn.close_up_completion, conn.up_fd);
             conn.up_fd = -1;
         }
+    }
+
+    fn cancelOp(conn: *ProxyConn, cancel_completion: *Completion, target: *const Completion) void {
+        conn.retain();
+        conn.io.cancel(*ProxyConn, conn, onCancel, cancel_completion, target);
+    }
+
+    fn onCancel(conn: *ProxyConn, _: *Completion, _: io_mod.CancelError!void) void {
+        conn.releaseRef();
     }
 
     fn onClosed(conn: *ProxyConn, _: *Completion, _: io_mod.CloseError!void) void {
@@ -261,15 +302,17 @@ pub const ProxyServer = struct {
     listener: Listener,
     router: *const Router,
     rr: RoundRobin,
+    timeout_ns: u63,
     accept_completion: Completion,
 
-    pub fn init(io: *IO, pool: *Pool, listener: Listener, router: *const Router) ProxyServer {
+    pub fn init(io: *IO, pool: *Pool, listener: Listener, router: *const Router, timeout_ns: u63) ProxyServer {
         return .{
             .io = io,
             .pool = pool,
             .listener = listener,
             .router = router,
             .rr = .{},
+            .timeout_ns = timeout_ns,
             .accept_completion = undefined,
         };
     }
@@ -285,7 +328,7 @@ pub const ProxyServer = struct {
     fn onAccept(server: *ProxyServer, _: *Completion, result: io_mod.AcceptError!posix.socket_t) void {
         if (result) |fd| {
             if (server.pool.acquire()) |conn| {
-                conn.start(server.io, server.pool, server.router, &server.rr, fd);
+                conn.start(server.io, server.pool, server.router, &server.rr, fd, server.timeout_ns);
             } else {
                 _ = linux.close(fd); // backpressure: reject, never allocate
             }
@@ -389,7 +432,7 @@ test "proxy: forwards a request to an upstream and relays the response" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router);
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, constants.connection_timeout_ns);
     server.start();
 
     // Client connects to the proxy and drives its request on the same loop.
@@ -459,7 +502,7 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var server = ProxyServer.init(&io, &pool, proxy_listener, &router);
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, constants.connection_timeout_ns);
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -498,6 +541,40 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
 
     try io.run_until_done(&c.done);
     try std.testing.expectEqual(response.len, c.total);
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: a stalled connection is reclaimed by the deadline" {
+    const gpa = std.testing.allocator;
+    var io = try IO.init(16, 0);
+    defer io.deinit();
+
+    var cfg = try config.parse(gpa,
+        \\{ "listen": "0.0.0.0:0", "routes": [{ "cluster": "o" }],
+        \\  "clusters": [{ "name": "o", "endpoints": ["127.0.0.1:9"] }] }
+    );
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 2);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    const short_timeout: u63 = 50 * std.time.ns_per_ms;
+    var server = ProxyServer.init(&io, &pool, proxy_listener, &router, short_timeout);
+    server.start();
+
+    // Slow-loris: connect, send a partial head, then never finish it.
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+    const partial = "GET / HTTP/1.1\r\n"; // no terminating blank line
+    _ = linux.write(client, partial, partial.len);
+
+    // The slot is taken once the proxy accepts...
+    while (pool.free_count == pool.capacity) try io.run_once();
+    try std.testing.expectEqual(pool.capacity - 1, pool.free_count);
+    // ...and the deadline must reclaim it; without the timer this would hang.
     while (pool.free_count != pool.capacity) try io.run_once();
 }
 
