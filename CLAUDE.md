@@ -107,8 +107,15 @@ Consequences that bite if you forget them:
   (`std.Io.Dir.cwd().readFileAlloc(init.io, ...)`, `init.minimal.args.toSlice(gpa)`).
 - `std.crypto.random` is gone; entropy comes through the Io interface:
   `init.io.random(&buf)` (infallible, CSPRNG) or `io.randomSecure(&buf)`
-  (strict, always a syscall). `std.time.Timer`/`Instant` are gone too — use
-  `clock_gettime(CLOCK.MONOTONIC)` directly (see `IO.now_ns`).
+  (strict, always a syscall).
+- `std.time.Timer`/`Instant` are gone; the idiomatic replacement is
+  `std.Io.Clock` — `std.Io.Clock.awake.now(io)` (CLOCK_MONOTONIC on Linux)
+  returns an `Io.Timestamp` with `durationTo`/`fromNow` arithmetic. Our
+  *data path* deliberately does not use it: no `std.Io` is threaded through
+  the workers, and the deadline clock must be virtualizable, so it goes
+  through our own seam (`IO.now_ns` — raw `clock_gettime` in the linux
+  backend, the virtual clock in the simulator). Reach for `std.Io.Clock`
+  only in code that already holds `init.io` (startup, tooling).
 
 ## Coding conventions (TigerStyle)
 
