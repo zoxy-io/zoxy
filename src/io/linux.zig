@@ -18,6 +18,11 @@ const IoUring = linux.IoUring;
 /// enter() syscall (TigerStyle: "amortize costs by batching").
 const cqes_batch_max = 256;
 
+/// Retries for an `io_uring_enter` interrupted by a signal (EINTR). A signal
+/// landing mid-submit is routine and must not kill the worker; the bound keeps
+/// the retry loop finite (TigerStyle: "put a limit on everything").
+const submit_retries_max = 8;
+
 pub const AcceptError = error{
     ConnectionAborted,
     ProcessFdQuotaExceeded,
@@ -316,8 +321,17 @@ pub const IO = struct {
 
     fn flush_submissions(io: *IO) void {
         if (io.queued == 0) return;
-        const submitted = io.ring.submit() catch |err|
-            std.debug.panic("io: submit: {s}", .{@errorName(err)});
+        assert(io.queued > 0);
+        var attempt: u32 = 0;
+        const submitted = while (attempt < submit_retries_max) : (attempt += 1) {
+            break io.ring.submit() catch |err| switch (err) {
+                error.SignalInterrupt => continue, // EINTR is routine; retry
+                else => std.debug.panic("io: submit: {s}", .{@errorName(err)}),
+            };
+        } else std.debug.panic(
+            "io: submit: interrupted {d} times in a row",
+            .{submit_retries_max},
+        );
         assert(submitted <= io.queued);
         io.queued -= submitted;
         io.in_kernel += submitted;
