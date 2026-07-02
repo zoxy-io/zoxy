@@ -134,6 +134,10 @@ pub const ProxyConn = struct {
     headers_storage: [constants.headers_max]h1.Header,
     prime_sent: usize,
 
+    // Fixed error response in flight (`fail`); empty when unused.
+    fail_response: []const u8,
+    fail_sent: usize,
+
     // Access-log accounting (slices point into head_buf).
     log_method: []const u8,
     log_target: []const u8,
@@ -180,6 +184,8 @@ pub const ProxyConn = struct {
         conn.timeout_armed = false;
         conn.head_filled = 0;
         conn.prime_sent = 0;
+        conn.fail_response = "";
+        conn.fail_sent = 0;
         conn.log_method = "";
         conn.log_target = "";
         conn.outcome = .aborted;
@@ -391,13 +397,33 @@ pub const ProxyConn = struct {
         } else {
             conn.metrics.upstream_errors.add(1);
         }
-        conn.retain();
-        conn.io.send(*ProxyConn, conn, onFailSent, &conn.aux_completion, conn.down_fd, response);
+        conn.fail_response = response;
+        conn.fail_sent = 0;
+        conn.armFailSend();
     }
 
-    fn onFailSent(conn: *ProxyConn, _: *Completion, _: io_mod.SendError!usize) void {
+    fn armFailSend(conn: *ProxyConn) void {
+        assert(conn.down_fd >= 0);
+        assert(conn.fail_sent < conn.fail_response.len);
+        conn.retain();
+        conn.io.send(
+            *ProxyConn,
+            conn,
+            onFailSent,
+            &conn.aux_completion,
+            conn.down_fd,
+            conn.fail_response[conn.fail_sent..],
+        );
+    }
+
+    fn onFailSent(conn: *ProxyConn, _: *Completion, result: io_mod.SendError!usize) void {
         defer conn.releaseRef();
-        conn.teardown();
+        if (conn.closing) return;
+        const m = result catch return conn.teardown();
+        conn.fail_sent += m;
+        assert(conn.fail_sent <= conn.fail_response.len); // never send past the response
+        if (conn.fail_sent < conn.fail_response.len) return conn.armFailSend();
+        conn.teardown(); // the full response is out; close the connection
     }
 };
 
