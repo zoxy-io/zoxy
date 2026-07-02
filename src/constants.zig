@@ -32,3 +32,8 @@ pub const relay_buf_bytes: usize = 16 * 1024;
 /// Overall per-connection deadline. Backstops slow-loris clients and stalled
 /// relays: a connection that lives longer than this is torn down.
 pub const connection_timeout_ns: u63 = 30 * std.time.ns_per_s;
+
+/// Delay before re-arming accept after fd/resource exhaustion (EMFILE etc.).
+/// An immediate re-arm would fail again instantly and spin the worker at
+/// 100% CPU for as long as the condition persists.
+pub const accept_retry_delay_ns: u63 = 100 * std.time.ns_per_ms;

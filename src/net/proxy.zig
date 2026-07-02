@@ -516,6 +516,7 @@ pub const ProxyServer = struct {
     rr: RoundRobin,
     timeout_ns: u63,
     accept_completion: Completion,
+    accept_retry_completion: Completion,
 
     pub fn init(
         io: *IO,
@@ -536,6 +537,7 @@ pub const ProxyServer = struct {
             .rr = .{},
             .timeout_ns = timeout_ns,
             .accept_completion = undefined,
+            .accept_retry_completion = undefined,
         };
     }
 
@@ -575,7 +577,28 @@ pub const ProxyServer = struct {
                 server.metrics.rejected.add(1);
                 _ = linux.close(fd); // backpressure: reject, never allocate
             }
-        } else |_| {}
+            server.armAccept();
+        } else |err| switch (err) {
+            // Quota/resource exhaustion persists; an immediate re-arm would
+            // fail again instantly and spin the loop at 100% CPU. Back off.
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            error.SystemResources,
+            => server.io.timeout(
+                *ProxyServer,
+                server,
+                onAcceptRetry,
+                &server.accept_retry_completion,
+                constants.accept_retry_delay_ns,
+            ),
+            // Transient, per-connection failures (e.g. the peer aborted its
+            // handshake); accept the next connection immediately.
+            else => server.armAccept(),
+        }
+    }
+
+    fn onAcceptRetry(server: *ProxyServer, _: *Completion, result: io_mod.TimeoutError!void) void {
+        result catch {}; // even a failed timer must not stop the accept loop
         server.armAccept();
     }
 };
