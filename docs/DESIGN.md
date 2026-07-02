@@ -322,12 +322,20 @@ H3/QUIC → `quiche`/`ngtcp2`. Pure-Zig H3 is blocked on QUIC-aware TLS 1.3.
   allocator gate; `bench/run.sh` measures the proxy hop against a direct
   baseline at constant throughput.
 
-### Phase 1 — HTTP/1.1 keep-alive (pulled forward)
+### Phase 1 — HTTP/1.1 keep-alive (pulled forward; done)
 Ends the one-request-per-connection contract. Justification: close-per-request
 costs ~6× throughput on loopback (zrk, 2026-07: ~740k req/s keep-alive vs
 ~125k close-mode direct; ~30k proxied) — connection reuse is the single
 biggest performance lever and needs no new dependencies, so it comes before
 resilience.
+
+Shipped 2026-07. Measured (zrk, loopback, 64 connections): sustainable
+throughput ~30k → ~90k+ req/s; at 60k the proxied hop costs ~+400µs at the
+median over nginx-direct keep-alive (509µs vs 104µs p50), with a 99.99%
+upstream-pool hit rate and zero errors. Two war stories are encoded in the
+code: TCP_NODELAY (Nagle + delayed ACK stalled warm pooled connections 40ms
+per request — invisible on fresh connections, which sit in TCP quickack),
+and the single-ticking-timer deadline design that avoids cancel/re-arm races.
 - **Response framing:** parse the upstream status line + headers (zero-copy,
   same discipline as the request parser); body framing via Content-Length and
   a bounded chunked-decode state machine. Close-delimited or unframeable
@@ -343,8 +351,9 @@ resilience.
   idle timeout reaps quiet keep-alive connections between requests.
 - Hop-by-hop rewrite in both directions (requests have it; responses gain it
   once they are parsed).
-- Gate: `bench/run.sh` with keep-alive clients approaches the direct
-  keep-alive baseline, and the zero-alloc gate still holds.
+- Gate (met): `bench/run.sh` with keep-alive clients holds the same constant
+  rates as the direct keep-alive baseline up to ~90k req/s saturation, and
+  the zero-alloc gate still holds.
 
 ### Phase 2 — Resilience
 - P2C weighted-least-request LB; active health checks + passive outlier

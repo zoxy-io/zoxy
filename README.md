@@ -98,7 +98,8 @@ warning) when zrk is not installed.
 ```
 per core (thread-per-core, share-nothing):
   SO_REUSEPORT listener ──io.accept──► single-threaded io_uring loop
-    io.recv ─► parse head ─► route ─► io.connect upstream ─► relay both ways
+    io.recv ─► parse head ─► route ─► upstream pool / io.connect
+             ─► framed relay both ways ─► reuse both connections
 ```
 
 Source layout:
@@ -120,15 +121,18 @@ Design rationale and the Zig-0.16 findings behind these choices are in
 
 ## Scope & roadmap
 
-**Phase 0 (done):** HTTP/1.1 with a one-request-per-connection contract
-(hop-by-hop headers stripped, `Connection: close` forced), static config,
-host/path routing, round-robin, bounded relay with backpressure, per-connection
-deadline, metrics + admin endpoint + access log, and the zero-alloc gate.
+**Phase 0 (done):** HTTP/1.1 proxying, static config, host/path routing,
+round-robin, bounded relay with backpressure, deadlines, metrics + admin
+endpoint + access log, and the zero-alloc gate.
 
-**Phase 1 (next): HTTP/1.1 keep-alive** — response framing (Content-Length /
-chunked), downstream connection reuse with per-request re-routing, and a
-per-worker upstream H1 pool. Close-per-request measures ~6× slower than
-keep-alive on loopback; this is the biggest single lever.
+**Phase 1 (done): HTTP/1.1 keep-alive** — both messages framed per RFC 9112
+§6.3 (Content-Length / chunked, smuggling-shaped framing rejected),
+downstream connection reuse with per-request re-routing, a per-worker
+upstream connection pool with one-shot stale retry, hop-by-hop header
+handling in both directions, and split request/idle timeouts. Measured on
+loopback with [zrk](https://github.com/floatdrop/zrk): sustainable
+throughput went from ~30k to ~90k+ req/s; the proxy hop costs ~+400µs at
+the median vs nginx-direct.
 
 **Later:** resilience (health checks, circuit breaking, retries, P2C/EWMA),
 TLS termination (planned via OpenSSL FFI), HTTP/2 and HTTP/3, graceful drain +

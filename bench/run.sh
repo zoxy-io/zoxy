@@ -3,11 +3,14 @@
 #
 #   bench/run.sh [-R rate] [-d duration] [-c connections] [-t threads]
 #
-# Two runs at the same target rate, so the proxy hop cost is directly visible:
-#   baseline:  generator -> nginx, with "Connection: close" (zoxy's Phase-0
-#              one-request-per-connection model — a keep-alive baseline would
-#              measure the handshake tax, not the proxy)
-#   proxied:   generator -> zoxy -> nginx
+# Three runs at the same target rate, so the proxy hop cost is directly
+# visible:
+#   baseline A: generator -> nginx, keep-alive — the honest comparison since
+#               Phase 1: zoxy speaks keep-alive on both sides (downstream
+#               reuse + upstream pool)
+#   baseline B: generator -> nginx, "Connection: close" — the Phase-0
+#               connection model, kept to show the handshake tax
+#   proxied:    generator -> zoxy -> nginx (keep-alive end to end)
 #
 # The generator is zrk (github.com/floatdrop/zrk): constant throughput with
 # coordinated-omission-corrected latency. A closed-loop generator (wrk) stops
@@ -114,11 +117,15 @@ else
 fi
 
 echo
-echo "== baseline: generator -> nginx, Connection: close, target ${RATE}/s =="
+echo "== baseline A: generator -> nginx, keep-alive, target ${RATE}/s =="
+generate "http://127.0.0.1:$ORIGIN_PORT/"
+
+echo
+echo "== baseline B: generator -> nginx, Connection: close, target ${RATE}/s =="
 generate -H 'Connection: close' "http://127.0.0.1:$ORIGIN_PORT/"
 
 echo
-echo "== proxied: generator -> zoxy -> nginx, target ${RATE}/s =="
+echo "== proxied: generator -> zoxy -> nginx, keep-alive, target ${RATE}/s =="
 generate "http://127.0.0.1:$PROXY_PORT/"
 
 echo

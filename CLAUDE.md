@@ -47,8 +47,9 @@ CI (`.github/workflows/ci.yml`) runs `zig fmt --check`, `zig build`, and
 Data flow, one instance per CPU core, **thread-per-core share-nothing**:
 
 ```
-SO_REUSEPORT listener ──io.accept──► single-threaded io_uring loop (own ring, own pool)
-  io.recv ─► parse request head ─► route to cluster ─► io.connect upstream ─► relay both ways
+SO_REUSEPORT listener ──io.accept──► single-threaded io_uring loop (own ring, own pools)
+  io.recv ─► parse request head ─► route to cluster ─► upstream pool checkout / io.connect
+           ─► framed relay both ways ─► reuse both connections (keep-alive)
 ```
 
 Each worker owns its ring, its `SO_REUSEPORT` listener, and its connection pool; there
@@ -78,15 +79,17 @@ Consequences that bite if you forget them:
 | Path | Role |
 |------|------|
 | `src/io/linux.zig` | `IO` + `Completion` over `std.os.linux.IoUring`; ops: accept/recv/send/connect/close/timeout/cancel |
-| `src/net/proxy.zig` | **the data path**: `ProxyConn` (start→armTimeout→recvHead→parse→route→connect→relay), `Pipe` (one relay direction), `ProxyServer`, fixed 4xx/5xx responses, integration + zero-alloc gate tests |
+| `src/net/proxy.zig` | **the data path**: `ProxyConn` (recvHead→parse→route→pool checkout or connect→framed relay→reuse or teardown), `Pipe` (one framed relay direction), `ProxyServer`, hop-by-hop header handling both ways, fixed 4xx/5xx responses, stale-pooled-upstream retry, integration + zero-alloc gate tests |
 | `src/net/listener.zig` | `SO_REUSEPORT` TCP listener via raw linux syscalls (REUSEADDR+REUSEPORT set before bind) |
 | `src/net/pool.zig` | generic `Pool(T)` over an **intrusive free list** (requires `T.free_next: ?*T`); exhaustion rejects, never grows |
-| `src/http/h1.zig` | zero-copy HTTP/1.1 parser — slices into the read buffer, bounded header array, strict CRLF/token rules |
+| `src/http/h1.zig` | zero-copy HTTP/1.1 request+response parsers, RFC 9112 §6.3 body-framing decisions (smuggling shapes rejected), `BodyFramer` message-end tracker |
+| `src/http/chunked.zig` | incremental chunked-coding decoder — finds message ends, transforms nothing |
+| `src/proxy/upstream_pool.zig` | per-worker idle upstream connections, fixed slots keyed by endpoint |
 | `src/config.zig` | JSON config → immutable `Config` (owns an arena); the **only** place allocation is expected |
 | `src/proxy/router.zig`, `src/proxy/balancer.zig` | first-match host/path routing; round-robin |
 | `src/obs/metrics.zig`, `src/obs/access_log.zig` | atomic counters; fixed-buffer batched access log |
 | `src/mem/guard.zig` | `CountingAllocator` — the zero-alloc acceptance gate (baseline count == final count) |
-| `src/constants.zig` | **every static limit** (connections_max, buffer sizes, ring depth, timeout). Sizing the proxy = choosing these; total memory is a function of them. |
+| `src/constants.zig` | **every static limit** (connections_max, buffer sizes, ring depth, timeouts, pool sizes). Sizing the proxy = choosing these; total memory is a function of them. |
 
 ### Zig 0.16 API notes (verified against the pinned toolchain, not guessed)
 
