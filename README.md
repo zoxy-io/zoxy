@@ -45,8 +45,11 @@ zig build run          # run using ./zoxy.json
 The simulator runs the real data path against a deterministic IO backend —
 virtual sockets, a virtual clock, seeded adversarial schedules with partial
 reads/writes, misbehaving origins, and injected faults (TCP resets at any
-point in any exchange, refused connects). A failure prints its seed;
-`zig build sim -- <seed> 1` replays the exact schedule, faults included.
+point in any exchange, refused connects). Every request carries a unique
+token its origin echoes into the body, so completed responses are verified
+byte-exact end to end. A failure prints its seed; `zig build sim -- <seed> 1`
+replays the exact schedule, faults included. `zig build sim -- fuzz` runs
+forever on entropy-derived seeds (each still individually replayable).
 
 Or point it at a config file:
 

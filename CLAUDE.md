@@ -22,11 +22,12 @@ zig build test         # run all tests (both test binaries)
 zig build test --summary all
 zig build run          # run using ./zoxy.json
 zig build sim -- 0 500 # deterministic simulator: [seed] [iterations]
+zig build sim -- fuzz  # random seeds forever (Ctrl-C; each seed replayable)
 zig fmt --check src build.zig   # lint (CI gate)
 ```
 
 A simulator failure prints its seed; `zig build sim -- <seed> 1` replays that
-exact schedule. CI runs seeds 0..300 on every push.
+exact schedule, faults included. CI runs seeds 0..300 on every push.
 
 Without direnv, prefix each with `nix develop --command` (this is what CI does), or
 enter the shell once with `nix develop` and drop the prefix.

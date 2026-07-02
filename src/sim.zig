@@ -7,6 +7,7 @@
 //!
 //!     zig build sim                 # seeds 0..50
 //!     zig build sim -- 1234 200     # seeds 1234..1434
+//!     zig build sim -- fuzz         # random seeds, forever (Ctrl-C to stop)
 //!
 //! Each iteration draws a fault profile: no faults (half the time, so the
 //! traffic-flow invariant stays strong), a drizzle of RSTs, an RST storm, or
@@ -18,6 +19,11 @@
 //!   never exceeds the step cap;
 //! - every byte stream a client receives parses as an HTTP/1.1 response and
 //!   frames correctly (RFC 9112 §6.3) — whatever the origin or network did;
+//! - response integrity: every request carries a unique token that the
+//!   origin echoes into the body; a completed 200 must return *this*
+//!   request's token, byte-exact for length-framed bodies — catching
+//!   truncation, reordering, and cross-connection contamination (stray
+//!   bytes on a pooled upstream would surface here);
 //! - all connection slots return to the pool, and `metrics.active` is zero,
 //!   once every client is gone: no leaks under any schedule.
 
@@ -52,6 +58,18 @@ const iterations_default = 50;
 /// The seed being run, for panic messages from any depth.
 var current_seed: u64 = 0;
 
+/// Every panic — including an assert deep inside proxy code, which never
+/// goes through `fail` — must name the seed, or the schedule is lost.
+pub const panic = std.debug.FullPanic(sim_panic);
+
+fn sim_panic(message: []const u8, first_trace_address: ?usize) noreturn {
+    std.debug.print("sim: seed {d} FAILED — replay: zig build sim -- {d} 1\n", .{
+        current_seed,
+        current_seed,
+    });
+    std.debug.defaultPanic(message, first_trace_address);
+}
+
 fn fail(comptime message: []const u8, extra: anytype) noreturn {
     std.debug.panic("sim: seed {d} FAILED: " ++ message, .{current_seed} ++ extra);
 }
@@ -59,6 +77,7 @@ fn fail(comptime message: []const u8, extra: anytype) noreturn {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
     const args = try init.minimal.args.toSlice(gpa);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "fuzz")) return fuzz();
     const seed_base: u64 = if (args.len > 1) try std.fmt.parseInt(u64, args[1], 10) else 0;
     const iterations: u64 =
         if (args.len > 2) try std.fmt.parseInt(u64, args[2], 10) else iterations_default;
@@ -75,6 +94,27 @@ pub fn main(init: std.process.Init) !void {
         "sim: OK — {d} iterations, {d} framed responses verified\n",
         .{ iterations, responses_total },
     );
+}
+
+/// Run forever on entropy-derived seeds. Each iteration is still fully
+/// deterministic from its seed — the panic handler prints it on failure.
+fn fuzz() !void {
+    var entropy: [8]u8 = undefined;
+    _ = std.os.linux.getrandom(&entropy, entropy.len, 0);
+    const seed_base = std.mem.readInt(u64, &entropy, .little);
+    std.debug.print("sim: fuzzing from seed base {d}\n", .{seed_base});
+    var responses_total: u64 = 0;
+    var iteration: u64 = 0;
+    while (true) : (iteration += 1) {
+        responses_total += try run_iteration(seed_base +% iteration);
+        if ((iteration + 1) % 500 == 0) {
+            std.debug.print("sim: fuzz {d} iterations, {d} responses verified, at seed {d}\n", .{
+                iteration + 1,
+                responses_total,
+                seed_base +% iteration,
+            });
+        }
+    }
 }
 
 fn run_iteration(seed: u64) !u64 {
@@ -124,8 +164,13 @@ fn run_iteration(seed: u64) !u64 {
     server.start();
 
     const clients = try arena.alloc(Client, clients_max);
-    for (clients) |*client| {
-        client.* = .{ .io = &io, .workload = &workload };
+    for (clients, 0..) |*client, index| {
+        client.* = .{
+            .io = &io,
+            .workload = &workload,
+            .id = @intCast(index),
+            .strict_until_close = io.faults.reset_ppm == 0,
+        };
         client.begin();
     }
 
@@ -275,6 +320,7 @@ const OriginConn = struct {
     headers: [16]h1.Header = undefined,
     request_end: usize = 0,
     response: []const u8 = "",
+    response_buf: [192]u8 = undefined,
     sent: usize = 0,
     recv_completion: Completion = undefined,
     send_completion: Completion = undefined,
@@ -315,18 +361,37 @@ const OriginConn = struct {
             return conn.shutdown();
         if (!framer.isComplete()) return conn.arm_recv(); // body still arriving
         conn.request_end = request.head_len + body_consumed;
-        conn.respond();
+        conn.respond(request.target);
     }
 
-    fn respond(conn: *OriginConn) void {
+    /// Answer per behavior, echoing the request target into the body so the
+    /// client can verify byte-exact end-to-end integrity.
+    fn respond(conn: *OriginConn, target: []const u8) void {
+        assert(target.len > 0);
+        const echo_len = "echo:".len + target.len;
         conn.response = switch (conn.behavior) {
             .framed_keep_alive,
             .linger_then_stale_close,
-            => "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nhello world!",
-            .framed_close => "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
-            .chunked_keep_alive => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-                "5\r\nhello\r\n6\r\nworld!\r\n0\r\n\r\n",
-            .close_delimited => "HTTP/1.1 200 OK\r\n\r\nclose-delimited body bytes",
+            => std.fmt.bufPrint(
+                &conn.response_buf,
+                "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\necho:{s}",
+                .{ echo_len, target },
+            ) catch unreachable, // targets are bounded by the client's buffer
+            .framed_close => std.fmt.bufPrint(
+                &conn.response_buf,
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {d}\r\n\r\necho:{s}",
+                .{ echo_len, target },
+            ) catch unreachable,
+            .chunked_keep_alive => std.fmt.bufPrint(
+                &conn.response_buf,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\necho:{s}\r\n0\r\n\r\n",
+                .{ echo_len, target },
+            ) catch unreachable,
+            .close_delimited => std.fmt.bufPrint(
+                &conn.response_buf,
+                "HTTP/1.1 200 OK\r\n\r\necho:{s}",
+                .{target},
+            ) catch unreachable,
             .garbage => "SPROING! NOT HTTP AT ALL\r\n\r\n",
             .premature_close => return conn.shutdown(),
         };
@@ -402,13 +467,25 @@ const OriginConn = struct {
 const Client = struct {
     io: *IO,
     workload: *Workload,
+    /// Distinguishes this client's tokens from every other client's.
+    id: u32 = 0,
+    /// With RST injection on, a close-delimited body can be truncated by a
+    /// legitimate teardown FIN — only fault-free runs verify those bodies.
+    strict_until_close: bool = true,
     fd: posix.socket_t = -1,
     requests_total: u32 = 0,
     requests_sent: u32 = 0,
+    sequence: u32 = 0,
     kind: RequestKind = .get,
     method: h1.Method = .get,
     abort_mid_response: bool = false,
     expected_responses: u32 = 0,
+    burst_size: u32 = 0,
+    /// The target (with its unique token) each response of the current
+    /// burst must echo back, in order.
+    expected: [2]Target = .{ .{}, .{} },
+    status: u16 = 0,
+    body_start: usize = 0,
     send_buf: [512]u8 = undefined,
     send_len: usize = 0,
     sent: usize = 0,
@@ -429,6 +506,15 @@ const Client = struct {
     recv_completion: Completion = undefined,
 
     const RequestKind = enum { get, post_sized, post_chunked, pipelined_pair, garbage };
+
+    const Target = struct {
+        buf: [48]u8 = undefined,
+        len: usize = 0,
+
+        fn slice(target: *const Target) []const u8 {
+            return target.buf[0..target.len];
+        }
+    };
 
     fn begin(client: *Client) void {
         client.requests_total = client.workload.requests_per_client();
@@ -465,23 +551,43 @@ const Client = struct {
         client.arm_send();
     }
 
+    /// Build a target carrying this request's unique token.
+    fn tokenize(client: *Client, index: usize, prefix: []const u8) []const u8 {
+        client.sequence += 1;
+        const text = std.fmt.bufPrint(
+            &client.expected[index].buf,
+            "{s}?token-c{d}s{d}",
+            .{ prefix, client.id, client.sequence },
+        ) catch unreachable; // bounded ids and sequences fit
+        client.expected[index].len = text.len;
+        return text;
+    }
+
     fn compose(client: *Client, last: bool) void {
         const connection: []const u8 = if (last) "Connection: close\r\n" else "";
         client.method = if (client.kind == .post_sized or client.kind == .post_chunked)
             .post
         else
             .get;
-        client.expected_responses = if (client.kind == .pipelined_pair) 2 else 1;
+        client.burst_size = if (client.kind == .pipelined_pair) 2 else 1;
+        client.expected_responses = client.burst_size;
         const text = switch (client.kind) {
-            .get => std.fmt.bufPrint(&client.send_buf, "GET /a HTTP/1.1\r\n" ++
-                "Host: sim\r\n{s}\r\n", .{connection}),
-            .post_sized => std.fmt.bufPrint(&client.send_buf, "POST /b HTTP/1.1\r\n" ++
-                "Host: sim\r\nContent-Length: 11\r\n{s}\r\nhello-body!", .{connection}),
-            .post_chunked => std.fmt.bufPrint(&client.send_buf, "POST /a HTTP/1.1\r\n" ++
+            .get => std.fmt.bufPrint(&client.send_buf, "GET {s} HTTP/1.1\r\n" ++
+                "Host: sim\r\n{s}\r\n", .{ client.tokenize(0, "/a"), connection }),
+            .post_sized => std.fmt.bufPrint(&client.send_buf, "POST {s} HTTP/1.1\r\n" ++
+                "Host: sim\r\nContent-Length: 11\r\n{s}\r\nhello-body!", .{
+                client.tokenize(0, "/b"),
+                connection,
+            }),
+            .post_chunked => std.fmt.bufPrint(&client.send_buf, "POST {s} HTTP/1.1\r\n" ++
                 "Host: sim\r\nTransfer-Encoding: chunked\r\n{s}\r\n" ++
-                "6\r\nchunky\r\n0\r\n\r\n", .{connection}),
-            .pipelined_pair => std.fmt.bufPrint(&client.send_buf, "GET /a HTTP/1.1\r\n" ++
-                "Host: sim\r\n\r\nGET /b HTTP/1.1\r\nHost: sim\r\n{s}\r\n", .{connection}),
+                "6\r\nchunky\r\n0\r\n\r\n", .{ client.tokenize(0, "/a"), connection }),
+            .pipelined_pair => std.fmt.bufPrint(&client.send_buf, "GET {s} HTTP/1.1\r\n" ++
+                "Host: sim\r\n\r\nGET {s} HTTP/1.1\r\nHost: sim\r\n{s}\r\n", .{
+                client.tokenize(0, "/a"),
+                client.tokenize(1, "/b"),
+                connection,
+            }),
             .garbage => std.fmt.bufPrint(&client.send_buf, "GET / WHAT\r\n\r\n", .{}),
         } catch unreachable; // all variants fit the buffer by construction
         client.send_len = text.len;
@@ -537,11 +643,41 @@ const Client = struct {
         // EOF legitimately ends a close-delimited response body.
         if (client.framer) |framer| {
             if (framer.framing == .until_close) {
+                // Under RST injection a teardown FIN can truncate this body
+                // mid-flight; only fault-free runs can insist on the echo.
+                if (client.strict_until_close) client.verify_integrity();
                 client.responses_ok += 1;
                 return client.conclude();
             }
         }
         client.conclude(); // proxy closed (5xx path, rejection, timeout): acceptable
+    }
+
+    /// A completed 200 must carry *this* request's token back: byte-exact
+    /// for length-framed bodies, embedded in the chunk framing otherwise.
+    /// Catches truncation, response reordering, and stray bytes leaking
+    /// between (pooled) connections.
+    fn verify_integrity(client: *Client) void {
+        if (client.status != 200) return; // proxy-generated errors echo nothing
+        assert(client.burst_size >= client.expected_responses);
+        const index = client.burst_size - client.expected_responses;
+        assert(index < 2);
+        var echo_buf: [64]u8 = undefined;
+        const echo = std.fmt.bufPrint(&echo_buf, "echo:{s}", .{
+            client.expected[index].slice(),
+        }) catch unreachable; // targets are bounded
+        const body = client.recv_buf[client.body_start..client.body_cursor];
+        const intact = switch (client.framer.?.framing) {
+            // The body is exactly the echo, byte for byte.
+            .content_length, .until_close => std.mem.eql(u8, echo, body),
+            // The wire bytes include the chunk framing around the echo.
+            .chunked => std.mem.indexOf(u8, body, echo) != null,
+            .none => body.len == 0,
+        };
+        if (!intact) fail("response integrity: expected \"{s}\", body was \"{s}\"", .{
+            echo,
+            body,
+        });
     }
 
     /// Every byte stream the proxy sends must parse and frame as HTTP/1.1 —
@@ -562,6 +698,8 @@ const Client = struct {
             const consumed = framer.consume(body) catch
                 fail("proxy emitted a malformed chunked body", .{});
             client.framer = framer;
+            client.status = response.status;
+            client.body_start = response.head_len;
             client.body_cursor = response.head_len + consumed;
         } else {
             const fresh = client.recv_buf[client.body_cursor..client.filled];
@@ -577,6 +715,7 @@ const Client = struct {
     }
 
     fn response_done(client: *Client) void {
+        client.verify_integrity();
         client.responses_ok += 1;
         client.expected_responses -= 1;
         // Slide any bytes past this response (a second pipelined response).
