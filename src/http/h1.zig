@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const chunked_coding = @import("chunked.zig");
 
 pub const Method = enum { get, head, post, put, delete, patch, options, connect, trace, other };
 
@@ -232,6 +233,54 @@ fn contentLengthValue(headers: []const Header) FramingError!?u64 {
 fn isChunkedOnly(value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "chunked");
 }
+
+/// Tracks one message body across arbitrarily-split reads: how many bytes
+/// still belong to the current message, and whether it has ended. Transforms
+/// nothing — a relay forwards the counted bytes verbatim. Fixed state.
+pub const BodyFramer = struct {
+    framing: Framing,
+    /// Content-Length bytes still expected (meaningful for `.content_length`).
+    remaining: u64,
+    decoder: chunked_coding.ChunkedDecoder,
+
+    pub fn init(framing: Framing) BodyFramer {
+        return .{
+            .framing = framing,
+            .remaining = switch (framing) {
+                .content_length => |n| n,
+                else => 0,
+            },
+            .decoder = .{},
+        };
+    }
+
+    /// How many leading bytes of `bytes` belong to the current message.
+    /// Anything beyond the returned count is the next message (or, on a
+    /// connection that must not carry one, a protocol violation).
+    pub fn consume(framer: *BodyFramer, bytes: []const u8) error{Malformed}!usize {
+        switch (framer.framing) {
+            .none => return 0,
+            .content_length => {
+                const n: usize = @intCast(@min(framer.remaining, bytes.len));
+                framer.remaining -= n;
+                return n;
+            },
+            .chunked => return framer.decoder.feed(bytes),
+            .until_close => return bytes.len,
+        }
+    }
+
+    /// True when the whole body has been consumed. Never true for
+    /// `.until_close` — there the connection's EOF is the terminator.
+    pub fn isComplete(framer: *const BodyFramer) bool {
+        return switch (framer.framing) {
+            .none => true,
+            .content_length => framer.remaining == 0,
+            .chunked => framer.decoder.done(),
+            .until_close => false,
+        };
+    }
+};
 
 const RequestLine = struct {
     method: Method,
@@ -585,6 +634,28 @@ test "h1: response framing per RFC 9112 section 6.3" {
         &headers,
     )).complete;
     try std.testing.expectError(error.InvalidFraming, responseFraming(.get, &conflict));
+}
+
+test "h1: BodyFramer tracks message ends across split reads" {
+    var sized = BodyFramer.init(.{ .content_length = 5 });
+    try std.testing.expectEqual(@as(usize, 3), try sized.consume("abc"));
+    try std.testing.expect(!sized.isComplete());
+    // Two bytes finish the body; "XX" belongs to the next message.
+    try std.testing.expectEqual(@as(usize, 2), try sized.consume("deXX"));
+    try std.testing.expect(sized.isComplete());
+
+    var chunked_body = BodyFramer.init(.chunked);
+    const wire = "3\r\nabc\r\n0\r\n\r\nNEXT";
+    try std.testing.expectEqual(wire.len - "NEXT".len, try chunked_body.consume(wire));
+    try std.testing.expect(chunked_body.isComplete());
+
+    var empty = BodyFramer.init(.none);
+    try std.testing.expectEqual(@as(usize, 0), try empty.consume("junk"));
+    try std.testing.expect(empty.isComplete());
+
+    var close_delimited = BodyFramer.init(.until_close);
+    try std.testing.expectEqual(@as(usize, 4), try close_delimited.consume("data"));
+    try std.testing.expect(!close_delimited.isComplete()); // only EOF ends it
 }
 
 test "h1: rejects too many headers" {

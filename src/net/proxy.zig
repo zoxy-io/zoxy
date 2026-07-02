@@ -1,23 +1,22 @@
-//! The Phase-0 reverse-proxy data path (docs/DESIGN.md §5, §7). Per downstream
+//! The reverse-proxy data path (docs/DESIGN.md §5, §7). Per downstream
 //! connection: receive the request head, route it to a cluster, connect an
-//! upstream, forward the buffered request bytes, then relay both directions
-//! until either side closes. Everything is reserved up front — the serving path
-//! allocates nothing.
+//! upstream, forward the spliced head plus the *framed* request body, parse
+//! the response head, then relay the framed response back. Both directions
+//! know where their message ends (RFC 9112 §6.3 via `h1.BodyFramer`), so the
+//! connection closes as soon as the response completes — an upstream that
+//! ignores `Connection: close` cannot pin the slot until the deadline — and
+//! bytes past a message end (a pipelined next request) are never forwarded.
+//! Everything is reserved up front — the serving path allocates nothing.
 //!
 //! Lifetime: `refs` counts in-flight io_uring operations for a connection.
 //! `teardown` flips `closing` and closes both fds; the resulting (and any other
 //! pending) completions decrement `refs`, and the last one releases the slot.
 //!
-//! Phase-0 contract: **one request per connection.** The head is primed
-//! upstream with hop-by-hop headers stripped and `Connection: close` injected
-//! (zero-copy, as bounded segmented sends), so a compliant upstream closes
-//! after its response; the first EOF in either direction tears the whole
-//! connection down. Without the forced close, a keep-alive client could pin a
-//! pool slot until the deadline and relay further pipelined requests through
-//! the tunnel picked by the *first* request's route — a routing bypass.
-//! Responses are relayed verbatim; real keep-alive needs response framing
-//! (Phase 1, docs/DESIGN.md §7). `Upgrade` requests cannot survive a forced
-//! close and are refused with 501.
+//! Still one request per connection: the head is primed upstream with
+//! hop-by-hop headers stripped and `Connection: close` injected (zero-copy,
+//! bounded segmented sends). Downstream connection reuse is the next Phase-1
+//! slice (docs/DESIGN.md §7); framing makes it possible. `Upgrade` requests
+//! cannot survive a forced close and are refused with 501.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -78,6 +77,9 @@ const Pipe = struct {
     dst_fd: posix.socket_t,
     /// True for the upstream->client direction (drives bytes_to_client metrics).
     to_client: bool,
+    /// Frames the message flowing through this direction; bytes beyond the
+    /// message end are never forwarded.
+    framer: h1.BodyFramer,
     buf: [constants.relay_buf_bytes]u8,
     filled: usize,
     sent: usize,
@@ -86,6 +88,7 @@ const Pipe = struct {
 
     fn armRecv(pipe: *Pipe) void {
         assert(pipe.src_fd >= 0);
+        assert(!pipe.framer.isComplete()); // a finished direction is never re-armed
         pipe.conn.retain();
         pipe.conn.io.recv(*Pipe, pipe, onRecv, &pipe.recv_completion, pipe.src_fd, &pipe.buf);
     }
@@ -94,12 +97,26 @@ const Pipe = struct {
         defer pipe.conn.releaseRef();
         if (pipe.conn.closing) return;
         const n = result catch return pipe.conn.teardown();
-        if (n == 0) return pipe.conn.teardown(); // EOF on this half
+        if (n == 0) return pipe.onEof();
         assert(n <= pipe.buf.len); // the read can never exceed the fixed buffer
-        pipe.filled = n;
+        const consumed = pipe.framer.consume(pipe.buf[0..n]) catch
+            return pipe.conn.teardown(); // malformed chunked framing
+        // A short consume means the message ended inside this read.
+        assert(consumed == n or pipe.framer.isComplete());
+        if (consumed == 0) return pipe.finish(); // everything read is past the end
+        pipe.filled = consumed;
         pipe.sent = 0;
-        assert(pipe.sent < pipe.filled); // n > 0, so there is something to send
+        assert(pipe.sent < pipe.filled);
         pipe.armSend();
+    }
+
+    fn onEof(pipe: *Pipe) void {
+        // EOF is a legal terminator only for a close-delimited response;
+        // anything else is a truncated message or the client quitting.
+        if (pipe.to_client and pipe.framer.framing == .until_close) {
+            return pipe.conn.responseComplete();
+        }
+        pipe.conn.teardown();
     }
 
     fn armSend(pipe: *Pipe) void {
@@ -128,7 +145,15 @@ const Pipe = struct {
         pipe.sent += m;
         assert(pipe.sent <= pipe.filled); // never send past what we read
         if (pipe.sent < pipe.filled) return pipe.armSend(); // finish a partial write
+        if (pipe.framer.isComplete()) return pipe.finish();
         pipe.armRecv();
+    }
+
+    fn finish(pipe: *Pipe) void {
+        assert(pipe.framer.isComplete());
+        if (pipe.to_client) return pipe.conn.responseComplete();
+        // Request body fully forwarded: this direction goes idle; the
+        // connection lives on until the response completes.
     }
 };
 
@@ -151,7 +176,14 @@ pub const ProxyConn = struct {
 
     head_buf: [constants.read_buf_bytes]u8,
     head_filled: usize,
+    /// Request headers during routing; reused for the response head parse
+    /// (the request's entries are dead once the prime segments are built).
     headers_storage: [constants.headers_max]h1.Header,
+
+    /// Method of the current request — decides the response framing (HEAD).
+    request_method: h1.Method,
+    /// Frames the request body; seeded here, then handed to the d2u pipe.
+    request_framer: h1.BodyFramer,
 
     // The upstream-bound head as slices of `head_buf` (plus the static
     // `Connection: close` injection), laid out by `buildPrimeSegments`.
@@ -210,6 +242,8 @@ pub const ProxyConn = struct {
         conn.timeout_ns = timeout_ns;
         conn.timeout_armed = false;
         conn.head_filled = 0;
+        conn.request_method = .other;
+        conn.request_framer = h1.BodyFramer.init(.none);
         conn.prime_segment_count = 0;
         conn.prime_segment_index = 0;
         conn.prime_sent = 0;
@@ -347,10 +381,21 @@ pub const ProxyConn = struct {
         // A protocol upgrade cannot survive the forced `Connection: close`;
         // refuse it honestly rather than letting it fail at the upstream.
         if (request.header("upgrade") != null) return conn.fail(resp_501);
+        // Smuggling-shaped framing (TE+CL, duplicate/garbage Content-Length)
+        // is rejected before any byte reaches an upstream.
+        const framing = h1.requestFraming(request) catch return conn.fail(resp_400);
+        conn.request_method = request.method;
+        conn.request_framer = h1.BodyFramer.init(framing);
         const cluster = conn.router.route(request.host(), request.target) orelse
             return conn.fail(resp_404);
         const endpoint = conn.rr.pick(cluster) orelse return conn.fail(resp_503);
-        conn.buildPrimeSegments(request);
+        // Body bytes already buffered behind the head count toward the frame;
+        // anything past the request's end (a pipelined next request) must not
+        // reach the upstream.
+        const body = conn.head_buf[request.head_len..conn.head_filled];
+        const body_consumed = conn.request_framer.consume(body) catch
+            return conn.fail(resp_400);
+        conn.buildPrimeSegments(request, request.head_len + body_consumed);
         conn.up_fd = createTcpSocket() orelse return conn.fail(resp_502);
         assert(conn.up_fd >= 0);
         conn.retain();
@@ -379,9 +424,11 @@ pub const ProxyConn = struct {
     /// injected, all without copying a byte. This makes one-request-per-
     /// connection real: the upstream closes after its response, and a second
     /// pipelined request can never reach the first request's cluster.
-    fn buildPrimeSegments(conn: *ProxyConn, request: *const h1.Request) void {
+    fn buildPrimeSegments(conn: *ProxyConn, request: *const h1.Request, body_end: usize) void {
         assert(request.head_len >= 4); // shortest head: request line + blank line
         assert(request.head_len <= conn.head_filled);
+        assert(body_end >= request.head_len); // the frame starts after the head
+        assert(body_end <= conn.head_filled); // and never exceeds what was read
         var count: usize = 0;
         var kept_start: usize = 0;
         for (request.headers) |header| {
@@ -402,8 +449,8 @@ pub const ProxyConn = struct {
         }
         conn.prime_segments[count] = connection_close_header;
         count += 1;
-        if (conn.head_filled > request.head_len) { // body bytes already buffered
-            conn.prime_segments[count] = conn.head_buf[request.head_len..conn.head_filled];
+        if (body_end > request.head_len) { // framed body bytes already buffered
+            conn.prime_segments[count] = conn.head_buf[request.head_len..body_end];
             count += 1;
         }
         assert(count >= 2); // at least the request line and the injected close
@@ -454,16 +501,84 @@ pub const ProxyConn = struct {
         conn.d2u.src_fd = conn.down_fd;
         conn.d2u.dst_fd = conn.up_fd;
         conn.d2u.to_client = false;
+        conn.d2u.framer = conn.request_framer; // continues where the prime left off
         conn.d2u.filled = 0;
         conn.d2u.sent = 0;
         conn.u2d.conn = conn;
         conn.u2d.src_fd = conn.up_fd;
         conn.u2d.dst_fd = conn.down_fd;
         conn.u2d.to_client = true;
+        // Placeholder until the response head parses (beginResponseRelay);
+        // the u2d pipe callbacks never run before then.
+        conn.u2d.framer = h1.BodyFramer.init(.until_close);
         conn.u2d.filled = 0;
         conn.u2d.sent = 0;
-        conn.d2u.armRecv();
-        conn.u2d.armRecv();
+        // The d2u direction only runs while request-body bytes are owed.
+        if (!conn.d2u.framer.isComplete()) conn.d2u.armRecv();
+        conn.armRecvResponseHead();
+    }
+
+    // ---- response head ------------------------------------------------------
+
+    /// Accumulate the response head in the u2d pipe's buffer (nothing is
+    /// forwarded downstream until it parses, so an unparseable upstream can
+    /// still be answered with a clean 502).
+    fn armRecvResponseHead(conn: *ProxyConn) void {
+        assert(conn.up_fd >= 0);
+        const pipe = &conn.u2d;
+        if (pipe.filled == pipe.buf.len) return conn.fail(resp_502); // head too large
+        assert(pipe.filled < pipe.buf.len); // there is room to read into
+        conn.retain();
+        conn.io.recv(
+            *ProxyConn,
+            conn,
+            onRecvResponseHead,
+            &pipe.recv_completion,
+            conn.up_fd,
+            pipe.buf[pipe.filled..],
+        );
+    }
+
+    fn onRecvResponseHead(conn: *ProxyConn, _: *Completion, result: io_mod.RecvError!usize) void {
+        defer conn.releaseRef();
+        if (conn.closing) return;
+        const n = result catch return conn.teardown();
+        if (n == 0) return conn.fail(resp_502); // upstream closed without a response
+        conn.u2d.filled += n;
+        assert(conn.u2d.filled <= conn.u2d.buf.len);
+        const parsed = h1.parseResponse(
+            conn.u2d.buf[0..conn.u2d.filled],
+            &conn.headers_storage, // the request's headers are dead by now
+        ) catch return conn.fail(resp_502);
+        switch (parsed) {
+            .incomplete => conn.armRecvResponseHead(),
+            .complete => |response| conn.beginResponseRelay(&response),
+        }
+    }
+
+    fn beginResponseRelay(conn: *ProxyConn, response: *const h1.Response) void {
+        assert(response.head_len > 0);
+        assert(response.head_len <= conn.u2d.filled);
+        const framing = h1.responseFraming(conn.request_method, response) catch
+            return conn.fail(resp_502); // conflicting framing: refuse to guess
+        const pipe = &conn.u2d;
+        pipe.framer = h1.BodyFramer.init(framing);
+        const body = pipe.buf[response.head_len..pipe.filled];
+        const body_consumed = pipe.framer.consume(body) catch return conn.fail(resp_502);
+        // Forward the head plus the framed body prefix; bytes past the
+        // message end are dropped (the upstream must not pipeline at us).
+        pipe.filled = response.head_len + body_consumed;
+        pipe.sent = 0;
+        assert(pipe.sent < pipe.filled); // the head alone is never empty
+        pipe.armSend(); // Pipe.onSend continues: finish, or relay the rest
+    }
+
+    /// The framed response has been fully forwarded. No downstream reuse yet
+    /// (that is the next Phase-1 slice) — but closing *here*, rather than on
+    /// EOF, is what keeps a lingering upstream from pinning the slot.
+    fn responseComplete(conn: *ProxyConn) void {
+        assert(conn.outcome == .proxied); // only a relayed response completes
+        conn.teardown();
     }
 
     // ---- error path -------------------------------------------------------
@@ -664,13 +779,19 @@ fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
 // ---- tests ----------------------------------------------------------------
 
 /// Minimal origin driven on the same IO loop: accept one connection, read the
-/// request head (the proxy primes it as several segmented sends), reply with a
-/// fixed response, and close. The received bytes stay in `request_buf` so tests
-/// can assert on what was actually forwarded.
+/// request (the proxy primes it as several segmented sends), reply with a
+/// fixed response, and close — or linger open when `close_after_send` is
+/// false, so tests can prove the proxy finishes without an upstream EOF. The
+/// received bytes stay in `request_buf` so tests can assert on what was
+/// actually forwarded.
 const TestOrigin = struct {
     io: *IO,
     listener: Listener,
     response: []const u8,
+    /// Respond once the received request contains this needle (default: the
+    /// end of the head; body tests wait for their body bytes instead).
+    respond_after: []const u8 = "\r\n\r\n",
+    close_after_send: bool = true,
     sent: usize = 0,
     fd: posix.socket_t = -1,
     request_buf: [1024]u8 = undefined,
@@ -703,11 +824,12 @@ const TestOrigin = struct {
     }
     fn onRecv(origin: *TestOrigin, _: *Completion, result: io_mod.RecvError!usize) void {
         const n = result catch return;
-        if (n == 0) return; // peer closed before completing the head
+        if (n == 0) return; // peer closed before completing the request
         origin.request_len += n;
         const received = origin.request_buf[0..origin.request_len];
-        // Respond only once the whole head has arrived.
-        if (std.mem.indexOf(u8, received, "\r\n\r\n") == null) return origin.armRecv();
+        if (std.mem.indexOf(u8, received, origin.respond_after) == null) {
+            return origin.armRecv();
+        }
         origin.sent = 0;
         origin.armSend();
     }
@@ -724,6 +846,7 @@ const TestOrigin = struct {
     fn onSend(origin: *TestOrigin, _: *Completion, result: io_mod.SendError!usize) void {
         origin.sent += result catch return;
         if (origin.sent < origin.response.len) return origin.armSend(); // finish a partial write
+        if (!origin.close_after_send) return; // linger: the proxy must finish on its own
         origin.io.close(*TestOrigin, origin, onClose, &origin.close_c, origin.fd);
         origin.fd = -1;
     }
@@ -966,6 +1089,419 @@ test "proxy: refuses an Upgrade request with 501 instead of tunneling it" {
 
     try io.run_until_done(&c.done);
     try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 501 "));
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: completes promptly when a lingering upstream sends a framed response" {
+    const gpa = std.testing.allocator;
+    // Content-Length framing, and the origin never closes: before framed
+    // relay, this connection was pinned until the 30s deadline.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false,
+    };
+    origin.start();
+    defer if (origin.fd >= 0) {
+        _ = linux.close(origin.fd);
+    };
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    const started_ns = monotonicNanos();
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    while (pool.free_count != pool.capacity) try io.run_once();
+    // Well under the 30s deadline: the framer ended the response, not a timer.
+    try std.testing.expect(monotonicNanos() - started_ns < 5 * std.time.ns_per_s);
+}
+
+fn monotonicNanos() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "proxy: relays a chunked response and ends it at the terminal chunk" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nHELLO\r\n6\r\nWORLD!\r\n0\r\n\r\n";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    // The origin lingers: only chunked end-detection can finish this request.
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false,
+    };
+    origin.start();
+    defer if (origin.fd >= 0) {
+        _ = linux.close(origin.fd);
+    };
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        total: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.armRecv();
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn armRecv(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, c.buf[c.total..]);
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch 0;
+            if (n == 0) { // EOF: the proxy closed after the terminal chunk
+                c.done = true;
+                return;
+            }
+            c.total += n;
+            c.armRecv();
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.total]);
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: does not forward a pipelined second request upstream" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+            // Two requests in one write: only the first may reach the origin.
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n" ++
+                "GET /second HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    while (pool.free_count != pool.capacity) try io.run_once();
+
+    const forwarded = origin.request_buf[0..origin.request_len];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, forwarded, "GET "));
+    try std.testing.expect(std.mem.indexOf(u8, forwarded, "/second") == null);
+}
+
+test "proxy: streams a framed request body to the upstream" {
+    const gpa = std.testing.allocator;
+    const body = "0123456789";
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    // The origin only answers once the whole body has arrived.
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .respond_after = body,
+    };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        body: []const u8,
+        body_sent: bool = false,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+            // Head first; the body follows in a separate send so it travels
+            // through the d2u relay pipe, not just the prime.
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "POST / HTTP/1.1\r\n" ++
+                "Host: o\r\nContent-Length: 10\r\n\r\n");
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            if (c.body_sent) return;
+            c.body_sent = true;
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, c.body);
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client, .body = body };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    while (pool.free_count != pool.capacity) try io.run_once();
+
+    const forwarded = origin.request_buf[0..origin.request_len];
+    try std.testing.expect(std.mem.endsWith(u8, forwarded, body));
+}
+
+test "proxy: answers 502 when the upstream response is unparseable" {
+    const gpa = std.testing.allocator;
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = "NOT-HTTP-AT-ALL\r\n\r\n",
+    };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+    defer _ = linux.close(client);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 502 "));
     while (pool.free_count != pool.capacity) try io.run_once();
 }
 
