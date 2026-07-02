@@ -23,6 +23,13 @@ const cqes_batch_max = 256;
 /// the retry loop finite (TigerStyle: "put a limit on everything").
 const submit_retries_max = 8;
 
+/// Resubmissions of one operation that completed with EINTR/EAGAIN. Sockets
+/// are non-blocking; io_uring normally poll-arms instead of surfacing EAGAIN,
+/// but if a kernel ever does, an unbounded resubmit would spin the loop.
+/// Beyond the bound the raw errno decodes to `error.Unexpected` and the
+/// caller tears the connection down.
+const completion_retries_max = 8;
+
 pub const AcceptError = error{
     ConnectionAborted,
     ProcessFdQuotaExceeded,
@@ -91,6 +98,8 @@ pub const Completion = struct {
     callback: ErasedCallback = undefined,
     /// Raw `cqe.res`, filled before the callback runs. Negative is `-errno`.
     result: i32 = 0,
+    /// EINTR/EAGAIN resubmissions so far; bounded by `completion_retries_max`.
+    retries: u32 = 0,
     /// Intrusive link for the `completed` queue. Non-null only while queued.
     next: ?*Completion = null,
 };
@@ -365,10 +374,14 @@ pub const IO = struct {
     }
 
     fn complete(io: *IO, completion: *Completion) void {
-        // Retry transient interruptions without notifying the caller.
+        // Retry transient interruptions without notifying the caller — bounded,
+        // so a socket that keeps reporting EAGAIN cannot spin this loop forever.
         if (completion.result < 0) {
             const e = to_errno(completion.result);
-            if (e == .INTR or e == .AGAIN) return io.enqueue(completion);
+            if ((e == .INTR or e == .AGAIN) and completion.retries < completion_retries_max) {
+                completion.retries += 1;
+                return io.enqueue(completion);
+            }
         }
         switch (completion.operation) {
             .accept => {
