@@ -265,19 +265,20 @@ accept → recv (provided buffer) → parse req line + headers (zero-copy slices
   Bounded `max_headers`; overflow → reject, don't grow.
 - **Lifetime rule:** header slices are valid only while the buffer is unmodified
   → any thread hand-off requires a copy (we avoid hand-off: connection-pinned).
-- **One request per connection (Phase-0 contract):** the head is forwarded with
-  hop-by-hop headers stripped (`Connection` + everything it names, `Keep-Alive`,
-  `Proxy-Connection`) and `Connection: close` injected — zero-copy, as bounded
-  segmented sends of the parse buffer. A compliant upstream then closes after
-  one response, so a keep-alive client can neither pin a pool slot until the
-  deadline nor smuggle a second, differently-routed request through the first
-  request's tunnel (routing bypass). `Upgrade` requests cannot survive the
-  forced close and are refused with 501. Responses are relayed verbatim — the
-  client may see `keep-alive` then FIN, which is legal and clients handle.
-  Real keep-alive requires response framing (status line + Content-Length /
-  chunked) and is **Phase 1** (§7) — the close-per-request handshake tax
-  measured ~6× on loopback, making connection reuse the biggest single lever —
-  with the forced close remaining the fallback for unframeable responses.
+- **Connection reuse (Phase 1, done):** both messages are framed per RFC 9112
+  §6.3 (Content-Length / lone-chunked; close-delimited responses fall back to
+  a forced close), so both sides of the proxy reuse connections. Downstream:
+  an HTTP/1.1 keep-alive client keeps its connection — each request is
+  re-parsed and re-routed, pipelined bytes slide to the front of the parse
+  buffer, hop-by-hop headers are stripped in both directions. Upstream:
+  requests are forwarded without a `Connection` header (1.1 default
+  keep-alive) and a framed, close-free response parks its connection in a
+  bounded per-worker, per-endpoint idle pool; a connection the upstream
+  closed while parked fails on first use and is retried once on a fresh dial
+  (only when the request was fully replayable from the parse buffer).
+  Smuggling-shaped request framing (TE+CL, duplicate/garbage Content-Length)
+  is rejected with 400 before any byte reaches an upstream. `Upgrade` is
+  still refused with 501; unframeable exchanges close both sides.
 
 ---
 

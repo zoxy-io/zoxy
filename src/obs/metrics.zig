@@ -32,6 +32,10 @@ pub const Metrics = struct {
     client_errors: Counter = .{},
     /// 5xx responses zoxy generated (no route / upstream failure).
     upstream_errors: Counter = .{},
+    /// Requests served over a pooled (reused) upstream connection.
+    upstream_reused: Counter = .{},
+    /// Stale pooled connections replaced by a fresh dial mid-request.
+    upstream_retried: Counter = .{},
     bytes_to_upstream: Counter = .{},
     bytes_to_client: Counter = .{},
 

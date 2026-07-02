@@ -40,6 +40,10 @@ pub const trailer_bytes_max: u32 = 4096;
 /// relays: a connection that lives longer than this is torn down.
 pub const connection_timeout_ns: u63 = 30 * std.time.ns_per_s;
 
+/// Idle upstream connections parked per worker (across all endpoints).
+/// Checkin beyond this closes the connection instead of keeping it.
+pub const upstream_idle_max: usize = 64;
+
 /// Delay before re-arming accept after fd/resource exhaustion (EMFILE etc.).
 /// An immediate re-arm would fail again instantly and spin the worker at
 /// 100% CPU for as long as the condition persists.

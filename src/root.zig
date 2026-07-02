@@ -27,6 +27,9 @@ pub const Router = @import("proxy/router.zig").Router;
 /// Round-robin load balancing.
 pub const RoundRobin = @import("proxy/balancer.zig").RoundRobin;
 
+/// Per-worker idle upstream connection pool.
+pub const UpstreamPool = @import("proxy/upstream_pool.zig").UpstreamPool;
+
 /// The reverse-proxy data path (docs/DESIGN.md §5, §7).
 pub const proxy = @import("net/proxy.zig");
 
@@ -50,6 +53,7 @@ test {
     _ = config;
     _ = @import("proxy/router.zig");
     _ = @import("proxy/balancer.zig");
+    _ = @import("proxy/upstream_pool.zig");
     _ = @import("net/pool.zig");
     _ = proxy;
     _ = @import("obs/metrics.zig");

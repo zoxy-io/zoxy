@@ -13,13 +13,19 @@
 //! pending) completions decrement `refs`, and the last one releases the slot.
 //!
 //! Downstream keep-alive: when a framed response completes for an HTTP/1.1
-//! keep-alive client, the request is logged, the per-request upstream is
-//! dropped, pipelined bytes slide to the front of the head buffer, and the
-//! connection parses its next head — every request re-routed from scratch.
-//! Response hop-by-hop headers are stripped when reusing (the upstream was
-//! told `Connection: close`; the client must not see that). The upstream
-//! side remains one connection per request until the pool slice lands
-//! (docs/DESIGN.md §7). `Upgrade` requests are refused with 501.
+//! keep-alive client, the request is logged, pipelined bytes slide to the
+//! front of the head buffer, and the connection parses its next head —
+//! every request re-routed from scratch. Hop-by-hop headers are stripped in
+//! both directions.
+//!
+//! Upstream keep-alive: requests are forwarded without a `Connection`
+//! header (HTTP/1.1 default keep-alive), and a framed, reusable response
+//! parks its connection in the per-worker `UpstreamPool`, keyed by
+//! endpoint. A pooled connection the upstream closed while idle fails on
+//! first use before any response byte — that request is replayed once on a
+//! fresh connection (only possible when it fit entirely in the prime
+//! segments). `Upgrade` requests are refused with 501; unframeable
+//! exchanges close both sides.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -35,6 +41,7 @@ const h1 = @import("../http/h1.zig");
 const config = @import("../config.zig");
 const Router = @import("../proxy/router.zig").Router;
 const RoundRobin = @import("../proxy/balancer.zig").RoundRobin;
+const UpstreamPool = @import("../proxy/upstream_pool.zig").UpstreamPool;
 const Metrics = @import("../obs/metrics.zig").Metrics;
 const access_log = @import("../obs/access_log.zig");
 const AccessLog = access_log.AccessLog;
@@ -56,10 +63,11 @@ const resp_503 = "HTTP/1.1 503 Service Unavailable\r\n" ++
 const resp_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\n" ++
     "Content-Length: 0\r\nConnection: close\r\n\r\n";
 
-/// Injected in place of the request's hop-by-hop headers when priming the
-/// upstream, terminating the head: one request per connection, so the upstream
-/// closes after its response (see the module comment).
-const connection_close_header = "Connection: close\r\n\r\n";
+/// Terminates the upstream-bound head after the hop-by-hop headers are
+/// stripped. Nothing is injected in their place: an HTTP/1.1 upstream
+/// defaults to keep-alive, which is what the connection pool wants; the
+/// response's own framing (not EOF) ends the exchange.
+const head_terminator = "\r\n";
 
 /// Upper bound on prime segments: one kept run around each skipped header line
 /// plus the `Connection: close` injection and any buffered body bytes.
@@ -106,10 +114,16 @@ const Pipe = struct {
             return pipe.conn.teardown(); // malformed chunked framing
         // A short consume means the message ended inside this read.
         assert(consumed == n or pipe.framer.isComplete());
-        if (consumed < n and !pipe.to_client) {
-            // Pipelined bytes landed here instead of head_buf; they cannot be
-            // handed to the next request, so downstream reuse is off.
-            pipe.conn.d2u_overflow = true;
+        if (consumed < n) {
+            if (pipe.to_client) {
+                // The upstream sent bytes past the response end; its
+                // connection is in an unknown state and must not be pooled.
+                pipe.conn.u2d_overflow = true;
+            } else {
+                // Pipelined bytes landed here instead of head_buf; they
+                // cannot be handed to the next request — reuse is off.
+                pipe.conn.d2u_overflow = true;
+            }
         }
         if (consumed == 0) return pipe.finish(); // everything read is past the end
         pipe.filled = consumed;
@@ -171,6 +185,7 @@ pub const ProxyConn = struct {
     pool: *Pool,
     router: *const Router,
     rr: *RoundRobin,
+    upstream_pool: *UpstreamPool,
     metrics: *Metrics,
     access: *AccessLog,
 
@@ -205,6 +220,24 @@ pub const ProxyConn = struct {
     /// Pipelined bytes leaked into the d2u relay buffer — reuse is off (they
     /// cannot be recovered into `head_buf` without another copy path).
     d2u_overflow: bool,
+    /// The upstream sent bytes past the response end — its connection is in
+    /// an unknown protocol state and must not be pooled.
+    u2d_overflow: bool,
+    /// Where the current upstream connection goes (pool key; retry target).
+    endpoint_address: Ip4Address,
+    /// The upstream connection came from the pool (a stale close is possible).
+    upstream_pooled: bool,
+    /// Set at response-head time: framed HTTP/1.1 response without
+    /// `Connection: close` — the upstream connection can be pooled.
+    upstream_reusable: bool,
+    /// The one-shot stale-connection retry has been spent.
+    upstream_retry_used: bool,
+    /// The whole request fit in the prime segments, so it can be replayed
+    /// verbatim on a fresh connection if a pooled one turns out stale.
+    request_replayable: bool,
+    /// At least one response byte arrived — a failure is no longer a stale
+    /// pooled connection, and the request must not be replayed.
+    response_bytes_received: bool,
     /// The previous request's upstream close has not completed yet.
     up_close_pending: bool,
     /// A request is in flight (or aborted mid-flight) — controls whether the
@@ -249,6 +282,7 @@ pub const ProxyConn = struct {
         pool: *Pool,
         router: *const Router,
         rr: *RoundRobin,
+        upstream_pool: *UpstreamPool,
         metrics: *Metrics,
         access: *AccessLog,
         down_fd: posix.socket_t,
@@ -259,6 +293,7 @@ pub const ProxyConn = struct {
         conn.pool = pool;
         conn.router = router;
         conn.rr = rr;
+        conn.upstream_pool = upstream_pool;
         conn.metrics = metrics;
         conn.access = access;
         conn.down_fd = down_fd;
@@ -307,6 +342,13 @@ pub const ProxyConn = struct {
         conn.downstream_keep_alive = false;
         conn.response_reusable = false;
         conn.d2u_overflow = false;
+        conn.u2d_overflow = false;
+        conn.endpoint_address = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 };
+        conn.upstream_pooled = false;
+        conn.upstream_reusable = false;
+        conn.upstream_retry_used = false;
+        conn.request_replayable = false;
+        conn.response_bytes_received = false;
         conn.request_active = false;
         conn.prime_segment_count = 0;
         conn.prime_segment_index = 0;
@@ -454,6 +496,23 @@ pub const ProxyConn = struct {
             return conn.fail(resp_400);
         conn.request_end = request.head_len + body_consumed;
         conn.buildPrimeSegments(request, conn.request_end);
+        // Replayable = the whole request is in the prime segments; a stale
+        // pooled connection can then be retried without losing body bytes.
+        conn.request_replayable = conn.request_framer.isComplete();
+        conn.endpoint_address = endpoint.address;
+        if (conn.upstream_pool.checkout(endpoint.address)) |pooled_fd| {
+            assert(pooled_fd >= 0);
+            conn.up_fd = pooled_fd;
+            conn.upstream_pooled = true;
+            conn.metrics.upstream_reused.add(1);
+            return conn.armPrime(); // already connected: skip the dial
+        }
+        conn.connectUpstream();
+    }
+
+    fn connectUpstream(conn: *ProxyConn) void {
+        assert(conn.up_fd < 0);
+        conn.upstream_pooled = false;
         conn.up_fd = createTcpSocket() orelse return conn.fail(resp_502);
         assert(conn.up_fd >= 0);
         conn.retain();
@@ -463,7 +522,7 @@ pub const ProxyConn = struct {
             onConnect,
             &conn.connect_completion,
             conn.up_fd,
-            sockaddrIn(endpoint.address),
+            sockaddrIn(conn.endpoint_address),
         );
     }
 
@@ -473,6 +532,42 @@ pub const ProxyConn = struct {
         result catch return conn.fail(resp_502);
         assert(conn.up_fd >= 0);
         conn.armPrime();
+    }
+
+    /// The upstream connection died before the response head completed. For
+    /// a pooled connection that yielded no response byte this is the classic
+    /// stale keep-alive close — replay the request once on a fresh dial.
+    /// Anything else gets the client a clean 502 (nothing was forwarded
+    /// downstream yet).
+    fn upstreamFailed(conn: *ProxyConn) void {
+        assert(!conn.closing);
+        assert(conn.up_fd >= 0);
+        const retryable = conn.upstream_pooled and !conn.upstream_retry_used and
+            conn.request_replayable and !conn.response_bytes_received and
+            !conn.up_close_pending;
+        if (!retryable) return conn.fail(resp_502);
+        conn.upstream_retry_used = true;
+        conn.metrics.upstream_retried.add(1);
+        // Drop the dead fd; its prime/recv ops have already completed.
+        _ = linux.shutdown(conn.up_fd, linux.SHUT.RDWR);
+        conn.up_close_pending = true;
+        conn.retain();
+        conn.io.close(
+            *ProxyConn,
+            conn,
+            onUpstreamClosed,
+            &conn.close_up_completion,
+            conn.up_fd,
+        );
+        conn.up_fd = -1;
+        // Replay: rewind the prime cursor and dial the same endpoint fresh.
+        // (u2d state may still hold the previous request's leftovers; it is
+        // reset when the relay starts — no response byte arrived for *this*
+        // request, per the retryable check above.)
+        assert(!conn.response_bytes_received);
+        conn.prime_segment_index = 0;
+        conn.prime_sent = 0;
+        conn.connectUpstream();
     }
 
     // ---- forward buffered request bytes, then relay -----------------------
@@ -505,7 +600,7 @@ pub const ProxyConn = struct {
             conn.prime_segments[count] = conn.head_buf[kept_start..head_end];
             count += 1;
         }
-        conn.prime_segments[count] = connection_close_header;
+        conn.prime_segments[count] = head_terminator;
         count += 1;
         if (body_end > request.head_len) { // framed body bytes already buffered
             conn.prime_segments[count] = conn.head_buf[request.head_len..body_end];
@@ -537,7 +632,7 @@ pub const ProxyConn = struct {
     fn onPrimeSent(conn: *ProxyConn, _: *Completion, result: io_mod.SendError!usize) void {
         defer conn.releaseRef();
         if (conn.closing) return;
-        const m = result catch return conn.teardown();
+        const m = result catch return conn.upstreamFailed();
         // The primed head is upstream traffic too — without this, a GET-only
         // workload reports zero bytes_to_upstream (only the relay pipe counts).
         conn.metrics.bytes_to_upstream.add(m);
@@ -601,8 +696,9 @@ pub const ProxyConn = struct {
     fn onRecvResponseHead(conn: *ProxyConn, _: *Completion, result: io_mod.RecvError!usize) void {
         defer conn.releaseRef();
         if (conn.closing) return;
-        const n = result catch return conn.teardown();
-        if (n == 0) return conn.fail(resp_502); // upstream closed without a response
+        const n = result catch return conn.upstreamFailed();
+        if (n == 0) return conn.upstreamFailed(); // upstream closed without a response
+        conn.response_bytes_received = true;
         conn.u2d.filled += n;
         assert(conn.u2d.filled <= conn.u2d.buf.len);
         const parsed = h1.parseResponse(
@@ -630,6 +726,13 @@ pub const ProxyConn = struct {
         // Reuse intent: a framed response to a keep-alive client. The final
         // decision (`canReuseDownstream`) also needs the request forwarded.
         conn.response_reusable = conn.downstream_keep_alive and framing != .until_close;
+        // The upstream connection can be pooled when the response is framed
+        // HTTP/1.1 that does not announce a close. (Decided before the strip
+        // below invalidates the header slices.)
+        conn.upstream_reusable = framing != .until_close and
+            response.status >= 200 and
+            response.version_minor == 1 and
+            !connectionListNames(response.headers, "close");
         var head_len = response.head_len;
         if (conn.response_reusable) {
             // The upstream was told `Connection: close` and its response says
@@ -640,7 +743,9 @@ pub const ProxyConn = struct {
         const body = pipe.buf[head_len..pipe.filled];
         const body_consumed = pipe.framer.consume(body) catch return conn.fail(resp_502);
         // Forward the head plus the framed body prefix; bytes past the
-        // message end are dropped (the upstream must not pipeline at us).
+        // message end are dropped (the upstream must not pipeline at us) and
+        // taint the connection against pooling.
+        if (body_consumed < body.len) conn.u2d_overflow = true;
         pipe.filled = head_len + body_consumed;
         pipe.sent = 0;
         assert(pipe.sent < pipe.filled); // the head alone is never empty
@@ -688,8 +793,22 @@ pub const ProxyConn = struct {
     /// the slot.
     fn responseComplete(conn: *ProxyConn) void {
         assert(conn.outcome == .proxied); // only a relayed response completes
+        conn.maybePoolUpstream();
         if (!conn.canReuseDownstream()) return conn.teardown();
         conn.finishRequest();
+    }
+
+    /// Park the upstream connection for the next request to this endpoint —
+    /// independent of whether the *downstream* connection survives.
+    fn maybePoolUpstream(conn: *ProxyConn) void {
+        if (!conn.upstream_reusable) return;
+        if (conn.u2d_overflow) return;
+        if (conn.up_fd < 0) return;
+        assert(conn.endpoint_address.port != 0); // set when the request routed
+        // Nothing is pending on the fd: the response was fully received and
+        // fully forwarded before this point.
+        conn.upstream_pool.checkin(conn.endpoint_address, conn.up_fd);
+        conn.up_fd = -1;
     }
 
     /// Downstream reuse requires: keep-alive client + framed response
@@ -804,6 +923,7 @@ pub const ProxyServer = struct {
     metrics: *Metrics,
     access: *AccessLog,
     rr: RoundRobin,
+    upstream_pool: UpstreamPool,
     timeout_ns: u63,
     accept_completion: Completion,
     accept_retry_completion: Completion,
@@ -825,10 +945,16 @@ pub const ProxyServer = struct {
             .metrics = metrics,
             .access = access,
             .rr = .{},
+            .upstream_pool = .{},
             .timeout_ns = timeout_ns,
             .accept_completion = undefined,
             .accept_retry_completion = undefined,
         };
+    }
+
+    /// Close every pooled upstream connection (tests; workers run forever).
+    pub fn deinit(server: *ProxyServer) void {
+        server.upstream_pool.drain();
     }
 
     pub fn start(server: *ProxyServer) void {
@@ -852,12 +978,14 @@ pub const ProxyServer = struct {
     ) void {
         if (result) |fd| {
             assert(fd >= 0);
+            setTcpNoDelay(fd); // response heads are small writes too
             if (server.pool.acquire()) |conn| {
                 conn.start(
                     server.io,
                     server.pool,
                     server.router,
                     &server.rr,
+                    &server.upstream_pool,
                     server.metrics,
                     server.access,
                     fd,
@@ -951,7 +1079,20 @@ fn createTcpSocket() ?posix.socket_t {
     const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
     const rc = linux.socket(linux.AF.INET, flags, 0);
     if (posix.errno(rc) != .SUCCESS) return null;
-    return @intCast(rc);
+    const fd: posix.socket_t = @intCast(rc);
+    setTcpNoDelay(fd);
+    return fd;
+}
+
+/// Disable Nagle. The head is primed as several small writes; on a warm
+/// (pooled) connection Nagle holds the later ones hostage to the peer's
+/// delayed ACK — a hard ~40ms stall per request. A proxy always wants its
+/// writes on the wire immediately. Best-effort: losing the option costs
+/// latency, not correctness.
+fn setTcpNoDelay(fd: posix.socket_t) void {
+    assert(fd >= 0);
+    const on: c_int = 1;
+    posix.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
 }
 
 fn sockaddrIn(address: Ip4Address) linux.sockaddr.in {
@@ -1036,7 +1177,9 @@ const TestOrigin = struct {
         origin.sent += result catch return;
         if (origin.sent < origin.response.len) return origin.armSend(); // finish a partial write
         origin.served_mark = origin.request_len;
-        if (!origin.close_after_send) return; // linger: the proxy must finish on its own
+        // Lingering keeps the connection open — and keeps reading, so a
+        // pooled upstream connection can carry the next request.
+        if (!origin.close_after_send) return origin.armRecv();
         origin.io.close(*TestOrigin, origin, onClose, &origin.close_c, origin.fd);
         origin.fd = -1;
     }
@@ -1084,6 +1227,7 @@ test "proxy: forwards a request to an upstream and relays the response" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     // Client connects to the proxy and drives its request on the same loop.
@@ -1134,7 +1278,7 @@ test "proxy: forwards a request to an upstream and relays the response" {
     );
 }
 
-test "proxy: strips hop-by-hop headers and forces Connection: close upstream" {
+test "proxy: strips hop-by-hop headers from the forwarded request" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
 
@@ -1171,13 +1315,15 @@ test "proxy: strips hop-by-hop headers and forces Connection: close upstream" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
     defer _ = linux.close(client);
 
-    // `Connection` names "x-hop", making X-Hop hop-by-hop as well; all of the
-    // keep-alive machinery must be replaced by a single `Connection: close`.
+    // `Connection` names "x-hop", making X-Hop hop-by-hop as well; the whole
+    // connection-management block must vanish (nothing is injected: an
+    // HTTP/1.1 upstream defaults to keep-alive, which the pool wants).
     const Client = struct {
         io: *IO,
         fd: posix.socket_t,
@@ -1214,7 +1360,8 @@ test "proxy: strips hop-by-hop headers and forces Connection: close upstream" {
     try std.testing.expect(std.mem.startsWith(u8, forwarded, "GET / HTTP/1.1\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "Host: o\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, forwarded, "Accept: */*\r\n") != null);
-    try std.testing.expect(std.mem.endsWith(u8, forwarded, "Connection: close\r\n\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, forwarded, "\r\n\r\n"));
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(forwarded, "connection") == null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(forwarded, "keep-alive") == null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(forwarded, "x-hop") == null);
 }
@@ -1248,6 +1395,7 @@ test "proxy: refuses an Upgrade request with 501 instead of tunneling it" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1329,6 +1477,7 @@ test "proxy: completes promptly when a lingering upstream sends a framed respons
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1419,6 +1568,7 @@ test "proxy: relays a chunked response and ends it at the terminal chunk" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1501,6 +1651,7 @@ test "proxy: serves pipelined requests sequentially, each routed on its own" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1597,6 +1748,7 @@ test "proxy: reuses the downstream connection for sequential keep-alive requests
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1663,6 +1815,237 @@ test "proxy: reuses the downstream connection for sequential keep-alive requests
     while (pool.free_count != pool.capacity) try io.run_once();
 }
 
+test "proxy: reuses a pooled upstream connection for the next request" {
+    const gpa = std.testing.allocator;
+    // No `Connection: close`, so the upstream connection is poolable; the
+    // origin lingers and keeps reading — request /two must arrive on the
+    // very same connection, without a second accept.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false,
+    };
+    origin.start();
+    defer if (origin.fd >= 0) {
+        _ = linux.close(origin.fd);
+    };
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        expected: []const u8,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        responses: u32 = 0,
+        matched: bool = true,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.armRecv();
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET /one HTTP/1.1\r\n" ++
+                "Host: o\r\n\r\n");
+        }
+        fn armRecv(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, c.buf[c.len..]);
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch 0;
+            if (n == 0) {
+                c.done = true;
+                return;
+            }
+            c.len += n;
+            if (c.len < c.expected.len) return c.armRecv();
+            c.matched = c.matched and std.mem.eql(u8, c.expected, c.buf[0..c.len]);
+            c.responses += 1;
+            c.len = 0;
+            if (c.responses == 2) {
+                c.done = true;
+                return;
+            }
+            c.armRecv();
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET /two HTTP/1.1\r\n" ++
+                "Host: o\r\n\r\n");
+        }
+    };
+    var c = Client{ .io = &io, .fd = client, .expected = response };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expect(c.matched);
+    try std.testing.expectEqual(@as(u32, 2), c.responses);
+    // The second request rode the pooled connection...
+    try std.testing.expectEqual(@as(u64, 1), metrics.upstream_reused.load());
+    // ...which the origin observes as both requests on one accept.
+    const forwarded = origin.request_buf[0..origin.request_len];
+    try std.testing.expect(std.mem.indexOf(u8, forwarded, "GET /one ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forwarded, "GET /two ") != null);
+
+    _ = linux.close(client);
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: retries a stale pooled upstream on a fresh connection" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false,
+    };
+    origin.start();
+    defer if (origin.fd >= 0) {
+        _ = linux.close(origin.fd);
+    };
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.boundAddress().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.connection_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    const client = try connectLoopback(proxy_listener.boundAddress().port);
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        expected: []const u8,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        responses: u32 = 0,
+        matched: bool = true,
+        got_first: bool = false,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.armRecv();
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET /one HTTP/1.1\r\n" ++
+                "Host: o\r\n\r\n");
+        }
+        fn sendSecond(c: *@This()) void {
+            c.io.send(*@This(), c, onSend, &c.send_c, c.fd, "GET /two HTTP/1.1\r\n" ++
+                "Host: o\r\n\r\n");
+        }
+        fn armRecv(c: *@This()) void {
+            c.io.recv(*@This(), c, onRecv, &c.recv_c, c.fd, c.buf[c.len..]);
+        }
+        fn onSend(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn onRecv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch 0;
+            if (n == 0) {
+                c.done = true;
+                return;
+            }
+            c.len += n;
+            if (c.len < c.expected.len) return c.armRecv();
+            c.matched = c.matched and std.mem.eql(u8, c.expected, c.buf[0..c.len]);
+            c.responses += 1;
+            c.len = 0;
+            if (c.responses == 1) {
+                c.got_first = true;
+                return c.armRecv();
+            }
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client, .expected = response };
+    c.go();
+
+    try io.run_until_done(&c.got_first);
+    // The upstream closes the connection while it idles in the pool —
+    // exactly what a server-side keep-alive timeout does.
+    _ = linux.shutdown(origin.fd, linux.SHUT.RDWR);
+    _ = linux.close(origin.fd);
+    origin.fd = -1;
+    origin.start(); // ready to accept the retry's fresh dial
+
+    c.sendSecond();
+    try io.run_until_done(&c.done);
+    try std.testing.expect(c.matched);
+    try std.testing.expectEqual(@as(u32, 2), c.responses);
+    // The stale connection was checked out, failed, and was replaced.
+    try std.testing.expectEqual(@as(u64, 1), metrics.upstream_reused.load());
+    try std.testing.expectEqual(@as(u64, 1), metrics.upstream_retried.load());
+    try std.testing.expectEqual(@as(u64, 0), metrics.upstream_errors.load());
+
+    _ = linux.close(client);
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
 test "proxy: does not reuse the connection for an HTTP/1.0 client" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nHELLO";
@@ -1700,6 +2083,7 @@ test "proxy: does not reuse the connection for an HTTP/1.0 client" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1787,6 +2171,7 @@ test "proxy: streams a framed request body to the upstream" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1870,6 +2255,7 @@ test "proxy: answers 502 when the upstream response is unparseable" {
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -1947,6 +2333,7 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
@@ -2017,6 +2404,7 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
         &access,
         short_timeout,
     );
+    defer server.deinit();
     server.start();
 
     // Slow-loris: connect, send a partial head, then never finish it.
@@ -2070,6 +2458,7 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
         &access,
         constants.connection_timeout_ns,
     );
+    defer server.deinit();
     server.start();
 
     const client = try connectLoopback(proxy_listener.boundAddress().port);
