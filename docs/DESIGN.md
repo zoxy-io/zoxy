@@ -36,7 +36,7 @@ allocating syscalls.
    current one is fully written, so memory is bounded to `relay_buf_bytes` per
    direction regardless of stream size and TCP flow control throttles the peer.
    This is *stronger* than watermark read-disable (which only matters when
-   reading ahead into a growable buffer); read-ahead + watermarks is a Phase-1
+   reading ahead into a growable buffer); read-ahead + watermarks is a later
    throughput option we deliberately skip. Retrofitting flow control is painful,
    so it's built in; it also *is* the zero-alloc story (bounded buffers push flow
    control down to TCP).
@@ -275,12 +275,13 @@ accept → recv (provided buffer) → parse req line + headers (zero-copy slices
   forced close and are refused with 501. Responses are relayed verbatim — the
   client may see `keep-alive` then FIN, which is legal and clients handle.
   Real keep-alive requires response framing (status line + Content-Length /
-  chunked) and arrives with Phase 2's protocol work; the forced close then
-  remains the fallback for unframeable responses.
+  chunked) and is **Phase 1** (§7) — the close-per-request handshake tax
+  measured ~6× on loopback, making connection reuse the biggest single lever —
+  with the forced close remaining the fallback for unframeable responses.
 
 ---
 
-## 6. TLS (Phase 2 — deferred, needs FFI)
+## 6. TLS (Phase 3 — deferred, needs FFI)
 
 std cannot terminate TLS. Options, ranked by our constraints:
 
@@ -304,36 +305,65 @@ H3/QUIC → `quiche`/`ngtcp2`. Pure-Zig H3 is blocked on QUIC-aware TLS 1.3.
 
 ## 7. Phased build plan
 
-### Phase 0 — Minimal viable proxy
+### Phase 0 — Minimal viable proxy (done)
 - Thread-per-core + `SO_REUSEPORT`, per-worker `io_uring` loop, connection-pinned.
-- Static config file: one listener, inline route (host `*` + path prefix →
-  cluster), one STATIC cluster with inline endpoints, round-robin LB.
-- HTTP/1.1: accept → parse → route → per-worker H1 pool → forward → stream back.
-- **Watermark backpressure + ref-counted read-disable** (day one).
-- Timeouts: connect, per-request, idle.
-- Counters (requests, active conns, upstream failures) + access log on a
-  dedicated flusher thread (off the data path).
-- **Zero-alloc harness:** whole request path runs green under `FailingAllocator`.
+- Static config file: listener, host/path-prefix routes, static clusters with
+  inline endpoints, round-robin LB (per-cluster counters).
+- HTTP/1.1: accept → parse → route → connect → segmented forward → relay both
+  directions until EOF. **One request per connection** (§5): hop-by-hop headers
+  stripped, `Connection: close` forced; `Upgrade` refused with 501.
+- Strict bounded-buffer backpressure (recv → send → recv, §1.4).
+- Whole-life connection deadline (slow-loris backstop); accept backoff on
+  fd/resource exhaustion.
+- Counters + admin/metrics endpoint (dedicated thread, off the data path);
+  per-worker batched access log.
+- **Zero-alloc harness:** the full serving path runs green under the counting
+  allocator gate; `bench/run.sh` measures the proxy hop against a direct
+  baseline at constant throughput.
 
-### Phase 1 — Resilience
+### Phase 1 — HTTP/1.1 keep-alive (pulled forward)
+Ends the one-request-per-connection contract. Justification: close-per-request
+costs ~6× throughput on loopback (zrk, 2026-07: ~740k req/s keep-alive vs
+~125k close-mode direct; ~30k proxied) — connection reuse is the single
+biggest performance lever and needs no new dependencies, so it comes before
+resilience.
+- **Response framing:** parse the upstream status line + headers (zero-copy,
+  same discipline as the request parser); body framing via Content-Length and
+  a bounded chunked-decode state machine. Close-delimited or unframeable
+  responses keep the Phase-0 forced-close behavior as the fallback.
+- **Downstream keep-alive:** when a framed response completes, reset
+  per-request state and re-arm for the next head on the same connection.
+  Every request is re-parsed and re-routed — which also restores per-request
+  routing semantics (no tunnel to smuggle through).
+- **Upstream H1 pool** (`upstream_pool.zig`): per-worker, per-cluster, bounded;
+  check out a live connection instead of connect-per-request, return it after
+  a framed response, close on error or staleness. No pipelining.
+- **Timeout split:** the whole-life deadline becomes per-request; a separate
+  idle timeout reaps quiet keep-alive connections between requests.
+- Hop-by-hop rewrite in both directions (requests have it; responses gain it
+  once they are parsed).
+- Gate: `bench/run.sh` with keep-alive clients approaches the direct
+  keep-alive baseline, and the zero-alloc gate still holds.
+
+### Phase 2 — Resilience
 - P2C weighted-least-request LB; active health checks + passive outlier
   detection; circuit breaking (max conns/pending/requests); retries with
   fully-jittered exponential backoff + retry budget; per-try timeout.
 
-### Phase 2 — Protocol depth
+### Phase 3 — Protocol depth
 - TLS termination (OpenSSL FFI: SNI cert select + ALPN), then upstream
   re-encryption.
 - HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
   control** (stream + connection windows) wired into the existing watermark
   system, HPACK decode/re-encode, H2 pool with multiplexing + GOAWAY draining.
 
-### Phase 3 — Operability
+### Phase 4 — Operability
 - Graceful drain + hot restart (FD passing over a unix socket, à la HAProxy
   `SCM_RIGHTS`; drain via `Connection: close` / GOAWAY; transfer stats).
 - Consistent-hash LB (ring-hash / Maglev). Distributed tracing (B3/W3C
   propagation) + Prometheus metrics.
 
-### Phase 4 — Dynamic config
+### Phase 5 — Dynamic config
 - xDS-style streaming client (CDS→EDS→LDS→RDS make-before-break ordering) or a
   simpler custom control-plane protocol. Apply via RCU pointer swap so the data
   path stays lock-free.

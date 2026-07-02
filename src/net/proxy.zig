@@ -16,8 +16,8 @@
 //! pool slot until the deadline and relay further pipelined requests through
 //! the tunnel picked by the *first* request's route — a routing bypass.
 //! Responses are relayed verbatim; real keep-alive needs response framing
-//! (Phase 2). `Upgrade` requests cannot survive a forced close and are
-//! refused with 501.
+//! (Phase 1, docs/DESIGN.md §7). `Upgrade` requests cannot survive a forced
+//! close and are refused with 501.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -71,7 +71,7 @@ const prime_segments_max = constants.headers_max + 3;
 /// fills and TCP flow control throttles the peer. Memory per direction is
 /// therefore bounded to `relay_buf_bytes` regardless of stream size — a stronger
 /// guarantee than watermark read-disable, which only matters when reading ahead
-/// into a growable buffer (a Phase-1 throughput option we deliberately skip).
+/// into a growable buffer (a later throughput option we deliberately skip).
 const Pipe = struct {
     conn: *ProxyConn,
     src_fd: posix.socket_t,

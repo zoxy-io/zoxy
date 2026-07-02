@@ -120,13 +120,20 @@ Design rationale and the Zig-0.16 findings behind these choices are in
 
 ## Scope & roadmap
 
-**Phase-0 (done):** HTTP/1.1, static config, host/path routing, round-robin,
-bounded relay with backpressure, per-connection deadline, metrics + access log,
-and the zero-alloc gate.
+**Phase 0 (done):** HTTP/1.1 with a one-request-per-connection contract
+(hop-by-hop headers stripped, `Connection: close` forced), static config,
+host/path routing, round-robin, bounded relay with backpressure, per-connection
+deadline, metrics + admin endpoint + access log, and the zero-alloc gate.
 
-**Not yet:** keep-alive / upstream connection pooling, TLS termination (planned via
-OpenSSL FFI), HTTP/2 and HTTP/3, health checks, circuit breaking, retries,
-P2C/EWMA balancing, an admin/metrics endpoint, and config hot-reload.
+**Phase 1 (next): HTTP/1.1 keep-alive** — response framing (Content-Length /
+chunked), downstream connection reuse with per-request re-routing, and a
+per-worker upstream H1 pool. Close-per-request measures ~6× slower than
+keep-alive on loopback; this is the biggest single lever.
+
+**Later:** resilience (health checks, circuit breaking, retries, P2C/EWMA),
+TLS termination (planned via OpenSSL FFI), HTTP/2 and HTTP/3, graceful drain +
+hot restart, and config hot-reload. The full plan is in
+[`docs/DESIGN.md`](docs/DESIGN.md) §7.
 
 ## License
 

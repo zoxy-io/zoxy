@@ -2,7 +2,7 @@
 //! and is single-threaded, so there are no locks: records accumulate in a fixed
 //! buffer and flush as a single batched write() when full. No allocation.
 //!
-//! (A dedicated flusher thread draining per-worker SPSC rings is the Phase-1
+//! (A dedicated flusher thread draining per-worker SPSC rings is a later
 //! refinement; batched writes keep syscalls off the per-connection path here.)
 
 const std = @import("std");

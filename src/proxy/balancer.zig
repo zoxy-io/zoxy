@@ -1,5 +1,5 @@
 //! Load balancing across a cluster's endpoints. Phase-0 ships round-robin;
-//! P2C/EWMA is Phase-1 (docs/DESIGN.md §7). State is per-worker (single-threaded,
+//! P2C/EWMA is Phase-2 (docs/DESIGN.md §7). State is per-worker (single-threaded,
 //! share-nothing), so plain counters need no synchronization. Each cluster gets
 //! its own counter — a single shared one lets traffic to one cluster skew
 //! another's rotation (interleaved picks can pin a cluster to one endpoint).
