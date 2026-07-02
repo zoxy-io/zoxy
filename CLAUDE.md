@@ -105,6 +105,10 @@ Consequences that bite if you forget them:
 - `std.posix.close` is gone → use `std.os.linux.close`.
 - `main` takes `std.process.Init`; use `init.io` for file reads / arg parsing
   (`std.Io.Dir.cwd().readFileAlloc(init.io, ...)`, `init.minimal.args.toSlice(gpa)`).
+- `std.crypto.random` is gone; entropy comes through the Io interface:
+  `init.io.random(&buf)` (infallible, CSPRNG) or `io.randomSecure(&buf)`
+  (strict, always a syscall). `std.time.Timer`/`Instant` are gone too — use
+  `clock_gettime(CLOCK.MONOTONIC)` directly (see `IO.now_ns`).
 
 ## Coding conventions (TigerStyle)
 
