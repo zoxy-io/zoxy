@@ -12,8 +12,11 @@ pub const Listener = @import("net/listener.zig").Listener;
 /// Static limits (docs/TIGER_STYLE.md: "put a limit on everything").
 pub const constants = @import("constants.zig");
 
-/// Zero-copy HTTP/1.1 request parser (docs/DESIGN.md §5).
+/// Zero-copy HTTP/1.1 request/response parser + body framing (docs/DESIGN.md §5).
 pub const h1 = @import("http/h1.zig");
+
+/// Chunked transfer-coding decoder (finds message ends; relays verbatim).
+pub const chunked = @import("http/chunked.zig");
 
 /// Static proxy configuration (docs/DESIGN.md §7).
 pub const config = @import("config.zig");
@@ -43,6 +46,7 @@ test {
     _ = io;
     _ = @import("net/listener.zig");
     _ = h1;
+    _ = chunked;
     _ = config;
     _ = @import("proxy/router.zig");
     _ = @import("proxy/balancer.zig");

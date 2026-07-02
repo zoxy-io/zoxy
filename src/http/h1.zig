@@ -142,6 +142,97 @@ fn findHeader(headers: []const Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
+// ---- message-body framing (RFC 9112 §6.3) ----------------------------------
+
+/// How a message body is delimited on the wire.
+pub const Framing = union(enum) {
+    /// No message body at all.
+    none,
+    /// Exactly this many body bytes follow the head.
+    content_length: u64,
+    /// Chunked transfer coding; find the end with `http/chunked.zig`.
+    chunked,
+    /// The body ends when the connection closes. Responses only — and
+    /// unframeable for connection reuse (forced close is the fallback).
+    until_close,
+};
+
+pub const FramingError = error{
+    /// Conflicting or unparseable framing headers — a smuggling vector.
+    /// Reject the message (400 for requests, 502 for responses).
+    InvalidFraming,
+};
+
+/// Body length of a request. Requests have no close-delimited form: absent
+/// framing headers mean no body.
+pub fn requestFraming(request: *const Request) FramingError!Framing {
+    const te = singleHeader(request.headers, "transfer-encoding") catch
+        return error.InvalidFraming;
+    const length = try contentLengthValue(request.headers);
+    // Both present is the classic TE/CL smuggling split; reject outright.
+    if (te != null and length != null) return error.InvalidFraming;
+    if (te) |value| {
+        if (!isChunkedOnly(value)) return error.InvalidFraming; // a coding we can't frame
+        return .chunked;
+    }
+    if (length) |n| {
+        if (n == 0) return .none;
+        return .{ .content_length = n };
+    }
+    return .none;
+}
+
+/// Body length of a response to `method`. Transfer-Encoding wins over
+/// Content-Length; exotic codings and absent framing fall back to
+/// close-delimited (safe, because the connection is then not reused).
+pub fn responseFraming(method: Method, response: *const Response) FramingError!Framing {
+    assert(response.status >= 100); // the parser rejects anything lower
+    if (method == .head) return .none;
+    if (response.status < 200) return .none; // 1xx interim: never has a body
+    if (response.status == 204 or response.status == 304) return .none;
+    if (method == .connect and response.status < 300) return .until_close; // tunnel
+    const te = singleHeader(response.headers, "transfer-encoding") catch return .until_close;
+    if (te) |value| {
+        if (!isChunkedOnly(value)) return .until_close; // a coding we can't frame
+        return .chunked;
+    }
+    if (try contentLengthValue(response.headers)) |n| {
+        if (n == 0) return .none;
+        return .{ .content_length = n };
+    }
+    return .until_close;
+}
+
+/// The value of `name` when it appears exactly once; duplicates are refused
+/// (for framing headers a duplicate is ambiguity an attacker can exploit).
+fn singleHeader(headers: []const Header, name: []const u8) error{Conflict}!?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, name)) continue;
+        if (found != null) return error.Conflict;
+        found = h.value;
+    }
+    return found;
+}
+
+/// Parse the Content-Length value: a single header, digits only.
+fn contentLengthValue(headers: []const Header) FramingError!?u64 {
+    const text = singleHeader(headers, "content-length") catch return error.InvalidFraming;
+    const value = text orelse return null;
+    if (value.len == 0 or value.len > 19) return error.InvalidFraming; // 19 digits < 2^64
+    for (value) |c| {
+        if (c < '0' or c > '9') return error.InvalidFraming;
+    }
+    const n = std.fmt.parseInt(u64, value, 10) catch return error.InvalidFraming;
+    return n;
+}
+
+/// True when the Transfer-Encoding value is exactly "chunked" — the only
+/// coding we can frame. Lists ("gzip, chunked") are not.
+fn isChunkedOnly(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "chunked");
+}
+
 const RequestLine = struct {
     method: Method,
     method_text: []const u8,
@@ -418,6 +509,82 @@ test "h1: rejects malformed and unsupported responses" {
         error.UnsupportedVersion,
         parseResponse("HTTP/2.0 200 OK\r\n\r\n", &headers),
     );
+}
+
+test "h1: request framing follows Content-Length and chunked" {
+    var headers: [8]Header = undefined;
+    const bare = (try parse("GET / HTTP/1.1\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(Framing.none, try requestFraming(&bare));
+
+    const sized = (try parse("POST / HTTP/1.1\r\nContent-Length: 12\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(Framing{ .content_length = 12 }, try requestFraming(&sized));
+
+    const chunked_request =
+        (try parse("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(Framing.chunked, try requestFraming(&chunked_request));
+}
+
+test "h1: request framing rejects smuggling-shaped headers" {
+    var headers: [8]Header = undefined;
+    // TE + CL together: the classic request-smuggling split.
+    const both = (try parse(
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n",
+        &headers,
+    )).complete;
+    try std.testing.expectError(error.InvalidFraming, requestFraming(&both));
+    // Duplicate Content-Length headers.
+    const duplicate = (try parse(
+        "POST / HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n",
+        &headers,
+    )).complete;
+    try std.testing.expectError(error.InvalidFraming, requestFraming(&duplicate));
+    // Non-numeric length and a coding we cannot frame.
+    const garbage =
+        (try parse("POST / HTTP/1.1\r\nContent-Length: 4x\r\n\r\n", &headers)).complete;
+    try std.testing.expectError(error.InvalidFraming, requestFraming(&garbage));
+    const gzip =
+        (try parse("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", &headers))
+            .complete;
+    try std.testing.expectError(error.InvalidFraming, requestFraming(&gzip));
+}
+
+test "h1: response framing per RFC 9112 section 6.3" {
+    var headers: [8]Header = undefined;
+    const sized = (try parseResponse(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+        &headers,
+    )).complete;
+    try std.testing.expectEqual(Framing{ .content_length = 5 }, try responseFraming(.get, &sized));
+    // HEAD: the head advertises a body that will not be sent.
+    try std.testing.expectEqual(Framing.none, try responseFraming(.head, &sized));
+
+    const chunked_response = (try parseResponse(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        &headers,
+    )).complete;
+    // Transfer-Encoding wins over Content-Length.
+    try std.testing.expectEqual(Framing.chunked, try responseFraming(.get, &chunked_response));
+
+    const no_body = (try parseResponse("HTTP/1.1 304\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(Framing.none, try responseFraming(.get, &no_body));
+
+    // No framing headers at all: close-delimited.
+    const bare = (try parseResponse("HTTP/1.1 200 OK\r\n\r\n", &headers)).complete;
+    try std.testing.expectEqual(Framing.until_close, try responseFraming(.get, &bare));
+
+    // A coding we cannot frame degrades to close-delimited, not an error.
+    const gzip = (try parseResponse(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+        &headers,
+    )).complete;
+    try std.testing.expectEqual(Framing.until_close, try responseFraming(.get, &gzip));
+
+    // Conflicting Content-Length is an error (502), not a guess.
+    const conflict = (try parseResponse(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n",
+        &headers,
+    )).complete;
+    try std.testing.expectError(error.InvalidFraming, responseFraming(.get, &conflict));
 }
 
 test "h1: rejects too many headers" {

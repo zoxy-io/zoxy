@@ -29,6 +29,13 @@ pub const clusters_max: usize = 64;
 /// Per-direction relay buffer for streaming request bodies and responses.
 pub const relay_buf_bytes: usize = 16 * 1024;
 
+/// Bounds inside the chunked transfer-coding decoder (http/chunked.zig):
+/// hex size digits (16 spans a full u64), extension bytes per chunk, and
+/// total trailer-section bytes. Beyond any of these the message is malformed.
+pub const chunk_size_digits_max: u8 = 16;
+pub const chunk_extension_bytes_max: u32 = 256;
+pub const trailer_bytes_max: u32 = 4096;
+
 /// Overall per-connection deadline. Backstops slow-loris clients and stalled
 /// relays: a connection that lives longer than this is torn down.
 pub const connection_timeout_ns: u63 = 30 * std.time.ns_per_s;
