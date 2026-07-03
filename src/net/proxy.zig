@@ -989,6 +989,9 @@ pub const ProxyServer = struct {
     access: *AccessLog,
     rr: RoundRobin,
     upstream_pool: UpstreamPool,
+    /// Which `Metrics.worker_accepted` slot this worker's accepts count
+    /// toward; set by the worker after init (tests leave the default).
+    worker_index: u32,
     request_timeout_ns: u63,
     idle_timeout_ns: u63,
     accept_completion: Completion,
@@ -1013,6 +1016,7 @@ pub const ProxyServer = struct {
             .access = access,
             .rr = .{},
             .upstream_pool = .{},
+            .worker_index = 0,
             .request_timeout_ns = request_timeout_ns,
             .idle_timeout_ns = idle_timeout_ns,
             .accept_completion = undefined,
@@ -1046,6 +1050,8 @@ pub const ProxyServer = struct {
     ) void {
         if (result) |fd| {
             assert(fd >= 0);
+            assert(server.worker_index < constants.workers_max);
+            server.metrics.worker_accepted[server.worker_index].add(1);
             server.io.set_tcp_no_delay(fd); // response heads are small writes too
             if (server.pool.acquire()) |conn| {
                 conn.start(

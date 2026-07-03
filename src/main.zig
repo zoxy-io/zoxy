@@ -110,6 +110,8 @@ fn runWorker(
         constants.request_timeout_ns,
         constants.idle_timeout_ns,
     );
+    // Workers beyond the metrics table share its last slot (diagnostic only).
+    server.worker_index = @intCast(@min(cpu, constants.workers_max - 1));
     server.start();
     while (true) {
         io.run_once() catch |err| return logWorkerError("io run", err);

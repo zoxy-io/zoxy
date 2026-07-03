@@ -54,6 +54,10 @@ pub const timeout_tick_ns: u63 = 1 * std.time.ns_per_s;
 /// Checkin beyond this closes the connection instead of keeping it.
 pub const upstream_idle_max: usize = 64;
 
+/// Worker slots in per-worker metrics (SO_REUSEPORT distribution). Workers
+/// beyond this share the last slot — the counters are diagnostic.
+pub const workers_max: usize = 64;
+
 /// Delay before re-arming accept after fd/resource exhaustion (EMFILE etc.).
 /// An immediate re-arm would fail again instantly and spin the worker at
 /// 100% CPU for as long as the condition persists.

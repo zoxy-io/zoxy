@@ -3,6 +3,7 @@
 //! and negligible contention on the hot path. Reserved at startup, never grows.
 
 const std = @import("std");
+const constants = @import("../constants.zig");
 
 /// A monotonic (or up/down, for gauges) atomic counter.
 pub const Counter = struct {
@@ -38,12 +39,28 @@ pub const Metrics = struct {
     upstream_retried: Counter = .{},
     bytes_to_upstream: Counter = .{},
     bytes_to_client: Counter = .{},
+    /// Downstream connections accepted, per worker: the kernel's
+    /// SO_REUSEPORT hash distribution made visible (imbalance here means
+    /// the busiest worker sets the throughput ceiling).
+    worker_accepted: [constants.workers_max]Counter = @splat(.{}),
 
-    /// Write a Prometheus-style text exposition of every counter.
+    /// Write a Prometheus-style text exposition of every counter. Array
+    /// fields become labeled series, one per non-zero slot.
     pub fn writeText(metrics: *const Metrics, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         inline for (@typeInfo(Metrics).@"struct".fields) |field| {
-            const counter: *const Counter = &@field(metrics, field.name);
-            try writer.print("zoxy_{s} {d}\n", .{ field.name, counter.load() });
+            if (comptime field.type == Counter) {
+                const counter: *const Counter = &@field(metrics, field.name);
+                try writer.print("zoxy_{s} {d}\n", .{ field.name, counter.load() });
+            } else {
+                for (&@field(metrics, field.name), 0..) |*counter, index| {
+                    const value = counter.load();
+                    if (value == 0) continue; // only workers that exist
+                    try writer.print(
+                        "zoxy_{s}{{worker=\"{d}\"}} {d}\n",
+                        .{ field.name, index, value },
+                    );
+                }
+            }
         }
     }
 };
@@ -68,4 +85,19 @@ test "metrics: writeText dumps every counter" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "zoxy_requests 7\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "zoxy_accepted 0\n") != null);
+}
+
+test "metrics: per-worker counters emit labeled series, zeros omitted" {
+    var m = Metrics{};
+    m.worker_accepted[0].add(3);
+    m.worker_accepted[5].add(9);
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try m.writeText(&w);
+    const out = w.buffered();
+    const series_0 = "zoxy_worker_accepted{worker=\"0\"} 3\n";
+    const series_5 = "zoxy_worker_accepted{worker=\"5\"} 9\n";
+    try std.testing.expect(std.mem.indexOf(u8, out, series_0) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, series_5) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "worker=\"1\"") == null); // zero: omitted
 }

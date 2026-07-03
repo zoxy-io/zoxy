@@ -9,12 +9,13 @@ const linux = std.os.linux;
 const posix = std.posix;
 const assert = std.debug.assert;
 
+const constants = @import("../constants.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const Ip4Address = std.Io.net.Ip4Address;
 
-/// Sized for every counter in `Metrics` (8 lines of ~40 bytes today); the
-/// comptime check in `serveOne` keeps this honest as counters are added.
-const body_bytes_max = 4096;
+/// Sized for every counter in `Metrics` plus one labeled series per worker
+/// slot; the comptime check in `serveOne` keeps this honest as counters grow.
+const body_bytes_max = 32 * 1024;
 const head_bytes_max = 256;
 const accept_backlog = 8;
 
@@ -89,7 +90,7 @@ pub const Admin = struct {
         var body_buf: [body_bytes_max]u8 = undefined;
         comptime { // every counter line must fit: name prefix + u64 digits + newline
             const fields = @typeInfo(Metrics).@"struct".fields;
-            assert(fields.len * 64 <= body_bytes_max);
+            assert((fields.len + constants.workers_max) * 64 <= body_bytes_max);
         }
         var body_writer = std.Io.Writer.fixed(&body_buf);
         admin.metrics.writeText(&body_writer) catch return;
