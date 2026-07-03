@@ -17,6 +17,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Keep frame pointers even in release builds: `perf record
+            // --call-graph fp` then works on the production binary, and the
+            // cost is a register we can spare. (DWARF unwinding needs
+            // permissions perf often lacks.)
+            .omit_frame_pointer = false,
             .imports = &.{
                 .{ .name = "zoxy", .module = mod },
             },
