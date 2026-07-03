@@ -199,6 +199,10 @@ fn run_iteration(seed: u64) !u64 {
     if (metrics.active.load() != 0) fail("metrics.active = {d} after drain", .{
         metrics.active.load(),
     });
+    // Resilience accounting must drain with the connections: a nonzero
+    // counter here is a leaked increment/decrement pair somewhere on the
+    // data path (the standing invariant for every Phase-2 slice).
+    if (!server.resilience.is_idle()) fail("resilience counters nonzero after drain", .{});
 
     var responses: u64 = 0;
     for (clients) |*client| responses += client.responses_ok;

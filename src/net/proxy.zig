@@ -41,6 +41,8 @@ const h1 = @import("../http/h1.zig");
 const config = @import("../config.zig");
 const Router = @import("../proxy/router.zig").Router;
 const RoundRobin = @import("../proxy/balancer.zig").RoundRobin;
+const resilience_mod = @import("../proxy/resilience.zig");
+const Resilience = resilience_mod.Resilience;
 const UpstreamPool = @import("../proxy/upstream_pool.zig").UpstreamPool;
 const Metrics = @import("../obs/metrics.zig").Metrics;
 const access_log = @import("../obs/access_log.zig");
@@ -185,6 +187,7 @@ pub const ProxyConn = struct {
     pool: *Pool,
     router: *const Router,
     round_robin: *RoundRobin,
+    resilience: *Resilience,
     upstream_pool: *UpstreamPool,
     metrics: *Metrics,
     access: *AccessLog,
@@ -228,6 +231,22 @@ pub const ProxyConn = struct {
     response_pipe_overflow: bool,
     /// Where the current upstream connection goes (pool key; retry target).
     endpoint_address: Ip4Address,
+    /// Resilience accounting keys for the current request (valid while the
+    /// matching flag below is set).
+    cluster_index: u32,
+    endpoint_index: u32,
+    /// The request was counted in `resilience.requests_active` (admission
+    /// happened); cleared by exactly one `settle_accounting`.
+    request_admitted: bool,
+    /// An attempt is counted in the endpoint's `in_flight`; cleared by
+    /// exactly one `close_attempt`.
+    attempt_open: bool,
+    /// A dial is counted in `pending_dials`; always settled by `on_connect`
+    /// (io_uring delivers a completion even for cancelled ops).
+    dial_pending: bool,
+    /// The upstream fd is counted in `connections_active`; cleared wherever
+    /// `upstream_fd` drops to -1.
+    upstream_accounted: bool,
     /// The upstream connection came from the pool (a stale close is possible).
     upstream_pooled: bool,
     /// Set at response-head time: framed HTTP/1.1 response without
@@ -292,6 +311,7 @@ pub const ProxyConn = struct {
         pool: *Pool,
         router: *const Router,
         round_robin: *RoundRobin,
+        resilience: *Resilience,
         upstream_pool: *UpstreamPool,
         metrics: *Metrics,
         access: *AccessLog,
@@ -304,6 +324,7 @@ pub const ProxyConn = struct {
         conn.pool = pool;
         conn.router = router;
         conn.round_robin = round_robin;
+        conn.resilience = resilience;
         conn.upstream_pool = upstream_pool;
         conn.metrics = metrics;
         conn.access = access;
@@ -371,6 +392,12 @@ pub const ProxyConn = struct {
         conn.request_pipe_overflow = false;
         conn.response_pipe_overflow = false;
         conn.endpoint_address = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 };
+        conn.cluster_index = 0;
+        conn.endpoint_index = 0;
+        conn.request_admitted = false;
+        conn.attempt_open = false;
+        conn.dial_pending = false;
+        conn.upstream_accounted = false;
         conn.upstream_pooled = false;
         conn.upstream_reusable = false;
         conn.upstream_retry_used = false;
@@ -386,6 +413,56 @@ pub const ProxyConn = struct {
         conn.log_target = "";
         conn.outcome = .aborted;
         conn.bytes_out = 0;
+    }
+
+    // ---- resilience accounting --------------------------------------------
+
+    /// An attempt on `endpoint_index` begins (first try or a replay).
+    fn open_attempt(conn: *ProxyConn, endpoint_index: u32) void {
+        assert(!conn.attempt_open); // the previous attempt was settled
+        assert(conn.request_admitted); // attempts only exist under a request
+        conn.endpoint_index = endpoint_index;
+        conn.attempt_open = true;
+        conn.resilience.attempt_start(conn.cluster_index, endpoint_index);
+    }
+
+    /// The open attempt ends with `outcome`; exactly once per attempt.
+    fn close_attempt(conn: *ProxyConn, outcome: resilience_mod.AttemptOutcome) void {
+        assert(conn.attempt_open);
+        conn.attempt_open = false;
+        conn.resilience.attempt_finish(conn.cluster_index, conn.endpoint_index, outcome);
+    }
+
+    /// Final accounting for the current request. Idempotent (flag-guarded):
+    /// `fail` settles and later triggers `teardown`, which settles again as
+    /// a no-op; a teardown with no request in flight is also a no-op.
+    fn settle_accounting(conn: *ProxyConn, outcome: resilience_mod.AttemptOutcome) void {
+        if (conn.attempt_open) conn.close_attempt(outcome);
+        if (conn.request_admitted) {
+            conn.request_admitted = false;
+            conn.resilience.request_finish(conn.cluster_index);
+        }
+        assert(!conn.attempt_open); // negative space: nothing left open
+        assert(!conn.request_admitted);
+    }
+
+    /// The upstream fd came into this connection's hands (fresh dial or pool
+    /// checkout): count it toward the cluster's connections.
+    fn account_upstream_open(conn: *ProxyConn) void {
+        assert(conn.upstream_fd >= 0);
+        assert(!conn.upstream_accounted); // the previous fd was dropped
+        conn.upstream_accounted = true;
+        conn.resilience.connection_open(conn.cluster_index);
+    }
+
+    /// The upstream fd is leaving (pooled, closed, or torn down): undo
+    /// `account_upstream_open` exactly once. Called wherever `upstream_fd`
+    /// drops to -1; a drop with nothing accounted is a no-op (teardown of a
+    /// connection that never dialed).
+    fn account_upstream_drop(conn: *ProxyConn) void {
+        if (!conn.upstream_accounted) return;
+        conn.upstream_accounted = false;
+        conn.resilience.connection_close(conn.cluster_index);
     }
 
     fn release_ref(conn: *ProxyConn) void {
@@ -412,6 +489,9 @@ pub const ProxyConn = struct {
         if (conn.closing) return;
         conn.closing = true;
         assert(conn.closing); // idempotent: a second call returns above
+        // Whatever was in flight ends here. Aborted, not failed: a client
+        // that vanished mid-exchange says nothing about the endpoint.
+        conn.settle_accounting(.aborted);
         // Cancel the ops that shutdown() cannot reach: the deadline timer (no fd)
         // and any in-flight connect (shutdown of a connecting socket is a no-op).
         // A cancel that matches nothing returns ENOENT — harmless.
@@ -446,6 +526,7 @@ pub const ProxyConn = struct {
                 conn.upstream_fd,
             );
             conn.upstream_fd = -1;
+            conn.account_upstream_drop();
         }
     }
 
@@ -532,7 +613,12 @@ pub const ProxyConn = struct {
         conn.downstream_keep_alive = keep_alive_requested(request, &connection);
         const cluster = conn.router.route(request.host(), request.target) orelse
             return conn.fail(response_404);
-        const endpoint = conn.round_robin.pick(cluster) orelse return conn.fail(response_503);
+        conn.cluster_index = @intCast(cluster.index);
+        conn.resilience.request_start(conn.cluster_index);
+        conn.request_admitted = true;
+        const endpoint_index = conn.round_robin.pick(cluster) orelse
+            return conn.fail(response_503);
+        const endpoint = &cluster.endpoints[endpoint_index];
         // Body bytes already buffered behind the head count toward the frame;
         // anything past the request's end (a pipelined next request) must not
         // reach the upstream.
@@ -545,9 +631,14 @@ pub const ProxyConn = struct {
         // pooled connection can then be retried without losing body bytes.
         conn.request_replayable = conn.request_framer.is_complete();
         conn.endpoint_address = endpoint.address;
+        // The attempt opens once the endpoint interaction begins — after the
+        // request-side 4xx rejections above, so a client error can never be
+        // settled against the endpoint.
+        conn.open_attempt(endpoint_index);
         if (conn.upstream_pool.checkout(endpoint.address)) |pooled_fd| {
             assert(pooled_fd >= 0);
             conn.upstream_fd = pooled_fd;
+            conn.account_upstream_open();
             conn.upstream_pooled = true;
             conn.metrics.upstream_reused.add(1);
             return conn.arm_prime(); // already connected: skip the dial
@@ -560,6 +651,9 @@ pub const ProxyConn = struct {
         conn.upstream_pooled = false;
         conn.upstream_fd = conn.io.open_tcp_socket() orelse return conn.fail(response_502);
         assert(conn.upstream_fd >= 0);
+        conn.account_upstream_open();
+        conn.dial_pending = true;
+        conn.resilience.dial_start(conn.cluster_index);
         conn.retain();
         conn.io.connect(
             *ProxyConn,
@@ -573,6 +667,11 @@ pub const ProxyConn = struct {
 
     fn on_connect(conn: *ProxyConn, _: *Completion, result: io_mod.ConnectError!void) void {
         defer conn.release_ref();
+        // The dial settles before the closing check: a cancelled connect
+        // still delivers its completion, and this is its only settle point.
+        assert(conn.dial_pending);
+        conn.dial_pending = false;
+        conn.resilience.dial_finish(conn.cluster_index);
         if (conn.closing) return;
         result catch return conn.fail(response_502);
         assert(conn.upstream_fd >= 0);
@@ -593,6 +692,9 @@ pub const ProxyConn = struct {
         if (!retryable) return conn.fail(response_502);
         conn.upstream_retry_used = true;
         conn.metrics.upstream_retried.add(1);
+        // A stale keep-alive close is pool churn, not an endpoint-health
+        // signal; the replay below opens a fresh attempt on the same endpoint.
+        conn.close_attempt(.failure_stale_pool);
         // Drop the dead fd; its prime/recv ops have already completed.
         conn.io.shutdown_socket(conn.upstream_fd);
         conn.upstream_close_pending = true;
@@ -605,6 +707,7 @@ pub const ProxyConn = struct {
             conn.upstream_fd,
         );
         conn.upstream_fd = -1;
+        conn.account_upstream_drop();
         // Replay: rewind the prime cursor and dial the same endpoint fresh.
         // (response_pipe state may still hold the previous request's leftovers; it is
         // reset when the relay starts — no response byte arrived for *this*
@@ -612,6 +715,7 @@ pub const ProxyConn = struct {
         assert(!conn.response_bytes_received);
         conn.prime_segment_index = 0;
         conn.prime_sent = 0;
+        conn.open_attempt(conn.endpoint_index);
         conn.connect_upstream();
     }
 
@@ -858,6 +962,7 @@ pub const ProxyConn = struct {
     /// the slot.
     fn response_complete(conn: *ProxyConn) void {
         assert(conn.outcome == .proxied); // only a relayed response completes
+        conn.settle_accounting(.success);
         conn.maybe_pool_upstream();
         if (!conn.can_reuse_downstream()) return conn.teardown();
         conn.finish_request();
@@ -880,6 +985,7 @@ pub const ProxyConn = struct {
         // fully forwarded before this point.
         conn.upstream_pool.checkin(conn.io, conn.endpoint_address, conn.upstream_fd);
         conn.upstream_fd = -1;
+        conn.account_upstream_drop(); // idle pooled fds are not cluster connections
     }
 
     /// Downstream reuse requires: keep-alive client + framed response
@@ -922,6 +1028,7 @@ pub const ProxyConn = struct {
                 conn.upstream_fd,
             );
             conn.upstream_fd = -1;
+            conn.account_upstream_drop();
         }
         assert(conn.request_end <= conn.head_filled);
         const excess = conn.head_filled - conn.request_end;
@@ -952,6 +1059,10 @@ pub const ProxyConn = struct {
     fn fail(conn: *ProxyConn, response: []const u8) void {
         assert(conn.downstream_fd >= 0);
         assert(response.len > 12); // "HTTP/1.1 XXX": status class read at index 9
+        // An attempt can only be open here for an upstream fault (client
+        // errors fail before `open_attempt`), so `failure` is an honest
+        // endpoint-health signal.
+        conn.settle_accounting(.failure);
         conn.outcome = outcome_for(response);
         // Status class is the first digit of the code at index 9 ("HTTP/1.1 X").
         if (response[9] == '4') {
@@ -998,6 +1109,7 @@ pub const ProxyServer = struct {
     metrics: *Metrics,
     access: *AccessLog,
     round_robin: RoundRobin,
+    resilience: Resilience,
     upstream_pool: UpstreamPool,
     /// Which `Metrics.worker_accepted` slot this worker's accepts count
     /// toward; set by the worker after init (tests leave the default).
@@ -1025,6 +1137,7 @@ pub const ProxyServer = struct {
             .metrics = metrics,
             .access = access,
             .round_robin = .{},
+            .resilience = .{},
             .upstream_pool = .{},
             .worker_index = 0,
             .request_timeout_ns = request_timeout_ns,
@@ -1069,6 +1182,7 @@ pub const ProxyServer = struct {
                     server.pool,
                     server.router,
                     &server.round_robin,
+                    &server.resilience,
                     &server.upstream_pool,
                     server.metrics,
                     server.access,
@@ -1381,6 +1495,8 @@ test "proxy: forwards a request to an upstream and relays the response" {
         @as(u64, origin.request_len),
         metrics.bytes_to_upstream.load(),
     );
+    // Resilience accounting drains with the connection.
+    try std.testing.expect(server.resilience.is_idle());
 }
 
 test "proxy: strips hop-by-hop headers from the forwarded request" {
@@ -2151,6 +2267,9 @@ test "proxy: retries a stale pooled upstream on a fresh connection" {
 
     _ = linux.close(client);
     while (pool.free_count != pool.capacity) try io.run_once();
+    // The replay opened a second attempt on the same endpoint; both attempts
+    // and the request itself must be settled.
+    try std.testing.expect(server.resilience.is_idle());
 }
 
 test "proxy: does not reuse the connection for an HTTP/1.0 client" {
@@ -2397,6 +2516,8 @@ test "proxy: answers 502 when the upstream response is unparseable" {
     try io.run_until_done(&c.done);
     try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 502 "));
     while (pool.free_count != pool.capacity) try io.run_once();
+    // The failed attempt (an upstream fault, mid-flight) must be settled.
+    try std.testing.expect(server.resilience.is_idle());
 }
 
 test "proxy: relays a response larger than the relay buffer with bounded memory" {
@@ -2530,6 +2651,8 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
     try std.testing.expectEqual(pool.capacity - 1, pool.free_count);
     // ...and the deadline must reclaim it; without the timer this would hang.
     while (pool.free_count != pool.capacity) try io.run_once();
+    // Teardown before routing: nothing was ever counted, nothing leaks.
+    try std.testing.expect(server.resilience.is_idle());
 }
 
 test "proxy: an idle keep-alive connection is reclaimed by the idle timeout" {

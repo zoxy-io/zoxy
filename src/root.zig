@@ -27,6 +27,9 @@ pub const Router = @import("proxy/router.zig").Router;
 /// Round-robin load balancing.
 pub const RoundRobin = @import("proxy/balancer.zig").RoundRobin;
 
+/// Per-worker resilience state: LB/breaker/outlier/retry accounting (§7 Phase 2).
+pub const resilience = @import("proxy/resilience.zig");
+
 /// Per-worker idle upstream connection pool.
 pub const UpstreamPool = @import("proxy/upstream_pool.zig").UpstreamPool;
 
@@ -54,6 +57,7 @@ test {
     _ = config;
     _ = @import("proxy/router.zig");
     _ = @import("proxy/balancer.zig");
+    _ = resilience;
     _ = @import("proxy/upstream_pool.zig");
     _ = @import("net/pool.zig");
     _ = proxy;

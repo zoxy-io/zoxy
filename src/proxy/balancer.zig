@@ -9,24 +9,24 @@ const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 const config = @import("../config.zig");
 const Cluster = config.Cluster;
-const Endpoint = config.Endpoint;
 
 pub const RoundRobin = struct {
     /// One rotation counter per cluster, indexed by `Cluster.index`
     /// (reserved statically; `config.parse` enforces `clusters_max`).
     next: [constants.clusters_max]usize = @splat(0),
 
-    /// Pick the next endpoint, cycling through the cluster. Null if the cluster
-    /// has no endpoints.
-    pub fn pick(round_robin: *RoundRobin, cluster: *const Cluster) ?*const Endpoint {
+    /// Pick the next endpoint's index, cycling through the cluster. Null if
+    /// the cluster has no endpoints. An index (not a pointer) so callers can
+    /// key the per-endpoint resilience state with the same value.
+    pub fn pick(round_robin: *RoundRobin, cluster: *const Cluster) ?u32 {
         if (cluster.endpoints.len == 0) return null;
         assert(cluster.endpoints.len > 0); // negative space: handled above
         assert(cluster.index < constants.clusters_max); // enforced by config.parse
         const counter = &round_robin.next[cluster.index];
-        const index = counter.* % cluster.endpoints.len;
+        const index: u32 = @intCast(counter.* % cluster.endpoints.len);
         assert(index < cluster.endpoints.len);
         counter.* +%= 1;
-        return &cluster.endpoints[index];
+        return index;
     }
 };
 
@@ -48,7 +48,8 @@ test "balancer: round-robin cycles endpoints" {
     var round_robin: RoundRobin = .{};
     const ports = [_]u16{ 1, 2, 3, 1, 2 };
     for (ports) |expected| {
-        try std.testing.expectEqual(expected, round_robin.pick(cluster).?.address.port);
+        const index = round_robin.pick(cluster).?;
+        try std.testing.expectEqual(expected, cluster.endpoints[index].address.port);
     }
 }
 
@@ -77,7 +78,8 @@ test "balancer: clusters rotate independently under interleaved traffic" {
         .{ .cluster = a, .port = 1 }, .{ .cluster = b, .port = 3 },
     };
     for (expected) |pick| {
-        try std.testing.expectEqual(pick.port, round_robin.pick(pick.cluster).?.address.port);
+        const index = round_robin.pick(pick.cluster).?;
+        try std.testing.expectEqual(pick.port, pick.cluster.endpoints[index].address.port);
     }
 }
 
