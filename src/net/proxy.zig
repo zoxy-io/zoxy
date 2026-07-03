@@ -62,6 +62,8 @@ const response_501 = "HTTP/1.1 501 Not Implemented\r\n" ++
 const response_502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const response_503 = "HTTP/1.1 503 Service Unavailable\r\n" ++
     "Content-Length: 0\r\nConnection: close\r\n\r\n";
+const response_504 = "HTTP/1.1 504 Gateway Timeout\r\n" ++
+    "Content-Length: 0\r\nConnection: close\r\n\r\n";
 const response_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\n" ++
     "Content-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -208,6 +210,17 @@ pub const ProxyConn = struct {
     /// transitions just move it; the single ticking timer enforces it.
     deadline_ns: u64,
     timeout_armed: bool,
+    /// Absolute per-attempt deadline (connect through first response byte);
+    /// 0 = inactive. Armed only for replayable requests (`arm_try_deadline`),
+    /// enforced by the same ticking timer, subordinate to `deadline_ns`.
+    try_deadline_ns: u64,
+    /// The per-try deadline passed: the attempt's in-flight upstream op has
+    /// been killed and must drain through `attempt_drained`.
+    attempt_dead: bool,
+    /// A cancel targeting `connect_completion` is in flight; never submit a
+    /// second one — a stale cancel could kill a later attempt's connect on
+    /// the reused completion.
+    try_connect_cancel_pending: bool,
 
     head_buf: [constants.read_buf_bytes]u8,
     head_filled: usize,
@@ -307,6 +320,10 @@ pub const ProxyConn = struct {
     timeout_completion: Completion,
     timeout_cancel_completion: Completion,
     connect_cancel_completion: Completion,
+    /// The per-try abort's connect cancel. Teardown owns
+    /// `connect_cancel_completion` unconditionally; sharing would risk a
+    /// double submit when a teardown lands during an aborting attempt.
+    try_connect_cancel_completion: Completion,
 
     request_pipe: Pipe,
     response_pipe: Pipe,
@@ -346,6 +363,7 @@ pub const ProxyConn = struct {
         conn.timeout_armed = false;
         conn.head_filled = 0;
         conn.upstream_close_pending = false;
+        conn.try_connect_cancel_pending = false;
         conn.reset_request_state();
         conn.request_active = true; // a fresh connection owes us a request
         metrics.accepted.add(1);
@@ -365,10 +383,14 @@ pub const ProxyConn = struct {
     fn arm_timeout(conn: *ProxyConn) void {
         assert(!conn.timeout_armed);
         const now = conn.io.now_ns();
-        // Sleep to the deadline, but at most one tick: if the deadline moves
-        // closer meanwhile (request phase -> idle phase), enforcement is late
-        // by at most the tick.
-        const remaining = if (conn.deadline_ns > now) conn.deadline_ns - now else 1;
+        // Sleep to the nearest deadline (overall or per-try), but at most one
+        // tick: if a deadline moves closer meanwhile (request phase -> idle
+        // phase, a per-try arming), enforcement is late by at most the tick.
+        var target_ns = conn.deadline_ns;
+        if (conn.try_deadline_ns != 0 and conn.try_deadline_ns < target_ns) {
+            target_ns = conn.try_deadline_ns;
+        }
+        const remaining = if (target_ns > now) target_ns - now else 1;
         const sleep_ns: u63 = @intCast(@min(remaining, constants.timeout_tick_ns));
         assert(sleep_ns > 0);
         conn.retain();
@@ -380,8 +402,10 @@ pub const ProxyConn = struct {
         defer conn.release_ref();
         conn.timeout_armed = false;
         if (conn.closing) return; // fired late / we cancelled it
-        if (conn.io.now_ns() >= conn.deadline_ns) return conn.teardown(); // deadline exceeded
-        conn.arm_timeout(); // still time left (or the deadline moved); keep watching
+        const now = conn.io.now_ns();
+        if (now >= conn.deadline_ns) return conn.teardown(); // the overall deadline is supreme
+        if (conn.try_deadline_ns != 0 and now >= conn.try_deadline_ns) conn.abort_attempt();
+        conn.arm_timeout(); // still time left (or a deadline moved); keep watching
     }
 
     fn retain(conn: *ProxyConn) void {
@@ -410,6 +434,8 @@ pub const ProxyConn = struct {
         conn.upstream_pooled = false;
         conn.upstream_reusable = false;
         conn.upstream_retry_used = false;
+        conn.try_deadline_ns = 0;
+        conn.attempt_dead = false;
         conn.request_replayable = false;
         conn.response_bytes_received = false;
         conn.request_active = false;
@@ -435,10 +461,13 @@ pub const ProxyConn = struct {
         conn.resilience.attempt_start(conn.cluster_index, endpoint_index);
     }
 
-    /// The open attempt ends with `outcome`; exactly once per attempt.
+    /// The open attempt ends with `outcome`; exactly once per attempt. Also
+    /// disarms the per-try deadline — a settled attempt must never be
+    /// aborted by a stale timer tick.
     fn close_attempt(conn: *ProxyConn, outcome: resilience_mod.AttemptOutcome) void {
         assert(conn.attempt_open);
         conn.attempt_open = false;
+        conn.try_deadline_ns = 0;
         conn.resilience.attempt_finish(conn.cluster_index, conn.endpoint_index, outcome);
     }
 
@@ -654,6 +683,7 @@ pub const ProxyConn = struct {
         // request-side 4xx rejections above, so a client error can never be
         // settled against the endpoint.
         conn.open_attempt(endpoint_index);
+        conn.arm_try_deadline();
         if (conn.upstream_pool.checkout(endpoint.address)) |pooled_fd| {
             assert(pooled_fd >= 0);
             conn.upstream_fd = pooled_fd;
@@ -699,9 +729,75 @@ pub const ProxyConn = struct {
         conn.dial_pending = false;
         conn.resilience.dial_finish(conn.cluster_index);
         if (conn.closing) return;
+        // Cancelled (or raced to completion) by a per-try abort: drain.
+        if (conn.attempt_dead) return conn.attempt_drained();
         result catch return conn.fail(response_502);
         assert(conn.upstream_fd >= 0);
         conn.arm_prime();
+    }
+
+    // ---- per-try timeout ----------------------------------------------------
+
+    /// Arm the per-attempt deadline. Only for replayable requests: in that
+    /// window the attempt owns exactly one in-flight upstream op at a time
+    /// (connect, prime send, or response-head recv — never a relay pipe),
+    /// so an abort drains deterministically. Streaming requests run under
+    /// the overall deadline alone (a documented simplification).
+    fn arm_try_deadline(conn: *ProxyConn) void {
+        assert(conn.attempt_open);
+        assert(!conn.attempt_dead);
+        conn.try_deadline_ns = 0;
+        if (conn.policy.per_try_timeout_ns == 0) return;
+        if (!conn.request_replayable) return;
+        conn.try_deadline_ns = conn.io.now_ns() + conn.policy.per_try_timeout_ns;
+    }
+
+    /// The per-try deadline passed. Kill the attempt's single in-flight
+    /// upstream op and let its completion drain through `attempt_drained`.
+    /// Never `fail` from here: the in-flight op may own `aux_completion` (a
+    /// prime send), which `fail` would resubmit while it sits in the ring.
+    fn abort_attempt(conn: *ProxyConn) void {
+        assert(!conn.closing);
+        assert(conn.attempt_open);
+        assert(conn.request_replayable); // arm_try_deadline's clean window
+        assert(!conn.attempt_dead);
+        conn.try_deadline_ns = 0;
+        conn.attempt_dead = true;
+        conn.metrics.per_try_timeouts.add(1);
+        if (conn.dial_pending) {
+            // shutdown() cannot reach a connecting socket; cancel the op.
+            if (!conn.try_connect_cancel_pending) {
+                conn.try_connect_cancel_pending = true;
+                conn.retain();
+                conn.io.cancel(
+                    *ProxyConn,
+                    conn,
+                    on_try_connect_cancel,
+                    &conn.try_connect_cancel_completion,
+                    &conn.connect_completion,
+                );
+            }
+            return;
+        }
+        // A prime send or response-head recv is in flight: shutdown forces
+        // it to complete; its callback sees `attempt_dead` and drains.
+        assert(conn.upstream_fd >= 0);
+        conn.io.shutdown_socket(conn.upstream_fd);
+    }
+
+    fn on_try_connect_cancel(conn: *ProxyConn, _: *Completion, _: io_mod.CancelError!void) void {
+        conn.try_connect_cancel_pending = false;
+        conn.release_ref();
+    }
+
+    /// The aborted attempt's in-flight op has drained: the connection is
+    /// quiescent (`aux_completion` free, nothing pending upstream) and can
+    /// answer the client honestly.
+    fn attempt_drained(conn: *ProxyConn) void {
+        assert(conn.attempt_dead);
+        assert(!conn.closing);
+        conn.attempt_dead = false;
+        conn.fail(response_504);
     }
 
     /// The upstream connection died before the response head completed. For
@@ -742,6 +838,7 @@ pub const ProxyConn = struct {
         conn.prime_segment_index = 0;
         conn.prime_sent = 0;
         conn.open_attempt(conn.endpoint_index);
+        conn.arm_try_deadline(); // the replay is a fresh attempt with a fresh budget
         conn.connect_upstream();
     }
 
@@ -812,6 +909,9 @@ pub const ProxyConn = struct {
     fn on_prime_sent(conn: *ProxyConn, _: *Completion, result: io_mod.SendError!usize) void {
         defer conn.release_ref();
         if (conn.closing) return;
+        // Killed by a per-try abort (the shutdown errored this send — or the
+        // send won the race; either way the attempt is dead): drain.
+        if (conn.attempt_dead) return conn.attempt_drained();
         const m = result catch return conn.upstream_failed();
         // The primed head is upstream traffic too — without this, a GET-only
         // workload reports zero bytes_to_upstream (only the relay pipe counts).
@@ -880,9 +980,12 @@ pub const ProxyConn = struct {
     ) void {
         defer conn.release_ref();
         if (conn.closing) return;
+        // Killed by a per-try abort: drain (any raced-in bytes are moot).
+        if (conn.attempt_dead) return conn.attempt_drained();
         const n = result catch return conn.upstream_failed();
         if (n == 0) return conn.upstream_failed(); // upstream closed without a response
         conn.response_bytes_received = true;
+        conn.try_deadline_ns = 0; // the attempt reached its first response byte
         conn.response_pipe.filled += n;
         assert(conn.response_pipe.filled <= conn.response_pipe.buf.len);
         const parsed = h1.parse_response(
@@ -1271,6 +1374,7 @@ fn outcome_for(response: []const u8) access_log.Outcome {
     if (response.ptr == response_501.ptr) return .not_implemented;
     if (response.ptr == response_502.ptr) return .no_upstream;
     if (response.ptr == response_503.ptr) return .unavailable;
+    if (response.ptr == response_504.ptr) return .upstream_timeout;
     return .bad_version; // response_505
 }
 
@@ -2726,6 +2830,89 @@ test "proxy: circuit breaker rejects a dial beyond max_connections with 503" {
     try std.testing.expect(std.mem.startsWith(u8, second.buf[0..second.len], "HTTP/1.1 503 "));
     try std.testing.expectEqual(@as(u64, 1), metrics.breaker_dials_rejected.load());
     try std.testing.expectEqual(@as(u64, 0), metrics.breaker_requests_rejected.load());
+
+    while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: per-try timeout answers 504 while the overall deadline still runs" {
+    const gpa = std.testing.allocator;
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    // The origin accepts and reads but never responds (the needle never
+    // arrives) — a wedged upstream, the per-try timeout's reason to exist.
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .respond_after = "NEVER-SENT",
+    };
+    origin.start();
+
+    // per-try (1s, the validation floor) well under the overall deadline
+    // (10s): the client must get a 504, not a silent 10s teardown.
+    var json_buf: [384]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"],
+        \\     "per_try_timeout_ms": 1000 }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        10 * std.time.ns_per_s,
+        10 * std.time.ns_per_s,
+    );
+    defer server.deinit();
+    server.start();
+
+    const client = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(client);
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 504 "));
+    try std.testing.expectEqual(@as(u64, 1), metrics.per_try_timeouts.load());
 
     while (pool.free_count != pool.capacity) try io.run_once();
     try std.testing.expect(server.resilience.is_idle());

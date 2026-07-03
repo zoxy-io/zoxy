@@ -82,13 +82,27 @@ pub const Faults = struct {
     /// A connect completes with ECONNREFUSED even though the listener
     /// exists — a transiently unreachable upstream.
     connect_refuse_ppm: u32 = 0,
+    /// A connect black-holes (a dropped SYN): nothing happens until the
+    /// virtual TCP handshake timeout, then it completes with ETIMEDOUT —
+    /// unless a cancel reaps it first (the per-try-timeout path).
+    connect_blackhole_ppm: u32 = 0,
 };
+
+/// How long a black-holed connect hangs before ETIMEDOUT (virtual time) —
+/// the kernel's SYN-retry give-up, far beyond any sane per-try timeout.
+pub const connect_blackhole_timeout_ns: u64 = 60 * std.time.ns_per_s;
 
 const Operation = union(enum) {
     accept: struct { socket: posix.socket_t },
     recv: struct { socket: posix.socket_t, buffer: []u8 },
     send: struct { socket: posix.socket_t, buffer: []const u8 },
-    connect: struct { socket: posix.socket_t, addr: linux.sockaddr.in },
+    connect: struct {
+        socket: posix.socket_t,
+        addr: linux.sockaddr.in,
+        /// Nonzero for a black-holed connect: not ready before this instant,
+        /// then fails ETIMEDOUT (decided once, at submit).
+        hung_until_ns: u64 = 0,
+    },
     close: struct { fd: posix.fd_t },
     timeout: struct { expires_at_ns: u64 },
     cancel: struct { target: u64 },
@@ -320,8 +334,12 @@ pub const IO = struct {
         socket: posix.socket_t,
         addr: linux.sockaddr.in,
     ) void {
+        const hung_until_ns: u64 = if (io.roll(io.faults.connect_blackhole_ppm))
+            io.now + connect_blackhole_timeout_ns
+        else
+            0;
         io.submit(Context, context, ConnectError!void, callback, completion, .{
-            .connect = .{ .socket = socket, .addr = addr },
+            .connect = .{ .socket = socket, .addr = addr, .hung_until_ns = hung_until_ns },
         });
     }
 
@@ -440,14 +458,14 @@ pub const IO = struct {
         var earliest: ?u64 = null;
         var current = io.pending.head;
         while (current) |completion| : (current = completion.next) {
-            switch (completion.operation) {
-                .timeout => |op| {
-                    if (earliest == null or op.expires_at_ns < earliest.?) {
-                        earliest = op.expires_at_ns;
-                    }
-                },
-                else => {},
-            }
+            const expires_at_ns: u64 = switch (completion.operation) {
+                .timeout => |op| op.expires_at_ns,
+                // A black-holed connect is a de-facto timer: the clock must
+                // be able to reach its ETIMEDOUT (or nothing else may wake).
+                .connect => |op| if (op.hung_until_ns != 0) op.hung_until_ns else continue,
+                else => continue,
+            };
+            if (earliest == null or expires_at_ns < earliest.?) earliest = expires_at_ns;
         }
         return earliest;
     }
@@ -472,7 +490,7 @@ pub const IO = struct {
                 const peer = io.socket_at(socket.peer_fd);
                 return peer.buffer_len < peer.buffer.len; // room to make progress
             },
-            .connect => return true,
+            .connect => |op| return io.now >= op.hung_until_ns,
             .close => return true,
             .timeout => |op| return io.now >= op.expires_at_ns,
             .cancel => return true,
@@ -491,6 +509,8 @@ pub const IO = struct {
                 return io.perform_send(op.socket, op.buffer);
             },
             .connect => |op| {
+                // A black-holed connect ran out its virtual SYN retries.
+                if (op.hung_until_ns != 0) return -@as(i32, @intFromEnum(linux.E.TIMEDOUT));
                 if (io.roll(io.faults.connect_refuse_ppm)) {
                     return -@as(i32, @intFromEnum(linux.E.CONNREFUSED));
                 }

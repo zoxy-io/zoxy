@@ -37,6 +37,8 @@ pub const Metrics = struct {
     upstream_reused: Counter = .{},
     /// Stale pooled connections replaced by a fresh dial mid-request.
     upstream_retried: Counter = .{},
+    /// Upstream attempts aborted by their cluster's per-try timeout.
+    per_try_timeouts: Counter = .{},
     /// Requests rejected by a cluster circuit breaker (max_requests).
     breaker_requests_rejected: Counter = .{},
     /// Upstream dials rejected by a cluster circuit breaker (max_pending or

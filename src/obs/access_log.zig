@@ -18,6 +18,7 @@ pub const Outcome = enum {
     not_implemented,
     no_upstream,
     unavailable,
+    upstream_timeout,
     aborted,
 
     pub fn text(outcome: Outcome) []const u8 {
@@ -30,6 +31,7 @@ pub const Outcome = enum {
             .not_implemented => "501",
             .no_upstream => "502",
             .unavailable => "503",
+            .upstream_timeout => "504",
             .aborted => "aborted",
         };
     }

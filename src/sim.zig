@@ -129,12 +129,18 @@ fn run_iteration(seed: u64) !u64 {
     var workload = Workload{ .prng = std.Random.DefaultPrng.init(seed +% 0x9E3779B97F4A7C15) };
     io.faults = workload.fault_profile();
 
+    // per_try_timeout (2s virtual, under the 5s request timeout) puts the
+    // attempt-abort/drain machinery under every seed's schedule: black-holed
+    // connects get cancelled, stalled attempts answer 504 instead of hanging
+    // to the overall deadline.
     var cfg = try config_mod.parse(arena,
         \\{ "listen": "127.0.0.1:8080",
         \\  "routes": [ { "path_prefix": "/a", "cluster": "one" }, { "cluster": "two" } ],
         \\  "clusters": [
-        \\    { "name": "one", "endpoints": ["127.0.0.1:9001", "127.0.0.1:9002"] },
-        \\    { "name": "two", "endpoints": ["127.0.0.1:9003"] }
+        \\    { "name": "one", "endpoints": ["127.0.0.1:9001", "127.0.0.1:9002"],
+        \\      "per_try_timeout_ms": 2000 },
+        \\    { "name": "two", "endpoints": ["127.0.0.1:9003"],
+        \\      "per_try_timeout_ms": 2000 }
         \\  ] }
     );
     const router = Router.init(&cfg);
@@ -249,12 +255,14 @@ const Workload = struct {
     prng: std.Random.DefaultPrng,
 
     /// Half the iterations are fault-free (keeps the traffic-flow invariant
-    /// meaningful); the rest see RST drizzle, an RST storm, or refusals.
+    /// meaningful); the rest see RST drizzle, an RST storm + refusals, or
+    /// black-holed connects (which exercise the per-try abort/cancel path).
     fn fault_profile(workload: *Workload) test_io.Faults {
-        return switch (workload.prng.random().intRangeLessThan(u32, 0, 4)) {
-            0, 1 => .{},
-            2 => .{ .reset_ppm = 2_000, .connect_refuse_ppm = 5_000 },
-            3 => .{ .reset_ppm = 30_000, .connect_refuse_ppm = 30_000 },
+        return switch (workload.prng.random().intRangeLessThan(u32, 0, 6)) {
+            0, 1, 2 => .{},
+            3 => .{ .reset_ppm = 2_000, .connect_refuse_ppm = 5_000 },
+            4 => .{ .reset_ppm = 30_000, .connect_refuse_ppm = 30_000 },
+            5 => .{ .reset_ppm = 2_000, .connect_blackhole_ppm = 30_000 },
             else => unreachable,
         };
     }
