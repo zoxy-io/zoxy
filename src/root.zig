@@ -24,8 +24,8 @@ pub const config = @import("config.zig");
 /// Request routing (host/path -> cluster).
 pub const Router = @import("proxy/router.zig").Router;
 
-/// Round-robin load balancing.
-pub const RoundRobin = @import("proxy/balancer.zig").RoundRobin;
+/// P2C least-request load balancing.
+pub const balancer = @import("proxy/balancer.zig");
 
 /// Per-worker resilience state: LB/breaker/outlier/retry accounting (§7 Phase 2).
 pub const resilience = @import("proxy/resilience.zig");
@@ -56,7 +56,7 @@ test {
     _ = chunked;
     _ = config;
     _ = @import("proxy/router.zig");
-    _ = @import("proxy/balancer.zig");
+    _ = balancer;
     _ = resilience;
     _ = @import("proxy/upstream_pool.zig");
     _ = @import("net/pool.zig");

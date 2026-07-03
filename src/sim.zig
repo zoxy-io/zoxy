@@ -163,6 +163,9 @@ fn run_iteration(seed: u64) !u64 {
         5 * std.time.ns_per_s, // request timeout (virtual time)
         10 * std.time.ns_per_s, // idle timeout (virtual time)
     );
+    // The balancer's PRNG derives from the iteration seed: same seed, same
+    // P2C draws, same schedule — determinism end to end.
+    server.prng = .init(seed +% 0x853C49E6748FEA9B);
     server.start();
 
     const clients = try arena.alloc(Client, clients_max);

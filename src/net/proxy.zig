@@ -40,7 +40,7 @@ const Listener = @import("listener.zig").Listener;
 const h1 = @import("../http/h1.zig");
 const config = @import("../config.zig");
 const Router = @import("../proxy/router.zig").Router;
-const RoundRobin = @import("../proxy/balancer.zig").RoundRobin;
+const balancer = @import("../proxy/balancer.zig");
 const resilience_mod = @import("../proxy/resilience.zig");
 const Resilience = resilience_mod.Resilience;
 const UpstreamPool = @import("../proxy/upstream_pool.zig").UpstreamPool;
@@ -186,11 +186,12 @@ pub const ProxyConn = struct {
     io: *IO,
     pool: *Pool,
     router: *const Router,
-    round_robin: *RoundRobin,
     resilience: *Resilience,
     upstream_pool: *UpstreamPool,
     metrics: *Metrics,
     access: *AccessLog,
+    /// The worker's PRNG (P2C draws, retry jitter). Never re-seeded here.
+    random: std.Random,
 
     downstream_fd: posix.socket_t,
     upstream_fd: posix.socket_t,
@@ -310,11 +311,11 @@ pub const ProxyConn = struct {
         io: *IO,
         pool: *Pool,
         router: *const Router,
-        round_robin: *RoundRobin,
         resilience: *Resilience,
         upstream_pool: *UpstreamPool,
         metrics: *Metrics,
         access: *AccessLog,
+        random: std.Random,
         downstream_fd: posix.socket_t,
         request_timeout_ns: u63,
         idle_timeout_ns: u63,
@@ -323,9 +324,9 @@ pub const ProxyConn = struct {
         conn.io = io;
         conn.pool = pool;
         conn.router = router;
-        conn.round_robin = round_robin;
         conn.resilience = resilience;
         conn.upstream_pool = upstream_pool;
+        conn.random = random;
         conn.metrics = metrics;
         conn.access = access;
         conn.downstream_fd = downstream_fd;
@@ -616,8 +617,13 @@ pub const ProxyConn = struct {
         conn.cluster_index = @intCast(cluster.index);
         conn.resilience.request_start(conn.cluster_index);
         conn.request_admitted = true;
-        const endpoint_index = conn.round_robin.pick(cluster) orelse
-            return conn.fail(response_503);
+        const endpoint_index = balancer.pick_least_request(
+            cluster,
+            conn.resilience.cluster_state(conn.cluster_index),
+            conn.random,
+            conn.io.now_ns(),
+            null,
+        ) orelse return conn.fail(response_503);
         const endpoint = &cluster.endpoints[endpoint_index];
         // Body bytes already buffered behind the head count toward the frame;
         // anything past the request's end (a pipelined next request) must not
@@ -1108,9 +1114,13 @@ pub const ProxyServer = struct {
     router: *const Router,
     metrics: *Metrics,
     access: *AccessLog,
-    round_robin: RoundRobin,
     resilience: Resilience,
     upstream_pool: UpstreamPool,
+    /// Per-worker PRNG for P2C draws and retry jitter. Tests keep the
+    /// deterministic default; `main.zig` seeds each worker from startup
+    /// entropy, `sim.zig` from the iteration seed (post-init, like
+    /// `worker_index`).
+    prng: std.Random.DefaultPrng,
     /// Which `Metrics.worker_accepted` slot this worker's accepts count
     /// toward; set by the worker after init (tests leave the default).
     worker_index: u32,
@@ -1136,9 +1146,9 @@ pub const ProxyServer = struct {
             .router = router,
             .metrics = metrics,
             .access = access,
-            .round_robin = .{},
             .resilience = .{},
             .upstream_pool = .{},
+            .prng = .init(0),
             .worker_index = 0,
             .request_timeout_ns = request_timeout_ns,
             .idle_timeout_ns = idle_timeout_ns,
@@ -1181,11 +1191,11 @@ pub const ProxyServer = struct {
                     server.io,
                     server.pool,
                     server.router,
-                    &server.round_robin,
                     &server.resilience,
                     &server.upstream_pool,
                     server.metrics,
                     server.access,
+                    server.prng.random(),
                     fd,
                     server.request_timeout_ns,
                     server.idle_timeout_ns,

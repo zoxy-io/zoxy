@@ -50,12 +50,18 @@ pub fn main(init: std.process.Init) !void {
     const pools = try gpa.alloc(Pool, worker_count);
     for (pools) |*pool| pool.* = try Pool.init(gpa, constants.connections_max);
 
+    // One entropy draw seeds every worker's PRNG (P2C draws, retry jitter);
+    // each worker offsets it by its cpu index so no two draw alike.
+    var seed_bytes: [8]u8 = undefined;
+    init.io.random(&seed_bytes);
+    const seed_base = std.mem.readInt(u64, &seed_bytes, .little);
+
     const threads = try gpa.alloc(std.Thread, worker_count);
     for (threads, pools, accesses, 0..) |*thread, *pool, *access, cpu| {
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
-            .{ cfg.listen, pool, &router, &metrics, access, cpu },
+            .{ cfg.listen, pool, &router, &metrics, access, seed_base, cpu },
         );
     }
 
@@ -87,6 +93,7 @@ fn run_worker(
     router: *const Router,
     metrics: *Metrics,
     access: *AccessLog,
+    seed_base: u64,
     cpu: usize,
 ) void {
     assert(pool.capacity > 0);
@@ -112,6 +119,7 @@ fn run_worker(
     );
     // Workers beyond the metrics table share its last slot (diagnostic only).
     server.worker_index = @intCast(@min(cpu, constants.workers_max - 1));
+    server.prng = .init(seed_base +% cpu);
     server.start();
     while (true) {
         io.run_once() catch |err| return log_worker_error("io run", err);
