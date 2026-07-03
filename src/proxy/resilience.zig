@@ -15,6 +15,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
+const config = @import("../config.zig");
+const ResiliencePolicy = config.ResiliencePolicy;
 
 /// How an attempt ended. `failure` is an endpoint-health signal (feeds
 /// outlier detection); `failure_stale_pool` (a parked keep-alive connection
@@ -75,6 +77,35 @@ pub const Resilience = struct {
     ) *EndpointState {
         assert(endpoint_index < constants.endpoints_per_cluster_max); // enforced by config.parse
         return &resilience.cluster_state(cluster_index).endpoints[endpoint_index];
+    }
+
+    /// Circuit-breaker admission for a new request (`max_requests`). An
+    /// unconfigured limit is `limit_none` and never trips.
+    pub fn admit_request(
+        resilience: *Resilience,
+        cluster_index: u32,
+        policy: *const ResiliencePolicy,
+    ) bool {
+        assert(policy.max_requests > 0); // zero limits are rejected at parse
+        const cluster = resilience.cluster_state(cluster_index);
+        return cluster.requests_active < policy.max_requests;
+    }
+
+    /// Circuit-breaker admission for a fresh upstream dial (`max_pending`
+    /// on concurrent connects, `max_connections` on held sockets). Pooled
+    /// checkouts bypass this: they consume no dial, and idle pooled fds are
+    /// bounded separately by `upstream_idle_max` (a documented delta from
+    /// Envoy, which attributes pool slots to the cluster).
+    pub fn admit_dial(
+        resilience: *Resilience,
+        cluster_index: u32,
+        policy: *const ResiliencePolicy,
+    ) bool {
+        assert(policy.max_pending > 0); // zero limits are rejected at parse
+        assert(policy.max_connections > 0);
+        const cluster = resilience.cluster_state(cluster_index);
+        if (cluster.pending_dials >= policy.max_pending) return false;
+        return cluster.connections_active < policy.max_connections;
     }
 
     pub fn request_start(resilience: *Resilience, cluster_index: u32) void {
@@ -185,6 +216,32 @@ test "resilience: a retried request stacks attempts on the same request" {
     resilience.attempt_finish(0, 0, .success);
     resilience.request_finish(0);
     try std.testing.expect(resilience.is_idle());
+}
+
+test "resilience: admission gates trip at their limits and never below" {
+    var resilience = Resilience{};
+    const unbounded = ResiliencePolicy{};
+    const tight = ResiliencePolicy{ .max_requests = 2, .max_pending = 1, .max_connections = 2 };
+
+    // Unconfigured limits (limit_none) never trip.
+    resilience.request_start(0);
+    resilience.dial_start(0);
+    resilience.connection_open(0);
+    try std.testing.expect(resilience.admit_request(0, &unbounded));
+    try std.testing.expect(resilience.admit_dial(0, &unbounded));
+
+    // requests_active = 1 < 2 admits; = 2 rejects.
+    try std.testing.expect(resilience.admit_request(0, &tight));
+    resilience.request_start(0);
+    try std.testing.expect(!resilience.admit_request(0, &tight));
+
+    // pending_dials = 1 trips max_pending = 1.
+    try std.testing.expect(!resilience.admit_dial(0, &tight));
+    resilience.dial_finish(0);
+    // connections_active = 1 < 2 admits; = 2 rejects.
+    try std.testing.expect(resilience.admit_dial(0, &tight));
+    resilience.connection_open(0);
+    try std.testing.expect(!resilience.admit_dial(0, &tight));
 }
 
 test "resilience: endpoints start healthy and un-ejected" {

@@ -65,6 +65,10 @@ const response_503 = "HTTP/1.1 503 Service Unavailable\r\n" ++
 const response_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\n" ++
     "Content-Length: 0\r\nConnection: close\r\n\r\n";
 
+/// Placeholder for `ProxyConn.policy` between requests; every feature off,
+/// every limit unbounded — it is never gated on outside a routed request.
+const policy_default = config.ResiliencePolicy{};
+
 /// Terminates the upstream-bound head after the hop-by-hop headers are
 /// stripped. Nothing is injected in their place: an HTTP/1.1 upstream
 /// defaults to keep-alive, which is what the connection pool wants; the
@@ -236,6 +240,9 @@ pub const ProxyConn = struct {
     /// matching flag below is set).
     cluster_index: u32,
     endpoint_index: u32,
+    /// The routed cluster's resilience policy (into the immutable Config;
+    /// `&policy_default` between requests).
+    policy: *const config.ResiliencePolicy,
     /// The request was counted in `resilience.requests_active` (admission
     /// happened); cleared by exactly one `settle_accounting`.
     request_admitted: bool,
@@ -395,6 +402,7 @@ pub const ProxyConn = struct {
         conn.endpoint_address = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 };
         conn.cluster_index = 0;
         conn.endpoint_index = 0;
+        conn.policy = &policy_default;
         conn.request_admitted = false;
         conn.attempt_open = false;
         conn.dial_pending = false;
@@ -615,6 +623,11 @@ pub const ProxyConn = struct {
         const cluster = conn.router.route(request.host(), request.target) orelse
             return conn.fail(response_404);
         conn.cluster_index = @intCast(cluster.index);
+        conn.policy = &cluster.policy;
+        if (!conn.resilience.admit_request(conn.cluster_index, conn.policy)) {
+            conn.metrics.breaker_requests_rejected.add(1);
+            return conn.fail(response_503);
+        }
         conn.resilience.request_start(conn.cluster_index);
         conn.request_admitted = true;
         const endpoint_index = balancer.pick_least_request(
@@ -655,6 +668,13 @@ pub const ProxyConn = struct {
     fn connect_upstream(conn: *ProxyConn) void {
         assert(conn.upstream_fd < 0);
         conn.upstream_pooled = false;
+        if (!conn.resilience.admit_dial(conn.cluster_index, conn.policy)) {
+            conn.metrics.breaker_dials_rejected.add(1);
+            // The endpoint never saw this attempt — a breaker rejection is
+            // load shedding, not an endpoint-health signal.
+            conn.close_attempt(.aborted);
+            return conn.fail(response_503);
+        }
         conn.upstream_fd = conn.io.open_tcp_socket() orelse return conn.fail(response_502);
         assert(conn.upstream_fd >= 0);
         conn.account_upstream_open();
@@ -2527,6 +2547,187 @@ test "proxy: answers 502 when the upstream response is unparseable" {
     try std.testing.expect(std.mem.startsWith(u8, c.buf[0..c.len], "HTTP/1.1 502 "));
     while (pool.free_count != pool.capacity) try io.run_once();
     // The failed attempt (an upstream fault, mid-flight) must be settled.
+    try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: circuit breaker rejects a request beyond max_requests with 503" {
+    const gpa = std.testing.allocator;
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    // The origin never answers (the needle never arrives), so the first
+    // request stays in flight and holds requests_active at 1.
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .respond_after = "NEVER-SENT",
+    };
+    origin.start();
+
+    var json_buf: [384]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"],
+        \\     "circuit_breaker": {{ "max_requests": 1 }} }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    const short_timeout: u63 = 250 * std.time.ns_per_ms; // reclaims the held request
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        short_timeout,
+        short_timeout,
+    );
+    defer server.deinit();
+    server.start();
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+
+    // First request is admitted and parks in flight at the silent origin.
+    const first_fd = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(first_fd);
+    var first = Client{ .io = &io, .fd = first_fd };
+    first.go();
+    while (server.resilience.clusters[0].requests_active != 1) try io.run_once();
+
+    // The second trips the breaker: rejected at admission, before any dial.
+    const second_fd = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(second_fd);
+    var second = Client{ .io = &io, .fd = second_fd };
+    second.go();
+    try io.run_until_done(&second.done);
+    try std.testing.expect(std.mem.startsWith(u8, second.buf[0..second.len], "HTTP/1.1 503 "));
+    try std.testing.expectEqual(@as(u64, 1), metrics.breaker_requests_rejected.load());
+    try std.testing.expectEqual(@as(u64, 0), metrics.breaker_dials_rejected.load());
+
+    // The deadline reclaims the held request; every counter drains.
+    while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: circuit breaker rejects a dial beyond max_connections with 503" {
+    const gpa = std.testing.allocator;
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .respond_after = "NEVER-SENT",
+    };
+    origin.start();
+
+    var json_buf: [384]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"],
+        \\     "circuit_breaker": {{ "max_connections": 1 }} }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    const short_timeout: u63 = 250 * std.time.ns_per_ms;
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        short_timeout,
+        short_timeout,
+    );
+    defer server.deinit();
+    server.start();
+
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+
+    // The first request holds its upstream connection (connections_active = 1).
+    const first_fd = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(first_fd);
+    var first = Client{ .io = &io, .fd = first_fd };
+    first.go();
+    while (server.resilience.clusters[0].connections_active != 1) try io.run_once();
+
+    // The second is admitted (no max_requests) but its dial is rejected.
+    const second_fd = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(second_fd);
+    var second = Client{ .io = &io, .fd = second_fd };
+    second.go();
+    try io.run_until_done(&second.done);
+    try std.testing.expect(std.mem.startsWith(u8, second.buf[0..second.len], "HTTP/1.1 503 "));
+    try std.testing.expectEqual(@as(u64, 1), metrics.breaker_dials_rejected.load());
+    try std.testing.expectEqual(@as(u64, 0), metrics.breaker_requests_rejected.load());
+
+    while (pool.free_count != pool.capacity) try io.run_once();
     try std.testing.expect(server.resilience.is_idle());
 }
 
