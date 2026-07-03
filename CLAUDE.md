@@ -87,14 +87,16 @@ Consequences that bite if you forget them:
 | `src/io/linux.zig` | `IO` + `Completion` over `std.os.linux.IoUring`; ops: accept/recv/send/connect/close/timeout/cancel, plus sync seam helpers (now_ns, open_tcp_socket, shutdown_socket, close_now) |
 | `src/io/test_io.zig` | deterministic simulation backend: virtual sockets/clock, seeded scheduler, adversarial partial IO; selected when the root file declares `zoxy_io = .simulation` |
 | `src/sim.zig` | the simulator: real data path + misbehaving virtual origins/clients, per-seed invariants (no deadlock, no leaks, every response parses + frames) |
-| `src/net/proxy.zig` | **the data path**: `ProxyConn` (recv head→parse→route→pool checkout or connect→framed relay→reuse or teardown), `Pipe` (one framed relay direction), `ProxyServer`, hop-by-hop header handling both ways, fixed 4xx/5xx responses, stale-pooled-upstream retry, integration + zero-alloc gate tests |
+| `src/net/proxy.zig` | **the data path**: `ProxyConn` (recv head→parse→route→pool checkout or connect→framed relay→reuse or teardown), `Pipe` (one framed relay direction), `ProxyServer`, hop-by-hop header handling both ways, fixed 4xx/5xx responses, per-try timeout via attempt-abort/drain, two-tier retries (free stale-pool replay + budgeted jittered-backoff retries), integration + zero-alloc gate tests |
 | `src/net/listener.zig` | `SO_REUSEPORT` TCP listener via raw linux syscalls (REUSEADDR+REUSEPORT set before bind) |
 | `src/net/pool.zig` | generic `Pool(T)` over an **intrusive free list** (requires `T.free_next: ?*T`); exhaustion rejects, never grows |
 | `src/http/h1.zig` | zero-copy HTTP/1.1 request+response parsers, RFC 9112 §6.3 body-framing decisions (smuggling shapes rejected), `BodyFramer` message-end tracker |
 | `src/http/chunked.zig` | incremental chunked-coding decoder — finds message ends, transforms nothing |
 | `src/proxy/upstream_pool.zig` | per-worker idle upstream connections, fixed slots keyed by endpoint |
-| `src/config.zig` | JSON config → immutable `Config` (owns an arena); the **only** place allocation is expected |
-| `src/proxy/router.zig`, `src/proxy/balancer.zig` | first-match host/path routing; round-robin |
+| `src/config.zig` | JSON config → immutable `Config` (owns an arena); the **only** place allocation is expected. Per-cluster resilience blocks resolve into a `ResiliencePolicy` here (ms→ns, validated) |
+| `src/proxy/router.zig`, `src/proxy/balancer.zig` | first-match host/path routing; P2C least-request balancing over per-worker in-flight counts, fail-open when no endpoint is available |
+| `src/proxy/resilience.zig` | per-worker mutable resilience state (Phase 2): request/attempt/dial/connection accounting, circuit-breaker admission, retry budget, passive outlier ejection — the narrow API the data path calls at fixed points; the sim asserts every counter drains to zero |
+| `src/proxy/health_check.zig` | active TCP-connect health probes, per worker, in-ring: one ticking scheduler, bounded probe slots, streak thresholds flip `EndpointState.healthy` |
 | `src/obs/metrics.zig`, `src/obs/access_log.zig` | atomic counters; fixed-buffer batched access log |
 | `src/mem/guard.zig` | `CountingAllocator` — the zero-alloc acceptance gate (baseline count == final count) |
 | `src/constants.zig` | **every static limit** (connections_max, buffer sizes, ring depth, timeouts, pool sizes). Sizing the proxy = choosing these; total memory is a function of them. |

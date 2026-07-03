@@ -355,10 +355,47 @@ and the single-ticking-timer deadline design that avoids cancel/re-arm races.
   rates as the direct keep-alive baseline up to ~90k req/s saturation, and
   the zero-alloc gate still holds.
 
-### Phase 2 — Resilience
+### Phase 2 — Resilience (done)
 - P2C weighted-least-request LB; active health checks + passive outlier
   detection; circuit breaking (max conns/pending/requests); retries with
   fully-jittered exponential backoff + retry budget; per-try timeout.
+
+Shipped 2026-07. All mutable state lives in one per-worker table
+(`resilience.zig`: per-cluster/per-endpoint counters behind a narrow
+admission/outcome API — the §1.5 "filter seam" in callback-I/O form); policy
+is resolved into the arena `Config` at parse (per-cluster `retry`,
+`circuit_breaker`, `outlier`, `health_check`, `per_try_timeout_ms` blocks;
+absent block = off). The per-try timeout rides the existing single ticking
+timer and aborts an attempt by killing its single in-flight op and draining
+through the op's own completion (`fail`/retry only after the drain — the op
+may own the completion `fail` would reuse). Retries generalize the Phase-1
+stale-pool replay: that replay stays free (same endpoint, no budget — pool
+churn is not a health signal); configured retries settle the attempt as a
+real failure, charge an Envoy-style budget (percent of active requests with
+a floor, plus a max_retries breaker), back off with full jitter on their own
+one-shot timer, and re-pick via P2C excluding the failed endpoint. The
+simulator gained black-holed connects, a `never_respond` origin, and a
+standing invariant that every resilience counter drains to zero.
+
+Measured (zrk, loopback, 60k req/s constant, 64 connections, 2026-07): the
+happy path costs ~nothing — one PRNG draw and a handful of per-worker
+counter bumps per request. Proxied p50 across runs 243µs–1.7ms vs the
+pre-Phase-2 build's 355µs–3.0ms on the same box back-to-back (run-to-run
+variance dominates; no regression signal), 60k sustained, zero errors,
+99.99% pool hit rate. 5000+ sim seeds green with every resilience feature
+enabled.
+
+Deliberate deltas from Envoy (simplicity first, revisit on evidence):
+per-worker limits and budgets (share-nothing — cluster-wide = value x
+workers); endpoints start healthy (a restarting proxy serves immediately);
+zero available endpoints fails open and routes anyway (no 50% panic
+threshold); idle pooled fds are excluded from max_connections (bounded
+separately by `upstream_idle_max`); per-try timeout arms only for replayable
+requests (streaming requests run under the overall deadline alone).
+Deferred: peak-EWMA weighting and config endpoint weights (least-request
+self-adapts; cross-multiply hook documented in balancer.zig), retry-on-5xx
+(needs response-head re-buffering analysis), HTTP health probes (TCP connect
+catches the dominant failures), ejection-time multipliers.
 
 ### Phase 3 — Protocol depth
 - TLS termination (OpenSSL FFI: SNI cert select + ALPN), then upstream
@@ -412,9 +449,10 @@ src/
   proxy/
     router.zig        host/path → cluster (StaticStringMap / bounded map)
     cluster.zig       cluster + endpoint tables
-    balancer.zig      RR → P2C EWMA
+    balancer.zig      P2C least-request (EWMA deferred)
     upstream_pool.zig per-worker/cluster H1 connection pool
-    resilience.zig    health checks, outlier detection, circuit breaker, retries
+    resilience.zig    per-worker state: outlier detection, circuit breaker, retry budget
+    health_check.zig  active TCP-connect probes, per worker, in-ring
   obs/
     metrics.zig       fixed counter/gauge/histogram registry
     access_log.zig    ring → flusher thread
