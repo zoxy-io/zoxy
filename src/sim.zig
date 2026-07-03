@@ -138,9 +138,11 @@ fn run_iteration(seed: u64) !u64 {
         \\  "routes": [ { "path_prefix": "/a", "cluster": "one" }, { "cluster": "two" } ],
         \\  "clusters": [
         \\    { "name": "one", "endpoints": ["127.0.0.1:9001", "127.0.0.1:9002"],
-        \\      "per_try_timeout_ms": 2000 },
+        \\      "per_try_timeout_ms": 2000,
+        \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 } },
         \\    { "name": "two", "endpoints": ["127.0.0.1:9003"],
-        \\      "per_try_timeout_ms": 2000 }
+        \\      "per_try_timeout_ms": 2000,
+        \\      "retry": { "max": 2, "backoff_base_ms": 50, "backoff_cap_ms": 400 } }
         \\  ] }
     );
     const router = Router.init(&cfg);
@@ -303,6 +305,10 @@ const Origin = struct {
         garbage,
         premature_close,
         linger_then_stale_close,
+        /// Read the request, never answer — a wedged upstream. The proxy's
+        /// per-try timeout must abort the attempt and retry elsewhere (or
+        /// answer 504); the overall deadline must never be the one to fire.
+        never_respond,
     };
 
     fn start(origin: *Origin) void {
@@ -412,6 +418,9 @@ const OriginConn = struct {
             ) catch unreachable,
             .garbage => "SPROING! NOT HTTP AT ALL\r\n\r\n",
             .premature_close => return conn.shutdown(),
+            // Keep reading so the proxy's abort (shutdown) is noticed and
+            // the fd is released; no response ever leaves.
+            .never_respond => return conn.arm_recv(),
         };
         conn.sent = 0;
         conn.arm_send();
@@ -447,7 +456,7 @@ const OriginConn = struct {
                     2 * std.time.ns_per_s,
                 );
             },
-            .premature_close => unreachable, // responded above
+            .premature_close, .never_respond => unreachable, // never send a response
         }
     }
 

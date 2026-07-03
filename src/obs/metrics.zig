@@ -39,6 +39,11 @@ pub const Metrics = struct {
     upstream_retried: Counter = .{},
     /// Upstream attempts aborted by their cluster's per-try timeout.
     per_try_timeouts: Counter = .{},
+    /// Configured retries scheduled (excludes the free stale-pool replay,
+    /// which `upstream_retried` counts).
+    retry_attempts: Counter = .{},
+    /// Retries denied by the retry budget or the max_retries breaker.
+    retry_budget_exhausted: Counter = .{},
     /// Requests rejected by a cluster circuit breaker (max_requests).
     breaker_requests_rejected: Counter = .{},
     /// Upstream dials rejected by a cluster circuit breaker (max_pending or

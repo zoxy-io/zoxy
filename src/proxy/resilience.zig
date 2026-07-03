@@ -108,6 +108,38 @@ pub const Resilience = struct {
         return cluster.connections_active < policy.max_connections;
     }
 
+    /// Retry admission: the Envoy-style budget (retries may run up to
+    /// `budget_percent` of active requests, with a `budget_min` floor so a
+    /// quiet cluster can still retry) and the `max_retries` breaker limit.
+    pub fn admit_retry(
+        resilience: *Resilience,
+        cluster_index: u32,
+        policy: *const ResiliencePolicy,
+    ) bool {
+        assert(policy.retry_budget_percent > 0); // zero percent is rejected at parse
+        assert(policy.retry_budget_percent <= 100);
+        const cluster = resilience.cluster_state(cluster_index);
+        if (cluster.retries_active >= policy.max_retries) return false;
+        const budget = @max(
+            @as(u64, policy.retry_budget_min),
+            @as(u64, cluster.requests_active) * policy.retry_budget_percent / 100,
+        );
+        return cluster.retries_active < budget;
+    }
+
+    pub fn retry_start(resilience: *Resilience, cluster_index: u32) void {
+        const cluster = resilience.cluster_state(cluster_index);
+        cluster.retries_active += 1;
+        // At most one scheduled retry per request, one request per slot.
+        assert(cluster.retries_active <= constants.connections_max);
+    }
+
+    pub fn retry_finish(resilience: *Resilience, cluster_index: u32) void {
+        const cluster = resilience.cluster_state(cluster_index);
+        assert(cluster.retries_active > 0); // finish never precedes start
+        cluster.retries_active -= 1;
+    }
+
     pub fn request_start(resilience: *Resilience, cluster_index: u32) void {
         const cluster = resilience.cluster_state(cluster_index);
         cluster.requests_active += 1;
@@ -242,6 +274,29 @@ test "resilience: admission gates trip at their limits and never below" {
     try std.testing.expect(resilience.admit_dial(0, &tight));
     resilience.connection_open(0);
     try std.testing.expect(!resilience.admit_dial(0, &tight));
+}
+
+test "resilience: retry budget scales with active requests above its floor" {
+    var resilience = Resilience{};
+    const policy = ResiliencePolicy{ .retry_budget_percent = 20, .retry_budget_min = 2 };
+
+    // Quiet cluster: the floor (2) admits the first two retries.
+    try std.testing.expect(resilience.admit_retry(0, &policy));
+    resilience.retry_start(0);
+    try std.testing.expect(resilience.admit_retry(0, &policy));
+    resilience.retry_start(0);
+    try std.testing.expect(!resilience.admit_retry(0, &policy)); // floor reached
+
+    // 20 active requests raise the budget to 4.
+    for (0..20) |_| resilience.request_start(0);
+    try std.testing.expect(resilience.admit_retry(0, &policy));
+    resilience.retry_start(0);
+    resilience.retry_start(0);
+    try std.testing.expect(!resilience.admit_retry(0, &policy)); // 4 of 4 in flight
+
+    // The max_retries breaker caps below the budget when configured tighter.
+    const tight = ResiliencePolicy{ .retry_budget_min = 100, .max_retries = 4 };
+    try std.testing.expect(!resilience.admit_retry(0, &tight));
 }
 
 test "resilience: endpoints start healthy and un-ejected" {

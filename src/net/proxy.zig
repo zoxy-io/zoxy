@@ -71,6 +71,17 @@ const response_505 = "HTTP/1.1 505 HTTP Version Not Supported\r\n" ++
 /// every limit unbounded — it is never gated on outside a routed request.
 const policy_default = config.ResiliencePolicy{};
 
+/// Why an upstream attempt died before its response head completed.
+/// Everything here happens strictly before any byte reaches the client, so
+/// the request may be replayed when the safety conditions hold.
+const AttemptFailure = enum {
+    connect_error,
+    send_error,
+    recv_error,
+    upstream_eof,
+    per_try_timeout,
+};
+
 /// Terminates the upstream-bound head after the hop-by-hop headers are
 /// stripped. Nothing is injected in their place: an HTTP/1.1 upstream
 /// defaults to keep-alive, which is what the connection pool wants; the
@@ -256,6 +267,18 @@ pub const ProxyConn = struct {
     /// The routed cluster's resilience policy (into the immutable Config;
     /// `&policy_default` between requests).
     policy: *const config.ResiliencePolicy,
+    /// The routed cluster (into the immutable Config; a retry re-picks its
+    /// endpoint from here). Null between requests.
+    cluster: ?*const config.Cluster,
+    /// Configured retries spent on this request (tier 2; the free stale-pool
+    /// replay does not count). Bounded by `policy.retry_max`.
+    attempts_used: u8,
+    /// A retry is owed once its gates clear (`maybe_start_retry`).
+    retry_scheduled: bool,
+    /// The backoff timer is in flight on `retry_timeout_completion`.
+    retry_pending: bool,
+    /// This request holds a charge in the cluster's `retries_active`.
+    retry_charged: bool,
     /// The request was counted in `resilience.requests_active` (admission
     /// happened); cleared by exactly one `settle_accounting`.
     request_admitted: bool,
@@ -324,6 +347,11 @@ pub const ProxyConn = struct {
     /// `connect_cancel_completion` unconditionally; sharing would risk a
     /// double submit when a teardown lands during an aborting attempt.
     try_connect_cancel_completion: Completion,
+    /// Retry backoff timer (`retry_pending` guards it) and teardown's cancel
+    /// of it — its own pair: the ticking deadline timer must keep running
+    /// through a backoff wait.
+    retry_timeout_completion: Completion,
+    retry_cancel_completion: Completion,
 
     request_pipe: Pipe,
     response_pipe: Pipe,
@@ -427,6 +455,11 @@ pub const ProxyConn = struct {
         conn.cluster_index = 0;
         conn.endpoint_index = 0;
         conn.policy = &policy_default;
+        conn.cluster = null;
+        conn.attempts_used = 0;
+        conn.retry_scheduled = false;
+        conn.retry_pending = false;
+        conn.retry_charged = false;
         conn.request_admitted = false;
         conn.attempt_open = false;
         conn.dial_pending = false;
@@ -469,6 +502,8 @@ pub const ProxyConn = struct {
         conn.attempt_open = false;
         conn.try_deadline_ns = 0;
         conn.resilience.attempt_finish(conn.cluster_index, conn.endpoint_index, outcome);
+        // A settling retry attempt returns its budget charge.
+        conn.release_retry_charge();
     }
 
     /// Final accounting for the current request. Idempotent (flag-guarded):
@@ -476,12 +511,28 @@ pub const ProxyConn = struct {
     /// a no-op; a teardown with no request in flight is also a no-op.
     fn settle_accounting(conn: *ProxyConn, outcome: resilience_mod.AttemptOutcome) void {
         if (conn.attempt_open) conn.close_attempt(outcome);
+        // Covers a teardown mid-backoff, when the charge has no open attempt.
+        conn.release_retry_charge();
         if (conn.request_admitted) {
             conn.request_admitted = false;
             conn.resilience.request_finish(conn.cluster_index);
         }
         assert(!conn.attempt_open); // negative space: nothing left open
         assert(!conn.request_admitted);
+    }
+
+    /// Count a scheduled retry against the cluster's retry budget; released
+    /// when the retried attempt settles (or the connection does).
+    fn charge_retry(conn: *ProxyConn) void {
+        assert(!conn.retry_charged); // the previous charge was released
+        conn.retry_charged = true;
+        conn.resilience.retry_start(conn.cluster_index);
+    }
+
+    fn release_retry_charge(conn: *ProxyConn) void {
+        if (!conn.retry_charged) return;
+        conn.retry_charged = false;
+        conn.resilience.retry_finish(conn.cluster_index);
     }
 
     /// The upstream fd came into this connection's hands (fresh dial or pool
@@ -536,6 +587,11 @@ pub const ProxyConn = struct {
         if (conn.timeout_armed) {
             conn.timeout_armed = false;
             conn.cancel_op(&conn.timeout_cancel_completion, &conn.timeout_completion);
+        }
+        // A backoff wait must not pin the slot for its full delay.
+        if (conn.retry_pending) {
+            conn.retry_pending = false;
+            conn.cancel_op(&conn.retry_cancel_completion, &conn.retry_timeout_completion);
         }
         conn.cancel_op(&conn.connect_cancel_completion, &conn.connect_completion);
         // Closing an fd does NOT cancel a recv/send already pending on it in
@@ -653,6 +709,7 @@ pub const ProxyConn = struct {
             return conn.fail(response_404);
         conn.cluster_index = @intCast(cluster.index);
         conn.policy = &cluster.policy;
+        conn.cluster = cluster;
         if (!conn.resilience.admit_request(conn.cluster_index, conn.policy)) {
             conn.metrics.breaker_requests_rejected.add(1);
             return conn.fail(response_503);
@@ -684,7 +741,15 @@ pub const ProxyConn = struct {
         // settled against the endpoint.
         conn.open_attempt(endpoint_index);
         conn.arm_try_deadline();
-        if (conn.upstream_pool.checkout(endpoint.address)) |pooled_fd| {
+        conn.begin_attempt();
+    }
+
+    /// Open the upstream side of the current attempt: a pooled connection
+    /// when one is parked for the endpoint, else a fresh dial.
+    fn begin_attempt(conn: *ProxyConn) void {
+        assert(conn.attempt_open);
+        assert(conn.upstream_fd < 0);
+        if (conn.upstream_pool.checkout(conn.endpoint_address)) |pooled_fd| {
             assert(pooled_fd >= 0);
             conn.upstream_fd = pooled_fd;
             conn.account_upstream_open();
@@ -731,7 +796,7 @@ pub const ProxyConn = struct {
         if (conn.closing) return;
         // Cancelled (or raced to completion) by a per-try abort: drain.
         if (conn.attempt_dead) return conn.attempt_drained();
-        result catch return conn.fail(response_502);
+        result catch return conn.attempt_failed(.connect_error);
         assert(conn.upstream_fd >= 0);
         conn.arm_prime();
     }
@@ -787,37 +852,137 @@ pub const ProxyConn = struct {
 
     fn on_try_connect_cancel(conn: *ProxyConn, _: *Completion, _: io_mod.CancelError!void) void {
         conn.try_connect_cancel_pending = false;
+        if (!conn.closing) conn.maybe_start_retry(); // a retry may be gated on this cancel
         conn.release_ref();
     }
 
     /// The aborted attempt's in-flight op has drained: the connection is
-    /// quiescent (`aux_completion` free, nothing pending upstream) and can
-    /// answer the client honestly.
+    /// quiescent (`aux_completion` free, nothing pending upstream) and the
+    /// failure can be handled honestly — retried or answered 504.
     fn attempt_drained(conn: *ProxyConn) void {
         assert(conn.attempt_dead);
         assert(!conn.closing);
         conn.attempt_dead = false;
-        conn.fail(response_504);
+        conn.attempt_failed(.per_try_timeout);
     }
 
-    /// The upstream connection died before the response head completed. For
-    /// a pooled connection that yielded no response byte this is the classic
-    /// stale keep-alive close — replay the request once on a fresh dial.
-    /// Anything else gets the client a clean 502 (nothing was forwarded
-    /// downstream yet).
-    fn upstream_failed(conn: *ProxyConn) void {
+    /// An upstream attempt died before the response head completed (nothing
+    /// was forwarded downstream yet). Three tiers: the built-in stale-pool
+    /// replay (same endpoint, immediate, free), a configured retry (new
+    /// endpoint pick, jittered backoff, budgeted), or a clean 502/504.
+    fn attempt_failed(conn: *ProxyConn, reason: AttemptFailure) void {
         assert(!conn.closing);
-        assert(conn.upstream_fd >= 0);
-        const retryable = conn.upstream_pooled and !conn.upstream_retry_used and
-            conn.request_replayable and !conn.response_bytes_received and
+        assert(conn.attempt_open);
+        const terminal = if (reason == .per_try_timeout) response_504 else response_502;
+        // Replay safety: the whole request must still sit in the prime
+        // segments and no response byte may have reached the client. The
+        // close-completion guard mirrors the Phase-1 rule (seed 1693): a
+        // previous close still in flight owns `close_upstream_completion`.
+        const replayable = conn.request_replayable and !conn.response_bytes_received and
             !conn.upstream_close_pending;
-        if (!retryable) return conn.fail(response_502);
-        conn.upstream_retry_used = true;
-        conn.metrics.upstream_retried.add(1);
-        // A stale keep-alive close is pool churn, not an endpoint-health
-        // signal; the replay below opens a fresh attempt on the same endpoint.
-        conn.close_attempt(.failure_stale_pool);
-        // Drop the dead fd; its prime/recv ops have already completed.
+        if (!replayable) return conn.fail(terminal);
+        // Tier 1 — a parked keep-alive connection the upstream closed under
+        // us: normal pool churn, not an endpoint-health signal. Replay once,
+        // same endpoint, no backoff, no budget charge. (A per-try timeout is
+        // a health signal, pooled or not — it takes the configured path.)
+        if (conn.upstream_pooled and !conn.upstream_retry_used and reason != .per_try_timeout) {
+            conn.upstream_retry_used = true;
+            conn.metrics.upstream_retried.add(1);
+            conn.close_attempt(.failure_stale_pool);
+            conn.dispose_upstream();
+            conn.prime_segment_index = 0;
+            conn.prime_sent = 0;
+            conn.open_attempt(conn.endpoint_index);
+            conn.arm_try_deadline(); // the replay is a fresh attempt with a fresh budget
+            return conn.connect_upstream(); // deliberately fresh: never a pooled sibling
+        }
+        // Tier 2 — configured retries, gated by the retry budget and the
+        // max_retries breaker.
+        if (conn.attempts_used < conn.policy.retry_max) {
+            if (conn.resilience.admit_retry(conn.cluster_index, conn.policy)) {
+                return conn.schedule_retry();
+            }
+            conn.metrics.retry_budget_exhausted.add(1);
+        }
+        conn.fail(terminal);
+    }
+
+    /// Settle the failed attempt, dispose of its upstream, and arm the
+    /// fully-jittered exponential backoff. The retry itself starts in
+    /// `maybe_start_retry` once every gate clears.
+    fn schedule_retry(conn: *ProxyConn) void {
+        assert(!conn.closing);
+        assert(conn.request_replayable);
+        assert(!conn.retry_scheduled); // one scheduled retry at a time
+        assert(!conn.retry_pending);
+        conn.close_attempt(.failure); // a real failure: feeds outlier detection
+        conn.charge_retry();
+        conn.attempts_used += 1;
+        assert(conn.attempts_used <= constants.retry_attempts_max);
+        conn.metrics.retry_attempts.add(1);
+        conn.dispose_upstream();
+        // Full jitter: uniform in [0, min(base << used, cap)) — desynchronizes
+        // retry herds better than equal-jitter (AWS Architecture Blog,
+        // "Exponential Backoff and Jitter").
+        const shift: u6 = @intCast(conn.attempts_used - 1);
+        const ceiling = @min(
+            @as(u64, conn.policy.retry_backoff_base_ns) << shift,
+            conn.policy.retry_backoff_cap_ns,
+        );
+        assert(ceiling > 0); // base >= 1ns is enforced at parse
+        const delay_ns: u63 = @intCast(@max(conn.random.uintLessThan(u64, ceiling), 1));
+        conn.retry_scheduled = true;
+        conn.retry_pending = true;
+        conn.retain();
+        conn.io.timeout(*ProxyConn, conn, on_retry_backoff, &conn.retry_timeout_completion, delay_ns);
+    }
+
+    fn on_retry_backoff(conn: *ProxyConn, _: *Completion, _: io_mod.TimeoutError!void) void {
+        defer conn.release_ref();
+        conn.retry_pending = false;
+        if (conn.closing) return; // cancelled by teardown; the charge settles there
+        conn.maybe_start_retry();
+    }
+
+    /// Start the scheduled retry once every gate has cleared: the backoff
+    /// expired, the dead upstream's close completed (its completion is
+    /// reused), and no stale connect-cancel is in flight (it could kill the
+    /// new dial). Each gate-clearing callback calls this; the last one
+    /// through starts the attempt.
+    fn maybe_start_retry(conn: *ProxyConn) void {
+        assert(!conn.closing);
+        if (!conn.retry_scheduled) return;
+        if (conn.retry_pending) return;
+        if (conn.upstream_close_pending) return;
+        if (conn.try_connect_cancel_pending) return;
+        conn.retry_scheduled = false;
+        assert(!conn.attempt_open); // settled when the retry was scheduled
+        assert(conn.request_replayable);
+        assert(conn.upstream_fd < 0);
+        const cluster = conn.cluster.?; // set at route time, request still active
+        // Prefer a different endpoint than the one that just failed.
+        const endpoint_index = balancer.pick_least_request(
+            cluster,
+            conn.resilience.cluster_state(conn.cluster_index),
+            conn.random,
+            conn.io.now_ns(),
+            conn.endpoint_index,
+        ) orelse return conn.fail(response_502); // unreachable: cluster routed non-empty
+        conn.endpoint_address = cluster.endpoints[endpoint_index].address;
+        conn.prime_segment_index = 0;
+        conn.prime_sent = 0;
+        assert(conn.head_filled >= conn.request_end); // the prime segments are intact
+        conn.open_attempt(endpoint_index);
+        conn.arm_try_deadline();
+        conn.begin_attempt();
+    }
+
+    /// Shutdown + close the current upstream fd on the per-request close
+    /// completion. Callers hold `!upstream_close_pending` (checked by the
+    /// replay gate or guaranteed by phase).
+    fn dispose_upstream(conn: *ProxyConn) void {
+        if (conn.upstream_fd < 0) return;
+        assert(!conn.upstream_close_pending);
         conn.io.shutdown_socket(conn.upstream_fd);
         conn.upstream_close_pending = true;
         conn.retain();
@@ -830,16 +995,6 @@ pub const ProxyConn = struct {
         );
         conn.upstream_fd = -1;
         conn.account_upstream_drop();
-        // Replay: rewind the prime cursor and dial the same endpoint fresh.
-        // (response_pipe state may still hold the previous request's leftovers; it is
-        // reset when the relay starts — no response byte arrived for *this*
-        // request, per the retryable check above.)
-        assert(!conn.response_bytes_received);
-        conn.prime_segment_index = 0;
-        conn.prime_sent = 0;
-        conn.open_attempt(conn.endpoint_index);
-        conn.arm_try_deadline(); // the replay is a fresh attempt with a fresh budget
-        conn.connect_upstream();
     }
 
     // ---- forward buffered request bytes, then relay -----------------------
@@ -912,7 +1067,7 @@ pub const ProxyConn = struct {
         // Killed by a per-try abort (the shutdown errored this send — or the
         // send won the race; either way the attempt is dead): drain.
         if (conn.attempt_dead) return conn.attempt_drained();
-        const m = result catch return conn.upstream_failed();
+        const m = result catch return conn.attempt_failed(.send_error);
         // The primed head is upstream traffic too — without this, a GET-only
         // workload reports zero bytes_to_upstream (only the relay pipe counts).
         conn.metrics.bytes_to_upstream.add(m);
@@ -982,8 +1137,8 @@ pub const ProxyConn = struct {
         if (conn.closing) return;
         // Killed by a per-try abort: drain (any raced-in bytes are moot).
         if (conn.attempt_dead) return conn.attempt_drained();
-        const n = result catch return conn.upstream_failed();
-        if (n == 0) return conn.upstream_failed(); // upstream closed without a response
+        const n = result catch return conn.attempt_failed(.recv_error);
+        if (n == 0) return conn.attempt_failed(.upstream_eof); // closed without a response
         conn.response_bytes_received = true;
         conn.try_deadline_ns = 0; // the attempt reached its first response byte
         conn.response_pipe.filled += n;
@@ -1143,22 +1298,9 @@ pub const ProxyConn = struct {
             .outcome = conn.outcome,
             .bytes_to_client = conn.bytes_out,
         });
-        if (conn.upstream_fd >= 0) {
-            // Same discipline as teardown: shutdown so any straggler op on
-            // the fd completes, then close.
-            conn.io.shutdown_socket(conn.upstream_fd);
-            conn.upstream_close_pending = true;
-            conn.retain();
-            conn.io.close(
-                *ProxyConn,
-                conn,
-                on_upstream_closed,
-                &conn.close_upstream_completion,
-                conn.upstream_fd,
-            );
-            conn.upstream_fd = -1;
-            conn.account_upstream_drop();
-        }
+        // Same discipline as teardown: shutdown so any straggler op on the
+        // fd completes, then close.
+        conn.dispose_upstream();
         assert(conn.request_end <= conn.head_filled);
         const excess = conn.head_filled - conn.request_end;
         if (excess > 0) {
@@ -1180,6 +1322,7 @@ pub const ProxyConn = struct {
 
     fn on_upstream_closed(conn: *ProxyConn, _: *Completion, _: io_mod.CloseError!void) void {
         conn.upstream_close_pending = false;
+        if (!conn.closing) conn.maybe_start_retry(); // a retry may be gated on this close
         conn.release_ref();
     }
 
@@ -2831,6 +2974,160 @@ test "proxy: circuit breaker rejects a dial beyond max_connections with 503" {
     try std.testing.expectEqual(@as(u64, 1), metrics.breaker_dials_rejected.load());
     try std.testing.expectEqual(@as(u64, 0), metrics.breaker_requests_rejected.load());
 
+    while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: a configured retry survives an upstream that dies once" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    // An origin that kills its first connection on accept (EOF before any
+    // response byte — a crash-looping backend), then serves normally.
+    const FlakyOrigin = struct {
+        io: *IO,
+        listener: Listener,
+        response: []const u8,
+        failures_left: u32,
+        fd: posix.socket_t = -1,
+        request_buf: [1024]u8 = undefined,
+        request_len: usize = 0,
+        sent: usize = 0,
+        accept_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        send_c: Completion = undefined,
+        fn start(origin: *@This()) void {
+            origin.io.accept(*@This(), origin, on_accept, &origin.accept_c, origin.listener.fd);
+        }
+        fn on_accept(
+            origin: *@This(),
+            _: *Completion,
+            result: io_mod.AcceptError!posix.socket_t,
+        ) void {
+            const fd = result catch return;
+            if (origin.failures_left > 0) {
+                origin.failures_left -= 1;
+                origin.io.shutdown_socket(fd);
+                origin.io.close_now(fd);
+                return origin.start(); // die on this one, serve the next
+            }
+            origin.fd = fd;
+            origin.arm_recv();
+        }
+        fn arm_recv(origin: *@This()) void {
+            origin.io.recv(
+                *@This(),
+                origin,
+                on_recv,
+                &origin.recv_c,
+                origin.fd,
+                origin.request_buf[origin.request_len..],
+            );
+        }
+        fn on_recv(origin: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch return;
+            if (n == 0) return;
+            origin.request_len += n;
+            const seen = origin.request_buf[0..origin.request_len];
+            if (std.mem.indexOf(u8, seen, "\r\n\r\n") == null) return origin.arm_recv();
+            origin.arm_send();
+        }
+        fn arm_send(origin: *@This()) void {
+            origin.io.send(
+                *@This(),
+                origin,
+                on_send,
+                &origin.send_c,
+                origin.fd,
+                origin.response[origin.sent..],
+            );
+        }
+        fn on_send(origin: *@This(), _: *Completion, result: io_mod.SendError!usize) void {
+            origin.sent += result catch return;
+            if (origin.sent < origin.response.len) return origin.arm_send();
+        }
+    };
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = FlakyOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .failures_left = 1,
+    };
+    origin.start();
+
+    var json_buf: [384]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"],
+        \\     "retry": {{ "max": 2, "backoff_base_ms": 1, "backoff_cap_ms": 10 }} }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
+            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            c.len = result catch 0;
+            c.done = true;
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    // The client sees the retried attempt's clean 200 — never the failure.
+    // (The hop-by-hop `Connection: close` is stripped for a keep-alive client.)
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO",
+        c.buf[0..c.len],
+    );
+    try std.testing.expectEqual(@as(u64, 1), metrics.retry_attempts.load());
+    // Tier 1 (stale-pool) was not involved: the first dial was fresh.
+    try std.testing.expectEqual(@as(u64, 0), metrics.upstream_retried.load());
+
+    // Close the keep-alive client so the drain below is not an idle-timeout wait.
+    _ = linux.close(client);
     while (pool.free_count != pool.capacity) try io.run_once();
     try std.testing.expect(server.resilience.is_idle());
 }
