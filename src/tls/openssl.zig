@@ -238,6 +238,11 @@ pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, lengt
 pub extern fn SSL_set_ex_data(ssl: *SSL, index: c_int, data: ?*anyopaque) c_int;
 pub extern fn SSL_get_ex_data(ssl: *const SSL, index: c_int) ?*anyopaque;
 pub extern fn SSL_get_current_cipher(ssl: *const SSL) ?*const SSL_CIPHER;
+/// The SSL's read-side BIO (borrowed, no reference transferred).
+pub extern fn SSL_get_rbio(ssl: *const SSL) ?*BIO;
+/// 1 when the SSL buffers any received data — decrypted-but-undelivered
+/// plaintext or a processed-but-undecrypted record.
+pub extern fn SSL_has_pending(ssl: *const SSL) c_int;
 /// The IANA cipher-suite id (0x1301 = TLS_AES_128_GCM_SHA256, ...).
 pub extern fn SSL_CIPHER_get_protocol_id(cipher: *const SSL_CIPHER) u16;
 

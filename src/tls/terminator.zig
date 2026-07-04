@@ -12,6 +12,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const openssl = @import("openssl.zig");
+const kernel = @import("kernel.zig");
 const constants = @import("../constants.zig");
 
 /// The ALPN identifier we speak today. h2 joins this list in the HTTP/2
@@ -337,6 +338,46 @@ pub const Channel = struct {
         return suite;
     }
 
+    /// Whether the kernel can take over the receive direction at record
+    /// sequence zero (docs/DESIGN.md §6): true only when the SSL has
+    /// consumed every fed ciphertext byte AND buffers nothing — any
+    /// application-epoch record the peer sent with (or right after) its
+    /// handshake flight would still be sitting in the pair's read side or
+    /// inside the SSL, and makes the connection ineligible. The caller
+    /// must additionally hold no unfed wire bytes of its own (ProxyConn's
+    /// staging) and have issued no application write yet (its switch
+    /// ordering); this checks everything the channel can see.
+    pub fn kernel_switch_eligible(channel: *const Channel) bool {
+        if (!channel.handshake_done()) return false;
+        const read_bio = openssl.SSL_get_rbio(channel.ssl).?; // set at init
+        if (openssl.BIO_ctrl_pending(read_bio) != 0) return false;
+        if (openssl.SSL_has_pending(channel.ssl) != 0) return false;
+        return true;
+    }
+
+    pub const KernelParameters = struct {
+        transmit: kernel.CryptoParameters,
+        receive: kernel.CryptoParameters,
+    };
+
+    pub const KernelParametersError = kernel.DeriveError || error{SecretsIncomplete};
+
+    /// Compose the kernel install for a *server-role* connection from its
+    /// captured secrets: we transmit under the server traffic secret and
+    /// receive under the client's.
+    pub fn kernel_parameters(
+        channel: *const Channel,
+        secrets: *const TrafficSecrets,
+    ) KernelParametersError!KernelParameters {
+        assert(channel.handshake_done()); // the suite is only known after
+        if (!secrets.complete()) return error.SecretsIncomplete;
+        const suite = channel.negotiated_cipher_suite();
+        return .{
+            .transmit = try kernel.derive_crypto_parameters(suite, secrets.server_secret()),
+            .receive = try kernel.derive_crypto_parameters(suite, secrets.client_secret()),
+        };
+    }
+
     /// The ALPN protocol both sides agreed on, if any. Valid post-handshake.
     pub fn alpn_selected(channel: *const Channel) ?[]const u8 {
         assert(channel.handshake_done());
@@ -548,7 +589,6 @@ test "terminator: close_notify reads as clean TLS EOF" {
 }
 
 test "terminator: keylog capture yields identical kernel parameters on both ends" {
-    const kernel = @import("kernel.zig");
     install_test_hook();
     const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
     defer server_context.deinit();
@@ -586,6 +626,91 @@ test "terminator: keylog capture yields identical kernel parameters on both ends
 
     // The two directions must never share keys.
     try std.testing.expect(!std.mem.eql(u8, server_tx.bytes(), server_rx.bytes()));
+}
+
+test "terminator: a clean handshake is kernel-switch eligible; composition works" {
+    install_test_hook();
+    const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
+    defer server_context.deinit();
+    const client_context = try Context.init_client();
+    defer client_context.deinit();
+
+    var server = try Channel.init(&server_context);
+    defer server.deinit();
+    var client = try Channel.init(&client_context);
+    defer client.deinit();
+    var secrets = TrafficSecrets{};
+    server.capture_secrets(&secrets);
+
+    try std.testing.expect(!server.kernel_switch_eligible()); // not before the handshake
+    try std.testing.expectError(error.SecretsIncomplete, blk: {
+        // Composition needs the handshake first; feed it a done channel below.
+        try test_handshaken_pair(&client, &server, constants.tls_bio_pair_bytes);
+        break :blk server.kernel_parameters(&TrafficSecrets{});
+    });
+
+    // The client sent nothing beyond its handshake flight: eligible.
+    try std.testing.expect(server.kernel_switch_eligible());
+
+    const parameters = try server.kernel_parameters(&secrets);
+    const suite = server.negotiated_cipher_suite();
+    const expected_tx = try kernel.derive_crypto_parameters(suite, secrets.server_secret());
+    try std.testing.expectEqualSlices(u8, expected_tx.bytes(), parameters.transmit.bytes());
+    const expected_rx = try kernel.derive_crypto_parameters(suite, secrets.client_secret());
+    try std.testing.expectEqualSlices(u8, expected_rx.bytes(), parameters.receive.bytes());
+}
+
+test "terminator: a request riding the handshake flight defeats eligibility" {
+    install_test_hook();
+    const server_context = try Context.init_server(test_certificate_pem, test_private_key_pem);
+    defer server_context.deinit();
+    const client_context = try Context.init_client();
+    defer client_context.deinit();
+
+    var server = try Channel.init(&server_context);
+    defer server.deinit();
+    var client = try Channel.init(&client_context);
+    defer client.deinit();
+
+    // Drive the handshake until the *client* believes it is done (the
+    // client finishes first in TLS 1.3) while the server still waits for
+    // the client Finished flight.
+    var scratch: [constants.tls_bio_pair_bytes]u8 = undefined;
+    _ = client.handshake_step(); // ClientHello out
+    var budget: u32 = 100;
+    while (!client.handshake_done() and budget > 0) : (budget -= 1) {
+        const to_server = client.drain_ciphertext(&scratch);
+        if (to_server > 0) assert(server.feed_ciphertext(scratch[0..to_server]) == to_server);
+        _ = server.handshake_step();
+        const to_client = server.drain_ciphertext(&scratch);
+        if (to_client > 0) assert(client.feed_ciphertext(scratch[0..to_client]) == to_client);
+        _ = client.handshake_step();
+    }
+    try std.testing.expect(client.handshake_done());
+    try std.testing.expect(!server.handshake_done()); // Finished not yet delivered
+
+    // The client pipelines a request into the same flight as its Finished:
+    // the server receives both in one batch.
+    const early = "GET / HTTP/1.1\r\nhost: eager\r\n\r\n";
+    switch (client.write_plaintext(early)) {
+        .bytes => |n| try std.testing.expectEqual(early.len, n),
+        else => return error.TestUnexpectedResult,
+    }
+    const flight = client.drain_ciphertext(&scratch);
+    try std.testing.expect(flight > 0);
+    try std.testing.expectEqual(flight, server.feed_ciphertext(scratch[0..flight]));
+    try std.testing.expectEqual(Channel.HandshakeStatus.done, server.handshake_step());
+
+    // Handshake done — but the early request sits in the pair or the SSL:
+    // installing kTLS RX now would desynchronize the sequence. Ineligible,
+    // so this connection stays on the userspace relay (which must still
+    // deliver that request intact).
+    try std.testing.expect(!server.kernel_switch_eligible());
+    var buffer: [128]u8 = undefined;
+    switch (server.read_plaintext(&buffer)) {
+        .bytes => |n| try std.testing.expectEqualStrings(early, buffer[0..n]),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "terminator: channels drain the hook heap to baseline" {

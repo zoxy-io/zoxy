@@ -342,13 +342,19 @@ as shipped (BIO pair, every byte a ring op, deterministic tests intact):
   IO-seam helper like `shutdown_socket`. Gated to the AES-GCM ciphers.
 - *Sequence numbers, eliminated rather than computed*: kTLS needs the next
   record sequence per direction. Rule: switch only at handshake completion
-  when **zero application-epoch records** have flowed (TX is trivially 0 —
-  we switch before the first `SSL_write`; RX we verify by counting record
-  boundaries in the ciphertext staging we already pass every byte through).
-  A client whose first request rode in with the handshake flight simply
-  leaves that connection on the BIO-pair relay — the fallback is the
-  already-shipped path, so a missed switch costs performance, never
-  correctness.
+  when **zero application-epoch records** have flowed. TX is trivially 0 —
+  we switch before the first `SSL_write`. RX turned out not to need the
+  originally-planned record-boundary counter: at handshake completion, any
+  application-epoch byte the client sent must be sitting in exactly one of
+  three places — our wire staging (unfed), the pair's read side
+  (`SSL_get_rbio` + `BIO_ctrl_pending`), or buffered inside the SSL
+  (`SSL_has_pending`). All three empty ⇒ sequence is exactly 0
+  (`Channel.kernel_switch_eligible`); nothing to parse, nothing to
+  miscount. A client whose first request rode in with the handshake flight
+  simply leaves that connection on the BIO-pair relay — the fallback is
+  the already-shipped path, so a missed switch costs performance, never
+  correctness (tested: the early request defeats eligibility and is
+  delivered intact by the userspace path).
 - *Steady state*: plain `io.recv`/`io.send` on the fd; the kernel does the
   records; the relay is byte-identical to plaintext. The channel (SSL + BIO
   pair, ~161 KiB) is freed at switchover — kTLS connections cost ~zero TLS
@@ -361,10 +367,11 @@ as shipped (BIO pair, every byte a ring op, deterministic tests intact):
   (module absent, old kernel, cipher mismatch) falls back to the pair relay
   and is counted (`zoxy_tls_ktls_active` / `_fallbacks` gauges).
 
-Slices, in order: (1) IO seam — `enable_kernel_tls` + the `sendmsg` op;
-(2) keylog capture + HKDF derivation, unit-tested against the RFC 8448
-TLS 1.3 vectors (no kernel needed); (3) record-boundary counter +
-eligibility rule in the staging path; (4) the ProxyConn switchover +
+Slices, in order: (1) IO seam — `enable_kernel_tls` + the `sendmsg` op
+(done 2026-07); (2) keylog capture + HKDF derivation, unit-tested against
+the RFC 8448 TLS 1.3 vectors (done 2026-07); (3) switchover eligibility
+(the quiescence checks above) + per-direction kernel parameter
+composition (done 2026-07); (4) the ProxyConn switchover +
 end-to-end test (must `error.SkipZigTest` when the environment cannot load
 the `tls` module — CI runners may not allow it; the dev box has
 `CONFIG_TLS=m`); (5) close_notify-over-cmsg + churn bench;
