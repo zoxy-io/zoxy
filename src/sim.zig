@@ -5,6 +5,14 @@
 //! adversarial partial reads/writes. Virtual clients and misbehaving virtual
 //! origins generate randomized workloads; the seed replays everything.
 //!
+//! Two proxies run each iteration on the same origins and fault profile: the
+//! HTTP/1.1 ProxyServer and, alongside it, the plaintext HTTP/2 (h2c)
+//! H2Server (h2 over TLS is out of reach — the sim excludes OpenSSL — but
+//! h2c drives the whole engine / per-stream leg / flow-control machinery,
+//! identical above the record layer). The h2c client multiplexes several
+//! streams per connection, each with a GET / small POST / ~10 KiB POST /
+//! deliberately-malformed request, and sometimes vanishes mid-response.
+//!
 //!     zig build sim                 # seeds 0..50
 //!     zig build sim -- 1234 200     # seeds 1234..1434
 //!     zig build sim -- fuzz         # random seeds, forever (Ctrl-C to stop)
@@ -17,20 +25,25 @@
 //! Checked invariants, every iteration:
 //! - progress: the loop never deadlocks (`error.WouldBlockForever`) and
 //!   never exceeds the step cap;
-//! - every byte stream a client receives parses as an HTTP/1.1 response and
-//!   frames correctly (RFC 9112 §6.3) — whatever the origin or network did;
+//! - every byte stream a client receives parses and frames correctly — an
+//!   HTTP/1.1 response (RFC 9112 §6.3) for the H1 clients, a valid HTTP/2
+//!   frame sequence for the h2c ones — whatever the origin or network did;
 //! - response integrity: every request carries a unique token that the
 //!   origin echoes into the body; a completed 200 must return *this*
 //!   request's token, byte-exact for length-framed bodies — catching
 //!   truncation, reordering, and cross-connection contamination (stray
-//!   bytes on a pooled upstream would surface here);
-//! - all connection slots return to the pool, and `metrics.active` is zero,
-//!   once every client is gone: no leaks under any schedule;
-//! - graceful drain (a third of iterations, begun at a random step): accepts
-//!   freeze, the listener closes (later connects are refused), every slot
-//!   still drains to zero — with a drain deadline short enough that forced
-//!   teardown of wedged exchanges is exercised — and the worker's exit
-//!   condition (`drain_complete`) is reached with no server op abandoned.
+//!   bytes on a pooled upstream would surface here). For h2c, `END_STREAM`
+//!   is the authoritative completion signal, so the per-stream check also
+//!   catches one stream's body leaking into another's;
+//! - all connection slots and stream legs return to their pools, and
+//!   `metrics.active` is zero, once every client is gone — for both proxies:
+//!   no leaks under any schedule;
+//! - graceful drain (a third of iterations, begun at a random step): both
+//!   proxies stop accepting and close their listeners (backlogged connects
+//!   are RST, not left hanging), every slot still drains to zero — with a
+//!   drain deadline short enough that forced teardown of wedged exchanges is
+//!   exercised — and each worker's exit condition (`drain_complete`) is
+//!   reached with no server op abandoned.
 
 pub const zoxy_io = .simulation;
 
@@ -482,7 +495,9 @@ const OriginConn = struct {
     io: *IO,
     fd: posix.socket_t,
     behavior: Origin.Behavior,
-    buf: [4096]u8 = undefined,
+    // Large enough for an h2c client's biggest (chunk-framed) upstream body
+    // plus the head — exercises the proxy's request-body flow-control release.
+    buf: [32 * 1024]u8 = undefined,
     filled: usize = 0,
     headers: [16]h1.Header = undefined,
     request_end: usize = 0,
@@ -972,9 +987,15 @@ const H2Client = struct {
     workload: *Workload,
     id: u32 = 0,
     fd: posix.socket_t = -1,
-    send_buf: [1024]u8 = undefined,
+    // Holds the whole opening flight: preface + SETTINGS + up to a ~10 KiB
+    // POST body (under the 16 KiB window we advertise, over the 8 KiB
+    // half-window that makes the proxy release a WINDOW_UPDATE).
+    send_buf: [16 * 1024]u8 = undefined,
     send_len: usize = 0,
     sent: usize = 0,
+    /// Drop the connection after the first response byte — a client that
+    /// vanishes mid-multiplex (the H2 twin of H1's abort_mid_response).
+    abort: bool = false,
     wire: [4096]u8 = undefined,
     wire_len: usize = 0,
     decoder: hpack.Decoder = .{},
@@ -989,9 +1010,11 @@ const H2Client = struct {
     send_completion: Completion = undefined,
     recv_completion: Completion = undefined,
 
+    const Kind = enum { get, post_small, post_large, malformed };
+
     const Stream = struct {
         id: u31 = 0,
-        post: bool = false,
+        kind: Kind = .get,
         token: [48]u8 = undefined,
         token_len: usize = 0,
         status: u16 = 0,
@@ -1027,56 +1050,79 @@ const H2Client = struct {
         client.arm_send();
     }
 
-    /// Build the opening flight: preface, an (empty) SETTINGS, and 1–3 stream
-    /// requests staged back to back so they are all in flight at once.
+    /// Build the opening flight: preface, an (empty) SETTINGS, and the stream
+    /// requests staged back to back so they are all in flight at once. A
+    /// large POST rides alone (its body fills the send buffer); otherwise 1–3
+    /// mixed GET / small-POST / malformed streams multiplex.
     fn compose(client: *H2Client) void {
         var len: usize = 0;
         @memcpy(client.send_buf[0..h2_frame.client_preface.len], h2_frame.client_preface);
         len += h2_frame.client_preface.len;
         len += h2_frame.write_settings(&.{}, client.send_buf[len..]);
-        client.stream_count = client.workload.prng.random().intRangeAtMost(u32, 1, 3);
+        client.abort = client.workload.one_in(8);
+        const large = client.workload.one_in(4);
+        client.stream_count = if (large) 1 else client.workload.prng.random().intRangeAtMost(u32, 1, 3);
         for (0..client.stream_count) |i| {
             const stream = &client.streams[i];
             stream.id = @intCast(1 + 2 * i);
-            stream.post = client.workload.one_in(3);
+            stream.kind = if (large) .post_large else client.pick_kind();
             const prefix: []const u8 = if (client.workload.prng.random().boolean()) "/a" else "/b";
             const token = std.fmt.bufPrint(&stream.token, "{s}?token-c{d}s{d}", .{
                 prefix, client.id, i,
             }) catch unreachable;
             stream.token_len = token.len;
-
-            var block: [96]u8 = undefined;
-            var block_len: usize = 0;
-            block_len += encode(&block, block_len, ":method", if (stream.post) "POST" else "GET");
-            block_len += encode(&block, block_len, ":scheme", "http");
-            block_len += encode(&block, block_len, ":path", token);
-            block_len += encode(&block, block_len, ":authority", "sim");
-            var flags: u8 = h2_frame.Flags.end_headers;
-            if (!stream.post) flags |= h2_frame.Flags.end_stream;
-            h2_frame.write_frame_header(.{
-                .length = @intCast(block_len),
-                .type = .headers,
-                .flags = flags,
-                .stream_id = stream.id,
-            }, client.send_buf[len..][0..h2_frame.frame_header_bytes]);
-            len += h2_frame.frame_header_bytes;
-            @memcpy(client.send_buf[len..][0..block_len], block[0..block_len]);
-            len += block_len;
-            if (stream.post) {
-                const body = "h2-body!";
-                h2_frame.write_frame_header(.{
-                    .length = body.len,
-                    .type = .data,
-                    .flags = h2_frame.Flags.end_stream,
-                    .stream_id = stream.id,
-                }, client.send_buf[len..][0..h2_frame.frame_header_bytes]);
-                len += h2_frame.frame_header_bytes;
-                @memcpy(client.send_buf[len..][0..body.len], body);
-                len += body.len;
-            }
+            len += encode_stream(stream, client.send_buf[len..]);
         }
         client.send_len = len;
         assert(client.send_len <= client.send_buf.len);
+    }
+
+    fn pick_kind(client: *H2Client) Kind {
+        const roll = client.workload.prng.random().intRangeAtMost(u32, 0, 99);
+        if (roll < 60) return .get;
+        if (roll < 85) return .post_small;
+        return .malformed; // bad pseudo-headers -> the proxy RSTs the stream
+    }
+
+    /// Stage one stream's HEADERS (+ DATA for a POST); returns bytes written.
+    fn encode_stream(stream: *Stream, out: []u8) usize {
+        const post = stream.kind == .post_small or stream.kind == .post_large;
+        var block: [96]u8 = undefined;
+        var block_len: usize = 0;
+        block_len += encode(&block, block_len, ":method", if (post) "POST" else "GET");
+        // A malformed request omits :scheme — a stream error (RST_STREAM
+        // PROTOCOL_ERROR at translation), not a connection-fatal one.
+        if (stream.kind != .malformed) {
+            block_len += encode(&block, block_len, ":scheme", "http");
+        }
+        block_len += encode(&block, block_len, ":path", stream.path());
+        block_len += encode(&block, block_len, ":authority", "sim");
+
+        var len: usize = 0;
+        var flags: u8 = h2_frame.Flags.end_headers;
+        if (!post) flags |= h2_frame.Flags.end_stream;
+        h2_frame.write_frame_header(.{
+            .length = @intCast(block_len),
+            .type = .headers,
+            .flags = flags,
+            .stream_id = stream.id,
+        }, out[len..][0..h2_frame.frame_header_bytes]);
+        len += h2_frame.frame_header_bytes;
+        @memcpy(out[len..][0..block_len], block[0..block_len]);
+        len += block_len;
+        if (post) {
+            const body_len: usize = if (stream.kind == .post_large) 10_000 else 8;
+            h2_frame.write_frame_header(.{
+                .length = @intCast(body_len),
+                .type = .data,
+                .flags = h2_frame.Flags.end_stream,
+                .stream_id = stream.id,
+            }, out[len..][0..h2_frame.frame_header_bytes]);
+            len += h2_frame.frame_header_bytes;
+            @memset(out[len..][0..body_len], 'x'); // the origin echoes :path, not the body
+            len += body_len;
+        }
+        return len;
     }
 
     fn encode(block: []u8, offset: usize, name: []const u8, value: []const u8) usize {
@@ -1145,12 +1191,15 @@ const H2Client = struct {
                 stream.status = std.fmt.parseInt(u16, decoded[0].value, 10) catch
                     fail("h2c: response missing :status", .{});
                 if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.stream_end(stream);
+                if (client.abort) return client.conclude(); // vanish mid-multiplex
             },
             .data => {
                 const stream = client.stream_for(frame.header.stream_id) orelse return;
+                assert(stream.body_len + frame.payload.len <= stream.body.len); // echo is small
                 @memcpy(stream.body[stream.body_len..][0..frame.payload.len], frame.payload);
                 stream.body_len += @intCast(frame.payload.len);
                 if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.stream_end(stream);
+                if (client.abort) return client.conclude();
             },
             .rst_stream => {
                 const stream = client.stream_for(frame.header.stream_id) orelse return;

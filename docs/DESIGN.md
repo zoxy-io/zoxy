@@ -415,13 +415,27 @@ relay is mandatory, not a fallback. And **the sim's OpenSSL exclusion means
 the TLS-gated H2 path can't ride the existing simulator** — the engine got
 its own seeded adversary instead.
 
+**Simulator coverage** (added after the slices): h2 over TLS can't ride the
+sim (it excludes OpenSSL), so an h2c H2Server runs alongside the H1
+ProxyServer each iteration on the same origins and fault profile — the H2
+engine, per-stream legs, and flow control under the seeded adversarial
+schedule, with multiplexed clients (GET / small + ~10 KiB POST / malformed,
+sometimes vanishing mid-response) and the same no-leak / integrity / drain
+invariants. It earned its keep immediately: it found a fatal-connection leg
+race, a mid-dial fd-close-vs-connect race, an unbounded H2 drain deadline,
+and an unclosed drain listener — four teardown/composition bugs the
+hand-written tests missed. zrk still can't drive it (bench pending an h2
+load generator).
+
 Later slices: H2 upstream + multiplexed upstream pooling; the retry tiers +
 per-try timeout for H2 legs (the Phase-2 H1 treatment applies unchanged);
 upstream TLS re-encryption for H2 legs (clusters demanding it answer 502);
 close_notify on H2 teardown (abrupt TCP close after GOAWAY today);
-h2c-in-simulator coverage; CONTINUATION-flood / rapid-reset hardening beyond
-what the fixed slots already give; the zrk measurement gate on the
-few-hot-connections shape (accept balancing exists to serve it).
+CONTINUATION-flood / rapid-reset hardening beyond what the fixed slots
+already give; client-side flow-control stall coverage in the sim (bodies
+beyond the initial window, needing a window-accounting test client); the
+zrk measurement gate on the few-hot-connections shape (accept balancing
+exists to serve it).
 
 ### Phase 6 — config: JSON schema + file-watch reload (planned)
 Decided 2026-07-04. Keep JSON as the canonical, machine-facing format (Caddy's
