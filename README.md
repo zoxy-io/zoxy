@@ -305,8 +305,11 @@ the restart, closing the drain-only RST window. Counter totals ride the
 same handoff (name-keyed, version-skew tolerant), so scrapes stay
 monotonic across the pair while gauges start over. Measured: an A→B
 restart under a request hammer served 928/928 with zero failures.
-Still to come: accept balancing across workers, consistent-hash LB,
-tracing + Prometheus polish. HTTP/2 is deliberately
+Accept balancing landed as `accept_mode: "shared"` — one listener, every
+worker with a pending accept, so idle workers pull more: the hottest
+worker's share at 64 connections drops from 22–23% to ~16% (10-run A/B),
+with no churn regression; `reuseport` stays the default. Still to come:
+consistent-hash LB, tracing + Prometheus polish. HTTP/2 is deliberately
 deferred behind operability: it
 is a large protocol surface that lands better on an operable base, and
 accept balancing is a prerequisite for its few-hot-connections traffic

@@ -115,6 +115,12 @@ pub const Config = struct {
     /// Unix-socket path for hot-restart listener handoff (docs/DESIGN.md §7
     /// Phase 4); null disables hot restart.
     handoff: ?[]const u8,
+    /// How accepted connections spread across workers (docs/DESIGN.md §7
+    /// Phase 4). `reuseport`: one SO_REUSEPORT listener per worker, the
+    /// kernel hashes — uniform at scale, but few long-lived connections pin
+    /// small-sample variance. `shared`: one listener, every worker holds a
+    /// pending accept — idle workers naturally pull more.
+    accept_mode: AcceptMode,
     /// TLS termination on the listener; null = plaintext.
     tls: ?TlsConfig,
     routes: []const Route,
@@ -142,13 +148,17 @@ pub const ParseError = error{
     InvalidLimit,
     InvalidTls,
     InvalidHandoff,
+    InvalidAcceptMode,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
+
+pub const AcceptMode = enum { reuseport, shared };
 
 /// JSON shape mirrored 1:1 for decoding, then lowered into `Config`.
 const Dto = struct {
     listen: []const u8,
     admin: ?[]const u8 = null,
     handoff: ?[]const u8 = null,
+    accept_mode: []const u8 = "reuseport",
     tls: ?TlsDto = null,
     routes: []const RouteDto,
     clusters: []const ClusterDto,
@@ -304,6 +314,8 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
             if (path.len == 0 or path.len > path_max) return error.InvalidHandoff;
             break :blk try a.dupe(u8, path);
         } else null,
+        .accept_mode = std.meta.stringToEnum(AcceptMode, dto.accept_mode) orelse
+            return error.InvalidAcceptMode,
         .tls = tls,
         .routes = routes,
         .clusters = clusters,
@@ -501,6 +513,27 @@ test "config: handoff path is optional, parses, and rejects the unfittable" {
         \\  "clusters": [{{ "name": "c", "endpoints": ["127.0.0.1:9000"] }}] }}
     , .{long_path});
     try std.testing.expectError(error.InvalidHandoff, parse(std.testing.allocator, text));
+}
+
+test "config: accept_mode defaults to reuseport, parses shared, rejects junk" {
+    var default_mode = try parse(std.testing.allocator, test_config);
+    defer default_mode.deinit();
+    try std.testing.expectEqual(AcceptMode.reuseport, default_mode.accept_mode);
+
+    var shared = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "accept_mode": "shared",
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer shared.deinit();
+    try std.testing.expectEqual(AcceptMode.shared, shared.accept_mode);
+
+    const junk = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "accept_mode": "round_robin",
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidAcceptMode, junk);
 }
 
 test "config: tls block is optional, parses paths, rejects empty ones" {

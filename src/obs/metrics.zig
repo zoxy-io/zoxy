@@ -15,6 +15,11 @@ pub const Counter = struct {
     pub fn sub(counter: *Counter, n: u64) void {
         _ = @atomicRmw(u64, &counter.value, .Sub, n, .monotonic);
     }
+    /// Subtract and return the *previous* value — for last-one-out decisions
+    /// (the shared-listener refcount).
+    pub fn fetch_sub(counter: *Counter, n: u64) u64 {
+        return @atomicRmw(u64, &counter.value, .Sub, n, .monotonic);
+    }
     pub fn load(counter: *const Counter) u64 {
         return @atomicLoad(u64, &counter.value, .monotonic);
     }

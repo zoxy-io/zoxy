@@ -180,8 +180,15 @@ pub fn main(init: std.process.Init) !void {
     // Listeners are owned by main — adopted from a predecessor over the
     // handoff socket when one is running (docs/DESIGN.md §7 Phase 4: the
     // SCM_RIGHTS duplicates keep the accept queues alive across the
-    // restart), fresh SO_REUSEPORT binds otherwise. A bind failure now
-    // fails startup instead of killing a lone worker thread.
+    // restart), fresh binds otherwise. A bind failure now fails startup
+    // instead of killing a lone worker thread. accept_mode decides the
+    // shape: `reuseport` = one listener per worker, kernel hashes;
+    // `shared` = one listener, every worker holds a pending accept and the
+    // kernel completes exactly one per connection — idle workers naturally
+    // pull more. Modes may mix across a hot restart: every listener carries
+    // SO_REUSEPORT, so fresh binds join an adopted socket's group.
+    const unique_listener_count: usize =
+        if (cfg.accept_mode == .shared) 1 else worker_count;
     var adopted_fds: [constants.workers_max]std.posix.socket_t = undefined;
     var adopted_count: usize = 0;
     if (cfg.handoff) |path| {
@@ -190,17 +197,18 @@ pub fn main(init: std.process.Init) !void {
             std.log.info("zoxy: adopted {d} listener(s) from a predecessor", .{adopted_count});
         }
     }
-    if (adopted_count > worker_count) {
-        // A predecessor with more workers: nobody would ever accept from the
-        // surplus queues once it drains — close them (a core-count change).
+    if (adopted_count > unique_listener_count) {
+        // A predecessor with more listeners (more workers, or an
+        // accept-mode change): nobody would ever accept from the surplus
+        // queues once it drains — close them.
         std.log.warn("zoxy: closing {d} surplus adopted listener(s)", .{
-            adopted_count - worker_count,
+            adopted_count - unique_listener_count,
         });
-        for (adopted_fds[worker_count..adopted_count]) |fd| _ = linux.close(fd);
-        adopted_count = worker_count;
+        for (adopted_fds[unique_listener_count..adopted_count]) |fd| _ = linux.close(fd);
+        adopted_count = unique_listener_count;
     }
-    const listeners = try gpa.alloc(Listener, worker_count);
-    for (listeners, 0..) |*listener, index| {
+    const unique_listeners = try gpa.alloc(Listener, unique_listener_count);
+    for (unique_listeners, 0..) |*listener, index| {
         listener.* = if (index < adopted_count)
             Listener{ .fd = adopted_fds[index] }
         else
@@ -208,6 +216,13 @@ pub fn main(init: std.process.Init) !void {
                 std.log.err("zoxy: cannot listen on {f}: {s}", .{ cfg.listen, @errorName(err) });
                 return err;
             };
+    }
+    // Shared mode: the last draining worker closes the one listener fd.
+    var shared_listener_refs: ?*zoxy.Counter = null;
+    if (cfg.accept_mode == .shared) {
+        const refs = try gpa.create(zoxy.Counter);
+        refs.* = .{ .value = worker_count };
+        shared_listener_refs = refs;
     }
 
     // Per-worker access logs, reserved up front.
@@ -226,21 +241,21 @@ pub fn main(init: std.process.Init) !void {
     const seed_base = std.mem.readInt(u64, &seed_bytes, .little);
 
     const threads = try gpa.alloc(std.Thread, worker_count);
-    for (threads, listeners, pools, accesses, drain_triggers, 0..) |
+    for (threads, pools, accesses, drain_triggers, 0..) |
         *thread,
-        listener,
         *pool,
         *access,
         trigger,
         cpu,
     | {
+        const listener = unique_listeners[if (cfg.accept_mode == .shared) 0 else cpu];
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
             .{
-                listener,     pool,       &router, &metrics,
-                access,       seed_base,  cpu,     tls_context,
-                upstream_tls, trigger[0],
+                listener,     pool,       &router,              &metrics,
+                access,       seed_base,  cpu,                  tls_context,
+                upstream_tls, trigger[0], shared_listener_refs,
             },
         );
     }
@@ -253,8 +268,8 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("zoxy: cannot open handoff socket {s}: {s}", .{ path, @errorName(err) });
             return err;
         };
-        const listener_fds = try gpa.alloc(std.posix.socket_t, worker_count);
-        for (listeners, listener_fds) |listener, *fd| fd.* = listener.fd;
+        const listener_fds = try gpa.alloc(std.posix.socket_t, unique_listener_count);
+        for (unique_listeners, listener_fds) |listener, *fd| fd.* = listener.fd;
         const handoff_thread = try std.Thread.spawn(
             .{},
             run_handoff_server,
@@ -397,6 +412,7 @@ fn run_worker(
     tls_context: ?*const zoxy.terminator.Context,
     upstream_tls: []const ?*const zoxy.terminator.Context,
     drain_trigger_fd: std.posix.socket_t,
+    listener_refs: ?*zoxy.Counter,
 ) void {
     assert(pool.capacity > 0);
     assert(listener.fd >= 0); // opened (or adopted) by main; never closes early
@@ -426,6 +442,7 @@ fn run_worker(
     server.tls_context = tls_context;
     server.upstream_tls_contexts = upstream_tls;
     server.drain_trigger_fd = drain_trigger_fd;
+    server.listener_refs = listener_refs;
     server.start();
 
     // Active health checks ride the same ring; arms only when configured.

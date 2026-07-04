@@ -44,6 +44,7 @@ pub const proxy = @import("net/proxy.zig");
 
 /// Process-wide metrics counters (docs/DESIGN.md §7).
 pub const Metrics = @import("obs/metrics.zig").Metrics;
+pub const Counter = @import("obs/metrics.zig").Counter;
 
 /// Per-worker access log.
 pub const AccessLog = @import("obs/access_log.zig").AccessLog;

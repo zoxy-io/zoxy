@@ -678,16 +678,34 @@ catches the dominant failures), ejection-time multipliers.
      truncated-tail tolerance, the full unix-socket path; process-level:
      A at requests=25/bytes=1075 handed off, B scraped requests=30/
      bytes=1290 after five more requests, gauges at 0.
-- **Accept balancing across workers.** Measured 2026-07 (per-worker accept
-  counters, `zoxy_worker_accepted`): the SO_REUSEPORT hash is uniform at
-  large N (1.14:1 over 150k accepts) but few long-lived connections pin
+- **Accept balancing across workers** — `accept_mode` done 2026-07-04.
+  The problem, measured 2026-07 (per-worker accept counters,
+  `zoxy_worker_accepted`): the SO_REUSEPORT hash is uniform at large N
+  (1.14:1 over 150k accepts) but few long-lived connections pin
   small-sample variance — at 64 keep-alive connections over 8 workers the
   hottest worker drew 15/64 (23% of load, 3.75:1 max:min), and the system
-  saturates when *it* does. Options: an `SO_ATTACH_REUSEPORT_EBPF` program
-  (round-robin or least-loaded assignment) or a userspace acceptor handing
-  fds to workers over `SCM_RIGHTS` — the same machinery hot restart needs.
-  Matters most for few-hot-connections traffic (an LB tier or HTTP/2 in
-  front); high-connection-count traffic self-smooths.
+  saturates when *it* does; matters most for few-hot-connections traffic
+  (an LB tier or HTTP/2 in front). Resolution: config
+  `accept_mode = "shared"` — ONE listener, every worker holds a pending
+  accept on it; the kernel completes exactly one accept per connection, so
+  idle workers naturally pull more. A shared refcount makes the *last*
+  draining worker close the fd (an early close would recycle the fd number
+  under siblings still referencing it). Drain and hot restart are
+  mode-agnostic: a shared-mode handoff carries one fd, and modes may mix
+  across a restart because every listener sets SO_REUSEPORT (fresh binds
+  join an adopted socket's group). Measured (10 runs each, c=64, same
+  box conditions): reuseport's hottest worker took 14–15/64 (22–23%) in
+  half the runs, worst spread 2–15; shared never exceeded 12, typically
+  10 (16%), worst spread 5–12 — the ceiling-setting worker sheds about a
+  third of its excess, and shared self-corrects under churn where the
+  hash cannot. Churn A/B (close-per-request, ~30–50k accepts/s): bands
+  overlap, no shared-queue contention signal, 0 errors both modes.
+  Default stays `reuseport` (uniform at scale; every historical baseline);
+  `shared` is the knob for few-hot-connections deployments. The
+  `SO_ATTACH_REUSEPORT_EBPF` round-robin alternative is deferred:
+  unprivileged BPF is disabled on modern kernels
+  (`kernel.unprivileged_bpf_disabled=2` on the dev box), so it needs
+  CAP_BPF even to load — revisit only if `shared` proves insufficient.
 - Consistent-hash LB (ring-hash / Maglev). Distributed tracing (B3/W3C
   propagation) + Prometheus metrics.
 

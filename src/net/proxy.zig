@@ -45,6 +45,7 @@ const resilience_mod = @import("../proxy/resilience.zig");
 const Resilience = resilience_mod.Resilience;
 const UpstreamPool = @import("../proxy/upstream_pool.zig").UpstreamPool;
 const Metrics = @import("../obs/metrics.zig").Metrics;
+const Counter = @import("../obs/metrics.zig").Counter;
 const access_log = @import("../obs/access_log.zig");
 const AccessLog = access_log.AccessLog;
 const guard = @import("../mem/guard.zig");
@@ -2344,6 +2345,13 @@ pub const ProxyServer = struct {
     /// zero so a worker never abandons a live op on ring teardown.
     operations_pending: u32,
     accept_pending: bool,
+    /// Shared-listener refcount (accept_mode = shared, docs/DESIGN.md §7
+    /// Phase 4): every worker holds the *same* listener fd, so only the last
+    /// worker out may close it — an earlier close would hand the fd number
+    /// back for reuse while sibling workers still have ops referencing it.
+    /// Null = this worker owns its listener (reuseport mode, tests). Wired
+    /// by the worker before `start`, like `worker_index`.
+    listener_refs: ?*Counter,
     /// Wired by the worker before `start` (-1 = none): a byte, EOF, or error
     /// on this fd — main's socketpair poke — begins the drain. The pending
     /// recv is what lets a signal wake a worker blocked in the ring.
@@ -2384,6 +2392,7 @@ pub const ProxyServer = struct {
             .listener_closed = false,
             .operations_pending = 0,
             .accept_pending = false,
+            .listener_refs = null,
             .drain_trigger_fd = -1,
             .drain_trigger_buf = undefined,
             .accept_completion = undefined,
@@ -2582,12 +2591,19 @@ pub const ProxyServer = struct {
     /// Close the listener fd exactly once. Nothing is ever pending on it at
     /// this point (the accept completed or was never armed), so the close is
     /// synchronous. Queued-but-unaccepted handshakes get RST — unavoidable
-    /// with a closing SO_REUSEPORT listener, and documented.
+    /// with a closing listener (the hot-restart handoff is what avoids it).
+    /// A shared listener (accept_mode = shared) closes when the *last*
+    /// worker's drain reaches this point.
     fn close_listener(server: *ProxyServer) void {
         assert(server.draining); // only the drain path closes the listener
         if (server.listener_closed) return;
         server.listener_closed = true;
         assert(!server.accept_pending); // never close under a live accept
+        if (server.listener_refs) |refs| {
+            const remaining_before = refs.fetch_sub(1);
+            assert(remaining_before >= 1); // one decrement per worker, exactly
+            if (remaining_before > 1) return; // siblings still hold the fd
+        }
         server.io.close_now(server.listener.fd);
     }
 
@@ -5817,6 +5833,95 @@ test "proxy: drain during a request completes it with Connection: close injected
     try std.testing.expect(std.mem.endsWith(u8, received, "\r\n\r\nHELLO"));
     try std.testing.expectEqual(@as(u64, 1), metrics.requests.load());
     try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: two servers share one listener and the last drain closes it once" {
+    const gpa = std.testing.allocator;
+    // Close-per-request on the upstream side: the single-connection
+    // TestOrigin re-arms its accept after each close, so rounds may land on
+    // either server (each dials its own upstream) without wedging it.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool_a = try Pool.init(gpa, 4);
+    defer pool_a.deinit(gpa);
+    var pool_b = try Pool.init(gpa, 4);
+    defer pool_b.deinit(gpa);
+
+    // ONE listener; both servers arm accepts on it (accept_mode = shared).
+    const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    const proxy_port = proxy_listener.bound_address().port;
+    var listener_refs = Counter{ .value = 2 };
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server_a = ProxyServer.init(
+        &io,
+        &pool_a,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server_a.deinit();
+    var server_b = ProxyServer.init(
+        &io,
+        &pool_b,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server_b.deinit();
+    server_a.listener_refs = &listener_refs;
+    server_b.listener_refs = &listener_refs;
+    server_a.start();
+    server_b.start();
+
+    // Four sequential exchanges; the kernel picks whichever server's accept
+    // is pending — every one must be served regardless of which won it.
+    var round: u32 = 0;
+    while (round < 4) : (round += 1) {
+        const client = try connect_loopback(proxy_port);
+        defer _ = linux.close(client);
+        var c = DrainTestClient{
+            .io = &io,
+            .fd = client,
+            .request = "GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+        };
+        c.go();
+        while (!c.eof) try io.run_once();
+        try std.testing.expect(std.mem.endsWith(u8, c.buf[0..c.len], "\r\n\r\nHELLO"));
+    }
+    try std.testing.expectEqual(@as(u64, 4), metrics.requests.load());
+    try std.testing.expectEqual(@as(u64, 4), metrics.accepted.load());
+
+    // Both drain; the refcount makes the LAST one close the shared fd —
+    // an earlier close would recycle the fd number under the sibling.
+    server_a.begin_drain();
+    server_b.begin_drain();
+    while (!server_a.drain_complete() or !server_b.drain_complete()) try io.run_once();
+    try std.testing.expectEqual(@as(u64, 0), listener_refs.load());
+    try expect_connect_refused(proxy_port);
 }
 
 test "proxy: a byte on the drain trigger fd begins the drain" {
