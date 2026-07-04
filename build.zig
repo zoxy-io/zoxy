@@ -19,7 +19,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mod.linkLibrary(openssl_dependency.artifact("openssl"));
+    const openssl_library = openssl_dependency.artifact("openssl");
+    mod.linkLibrary(openssl_library);
+    // Also installed (zig-out/lib/libopenssl.a) for builds that bypass the
+    // build graph and must link it by path: scripts/coverage.sh.
+    b.installArtifact(openssl_library);
 
     const exe = b.addExecutable(.{
         .name = "zoxy",
@@ -47,9 +51,16 @@ pub fn build(b: *std.Build) void {
 
     // A Zig test binary tests one module at a time, hence two: the "zoxy"
     // module (all library tests via root.zig) and the executable's root.
-    const mod_tests = b.addTest(.{ .root_module = mod });
+    // -Dtest-filter narrows by test-name substring (raw `zig test` on
+    // src/root.zig no longer works: it would not link the OpenSSL library).
+    const test_filters: []const []const u8 = if (b.option(
+        []const u8,
+        "test-filter",
+        "Run only tests whose name contains this substring",
+    )) |filter| b.dupeStrings(&.{filter}) else &.{};
+    const mod_tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
     const run_mod_tests = b.addRunArtifact(mod_tests);
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");

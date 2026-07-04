@@ -33,17 +33,18 @@ exact schedule, faults included. CI runs seeds 0..300 on every push.
 Without direnv, prefix each with `nix develop --command` (this is what CI does), or
 enter the shell once with `nix develop` and drop the prefix.
 
-**Running a single test:** the build has no test filter step, so invoke the test
-binary directly with a name filter:
+**Running a single test:**
 
 ```sh
-zig test src/root.zig --test-filter "substring of test name"
+zig build test -Dtest-filter="substring of test name"
 ```
 
-(`zig build test` compiles two binaries — `mod` rooted at `src/root.zig` and the
-exe rooted at `src/main.zig` — because a Zig test binary tests one module at a time.
-`src/root.zig` aggregates every module's tests via its trailing `test { _ = ...; }`
-block, so a new source file's tests only run once it is `_ = @import(...)`ed there.)
+(Raw `zig test src/root.zig` no longer works — it bypasses the build graph and
+does not link the vendored OpenSSL. `zig build test` compiles two binaries —
+`mod` rooted at `src/root.zig` and the exe rooted at `src/main.zig` — because a
+Zig test binary tests one module at a time. `src/root.zig` aggregates every
+module's tests via its trailing `test { _ = ...; }` block, so a new source
+file's tests only run once it is `_ = @import(...)`ed there.)
 
 CI (`.github/workflows/ci.yml`) runs `zig fmt --check`, `zig build`, and
 `zig build test` inside `nix develop`. Match it before pushing.
