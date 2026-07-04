@@ -557,8 +557,24 @@ catches the dominant failures), ejection-time multipliers.
      numbers trivially 0/0 (else the connection stays on the pair relay),
      and the steady-state relay becomes byte-identical to plaintext. Six
      sub-slices listed there, IO seam first.
-  4. **Upstream re-encryption** — client-side TLS to origins, reusing the same
-     arena + BIO/kTLS machinery; only after downstream termination is proven.
+  4. **Upstream re-encryption** — mostly done 2026-07-04. Config: a cluster
+     `tls` block with an explicit verification posture — `ca_file` (a PEM
+     bundle loaded into the context's store in memory) plus `server_name`
+     (required of the certificate via SSL_set1_host and offered as SNI), or
+     a spelled-out `"insecure": true`; halves and mixes are refused. The
+     TLS driver became leg-parameterized: the same `Tls` struct and pump
+     serve a downstream leg (failures tear down) and a per-attempt upstream
+     leg (failures feed the retry machinery through the active logical op's
+     callback — a refused certificate is an attempt failure, answered 502,
+     retryable). The upstream leg handshakes after connect, primes on
+     completion, and dies with the attempt at dispose. **No upstream kTLS**:
+     origins send session tickets as application-epoch records, which
+     defeats the sequence-zero rule — the upstream leg stays on the BIO
+     pair. **No pooling yet (U3)**: TLS clusters dial fresh per request
+     (`maybe_pool_upstream` refuses; a parked connection would need its
+     channel parked too). Verified: TLS client -> zoxy -> TLS nginx with
+     hostname verification end to end; wrong authority and wrong hostname
+     both produce clean 502s with nothing reaching the origin.
 - HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
   control** (stream + connection windows) wired into the existing watermark
   system, HPACK decode/re-encode, H2 pool with multiplexing + GOAWAY draining.
