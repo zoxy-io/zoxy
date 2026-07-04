@@ -15,6 +15,7 @@ const Listener = zoxy.Listener;
 const Router = zoxy.Router;
 const ProxyServer = zoxy.proxy.ProxyServer;
 const Pool = zoxy.proxy.ConnPool;
+const TlsLegPool = zoxy.proxy.TlsLegPool;
 const Metrics = zoxy.Metrics;
 const AccessLog = zoxy.AccessLog;
 const Ip4Address = std.Io.net.Ip4Address;
@@ -239,6 +240,25 @@ pub fn main(init: std.process.Init) !void {
     const pools = try gpa.alloc(cache_line.Padded(Pool), worker_count);
     for (pools) |*slot| slot.value = try Pool.init(gpa, constants.connections_max);
 
+    // TLS legs live in their own per-worker pool, sized one leg per
+    // connection per TLS-speaking side — a plaintext config reserves none
+    // (the legs' 2x18KiB wire staging dominated ProxyConn's footprint).
+    var tls_sides: u32 = 0;
+    if (tls_context != null) tls_sides += 1;
+    for (upstream_tls) |slot| {
+        if (slot != null) {
+            tls_sides += 1;
+            break;
+        }
+    }
+    const leg_pools: []cache_line.Padded(TlsLegPool) = if (tls_sides > 0) pools: {
+        const leg_pools = try gpa.alloc(cache_line.Padded(TlsLegPool), worker_count);
+        for (leg_pools) |*slot| {
+            slot.value = try TlsLegPool.init(gpa, constants.connections_max * tls_sides);
+        }
+        break :pools leg_pools;
+    } else &.{};
+
     // One entropy draw seeds every worker's PRNG (P2C draws, retry jitter);
     // each worker offsets it by its cpu index so no two draw alike.
     var seed_bytes: [8]u8 = undefined;
@@ -254,14 +274,15 @@ pub fn main(init: std.process.Init) !void {
         cpu,
     | {
         const listener = unique_listeners[if (cfg.accept_mode == .shared) 0 else cpu];
+        const legs: ?*TlsLegPool = if (tls_sides > 0) &leg_pools[cpu].value else null;
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
             .{
-                listener,   &pool_slot.value,     &router,
-                &metrics,   &access_slot.value,   seed_base,
-                cpu,        tls_context,          upstream_tls,
-                trigger[0], shared_listener_refs,
+                listener, &pool_slot.value,   &router,
+                &metrics, &access_slot.value, seed_base,
+                cpu,      tls_context,        upstream_tls,
+                legs,     trigger[0],         shared_listener_refs,
             },
         );
     }
@@ -417,6 +438,7 @@ fn run_worker(
     cpu: usize,
     tls_context: ?*const zoxy.terminator.Context,
     upstream_tls: []const ?*const zoxy.terminator.Context,
+    tls_legs: ?*TlsLegPool,
     drain_trigger_fd: std.posix.socket_t,
     listener_refs: ?*zoxy.Counter,
 ) void {
@@ -449,6 +471,7 @@ fn run_worker(
     server.prng = .init(seed_base +% cpu);
     server.tls_context = tls_context;
     server.upstream_tls_contexts = upstream_tls;
+    server.tls_legs = tls_legs;
     server.drain_trigger_fd = drain_trigger_fd;
     server.listener_refs = listener_refs;
     server.start();

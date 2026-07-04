@@ -55,6 +55,11 @@ const kernel_tls = @import("../tls/kernel.zig");
 const Ip4Address = std.Io.net.Ip4Address;
 
 const Pool = @import("pool.zig").Pool(ProxyConn);
+/// TLS legs, pooled per worker like connections. Sized by config —
+/// `connections_max` per TLS-speaking side (downstream termination,
+/// upstream re-encryption) — so a conn's acquire of at most one leg per
+/// side can never find the pool empty. Null when the config has no TLS.
+pub const TlsLegPool = @import("pool.zig").Pool(ProxyConn.Tls);
 
 // Fixed error responses (Connection: close so the client stops after reading).
 const response_400 = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -131,12 +136,12 @@ const Pipe = struct {
         assert(!pipe.framer.is_complete()); // a finished direction is never re-armed
         if (!pipe.to_client and pipe.conn.tls != null) {
             // The request-body direction reads from a TLS client.
-            const leg = &pipe.conn.tls.?;
+            const leg = pipe.conn.tls.?;
             return pipe.conn.tls_recv_start(leg, &pipe.buf, on_tls_recv);
         }
         if (pipe.to_client and pipe.conn.upstream_tls != null) {
             // The response direction reads from a TLS origin.
-            const leg = &pipe.conn.upstream_tls.?;
+            const leg = pipe.conn.upstream_tls.?;
             return pipe.conn.tls_recv_start(leg, &pipe.buf, on_upstream_tls_recv);
         }
         pipe.conn.retain();
@@ -199,12 +204,12 @@ const Pipe = struct {
             // The response direction writes to a TLS client. The completion
             // reports plaintext consumed, so byte accounting stays in
             // application bytes on both paths.
-            const leg = &pipe.conn.tls.?;
+            const leg = pipe.conn.tls.?;
             return pipe.conn.tls_send_start(leg, pipe.buf[pipe.sent..pipe.filled], on_tls_send);
         }
         if (!pipe.to_client and pipe.conn.upstream_tls != null) {
             // The request-body direction writes to a TLS origin.
-            const leg = &pipe.conn.upstream_tls.?;
+            const leg = pipe.conn.upstream_tls.?;
             return pipe.conn.tls_send_start(
                 leg,
                 pipe.buf[pipe.sent..pipe.filled],
@@ -435,13 +440,16 @@ pub const ProxyConn = struct {
     response_pipe: Pipe,
 
     /// Downstream TLS state; null on a plaintext listener. Connection-scoped:
-    /// created at accept (or the connection is shed), freed with the slot —
-    /// or earlier, at the kernel switchover.
-    tls: ?Tls,
+    /// checked out of `tls_legs` at accept (or the connection is shed),
+    /// checked back in with the slot — or earlier, at the kernel switchover.
+    tls: ?*Tls,
     /// Upstream TLS state (re-encryption); null between attempts and on
-    /// plaintext clusters. Attempt-scoped: created after connect, freed at
-    /// dispose_upstream (or with the slot on teardown).
-    upstream_tls: ?Tls,
+    /// plaintext clusters. Attempt-scoped: checked out after connect,
+    /// checked in at dispose_upstream (or with the slot on teardown).
+    upstream_tls: ?*Tls,
+    /// The worker's leg pool; null iff the config has no TLS anywhere (then
+    /// neither leg is ever acquired). From the server, set at start.
+    tls_legs: ?*TlsLegPool,
     /// Per-cluster upstream client contexts (by cluster.index); empty when
     /// no cluster re-encrypts. From the server, set at start.
     upstream_tls_contexts: []const ?*const terminator.Context,
@@ -524,33 +532,41 @@ pub const ProxyConn = struct {
         wire_recv_completion: Completion,
         wire_send_completion: Completion,
 
+        // Pool bookkeeping (`Pool(Tls)`): legs live in a per-worker pool,
+        // not inline in ProxyConn — inline they cost 2 x 36KiB of dirtied
+        // pages per connection even on plaintext workloads.
+        free_next: ?*Tls,
+        in_use: bool,
+
         const Side = enum { downstream, upstream };
 
-        fn init(channel: terminator.Channel, side: Side, kernel_offload_enabled: bool) Tls {
-            return .{
-                .channel = channel,
-                .side = side,
-                .handshake_complete = false,
-                .wire_recv_buf = undefined,
-                .wire_recv_staged = 0,
-                .wire_recv_in_flight = false,
-                .wire_send_buf = undefined,
-                .wire_send_filled = 0,
-                .wire_send_sent = 0,
-                .wire_send_in_flight = false,
-                .recv_target = null,
-                .recv_callback = undefined,
-                .send_source = "",
-                .send_consumed = 0,
-                .send_active = false,
-                .send_callback = undefined,
-                .notify_then_teardown = false,
-                .kernel_switch_pending = false,
-                .kernel_offload_enabled = kernel_offload_enabled,
-                .secrets = .{},
-                .wire_recv_completion = undefined,
-                .wire_send_completion = undefined,
-            };
+        /// Field-by-field reset of a pooled leg. Deliberately NOT a struct
+        /// assignment: the wire buffers stay untouched (a whole-struct write
+        /// would dirty their 36KiB even when TLS never stages a byte) and
+        /// the pool's own bookkeeping fields must survive.
+        fn reset(leg: *Tls, channel: terminator.Channel, side: Side, kernel_offload: bool) void {
+            assert(leg.in_use); // freshly acquired from the pool
+            assert(leg.free_next == null);
+            leg.channel = channel;
+            leg.side = side;
+            leg.handshake_complete = false;
+            leg.wire_recv_staged = 0;
+            leg.wire_recv_in_flight = false;
+            leg.wire_send_filled = 0;
+            leg.wire_send_sent = 0;
+            leg.wire_send_in_flight = false;
+            leg.recv_target = null;
+            leg.recv_callback = undefined;
+            leg.send_source = "";
+            leg.send_consumed = 0;
+            leg.send_active = false;
+            leg.send_callback = undefined;
+            leg.notify_then_teardown = false;
+            leg.kernel_switch_pending = false;
+            leg.kernel_offload_enabled = kernel_offload;
+            leg.secrets = .{};
+            leg.wire_recv_completion = undefined;
+            leg.wire_send_completion = undefined;
         }
     };
 
@@ -569,29 +585,43 @@ pub const ProxyConn = struct {
         idle_timeout_ns: u63,
         tls_context: ?*const terminator.Context,
         upstream_tls_contexts: []const ?*const terminator.Context,
+        tls_legs: ?*TlsLegPool,
     ) void {
         assert(downstream_fd >= 0);
         // TLS first, before any state or metrics: exhaustion of the TLS heap
         // sheds the whole connection here (reject, never a partial start).
         conn.tls = null;
         conn.upstream_tls = null;
+        conn.tls_legs = tls_legs;
         conn.upstream_tls_contexts = upstream_tls_contexts;
         conn.downstream_yield_pending = false;
         conn.upstream_yield_pending = false;
         conn.ktls_active = false;
         conn.ktls_notify_pending = false;
         if (tls_context) |context| {
-            const channel = terminator.Channel.init(context) catch {
+            assert(tls_legs != null); // wired together with the context
+            // Sized one leg per connection, so a fresh conn always finds one;
+            // shed like heap exhaustion if the invariant ever breaks.
+            const leg = tls_legs.?.acquire() orelse {
                 metrics.tls_handshake_failures.add(1);
                 metrics.rejected.add(1);
                 io.close_now(downstream_fd);
                 pool.release(conn);
                 return;
             };
-            conn.tls = Tls.init(channel, .downstream, context.kernel_offload);
+            const channel = terminator.Channel.init(context) catch {
+                tls_legs.?.release(leg);
+                metrics.tls_handshake_failures.add(1);
+                metrics.rejected.add(1);
+                io.close_now(downstream_fd);
+                pool.release(conn);
+                return;
+            };
+            leg.reset(channel, .downstream, context.kernel_offload);
             // The keylog callback fills these secrets during the handshake;
-            // armed here, at the field's final (pooled, stable) address.
-            conn.tls.?.channel.capture_secrets(&conn.tls.?.secrets);
+            // armed here, at the leg's checked-out (pool-stable) address.
+            leg.channel.capture_secrets(&leg.secrets);
+            conn.tls = leg;
         }
         conn.io = io;
         conn.pool = pool;
@@ -622,7 +652,7 @@ pub const ProxyConn = struct {
         // (ClientHello), so this arms the first wire recv. Handshake and
         // request share the request deadline already running.
         if (conn.tls != null) {
-            conn.tls_handshake_progress(&conn.tls.?);
+            conn.tls_handshake_progress(conn.tls.?);
         } else {
             conn.arm_recv_head();
         }
@@ -798,18 +828,30 @@ pub const ProxyConn = struct {
         conn.resilience.connection_close(conn.cluster_index);
     }
 
+    /// Hand a leg back to the worker's pool. The channel is already gone —
+    /// deinit'ed by the caller, or parked (upstream pool / kernel switch).
+    fn tls_leg_release(conn: *ProxyConn, leg: *Tls) void {
+        assert(!leg.wire_recv_in_flight); // release points are wire-quiescent
+        assert(!leg.wire_send_in_flight);
+        assert(conn.tls_legs != null); // a leg exists, so the pool does
+        conn.tls_legs.?.release(leg);
+    }
+
     fn release_ref(conn: *ProxyConn) void {
         assert(conn.refs > 0);
         conn.refs -= 1;
         if (conn.closing and conn.refs == 0) {
             // Quiescent: no op can touch the channels anymore. Their SSL +
-            // BIO pairs return to the TLS heap with the slot.
-            if (conn.tls) |*tls| {
+            // BIO pairs return to the TLS heap with the slot, the legs to
+            // the worker's pool.
+            if (conn.tls) |tls| {
                 tls.channel.deinit();
+                conn.tls_leg_release(tls);
                 conn.tls = null;
             }
-            if (conn.upstream_tls) |*leg| {
+            if (conn.upstream_tls) |leg| {
                 leg.channel.deinit();
+                conn.tls_leg_release(leg);
                 conn.upstream_tls = null;
             }
             conn.metrics.active.sub(1);
@@ -977,7 +1019,7 @@ pub const ProxyConn = struct {
     /// socket error — else settle the attempt directly.
     fn tls_upstream_broken(conn: *ProxyConn) void {
         assert(!conn.closing);
-        const leg = &conn.upstream_tls.?;
+        const leg = conn.upstream_tls.?;
         assert(leg.side == .upstream);
         if (leg.recv_target != null) {
             leg.recv_target = null;
@@ -1002,7 +1044,7 @@ pub const ProxyConn = struct {
     /// whichever relay won.
     fn tls_try_kernel_switch(conn: *ProxyConn) void {
         assert(!conn.closing);
-        const tls = &conn.tls.?;
+        const tls = conn.tls.?;
         assert(tls.side == .downstream); // upstream never switches (tickets)
         assert(tls.kernel_switch_pending);
         assert(tls.handshake_complete);
@@ -1026,9 +1068,11 @@ pub const ProxyConn = struct {
                 parameters.receive.bytes(),
             ) catch break :switched; // no module / kernel refused the cipher
             // The kernel owns the record layer: the channel (SSL + BIO
-            // pair) returns to the TLS heap *now*, and every downstream op
-            // from here on is a plain ring op on the fd.
+            // pair) returns to the TLS heap *now*, the leg to the worker's
+            // pool, and every downstream op from here on is a plain ring op
+            // on the fd.
             tls.channel.deinit();
+            conn.tls_leg_release(tls);
             conn.tls = null;
             conn.ktls_active = true;
             conn.metrics.tls_ktls_active.add(1);
@@ -1048,7 +1092,7 @@ pub const ProxyConn = struct {
     fn close_downstream(conn: *ProxyConn) void {
         if (conn.closing) return;
         if (conn.ktls_active) return conn.ktls_send_close_notify();
-        const tls = if (conn.tls) |*tls| tls else return conn.teardown();
+        const tls = if (conn.tls) |tls| tls else return conn.teardown();
         if (!tls.handshake_complete) return conn.teardown();
         if (tls.notify_then_teardown) return; // already flushing
         assert(!tls.send_active); // callers close only after a delivered send
@@ -1064,13 +1108,23 @@ pub const ProxyConn = struct {
         assert(!conn.closing);
         assert(conn.upstream_fd >= 0);
         assert(conn.upstream_tls == null); // one leg per attempt
-        const channel = terminator.Channel.init(context) catch {
+        assert(conn.tls_legs != null); // an upstream context implies a leg pool
+        // Sized one upstream leg per connection, so this cannot run dry;
+        // shed like heap exhaustion if the invariant ever breaks.
+        const leg = conn.tls_legs.?.acquire() orelse {
             conn.metrics.tls_handshake_failures.add(1);
             conn.close_attempt(.aborted);
             return conn.fail(response_503);
         };
-        conn.upstream_tls = Tls.init(channel, .upstream, false);
-        conn.tls_handshake_progress(&conn.upstream_tls.?);
+        const channel = terminator.Channel.init(context) catch {
+            conn.tls_legs.?.release(leg);
+            conn.metrics.tls_handshake_failures.add(1);
+            conn.close_attempt(.aborted);
+            return conn.fail(response_503);
+        };
+        leg.reset(channel, .upstream, false);
+        conn.upstream_tls = leg;
+        conn.tls_handshake_progress(leg);
     }
 
     /// One alert record through the kernel: payload in the iovec, record
@@ -1124,7 +1178,7 @@ pub const ProxyConn = struct {
     /// via the send completion; a stalled peer is bounded by the deadline.
     fn tls_notify_progress(conn: *ProxyConn) void {
         assert(!conn.closing);
-        const tls = &conn.tls.?;
+        const tls = conn.tls.?;
         assert(tls.notify_then_teardown);
         conn.tls_flush_wire_send(tls);
         const wire_idle = !tls.wire_send_in_flight and
@@ -1282,7 +1336,7 @@ pub const ProxyConn = struct {
         result: io_mod.RecvError!usize,
     ) void {
         defer conn.release_ref();
-        conn.tls_wire_recv_done(&conn.tls.?, result);
+        conn.tls_wire_recv_done(conn.tls.?, result);
     }
 
     fn on_upstream_wire_recv(
@@ -1293,7 +1347,7 @@ pub const ProxyConn = struct {
         defer conn.release_ref();
         // The leg may already be disposed when a teardown raced this
         // completion; nothing is left to progress then.
-        if (conn.upstream_tls) |*leg| conn.tls_wire_recv_done(leg, result);
+        if (conn.upstream_tls) |leg| conn.tls_wire_recv_done(leg, result);
     }
 
     fn tls_wire_recv_done(conn: *ProxyConn, leg: *Tls, result: io_mod.RecvError!usize) void {
@@ -1363,7 +1417,7 @@ pub const ProxyConn = struct {
         result: io_mod.SendError!usize,
     ) void {
         defer conn.release_ref();
-        conn.tls_wire_send_done(&conn.tls.?, result);
+        conn.tls_wire_send_done(conn.tls.?, result);
     }
 
     fn on_upstream_wire_send(
@@ -1372,7 +1426,7 @@ pub const ProxyConn = struct {
         result: io_mod.SendError!usize,
     ) void {
         defer conn.release_ref();
-        if (conn.upstream_tls) |*leg| conn.tls_wire_send_done(leg, result);
+        if (conn.upstream_tls) |leg| conn.tls_wire_send_done(leg, result);
     }
 
     fn tls_wire_send_done(conn: *ProxyConn, leg: *Tls, result: io_mod.SendError!usize) void {
@@ -1424,7 +1478,7 @@ pub const ProxyConn = struct {
         if (conn.closing) return;
         // The leg may be gone: the kernel switchover freed it and HTTP now
         // runs on plain ring ops — nothing left to pump.
-        const leg = if (conn.tls) |*leg| leg else return;
+        const leg = if (conn.tls) |leg| leg else return;
         conn.tls_progress(leg);
     }
 
@@ -1435,7 +1489,7 @@ pub const ProxyConn = struct {
         // The attempt's leg may be gone (disposed) or replaced (the next
         // request's resumed leg) by the time a stale yield fires; pumping
         // the current leg — or nothing — is safe: progress is idempotent.
-        const leg = if (conn.upstream_tls) |*leg| leg else return;
+        const leg = if (conn.upstream_tls) |leg| leg else return;
         conn.tls_progress(leg);
     }
 
@@ -1447,7 +1501,7 @@ pub const ProxyConn = struct {
         assert(conn.head_filled < conn.head_buf.len); // there is room to read into
         if (conn.tls != null) {
             return conn.tls_recv_start(
-                &conn.tls.?,
+                conn.tls.?,
                 conn.head_buf[conn.head_filled..],
                 handle_recv_head,
             );
@@ -1598,16 +1652,26 @@ pub const ProxyConn = struct {
                 conn.io.close_now(parked.fd);
                 return conn.connect_upstream();
             }
+            if (parked.channel) |channel| {
+                // Resume the parked TLS session as this attempt's leg: the
+                // handshake is long done, so the prime goes straight out.
+                assert(conn.tls_legs != null); // a parked channel implies TLS config
+                const leg = conn.tls_legs.?.acquire() orelse {
+                    // Cannot happen by sizing. Nothing committed yet: drop
+                    // the parked connection and dial fresh (the dial's own
+                    // leg acquire sheds if the pool is truly dry).
+                    channel.deinit();
+                    conn.io.close_now(parked.fd);
+                    return conn.connect_upstream();
+                };
+                leg.reset(channel, .upstream, false);
+                leg.handshake_complete = true;
+                conn.upstream_tls = leg;
+            }
             conn.upstream_fd = parked.fd;
             conn.account_upstream_open();
             conn.upstream_pooled = true;
             conn.metrics.upstream_reused.add(1);
-            if (parked.channel) |channel| {
-                // Resume the parked TLS session as this attempt's leg: the
-                // handshake is long done, so the prime goes straight out.
-                conn.upstream_tls = Tls.init(channel, .upstream, false);
-                conn.upstream_tls.?.handshake_complete = true;
-            }
             return conn.arm_prime(); // already connected: skip the dial
         }
         conn.connect_upstream();
@@ -1860,10 +1924,11 @@ pub const ProxyConn = struct {
         // The attempt's TLS leg dies with its connection. Dispose points are
         // quiescent — no wire op can be in flight (their completions are how
         // the attempt settled); a stale yield is guarded by its callback.
-        if (conn.upstream_tls) |*leg| {
+        if (conn.upstream_tls) |leg| {
             assert(!leg.wire_recv_in_flight);
             assert(!leg.wire_send_in_flight);
             leg.channel.deinit();
+            conn.tls_leg_release(leg);
             conn.upstream_tls = null;
         }
         conn.io.shutdown_socket(conn.upstream_fd);
@@ -1934,7 +1999,7 @@ pub const ProxyConn = struct {
         const segment = conn.prime_segments[conn.prime_segment_index];
         assert(conn.prime_sent < segment.len);
         if (conn.upstream_tls != null) {
-            const leg = &conn.upstream_tls.?;
+            const leg = conn.upstream_tls.?;
             return conn.tls_send_start(leg, segment[conn.prime_sent..], handle_prime_sent);
         }
         conn.retain();
@@ -2014,7 +2079,7 @@ pub const ProxyConn = struct {
         if (pipe.filled >= capacity) return conn.fail(response_502); // head too large
         assert(pipe.filled < capacity); // there is room to read into
         if (conn.upstream_tls != null) {
-            const leg = &conn.upstream_tls.?;
+            const leg = conn.upstream_tls.?;
             return conn.tls_recv_start(
                 leg,
                 pipe.buf[pipe.filled..capacity],
@@ -2213,7 +2278,7 @@ pub const ProxyConn = struct {
         // session tickets land in the same check, and closing is the safe
         // answer to both.
         var parked_channel: ?terminator.Channel = null;
-        if (conn.upstream_tls) |*leg| {
+        if (conn.upstream_tls) |leg| {
             conn.tls_feed_staged(leg); // a record tail may still be staged
             const quiescent = leg.wire_recv_staged == 0 and
                 !leg.wire_recv_in_flight and
@@ -2221,8 +2286,9 @@ pub const ProxyConn = struct {
                 leg.channel.pending_ciphertext() == 0 and
                 leg.channel.kernel_switch_eligible(); // nothing buffered in the SSL
             if (!quiescent) return; // finish_request / teardown closes it
-            parked_channel = leg.channel;
-            conn.upstream_tls = null; // ownership moves to the pool
+            parked_channel = leg.channel; // ownership moves to the upstream pool
+            conn.tls_leg_release(leg); // the leg (wire staging) does not
+            conn.upstream_tls = null;
         }
         // Nothing is pending on the fd: the response was fully received and
         // fully forwarded before this point.
@@ -2316,7 +2382,7 @@ pub const ProxyConn = struct {
         assert(conn.fail_sent < conn.fail_response.len);
         if (conn.tls != null) {
             return conn.tls_send_start(
-                &conn.tls.?,
+                conn.tls.?,
                 conn.fail_response[conn.fail_sent..],
                 handle_fail_sent,
             );
@@ -2373,6 +2439,9 @@ pub const ProxyServer = struct {
     /// `cluster.index`; null = plaintext upstream). Set by the worker after
     /// init; empty means "no cluster re-encrypts". Used from U2 onward.
     upstream_tls_contexts: []const ?*const terminator.Context,
+    /// This worker's TLS leg pool; set by the worker after init alongside
+    /// the contexts. Null iff neither side speaks TLS.
+    tls_legs: ?*TlsLegPool,
     request_timeout_ns: u63,
     idle_timeout_ns: u63,
     /// Drain-to-forced-teardown bound; set by the worker after init like
@@ -2429,6 +2498,7 @@ pub const ProxyServer = struct {
             .prng = .init(0),
             .tls_context = null,
             .upstream_tls_contexts = &.{},
+            .tls_legs = null,
             .request_timeout_ns = request_timeout_ns,
             .idle_timeout_ns = idle_timeout_ns,
             .drain_timeout_ns = constants.drain_timeout_ns,
@@ -2509,6 +2579,7 @@ pub const ProxyServer = struct {
                     server.idle_timeout_ns,
                     server.tls_context,
                     server.upstream_tls_contexts,
+                    server.tls_legs,
                 );
             } else {
                 server.metrics.rejected.add(1);
@@ -3106,6 +3177,8 @@ test "proxy: terminates TLS end to end — handshake, relay, heap drain" {
     defer client_context.deinit();
 
     var pool = try Pool.init(gpa, 4);
+    var tls_legs = try TlsLegPool.init(gpa, 8);
+    defer tls_legs.deinit(gpa);
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
@@ -3123,6 +3196,7 @@ test "proxy: terminates TLS end to end — handshake, relay, heap drain" {
     );
     defer server.deinit();
     server.tls_context = &server_context;
+    server.tls_legs = &tls_legs;
     server.start();
 
     const proxy_port = proxy_listener.bound_address().port;
@@ -3187,6 +3261,8 @@ test "proxy: TLS keep-alive carries pipelined requests on one handshake" {
     defer client_context.deinit();
 
     var pool = try Pool.init(gpa, 4);
+    var tls_legs = try TlsLegPool.init(gpa, 8);
+    defer tls_legs.deinit(gpa);
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
@@ -3204,6 +3280,7 @@ test "proxy: TLS keep-alive carries pipelined requests on one handshake" {
     );
     defer server.deinit();
     server.tls_context = &server_context;
+    server.tls_legs = &tls_legs;
     server.start();
 
     // Two pipelined requests in one write: the second head is decrypted
@@ -3269,6 +3346,8 @@ test "proxy: hands the record layer to the kernel after a quiet handshake" {
     defer client_context.deinit();
 
     var pool = try Pool.init(gpa, 4);
+    var tls_legs = try TlsLegPool.init(gpa, 8);
+    defer tls_legs.deinit(gpa);
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
@@ -3286,6 +3365,7 @@ test "proxy: hands the record layer to the kernel after a quiet handshake" {
     );
     defer server.deinit();
     server.tls_context = &server_context;
+    server.tls_legs = &tls_legs;
     server.start();
 
     const heap_before = hook.memory_hook_stats();
@@ -3502,6 +3582,8 @@ test "proxy: re-encrypts to a verified TLS origin" {
     const router = Router.init(&cfg);
 
     var pool = try Pool.init(gpa, 4);
+    var tls_legs = try TlsLegPool.init(gpa, 8);
+    defer tls_legs.deinit(gpa);
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
@@ -3520,6 +3602,7 @@ test "proxy: re-encrypts to a verified TLS origin" {
     defer server.deinit();
     const upstream_contexts = [_]?*const terminator.Context{&upstream_context};
     server.upstream_tls_contexts = &upstream_contexts;
+    server.tls_legs = &tls_legs;
     server.start();
 
     // A plaintext client: only the upstream hop is encrypted.
@@ -3607,6 +3690,8 @@ test "proxy: pools and resumes a TLS upstream — one handshake, two requests" {
     const router = Router.init(&cfg);
 
     var pool = try Pool.init(gpa, 4);
+    var tls_legs = try TlsLegPool.init(gpa, 8);
+    defer tls_legs.deinit(gpa);
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
@@ -3625,6 +3710,7 @@ test "proxy: pools and resumes a TLS upstream — one handshake, two requests" {
     defer server.deinit();
     const upstream_contexts = [_]?*const terminator.Context{&upstream_context};
     server.upstream_tls_contexts = &upstream_contexts;
+    server.tls_legs = &tls_legs;
     server.start();
 
     // Two pipelined requests on one downstream connection: request two must
@@ -3721,6 +3807,8 @@ test "proxy: a wrong upstream authority fails the attempt with a 502" {
     const router = Router.init(&cfg);
 
     var pool = try Pool.init(gpa, 4);
+    var tls_legs = try TlsLegPool.init(gpa, 8);
+    defer tls_legs.deinit(gpa);
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
@@ -3739,6 +3827,7 @@ test "proxy: a wrong upstream authority fails the attempt with a 502" {
     defer server.deinit();
     const upstream_contexts = [_]?*const terminator.Context{&upstream_context};
     server.upstream_tls_contexts = &upstream_contexts;
+    server.tls_legs = &tls_legs;
     server.start();
 
     const client = try connect_loopback(proxy_listener.bound_address().port);
