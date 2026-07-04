@@ -234,7 +234,12 @@ pub const HealthChecker = struct {
     /// Fold a probe result into the endpoint's streaks and flip `healthy`
     /// at the thresholds. Streaks only accumulate toward a flip — the
     /// steady state stays at zero so a single blip cannot linger.
-    fn record(checker: *HealthChecker, cluster_index: u32, endpoint_index: u32, success: bool) void {
+    fn record(
+        checker: *HealthChecker,
+        cluster_index: u32,
+        endpoint_index: u32,
+        success: bool,
+    ) void {
         const policy = &checker.clusters[cluster_index].policy;
         assert(policy.health_interval_ns > 0); // probes only run when configured
         const endpoint = checker.resilience.endpoint_state(cluster_index, endpoint_index);

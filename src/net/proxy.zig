@@ -943,7 +943,13 @@ pub const ProxyConn = struct {
         conn.retry_scheduled = true;
         conn.retry_pending = true;
         conn.retain();
-        conn.io.timeout(*ProxyConn, conn, on_retry_backoff, &conn.retry_timeout_completion, delay_ns);
+        conn.io.timeout(
+            *ProxyConn,
+            conn,
+            on_retry_backoff,
+            &conn.retry_timeout_completion,
+            delay_ns,
+        );
     }
 
     fn on_retry_backoff(conn: *ProxyConn, _: *Completion, _: io_mod.TimeoutError!void) void {

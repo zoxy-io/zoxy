@@ -407,8 +407,14 @@ test "config: resilience blocks resolve fields, defaults, and ms to ns" {
     try std.testing.expectEqual(@as(u8, 3), policy.retry_max);
     try std.testing.expectEqual(@as(u63, 50 * std.time.ns_per_ms), policy.retry_backoff_base_ns);
     // Absent fields inside a present block fall back to constants defaults.
-    try std.testing.expectEqual(constants.retry_backoff_cap_ns_default, policy.retry_backoff_cap_ns);
-    try std.testing.expectEqual(constants.retry_budget_percent_default, policy.retry_budget_percent);
+    try std.testing.expectEqual(
+        constants.retry_backoff_cap_ns_default,
+        policy.retry_backoff_cap_ns,
+    );
+    try std.testing.expectEqual(
+        constants.retry_budget_percent_default,
+        policy.retry_budget_percent,
+    );
     try std.testing.expectEqual(constants.retry_budget_min_default, policy.retry_budget_min);
     try std.testing.expectEqual(@as(u63, 2 * std.time.ns_per_s), policy.per_try_timeout_ns);
     try std.testing.expectEqual(@as(u32, 128), policy.max_requests);

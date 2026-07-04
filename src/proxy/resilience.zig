@@ -314,16 +314,19 @@ test "resilience: consecutive failures eject, success and neutral outcomes do no
         .outlier_ejection_percent_max = 50,
     };
     const total: u32 = 4;
+    const endpoint = &resilience.clusters[0].endpoints[0];
 
     // Neutral outcomes leave the streak alone; success resets it.
     resilience.attempt_start(0, 0);
-    try std.testing.expect(!resilience.attempt_finish(0, 0, .failure_stale_pool, &policy, total, 0));
+    try std.testing.expect(
+        !resilience.attempt_finish(0, 0, .failure_stale_pool, &policy, total, 0),
+    );
     resilience.attempt_start(0, 0);
     try std.testing.expect(!resilience.attempt_finish(0, 0, .failure, &policy, total, 0));
-    try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].endpoints[0].consecutive_failures);
+    try std.testing.expectEqual(@as(u32, 1), endpoint.consecutive_failures);
     resilience.attempt_start(0, 0);
     try std.testing.expect(!resilience.attempt_finish(0, 0, .success, &policy, total, 0));
-    try std.testing.expectEqual(@as(u32, 0), resilience.clusters[0].endpoints[0].consecutive_failures);
+    try std.testing.expectEqual(@as(u32, 0), endpoint.consecutive_failures);
 
     // Two straight failures eject: deadline set, count bumped, streak reset.
     for (0..2) |i| {
@@ -331,9 +334,9 @@ test "resilience: consecutive failures eject, success and neutral outcomes do no
         const ejected = resilience.attempt_finish(0, 0, .failure, &policy, total, 100);
         try std.testing.expectEqual(i == 1, ejected);
     }
-    try std.testing.expectEqual(@as(u64, 1100), resilience.clusters[0].endpoints[0].ejected_until_ns);
+    try std.testing.expectEqual(@as(u64, 1100), endpoint.ejected_until_ns);
     try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].ejected_count);
-    try std.testing.expectEqual(@as(u32, 0), resilience.clusters[0].endpoints[0].consecutive_failures);
+    try std.testing.expectEqual(@as(u32, 0), endpoint.consecutive_failures);
 }
 
 test "resilience: the ejection ceiling holds until an expired ejection is swept" {
@@ -356,7 +359,10 @@ test "resilience: the ejection ceiling holds until an expired ejection is swept"
     resilience.attempt_start(0, 1);
     try std.testing.expect(resilience.attempt_finish(0, 1, .failure, &policy, total, 2000));
     try std.testing.expectEqual(@as(u64, 0), resilience.clusters[0].endpoints[0].ejected_until_ns);
-    try std.testing.expectEqual(@as(u64, 3000), resilience.clusters[0].endpoints[1].ejected_until_ns);
+    try std.testing.expectEqual(
+        @as(u64, 3000),
+        resilience.clusters[0].endpoints[1].ejected_until_ns,
+    );
     try std.testing.expectEqual(@as(u32, 1), resilience.clusters[0].ejected_count);
 }
 
