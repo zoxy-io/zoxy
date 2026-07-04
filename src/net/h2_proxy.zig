@@ -20,9 +20,13 @@
 //! same follow-up path applies): no retry tiers, no per-try timeout —
 //! an attempt failure before the first response byte answers the stream
 //! with 502/504, after it resets the stream. Upstream TLS re-encryption
-//! is not wired for H2 legs yet (clusters demanding it answer 502; the
-//! ALPN flip that makes this path reachable is slice 5, which also owns
-//! drain GOAWAY).
+//! is still not wired for H2 legs (clusters demanding it answer 502).
+//!
+//! Downstream reaches here two ways: over TLS via
+//! `ProxyServer.hand_off_to_h2` (a terminated connection that negotiated
+//! `h2` in ALPN moves its channel + fd here), or plaintext h2c via
+//! `H2Server` (the simulator's driver — it excludes OpenSSL, so h2c is
+//! its only route in).
 
 const std = @import("std");
 const posix = std.posix;
@@ -1669,7 +1673,10 @@ pub const H2Conn = struct {
     }
 };
 
-/// Accept loop for a (plaintext, until slice 5's ALPN wiring) H2 listener.
+/// Accept loop for a plaintext h2c listener — the simulator's H2 driver.
+/// (TLS-ALPN `h2` never arrives here; it reaches `H2Conn` via
+/// `ProxyServer.hand_off_to_h2`. The sim excludes OpenSSL, so h2c is the
+/// only way to exercise the whole engine / leg / flow-control path.)
 pub const H2Server = struct {
     io: *IO,
     pool: *H2ConnPool,
