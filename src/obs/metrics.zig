@@ -11,11 +11,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
-
-/// Padding unit between shards. `std.atomic.cache_line` is 128 on x86_64 —
-/// deliberately double the 64-byte line, because the L2 spatial prefetcher
-/// pulls lines in adjacent pairs and would otherwise couple neighbor shards.
-const cache_line_bytes = std.atomic.cache_line;
+const cache_line = @import("../mem/cache_line.zig");
 
 /// A monotonic (or up/down, for gauges) atomic counter.
 pub const Counter = struct {
@@ -110,27 +106,14 @@ pub const Counters = struct {
 };
 
 pub const Metrics = struct {
-    shards: [shards_count]Shard align(cache_line_bytes) = @splat(.{}),
+    shards: [shards_count]cache_line.Padded(Counters) = @splat(.{ .value = .{} }),
 
     /// One shard per worker slot, plus one where a hot-restart predecessor's
     /// totals are folded (so they never pollute a worker's accept series).
     pub const shards_count = constants.workers_max + 1;
     pub const shard_adopted = constants.workers_max;
 
-    /// `Counters` padded out so no two shards share a cache line (or a
-    /// prefetched line pair — see `cache_line_bytes`).
-    const Shard = struct {
-        counters: Counters = .{},
-        padding: [padding_bytes]u8 = @splat(0),
-
-        const padding_bytes =
-            std.mem.alignForward(usize, @sizeOf(Counters), cache_line_bytes) -
-            @sizeOf(Counters);
-    };
-
     comptime {
-        assert(@sizeOf(Shard) % cache_line_bytes == 0); // shards never share a line
-        assert(Shard.padding_bytes < cache_line_bytes); // padding stays minimal
         // Every field is a Counter: `total`/`snapshot` iterate them uniformly.
         for (@typeInfo(Counters).@"struct".fields) |field| {
             assert(field.type == Counter);
@@ -141,7 +124,7 @@ pub const Metrics = struct {
     /// share the last worker slot (diagnostic accept series only).
     pub fn shard(metrics: *Metrics, index: u32) *Counters {
         assert(index < shards_count);
-        return &metrics.shards[index].counters;
+        return &metrics.shards[index].value;
     }
 
     /// Process-wide value of one counter: the sum over every shard. Read
@@ -150,7 +133,7 @@ pub const Metrics = struct {
     pub fn total(metrics: *const Metrics, comptime field_name: []const u8) u64 {
         var sum: u64 = 0;
         for (&metrics.shards) |*one_shard| { // bounded: shards_count
-            sum += @field(one_shard.counters, field_name).load();
+            sum += @field(one_shard.value, field_name).load();
         }
         return sum;
     }
@@ -164,7 +147,7 @@ pub const Metrics = struct {
             try writer.print("zoxy_{s} {d}\n", .{ field.name, metrics.total(field.name) });
         }
         for (metrics.shards[0..constants.workers_max], 0..) |*one_shard, index| {
-            const value = one_shard.counters.accepted.load();
+            const value = one_shard.value.accepted.load();
             if (value == 0) continue; // only workers that exist
             try writer.print(
                 "zoxy_worker_accepted{{worker=\"{d}\"}} {d}\n",
@@ -198,9 +181,9 @@ test "metrics: shards never share a cache line" {
     var m = Metrics{};
     const first = @intFromPtr(m.shard(0));
     const second = @intFromPtr(m.shard(1));
-    try std.testing.expect(second - first >= cache_line_bytes);
-    try std.testing.expectEqual(@as(usize, 0), first % cache_line_bytes);
-    try std.testing.expectEqual(@as(usize, 0), (second - first) % cache_line_bytes);
+    try std.testing.expect(second - first >= cache_line.bytes);
+    try std.testing.expectEqual(@as(usize, 0), first % cache_line.bytes);
+    try std.testing.expectEqual(@as(usize, 0), (second - first) % cache_line.bytes);
 }
 
 test "metrics: write_text dumps every counter" {

@@ -60,6 +60,10 @@ pub const Admin = @import("obs/admin.zig").Admin;
 /// Allocation guard for the zero-alloc acceptance gate (docs/DESIGN.md §4).
 pub const guard = @import("mem/guard.zig");
 
+/// Cache-line isolation for per-worker mutable state (metrics shards,
+/// pool headers, access logs): neighbors in an array never share a line.
+pub const cache_line = @import("mem/cache_line.zig");
+
 /// TLS termination via OpenSSL FFI (docs/DESIGN.md §6, Phase 3).
 pub const tls = @import("tls/openssl.zig");
 
@@ -86,6 +90,7 @@ test {
     _ = @import("obs/access_log.zig");
     _ = @import("obs/admin.zig");
     _ = guard;
+    _ = cache_line;
     _ = tls;
     _ = terminator;
     _ = @import("tls/heap.zig");

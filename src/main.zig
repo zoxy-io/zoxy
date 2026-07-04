@@ -8,6 +8,7 @@ const linux = std.os.linux;
 const assert = std.debug.assert;
 
 const zoxy = @import("zoxy");
+const cache_line = zoxy.cache_line;
 const constants = zoxy.constants;
 const IO = zoxy.io.IO;
 const Listener = zoxy.Listener;
@@ -225,14 +226,18 @@ pub fn main(init: std.process.Init) !void {
         shared_listener_refs = refs;
     }
 
-    // Per-worker access logs, reserved up front.
-    const accesses = try gpa.alloc(AccessLog, worker_count);
-    for (accesses) |*access| access.* = .{ .fd = stderr_fd };
+    // Per-worker access logs, reserved up front. Cache-line-padded slots:
+    // `used` moves on every request, and adjacent workers' mutable state
+    // must not share a line (same rule as the metrics shards).
+    const accesses = try gpa.alloc(cache_line.Padded(AccessLog), worker_count);
+    for (accesses) |*slot| slot.value = .{ .fd = stderr_fd };
 
     // Reserve every worker's pool up front, on this thread, so worker startup
     // touches no shared allocator and the serving loop allocates nothing.
-    const pools = try gpa.alloc(Pool, worker_count);
-    for (pools) |*pool| pool.* = try Pool.init(gpa, constants.connections_max);
+    // Padded like the access logs: a pool header (free list head/count) is
+    // written on every connection acquire/release by its owning worker.
+    const pools = try gpa.alloc(cache_line.Padded(Pool), worker_count);
+    for (pools) |*slot| slot.value = try Pool.init(gpa, constants.connections_max);
 
     // One entropy draw seeds every worker's PRNG (P2C draws, retry jitter);
     // each worker offsets it by its cpu index so no two draw alike.
@@ -243,8 +248,8 @@ pub fn main(init: std.process.Init) !void {
     const threads = try gpa.alloc(std.Thread, worker_count);
     for (threads, pools, accesses, drain_triggers, 0..) |
         *thread,
-        *pool,
-        *access,
+        *pool_slot,
+        *access_slot,
         trigger,
         cpu,
     | {
@@ -253,9 +258,10 @@ pub fn main(init: std.process.Init) !void {
             .{},
             run_worker,
             .{
-                listener,     pool,       &router,              &metrics,
-                access,       seed_base,  cpu,                  tls_context,
-                upstream_tls, trigger[0], shared_listener_refs,
+                listener,   &pool_slot.value,     &router,
+                &metrics,   &access_slot.value,   seed_base,
+                cpu,        tls_context,          upstream_tls,
+                trigger[0], shared_listener_refs,
             },
         );
     }

@@ -103,6 +103,7 @@ Consequences that bite if you forget them:
 | `src/proxy/health_check.zig` | active TCP-connect health probes, per worker, in-ring: one ticking scheduler, bounded probe slots, streak thresholds flip `EndpointState.healthy` |
 | `src/obs/metrics.zig`, `src/obs/access_log.zig` | per-worker cache-line-padded counter shards (single writer, no shared line on the data path; scrape/handoff sum across shards); fixed-buffer batched access log |
 | `src/mem/guard.zig` | `CountingAllocator` — the zero-alloc acceptance gate (baseline count == final count) |
+| `src/mem/cache_line.zig` | `Padded(T)` — cache-line isolation for per-worker mutable state in shared arrays (metrics shards, pool headers, access logs); neighbors never share a line |
 | `src/tls/openssl.zig` | OpenSSL FFI seam (Phase 3): hand-written externs (no @cImport), the process-global `CRYPTO_set_mem_functions` hook, PEM identity validation. **Install the hook before any other OpenSSL call** — OpenSSL refuses it after its first allocation |
 | `src/tls/heap.zig` | fixed-capacity size-class heap behind the memory hook — reserved at startup, exhaustion fails the OpenSSL operation (load-shedding), never grows |
 | `src/mem/futex_mutex.zig` | blocking mutex over the raw Linux futex (0.16 removed `std.Thread.Mutex`); off the data path only (TLS heap, handshake-time) |
