@@ -70,6 +70,8 @@ pub const TimeoutError = error{ Canceled, Unexpected };
 
 pub const CancelError = error{Unexpected};
 
+pub const KernelTlsError = error{ UpgradeUnsupported, ParametersRejected };
+
 /// Fault-injection knobs. Probabilities are per million, evaluated once per
 /// eligible operation completion with the scheduler's PRNG — a seed replays
 /// its faults exactly.
@@ -280,6 +282,21 @@ pub const IO = struct {
         socket.peer_fd = -1;
     }
 
+    /// The virtual kernel has no TLS ULP: every upgrade attempt fails, so a
+    /// simulated proxy always stays on the userspace relay (kTLS is
+    /// exercised by the linux-backend tests in tls/kernel.zig).
+    pub fn enable_kernel_tls(
+        io: *IO,
+        fd: posix.socket_t,
+        transmit_info: []const u8,
+        receive_info: []const u8,
+    ) KernelTlsError!void {
+        assert(transmit_info.len >= 40); // same contract as the linux backend
+        assert(receive_info.len >= 40);
+        _ = io.socket_at(fd); // range check
+        return error.UpgradeUnsupported;
+    }
+
     // ---- submission (same shape as the io_uring backend) -------------------
 
     pub fn accept(
@@ -322,6 +339,26 @@ pub const IO = struct {
         assert(buffer.len > 0);
         io.submit(Context, context, SendError!usize, callback, completion, .{
             .send = .{ .socket = socket, .buffer = buffer },
+        });
+    }
+
+    /// sendmsg(2) parity: the virtual wire has no record types, so the
+    /// control message is irrelevant and the payload (a single segment —
+    /// all zoxy needs) is submitted as a plain send.
+    pub fn send_message(
+        io: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, SendError!usize) void,
+        completion: *Completion,
+        socket: posix.socket_t,
+        message: *const linux.msghdr_const,
+    ) void {
+        assert(message.iovlen == 1); // multi-segment is unused; extend when needed
+        const segment = message.iov[0];
+        assert(segment.len > 0);
+        io.submit(Context, context, SendError!usize, callback, completion, .{
+            .send = .{ .socket = socket, .buffer = segment.base[0..segment.len] },
         });
     }
 

@@ -78,5 +78,6 @@ test {
     _ = tls;
     _ = terminator;
     _ = @import("tls/heap.zig");
+    _ = @import("tls/kernel.zig");
     _ = @import("mem/futex_mutex.zig");
 }

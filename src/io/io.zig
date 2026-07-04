@@ -25,6 +25,7 @@ pub const ConnectError = impl.ConnectError;
 pub const CloseError = impl.CloseError;
 pub const TimeoutError = impl.TimeoutError;
 pub const CancelError = impl.CancelError;
+pub const KernelTlsError = impl.KernelTlsError;
 
 test {
     _ = impl;

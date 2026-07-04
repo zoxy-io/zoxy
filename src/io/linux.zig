@@ -71,6 +71,14 @@ pub const ConnectError = error{
 
 pub const CloseError = error{Unexpected};
 
+pub const KernelTlsError = error{
+    /// The "tls" ULP would not attach: kernel module absent or too old.
+    UpgradeUnsupported,
+    /// The ULP attached but a direction's crypto parameters were refused
+    /// (cipher/version the kernel cannot offload).
+    ParametersRejected,
+};
+
 pub const TimeoutError = error{ Canceled, Unexpected };
 
 pub const CancelError = error{Unexpected};
@@ -81,6 +89,10 @@ const Operation = union(enum) {
     accept: struct { socket: posix.socket_t },
     recv: struct { socket: posix.socket_t, buffer: []u8 },
     send: struct { socket: posix.socket_t, buffer: []const u8 },
+    /// sendmsg(2): the caller owns the msghdr and everything it points at
+    /// (iovecs, control buffer) until the completion fires. Exists for
+    /// kTLS control records (a cmsg carries the TLS record type).
+    send_message: struct { socket: posix.socket_t, message: *const linux.msghdr_const },
     connect: struct { socket: posix.socket_t, addr: linux.sockaddr.in },
     close: struct { fd: posix.fd_t },
     timeout: struct { expires: linux.kernel_timespec },
@@ -208,6 +220,23 @@ pub const IO = struct {
         });
     }
 
+    /// sendmsg(2) through the ring. `message` and everything it references
+    /// must outlive the completion (same contract as a send buffer).
+    pub fn send_message(
+        io: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (Context, *Completion, SendError!usize) void,
+        completion: *Completion,
+        socket: posix.socket_t,
+        message: *const linux.msghdr_const,
+    ) void {
+        assert(message.iovlen > 0);
+        io.submit(Context, context, SendError!usize, callback, completion, .{
+            .send_message = .{ .socket = socket, .message = message },
+        });
+    }
+
     pub fn connect(
         io: *IO,
         comptime Context: type,
@@ -305,6 +334,12 @@ pub const IO = struct {
             // not raise SIGPIPE. Zig's start code ignores SIGPIPE by default,
             // but that is an invisible dependency (keep_sigpipe flips it).
             .send => |op| _ = try io.ring.send(user_data, op.socket, op.buffer, linux.MSG.NOSIGNAL),
+            .send_message => |op| _ = try io.ring.sendmsg(
+                user_data,
+                op.socket,
+                op.message,
+                linux.MSG.NOSIGNAL,
+            ),
             .connect => |*op| _ = try io.ring.connect(
                 user_data,
                 op.socket,
@@ -345,7 +380,7 @@ pub const IO = struct {
     pub fn open_tcp_socket(io: *IO) ?posix.socket_t {
         const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
         const rc = linux.socket(linux.AF.INET, flags, 0);
-        if (posix.errno(rc) != .SUCCESS) return null;
+        if (linux.errno(rc) != .SUCCESS) return null;
         const fd: posix.socket_t = @intCast(rc);
         io.set_tcp_no_delay(fd);
         return fd;
@@ -378,6 +413,32 @@ pub const IO = struct {
         _ = io;
         assert(fd >= 0);
         _ = linux.close(fd);
+    }
+
+    /// Hand a connection's TLS record layer to the kernel (docs/DESIGN.md
+    /// §6 "kTLS design"): attach the "tls" ULP, then install one
+    /// `tls/kernel.zig` crypto-info per direction. After success, plain
+    /// send/recv on the fd carry TLS records and the userspace channel can
+    /// be freed. Control plane, synchronous, called once per connection at
+    /// handshake completion. Failure means "stay on the userspace relay".
+    pub fn enable_kernel_tls(
+        io: *IO,
+        fd: posix.socket_t,
+        transmit_info: []const u8,
+        receive_info: []const u8,
+    ) KernelTlsError!void {
+        _ = io;
+        assert(fd >= 0);
+        assert(transmit_info.len >= 40); // smallest crypto-info (AES-GCM-128)
+        assert(receive_info.len >= 40);
+        posix.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.ULP, "tls") catch
+            return error.UpgradeUnsupported;
+        const tls_tx = 1; // linux/tls.h TLS_TX / TLS_RX
+        const tls_rx = 2;
+        posix.setsockopt(fd, linux.SOL.TLS, tls_tx, transmit_info) catch
+            return error.ParametersRejected;
+        posix.setsockopt(fd, linux.SOL.TLS, tls_rx, receive_info) catch
+            return error.ParametersRejected;
     }
 
     // ---- driving the loop -------------------------------------------------
@@ -475,7 +536,7 @@ pub const IO = struct {
                 const result = decode_recv(completion.result);
                 completion.callback(completion.context, completion, &result);
             },
-            .send => {
+            .send, .send_message => {
                 const result = decode_send(completion.result);
                 completion.callback(completion.context, completion, &result);
             },
