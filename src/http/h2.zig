@@ -110,6 +110,10 @@ pub const Connection = struct {
     send_window: i64 = 65535,
 
     goaway_received: bool = false,
+    /// Draining (docs/DESIGN.md §7 Phase 4, extended to H2 in Phase 5
+    /// slice 5): a GOAWAY with this last-stream id went out; streams the
+    /// client raced above it are refused, streams at or below it complete.
+    drain_last_stream_id: ?u31 = null,
 
     /// Process input and stage control output. Consumes at most one frame
     /// (or the preface) per call; call again while it makes progress.
@@ -154,6 +158,27 @@ pub const Connection = struct {
         assert(flow_bytes > 0);
         connection.recv_pending += flow_bytes;
         if (connection.stream_find(stream_id)) |stream| stream.recv_pending += flow_bytes;
+    }
+
+    /// Begin a graceful drain: stage GOAWAY naming the highest stream we
+    /// will serve. Streams the client already raced above it are refused
+    /// (their header blocks still decode — HPACK sync); the caller closes
+    /// the connection once every live stream settles.
+    pub fn begin_drain(connection: *Connection, output: []u8) usize {
+        assert(output.len >= h2_frame.goaway_frame_bytes);
+        if (connection.drain_last_stream_id != null) return 0; // already draining
+        if (connection.state == .failed) return 0; // the fatal GOAWAY said it all
+        connection.drain_last_stream_id = connection.stream_id_max_started;
+        h2_frame.write_goaway(
+            connection.stream_id_max_started,
+            .no_error,
+            output[0..h2_frame.goaway_frame_bytes],
+        );
+        return h2_frame.goaway_frame_bytes;
+    }
+
+    pub fn draining(connection: *const Connection) bool {
+        return connection.drain_last_stream_id != null;
     }
 
     /// The response for this stream is complete: free the slot.
@@ -455,12 +480,12 @@ pub const Connection = struct {
             }
             connection.block_kind = .trailers;
         } else if (stream_id > connection.stream_id_max_started) {
-            connection.block_kind = if (connection.streams_active < constants.h2_streams_max)
-                .request
-            else
-                // Over the advertised limit: the block still must be decoded
-                // (HPACK state), then the stream is refused.
-                .request_refused;
+            const refused = connection.streams_active >= constants.h2_streams_max or
+                // Draining: the GOAWAY named a lower id; this stream is the
+                // client's race, refused so it retries elsewhere (§6.8).
+                connection.drain_last_stream_id != null;
+            // Refused or not, the block still must be decoded (HPACK state).
+            connection.block_kind = if (refused) .request_refused else .request;
             connection.stream_id_max_started = stream_id;
         } else {
             return connection.fail(.stream_closed, output, staged, consumed); // closed stream (§5.1)
@@ -1269,6 +1294,36 @@ test "h2: send_data respects the connection window and empty END_STREAM" {
     h2_frame.write_window_update(0, 100, &update);
     const event = peer.feed(&update).?;
     try testing.expectEqual(@as(u31, 0), event.window_open.stream_id);
+}
+
+test "h2: drain refuses raced streams and existing ones complete" {
+    var peer = TestPeer{};
+    peer.open();
+    var frame: [256]u8 = undefined;
+    _ = peer.feed(frame[0..TestPeer.request_bytes(1, false, &frame)]);
+
+    var out: [64]u8 = undefined;
+    const produced = peer.connection.begin_drain(&out);
+    const goaway = (try h2_frame.parse_frame(out[0..produced])).?;
+    try testing.expectEqual(h2_frame.FrameType.goaway, goaway.header.type);
+    try testing.expectEqual(@as(u31, 1), h2_frame.parse_goaway(goaway.payload).last_stream_id);
+    try testing.expect(peer.connection.draining());
+    // A second begin_drain stages nothing.
+    try testing.expectEqual(@as(usize, 0), peer.connection.begin_drain(&out));
+
+    // A stream raced past the GOAWAY id is refused; HPACK stayed in sync.
+    try testing.expectEqual(
+        @as(?Event, null),
+        peer.feed(frame[0..TestPeer.request_bytes(3, true, &frame)]),
+    );
+    try peer.expect_output(&.{.rst_stream});
+    const rst = (try h2_frame.parse_frame(peer.output[0..peer.produced])).?;
+    try testing.expectEqual(ErrorCode.refused_stream, h2_frame.parse_rst_stream(rst.payload[0..4]));
+
+    // The pre-drain stream still flows.
+    const data_len = TestPeer.data_frame_bytes(1, "still on", true, &frame);
+    const event = peer.feed(frame[0..data_len]).?;
+    try testing.expectEqualStrings("still on", event.data.bytes);
 }
 
 test "h2: reset_stream stages RST and frees the slot" {

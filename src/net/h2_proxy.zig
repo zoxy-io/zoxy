@@ -266,6 +266,9 @@ pub const H2Conn = struct {
     /// Connection-level deadline: idle cutoff, refreshed on client bytes.
     deadline_ns: u64,
     timeout_armed: bool,
+    /// Draining, but the GOAWAY could not be staged yet (send buffer full);
+    /// retried when the staging drains.
+    drain_pending: bool,
 
     recv_completion: Completion,
     send_completion: Completion,
@@ -316,6 +319,7 @@ pub const H2Conn = struct {
         conn.request_timeout_ns = request_timeout_ns;
         conn.idle_timeout_ns = idle_timeout_ns;
         conn.timeout_armed = false;
+        conn.drain_pending = false;
         conn.metrics.active.add(1);
         conn.set_deadline(idle_timeout_ns);
         conn.arm_timeout();
@@ -349,7 +353,11 @@ pub const H2Conn = struct {
         if (n == 0) return conn.teardown(); // client hangup ends every stream
         conn.recv_filled += n;
         assert(conn.recv_filled <= conn.recv_buf.len);
-        conn.set_deadline(conn.idle_timeout_ns); // client activity resets idle
+        // Client activity resets the idle clock — except under drain, whose
+        // clamped deadline must never move out again.
+        if (!conn.engine.draining() and !conn.drain_pending) {
+            conn.set_deadline(conn.idle_timeout_ns);
+        }
         conn.process();
         if (conn.closing or conn.close_after_flush) return;
         if (!conn.recv_in_flight and conn.recv_filled < conn.recv_buf.len) conn.arm_recv();
@@ -401,6 +409,7 @@ pub const H2Conn = struct {
             .data => |data| conn.on_request_data(data),
             .reset => |reset| {
                 if (conn.leg_for(reset.stream_id)) |leg| conn.leg_abort(leg);
+                conn.maybe_finish_drain();
             },
             .window_open => |window| conn.pump_blocked_streams(window.stream_id),
             .goaway => {}, // informational: the client opens nothing new
@@ -974,6 +983,7 @@ pub const H2Conn = struct {
         });
         conn.engine.close_stream(leg.stream_id);
         conn.leg_detach(leg);
+        conn.maybe_finish_drain();
     }
 
     /// An upstream fault: answer 502/504 if no response byte was forwarded,
@@ -1010,6 +1020,7 @@ pub const H2Conn = struct {
             .bad_gateway => conn.answer_without_leg(stream_id, response_block_502),
             .gateway_timeout => conn.answer_without_leg(stream_id, response_block_504),
         }
+        conn.maybe_finish_drain();
     }
 
     /// A synthesized HEADERS answer on a stream with no (or no longer a)
@@ -1035,6 +1046,7 @@ pub const H2Conn = struct {
         assert(leg.upstream_fd < 0);
         conn.leg_detach(leg);
         conn.answer_without_leg(stream_id, block);
+        conn.maybe_finish_drain();
     }
 
     fn stage_reset(conn: *H2Conn, stream_id: u31, code: h2.ErrorCode) void {
@@ -1222,6 +1234,7 @@ pub const H2Conn = struct {
         conn.send_filled = 0;
         if (conn.close_after_flush) return conn.teardown();
         // Staging drained: resume whoever was waiting on it.
+        if (conn.drain_pending) conn.try_stage_drain();
         conn.pump_engine();
         conn.pump_blocked_streams(0);
         if (conn.recv_filled > 0) conn.process();
@@ -1230,6 +1243,41 @@ pub const H2Conn = struct {
         {
             conn.arm_recv();
         }
+        conn.flush_send();
+    }
+
+    // ---- graceful drain (docs/DESIGN.md §7 Phase 4, extended to H2) ------------
+
+    /// Announce the drain (GOAWAY naming the highest served stream), clamp
+    /// the deadline, and close once every live stream settles. In-flight
+    /// exchanges complete; raced-in streams above the GOAWAY id are refused
+    /// by the engine so clients retry elsewhere.
+    pub fn begin_drain(conn: *H2Conn) void {
+        if (conn.closing or conn.close_after_flush) return;
+        // The deadline clamp bounds the drain whatever clients and origins
+        // do — the existing ticking timer enforces it (the H1 rule).
+        const drain_deadline = conn.io.now_ns() + constants.drain_timeout_ns;
+        if (drain_deadline < conn.deadline_ns) conn.deadline_ns = drain_deadline;
+        conn.drain_pending = true;
+        conn.try_stage_drain();
+    }
+
+    fn try_stage_drain(conn: *H2Conn) void {
+        assert(conn.drain_pending);
+        if (conn.send_free() < h2_frame.goaway_frame_bytes) return; // send drain retries
+        conn.drain_pending = false;
+        conn.send_filled += conn.engine.begin_drain(conn.send_buf[conn.send_filled..]);
+        conn.flush_send();
+        conn.maybe_finish_drain();
+    }
+
+    /// A draining connection closes when its last stream settles (engine
+    /// slots and legs both empty).
+    fn maybe_finish_drain(conn: *H2Conn) void {
+        if (!conn.engine.draining()) return;
+        if (conn.closing or conn.close_after_flush) return;
+        if (conn.engine.streams_active > 0 or conn.active_count > 0) return;
+        conn.close_after_flush = true;
         conn.flush_send();
     }
 
@@ -1386,6 +1434,17 @@ pub const H2Server = struct {
         );
     }
 
+    /// Sweep every live connection into graceful drain (GOAWAY + clamped
+    /// deadline). Refusing *new* connections is the accept path's job —
+    /// today the test harness's, after the ALPN handoff the ProxyServer
+    /// drain sweep this rides on.
+    pub fn begin_drain(server: *H2Server) void {
+        for (server.pool.items) |*conn| {
+            if (!conn.in_use) continue;
+            conn.begin_drain();
+        }
+    }
+
     fn on_accept(
         server: *H2Server,
         _: *Completion,
@@ -1538,6 +1597,7 @@ const H2TestClient = struct {
     body_len: usize = 0,
     done: bool = false,
     reset: bool = false,
+    saw_goaway: bool = false,
     send_c: Completion = undefined,
     recv_c: Completion = undefined,
 
@@ -1641,10 +1701,11 @@ const H2TestClient = struct {
                     client.body_len += frame.payload.len;
                     if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.done = true;
                 },
-                .rst_stream, .goaway => {
+                .rst_stream => {
                     client.reset = true;
                     client.done = true;
                 },
+                .goaway => client.saw_goaway = true,
                 else => {}, // SETTINGS, WINDOW_UPDATE, PING: ignored
             }
         }
@@ -1832,6 +1893,64 @@ test "h2_proxy: an unreachable upstream answers the stream 502" {
     try testing.expectEqual(@as(usize, 0), client.body_len);
 
     _ = linux.close(fd);
+    try harness.settle();
+    try testing.expect(harness.server.resilience.is_idle());
+}
+
+test "h2_proxy: drain announces GOAWAY, completes in-flight streams, then closes" {
+    const gpa = testing.allocator;
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+
+    var harness: TestHarness = undefined;
+    try harness.init(gpa, origin_listener.bound_address().port);
+    defer harness.deinit(gpa);
+
+    var origin = TestOrigin{
+        .io = &harness.io,
+        .listener = origin_listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .respond_after = "0\r\n\r\n", // waits for the whole chunked body
+    };
+    origin.start();
+
+    // An in-flight POST: head forwarded, body still owed when drain begins.
+    const busy_fd = try connect_loopback(harness.listener.bound_address().port);
+    defer _ = linux.close(busy_fd);
+    var busy = H2TestClient{ .io = &harness.io, .fd = busy_fd };
+    busy.stage(h2_frame.client_preface);
+    var settings: [64]u8 = undefined;
+    busy.stage(settings[0..h2_frame.write_settings(&.{}, &settings)]);
+    busy.stage_request("/upload", false);
+    busy.go();
+    while (origin.request_len == 0) try harness.io.run_once();
+
+    // An idle connection alongside it.
+    const idle_fd = try connect_loopback(harness.listener.bound_address().port);
+    defer _ = linux.close(idle_fd);
+    var idle = H2TestClient{ .io = &harness.io, .fd = idle_fd };
+    idle.stage(h2_frame.client_preface);
+    idle.stage(settings[0..h2_frame.write_settings(&.{}, &settings)]);
+    idle.go();
+    while (harness.pool.free_count != harness.pool.capacity - 2) try harness.io.run_once();
+
+    harness.server.begin_drain();
+
+    // The idle connection gets GOAWAY and closes immediately (EOF ends it).
+    try harness.io.run_until_done(&idle.done);
+    try testing.expect(idle.saw_goaway);
+    try testing.expectEqual(@as(u16, 0), idle.status); // no stream, no response
+
+    // The busy stream still completes: finish the body, read the response.
+    busy.stage_data("late body", true);
+    busy.arm_send();
+    try harness.io.run_until_done(&busy.done);
+    try testing.expect(busy.saw_goaway);
+    try testing.expect(!busy.reset);
+    try testing.expectEqual(@as(u16, 200), busy.status);
+    try testing.expectEqualStrings("ok", busy.body[0..busy.body_len]);
+
+    // Both connections close themselves; every slot comes home.
     try harness.settle();
     try testing.expect(harness.server.resilience.is_idle());
 }
