@@ -57,6 +57,10 @@ pub const TrafficSecrets = struct {
 pub const Context = struct {
     context: *openssl.SSL_CTX,
     role: Role,
+    /// Hand completed handshakes' record layers to the kernel when
+    /// possible (docs/DESIGN.md §6). Config-controlled ops escape hatch
+    /// (`tls.kernel_offload`); set post-init like ProxyServer.worker_index.
+    kernel_offload: bool = true,
 
     pub const Role = enum { server, client };
 

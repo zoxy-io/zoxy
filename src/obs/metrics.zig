@@ -52,6 +52,12 @@ pub const Metrics = struct {
     health_probe_failures: Counter = .{},
     /// Downstream TLS handshakes completed.
     tls_handshakes: Counter = .{},
+    /// Connections whose record layer was handed to the kernel (kTLS): the
+    /// steady-state relay runs as plain ring ops, the channel is freed.
+    tls_ktls_active: Counter = .{},
+    /// Handshakes that stayed on the userspace relay: kernel/cipher refused
+    /// the offload, data rode the handshake flight, or offload is off.
+    tls_ktls_fallbacks: Counter = .{},
     /// Downstream TLS handshakes that failed (bad ClientHello, no shared
     /// cipher, or the TLS heap load-shed the connection at accept).
     tls_handshake_failures: Counter = .{},
@@ -102,7 +108,7 @@ test "metrics: counters add, sub, and load" {
 test "metrics: write_text dumps every counter" {
     var m = Metrics{};
     m.requests.add(7);
-    var buf: [512]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try m.write_text(&w);
     const out = w.buffered();

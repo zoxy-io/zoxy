@@ -371,12 +371,22 @@ Slices, in order: (1) IO seam — `enable_kernel_tls` + the `sendmsg` op
 (done 2026-07); (2) keylog capture + HKDF derivation, unit-tested against
 the RFC 8448 TLS 1.3 vectors (done 2026-07); (3) switchover eligibility
 (the quiescence checks above) + per-direction kernel parameter
-composition (done 2026-07); (4) the ProxyConn switchover +
-end-to-end test (must `error.SkipZigTest` when the environment cannot load
-the `tls` module — CI runners may not allow it; the dev box has
-`CONFIG_TLS=m`); (5) close_notify-over-cmsg + churn bench;
-(6) measurement gate: bands vs the userspace relay, heap occupancy drop,
-CPU per byte.
+composition (done 2026-07); (4+5) the ProxyConn switchover and the
+cmsg close_notify (done 2026-07): the decision is owed from handshake
+completion and taken once the wire is idle (a pending wire send would be
+double-encrypted; a pending recv would deliver kernel-decrypted plaintext
+into the ciphertext staging); on switch the channel frees mid-connection
+and `conn.tls` returns to null, so every downstream op is the plaintext
+path on the fd; the polite close sends the alert through
+`TLS_SET_RECORD_TYPE`. `tls.kernel_offload=false` in config forces the
+userspace relay. Verified: curl and zrk switch 100% (7k+ churn
+switchovers, zero fallbacks, zero client-visible errors); steady 20k
+req/s with p50 135µs; carved heap under load dropped 11.1 → 4.9 MiB. A
+client that pipelines into the Finished flight falls back and is served
+identically (asserted in tests — loopback coalescing makes that path
+timing-dependent, so tests assert the decision sum, plus a dedicated
+delayed-request test that must switch). Remaining: (6) measurement gate —
+bands vs the userspace relay, CPU per byte.
 
 HTTP/2 & HTTP/3: nothing usable in pure Zig. H2 → `nghttp2` FFI when needed;
 H3/QUIC → `quiche`/`ngtcp2`. Pure-Zig H3 is blocked on QUIC-aware TLS 1.3.

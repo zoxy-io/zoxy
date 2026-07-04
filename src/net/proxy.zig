@@ -49,6 +49,7 @@ const access_log = @import("../obs/access_log.zig");
 const AccessLog = access_log.AccessLog;
 const guard = @import("../mem/guard.zig");
 const terminator = @import("../tls/terminator.zig");
+const kernel_tls = @import("../tls/kernel.zig");
 const Ip4Address = std.Io.net.Ip4Address;
 
 const Pool = @import("pool.zig").Pool(ProxyConn);
@@ -392,8 +393,19 @@ pub const ProxyConn = struct {
     response_pipe: Pipe,
 
     /// Downstream TLS state; null on a plaintext listener. Connection-scoped:
-    /// created at accept (or the connection is shed), freed with the slot.
+    /// created at accept (or the connection is shed), freed with the slot —
+    /// or earlier, at the kernel switchover.
     tls: ?Tls,
+    /// The record layer lives in the kernel (docs/DESIGN.md §6): `tls` is
+    /// null again and every downstream op is a plain ring op on the fd; only
+    /// the polite close differs (an alert cmsg instead of a channel).
+    ktls_active: bool,
+    /// The close_notify alert send (a `send_message` cmsg) is in flight.
+    ktls_notify_pending: bool,
+    /// The alert's msghdr machinery — must outlive the send_message op.
+    ktls_close_control: kernel_tls.RecordTypeControl,
+    ktls_close_segments: [1]posix.iovec_const,
+    ktls_close_message: linux.msghdr_const,
 
     free_next: ?*ProxyConn,
 
@@ -434,11 +446,21 @@ pub const ProxyConn = struct {
         /// flush is bounded by the connection deadline: the ticking timer is
         /// still armed and its expiry tears down regardless.
         notify_then_teardown: bool,
+        /// The handshake completed and the kernel switchover decision is
+        /// owed — taken once the wire goes idle (tls_try_kernel_switch).
+        /// HTTP does not start until the decision lands.
+        kernel_switch_pending: bool,
+        /// Copied from the Context at accept (the config escape hatch).
+        kernel_offload_enabled: bool,
+        /// Traffic secrets the keylog callback fills during the handshake;
+        /// OpenSSL holds a raw pointer to this field (stable: the conn is
+        /// pooled), armed at channel init.
+        secrets: terminator.TrafficSecrets,
         wire_recv_completion: Completion,
         wire_send_completion: Completion,
         yield_completion: Completion,
 
-        fn init(channel: terminator.Channel) Tls {
+        fn init(channel: terminator.Channel, kernel_offload_enabled: bool) Tls {
             return .{
                 .channel = channel,
                 .handshake_complete = false,
@@ -457,6 +479,9 @@ pub const ProxyConn = struct {
                 .send_callback = undefined,
                 .yield_pending = false,
                 .notify_then_teardown = false,
+                .kernel_switch_pending = false,
+                .kernel_offload_enabled = kernel_offload_enabled,
+                .secrets = .{},
                 .wire_recv_completion = undefined,
                 .wire_send_completion = undefined,
                 .yield_completion = undefined,
@@ -483,6 +508,8 @@ pub const ProxyConn = struct {
         // TLS first, before any state or metrics: exhaustion of the TLS heap
         // sheds the whole connection here (reject, never a partial start).
         conn.tls = null;
+        conn.ktls_active = false;
+        conn.ktls_notify_pending = false;
         if (tls_context) |context| {
             const channel = terminator.Channel.init(context) catch {
                 metrics.tls_handshake_failures.add(1);
@@ -491,7 +518,10 @@ pub const ProxyConn = struct {
                 pool.release(conn);
                 return;
             };
-            conn.tls = Tls.init(channel);
+            conn.tls = Tls.init(channel, context.kernel_offload);
+            // The keylog callback fills these secrets during the handshake;
+            // armed here, at the field's final (pooled, stable) address.
+            conn.tls.?.channel.capture_secrets(&conn.tls.?.secrets);
         }
         conn.io = io;
         conn.pool = pool;
@@ -833,17 +863,66 @@ pub const ProxyConn = struct {
         const tls = &conn.tls.?;
         if (tls.notify_then_teardown) return conn.tls_notify_progress();
         if (!tls.handshake_complete) return conn.tls_handshake_progress();
+        if (tls.kernel_switch_pending) return conn.tls_try_kernel_switch();
         conn.tls_send_progress();
         if (conn.closing) return; // a delivered send may have torn down
         conn.tls_recv_progress();
     }
 
+    /// The kernel switchover decision (docs/DESIGN.md §6), owed since the
+    /// handshake completed and taken exactly once the wire is idle: every
+    /// userspace-encrypted byte must be out (a pending wire send would be
+    /// double-encrypted by kernel TX) and no wire recv may be in flight (it
+    /// would complete with kernel-decrypted plaintext into the ciphertext
+    /// staging). HTTP starts — arm_recv_head — only after the decision, on
+    /// whichever relay won.
+    fn tls_try_kernel_switch(conn: *ProxyConn) void {
+        assert(!conn.closing);
+        const tls = &conn.tls.?;
+        assert(tls.kernel_switch_pending);
+        assert(tls.handshake_complete);
+        assert(tls.recv_target == null); // HTTP has not started
+        assert(!tls.send_active);
+        conn.tls_flush_wire_send();
+        if (tls.wire_send_in_flight or tls.wire_send_sent != tls.wire_send_filled) return;
+        if (tls.channel.pending_ciphertext() != 0) return; // flush loops back here
+        if (tls.wire_recv_in_flight) return; // its completion loops back here
+
+        tls.kernel_switch_pending = false;
+        const eligible = tls.kernel_offload_enabled and
+            tls.wire_recv_staged == 0 and
+            tls.channel.kernel_switch_eligible();
+        if (eligible) switched: {
+            const parameters = tls.channel.kernel_parameters(&tls.secrets) catch
+                break :switched; // unsupported suite / secrets missing
+            conn.io.enable_kernel_tls(
+                conn.downstream_fd,
+                parameters.transmit.bytes(),
+                parameters.receive.bytes(),
+            ) catch break :switched; // no module / kernel refused the cipher
+            // The kernel owns the record layer: the channel (SSL + BIO
+            // pair) returns to the TLS heap *now*, and every downstream op
+            // from here on is a plain ring op on the fd.
+            tls.channel.deinit();
+            conn.tls = null;
+            conn.ktls_active = true;
+            conn.metrics.tls_ktls_active.add(1);
+            conn.arm_recv_head();
+            return;
+        }
+        conn.metrics.tls_ktls_fallbacks.add(1);
+        conn.arm_recv_head(); // userspace relay, as before the switchover existed
+    }
+
     /// Close the downstream connection the way the peer's TLS stack wants:
-    /// queue a close_notify, keep flushing until the wire drains, then tear
-    /// down. Falls back to plain teardown when there is no TLS (or no
-    /// completed handshake) to be polite about.
+    /// queue a close_notify, flush it, then tear down. Three shapes: the
+    /// userspace channel writes the alert into the pair; a kernel-switched
+    /// connection sends it as a TLS_SET_RECORD_TYPE cmsg (the kernel
+    /// encrypts it); plaintext (or an unfinished handshake) tears down
+    /// directly.
     fn close_downstream(conn: *ProxyConn) void {
         if (conn.closing) return;
+        if (conn.ktls_active) return conn.ktls_send_close_notify();
         const tls = if (conn.tls) |*tls| tls else return conn.teardown();
         if (!tls.handshake_complete) return conn.teardown();
         if (tls.notify_then_teardown) return; // already flushing
@@ -851,6 +930,52 @@ pub const ProxyConn = struct {
         tls.notify_then_teardown = true;
         tls.channel.shutdown_notify();
         conn.tls_notify_progress();
+    }
+
+    /// One alert record through the kernel: payload in the iovec, record
+    /// type in the control message. Teardown follows the completion either
+    /// way; a stalled peer is bounded by the still-armed deadline timer.
+    fn ktls_send_close_notify(conn: *ProxyConn) void {
+        assert(conn.ktls_active);
+        assert(conn.tls == null); // the channel was freed at the switchover
+        assert(!conn.closing);
+        if (conn.ktls_notify_pending) return; // already in flight
+        conn.ktls_notify_pending = true;
+        conn.ktls_close_control = kernel_tls.RecordTypeControl.init(kernel_tls.record_type_alert);
+        conn.ktls_close_segments = .{.{
+            .base = &kernel_tls.alert_close_notify,
+            .len = kernel_tls.alert_close_notify.len,
+        }};
+        conn.ktls_close_message = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &conn.ktls_close_segments,
+            .iovlen = conn.ktls_close_segments.len,
+            .control = &conn.ktls_close_control,
+            .controllen = @sizeOf(kernel_tls.RecordTypeControl),
+            .flags = 0,
+        };
+        conn.retain();
+        conn.io.send_message(
+            *ProxyConn,
+            conn,
+            on_ktls_close_notify_sent,
+            &conn.aux_completion,
+            conn.downstream_fd,
+            &conn.ktls_close_message,
+        );
+    }
+
+    fn on_ktls_close_notify_sent(
+        conn: *ProxyConn,
+        _: *Completion,
+        result: io_mod.SendError!usize,
+    ) void {
+        defer conn.release_ref();
+        conn.ktls_notify_pending = false;
+        _ = result catch {}; // best effort: the close proceeds regardless
+        if (conn.closing) return;
+        conn.teardown();
     }
 
     /// The notify-mode pump: flush until the alert (and anything queued
@@ -876,10 +1001,12 @@ pub const ProxyConn = struct {
             .done => {
                 tls.handshake_complete = true;
                 conn.metrics.tls_handshakes.add(1);
-                conn.tls_flush_wire_send(); // any final flight records
-                // The first request may already sit decrypted in the channel;
-                // arm_recv_head's tls path yields and picks it up.
-                conn.arm_recv_head();
+                // HTTP waits for the switchover decision; it arms
+                // arm_recv_head on whichever relay wins. A first request
+                // already decrypted in the channel defeats eligibility and
+                // is picked up by the userspace path's yield.
+                tls.kernel_switch_pending = true;
+                conn.tls_try_kernel_switch();
             },
             .want_io => {
                 conn.tls_flush_wire_send();
@@ -2270,6 +2397,13 @@ const TlsTestClient = struct {
     request_written: bool = false,
     /// Stop after this much plaintext (0 = read until EOF).
     expected_total: usize = 0,
+    /// Hold the first request this long after the handshake instead of
+    /// writing it into the Finished flight — lets the server's kernel
+    /// switchover decide on a quiet wire (0 = write immediately, which
+    /// usually coalesces with Finished and forces the userspace fallback).
+    request_delay_ns: u63 = 0,
+    delay_armed: bool = false,
+    delay_c: Completion = undefined,
     wire_in: [constants.tls_bio_pair_bytes]u8 = undefined,
     wire_out: [constants.tls_bio_pair_bytes]u8 = undefined,
     wire_out_filled: usize = 0,
@@ -2289,15 +2423,38 @@ const TlsTestClient = struct {
         client.progress();
     }
 
+    fn write_request(client: *TlsTestClient) void {
+        assert(!client.request_written);
+        const written = client.channel.write_plaintext(client.request);
+        std.testing.expectEqual(
+            terminator.Channel.WriteResult{ .bytes = client.request.len },
+            written,
+        ) catch unreachable; // a short first write means a broken pair
+        client.request_written = true;
+    }
+
+    fn on_request_delay(client: *TlsTestClient, _: *Completion, _: io_mod.TimeoutError!void) void {
+        client.write_request();
+        client.progress();
+    }
+
     fn progress(client: *TlsTestClient) void {
         _ = client.channel.handshake_step();
         if (client.channel.handshake_done() and !client.request_written) {
-            const written = client.channel.write_plaintext(client.request);
-            std.testing.expectEqual(
-                terminator.Channel.WriteResult{ .bytes = client.request.len },
-                written,
-            ) catch unreachable; // a short first write means a broken pair
-            client.request_written = true;
+            if (client.request_delay_ns > 0) {
+                if (!client.delay_armed) {
+                    client.delay_armed = true;
+                    client.io.timeout(
+                        *TlsTestClient,
+                        client,
+                        on_request_delay,
+                        &client.delay_c,
+                        client.request_delay_ns,
+                    );
+                }
+            } else {
+                client.write_request();
+            }
         }
         // Drain every buffered record: no wire event will re-run this if
         // plaintext is left sitting in the channel.
@@ -2431,6 +2588,14 @@ test "proxy: terminates TLS end to end — handshake, relay, heap drain" {
 
     try std.testing.expectEqual(@as(u64, 2), metrics.tls_handshakes.load());
     try std.testing.expectEqual(@as(u64, 0), metrics.tls_handshake_failures.load());
+    // Every handshake takes exactly one switchover decision. This client
+    // writes its request into the Finished flight, so whether the kernel or
+    // the userspace relay serves it depends on TCP coalescing — both must
+    // produce identical bytes (that is the fallback guarantee).
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        metrics.tls_ktls_active.load() + metrics.tls_ktls_fallbacks.load(),
+    );
     try std.testing.expect(server.resilience.is_idle());
 }
 
@@ -2509,10 +2674,95 @@ test "proxy: TLS keep-alive carries pipelined requests on one handshake" {
     try std.testing.expectEqualStrings(response ++ response, client.plain_buf[0..client.plain_len]);
     try std.testing.expectEqual(@as(u64, 1), metrics.tls_handshakes.load()); // one connection
     try std.testing.expectEqual(@as(u64, 2), metrics.requests.load());
+    try std.testing.expectEqual(
+        @as(u64, 1), // one decision; which way depends on flight coalescing
+        metrics.tls_ktls_active.load() + metrics.tls_ktls_fallbacks.load(),
+    );
 
     // The client hangs up; the proxy sees TLS-layer EOF and reclaims.
     _ = linux.close(client_fd);
     while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: hands the record layer to the kernel after a quiet handshake" {
+    const gpa = std.testing.allocator;
+    const hook = @import("../tls/openssl.zig");
+    install_proxy_test_hook();
+    if (!kernel_tls.test_environment_supports_kernel_tls()) return error.SkipZigTest;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = origin_listener, .response = response };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    const server_context = try terminator.Context.init_server(
+        @embedFile("../tls/testdata/certificate.pem"),
+        @embedFile("../tls/testdata/private_key.pem"),
+    );
+    defer server_context.deinit();
+    const client_context = try terminator.Context.init_client();
+    defer client_context.deinit();
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.tls_context = &server_context;
+    server.start();
+
+    const heap_before = hook.memory_hook_stats();
+    const client_fd = try connect_loopback(proxy_listener.bound_address().port);
+    var client = TlsTestClient{
+        .io = &io,
+        .fd = client_fd,
+        .channel = try terminator.Channel.init(&client_context),
+        .request = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n",
+        // Past the Finished flight: the server decides on a quiet wire.
+        .request_delay_ns = 20 * std.time.ns_per_ms,
+    };
+    client.go();
+
+    try io.run_until_done(&client.done);
+    try std.testing.expectEqualStrings(response, client.plain_buf[0..client.plain_len]);
+    // The switch happened, and the polite close arrived as a *kernel-built*
+    // alert record (close_downstream's cmsg path) the client decrypted.
+    try std.testing.expectEqual(@as(u64, 1), metrics.tls_ktls_active.load());
+    try std.testing.expectEqual(@as(u64, 0), metrics.tls_ktls_fallbacks.load());
+    try std.testing.expect(client.saw_close_notify);
+
+    // The channel was freed at the switchover, mid-connection; after slot
+    // reclaim and the client channel's release, the heap is at baseline.
+    _ = linux.close(client_fd);
+    while (pool.free_count != pool.capacity) try io.run_once();
+    client.channel.deinit();
+    try std.testing.expectEqual(heap_before.live_count, hook.memory_hook_stats().live_count);
     try std.testing.expect(server.resilience.is_idle());
 }
 

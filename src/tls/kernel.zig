@@ -169,6 +169,16 @@ comptime {
     assert(@offsetOf(RecordTypeControl, "record_type") == @sizeOf(linux.cmsghdr));
 }
 
+/// Test-support (like openssl.zig's install_memory_hook_for_tests): whether
+/// this environment can attach the "tls" ULP — integration tests assert the
+/// kernel switchover when true and the fallback when false.
+pub fn test_environment_supports_kernel_tls() bool {
+    const pair = LoopbackPair.open() catch return false;
+    defer pair.close();
+    posix.setsockopt(pair.a, linux.IPPROTO.TCP, linux.TCP.ULP, "tls") catch return false;
+    return true;
+}
+
 // ---- tests ----------------------------------------------------------------
 
 test "kernel tls: derivation matches the RFC 8448 1-RTT vectors (server direction)" {

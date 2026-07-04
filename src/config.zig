@@ -76,6 +76,9 @@ pub const Route = struct {
 pub const TlsConfig = struct {
     certificate_file: []const u8,
     private_key_file: []const u8,
+    /// Hand completed handshakes to kernel TLS (docs/DESIGN.md §6); off
+    /// forces every connection onto the userspace relay (ops escape hatch).
+    kernel_offload: bool = true,
 };
 
 pub const Config = struct {
@@ -123,6 +126,7 @@ const Dto = struct {
     const TlsDto = struct {
         certificate_file: []const u8,
         private_key_file: []const u8,
+        kernel_offload: bool = true,
     };
     const RouteDto = struct {
         host: []const u8 = "*",
@@ -219,6 +223,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         break :lower .{
             .certificate_file = try a.dupe(u8, dt.certificate_file),
             .private_key_file = try a.dupe(u8, dt.private_key_file),
+            .kernel_offload = dt.kernel_offload,
         };
     } else null;
 

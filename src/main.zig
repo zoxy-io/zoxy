@@ -64,8 +64,12 @@ pub fn main(init: std.process.Init) !void {
             });
             return err;
         };
+        context.kernel_offload = tls_config.kernel_offload;
         tls_context = context;
-        std.log.info("zoxy tls listener: {s}", .{tls_config.certificate_file});
+        std.log.info("zoxy tls listener: {s} (kernel_offload={})", .{
+            tls_config.certificate_file,
+            tls_config.kernel_offload,
+        });
     }
 
     // Shared counters (atomic) and per-worker access logs, reserved up front.
