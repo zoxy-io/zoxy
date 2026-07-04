@@ -570,11 +570,20 @@ catches the dominant failures), ejection-time multipliers.
      completion, and dies with the attempt at dispose. **No upstream kTLS**:
      origins send session tickets as application-epoch records, which
      defeats the sequence-zero rule — the upstream leg stays on the BIO
-     pair. **No pooling yet (U3)**: TLS clusters dial fresh per request
-     (`maybe_pool_upstream` refuses; a parked connection would need its
-     channel parked too). Verified: TLS client -> zoxy -> TLS nginx with
-     hostname verification end to end; wrong authority and wrong hostname
-     both produce clean 502s with nothing reaching the origin.
+     pair. **Pooling (U3, done)**: the upstream leg's channel parks in the
+     UpstreamPool alongside the fd — but only fully quiescent (no staged or
+     pending ciphertext, no wire op, nothing buffered inside the SSL: the
+     same quiescence check as the kTLS switchover; leftover plaintext there
+     would corrupt the next response, unprocessed session tickets hit the
+     same check, and closing is the safe answer to both). Checkout resumes
+     the channel as the next attempt's leg with the handshake already done;
+     a parked connection of the wrong TLS posture for its cluster (shared
+     endpoint address) is closed, never misused. The heap reservation adds
+     upstream_idle_max parked channels per worker. Measured: TLS client ->
+     zoxy -> TLS nginx at 20k req/s, p50 138µs (plaintext-level), >99.9%
+     upstream reuse, 64+64 handshakes for 200k requests, zero errors.
+     Verified: hostname verification end to end; wrong authority and wrong
+     hostname both produce clean 502s with nothing reaching the origin.
 - HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
   control** (stream + connection windows) wired into the existing watermark
   system, HPACK decode/re-encode, H2 pool with multiplexing + GOAWAY draining.

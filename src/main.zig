@@ -49,12 +49,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (cfg.tls != null or clusters_with_tls > 0) {
         // Sized so every connection slot on every worker can be TLS on both
-        // hops (per-connection cost measured; see constants.zig). Virtual
+        // hops, plus every upstream-pool slot parking a TLS channel
+        // (per-connection cost measured; see constants.zig). Virtual
         // reservation: pages are touched only as connections carve.
         const hops: usize = if (cfg.tls != null and clusters_with_tls > 0) 2 else 1;
+        const parked: usize = if (clusters_with_tls > 0) constants.upstream_idle_max else 0;
         const tls_heap_bytes = constants.tls_heap_base_bytes +
-            constants.tls_heap_per_connection_bytes *
-                constants.connections_max * worker_count * hops;
+            constants.tls_heap_per_connection_bytes * worker_count *
+                (constants.connections_max * hops + parked);
         const alignment = comptime std.mem.Alignment.fromByteUnits(zoxy.tls.Heap.block_align);
         const region = try gpa.alignedAlloc(u8, alignment, tls_heap_bytes);
         try zoxy.tls.install_memory_hook(region);

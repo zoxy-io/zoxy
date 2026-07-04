@@ -1514,15 +1514,27 @@ pub const ProxyConn = struct {
         assert(conn.attempt_open);
         assert(conn.upstream_fd < 0);
         assert(conn.upstream_tls == null); // the previous leg was disposed
-        // TLS upstreams are never pooled in U2: a parked connection would
-        // need its channel parked too (U3). Every attempt dials fresh.
-        if (conn.upstream_tls_context() != null) return conn.connect_upstream();
-        if (conn.upstream_pool.checkout(conn.endpoint_address)) |pooled_fd| {
-            assert(pooled_fd >= 0);
-            conn.upstream_fd = pooled_fd;
+        const cluster_wants_tls = conn.upstream_tls_context() != null;
+        if (conn.upstream_pool.checkout(conn.endpoint_address)) |parked| {
+            assert(parked.fd >= 0);
+            // Two clusters may share an endpoint address with different TLS
+            // postures; a parked connection of the wrong kind is useless to
+            // this attempt — close it and dial fresh.
+            if (cluster_wants_tls != (parked.channel != null)) {
+                if (parked.channel) |channel| channel.deinit();
+                conn.io.close_now(parked.fd);
+                return conn.connect_upstream();
+            }
+            conn.upstream_fd = parked.fd;
             conn.account_upstream_open();
             conn.upstream_pooled = true;
             conn.metrics.upstream_reused.add(1);
+            if (parked.channel) |channel| {
+                // Resume the parked TLS session as this attempt's leg: the
+                // handshake is long done, so the prime goes straight out.
+                conn.upstream_tls = Tls.init(channel, .upstream, false);
+                conn.upstream_tls.?.handshake_complete = true;
+            }
             return conn.arm_prime(); // already connected: skip the dial
         }
         conn.connect_upstream();
@@ -2094,9 +2106,6 @@ pub const ProxyConn = struct {
     /// Park the upstream connection for the next request to this endpoint —
     /// independent of whether the *downstream* connection survives.
     fn maybe_pool_upstream(conn: *ProxyConn) void {
-        // A TLS upstream carries channel state the pool cannot park (U3);
-        // finish_request / teardown closes it instead.
-        if (conn.upstream_tls != null) return;
         if (!conn.upstream_reusable) return;
         if (conn.response_pipe_overflow) return;
         // The request must be fully forwarded with nothing in flight: if the
@@ -2107,9 +2116,32 @@ pub const ProxyConn = struct {
         if (!conn.request_forwarded) return;
         if (conn.upstream_fd < 0) return;
         assert(conn.endpoint_address.port != 0); // set when the request routed
+        // A TLS leg parks its channel with the fd — but only fully quiescent:
+        // no unfed ciphertext, no wire op in flight, nothing pending in the
+        // pair, nothing buffered inside the SSL. Leftover plaintext in the
+        // SSL would corrupt the next request's response head; unprocessed
+        // session tickets land in the same check, and closing is the safe
+        // answer to both.
+        var parked_channel: ?terminator.Channel = null;
+        if (conn.upstream_tls) |*leg| {
+            conn.tls_feed_staged(leg); // a record tail may still be staged
+            const quiescent = leg.wire_recv_staged == 0 and
+                !leg.wire_recv_in_flight and
+                !leg.wire_send_in_flight and
+                leg.channel.pending_ciphertext() == 0 and
+                leg.channel.kernel_switch_eligible(); // nothing buffered in the SSL
+            if (!quiescent) return; // finish_request / teardown closes it
+            parked_channel = leg.channel;
+            conn.upstream_tls = null; // ownership moves to the pool
+        }
         // Nothing is pending on the fd: the response was fully received and
         // fully forwarded before this point.
-        conn.upstream_pool.checkin(conn.io, conn.endpoint_address, conn.upstream_fd);
+        conn.upstream_pool.checkin(
+            conn.io,
+            conn.endpoint_address,
+            conn.upstream_fd,
+            parked_channel,
+        );
         conn.upstream_fd = -1;
         conn.account_upstream_drop(); // idle pooled fds are not cluster connections
     }
@@ -3031,6 +3063,10 @@ const TlsTestOrigin = struct {
     listener: Listener,
     context: *const terminator.Context,
     response: []const u8,
+    /// False = keep-alive origin: serve request after request on one
+    /// connection (the pooled-upstream tests need a lingering peer).
+    close_after_send: bool = true,
+    connections: u32 = 0,
     channel: terminator.Channel = undefined,
     channel_alive: bool = false,
     fd: posix.socket_t = -1,
@@ -3060,6 +3096,7 @@ const TlsTestOrigin = struct {
         origin.fd = result catch return;
         origin.channel = terminator.Channel.init(origin.context) catch unreachable;
         origin.channel_alive = true;
+        origin.connections += 1;
         origin.request_len = 0;
         origin.response_written = false;
         origin.wire_out_filled = 0;
@@ -3084,8 +3121,13 @@ const TlsTestOrigin = struct {
                     .bytes => |n| assert(n == origin.response.len),
                     else => unreachable, // an empty pair takes a full response
                 }
-                origin.channel.shutdown_notify(); // response, then a polite EOF
-                origin.response_written = true;
+                if (origin.close_after_send) {
+                    origin.channel.shutdown_notify(); // response, then polite EOF
+                    origin.response_written = true;
+                } else {
+                    // Keep-alive: ready for the next request immediately.
+                    origin.request_len = 0;
+                }
                 origin.served += 1;
             }
         }
@@ -3258,6 +3300,121 @@ test "proxy: re-encrypts to a verified TLS origin" {
     try std.testing.expectEqual(@as(u64, 1), metrics.tls_handshakes.load()); // the upstream hop
     try std.testing.expectEqual(@as(u64, 0), metrics.tls_handshake_failures.load());
     while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
+}
+
+test "proxy: pools and resumes a TLS upstream — one handshake, two requests" {
+    const gpa = std.testing.allocator;
+    install_proxy_test_hook();
+    // Keep-alive on both hops: no Connection header from the origin.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    const origin_context = try terminator.Context.init_server(
+        @embedFile("../tls/testdata/certificate.pem"),
+        @embedFile("../tls/testdata/private_key.pem"),
+    );
+    defer origin_context.deinit();
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TlsTestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .context = &origin_context,
+        .response = response,
+        .close_after_send = false, // linger: the pool can reuse it
+    };
+    origin.start();
+
+    const upstream_context = try terminator.Context.init_client(.{ .authority = .{
+        .bundle_pem = @embedFile("../tls/testdata/certificate.pem"),
+        .host = "zoxy.test",
+    } });
+    defer upstream_context.deinit();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    const upstream_contexts = [_]?*const terminator.Context{&upstream_context};
+    server.upstream_tls_contexts = &upstream_contexts;
+    server.start();
+
+    // Two pipelined requests on one downstream connection: request two must
+    // ride the parked TLS upstream, not a second handshake.
+    const client = try connect_loopback(proxy_listener.bound_address().port);
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        expected_total: usize,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET /one HTTP/1.1\r\n" ++
+                "Host: origin\r\n\r\n" ++ "GET /two HTTP/1.1\r\nHost: origin\r\n\r\n");
+            c.arm_recv();
+        }
+        fn arm_recv(c: *@This()) void {
+            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, c.buf[c.len..]);
+        }
+        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch 0;
+            if (n == 0) {
+                c.done = true;
+                return;
+            }
+            c.len += n;
+            if (c.len >= c.expected_total) {
+                c.done = true;
+                return;
+            }
+            c.arm_recv();
+        }
+    };
+    var c = Client{ .io = &io, .fd = client, .expected_total = 2 * response.len };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response ++ response, c.buf[0..c.len]);
+    try std.testing.expectEqual(@as(u32, 2), origin.served);
+    try std.testing.expectEqual(@as(u32, 1), origin.connections); // one TLS session
+    try std.testing.expectEqual(@as(u64, 1), metrics.tls_handshakes.load());
+    try std.testing.expectEqual(@as(u64, 1), metrics.upstream_reused.load());
+
+    // The client hangs up; the parked channel drains with the pool.
+    _ = linux.close(client);
+    while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expectEqual(@as(u32, 1), server.upstream_pool.count); // parked again
     try std.testing.expect(server.resilience.is_idle());
 }
 
