@@ -104,7 +104,7 @@ const prime_segments_max = constants.headers_max + 3;
 
 /// One direction of the relay: read from `src_fd`, write to `dst_fd`, repeat.
 ///
-/// Backpressure (docs/DESIGN.md §8): strict recv -> send -> recv over a single
+/// Backpressure (docs/DESIGN.md §1.4): strict recv -> send -> recv over a single
 /// fixed buffer. We never read the next chunk until the current one is fully
 /// written, so a slow destination stalls the source: its socket receive buffer
 /// fills and TCP flow control throttles the peer. Memory per direction is
