@@ -211,8 +211,22 @@ run-to-run variance dominates any difference against the pre-Phase-2 build at
 60k req/s. Deferred with rationale (EWMA weighting, retry-on-5xx, HTTP
 probes): see [`docs/DESIGN.md`](docs/DESIGN.md) §7.
 
-**Later:** TLS termination (OpenSSL FFI for the handshake only, kTLS for the
-record layer — see [`docs/DESIGN.md`](docs/DESIGN.md) §6), HTTP/2 and HTTP/3,
+**Phase 3, TLS half (done): termination + kTLS** — TLS 1.3/1.2 termination
+with a vendored OpenSSL used *only* for the handshake, sans-io over memory
+BIO pairs so every byte stays a ring op; SNI-ready ALPN (`http/1.1`);
+allocations routed into a fixed heap reserved at startup (exhaustion
+load-sheds the handshake, never OOM). After a quiet handshake the record
+layer moves into the kernel (kTLS): traffic secrets from the keylog
+callback, keys via HKDF-Expand-Label (RFC 8448-verified), installed only
+when the record sequence is provably zero — otherwise the connection stays
+on the userspace relay, which serves identical bytes. Steady state, a
+kernel-TLS connection runs the *plaintext* relay code path. Measured:
+TLS ≈ plaintext at 20k req/s (p50 ~135µs vs ~155µs plaintext); kTLS saves
+~10% proxy CPU vs the userspace relay at equal latency; ~161 KiB TLS heap
+per userspace connection, ~0 after the kernel switchover. Closes are
+polite (close_notify both modes). See [`docs/DESIGN.md`](docs/DESIGN.md) §6.
+
+**Later:** HTTP/2 and HTTP/3, upstream re-encryption, SNI multi-cert,
 graceful drain + hot restart, and config hot-reload. The full plan is in
 [`docs/DESIGN.md`](docs/DESIGN.md) §7.
 

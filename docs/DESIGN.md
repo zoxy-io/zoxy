@@ -385,8 +385,16 @@ req/s with p50 135µs; carved heap under load dropped 11.1 → 4.9 MiB. A
 client that pipelines into the Finished flight falls back and is served
 identically (asserted in tests — loopback coalescing makes that path
 timing-dependent, so tests assert the decision sum, plus a dedicated
-delayed-request test that must switch). Remaining: (6) measurement gate —
-bands vs the userspace relay, CPU per byte.
+delayed-request test that must switch). (6) measurement gate (done
+2026-07-04, kernel_offload on/off A/B, 3 alternating rounds, R=20k c=64):
+latency bands fully overlap (p50 132–138µs both modes, p99 within noise),
+and zoxy CPU bands do NOT overlap — kernel 3.8–4.2s vs userspace
+4.3–4.6s per 10s run (~10% less proxy CPU), same shape at 16 KiB bodies
+(1.9 vs 2.1s at ~65 MiB/s). The win is copy elimination (the BIO-pair
+shuffle), not crypto speed — both sides run AES-GCM at native speed.
+Verdict: kTLS = equal latency, ~10% less CPU, ~55% less TLS-heap carve,
+and the steady-state relay is the plaintext code path. The kTLS campaign
+is complete.
 
 HTTP/2 & HTTP/3: nothing usable in pure Zig. H2 → `nghttp2` FFI when needed;
 H3/QUIC → `quiche`/`ngtcp2`. Pure-Zig H3 is blocked on QUIC-aware TLS 1.3.
