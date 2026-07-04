@@ -1,9 +1,21 @@
-//! Fixed set of process-wide counters (docs/DESIGN.md §7). One shared instance
-//! across all workers; increments are relaxed atomics, so there is no allocation
-//! and negligible contention on the hot path. Reserved at startup, never grows.
+//! Fixed set of process-wide counters (docs/DESIGN.md §7), sharded per worker
+//! so the hot path never contends on a shared cache line: each worker writes
+//! only its own `Counters` shard (single writer — the RMW below is uncontended
+//! and the line stays in that core's cache in M state), and readers (the admin
+//! scrape, the handoff snapshot) sum across shards. Shards are padded to the
+//! cache line so no two workers' counters cohabit one line — before sharding,
+//! eight `u64` counters per 64-byte line were RMW'd by every worker, and the
+//! adjacent `bytes_to_*` pair was hit once per 16 KiB relay chunk from every
+//! core at once. Reserved at startup, never grows.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const constants = @import("../constants.zig");
+
+/// Padding unit between shards. `std.atomic.cache_line` is 128 on x86_64 —
+/// deliberately double the 64-byte line, because the L2 spatial prefetcher
+/// pulls lines in adjacent pairs and would otherwise couple neighbor shards.
+const cache_line_bytes = std.atomic.cache_line;
 
 /// A monotonic (or up/down, for gauges) atomic counter.
 pub const Counter = struct {
@@ -25,8 +37,12 @@ pub const Counter = struct {
     }
 };
 
-pub const Metrics = struct {
-    /// Downstream connections accepted.
+/// One worker's counter set — the handle the data path writes through
+/// (`ProxyServer`, `ProxyConn`, and the health checker hold a `*Counters`).
+/// Process totals are sums over shards, computed by `Metrics.total`.
+pub const Counters = struct {
+    /// Downstream connections accepted (this shard's slot doubles as the
+    /// per-worker accept-distribution series in the exposition).
     accepted: Counter = .{},
     /// Currently-open downstream connections (gauge).
     active: Counter = .{},
@@ -79,10 +95,6 @@ pub const Metrics = struct {
     breaker_dials_rejected: Counter = .{},
     bytes_to_upstream: Counter = .{},
     bytes_to_client: Counter = .{},
-    /// Downstream connections accepted, per worker: the kernel's
-    /// SO_REUSEPORT hash distribution made visible (imbalance here means
-    /// the busiest worker sets the throughput ceiling).
-    worker_accepted: [constants.workers_max]Counter = @splat(.{}),
 
     /// Fields that are point-in-time gauges, not cumulative counters. A hot
     /// restart transfers counters to the successor so scrapes stay monotonic
@@ -95,43 +107,106 @@ pub const Metrics = struct {
         }
         return false;
     }
+};
 
-    /// Write a Prometheus-style text exposition of every counter. Array
-    /// fields become labeled series, one per non-zero slot.
+pub const Metrics = struct {
+    shards: [shards_count]Shard align(cache_line_bytes) = @splat(.{}),
+
+    /// One shard per worker slot, plus one where a hot-restart predecessor's
+    /// totals are folded (so they never pollute a worker's accept series).
+    pub const shards_count = constants.workers_max + 1;
+    pub const shard_adopted = constants.workers_max;
+
+    /// `Counters` padded out so no two shards share a cache line (or a
+    /// prefetched line pair — see `cache_line_bytes`).
+    const Shard = struct {
+        counters: Counters = .{},
+        padding: [padding_bytes]u8 = @splat(0),
+
+        const padding_bytes =
+            std.mem.alignForward(usize, @sizeOf(Counters), cache_line_bytes) -
+            @sizeOf(Counters);
+    };
+
+    comptime {
+        assert(@sizeOf(Shard) % cache_line_bytes == 0); // shards never share a line
+        assert(Shard.padding_bytes < cache_line_bytes); // padding stays minimal
+        // Every field is a Counter: `total`/`snapshot` iterate them uniformly.
+        for (@typeInfo(Counters).@"struct".fields) |field| {
+            assert(field.type == Counter);
+        }
+    }
+
+    /// The shard a worker writes through. Workers beyond the shard table
+    /// share the last worker slot (diagnostic accept series only).
+    pub fn shard(metrics: *Metrics, index: u32) *Counters {
+        assert(index < shards_count);
+        return &metrics.shards[index].counters;
+    }
+
+    /// Process-wide value of one counter: the sum over every shard. Read
+    /// side only (scrape, handoff snapshot, drain decisions) — never on the
+    /// data path.
+    pub fn total(metrics: *const Metrics, comptime field_name: []const u8) u64 {
+        var sum: u64 = 0;
+        for (&metrics.shards) |*one_shard| { // bounded: shards_count
+            sum += @field(one_shard.counters, field_name).load();
+        }
+        return sum;
+    }
+
+    /// Write a Prometheus-style text exposition: every counter as its
+    /// cross-shard total, then the per-worker accept distribution as labeled
+    /// series, one per non-zero worker shard (the adopted shard is excluded
+    /// — a predecessor's distribution deliberately starts over).
     pub fn write_text(metrics: *const Metrics, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        inline for (@typeInfo(Metrics).@"struct".fields) |field| {
-            if (comptime field.type == Counter) {
-                const counter: *const Counter = &@field(metrics, field.name);
-                try writer.print("zoxy_{s} {d}\n", .{ field.name, counter.load() });
-            } else {
-                for (&@field(metrics, field.name), 0..) |*counter, index| {
-                    const value = counter.load();
-                    if (value == 0) continue; // only workers that exist
-                    try writer.print(
-                        "zoxy_{s}{{worker=\"{d}\"}} {d}\n",
-                        .{ field.name, index, value },
-                    );
-                }
-            }
+        inline for (@typeInfo(Counters).@"struct".fields) |field| {
+            try writer.print("zoxy_{s} {d}\n", .{ field.name, metrics.total(field.name) });
+        }
+        for (metrics.shards[0..constants.workers_max], 0..) |*one_shard, index| {
+            const value = one_shard.counters.accepted.load();
+            if (value == 0) continue; // only workers that exist
+            try writer.print(
+                "zoxy_worker_accepted{{worker=\"{d}\"}} {d}\n",
+                .{ index, value },
+            );
         }
     }
 };
 
 test "metrics: counters add, sub, and load" {
+    var counters = Counters{};
+    counters.accepted.add(3);
+    counters.accepted.add(1);
+    counters.active.add(5);
+    counters.active.sub(2);
+    try std.testing.expectEqual(@as(u64, 4), counters.accepted.load());
+    try std.testing.expectEqual(@as(u64, 3), counters.active.load());
+    try std.testing.expectEqual(@as(u64, 0), counters.rejected.load());
+}
+
+test "metrics: totals sum across shards" {
     var m = Metrics{};
-    m.accepted.add(3);
-    m.accepted.add(1);
-    m.active.add(5);
-    m.active.sub(2);
-    try std.testing.expectEqual(@as(u64, 4), m.accepted.load());
-    try std.testing.expectEqual(@as(u64, 3), m.active.load());
-    try std.testing.expectEqual(@as(u64, 0), m.rejected.load());
+    m.shard(0).requests.add(7);
+    m.shard(5).requests.add(2);
+    m.shard(Metrics.shard_adopted).requests.add(100); // hot-restart fold
+    try std.testing.expectEqual(@as(u64, 109), m.total("requests"));
+    try std.testing.expectEqual(@as(u64, 0), m.total("accepted"));
+}
+
+test "metrics: shards never share a cache line" {
+    var m = Metrics{};
+    const first = @intFromPtr(m.shard(0));
+    const second = @intFromPtr(m.shard(1));
+    try std.testing.expect(second - first >= cache_line_bytes);
+    try std.testing.expectEqual(@as(usize, 0), first % cache_line_bytes);
+    try std.testing.expectEqual(@as(usize, 0), (second - first) % cache_line_bytes);
 }
 
 test "metrics: write_text dumps every counter" {
     var m = Metrics{};
-    m.requests.add(7);
-    var buf: [1024]u8 = undefined;
+    m.shard(0).requests.add(7);
+    var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try m.write_text(&w);
     const out = w.buffered();
@@ -139,17 +214,20 @@ test "metrics: write_text dumps every counter" {
     try std.testing.expect(std.mem.indexOf(u8, out, "zoxy_accepted 0\n") != null);
 }
 
-test "metrics: per-worker counters emit labeled series, zeros omitted" {
+test "metrics: per-worker accepts emit labeled series, zeros and adopted omitted" {
     var m = Metrics{};
-    m.worker_accepted[0].add(3);
-    m.worker_accepted[5].add(9);
-    var buf: [1024]u8 = undefined;
+    m.shard(0).accepted.add(3);
+    m.shard(5).accepted.add(9);
+    m.shard(Metrics.shard_adopted).accepted.add(50); // total only, no series
+    var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try m.write_text(&w);
     const out = w.buffered();
     const series_0 = "zoxy_worker_accepted{worker=\"0\"} 3\n";
     const series_5 = "zoxy_worker_accepted{worker=\"5\"} 9\n";
+    try std.testing.expect(std.mem.indexOf(u8, out, "zoxy_accepted 62\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, series_0) != null);
     try std.testing.expect(std.mem.indexOf(u8, out, series_5) != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "worker=\"1\"") == null); // zero: omitted
+    try std.testing.expect(std.mem.indexOf(u8, out, "worker=\"64\"") == null); // adopted: omitted
 }

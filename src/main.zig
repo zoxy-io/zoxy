@@ -346,7 +346,7 @@ fn run_handoff_server(
 ) void {
     assert(listener_fds.len > 0);
     while (true) { // bounded by process lifetime: one success ends it
-        if (metrics.draining.load() > 0) {
+        if (metrics.total("draining") > 0) {
             const rc = linux.accept4(handoff_fd, null, null, linux.SOCK.CLOEXEC);
             if (linux.errno(rc) == .SUCCESS) _ = linux.close(@as(i32, @intCast(rc)));
             continue;
@@ -426,18 +426,20 @@ fn run_worker(
     // drain path closes this worker's use of it exactly once, via
     // `close_listener`, the moment accepting stops — a successor holding a
     // handed-off duplicate keeps the accept queue alive past that close.
+    // This worker's metrics shard — the only counters it ever writes (no
+    // shared cache line on the data path). Workers beyond the shard table
+    // share its last worker slot (the accept series is diagnostic only).
+    const counters = metrics.shard(@intCast(@min(cpu, constants.workers_max - 1)));
     var server = ProxyServer.init(
         &io,
         pool,
         listener,
         router,
-        metrics,
+        counters,
         access,
         constants.request_timeout_ns,
         constants.idle_timeout_ns,
     );
-    // Workers beyond the metrics table share its last slot (diagnostic only).
-    server.worker_index = @intCast(@min(cpu, constants.workers_max - 1));
     server.prng = .init(seed_base +% cpu);
     server.tls_context = tls_context;
     server.upstream_tls_contexts = upstream_tls;
@@ -446,7 +448,7 @@ fn run_worker(
     server.start();
 
     // Active health checks ride the same ring; arms only when configured.
-    var health = zoxy.HealthChecker.init(&io, router.config.clusters, &server.resilience, metrics);
+    var health = zoxy.HealthChecker.init(&io, router.config.clusters, &server.resilience, counters);
     health.start();
 
     while (!server.drain_complete()) {

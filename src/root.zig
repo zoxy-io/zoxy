@@ -45,8 +45,10 @@ pub const UpstreamPool = @import("proxy/upstream_pool.zig").UpstreamPool;
 /// The reverse-proxy data path (docs/DESIGN.md §5, §7).
 pub const proxy = @import("net/proxy.zig");
 
-/// Process-wide metrics counters (docs/DESIGN.md §7).
+/// Process-wide metrics: per-worker `Counters` shards, cache-line padded so
+/// the data path never contends on a shared line (docs/DESIGN.md §7).
 pub const Metrics = @import("obs/metrics.zig").Metrics;
+pub const Counters = @import("obs/metrics.zig").Counters;
 pub const Counter = @import("obs/metrics.zig").Counter;
 
 /// Per-worker access log.

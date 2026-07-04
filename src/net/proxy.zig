@@ -45,7 +45,7 @@ const maglev = @import("../proxy/maglev.zig");
 const resilience_mod = @import("../proxy/resilience.zig");
 const Resilience = resilience_mod.Resilience;
 const UpstreamPool = @import("../proxy/upstream_pool.zig").UpstreamPool;
-const Metrics = @import("../obs/metrics.zig").Metrics;
+const Counters = @import("../obs/metrics.zig").Counters;
 const Counter = @import("../obs/metrics.zig").Counter;
 const access_log = @import("../obs/access_log.zig");
 const AccessLog = access_log.AccessLog;
@@ -267,7 +267,9 @@ pub const ProxyConn = struct {
     router: *const Router,
     resilience: *Resilience,
     upstream_pool: *UpstreamPool,
-    metrics: *Metrics,
+    /// This worker's metrics shard (single writer; totals are summed on the
+    /// read side by `Metrics.total`).
+    metrics: *Counters,
     access: *AccessLog,
     /// The worker's PRNG (P2C draws, retry jitter). Never re-seeded here.
     random: std.Random,
@@ -559,7 +561,7 @@ pub const ProxyConn = struct {
         router: *const Router,
         resilience: *Resilience,
         upstream_pool: *UpstreamPool,
-        metrics: *Metrics,
+        metrics: *Counters,
         access: *AccessLog,
         random: std.Random,
         downstream_fd: posix.socket_t,
@@ -2352,20 +2354,18 @@ pub const ProxyServer = struct {
     pool: *Pool,
     listener: Listener,
     router: *const Router,
-    metrics: *Metrics,
+    /// This worker's metrics shard (single writer; the worker resolves it
+    /// from the sharded `Metrics` before init — tests pass a bare set).
+    metrics: *Counters,
     access: *AccessLog,
     resilience: Resilience,
     upstream_pool: UpstreamPool,
     /// Per-worker PRNG for P2C draws and retry jitter. Tests keep the
     /// deterministic default; `main.zig` seeds each worker from startup
-    /// entropy, `sim.zig` from the iteration seed (post-init, like
-    /// `worker_index`).
+    /// entropy, `sim.zig` from the iteration seed (both post-init).
     prng: std.Random.DefaultPrng,
-    /// Which `Metrics.worker_accepted` slot this worker's accepts count
-    /// toward; set by the worker after init (tests leave the default).
-    worker_index: u32,
     /// Downstream TLS termination context; null = plaintext listener. Set by
-    /// the worker after init, like `worker_index` (tests set it for the TLS
+    /// the worker after init, like `prng` (tests set it for the TLS
     /// end-to-end case). Shared across workers: with the session cache and
     /// tickets off it is immutable, and SSL_new only bumps its refcount.
     tls_context: ?*const terminator.Context,
@@ -2376,7 +2376,7 @@ pub const ProxyServer = struct {
     request_timeout_ns: u63,
     idle_timeout_ns: u63,
     /// Drain-to-forced-teardown bound; set by the worker after init like
-    /// `worker_index` (the simulator shrinks it to force the deadline path).
+    /// `prng` (the simulator shrinks it to force the deadline path).
     drain_timeout_ns: u63,
     /// Graceful drain (docs/DESIGN.md §7 Phase 4). Once `draining` is set:
     /// no new accepts, the listener closes, idle connections close politely,
@@ -2395,7 +2395,7 @@ pub const ProxyServer = struct {
     /// worker out may close it — an earlier close would hand the fd number
     /// back for reuse while sibling workers still have ops referencing it.
     /// Null = this worker owns its listener (reuseport mode, tests). Wired
-    /// by the worker before `start`, like `worker_index`.
+    /// by the worker before `start`, like `prng`.
     listener_refs: ?*Counter,
     /// Wired by the worker before `start` (-1 = none): a byte, EOF, or error
     /// on this fd — main's socketpair poke — begins the drain. The pending
@@ -2412,7 +2412,7 @@ pub const ProxyServer = struct {
         pool: *Pool,
         listener: Listener,
         router: *const Router,
-        metrics: *Metrics,
+        metrics: *Counters,
         access: *AccessLog,
         request_timeout_ns: u63,
         idle_timeout_ns: u63,
@@ -2427,7 +2427,6 @@ pub const ProxyServer = struct {
             .resilience = .{},
             .upstream_pool = .{},
             .prng = .init(0),
-            .worker_index = 0,
             .tls_context = null,
             .upstream_tls_contexts = &.{},
             .request_timeout_ns = request_timeout_ns,
@@ -2494,8 +2493,6 @@ pub const ProxyServer = struct {
         }
         if (result) |fd| {
             assert(fd >= 0);
-            assert(server.worker_index < constants.workers_max);
-            server.metrics.worker_accepted[server.worker_index].add(1);
             server.io.set_tcp_no_delay(fd); // response heads are small writes too
             if (server.pool.acquire()) |conn| {
                 conn.start(
@@ -2876,7 +2873,7 @@ test "proxy: forwards a request to an upstream and relays the response" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3112,7 +3109,7 @@ test "proxy: terminates TLS end to end — handshake, relay, heap drain" {
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3193,7 +3190,7 @@ test "proxy: TLS keep-alive carries pipelined requests on one handshake" {
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3275,7 +3272,7 @@ test "proxy: hands the record layer to the kernel after a quiet handshake" {
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3508,7 +3505,7 @@ test "proxy: re-encrypts to a verified TLS origin" {
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3613,7 +3610,7 @@ test "proxy: pools and resumes a TLS upstream — one handshake, two requests" {
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3727,7 +3724,7 @@ test "proxy: a wrong upstream authority fails the attempt with a 502" {
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3847,7 +3844,7 @@ test "proxy: a response the proxy will close after announces Connection: close" 
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -3929,7 +3926,7 @@ test "proxy: strips hop-by-hop headers from the forwarded request" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4010,7 +4007,7 @@ test "proxy: refuses an Upgrade request with 501 instead of tunneling it" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4093,7 +4090,7 @@ test "proxy: completes promptly when a lingering upstream sends a framed respons
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4182,7 +4179,7 @@ test "proxy: relays a chunked response and ends it at the terminal chunk" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4269,7 +4266,7 @@ test "proxy: serves pipelined requests sequentially, each routed on its own" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4367,7 +4364,7 @@ test "proxy: reuses the downstream connection for sequential keep-alive requests
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4483,7 +4480,7 @@ test "proxy: reuses a pooled upstream connection for the next request" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4593,7 +4590,7 @@ test "proxy: retries a stale pooled upstream on a fresh connection" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4708,7 +4705,7 @@ test "proxy: does not reuse the connection for an HTTP/1.0 client" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4797,7 +4794,7 @@ test "proxy: streams a framed request body to the upstream" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4884,7 +4881,7 @@ test "proxy: answers 502 when the upstream response is unparseable" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -4966,7 +4963,7 @@ test "proxy: circuit breaker rejects a request beyond max_requests with 503" {
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
     const short_timeout: u63 = 250 * std.time.ns_per_ms; // reclaims the held request
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5056,7 +5053,7 @@ test "proxy: circuit breaker rejects a dial beyond max_connections with 503" {
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
     const short_timeout: u63 = 250 * std.time.ns_per_ms;
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5211,7 +5208,7 @@ test "proxy: a configured retry survives an upstream that dies once" {
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5304,7 +5301,7 @@ test "proxy: outlier detection ejects a dead endpoint and traffic routes around 
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5397,7 +5394,7 @@ test "proxy: per-try timeout answers 504 while the overall deadline still runs" 
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5478,7 +5475,7 @@ test "proxy: relays a response larger than the relay buffer with bounded memory"
 
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5550,7 +5547,7 @@ test "proxy: a stalled connection is reclaimed by the deadline" {
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
     const short_timeout: u63 = 50 * std.time.ns_per_ms;
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5618,7 +5615,7 @@ test "proxy: an idle keep-alive connection is reclaimed by the idle timeout" {
     // by the request timeout here — keep both short so the test is fast.
     const request_timeout: u63 = 300 * std.time.ns_per_ms;
     const idle_timeout: u63 = 100 * std.time.ns_per_ms;
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5766,7 +5763,7 @@ test "proxy: drain closes an idle keep-alive connection and refuses new connects
     // No defer close: the drain path closes the listener exactly once.
     const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     const proxy_port = proxy_listener.bound_address().port;
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5840,7 +5837,7 @@ test "proxy: drain during a request completes it with Connection: close injected
     defer pool.deinit(gpa);
 
     const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5912,7 +5909,7 @@ test "proxy: maglev cluster pins a target to one endpoint and spreads targets" {
     defer pool.deinit(gpa);
     var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     defer proxy_listener.close();
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -5999,7 +5996,7 @@ test "proxy: two servers share one listener and the last drain closes it once" {
     const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     const proxy_port = proxy_listener.bound_address().port;
     var listener_refs = Counter{ .value = 2 };
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server_a = ProxyServer.init(
         &io,
@@ -6073,7 +6070,7 @@ test "proxy: a byte on the drain trigger fd begins the drain" {
 
     const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
     const proxy_port = proxy_listener.bound_address().port;
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     var server = ProxyServer.init(
         &io,
@@ -6140,7 +6137,7 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
     var pool = try Pool.init(gpa, 4);
     defer pool.deinit(gpa);
 
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 };
     // No defer close: the drain at the end of this test closes the listener.
     const proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);

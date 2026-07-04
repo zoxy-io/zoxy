@@ -11,6 +11,7 @@ const assert = std.debug.assert;
 
 const constants = @import("../constants.zig");
 const Metrics = @import("metrics.zig").Metrics;
+const Counters = @import("metrics.zig").Counters;
 const tls = @import("../tls/openssl.zig");
 const Ip4Address = std.Io.net.Ip4Address;
 
@@ -101,7 +102,7 @@ pub const Admin = struct {
 
         var body_buf: [body_bytes_max]u8 = undefined;
         comptime { // every counter line must fit: name prefix + u64 digits + newline
-            const fields = @typeInfo(Metrics).@"struct".fields;
+            const fields = @typeInfo(Counters).@"struct".fields;
             const lines = fields.len + constants.workers_max + tls_heap_gauge_count;
             assert(lines * 64 <= body_bytes_max);
         }
@@ -165,8 +166,8 @@ test "admin: serves the metrics exposition over HTTP" {
     // the exposition must include the TLS heap gauges.
     tls.install_memory_hook_for_tests();
     var metrics = Metrics{};
-    metrics.requests.add(7);
-    metrics.accepted.add(2);
+    metrics.shard(0).requests.add(7);
+    metrics.shard(0).accepted.add(2);
 
     var admin = try Admin.open(Ip4Address.loopback(0), &metrics);
     defer admin.close();

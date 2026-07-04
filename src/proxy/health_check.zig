@@ -26,13 +26,13 @@ const io_mod = @import("../io/io.zig");
 const IO = io_mod.IO;
 const Completion = io_mod.Completion;
 const Resilience = @import("resilience.zig").Resilience;
-const Metrics = @import("../obs/metrics.zig").Metrics;
+const Counters = @import("../obs/metrics.zig").Counters;
 
 pub const HealthChecker = struct {
     io: *IO,
     clusters: []const config.Cluster,
     resilience: *Resilience,
-    metrics: *Metrics,
+    metrics: *Counters,
     /// Absolute due instant per (cluster, endpoint); 0 = never probed
     /// (health checking off for that cluster).
     next_probe_ns: [constants.clusters_max][constants.endpoints_per_cluster_max]u64,
@@ -65,7 +65,7 @@ pub const HealthChecker = struct {
         io: *IO,
         clusters: []const config.Cluster,
         resilience: *Resilience,
-        metrics: *Metrics,
+        metrics: *Counters,
     ) HealthChecker {
         assert(clusters.len <= constants.clusters_max); // enforced by config.parse
         return .{
@@ -322,7 +322,7 @@ test "health_check: a dead endpoint flips unhealthy, a live one stays healthy" {
     defer cfg.deinit();
 
     var resilience = Resilience{};
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var checker = HealthChecker.init(&io, cfg.clusters, &resilience, &metrics);
     checker.start();
     try testing.expect(checker.running);
@@ -351,7 +351,7 @@ test "health_check: a recovered endpoint flips healthy after the threshold strea
     defer cfg.deinit();
 
     var resilience = Resilience{};
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var checker = HealthChecker.init(&io, cfg.clusters, &resilience, &metrics);
     // Simulate a previously-failed endpoint: unhealthy, mid-streak.
     resilience.endpoint_state(0, 0).healthy = false;
@@ -377,7 +377,7 @@ test "health_check: no configured cluster means the checker never arms" {
     defer cfg.deinit();
 
     var resilience = Resilience{};
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var checker = HealthChecker.init(&io, cfg.clusters, &resilience, &metrics);
     checker.start();
     try testing.expect(!checker.running);

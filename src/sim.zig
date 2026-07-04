@@ -51,7 +51,7 @@ const proxy_mod = @import("net/proxy.zig");
 const ProxyServer = proxy_mod.ProxyServer;
 const ConnPool = proxy_mod.ConnPool;
 const Listener = @import("net/listener.zig").Listener;
-const Metrics = @import("obs/metrics.zig").Metrics;
+const Counters = @import("obs/metrics.zig").Counters;
 const AccessLog = @import("obs/access_log.zig").AccessLog;
 
 const proxy_port = 8080;
@@ -170,7 +170,7 @@ fn run_iteration(seed: u64) !u64 {
     }
 
     var pool = try ConnPool.init(arena, connection_pool_capacity);
-    var metrics = Metrics{};
+    var metrics = Counters{};
     var access = AccessLog{ .fd = -1 }; // records accumulate, flushes are no-ops
     var server = ProxyServer.init(
         &io,

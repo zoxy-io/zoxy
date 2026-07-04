@@ -60,8 +60,9 @@ SO_REUSEPORT listener ──io.accept──► single-threaded io_uring loop (ow
 ```
 
 Each worker owns its ring, its `SO_REUSEPORT` listener, and its connection pool; there
-are **no locks on the data path**. `Metrics` counters are the only shared state (atomics);
-each worker has its own `AccessLog`.
+are **no locks on the data path**. `Metrics` is the only shared state, and it is sharded:
+each worker writes its own cache-line-padded `Counters` shard (atomics, single writer);
+readers sum across shards. Each worker has its own `AccessLog`.
 
 ### The I/O model is the load-bearing decision
 
@@ -100,7 +101,7 @@ Consequences that bite if you forget them:
 | `src/proxy/maglev.zig` | Maglev lookup tables: built once at config time (prime-sized, `u8` entries), data path = one wyhash + one index; knows nothing of config or balancer |
 | `src/proxy/resilience.zig` | per-worker mutable resilience state (Phase 2): request/attempt/dial/connection accounting, circuit-breaker admission, retry budget, passive outlier ejection — the narrow API the data path calls at fixed points; the sim asserts every counter drains to zero |
 | `src/proxy/health_check.zig` | active TCP-connect health probes, per worker, in-ring: one ticking scheduler, bounded probe slots, streak thresholds flip `EndpointState.healthy` |
-| `src/obs/metrics.zig`, `src/obs/access_log.zig` | atomic counters; fixed-buffer batched access log |
+| `src/obs/metrics.zig`, `src/obs/access_log.zig` | per-worker cache-line-padded counter shards (single writer, no shared line on the data path; scrape/handoff sum across shards); fixed-buffer batched access log |
 | `src/mem/guard.zig` | `CountingAllocator` — the zero-alloc acceptance gate (baseline count == final count) |
 | `src/tls/openssl.zig` | OpenSSL FFI seam (Phase 3): hand-written externs (no @cImport), the process-global `CRYPTO_set_mem_functions` hook, PEM identity validation. **Install the hook before any other OpenSSL call** — OpenSSL refuses it after its first allocation |
 | `src/tls/heap.zig` | fixed-capacity size-class heap behind the memory hook — reserved at startup, exhaustion fails the OpenSSL operation (load-shedding), never grows |

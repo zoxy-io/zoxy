@@ -16,7 +16,7 @@ const assert = std.debug.assert;
 
 const constants = @import("../constants.zig");
 const Metrics = @import("../obs/metrics.zig").Metrics;
-const Counter = @import("../obs/metrics.zig").Counter;
+const Counters = @import("../obs/metrics.zig").Counters;
 const Ip4Address = std.Io.net.Ip4Address;
 
 pub const fds_max = constants.workers_max;
@@ -75,15 +75,16 @@ fn control_space(fd_count: usize) usize {
 // Counters cross the restart as name-keyed records — `u8` name length, the
 // name, a little-endian `u64` value — so a successor built from a different
 // zoxy version simply ignores names it does not know and leaves absent ones
-// at zero. Gauges (`Metrics.gauge_fields`) and the diagnostic per-worker
+// at zero. Gauges (`Counters.gauge_fields`) and the diagnostic per-worker
 // accept distribution deliberately start over.
 
-/// Encode every transferable counter into `buffer`; returns bytes written.
+/// Encode every transferable counter (its cross-shard total) into `buffer`;
+/// returns bytes written.
 pub fn snapshot_stats(metrics: *const Metrics, buffer: []u8) usize {
     assert(buffer.len >= stats_bytes_max);
     var offset: usize = 0;
-    inline for (@typeInfo(Metrics).@"struct".fields) |field| {
-        if (comptime field.type == Counter and !Metrics.is_gauge(field.name)) {
+    inline for (@typeInfo(Counters).@"struct".fields) |field| {
+        if (comptime !Counters.is_gauge(field.name)) {
             comptime assert(field.name.len <= std.math.maxInt(u8));
             const record_length = 1 + field.name.len + @sizeOf(u64);
             assert(offset + record_length <= buffer.len); // sized by the comptime field set
@@ -91,21 +92,23 @@ pub fn snapshot_stats(metrics: *const Metrics, buffer: []u8) usize {
             offset += 1;
             @memcpy(buffer[offset..][0..field.name.len], field.name);
             offset += field.name.len;
-            const value = @field(metrics, field.name).load();
+            const value = metrics.total(field.name);
             std.mem.writeInt(u64, buffer[offset..][0..8], value, .little);
             offset += 8;
         }
     }
-    assert(offset > 0); // Metrics always has transferable counters
+    assert(offset > 0); // Counters always has transferable fields
     assert(offset <= stats_bytes_max);
     return offset;
 }
 
-/// Fold received counter records into `metrics` (counters start at zero, so
-/// `add` restores the predecessor's totals). Unknown names are skipped; a
+/// Fold received counter records into the dedicated adopted shard (its
+/// counters start at zero, so `add` restores the predecessor's totals
+/// without touching any worker's shard). Unknown names are skipped; a
 /// malformed tail stops the fold — stats are best-effort by design, the
 /// adopted listeners must never depend on them.
 pub fn apply_stats(metrics: *Metrics, records: []const u8) void {
+    const adopted = metrics.shard(Metrics.shard_adopted);
     var offset: usize = 0;
     var applied: u32 = 0;
     while (offset < records.len) {
@@ -117,9 +120,9 @@ pub fn apply_stats(metrics: *Metrics, records: []const u8) void {
         offset += name_length;
         const value = std.mem.readInt(u64, records[offset..][0..8], .little);
         offset += 8;
-        inline for (@typeInfo(Metrics).@"struct".fields) |field| {
-            if (comptime field.type == Counter and !Metrics.is_gauge(field.name)) {
-                if (std.mem.eql(u8, field.name, name)) @field(metrics, field.name).add(value);
+        inline for (@typeInfo(Counters).@"struct".fields) |field| {
+            if (comptime !Counters.is_gauge(field.name)) {
+                if (std.mem.eql(u8, field.name, name)) @field(adopted, field.name).add(value);
             }
         }
         applied += 1;
@@ -396,12 +399,14 @@ test "handoff: listener fds round-trip over SCM_RIGHTS and stay listeners" {
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
 
-    // Counters cross the restart; gauges (`active`) start over.
+    // Counters cross the restart (as cross-shard totals); gauges (`active`)
+    // start over.
     var old_metrics = Metrics{};
-    old_metrics.accepted.add(41);
-    old_metrics.requests.add(7);
-    old_metrics.bytes_to_client.add(123_456);
-    old_metrics.active.add(3);
+    old_metrics.shard(0).accepted.add(40);
+    old_metrics.shard(1).accepted.add(1);
+    old_metrics.shard(0).requests.add(7);
+    old_metrics.shard(0).bytes_to_client.add(123_456);
+    old_metrics.shard(0).active.add(3);
 
     const sent = send_fds(pair[0], &.{ listener_a.fd, listener_b.fd }, bound, &old_metrics);
     try testing.expect(sent);
@@ -416,10 +421,13 @@ test "handoff: listener fds round-trip over SCM_RIGHTS and stay listeners" {
         try testing.expect(is_listener_for(fd, bound));
         _ = linux.close(fd);
     }
-    try testing.expectEqual(@as(u64, 41), new_metrics.accepted.load());
-    try testing.expectEqual(@as(u64, 7), new_metrics.requests.load());
-    try testing.expectEqual(@as(u64, 123_456), new_metrics.bytes_to_client.load());
-    try testing.expectEqual(@as(u64, 0), new_metrics.active.load()); // gauge: reset
+    try testing.expectEqual(@as(u64, 41), new_metrics.total("accepted"));
+    try testing.expectEqual(@as(u64, 7), new_metrics.total("requests"));
+    try testing.expectEqual(@as(u64, 123_456), new_metrics.total("bytes_to_client"));
+    try testing.expectEqual(@as(u64, 0), new_metrics.total("active")); // gauge: reset
+    // The fold lands in the adopted shard, never in a worker's.
+    try testing.expectEqual(@as(u64, 41), new_metrics.shard(Metrics.shard_adopted).accepted.load());
+    try testing.expectEqual(@as(u64, 0), new_metrics.shard(0).accepted.load());
 }
 
 test "handoff: unknown counter names are skipped, known ones still apply" {
@@ -441,12 +449,12 @@ test "handoff: unknown counter names are skipped, known ones still apply" {
 
     var metrics = Metrics{};
     apply_stats(&metrics, records[0..offset]);
-    try testing.expectEqual(@as(u64, 17), metrics.requests.load());
+    try testing.expectEqual(@as(u64, 17), metrics.total("requests"));
 
     // A truncated tail stops the fold without touching anything else.
     var truncated = Metrics{};
     apply_stats(&truncated, records[0 .. offset - 3]);
-    try testing.expectEqual(@as(u64, 0), truncated.requests.load());
+    try testing.expectEqual(@as(u64, 0), truncated.total("requests"));
 }
 
 test "handoff: a queued connection survives the sender closing its copy" {
@@ -526,7 +534,7 @@ test "handoff: full unix-socket path — serve_once hands off to adopt" {
     defer _ = linux.close(server_fd);
 
     var old_metrics = Metrics{};
-    old_metrics.requests.add(29);
+    old_metrics.shard(0).requests.add(29);
     const Server = struct {
         fn run(
             fd: posix.socket_t,
@@ -550,7 +558,7 @@ test "handoff: full unix-socket path — serve_once hands off to adopt" {
     const count = adopt(path, bound, &adopted, &new_metrics);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expect(is_listener_for(adopted[0], bound));
-    try testing.expectEqual(@as(u64, 29), new_metrics.requests.load());
+    try testing.expectEqual(@as(u64, 29), new_metrics.total("requests"));
     _ = linux.close(adopted[0]);
 
     var unlink_path = sockaddr_un(path).?;
