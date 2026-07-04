@@ -44,8 +44,15 @@ pub const Admin = struct {
         assert(fd >= 0);
         errdefer _ = linux.close(fd);
 
+        // REUSEPORT as well as REUSEADDR: during a hot restart the draining
+        // predecessor still holds this port — the successor must bind beside
+        // it or die *after* the listener handoff, taking both processes (and
+        // the handed-off accept queues) down. Scrapes during the overlap hit
+        // either process; the survivor owns the port once the drain ends.
         const on: c_int = 1;
         posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&on)) catch
+            return error.SetSockOptFailed;
+        posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&on)) catch
             return error.SetSockOptFailed;
 
         var sa = sockaddr_in(address);

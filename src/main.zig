@@ -172,6 +172,39 @@ pub fn main(init: std.process.Init) !void {
         pair.* = .{ fds[0], fds[1] };
     }
 
+    // Listeners are owned by main — adopted from a predecessor over the
+    // handoff socket when one is running (docs/DESIGN.md §7 Phase 4: the
+    // SCM_RIGHTS duplicates keep the accept queues alive across the
+    // restart), fresh SO_REUSEPORT binds otherwise. A bind failure now
+    // fails startup instead of killing a lone worker thread.
+    var adopted_fds: [constants.workers_max]std.posix.socket_t = undefined;
+    var adopted_count: usize = 0;
+    if (cfg.handoff) |path| {
+        adopted_count = zoxy.handoff.adopt(path, cfg.listen, &adopted_fds);
+        if (adopted_count > 0) {
+            std.log.info("zoxy: adopted {d} listener(s) from a predecessor", .{adopted_count});
+        }
+    }
+    if (adopted_count > worker_count) {
+        // A predecessor with more workers: nobody would ever accept from the
+        // surplus queues once it drains — close them (a core-count change).
+        std.log.warn("zoxy: closing {d} surplus adopted listener(s)", .{
+            adopted_count - worker_count,
+        });
+        for (adopted_fds[worker_count..adopted_count]) |fd| _ = linux.close(fd);
+        adopted_count = worker_count;
+    }
+    const listeners = try gpa.alloc(Listener, worker_count);
+    for (listeners, 0..) |*listener, index| {
+        listener.* = if (index < adopted_count)
+            Listener{ .fd = adopted_fds[index] }
+        else
+            Listener.open(cfg.listen, constants.accept_backlog) catch |err| {
+                std.log.err("zoxy: cannot listen on {f}: {s}", .{ cfg.listen, @errorName(err) });
+                return err;
+            };
+    }
+
     // Shared counters (atomic) and per-worker access logs, reserved up front.
     var metrics: Metrics = .{};
     const accesses = try gpa.alloc(AccessLog, worker_count);
@@ -189,16 +222,42 @@ pub fn main(init: std.process.Init) !void {
     const seed_base = std.mem.readInt(u64, &seed_bytes, .little);
 
     const threads = try gpa.alloc(std.Thread, worker_count);
-    for (threads, pools, accesses, drain_triggers, 0..) |*thread, *pool, *access, trigger, cpu| {
+    for (threads, listeners, pools, accesses, drain_triggers, 0..) |
+        *thread,
+        listener,
+        *pool,
+        *access,
+        trigger,
+        cpu,
+    | {
         thread.* = try std.Thread.spawn(
             .{},
             run_worker,
             .{
-                cfg.listen,   pool,       &router, &metrics,
+                listener,     pool,       &router, &metrics,
                 access,       seed_base,  cpu,     tls_context,
                 upstream_tls, trigger[0],
             },
         );
+    }
+
+    // Hot restart: serve our listener fds to a successor, then drain. Bound
+    // *after* the adopt above, so a fresh process replaces (unlinks) its
+    // predecessor's socket file only once the fds are already in hand.
+    if (cfg.handoff) |path| {
+        const handoff_fd = zoxy.handoff.open_server(path) catch |err| {
+            std.log.err("zoxy: cannot open handoff socket {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        const listener_fds = try gpa.alloc(std.posix.socket_t, worker_count);
+        for (listeners, listener_fds) |listener, *fd| fd.* = listener.fd;
+        const handoff_thread = try std.Thread.spawn(
+            .{},
+            run_handoff_server,
+            .{ handoff_fd, listener_fds, cfg.listen, &metrics },
+        );
+        handoff_thread.detach();
+        std.log.info("zoxy handoff socket on {s}", .{path});
     }
 
     // Admin/metrics plane: blocking, on its own detached thread, off the data
@@ -256,6 +315,29 @@ fn hard_exit_watcher(signal_fd: linux.fd_t) void {
     linux.exit_group(1);
 }
 
+/// Serve the handoff socket until one successor takes the listeners, then
+/// trigger our own drain through the normal signal path — one drain entry
+/// point. Once draining, further successors are accepted-and-dropped so
+/// they fall back to fresh binds instead of waiting on closing fds.
+fn run_handoff_server(
+    handoff_fd: std.posix.socket_t,
+    listener_fds: []const std.posix.socket_t,
+    listen: Ip4Address,
+    metrics: *const Metrics,
+) void {
+    assert(listener_fds.len > 0);
+    while (true) { // bounded by process lifetime: one success ends it
+        if (metrics.draining.load() > 0) {
+            const rc = linux.accept4(handoff_fd, null, null, linux.SOCK.CLOEXEC);
+            if (linux.errno(rc) == .SUCCESS) _ = linux.close(@as(i32, @intCast(rc)));
+            continue;
+        }
+        if (zoxy.handoff.serve_once(handoff_fd, listener_fds, listen)) break;
+    }
+    std.log.info("zoxy: listeners handed to a successor; draining", .{});
+    _ = linux.kill(linux.getpid(), .TERM);
+}
+
 /// Build one cluster's upstream (client-role) context: read the CA bundle
 /// when verification is on, or honor the explicit `insecure`.
 fn build_upstream_context(
@@ -301,7 +383,7 @@ fn load_tls_identity(
 /// pinned to a core. Runs the proxy accept/relay loop until a drain completes
 /// (or forever, if no drain is ever triggered).
 fn run_worker(
-    listen: Ip4Address,
+    listener: Listener,
     pool: *Pool,
     router: *const Router,
     metrics: *Metrics,
@@ -313,18 +395,17 @@ fn run_worker(
     drain_trigger_fd: std.posix.socket_t,
 ) void {
     assert(pool.capacity > 0);
+    assert(listener.fd >= 0); // opened (or adopted) by main; never closes early
     pin_to_cpu(cpu);
 
     var io = IO.init(constants.io_ring_entries, 0) catch |err|
         return log_worker_error("io init", err);
     defer io.deinit();
 
-    // No defer close: the drain path closes the listener (exactly once, via
-    // `close_listener`) the moment accepting stops, so clients get refused
-    // instead of queueing behind a worker that will never accept them.
-    const listener = Listener.open(listen, constants.accept_backlog) catch |err|
-        return log_worker_error("listen", err);
-
+    // The listener is owned by main (fresh bind or adopted via handoff); the
+    // drain path closes this worker's use of it exactly once, via
+    // `close_listener`, the moment accepting stops — a successor holding a
+    // handed-off duplicate keeps the accept queue alive past that close.
     var server = ProxyServer.init(
         &io,
         pool,

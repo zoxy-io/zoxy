@@ -112,6 +112,9 @@ pub const Config = struct {
     listen: Ip4Address,
     /// Address of the admin/metrics endpoint; null disables it.
     admin: ?Ip4Address,
+    /// Unix-socket path for hot-restart listener handoff (docs/DESIGN.md §7
+    /// Phase 4); null disables hot restart.
+    handoff: ?[]const u8,
     /// TLS termination on the listener; null = plaintext.
     tls: ?TlsConfig,
     routes: []const Route,
@@ -138,12 +141,14 @@ pub const ParseError = error{
     TooManyEndpoints,
     InvalidLimit,
     InvalidTls,
+    InvalidHandoff,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// JSON shape mirrored 1:1 for decoding, then lowered into `Config`.
 const Dto = struct {
     listen: []const u8,
     admin: ?[]const u8 = null,
+    handoff: ?[]const u8 = null,
     tls: ?TlsDto = null,
     routes: []const RouteDto,
     clusters: []const ClusterDto,
@@ -291,6 +296,14 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
         .arena = arena,
         .listen = try parse_address(dto.listen),
         .admin = if (dto.admin) |text_addr| try parse_address(text_addr) else null,
+        .handoff = if (dto.handoff) |path| blk: {
+            // Must fit sockaddr_un.path as a NUL-terminated string.
+            const path_max = @typeInfo(
+                @FieldType(std.os.linux.sockaddr.un, "path"),
+            ).array.len - 1;
+            if (path.len == 0 or path.len > path_max) return error.InvalidHandoff;
+            break :blk try a.dupe(u8, path);
+        } else null,
         .tls = tls,
         .routes = routes,
         .clusters = clusters,
@@ -457,6 +470,37 @@ test "config: admin endpoint is optional and parses when present" {
     );
     defer with.deinit();
     try std.testing.expectEqual(@as(u16, 9901), with.admin.?.port);
+}
+
+test "config: handoff path is optional, parses, and rejects the unfittable" {
+    var without = try parse(std.testing.allocator, test_config);
+    defer without.deinit();
+    try std.testing.expect(without.handoff == null);
+
+    var with = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "handoff": "/run/zoxy-handoff.sock",
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer with.deinit();
+    try std.testing.expectEqualStrings("/run/zoxy-handoff.sock", with.handoff.?);
+
+    // Empty and longer-than-sockaddr_un paths are refused at parse time.
+    const empty = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "handoff": "",
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidHandoff, empty);
+
+    const long_path = "/tmp/" ++ "x" ** 120;
+    var buf: [512]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf,
+        \\{{ "listen": "0.0.0.0:80", "handoff": "{s}",
+        \\  "routes": [{{ "cluster": "c" }}],
+        \\  "clusters": [{{ "name": "c", "endpoints": ["127.0.0.1:9000"] }}] }}
+    , .{long_path});
+    try std.testing.expectError(error.InvalidHandoff, parse(std.testing.allocator, text));
 }
 
 test "config: tls block is optional, parses paths, rejects empty ones" {

@@ -90,6 +90,7 @@ Consequences that bite if you forget them:
 | `src/sim.zig` | the simulator: real data path + misbehaving virtual origins/clients, per-seed invariants (no deadlock, no leaks, every response parses + frames) |
 | `src/net/proxy.zig` | **the data path**: `ProxyConn` (recv head→parse→route→pool checkout or connect→framed relay→reuse or teardown), `Pipe` (one framed relay direction), `ProxyServer` (accept loop + graceful drain: `begin_drain`/`drain_complete`, close-after-response, deadline clamp), hop-by-hop header handling both ways, fixed 4xx/5xx responses, per-try timeout via attempt-abort/drain, two-tier retries (free stale-pool replay + budgeted jittered-backoff retries), integration + zero-alloc gate tests |
 | `src/net/listener.zig` | `SO_REUSEPORT` TCP listener via raw linux syscalls (REUSEADDR+REUSEPORT set before bind) |
+| `src/net/handoff.zig` | hot-restart listener handoff: unix socket + one `SCM_RIGHTS` cmsg carries every worker's listener fd to a successor, validated (`getsockname` + `SO_ACCEPTCONN`) before adoption; blocking, startup/dedicated-thread only |
 | `src/net/pool.zig` | generic `Pool(T)` over an **intrusive free list** (requires `T.free_next: ?*T`); exhaustion rejects, never grows |
 | `src/http/h1.zig` | zero-copy HTTP/1.1 request+response parsers, RFC 9112 §6.3 body-framing decisions (smuggling shapes rejected), `BodyFramer` message-end tracker |
 | `src/http/chunked.zig` | incremental chunked-coding decoder — finds message ends, transforms nothing |

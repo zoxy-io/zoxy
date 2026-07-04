@@ -636,11 +636,35 @@ catches the dominant failures), ejection-time multipliers.
      refused while admin stays up, gauge visible, second-signal hard
      exit). Sanity bench at 60k req/s: in-band (avg 462µs, 0 errors,
      >99.9% upstream reuse).
-  2. **Hot restart** — FD passing over a unix socket, à la HAProxy
-     `SCM_RIGHTS`: the new process starts and binds alongside the old
-     (SO_REUSEPORT admits it), takes over accepting, then the old drains
-     via slice 1; a listener handoff also closes the drain-only RST
-     window. Transfer stats across the pair.
+  2. **Hot restart** — done 2026-07-04. Config `handoff` names a unix
+     socket; main now owns every worker's listener (a bind failure fails
+     startup, not a lone worker thread). Old side: a dedicated thread (the
+     admin pattern) serves the socket — one accept, a fixed header
+     (magic/version/count/listen address) plus all listener fds in one
+     `SCM_RIGHTS` cmsg — then raises SIGTERM at its own process, so the
+     handoff funnels into the slice-1 drain (one drain entry point); once
+     draining it accepts-and-drops, and a late successor falls back to
+     fresh binds. New side, at startup before binding: connect, recvmsg
+     (`MSG_CMSG_CLOEXEC`), refuse the whole batch unless the header checks
+     out and every fd getsockname-matches the configured listen address
+     and is `SO_ACCEPTCONN`-listening; surplus fds (core count shrank) are
+     closed with a warning, missing ones fresh-bound — SO_REUSEPORT admits
+     both processes during the overlap. Because `SCM_RIGHTS` duplicates
+     fds, the old workers' `close_listener` closes only their copies: the
+     accept queues survive in the successor and the drain-only RST window
+     is gone (tested directly — a queued-but-unaccepted connection is
+     accepted through the duplicate after the original closes). The admin
+     listener gained SO_REUSEPORT for the same overlap, found the hard
+     way: the successor bound admin *after* adopting, died on the
+     predecessor's still-held port, and took both processes (and the
+     handed-off queues) down — post-adoption startup failures are the
+     dangerous class, so everything fallible is ordered before the adopt
+     except the handoff-socket rebind and admin, both overlap-safe now.
+     Verified: fd round-trip, wrong-address refusal, first-boot fallback,
+     and the full unix-socket path in tests; process-level A→B restart
+     under a request hammer: 928/928 responses, zero failures, A drained
+     and exited, B adopted all 8 listeners. Still separate: stats transfer
+     across the pair.
 - **Accept balancing across workers.** Measured 2026-07 (per-worker accept
   counters, `zoxy_worker_accepted`): the SO_REUSEPORT hash is uniform at
   large N (1.14:1 over 150k accepts) but few long-lived connections pin

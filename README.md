@@ -297,9 +297,15 @@ drained; a second signal exits immediately. The signal reaches a worker
 blocked in `io_uring_enter` as a plain recv completion on a per-worker
 socketpair. Verified by the simulator (a third of iterations drain
 mid-traffic, replayable), integration tests, and the zero-alloc gate
-(which now drains inside it). Still to come: hot restart (`SCM_RIGHTS` fd
-passing), accept balancing across workers, consistent-hash LB, tracing +
-Prometheus polish. HTTP/2 is deliberately deferred behind operability: it
+(which now drains inside it). **Hot restart done too:** a `handoff` unix
+socket serves every worker's listener fd to a successor over `SCM_RIGHTS`
+(validated against the configured address before adoption), then the old
+process drains — the duplicated fds keep the accept queues alive across
+the restart, closing the drain-only RST window. Measured: an A→B restart
+under a request hammer served 928/928 with zero failures. Still to come:
+transfer stats across the restart pair, accept balancing across workers,
+consistent-hash LB, tracing + Prometheus polish. HTTP/2 is deliberately
+deferred behind operability: it
 is a large protocol surface that lands better on an operable base, and
 accept balancing is a prerequisite for its few-hot-connections traffic
 shape.

@@ -9,6 +9,9 @@ pub const io = @import("io/io.zig");
 /// A SO_REUSEPORT TCP listener (docs/DESIGN.md §2).
 pub const Listener = @import("net/listener.zig").Listener;
 
+/// Hot-restart listener handoff over SCM_RIGHTS (docs/DESIGN.md §7 Phase 4).
+pub const handoff = @import("net/handoff.zig");
+
 /// Static limits (docs/TIGER_STYLE.md: "put a limit on everything").
 pub const constants = @import("constants.zig");
 
@@ -61,6 +64,7 @@ test {
     _ = io;
     _ = @import("io/test_io.zig");
     _ = @import("net/listener.zig");
+    _ = handoff;
     _ = h1;
     _ = chunked;
     _ = config;
