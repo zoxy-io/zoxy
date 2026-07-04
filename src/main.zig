@@ -172,6 +172,11 @@ pub fn main(init: std.process.Init) !void {
         pair.* = .{ fds[0], fds[1] };
     }
 
+    // Shared counters (atomic), reserved before the adopt below so a
+    // predecessor's totals can be folded in — scrapes stay monotonic across
+    // a hot restart (gauges start over; see Metrics.gauge_fields).
+    var metrics: Metrics = .{};
+
     // Listeners are owned by main — adopted from a predecessor over the
     // handoff socket when one is running (docs/DESIGN.md §7 Phase 4: the
     // SCM_RIGHTS duplicates keep the accept queues alive across the
@@ -180,7 +185,7 @@ pub fn main(init: std.process.Init) !void {
     var adopted_fds: [constants.workers_max]std.posix.socket_t = undefined;
     var adopted_count: usize = 0;
     if (cfg.handoff) |path| {
-        adopted_count = zoxy.handoff.adopt(path, cfg.listen, &adopted_fds);
+        adopted_count = zoxy.handoff.adopt(path, cfg.listen, &adopted_fds, &metrics);
         if (adopted_count > 0) {
             std.log.info("zoxy: adopted {d} listener(s) from a predecessor", .{adopted_count});
         }
@@ -205,8 +210,7 @@ pub fn main(init: std.process.Init) !void {
             };
     }
 
-    // Shared counters (atomic) and per-worker access logs, reserved up front.
-    var metrics: Metrics = .{};
+    // Per-worker access logs, reserved up front.
     const accesses = try gpa.alloc(AccessLog, worker_count);
     for (accesses) |*access| access.* = .{ .fd = stderr_fd };
 
@@ -332,7 +336,7 @@ fn run_handoff_server(
             if (linux.errno(rc) == .SUCCESS) _ = linux.close(@as(i32, @intCast(rc)));
             continue;
         }
-        if (zoxy.handoff.serve_once(handoff_fd, listener_fds, listen)) break;
+        if (zoxy.handoff.serve_once(handoff_fd, listener_fds, listen, metrics)) break;
     }
     std.log.info("zoxy: listeners handed to a successor; draining", .{});
     _ = linux.kill(linux.getpid(), .TERM);

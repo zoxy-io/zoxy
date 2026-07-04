@@ -15,17 +15,24 @@ const posix = std.posix;
 const assert = std.debug.assert;
 
 const constants = @import("../constants.zig");
+const Metrics = @import("../obs/metrics.zig").Metrics;
+const Counter = @import("../obs/metrics.zig").Counter;
 const Ip4Address = std.Io.net.Ip4Address;
 
 pub const fds_max = constants.workers_max;
 
+/// Bounds the stats block a successor will read. Generous: every counter
+/// record is a length-prefixed name plus a u64.
+pub const stats_bytes_max: u32 = 16 * 1024;
+
 const magic: u32 = 0x584f5a48; // "HZOX"
-const version: u32 = 1;
+const version: u32 = 2;
 const accept_backlog = 4;
 
 /// Fixed-layout message head sent before the fd-carrying cmsg; lets the new
 /// side refuse a stranger, a version skew, or a listener for the wrong
-/// address without touching the fds.
+/// address without touching the fds. `stats_bytes` of counter records
+/// follow the header on the same stream.
 pub const Header = extern struct {
     magic: u32,
     version: u32,
@@ -33,10 +40,11 @@ pub const Header = extern struct {
     listen_address: [4]u8,
     listen_port: u16,
     reserved: u16 = 0,
+    stats_bytes: u32,
 };
 
 comptime {
-    assert(@sizeOf(Header) == 20); // no hidden padding crosses the wire
+    assert(@sizeOf(Header) == 24); // no hidden padding crosses the wire
 }
 
 /// One SCM_RIGHTS cmsg big enough for every worker's listener.
@@ -62,6 +70,63 @@ fn control_space(fd_count: usize) usize {
     return std.mem.alignForward(usize, control_length(fd_count), @alignOf(linux.cmsghdr));
 }
 
+// ---- counter records --------------------------------------------------------
+//
+// Counters cross the restart as name-keyed records — `u8` name length, the
+// name, a little-endian `u64` value — so a successor built from a different
+// zoxy version simply ignores names it does not know and leaves absent ones
+// at zero. Gauges (`Metrics.gauge_fields`) and the diagnostic per-worker
+// accept distribution deliberately start over.
+
+/// Encode every transferable counter into `buffer`; returns bytes written.
+pub fn snapshot_stats(metrics: *const Metrics, buffer: []u8) usize {
+    assert(buffer.len >= stats_bytes_max);
+    var offset: usize = 0;
+    inline for (@typeInfo(Metrics).@"struct".fields) |field| {
+        if (comptime field.type == Counter and !Metrics.is_gauge(field.name)) {
+            comptime assert(field.name.len <= std.math.maxInt(u8));
+            const record_length = 1 + field.name.len + @sizeOf(u64);
+            assert(offset + record_length <= buffer.len); // sized by the comptime field set
+            buffer[offset] = @intCast(field.name.len);
+            offset += 1;
+            @memcpy(buffer[offset..][0..field.name.len], field.name);
+            offset += field.name.len;
+            const value = @field(metrics, field.name).load();
+            std.mem.writeInt(u64, buffer[offset..][0..8], value, .little);
+            offset += 8;
+        }
+    }
+    assert(offset > 0); // Metrics always has transferable counters
+    assert(offset <= stats_bytes_max);
+    return offset;
+}
+
+/// Fold received counter records into `metrics` (counters start at zero, so
+/// `add` restores the predecessor's totals). Unknown names are skipped; a
+/// malformed tail stops the fold — stats are best-effort by design, the
+/// adopted listeners must never depend on them.
+pub fn apply_stats(metrics: *Metrics, records: []const u8) void {
+    var offset: usize = 0;
+    var applied: u32 = 0;
+    while (offset < records.len) {
+        const name_length: usize = records[offset];
+        offset += 1;
+        if (name_length == 0) return; // malformed: stop, keep what was applied
+        if (offset + name_length + @sizeOf(u64) > records.len) return;
+        const name = records[offset..][0..name_length];
+        offset += name_length;
+        const value = std.mem.readInt(u64, records[offset..][0..8], .little);
+        offset += 8;
+        inline for (@typeInfo(Metrics).@"struct".fields) |field| {
+            if (comptime field.type == Counter and !Metrics.is_gauge(field.name)) {
+                if (std.mem.eql(u8, field.name, name)) @field(metrics, field.name).add(value);
+            }
+        }
+        applied += 1;
+        assert(applied <= stats_bytes_max / (1 + @sizeOf(u64))); // bounded by the wire format
+    }
+}
+
 // ---- old side ---------------------------------------------------------------
 
 /// Bind the handoff unix socket, replacing any stale file at `path` (a crash
@@ -82,13 +147,14 @@ pub fn open_server(path: []const u8) error{HandoffSocketFailed}!posix.socket_t {
     return fd;
 }
 
-/// Block for one successor and hand it the listeners. True = a handoff
-/// happened and the caller must begin its own drain. False = the client
-/// vanished or a send failed — serve the next one.
+/// Block for one successor and hand it the listeners (and the counter
+/// totals). True = a handoff happened and the caller must begin its own
+/// drain. False = the client vanished or a send failed — serve the next one.
 pub fn serve_once(
     server_fd: posix.socket_t,
     listeners: []const posix.socket_t,
     listen_address: Ip4Address,
+    metrics: *const Metrics,
 ) bool {
     assert(listeners.len > 0);
     assert(listeners.len <= fds_max);
@@ -97,24 +163,29 @@ pub fn serve_once(
     const client: posix.socket_t = @intCast(rc);
     assert(client >= 0);
     defer _ = linux.close(client);
-    return send_fds(client, listeners, listen_address);
+    return send_fds(client, listeners, listen_address, metrics);
 }
 
-/// The wire write: header iov + one SCM_RIGHTS cmsg. Split from `serve_once`
-/// so the transfer is testable over a plain socketpair.
+/// The wire write: header + counter records in the iov, one SCM_RIGHTS
+/// cmsg. Split from `serve_once` so the transfer is testable over a plain
+/// socketpair.
 pub fn send_fds(
     connection: posix.socket_t,
     listeners: []const posix.socket_t,
     listen_address: Ip4Address,
+    metrics: *const Metrics,
 ) bool {
     assert(listeners.len > 0);
     assert(listeners.len <= fds_max);
+    var stats_buffer: [stats_bytes_max]u8 = undefined;
+    const stats_length = snapshot_stats(metrics, &stats_buffer);
     var header = Header{
         .magic = magic,
         .version = version,
         .listener_count = @intCast(listeners.len),
         .listen_address = listen_address.bytes,
         .listen_port = listen_address.port,
+        .stats_bytes = @intCast(stats_length),
     };
     var control = FdControl{
         .header = .{
@@ -128,10 +199,10 @@ pub fn send_fds(
         assert(listener_fd >= 0);
         slot.* = listener_fd;
     }
-    var segments = [1]posix.iovec_const{.{
-        .base = std.mem.asBytes(&header),
-        .len = @sizeOf(Header),
-    }};
+    var segments = [2]posix.iovec_const{
+        .{ .base = std.mem.asBytes(&header), .len = @sizeOf(Header) },
+        .{ .base = &stats_buffer, .len = stats_length },
+    };
     const message = linux.msghdr_const{
         .name = null,
         .namelen = 0,
@@ -143,7 +214,9 @@ pub fn send_fds(
     };
     const sent = linux.sendmsg(connection, &message, 0);
     if (linux.errno(sent) != .SUCCESS) return false;
-    return sent == @sizeOf(Header); // a short header write means a broken peer
+    // A short write means a broken peer; the header alone decides validity
+    // on the other side, and the stats tail is best-effort by design.
+    return sent == @sizeOf(Header) + stats_length;
 }
 
 // ---- new side ---------------------------------------------------------------
@@ -152,7 +225,12 @@ pub fn send_fds(
 /// were written into `fds_out`; 0 means no predecessor (first boot), a
 /// protocol mismatch, or listeners for a different address — the caller
 /// binds fresh in every one of those cases.
-pub fn adopt(path: []const u8, listen_address: Ip4Address, fds_out: []posix.socket_t) usize {
+pub fn adopt(
+    path: []const u8,
+    listen_address: Ip4Address,
+    fds_out: []posix.socket_t,
+    metrics: ?*Metrics,
+) usize {
     assert(path.len > 0);
     assert(fds_out.len > 0);
     const fd = unix_socket() orelse return 0;
@@ -160,7 +238,7 @@ pub fn adopt(path: []const u8, listen_address: Ip4Address, fds_out: []posix.sock
     var address = sockaddr_un(path) orelse return 0;
     const rc = linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.un));
     if (linux.errno(rc) != .SUCCESS) return 0; // first boot: nobody listening
-    return recv_fds(fd, listen_address, fds_out);
+    return recv_fds(fd, listen_address, fds_out, metrics);
 }
 
 /// The wire read: header + SCM_RIGHTS cmsg, then per-fd validation. Any
@@ -170,6 +248,7 @@ pub fn recv_fds(
     connection: posix.socket_t,
     listen_address: Ip4Address,
     fds_out: []posix.socket_t,
+    metrics: ?*Metrics,
 ) usize {
     assert(fds_out.len > 0);
     var header: Header = undefined;
@@ -187,7 +266,10 @@ pub fn recv_fds(
         .controllen = @sizeOf(FdControl),
         .flags = 0,
     };
-    const received = linux.recvmsg(connection, &message, linux.MSG.CMSG_CLOEXEC);
+    // WAITALL: the header must arrive whole (the cmsg rides its first byte);
+    // the stats tail is read separately below.
+    const flags = linux.MSG.CMSG_CLOEXEC | linux.MSG.WAITALL;
+    const received = linux.recvmsg(connection, &message, flags);
     if (linux.errno(received) != .SUCCESS) return 0;
     if (received != @sizeOf(Header)) return 0; // EOF or a short/oversized head
     // Truncated control data means fds the kernel may have dropped — refuse.
@@ -227,6 +309,27 @@ pub fn recv_fds(
     }
     for (control.fds[0..fd_count], fds_out[0..fd_count]) |received_fd, *slot| {
         slot.* = received_fd;
+    }
+
+    // The counter records ride behind the header. Best-effort: an absent,
+    // oversized, or short block never un-adopts the listeners above.
+    if (header.stats_bytes > 0 and header.stats_bytes <= stats_bytes_max) {
+        var stats_buffer: [stats_bytes_max]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < header.stats_bytes) { // bounded: every pass reads >= 1 byte or stops
+            const stats_rc = linux.read(
+                connection,
+                stats_buffer[filled..].ptr,
+                header.stats_bytes - filled,
+            );
+            if (linux.errno(stats_rc) != .SUCCESS) break;
+            if (stats_rc == 0) break; // peer closed early: partial block
+            filled += stats_rc;
+            assert(filled <= header.stats_bytes);
+        }
+        if (metrics) |target| {
+            if (filled == header.stats_bytes) apply_stats(target, stats_buffer[0..filled]);
+        }
     }
     return fd_count;
 }
@@ -293,11 +396,19 @@ test "handoff: listener fds round-trip over SCM_RIGHTS and stay listeners" {
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
 
-    const sent = send_fds(pair[0], &.{ listener_a.fd, listener_b.fd }, bound);
+    // Counters cross the restart; gauges (`active`) start over.
+    var old_metrics = Metrics{};
+    old_metrics.accepted.add(41);
+    old_metrics.requests.add(7);
+    old_metrics.bytes_to_client.add(123_456);
+    old_metrics.active.add(3);
+
+    const sent = send_fds(pair[0], &.{ listener_a.fd, listener_b.fd }, bound, &old_metrics);
     try testing.expect(sent);
 
     var adopted: [fds_max]posix.socket_t = undefined;
-    const count = recv_fds(pair[1], bound, &adopted);
+    var new_metrics = Metrics{};
+    const count = recv_fds(pair[1], bound, &adopted, &new_metrics);
     try testing.expectEqual(@as(usize, 2), count);
     for (adopted[0..count]) |fd| {
         try testing.expect(fd >= 0);
@@ -305,6 +416,37 @@ test "handoff: listener fds round-trip over SCM_RIGHTS and stay listeners" {
         try testing.expect(is_listener_for(fd, bound));
         _ = linux.close(fd);
     }
+    try testing.expectEqual(@as(u64, 41), new_metrics.accepted.load());
+    try testing.expectEqual(@as(u64, 7), new_metrics.requests.load());
+    try testing.expectEqual(@as(u64, 123_456), new_metrics.bytes_to_client.load());
+    try testing.expectEqual(@as(u64, 0), new_metrics.active.load()); // gauge: reset
+}
+
+test "handoff: unknown counter names are skipped, known ones still apply" {
+    // A record stream from a *different* zoxy version: one counter this
+    // build has never heard of, then one it knows.
+    var records: [64]u8 = undefined;
+    var offset: usize = 0;
+    for ([_]struct { name: []const u8, value: u64 }{
+        .{ .name = "counter_from_the_future", .value = 999 },
+        .{ .name = "requests", .value = 17 },
+    }) |record| {
+        records[offset] = @intCast(record.name.len);
+        offset += 1;
+        @memcpy(records[offset..][0..record.name.len], record.name);
+        offset += record.name.len;
+        std.mem.writeInt(u64, records[offset..][0..8], record.value, .little);
+        offset += 8;
+    }
+
+    var metrics = Metrics{};
+    apply_stats(&metrics, records[0..offset]);
+    try testing.expectEqual(@as(u64, 17), metrics.requests.load());
+
+    // A truncated tail stops the fold without touching anything else.
+    var truncated = Metrics{};
+    apply_stats(&truncated, records[0 .. offset - 3]);
+    try testing.expectEqual(@as(u64, 0), truncated.requests.load());
 }
 
 test "handoff: a queued connection survives the sender closing its copy" {
@@ -331,9 +473,10 @@ test "handoff: a queued connection survives the sender closing its copy" {
     const pair = try stream_socketpair();
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
-    try testing.expect(send_fds(pair[0], &.{listener.fd}, bound));
+    var metrics = Metrics{};
+    try testing.expect(send_fds(pair[0], &.{listener.fd}, bound, &metrics));
     var adopted: [fds_max]posix.socket_t = undefined;
-    try testing.expectEqual(@as(usize, 1), recv_fds(pair[1], bound, &adopted));
+    try testing.expectEqual(@as(usize, 1), recv_fds(pair[1], bound, &adopted, null));
 
     // The old process closes its copy — the drain path — and the queued
     // connection is still accepted through the adopted duplicate.
@@ -353,14 +496,20 @@ test "handoff: listeners for the wrong address are refused and closed" {
     const pair = try stream_socketpair();
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
-    try testing.expect(send_fds(pair[0], &.{listener.fd}, bound));
+    var metrics = Metrics{};
+    try testing.expect(send_fds(pair[0], &.{listener.fd}, bound, &metrics));
     var adopted: [fds_max]posix.socket_t = undefined;
-    try testing.expectEqual(@as(usize, 0), recv_fds(pair[1], elsewhere, &adopted));
+    try testing.expectEqual(@as(usize, 0), recv_fds(pair[1], elsewhere, &adopted, null));
 }
 
 test "handoff: adopt without a predecessor returns zero (first boot)" {
     var adopted: [fds_max]posix.socket_t = undefined;
-    const count = adopt("/tmp/zoxy-handoff-test-nobody.sock", Ip4Address.loopback(80), &adopted);
+    const count = adopt(
+        "/tmp/zoxy-handoff-test-nobody.sock",
+        Ip4Address.loopback(80),
+        &adopted,
+        null,
+    );
     try testing.expectEqual(@as(usize, 0), count);
 }
 
@@ -376,19 +525,32 @@ test "handoff: full unix-socket path — serve_once hands off to adopt" {
     const server_fd = try open_server(path);
     defer _ = linux.close(server_fd);
 
+    var old_metrics = Metrics{};
+    old_metrics.requests.add(29);
     const Server = struct {
-        fn run(fd: posix.socket_t, listener_fd: posix.socket_t, address: Ip4Address) void {
+        fn run(
+            fd: posix.socket_t,
+            listener_fd: posix.socket_t,
+            address: Ip4Address,
+            metrics: *const Metrics,
+        ) void {
             // One client, one handoff — mirrors the main-thread wiring.
-            while (!serve_once(fd, &.{listener_fd}, address)) {}
+            while (!serve_once(fd, &.{listener_fd}, address, metrics)) {}
         }
     };
-    const thread = try std.Thread.spawn(.{}, Server.run, .{ server_fd, listener.fd, bound });
+    const thread = try std.Thread.spawn(
+        .{},
+        Server.run,
+        .{ server_fd, listener.fd, bound, &old_metrics },
+    );
     defer thread.join();
 
     var adopted: [fds_max]posix.socket_t = undefined;
-    const count = adopt(path, bound, &adopted);
+    var new_metrics = Metrics{};
+    const count = adopt(path, bound, &adopted, &new_metrics);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expect(is_listener_for(adopted[0], bound));
+    try testing.expectEqual(@as(u64, 29), new_metrics.requests.load());
     _ = linux.close(adopted[0]);
 
     var unlink_path = sockaddr_un(path).?;

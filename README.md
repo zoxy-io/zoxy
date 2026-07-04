@@ -301,10 +301,12 @@ mid-traffic, replayable), integration tests, and the zero-alloc gate
 socket serves every worker's listener fd to a successor over `SCM_RIGHTS`
 (validated against the configured address before adoption), then the old
 process drains — the duplicated fds keep the accept queues alive across
-the restart, closing the drain-only RST window. Measured: an A→B restart
-under a request hammer served 928/928 with zero failures. Still to come:
-transfer stats across the restart pair, accept balancing across workers,
-consistent-hash LB, tracing + Prometheus polish. HTTP/2 is deliberately
+the restart, closing the drain-only RST window. Counter totals ride the
+same handoff (name-keyed, version-skew tolerant), so scrapes stay
+monotonic across the pair while gauges start over. Measured: an A→B
+restart under a request hammer served 928/928 with zero failures.
+Still to come: accept balancing across workers, consistent-hash LB,
+tracing + Prometheus polish. HTTP/2 is deliberately
 deferred behind operability: it
 is a large protocol surface that lands better on an operable base, and
 accept balancing is a prerequisite for its few-hot-connections traffic

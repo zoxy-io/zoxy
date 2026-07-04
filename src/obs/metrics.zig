@@ -79,6 +79,18 @@ pub const Metrics = struct {
     /// the busiest worker sets the throughput ceiling).
     worker_accepted: [constants.workers_max]Counter = @splat(.{}),
 
+    /// Fields that are point-in-time gauges, not cumulative counters. A hot
+    /// restart transfers counters to the successor so scrapes stay monotonic
+    /// across the pair; gauges describe *this* process and must start at 0.
+    pub const gauge_fields = [_][]const u8{ "active", "draining" };
+
+    pub fn is_gauge(comptime field_name: []const u8) bool {
+        inline for (gauge_fields) |gauge| {
+            if (comptime std.mem.eql(u8, gauge, field_name)) return true;
+        }
+        return false;
+    }
+
     /// Write a Prometheus-style text exposition of every counter. Array
     /// fields become labeled series, one per non-zero slot.
     pub fn write_text(metrics: *const Metrics, writer: *std.Io.Writer) std.Io.Writer.Error!void {

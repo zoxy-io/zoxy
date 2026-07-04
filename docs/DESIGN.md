@@ -663,8 +663,21 @@ catches the dominant failures), ejection-time multipliers.
      Verified: fd round-trip, wrong-address refusal, first-boot fallback,
      and the full unix-socket path in tests; process-level A→B restart
      under a request hammer: 928/928 responses, zero failures, A drained
-     and exited, B adopted all 8 listeners. Still separate: stats transfer
-     across the pair.
+     and exited, B adopted all 8 listeners.
+  3. **Stats transfer** — done 2026-07-04. The handoff message (v2)
+     carries the counter totals as name-keyed records (`u8` name length,
+     name, little-endian `u64`) behind the header; a successor folds them
+     into its zeroed counters, so scrapes stay monotonic across the
+     restart pair. Unknown names are skipped and absent ones stay zero —
+     the two binaries may disagree on the counter set, which is the point:
+     a hot restart is usually an upgrade. Gauges (`Metrics.gauge_fields`:
+     active, draining) and the diagnostic per-worker accept distribution
+     deliberately start over. Best-effort by construction: a short,
+     oversized, or malformed block never un-adopts the listeners.
+     Verified: round-trip with gauge exclusion, unknown-name and
+     truncated-tail tolerance, the full unix-socket path; process-level:
+     A at requests=25/bytes=1075 handed off, B scraped requests=30/
+     bytes=1290 after five more requests, gauges at 0.
 - **Accept balancing across workers.** Measured 2026-07 (per-worker accept
   counters, `zoxy_worker_accepted`): the SO_REUSEPORT hash is uniform at
   large N (1.14:1 over 150k accepts) but few long-lived connections pin
