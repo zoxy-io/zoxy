@@ -27,6 +27,9 @@ pub const h2_frame = @import("http/h2_frame.zig");
 /// HPACK header compression, strictly bounded (docs/DESIGN.md §7 Phase 5, slice 2).
 pub const hpack = @import("http/hpack.zig");
 
+/// Sans-io HTTP/2 server connection engine (docs/DESIGN.md §7 Phase 5, slice 3).
+pub const h2 = @import("http/h2.zig");
+
 /// Static proxy configuration (docs/DESIGN.md §7).
 pub const config = @import("config.zig");
 
@@ -85,6 +88,7 @@ test {
     _ = chunked;
     _ = h2_frame;
     _ = hpack;
+    _ = h2;
     _ = config;
     _ = @import("proxy/router.zig");
     _ = balancer;

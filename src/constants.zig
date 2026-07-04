@@ -94,6 +94,28 @@ pub const h2_header_table_bytes: u32 = 4096;
 /// Matches the HTTP/1.1 head budget (`read_buf_bytes`).
 pub const h2_header_list_bytes_max: u32 = 16 * 1024;
 
+/// Concurrent streams per HTTP/2 connection: advertised
+/// (SETTINGS_MAX_CONCURRENT_STREAMS) and enforced with fixed stream slots —
+/// excess opens are refused (REFUSED_STREAM), never grown.
+pub const h2_streams_max: u32 = 64;
+
+/// Per-stream receive window we advertise (SETTINGS_INITIAL_WINDOW_SIZE):
+/// the relay-buffer size, so a stream's read-ahead permission equals the
+/// buffer that will carry it (docs/DESIGN.md §7 Phase 5).
+pub const h2_stream_window_bytes: u31 = 16 * 1024;
+
+/// Connection-level receive-window target, raised from the 64 KiB protocol
+/// default by one WINDOW_UPDATE at connection start: full per-stream
+/// windows for every slot, so the connection window never throttles
+/// multiplexing below the per-stream bound.
+pub const h2_connection_window_bytes: u31 = h2_streams_max * h2_stream_window_bytes;
+
+/// Encoded header-block accumulation bound (HEADERS plus CONTINUATIONs,
+/// RFC 9113 §4.3) — a block must be complete before HPACK decoding. Also
+/// the CONTINUATION-flood defense: a block still unfinished past this kills
+/// the connection (ENHANCE_YOUR_CALM).
+pub const h2_header_block_bytes_max: u32 = 16 * 1024;
+
 /// Bounds inside the chunked transfer-coding decoder (http/chunked.zig):
 /// hex size digits (16 spans a full u64), extension bytes per chunk, and
 /// total trailer-section bytes. Beyond any of these the message is malformed.
