@@ -282,22 +282,39 @@ accept → recv (provided buffer) → parse req line + headers (zero-copy slices
 
 ---
 
-## 6. TLS (Phase 3 — deferred, needs FFI)
+## 6. TLS (Phase 3 — OpenSSL FFI for the handshake, kTLS for the record layer)
 
-std cannot terminate TLS. Options, ranked by our constraints:
+std cannot terminate TLS. Options, re-surveyed 2026-07:
 
-| Path | Alloc control | Server maturity | Notes |
-|------|---------------|-----------------|-------|
-| **OpenSSL** FFI | ✅ `CRYPTO_set_mem_functions` (global alloc hook) | mature | best allocation control; `allyourcodebase/openssl` builds on 0.16 |
-| **BoringSSL** FFI | ❌ (upstream refuses hook) | mature | Bun-grade lean fixed-alloc path; memory-BIO sans-io |
-| **ianic/tls.zig** | pure Zig | TLS 1.3 server exists | most mature pure-Zig termination; vet maturity |
-| `rustls-ffi` | ❌ global Rust alloc | experimental server | best sans-io ergonomics; extra cargo dep |
+| Path | Alloc control | Server maturity | Verdict |
+|------|---------------|-----------------|---------|
+| **OpenSSL** FFI | ✅ `CRYPTO_set_mem_functions` (global alloc hook) | mature | **chosen** — the only mature stack whose memory we can pool and gate; `allyourcodebase/openssl` builds on 0.16 |
+| **BoringSSL** FFI | ❌ (upstream refuses hook) | mature | allocations invisible to our gate — disqualified |
+| **ianic/tls.zig** | pure Zig, allocator-threaded API | TLS 1.3 only, "minimal"; no documented server SNI/ALPN | stream-owning (wants the socket), not sans-io; unaudited. Recheck when its std upstreaming ([ziglang/zig#23005], open) lands |
+| `rustls-ffi` | ❌ global Rust alloc | experimental server | second FFI ecosystem for less server maturity |
+| BearSSL / wolfSSL / s2n-tls | BearSSL truly static | 1.2-only+stagnant / GPL-or-commercial / needs a libcrypto anyway | each fails one hard constraint |
 
-All are **sans-io**: shuttle ciphertext through in-memory buffers (BIO pairs /
-`read_tls`+`write_tls`), which maps cleanly onto io_uring registered buffers.
-**Lean toward OpenSSL FFI** for the allocator hook. SNI selects cert (from
-ClientHello), ALPN negotiates `h2`/`http/1.1`. **MVP runs plaintext** (or a TLS
-terminator in front).
+**Decision: OpenSSL terminates the handshake; kTLS carries the bytes.**
+
+- *Handshake* (sans-io): ciphertext shuttles through **memory BIO pairs** —
+  every real read/write stays a ring op on our fixed buffers, OpenSSL never
+  sees a socket, run-to-completion holds. SNI selects the cert (from
+  ClientHello), ALPN negotiates `http/1.1` (later `h2`).
+- *Record layer*: after the handshake, hand the negotiated keys to the kernel
+  (`setsockopt` `TLS_TX`/`TLS_RX`, kernel TLS) and the existing relay runs
+  **unchanged** — plain `io.recv`/`io.send` on the same fd, kernel does
+  AES-GCM. OpenSSL is out of the steady-state picture. BIO-pair relay remains
+  as the fallback when the kernel/cipher combination lacks kTLS.
+- *Allocation*: `CRYPTO_set_mem_functions` routes OpenSSL into a fixed arena
+  reserved at startup and wired into the `CountingAllocator` gate. This is the
+  invariant stated precisely: **no allocation outside pre-reserved pools** —
+  OpenSSL may suballocate within its arena per handshake, and arena exhaustion
+  **rejects that handshake** (load-shedding, like every other pool here),
+  never OOM, never growth.
+- *Testing*: the simulator keeps exercising the plaintext data path (TLS is a
+  byte-transform at the edge); the BIO-pair handshake driver is pure
+  bytes-in/bytes-out and gets its own deterministic unit tests (seeded RNG via
+  `RAND_set_rand_method`).
 
 HTTP/2 & HTTP/3: nothing usable in pure Zig. H2 → `nghttp2` FFI when needed;
 H3/QUIC → `quiche`/`ngtcp2`. Pure-Zig H3 is blocked on QUIC-aware TLS 1.3.
@@ -398,8 +415,17 @@ self-adapts; cross-multiply hook documented in balancer.zig), retry-on-5xx
 catches the dominant failures), ejection-time multipliers.
 
 ### Phase 3 — Protocol depth
-- TLS termination (OpenSSL FFI: SNI cert select + ALPN), then upstream
-  re-encryption.
+- TLS termination (design in §6), sliced:
+  1. **FFI foundation** — vendor OpenSSL (`allyourcodebase`), route
+     `CRYPTO_set_mem_functions` into a startup-reserved arena + the counting
+     gate, load certs/keys (PEM) into `Config` at parse time.
+  2. **BIO-pair terminator** — handshake state machine driven by recv/send
+     completions inside `ProxyConn`; SNI cert select, ALPN `http/1.1`;
+     BIO-pair relay (correct everywhere, slower).
+  3. **kTLS fast path** — post-handshake `setsockopt(TLS_TX/TLS_RX)` behind a
+     config flag; relay code untouched; BIO-pair fallback on `ENOTSUPP`.
+  4. **Upstream re-encryption** — client-side TLS to origins, reusing the same
+     arena + BIO/kTLS machinery; only after downstream termination is proven.
 - HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
   control** (stream + connection windows) wired into the existing watermark
   system, HPACK decode/re-encode, H2 pool with multiplexing + GOAWAY draining.

@@ -211,7 +211,8 @@ run-to-run variance dominates any difference against the pre-Phase-2 build at
 60k req/s. Deferred with rationale (EWMA weighting, retry-on-5xx, HTTP
 probes): see [`docs/DESIGN.md`](docs/DESIGN.md) §7.
 
-**Later:** TLS termination (planned via OpenSSL FFI), HTTP/2 and HTTP/3,
+**Later:** TLS termination (OpenSSL FFI for the handshake only, kTLS for the
+record layer — see [`docs/DESIGN.md`](docs/DESIGN.md) §6), HTTP/2 and HTTP/3,
 graceful drain + hot restart, and config hot-reload. The full plan is in
 [`docs/DESIGN.md`](docs/DESIGN.md) §7.
 
