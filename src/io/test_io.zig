@@ -25,7 +25,10 @@ const assert = std.debug.assert;
 /// Virtual fds start here — accidentally passing one to a real syscall (or a
 /// real fd to us) trips range asserts instead of corrupting something.
 const fd_base: posix.socket_t = 1000;
-const socket_max = 4096;
+// Cumulative sockets per iteration (slots are never reused — see the module
+// comment). Bumped when the h2c workload joined the H1 one: ~50% more
+// clients, each fanning out per-stream upstream dials.
+const socket_max = 8192;
 const socket_buffer_bytes = 4096;
 const accept_queue_max = 16;
 const candidates_max = 1024;

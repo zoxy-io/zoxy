@@ -1151,6 +1151,7 @@ pub const ProxyConn = struct {
             conn.downstream_fd,
             conn.request_timeout_ns,
             conn.idle_timeout_ns,
+            constants.drain_timeout_ns, // the same fixed bound the H1 side uses
             tls.channel, // ownership moves to the H2Conn
             staged,
         );

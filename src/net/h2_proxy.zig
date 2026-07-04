@@ -288,6 +288,9 @@ pub const H2Conn = struct {
 
     idle_timeout_ns: u63,
     request_timeout_ns: u63,
+    /// Drain-to-forced-teardown bound; clamps the deadline at `begin_drain`
+    /// (the simulator shrinks it to force the deadline path within a run).
+    drain_timeout_ns: u63,
     /// Connection-level deadline: idle cutoff, refreshed on client bytes.
     deadline_ns: u64,
     timeout_armed: bool,
@@ -318,6 +321,7 @@ pub const H2Conn = struct {
         downstream_fd: posix.socket_t,
         request_timeout_ns: u63,
         idle_timeout_ns: u63,
+        drain_timeout_ns: u63,
         /// The terminated TLS channel when this is an adopted h2-over-TLS
         /// connection (the H1 handshaker read `h2` off ALPN); null = h2c.
         tls: ?terminator.Channel,
@@ -362,6 +366,7 @@ pub const H2Conn = struct {
         }
         conn.request_timeout_ns = request_timeout_ns;
         conn.idle_timeout_ns = idle_timeout_ns;
+        conn.drain_timeout_ns = drain_timeout_ns;
         conn.timeout_armed = false;
         conn.drain_pending = false;
         conn.metrics.active.add(1);
@@ -1534,7 +1539,7 @@ pub const H2Conn = struct {
         if (conn.closing or conn.close_after_flush) return;
         // The deadline clamp bounds the drain whatever clients and origins
         // do — the existing ticking timer enforces it (the H1 rule).
-        const drain_deadline = conn.io.now_ns() + constants.drain_timeout_ns;
+        const drain_deadline = conn.io.now_ns() + conn.drain_timeout_ns;
         if (drain_deadline < conn.deadline_ns) conn.deadline_ns = drain_deadline;
         conn.drain_pending = true;
         conn.try_stage_drain();
@@ -1678,6 +1683,12 @@ pub const H2Server = struct {
     prng: std.Random.DefaultPrng,
     request_timeout_ns: u63,
     idle_timeout_ns: u63,
+    /// Drain-to-forced-teardown bound handed to each connection; the sim
+    /// shrinks it. Defaults to the global constant (production).
+    drain_timeout_ns: u63 = constants.drain_timeout_ns,
+    /// Once draining: no new connections accepted, live ones GOAWAY-drained.
+    draining: bool = false,
+    listener_closed: bool = false,
     accept_completion: Completion = undefined,
 
     pub fn init(
@@ -1722,14 +1733,37 @@ pub const H2Server = struct {
     }
 
     /// Sweep every live connection into graceful drain (GOAWAY + clamped
-    /// deadline). Refusing *new* connections is the accept path's job —
-    /// today the test harness's, after the ALPN handoff the ProxyServer
-    /// drain sweep this rides on.
+    /// deadline) and stop accepting new ones. Idempotent. The pending accept
+    /// is left in flight (it holds no slot); a connection that races it is
+    /// refused in on_accept.
     pub fn begin_drain(server: *H2Server) void {
+        if (!server.draining) {
+            server.draining = true;
+            // Close the listener now: this also FINs connections queued in the
+            // accept backlog but never accepted (they would otherwise hang,
+            // never accepted and never closed). The pending accept op is left
+            // dangling — harmless, it can never become ready on a dead
+            // listener. A queued connection getting RST beats one accepted
+            // then immediately GOAWAY'd. (The ALPN-handoff path drains via
+            // ProxyServer, which owns its own listener lifecycle.)
+            if (!server.listener_closed) {
+                server.listener_closed = true;
+                server.io.close_now(server.listener.fd);
+            }
+        }
         for (server.pool.items) |*conn| {
             if (!conn.in_use) continue;
             conn.begin_drain();
         }
+    }
+
+    /// Drained when every connection slot and stream leg is back and no new
+    /// connection was accepted after the drain began.
+    pub fn drain_complete(server: *const H2Server) bool {
+        if (!server.draining) return false;
+        if (server.pool.free_count != server.pool.capacity) return false;
+        if (server.legs.free_count != server.legs.capacity) return false;
+        return true;
     }
 
     fn on_accept(
@@ -1737,7 +1771,13 @@ pub const H2Server = struct {
         _: *Completion,
         result: io_mod.AcceptError!posix.socket_t,
     ) void {
-        const fd = result catch return server.start();
+        const fd = result catch return if (!server.draining) server.start();
+        if (server.draining) {
+            // Refused-at-accept beats accepted-then-GOAWAY'd; do not re-arm.
+            server.metrics.rejected.add(1);
+            server.io.close_now(fd);
+            return;
+        }
         const conn = server.pool.acquire() orelse {
             server.metrics.rejected.add(1);
             server.io.close_now(fd);
@@ -1757,6 +1797,7 @@ pub const H2Server = struct {
             fd,
             server.request_timeout_ns,
             server.idle_timeout_ns,
+            server.drain_timeout_ns,
             null, // h2c: plaintext listener
             "",
         );
@@ -2044,7 +2085,8 @@ const TestHarness = struct {
 
     fn deinit(harness: *TestHarness, gpa: std.mem.Allocator) void {
         harness.server.deinit();
-        harness.listener.close();
+        // A drained server already closed its listener fd; don't double-close.
+        if (!harness.server.listener_closed) harness.listener.close();
         harness.legs.deinit(gpa);
         harness.pool.deinit(gpa);
         harness.cfg.deinit();
@@ -2487,6 +2529,7 @@ const TlsHarness = struct {
             fd,
             constants.request_timeout_ns,
             constants.idle_timeout_ns,
+            constants.drain_timeout_ns,
             channel,
             staged,
         );

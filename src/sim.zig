@@ -235,6 +235,9 @@ fn run_iteration(seed: u64) !u64 {
         10 * std.time.ns_per_s,
     );
     h2_server.prng = .init(seed +% 0x2545F4914F6CDD1D);
+    // The h2c drain deadline sits below the per-try timeout (as on H1) so
+    // wedged streams hit the forced-teardown path within the run's step cap.
+    if (drain_requested) h2_server.drain_timeout_ns = 1 * std.time.ns_per_s;
     h2_server.start();
 
     const clients = try arena.alloc(Client, clients_max);
@@ -258,22 +261,30 @@ fn run_iteration(seed: u64) !u64 {
     // every slot (teardowns, idle timeouts, pool checkins all complete).
     var steps: u64 = 0;
     var accepted_at_drain: ?u64 = null;
+    var h2_accepted_at_drain: u64 = 0;
     while (!clients_done(clients) or !h2_clients_done(h2_clients)) : (steps += 1) {
         if (drain_requested and accepted_at_drain == null and steps >= drain_after_steps) {
             server.begin_drain();
+            h2_server.begin_drain(); // the h2c server drains in parallel (GOAWAY sweep)
             accepted_at_drain = metrics.accepted.load();
+            h2_accepted_at_drain = h2_metrics.accepted.load();
         }
-        if (steps > step_cap) fail("hang: step cap with {d} H1 + {d} h2c clients unfinished", .{
-            clients_unfinished(clients),
-            h2_clients_unfinished(h2_clients),
-        });
+        if (steps > step_cap) {
+            dump_h2(h2_clients, &h2_conn_pool, io.now_ns());
+            fail("hang: step cap with {d} H1 + {d} h2c clients unfinished", .{
+                clients_unfinished(clients),
+                h2_clients_unfinished(h2_clients),
+            });
+        }
         io.run_once() catch fail("deadlock while clients still running", .{});
     }
     // Clients can all conclude before the drain step arrives: drain an idle
     // proxy then — begin_drain with nothing in flight must still complete.
     if (drain_requested and accepted_at_drain == null) {
         server.begin_drain();
+        h2_server.begin_drain();
         accepted_at_drain = metrics.accepted.load();
+        h2_accepted_at_drain = h2_metrics.accepted.load();
     }
     while (pool.free_count != pool.capacity) : (steps += 1) {
         if (steps > step_cap) fail("leak: {d} slots never reclaimed", .{
@@ -333,6 +344,14 @@ fn run_iteration(seed: u64) !u64 {
             io.dump_pending();
             fail("h2c leak: slot held with no pending operation", .{});
         };
+    }
+    if (drain_requested) {
+        if (!h2_server.drain_complete()) fail("h2c drain never completed", .{});
+        if (h2_metrics.accepted.load() != h2_accepted_at_drain) {
+            fail("h2c accepted {d} connections after drain began", .{
+                h2_metrics.accepted.load() - h2_accepted_at_drain,
+            });
+        }
     }
     h2_server.deinit();
     if (h2_metrics.active.load() != 0) fail("h2c metrics.active = {d}", .{h2_metrics.active.load()});
@@ -917,6 +936,30 @@ fn h2_clients_unfinished(clients: []H2Client) u64 {
     return count;
 }
 
+fn dump_h2(clients: []H2Client, pool: *H2ConnPool, now: u64) void {
+    for (clients) |*c| {
+        if (c.done) continue;
+        std.debug.print("h2 client {d}: completed={d}/{d} sent={d}/{d} fd={d}\n", .{
+            c.id, c.completed, c.stream_count, c.sent, c.send_len, c.fd,
+        });
+        for (c.streams[0..c.stream_count]) |*s| {
+            std.debug.print("  stream {d}: status={d} complete={} body_len={d}\n", .{
+                s.id, s.status, s.complete, s.body_len,
+            });
+        }
+    }
+    for (pool.items) |*conn| {
+        if (!conn.in_use) continue;
+        std.debug.print("h2 conn: closing={} caf={} drain_pending={} active={d} " ++
+            "streams={d} refs={d} deadline={d} now={d} recv_if={} send_if={}\n", .{
+            conn.closing,        conn.close_after_flush,     conn.drain_pending,
+            conn.active_count,   conn.engine.streams_active, conn.refs,
+            conn.deadline_ns,    now,                        conn.recv_in_flight,
+            conn.send_in_flight,
+        });
+    }
+}
+
 /// A plaintext HTTP/2 client that opens several streams concurrently on one
 /// connection — the multiplexed shape the H1 client cannot exercise. Each
 /// stream carries a unique token in its `:path`; the origin echoes it back,
@@ -1113,7 +1156,9 @@ const H2Client = struct {
                 const stream = client.stream_for(frame.header.stream_id) orelse return;
                 client.stream_reset(stream); // proxy aborted the stream (e.g. upstream fault)
             },
-            .goaway => client.conclude(), // proxy draining: stop
+            // Draining: no new streams may open, but the ones already in
+            // flight (the client opened them all up front) must still finish.
+            .goaway => {},
             else => {}, // SETTINGS, WINDOW_UPDATE, PING: ignored
         }
     }
