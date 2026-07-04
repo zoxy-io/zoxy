@@ -18,6 +18,25 @@ pub const Heap = @import("heap.zig").Heap;
 pub const BIO = opaque {};
 pub const X509 = opaque {};
 pub const EVP_PKEY = opaque {};
+pub const SSL_CTX = opaque {};
+pub const SSL = opaque {};
+pub const SSL_METHOD = opaque {};
+
+// Values verified against the vendored OpenSSL 3.3.2 headers (ssl.h.in,
+// tls1.h, prov_ssl.h) — mirrored here because the C names are macros with no
+// linkable symbol. Keep the C spelling: these are the FFI contract.
+pub const SSL_ERROR_NONE: c_int = 0;
+pub const SSL_ERROR_SSL: c_int = 1;
+pub const SSL_ERROR_WANT_READ: c_int = 2;
+pub const SSL_ERROR_WANT_WRITE: c_int = 3;
+pub const SSL_ERROR_SYSCALL: c_int = 5;
+pub const SSL_ERROR_ZERO_RETURN: c_int = 6;
+pub const SSL_CTRL_SET_SESS_CACHE_MODE: c_int = 44;
+pub const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
+pub const SSL_SESS_CACHE_OFF: c_long = 0x0000;
+pub const TLS1_2_VERSION: c_long = 0x0303;
+pub const SSL_TLSEXT_ERR_OK: c_int = 0;
+pub const SSL_TLSEXT_ERR_NOACK: c_int = 3;
 
 var global_heap: Heap = undefined;
 var hook_installed: bool = false;
@@ -134,7 +153,7 @@ pub fn validate_identity(
     }
 }
 
-fn read_pem_x509(pem: []const u8) ?*X509 {
+pub fn read_pem_x509(pem: []const u8) ?*X509 {
     assert(pem.len > 0);
     assert(pem.len <= std.math.maxInt(c_int)); // config parsing bounds file sizes
     const bio = BIO_new_mem_buf(pem.ptr, @intCast(pem.len)) orelse return null;
@@ -142,7 +161,7 @@ fn read_pem_x509(pem: []const u8) ?*X509 {
     return PEM_read_bio_X509(bio, null, null, null);
 }
 
-fn read_pem_private_key(pem: []const u8) ?*EVP_PKEY {
+pub fn read_pem_private_key(pem: []const u8) ?*EVP_PKEY {
     assert(pem.len > 0);
     assert(pem.len <= std.math.maxInt(c_int));
     const bio = BIO_new_mem_buf(pem.ptr, @intCast(pem.len)) orelse return null;
@@ -152,6 +171,65 @@ fn read_pem_private_key(pem: []const u8) ?*EVP_PKEY {
 
 pub extern fn OpenSSL_version_num() c_ulong;
 
+// -- SSL_CTX / SSL / BIO-pair surface (used by terminator.zig) ------------
+
+/// int (*cb)(SSL*, const unsigned char **out, unsigned char *outlen,
+///           const unsigned char *in, unsigned int inlen, void *arg)
+pub const AlpnSelectCallback = fn (
+    ssl: *SSL,
+    out: *?[*]const u8,
+    out_length: *u8,
+    in: [*]const u8,
+    in_length: c_uint,
+    argument: ?*anyopaque,
+) callconv(.c) c_int;
+
+pub extern fn TLS_server_method() *const SSL_METHOD;
+pub extern fn TLS_client_method() *const SSL_METHOD;
+pub extern fn SSL_CTX_new(method: *const SSL_METHOD) ?*SSL_CTX;
+pub extern fn SSL_CTX_free(context: *SSL_CTX) void;
+pub extern fn SSL_CTX_use_certificate(context: *SSL_CTX, certificate: *X509) c_int;
+pub extern fn SSL_CTX_use_PrivateKey(context: *SSL_CTX, key: *EVP_PKEY) c_int;
+pub extern fn SSL_CTX_check_private_key(context: *const SSL_CTX) c_int;
+pub extern fn SSL_CTX_ctrl(
+    context: *SSL_CTX,
+    command: c_int,
+    argument: c_long,
+    pointer: ?*anyopaque,
+) c_long;
+pub extern fn SSL_CTX_set_num_tickets(context: *SSL_CTX, count: usize) c_int;
+pub extern fn SSL_CTX_set_alpn_select_cb(
+    context: *SSL_CTX,
+    callback: *const AlpnSelectCallback,
+    argument: ?*anyopaque,
+) void;
+
+pub extern fn SSL_new(context: *SSL_CTX) ?*SSL;
+pub extern fn SSL_free(ssl: *SSL) void;
+pub extern fn SSL_set_accept_state(ssl: *SSL) void;
+pub extern fn SSL_set_connect_state(ssl: *SSL) void;
+/// Takes ownership of the BIO references (one reference when rbio == wbio).
+pub extern fn SSL_set_bio(ssl: *SSL, read_bio: *BIO, write_bio: *BIO) void;
+pub extern fn SSL_do_handshake(ssl: *SSL) c_int;
+pub extern fn SSL_is_init_finished(ssl: *const SSL) c_int;
+pub extern fn SSL_get_error(ssl: *const SSL, return_code: c_int) c_int;
+pub extern fn SSL_read(ssl: *SSL, buffer: [*]u8, length: c_int) c_int;
+pub extern fn SSL_write(ssl: *SSL, buffer: [*]const u8, length: c_int) c_int;
+pub extern fn SSL_shutdown(ssl: *SSL) c_int;
+/// Returns 0 on success (inverted vs the rest of the API).
+pub extern fn SSL_set_alpn_protos(ssl: *SSL, protocols: [*]const u8, length: c_uint) c_int;
+pub extern fn SSL_get0_alpn_selected(ssl: *const SSL, data: *?[*]const u8, length: *c_uint) void;
+
+pub extern fn BIO_new_bio_pair(
+    bio1: *?*BIO,
+    write_buffer1: usize,
+    bio2: *?*BIO,
+    write_buffer2: usize,
+) c_int;
+pub extern fn BIO_read(bio: *BIO, buffer: [*]u8, length: c_int) c_int;
+pub extern fn BIO_write(bio: *BIO, buffer: [*]const u8, length: c_int) c_int;
+pub extern fn BIO_ctrl_pending(bio: *BIO) usize;
+
 extern fn CRYPTO_set_mem_functions(
     malloc_function: *const fn (usize, [*c]const u8, c_int) callconv(.c) ?*anyopaque,
     realloc_function: *const fn (?*anyopaque, usize, [*c]const u8, c_int) callconv(.c) ?*anyopaque,
@@ -159,7 +237,7 @@ extern fn CRYPTO_set_mem_functions(
 ) c_int;
 
 extern fn BIO_new_mem_buf(buffer: *const anyopaque, length: c_int) ?*BIO;
-extern fn BIO_free(bio: *BIO) c_int;
+pub extern fn BIO_free(bio: *BIO) c_int;
 extern fn PEM_read_bio_X509(
     bio: *BIO,
     out: ?*?*X509,
@@ -172,10 +250,10 @@ extern fn PEM_read_bio_PrivateKey(
     password_callback: ?*const anyopaque,
     callback_data: ?*anyopaque,
 ) ?*EVP_PKEY;
-extern fn X509_free(certificate: *X509) void;
-extern fn EVP_PKEY_free(key: *EVP_PKEY) void;
+pub extern fn X509_free(certificate: *X509) void;
+pub extern fn EVP_PKEY_free(key: *EVP_PKEY) void;
 extern fn X509_check_private_key(certificate: *const X509, key: *const EVP_PKEY) c_int;
-extern fn ERR_clear_error() void;
+pub extern fn ERR_clear_error() void;
 
 // -- tests --------------------------------------------------------------
 

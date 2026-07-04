@@ -115,3 +115,9 @@ pub const tls_heap_bytes: usize = 64 * 1024 * 1024;
 /// chains are a few KB; anything near this limit is a misconfiguration. Must
 /// stay below maxInt(c_int): the PEM bytes cross the OpenSSL FFI boundary.
 pub const tls_pem_bytes_max: u32 = 256 * 1024;
+
+/// Each half of a connection's BIO pair buffers this much ciphertext (the
+/// pair is the in-memory "network" between the SSL state machine and our
+/// ring ops). Sized to hold one maximum TLS record (16 KiB payload + record
+/// overhead) with headroom; larger flights loop through WANT_READ/WANT_WRITE.
+pub const tls_bio_pair_bytes: usize = 18 * 1024;

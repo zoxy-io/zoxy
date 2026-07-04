@@ -54,6 +54,9 @@ pub const guard = @import("mem/guard.zig");
 /// TLS termination via OpenSSL FFI (docs/DESIGN.md §6, Phase 3).
 pub const tls = @import("tls/openssl.zig");
 
+/// Sans-io TLS terminator: SSL_CTX policy + per-connection BIO-pair channel.
+pub const terminator = @import("tls/terminator.zig");
+
 test {
     _ = io;
     _ = @import("io/test_io.zig");
@@ -73,6 +76,7 @@ test {
     _ = @import("obs/admin.zig");
     _ = guard;
     _ = tls;
+    _ = terminator;
     _ = @import("tls/heap.zig");
     _ = @import("mem/futex_mutex.zig");
 }

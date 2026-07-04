@@ -426,9 +426,19 @@ catches the dominant failures), ejection-time multipliers.
      block (paths only — config stays FFI-free for the simulator); main
      validates the PEM identity via OpenSSL at startup, so a bad cert kills
      boot, not the first handshake.
-  2. **BIO-pair terminator** — handshake state machine driven by recv/send
-     completions inside `ProxyConn`; SNI cert select, ALPN `http/1.1`;
-     BIO-pair relay (correct everywhere, slower).
+  2. **BIO-pair terminator** — in progress. Done: `src/tls/terminator.zig`,
+     the sans-io half — `Context` (SSL_CTX: identity install + cross-check,
+     TLS >= 1.2, ALPN select preferring `http/1.1` with NOACK fallback,
+     session cache/tickets off so every handshake is full and the context
+     stays immutable across workers) and `Channel` (per-connection SSL over
+     a fixed-size BIO pair; feed/drain ciphertext, handshake_step,
+     read/write plaintext, close_notify — pure byte transformer, tested by
+     deterministic in-memory loopback down to 1-byte adversarial delivery,
+     with heap-drain-to-baseline assertions). Remaining: drive it from
+     `ProxyConn` recv/send completions and wire `main` to build per-worker
+     contexts. SNI multi-cert select deferred until config carries multiple
+     identities (single `tls` block today; the ALPN/servername callbacks are
+     the extension point).
   3. **kTLS fast path** — post-handshake `setsockopt(TLS_TX/TLS_RX)` behind a
      config flag; relay code untouched; BIO-pair fallback on `ENOTSUPP`.
   4. **Upstream re-encryption** — client-side TLS to origins, reusing the same
