@@ -285,9 +285,15 @@ TLS heap per userspace connection, ~0 after the kernel switchover. Closes
 are polite (close_notify in both modes). See
 [`docs/DESIGN.md`](docs/DESIGN.md) §6.
 
-**Later:** HTTP/2 and HTTP/3, TLS session resumption, graceful drain + hot
-restart, and config hot-reload. The full plan is in
-[`docs/DESIGN.md`](docs/DESIGN.md) §7.
+**Next — Phase 4, operability:** graceful drain + hot restart (FD passing
+over a unix socket), accept balancing across workers (the SO_REUSEPORT hash
+pins few-hot-connection loads), consistent-hash LB, Prometheus metrics +
+distributed tracing. HTTP/2 is deliberately deferred behind it: it is a
+large protocol surface that lands better on an operable base, and accept
+balancing is a prerequisite for its few-hot-connections traffic shape.
+
+**Later:** HTTP/2 and HTTP/3, TLS session resumption, and config
+hot-reload. The full plan is in [`docs/DESIGN.md`](docs/DESIGN.md) §7.
 
 ## License
 

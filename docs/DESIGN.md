@@ -591,9 +591,13 @@ catches the dominant failures), ejection-time multipliers.
      upstream reuse, 64+64 handshakes for 200k requests, zero errors.
      Verified: hostname verification end to end; wrong authority and wrong
      hostname both produce clean 502s with nothing reaching the origin.
-- HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
-  control** (stream + connection windows) wired into the existing watermark
-  system, HPACK decode/re-encode, H2 pool with multiplexing + GOAWAY draining.
+- HTTP/2: **deferred past operability** (2026-07-04). The proxy is a complete,
+  measurable HTTPS/HTTP/1.1 product; drain + hot restart and accept balancing
+  change how it runs in production *today*, while H2 is a large new protocol
+  surface (HPACK, dual-level flow control, multiplexed pooling) that lands
+  better on an operable base. Accept balancing is itself a prerequisite for
+  H2's traffic shape — few hot multiplexed connections is exactly where the
+  SO_REUSEPORT hash pins load (measured below). Plan moved to Phase 5.
 
 ### Phase 4 — Operability
 - Graceful drain + hot restart (FD passing over a unix socket, à la HAProxy
@@ -611,7 +615,13 @@ catches the dominant failures), ejection-time multipliers.
 - Consistent-hash LB (ring-hash / Maglev). Distributed tracing (B3/W3C
   propagation) + Prometheus metrics.
 
-### Phase 5 — Dynamic config
+### Phase 5 — HTTP/2
+- HTTP/2 downstream+upstream: per-stream state machines, **dual-level flow
+  control** (stream + connection windows) wired into the existing watermark
+  system, HPACK decode/re-encode, H2 pool with multiplexing + GOAWAY draining.
+  Deferred from Phase 3 (2026-07-04): operability first — see the note there.
+
+### Phase 6 — Dynamic config
 - xDS-style streaming client (CDS→EDS→LDS→RDS make-before-break ordering) or a
   simpler custom control-plane protocol. Apply via RCU pointer swap so the data
   path stays lock-free.
