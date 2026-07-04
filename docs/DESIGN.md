@@ -424,18 +424,34 @@ sometimes vanishing mid-response) and the same no-leak / integrity / drain
 invariants. It earned its keep immediately: it found a fatal-connection leg
 race, a mid-dial fd-close-vs-connect race, an unbounded H2 drain deadline,
 and an unclosed drain listener — four teardown/composition bugs the
-hand-written tests missed. zrk still can't drive it (bench pending an h2
-load generator).
+hand-written tests missed.
 
-Later slices: H2 upstream + multiplexed upstream pooling; the retry tiers +
-per-try timeout for H2 legs (the Phase-2 H1 treatment applies unchanged);
-upstream TLS re-encryption for H2 legs (clusters demanding it answer 502);
-close_notify on H2 teardown (abrupt TCP close after GOAWAY today);
-CONTINUATION-flood / rapid-reset hardening beyond what the fixed slots
-already give; client-side flow-control stall coverage in the sim (bodies
-beyond the initial window, needing a window-accounting test client); the
-zrk measurement gate on the few-hot-connections shape (accept balancing
-exists to serve it).
+**Measured** (h2load over TLS+ALPN, `bench/h2.sh`: direct-nginx-h2 vs
+proxied, cores pinned per role). At `-m1` — one stream per connection, so a
+latency test — the h2 hop adds ~35µs at the median (TLS terminate + HPACK +
+framing + h2→h1 translate); zoxy stays latency-bound with CPU headroom. At
+`-m16` with balanced accepts the proxied path holds ~92% of native
+nginx-h2 throughput at zero shedding. The finding that mattered: H2's
+few-hot-connections shape makes SO_REUSEPORT imbalance bite hard — a
+clustered worker's *reserved* per-stream legs (`h2_legs_max`) overflow into
+bounded 503 load-shedding (served requests stay 200) while its neighbours
+idle, so `accept_mode = "shared"` (§7 Phase 4) is effectively required for
+H2, not optional. A/B at `-m32`, `-c8`: reuseport accept spread 8/6/3 shed
+78k requests; `shared` spread 9/8/8 shed none. This is exactly the traffic
+shape accept balancing was built to serve.
+
+Deferred to later slices:
+- **H2 upstream** + multiplexed upstream pooling — this phase mapped each
+  stream to one H1 upstream transaction, not upstream multiplexing.
+- **Retry tiers + per-try timeout for H2 legs** — the Phase-2 H1 treatment
+  applies unchanged.
+- **Upstream TLS re-encryption for H2 legs** — clusters demanding it answer
+  502 today.
+- **close_notify on H2 teardown** — an abrupt TCP close follows GOAWAY today.
+- **CONTINUATION-flood / rapid-reset hardening** beyond what the fixed stream
+  slots already give.
+- **Client-side flow-control stall coverage in the sim** — bodies beyond the
+  initial window, needing a window-accounting test client.
 
 ### Phase 6 — config: JSON schema + file-watch reload (planned)
 Decided 2026-07-04. Keep JSON as the canonical, machine-facing format (Caddy's
