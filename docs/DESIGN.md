@@ -443,12 +443,21 @@ catches the dominant failures), ejection-time multipliers.
      connection drains the hook heap to baseline (asserted end-to-end).
      Channel init at accept load-sheds on heap exhaustion. Verified with
      curl: TLS 1.3, ALPN `http/1.1` picked from `h2,http/1.1`, keep-alive
-     and pipelined requests on one handshake. Deferred, recorded here:
-     SNI multi-cert (single identity in config today; the servername
-     callback is the extension point), close_notify on teardown (abrupt
-     close like the plaintext path — an `until_close` response to a TLS
-     client is indistinguishable from truncation), and TLS-heap sizing from
-     measured per-handshake usage.
+     and pipelined requests on one handshake.
+     Follow-ups landed 2026-07-04: server-initiated closes (delivered
+     response or error) flush a **close_notify** before teardown
+     (`close_downstream`, bounded by the connection deadline; client-EOF
+     and error teardowns stay abrupt), and a relayed response the proxy
+     will close after gets **`Connection: close` injected** when the origin
+     head lacked it (RFC 9112 §9.6 — without it clients assume keep-alive,
+     pipeline the next request, and read our close as an error; found by
+     zrk, whose churn benches went from ~1 read error per request to zero).
+     The hook heap exposes gauges via /metrics (`zoxy_tls_heap_*`);
+     measured churn high-water: ~10.6 MiB carved of 64 MiB at 64 concurrent
+     full-handshake connections, live-block count flat across runs (no
+     per-connection leakage). Still deferred: SNI multi-cert (single
+     identity in config today; the servername callback is the extension
+     point) and re-deriving `tls_heap_bytes` from measured usage.
   3. **kTLS fast path** — post-handshake `setsockopt(TLS_TX/TLS_RX)` behind a
      config flag; relay code untouched; BIO-pair fallback on `ENOTSUPP`.
   4. **Upstream re-encryption** — client-side TLS to origins, reusing the same

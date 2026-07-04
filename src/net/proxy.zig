@@ -89,6 +89,12 @@ const AttemptFailure = enum {
 /// response's own framing (not EOF) ends the exchange.
 const head_terminator = "\r\n";
 
+/// Injected into a relayed response head when the downstream connection
+/// will close after it (RFC 9112 §9.6: a close must be announced — without
+/// this, an HTTP/1.1 client assumes keep-alive, pipelines its next request,
+/// and reads our close as a failure).
+const close_header_line = "Connection: close\r\n";
+
 /// Upper bound on prime segments: one kept run around each skipped header line
 /// plus the `Connection: close` injection and any buffered body bytes.
 const prime_segments_max = constants.headers_max + 3;
@@ -423,6 +429,11 @@ pub const ProxyConn = struct {
         /// synchronously from a logical-op start (TigerStyle: no recursion);
         /// this guards the zero-delay yield timer that reschedules us.
         yield_pending: bool,
+        /// A close_notify is queued and flushing; when the wire drains,
+        /// teardown runs. Normal logical progress stops in this mode. The
+        /// flush is bounded by the connection deadline: the ticking timer is
+        /// still armed and its expiry tears down regardless.
+        notify_then_teardown: bool,
         wire_recv_completion: Completion,
         wire_send_completion: Completion,
         yield_completion: Completion,
@@ -445,6 +456,7 @@ pub const ProxyConn = struct {
                 .send_active = false,
                 .send_callback = undefined,
                 .yield_pending = false,
+                .notify_then_teardown = false,
                 .wire_recv_completion = undefined,
                 .wire_send_completion = undefined,
                 .yield_completion = undefined,
@@ -769,10 +781,11 @@ pub const ProxyConn = struct {
     // machine calls tls_recv_start/tls_send_start exactly where it would call
     // io.recv/io.send on the downstream fd; deliveries arrive through the
     // stored callback from a wire completion (or the yield timer), so the
-    // control flow shape is identical to the plaintext path. Teardown is
-    // abrupt (no close_notify flush) exactly like the plaintext path — safe
-    // for length-framed responses; an `until_close` response to a TLS client
-    // is indistinguishable from truncation (polite shutdown is a follow-up).
+    // control flow shape is identical to the plaintext path. Server-initiated
+    // closes (a delivered response or error that ends the connection) flush a
+    // close_notify first via `close_downstream` — strict clients (including
+    // std.crypto.tls) otherwise flag every close as possible truncation.
+    // Client-EOF and error teardowns stay abrupt, like the plaintext path.
 
     /// Begin a logical plaintext recv into `target`. One at a time; the
     /// callback receives plaintext byte count (0 = clean TLS EOF).
@@ -818,10 +831,39 @@ pub const ProxyConn = struct {
     fn tls_progress(conn: *ProxyConn) void {
         if (conn.closing) return;
         const tls = &conn.tls.?;
+        if (tls.notify_then_teardown) return conn.tls_notify_progress();
         if (!tls.handshake_complete) return conn.tls_handshake_progress();
         conn.tls_send_progress();
         if (conn.closing) return; // a delivered send may have torn down
         conn.tls_recv_progress();
+    }
+
+    /// Close the downstream connection the way the peer's TLS stack wants:
+    /// queue a close_notify, keep flushing until the wire drains, then tear
+    /// down. Falls back to plain teardown when there is no TLS (or no
+    /// completed handshake) to be polite about.
+    fn close_downstream(conn: *ProxyConn) void {
+        if (conn.closing) return;
+        const tls = if (conn.tls) |*tls| tls else return conn.teardown();
+        if (!tls.handshake_complete) return conn.teardown();
+        if (tls.notify_then_teardown) return; // already flushing
+        assert(!tls.send_active); // callers close only after a delivered send
+        tls.notify_then_teardown = true;
+        tls.channel.shutdown_notify();
+        conn.tls_notify_progress();
+    }
+
+    /// The notify-mode pump: flush until the alert (and anything queued
+    /// before it) is on the wire, then tear down. A wire error tears down
+    /// via the send completion; a stalled peer is bounded by the deadline.
+    fn tls_notify_progress(conn: *ProxyConn) void {
+        assert(!conn.closing);
+        const tls = &conn.tls.?;
+        assert(tls.notify_then_teardown);
+        conn.tls_flush_wire_send();
+        const wire_idle = !tls.wire_send_in_flight and
+            tls.wire_send_sent == tls.wire_send_filled;
+        if (wire_idle and tls.channel.pending_ciphertext() == 0) conn.teardown();
     }
 
     fn tls_handshake_progress(conn: *ProxyConn) void {
@@ -1511,8 +1553,12 @@ pub const ProxyConn = struct {
     fn arm_recv_response_head(conn: *ProxyConn) void {
         assert(conn.upstream_fd >= 0);
         const pipe = &conn.response_pipe;
-        if (pipe.filled == pipe.buf.len) return conn.fail(response_502); // head too large
-        assert(pipe.filled < pipe.buf.len); // there is room to read into
+        // The head-phase reads stop short of the buffer end so a
+        // `Connection: close` injection always has room (body-phase relay
+        // reads, after the head is forwarded, use the whole buffer again).
+        const capacity = pipe.buf.len - close_header_line.len;
+        if (pipe.filled >= capacity) return conn.fail(response_502); // head too large
+        assert(pipe.filled < capacity); // there is room to read into
         conn.retain();
         conn.io.recv(
             *ProxyConn,
@@ -1520,7 +1566,7 @@ pub const ProxyConn = struct {
             on_recv_response_head,
             &pipe.recv_completion,
             conn.upstream_fd,
-            pipe.buf[pipe.filled..],
+            pipe.buf[pipe.filled..capacity],
         );
     }
 
@@ -1583,6 +1629,12 @@ pub const ProxyConn = struct {
             // announcement, keep-alive hints) are hop semantics between it
             // and us; a keep-alive client must not see them and close on us.
             head_len -= conn.strip_response_head(response, &connection);
+        } else if (response.status >= 200 and !connection.names("close")) {
+            // We will close the downstream connection after this response;
+            // the head must say so (RFC 9112 §9.6) or an HTTP/1.1 client
+            // assumes keep-alive and reads our close as a failure. Interim
+            // (1xx) heads are relayed untouched — they are not the response.
+            head_len += conn.inject_response_close(head_len);
         }
         pipe.framer = h1.BodyFramer.init(framing);
         const body = pipe.buf[head_len..pipe.filled];
@@ -1636,6 +1688,25 @@ pub const ProxyConn = struct {
         return removed;
     }
 
+    /// Insert `Connection: close` before the head's terminating blank line,
+    /// shifting the buffered body prefix right (one bounded copy; the head
+    /// phase reserved the room). Returns the bytes inserted.
+    fn inject_response_close(conn: *ProxyConn, head_len: usize) usize {
+        const pipe = &conn.response_pipe;
+        assert(head_len >= 4); // shortest head: status line + blank line
+        assert(head_len <= pipe.filled);
+        assert(pipe.filled + close_header_line.len <= pipe.buf.len); // reserved in head recv
+        const insert_at = head_len - 2; // before the blank-line CRLF
+        std.mem.copyBackwards(
+            u8,
+            pipe.buf[insert_at + close_header_line.len .. pipe.filled + close_header_line.len],
+            pipe.buf[insert_at..pipe.filled],
+        );
+        @memcpy(pipe.buf[insert_at..][0..close_header_line.len], close_header_line);
+        pipe.filled += close_header_line.len;
+        return close_header_line.len;
+    }
+
     /// The framed response has been fully forwarded: keep the downstream
     /// connection when everything lines up, else close. Closing *here*,
     /// rather than on EOF, is what keeps a lingering upstream from pinning
@@ -1644,7 +1715,9 @@ pub const ProxyConn = struct {
         assert(conn.outcome == .proxied); // only a relayed response completes
         conn.settle_accounting(.success);
         conn.maybe_pool_upstream();
-        if (!conn.can_reuse_downstream()) return conn.teardown();
+        // The response is fully delivered: a close here is server-initiated
+        // and polite (close_notify for a TLS client).
+        if (!conn.can_reuse_downstream()) return conn.close_downstream();
         conn.finish_request();
     }
 
@@ -1772,7 +1845,7 @@ pub const ProxyConn = struct {
         conn.fail_sent += m;
         assert(conn.fail_sent <= conn.fail_response.len); // never send past the response
         if (conn.fail_sent < conn.fail_response.len) return conn.arm_fail_send();
-        conn.teardown(); // the full response is out; close the connection
+        conn.close_downstream(); // the full response is out; close politely
     }
 };
 
@@ -2205,6 +2278,8 @@ const TlsTestClient = struct {
     recv_in_flight: bool = false,
     plain_buf: [512]u8 = undefined,
     plain_len: usize = 0,
+    /// The server sent close_notify before closing (polite TLS shutdown).
+    saw_close_notify: bool = false,
     done: bool = false,
     send_c: Completion = undefined,
     recv_c: Completion = undefined,
@@ -2231,7 +2306,8 @@ const TlsTestClient = struct {
             switch (client.channel.read_plaintext(client.plain_buf[client.plain_len..])) {
                 .bytes => |n| client.plain_len += n,
                 .closed => {
-                    client.done = true; // close_notify (not expected today)
+                    client.saw_close_notify = true;
+                    client.done = true;
                     break;
                 },
                 .want_io, .failed => break,
@@ -2462,6 +2538,98 @@ fn run_tls_exchange(
 
     try io.run_until_done(&client.done);
     try std.testing.expectEqualStrings(expected_response, client.plain_buf[0..client.plain_len]);
+    // A server-initiated close (Connection: close exchange) must be polite:
+    // close_notify before FIN, so a strict client sees clean EOF.
+    try std.testing.expect(client.saw_close_notify);
+    while (pool.free_count != pool.capacity) try io.run_once();
+}
+
+test "proxy: a response the proxy will close after announces Connection: close" {
+    const gpa = std.testing.allocator;
+    // The origin's response implies keep-alive (no Connection header); the
+    // client asks for close — the relayed head must announce the close the
+    // proxy is about to perform.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var origin_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer origin_listener.close();
+    var origin = TestOrigin{
+        .io = &io,
+        .listener = origin_listener,
+        .response = response,
+        .close_after_send = false, // origin keeps alive; the close is ours
+    };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["127.0.0.1:{d}"] }}] }}
+    , .{origin_listener.bound_address().port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Metrics{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    const client = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(client);
+    const Client = struct {
+        io: *IO,
+        fd: posix.socket_t,
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        done: bool = false,
+        send_c: Completion = undefined,
+        recv_c: Completion = undefined,
+        fn go(c: *@This()) void {
+            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\n" ++
+                "Host: origin\r\nConnection: close\r\n\r\n");
+            c.arm_recv();
+        }
+        fn arm_recv(c: *@This()) void {
+            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, c.buf[c.len..]);
+        }
+        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
+            _ = c;
+        }
+        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
+            const n = result catch 0;
+            if (n == 0) { // EOF: the proxy closed, as announced
+                c.done = true;
+                return;
+            }
+            c.len += n;
+            c.arm_recv();
+        }
+    };
+    var c = Client{ .io = &io, .fd = client };
+    c.go();
+
+    try io.run_until_done(&c.done);
+    const received = c.buf[0..c.len];
+    try std.testing.expect(std.mem.indexOf(u8, received, "Connection: close\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, received, "\r\n\r\nHELLO"));
     while (pool.free_count != pool.capacity) try io.run_once();
 }
 
@@ -2699,7 +2867,10 @@ test "proxy: completes promptly when a lingering upstream sends a framed respons
 
     const started_ns = monotonic_nanos();
     try io.run_until_done(&c.done);
-    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    // The origin's head implied keep-alive; the proxy closes after this
+    // response, so the relayed head announces it (RFC 9112 §9.6).
+    const expected = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+    try std.testing.expectEqualStrings(expected, c.buf[0..c.len]);
     while (pool.free_count != pool.capacity) try io.run_once();
     // Well under the 30s deadline: the framer ended the response, not a timer.
     try std.testing.expect(monotonic_nanos() - started_ns < 5 * std.time.ns_per_s);
@@ -2792,7 +2963,10 @@ test "proxy: relays a chunked response and ends it at the terminal chunk" {
     c.go();
 
     try io.run_until_done(&c.done);
-    try std.testing.expectEqualStrings(response, c.buf[0..c.total]);
+    // Keep-alive origin + closing client: the relayed head announces our close.
+    const expected = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+        "5\r\nHELLO\r\n6\r\nWORLD!\r\n0\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, c.buf[0..c.total]);
     while (pool.free_count != pool.capacity) try io.run_once();
 }
 
@@ -3402,7 +3576,9 @@ test "proxy: streams a framed request body to the upstream" {
     c.go();
 
     try io.run_until_done(&c.done);
-    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+    // Keep-alive origin + closing client: the relayed head announces our close.
+    const expected = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    try std.testing.expectEqualStrings(expected, c.buf[0..c.len]);
     while (pool.free_count != pool.capacity) try io.run_once();
 
     const forwarded = origin.request_buf[0..origin.request_len];
