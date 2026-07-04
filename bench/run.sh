@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end benchmark: load generator -> zoxy -> nginx origin, on loopback.
 #
-#   bench/run.sh [-R rate] [-d duration] [-c connections] [-t threads]
+#   bench/run.sh [-d duration] [-c connections] [-t threads]
 #
-# Three runs at the same target rate, so the proxy hop cost is directly
-# visible:
+# Three saturating runs over the same connection set, so the proxy hop cost is
+# directly visible:
 #   baseline A: generator -> nginx, keep-alive — the honest comparison since
 #               Phase 1: zoxy speaks keep-alive on both sides (downstream
 #               reuse + upstream pool)
@@ -12,28 +12,27 @@
 #               connection model, kept to show the handshake tax
 #   proxied:    generator -> zoxy -> nginx (keep-alive end to end)
 #
-# The generator is zrk (github.com/floatdrop/zrk): constant throughput with
-# coordinated-omission-corrected latency. A closed-loop generator (wrk) stops
-# sending when the server stalls, so the stall never shows up in its numbers;
-# zrk charges backlogged requests from their *intended* send time. Set $ZRK to
-# the binary or have `zrk` on PATH; otherwise this falls back to wrk via nix
-# with a warning (its latencies are NOT corrected, treat them as optimistic).
+# The generator is h2load (nghttp2's load tool): closed-loop, forced to
+# HTTP/1.1 (--h1) since zoxy is H1-only until the H2 phase lands. It drives
+# each connection flat out for the duration and reports throughput plus a
+# time-for-request distribution and an errored/failed count — the error
+# counters catch protocol bugs that throughput numbers alone hide. h2load
+# ships in the dev shell; used from PATH when present, else fetched via
+# `nix shell`.
 #
 # nginx is used from PATH when installed, otherwise fetched with `nix shell`.
 # Ports are offset from the dev defaults so a running dev instance survives.
 set -euo pipefail
 
-RATE=30000
 DURATION=10s
 CONNECTIONS=64
 THREADS=4
-while getopts "R:d:c:t:h" opt; do
+while getopts "d:c:t:h" opt; do
     case $opt in
-        R) RATE=$OPTARG ;;
         d) DURATION=$OPTARG ;;
         c) CONNECTIONS=$OPTARG ;;
         t) THREADS=$OPTARG ;;
-        *) sed -n '2,20p' "$0"; exit 2 ;;
+        *) sed -n '2,24p' "$0"; exit 2 ;;
     esac
 done
 
@@ -104,28 +103,23 @@ ZOXY_PID=$!
 wait_for "http://127.0.0.1:$ORIGIN_PORT/"
 wait_for "http://127.0.0.1:$PROXY_PORT/"
 
-ZRK=${ZRK:-$(command -v zrk || true)}
-if [ -n "$ZRK" ]; then
-    generate() { "$ZRK" -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" -R"$RATE" \
-        --plain --latency "$@"; }
+if command -v h2load >/dev/null; then
+    generate() { h2load --h1 -t"$THREADS" -c"$CONNECTIONS" -D"$DURATION" -m1 "$@"; }
 else
-    echo "bench: zrk not found (set \$ZRK or install github.com/floatdrop/zrk)" >&2
-    echo "bench: falling back to closed-loop wrk — latencies are NOT" >&2
-    echo "bench: coordinated-omission-corrected; treat them as optimistic" >&2
-    generate() { nix shell nixpkgs#wrk --command wrk -t"$THREADS" -c"$CONNECTIONS" \
-        -d"$DURATION" --latency "$@"; }
+    generate() { nix shell nixpkgs#nghttp2 --command \
+        h2load --h1 -t"$THREADS" -c"$CONNECTIONS" -D"$DURATION" -m1 "$@"; }
 fi
 
 echo
-echo "== baseline A: generator -> nginx, keep-alive, target ${RATE}/s =="
+echo "== baseline A: generator -> nginx, keep-alive, ${DURATION} x ${CONNECTIONS} conns =="
 generate "http://127.0.0.1:$ORIGIN_PORT/"
 
 echo
-echo "== baseline B: generator -> nginx, Connection: close, target ${RATE}/s =="
+echo "== baseline B: generator -> nginx, Connection: close, ${DURATION} x ${CONNECTIONS} conns =="
 generate -H 'Connection: close' "http://127.0.0.1:$ORIGIN_PORT/"
 
 echo
-echo "== proxied: generator -> zoxy -> nginx, keep-alive, target ${RATE}/s =="
+echo "== proxied: generator -> zoxy -> nginx, keep-alive, ${DURATION} x ${CONNECTIONS} conns =="
 generate "http://127.0.0.1:$PROXY_PORT/"
 
 echo

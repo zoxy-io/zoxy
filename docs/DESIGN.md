@@ -193,7 +193,7 @@ accept → recv head → parse (zero-copy slices) → route (host/path → clust
   close after gets `Connection: close` injected if the origin's head lacked
   it (RFC 9112 §9.6) — without it, clients assume keep-alive, pipeline the
   next request, and read the close as an error. Found as ~1 read error per
-  request in churn benches; zrk's error counters catch protocol bugs that
+  request in churn benches; h2load's error counters catch protocol bugs that
   throughput numbers hide.
 
 ---
@@ -289,9 +289,9 @@ revisit then.)
 
 ## 7. Build history & roadmap
 
-Each phase shipped behind a measured gate (zrk, constant-throughput,
-coordinated-omission-corrected; run *bands* compared, never single runs —
-p50 on this box swings 3× between back-to-back identical runs).
+Each phase shipped behind a measured gate (h2load, closed-loop over a fixed
+connection set; run *bands* compared, never single runs — p50 on this box
+swings 3× between back-to-back identical runs).
 
 ### Phase 0 — minimal viable proxy (done)
 Thread-per-core io_uring loop, static config, one request per connection,
@@ -368,7 +368,7 @@ machinery — the initial deliverable is the translation layer, not upstream
 multiplexing. H2 upstream (multiplexed pooling, GOAWAY-aware draining of
 shared connections) is a later slice, once the core is proven downstream.
 
-Slices, each behind the usual gates (zero-alloc, sim seeds, zrk bands):
+Slices, each behind the usual gates (zero-alloc, sim seeds, h2load bands):
 
 1. **Frame codec** — sans-io frame reader/writer over fixed buffers: preface,
    9-byte header, bounded max frame size, SETTINGS exchange/ack, PING,
@@ -391,7 +391,7 @@ Slices, each behind the usual gates (zero-alloc, sim seeds, zrk bands):
    GOAWAY rides the Phase 4 drain (kTLS is below the record layer, so H2 over
    the switched path needs nothing new), zero-alloc gate extended over H2
    traffic, sim invariants (every stream slot drains to zero under every
-   seed), zrk measurement gate including the few-hot-connections shape that
+   seed), h2load measurement gate including the few-hot-connections shape that
    accept balancing (Phase 4) exists to serve.
 
 Later slices: H2 upstream + multiplexed upstream pooling; CONTINUATION-flood
@@ -460,8 +460,8 @@ Tooling:
 
 - [allyourcodebase/openssl] — the vendored OpenSSL build recipe
   (`third_party/openssl`, with local duplicate-symbol fixes).
-- [zrk](https://github.com/floatdrop/zrk) — constant-throughput,
-  coordinated-omission-corrected load generator; every number in §7 comes
+- [h2load](https://nghttp2.org/documentation/h2load-howto.html) — nghttp2's
+  closed-loop HTTP/1.1 & HTTP/2 load generator; every number in §7 comes
   from it.
 
 [ziglang/zig#25047]: https://github.com/ziglang/zig/issues/25047

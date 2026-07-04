@@ -30,6 +30,7 @@
           packages = with pkgs; [
             zig_0_16
             zls
+            nghttp2 # provides h2load, the bench load generator
           ] ++ (if pkgs.stdenv.hostPlatform.isLinux then [ pkgs.kcov ] else []);
         }
       );

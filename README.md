@@ -199,17 +199,19 @@ Terminate TLS on the listener, and/or re-encrypt to a cluster's origins:
 ## Benchmarking
 
 ```sh
-bench/run.sh                 # 30k req/s for 10s over 64 connections
-bench/run.sh -R 40000 -d 30s # find the saturation point
+bench/run.sh                 # 10s saturating run over 64 connections
+bench/run.sh -c 128 -d 30s   # more connections, longer — find the ceiling
 ```
 
 Stands up an nginx origin and zoxy on loopback, then drives direct baselines
 (keep-alive — the honest comparison, plus `Connection: close` to show the
-handshake tax) and the proxied path at the same constant rate with
-[zrk](https://github.com/floatdrop/zrk), so the corrected latency of the proxy
-hop is directly comparable. Falls back to closed-loop `wrk` (via nix, with a
-warning) when zrk is not installed. Run-to-run variance on a busy box easily
-dominates the hop cost — compare bands of several runs, not single numbers.
+handshake tax) and the proxied path with
+[h2load](https://nghttp2.org/documentation/h2load-howto.html) — nghttp2's
+closed-loop load generator, forced to HTTP/1.1 (`--h1`) — so the proxy hop's
+throughput and latency distribution are directly comparable. h2load ships in
+the dev shell; the script fetches it via nix if it isn't on PATH. Run-to-run
+variance on a busy box easily dominates the hop cost — compare bands of
+several runs, not single numbers.
 
 ## Architecture
 
