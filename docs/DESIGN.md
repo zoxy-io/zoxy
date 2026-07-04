@@ -5,10 +5,6 @@ hard constraint: **all memory is reserved at startup; nothing allocates on the
 hot path.** Steady-state operation issues zero heap allocations and zero
 allocating syscalls.
 
-> Status: design/plan. Nothing here is built yet. Every Zig-0.16 API name below
-> was gathered from release notes + `master` std (0.16 is barely tagged) and
-> must be verified against the pinned toolchain before coding.
-
 ---
 
 ## 1. Guiding decisions (lock these early — expensive to retrofit)
