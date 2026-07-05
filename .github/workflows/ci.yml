@@ -26,19 +26,13 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Check formatting
-        run: nix develop --command zig fmt --check src build.zig
+        run: nix develop --command zig fmt --check src build.zig scripts/check_line_length.zig
 
       # zig fmt does not enforce line width; TigerStyle mandates a hard 100-column
-      # limit (docs/TIGER_STYLE.md). Fail loudly on any offending line.
+      # limit (docs/TIGER_STYLE.md). Enforced by a Zig tool so local
+      # `zig build lint` and CI share one implementation (scripts/check_line_length.zig).
       - name: Check line length (100-column hard limit)
-        run: |
-          offenders=$(awk 'length > 100 { print FILENAME ":" FNR " (" length " cols)" }' \
-            $(find src -name '*.zig') build.zig)
-          if [ -n "$offenders" ]; then
-            echo "$offenders"
-            echo "::error::lines above exceed the 100-column TigerStyle limit"
-            exit 1
-          fi
+        run: nix develop --command zig build lint
 
       - name: Build
         run: nix develop --command zig build

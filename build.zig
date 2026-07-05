@@ -88,4 +88,38 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_sim.addArgs(args);
     const sim_step = b.step("sim", "Run the deterministic simulator (args: [seed] [iterations])");
     sim_step.dependOn(&run_sim.step);
+
+    // Line-length lint (TigerStyle's 100-column hard limit, docs/TIGER_STYLE.md):
+    // kept in Zig rather than shell, per the tooling convention. CI runs this
+    // same `zig build lint`, so local and CI share one enforcement path.
+    const lint_exe = b.addExecutable(.{
+        .name = "check_line_length",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/check_line_length.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_lint = b.addRunArtifact(lint_exe);
+    add_zig_sources(b, run_lint, "src");
+    run_lint.addFileArg(b.path("build.zig"));
+    run_lint.addFileArg(b.path("scripts/check_line_length.zig"));
+    const lint_step = b.step("lint", "Check the 100-column line-length limit");
+    lint_step.dependOn(&run_lint.step);
+}
+
+/// Add every `.zig` file under `dir_path` (recursively) to `run` as a file
+/// argument: the lint tool receives their absolute paths and the step re-runs
+/// when any changes. The file set is resolved once, at configure time.
+fn add_zig_sources(b: *std.Build, run: *std.Build.Step.Run, dir_path: []const u8) void {
+    const io = b.graph.io;
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch |err|
+        std.debug.panic("lint: cannot open {s}: {s}", .{ dir_path, @errorName(err) });
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("lint: walk failed");
+    defer walker.deinit();
+    while (walker.next(io) catch @panic("lint: walk failed")) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        run.addFileArg(b.path(b.fmt("{s}/{s}", .{ dir_path, entry.path })));
+    }
 }
