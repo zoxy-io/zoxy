@@ -1,7 +1,7 @@
 # zoxy
 
-[![CI](https://github.com/floatdrop/zoxy/actions/workflows/ci.yml/badge.svg)](https://github.com/floatdrop/zoxy/actions/workflows/ci.yml)
-[![Coverage Status](https://coveralls.io/repos/github/floatdrop/zoxy/badge.svg?branch=main)](https://coveralls.io/github/floatdrop/zoxy?branch=main)
+[![CI](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/zoxy-io/zoxy/badge.svg?branch=main)](https://coveralls.io/github/zoxy-io/zoxy?branch=main)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A zero-allocation L7 edge proxy in Zig, in the spirit of Envoy and Linkerd.
@@ -84,6 +84,58 @@ zoxy logs a startup line and per-request access lines to stderr:
 info: zoxy listening on 127.0.0.1:8080 across 8 worker(s)
 GET /api/thing proxied 70
 ```
+
+### As a package / on NixOS
+
+The flake also exposes zoxy as a package (`packages.<system>.zoxy`), a runnable
+app, a `pkgs` overlay, and a NixOS module:
+
+```sh
+nix build github:zoxy-io/zoxy#zoxy            # -> ./result/bin/zoxy
+nix run   github:zoxy-io/zoxy -- config.json  # run it directly
+```
+
+The package build is fully offline. The one network dependency — the vendored
+OpenSSL *source* (built from source, see `third_party/openssl`) — is fetched by
+a fixed-output derivation (`nix/package.nix`), and the real build runs against
+it with `zig build --system`, so the Nix sandbox never needs the network. After
+bumping the OpenSSL ref in `third_party/openssl/build.zig.zon`, reset
+`outputHash` to `lib.fakeHash`, run `nix build`, and copy back the reported hash.
+
+Run it as a service on NixOS via `nixosModules.default`:
+
+```nix
+{
+  inputs.zoxy.url = "github:zoxy-io/zoxy";
+
+  outputs = { nixpkgs, zoxy, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        zoxy.nixosModules.default
+        {
+          services.zoxy = {
+            enable = true;
+            settings = {
+              listen = "0.0.0.0:8080";
+              admin = "127.0.0.1:9901";
+              routes = [ { cluster = "origin"; } ];
+              clusters = [ { name = "origin"; endpoints = [ "127.0.0.1:9000" ]; } ];
+            };
+            openFirewall = true;
+            ports = [ 8080 ];
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The service runs as a hardened, dynamically-allocated user with the io_uring
+syscalls explicitly allowed (systemd excludes them from `@system-service`). Set
+`services.zoxy.configFile` instead of `settings` to hand zoxy a config file
+verbatim — e.g. one holding TLS material managed outside Nix.
 
 ## Configuration
 

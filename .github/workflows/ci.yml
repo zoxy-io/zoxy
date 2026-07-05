@@ -54,6 +54,34 @@ jobs:
       - name: Run simulator (seeds 0..300)
         run: nix develop --command zig build sim -- 0 300
 
+  nix-flake-check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The NixOS VM test (checks.*.nixos-module) boots a real VM, which needs
+      # hardware virtualisation. GitHub's Linux runners expose /dev/kvm; this
+      # grants the unprivileged Nix build user access to it.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Builds the package hermetically (packages.<system>.zoxy) and runs the
+      # NixOS VM test (checks.<system>.nixos-module: nginx origin behind zoxy,
+      # asserting a proxied request and a live /metrics endpoint).
+      - name: nix flake check
+        run: nix flake check -L
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest
