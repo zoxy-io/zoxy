@@ -453,7 +453,7 @@ Deferred to later slices:
 - **Client-side flow-control stall coverage in the sim** — bodies beyond the
   initial window, needing a window-accounting test client.
 
-### Phase 6 — config: JSON schema + file-watch reload (planned)
+### Phase 6 — config: JSON schema (slice 1 done) + file-watch reload (planned)
 Decided 2026-07-04. Keep JSON as the canonical, machine-facing format (Caddy's
 model): the format was never the problem — `config.zig` already lowers a wire
 DTO into an immutable, arena-owned `Config`, and the allocation island absorbs
@@ -470,14 +470,25 @@ existing Envoy/Istio mesh" becomes a real requirement.
 
 Slices, each behind the usual gates:
 
-1. **Schema + strictness.** The Zig DTO stays the single source of truth; a
-   comptime reflection over its fields emits a JSON Schema, shipped for editor
-   completion and a `zig build check-config` CI gate (the schema can't drift —
-   it is derived from the parser). **Stop ignoring unknown fields**
-   (`ignore_unknown_fields = true` today): a misspelled `"circuit_breaker"`
-   silently disables the feature you thought you set — the worst property an
-   ops-facing config can have. Unknown keys become a parse error naming the
-   offending path.
+1. **Schema + strictness (done).** The Zig DTO (`config.zig`) stays the single
+   source of truth; a comptime reflection (`config_schema.zig`) emits a JSON
+   Schema (draft 2020-12). `zig build schema` regenerates the committed
+   `config.schema.json`; `zig build check-config` byte-diffs a fresh generation
+   against it — a drift gate, since the schema is derived from the parser — and
+   strict-parses `zoxy.json`; both run in CI. Rich descriptions, enum values,
+   and formats live in per-struct `schema_fields` metadata co-located with the
+   fields and pinned to them by a comptime cross-check (`assert_meta_matches`):
+   a stray or missing entry fails compilation, so the *prose* can't drift from
+   the shape either. **Unknown fields are now rejected** (`ignore_unknown_fields`
+   is gone): a misspelled `"circuit_breaker"` used to silently disable the
+   feature you thought you set — the worst property an ops-facing config can
+   have. Parsing now decodes to a dynamic tree, a comptime type-directed walk
+   reports the first unknown key by path
+   (`clusters[2].circuit_breaker.max_requsts`), then decodes strictly into the
+   DTO. A `$schema` key is accepted (and emitted) so editor completion coexists
+   with strictness. Lesson: reflecting the schema from the parser makes the
+   schema *and its documentation* a byproduct of the DTO, so "can't drift"
+   covers every description and enum value, not just the field shape.
 2. **File-watch reload → RCU swap.** A dedicated thread (off every data path)
    watches the config file, parses + validates a *complete* new `Config` in a
    fresh arena, and publishes only on success — a bad edit is logged and the

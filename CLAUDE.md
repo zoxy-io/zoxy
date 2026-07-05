@@ -23,6 +23,8 @@ zig build test --summary all
 zig build run          # run using ./zoxy.json
 zig build sim -- 0 500 # deterministic simulator: [seed] [iterations]
 zig build sim -- fuzz  # random seeds forever (Ctrl-C; each seed replayable)
+zig build schema       # regenerate config.schema.json from the config DTO
+zig build check-config # CI gate: schema not stale + zoxy.json strict-parses
 zig fmt --check src build.zig   # lint (CI gate)
 scripts/coverage.sh    # kcov line coverage (tests + sim), HTML + cobertura
 ```
@@ -101,7 +103,8 @@ Consequences that bite if you forget them:
 | `src/http/h2_translate.zig` | H2 ↔ H1 translation (Phase 5, slice 4): `request_head` synthesizes an H1 head from decoded H2 fields (pseudo-header validation per RFC 9113 §8.3, §8.2.2 connection-specific rejects, cookie rejoining, CR/LF/NUL value hardening, content-length vs chunked framing choice); `response_block` hpack-encodes a parsed H1 response head (`:status` first, names lowercased, hop-by-hop + Connection-named strip) |
 | `src/net/h2_proxy.zig` | the H2-downstream data path (Phase 5): `H2Conn` drives the engine from ring completions (staged recv/send, one op per direction, ticking deadline scanning per-stream deadlines), pooled `StreamLeg`s run one H1 upstream transaction per stream (route→admit→pool checkout/dial→synthesized head→send-time chunk framing→response translate→window-paced DATA relay→pool checkin); WINDOW_UPDATE credit only after the upstream write (§1.4); legs release to their pool only op-quiescent (seed-1693 rule); **downstream TLS**: `H2Conn` adopts the handshaker's `terminator.Channel` and drives the userspace BIO-pair relay inline (h2c = null tls); GOAWAY drain via `begin_drain`; retries/per-try/upstream-TLS/close_notify deferred (DESIGN §7 Phase 5) |
 | `src/proxy/upstream_pool.zig` | per-worker idle upstream connections, fixed slots keyed by endpoint |
-| `src/config.zig` | JSON config → immutable `Config` (owns an arena); the **only** place allocation is expected. Per-cluster resilience blocks resolve into a `ResiliencePolicy` here (ms→ns, validated) |
+| `src/config.zig` | JSON config → immutable `Config` (owns an arena); the **only** place allocation is expected. Per-cluster resilience blocks resolve into a `ResiliencePolicy` here (ms→ns, validated). **Strict**: unknown keys are rejected by a type-directed walk that names the offending path; the `Dto` + its co-located `schema_fields` metadata are the source of truth for the JSON Schema |
+| `src/config_schema.zig` | comptime JSON-Schema (draft 2020-12) generator reflected from `config.Dto` (docs/DESIGN.md §7 Phase 6, slice 1); `assert_meta_matches` pins descriptions to fields at comptime so the schema can't drift. Driven by the `scripts/config_tool.zig` host tool behind `zig build schema` / `check-config` |
 | `src/proxy/router.zig`, `src/proxy/balancer.zig` | first-match host/path routing; P2C least-request balancing over per-worker in-flight counts and the Maglev consistent-hash pick (`pick_hashed`: deterministic forward-walk fallback, soft retry exclusion), fail-open when no endpoint is available |
 | `src/proxy/maglev.zig` | Maglev lookup tables: built once at config time (prime-sized, `u8` entries), data path = one wyhash + one index; knows nothing of config or balancer |
 | `src/proxy/resilience.zig` | per-worker mutable resilience state (Phase 2): request/attempt/dial/connection accounting, circuit-breaker admission, retry budget, passive outlier ejection — the narrow API the data path calls at fixed points; the sim asserts every counter drains to zero |

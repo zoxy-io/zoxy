@@ -99,6 +99,7 @@ test {
     _ = h2_translate;
     _ = h2_proxy;
     _ = config;
+    _ = @import("config_schema.zig");
     _ = @import("proxy/router.zig");
     _ = balancer;
     _ = maglev;

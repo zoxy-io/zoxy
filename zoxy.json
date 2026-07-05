@@ -1,4 +1,5 @@
 {
+  "$schema": "./config.schema.json",
   "listen": "127.0.0.1:8080",
   "admin": "127.0.0.1:9901",
   "handoff": "/tmp/zoxy-handoff.sock",
