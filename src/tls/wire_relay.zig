@@ -189,7 +189,11 @@ const FakeChannel = struct {
     fn drain_ciphertext(channel: *FakeChannel, out: []u8) usize {
         const give = @min(channel.len, out.len);
         @memcpy(out[0..give], channel.buf[0..give]);
-        std.mem.copyForwards(u8, channel.buf[0 .. channel.len - give], channel.buf[give..channel.len]);
+        std.mem.copyForwards(
+            u8,
+            channel.buf[0 .. channel.len - give],
+            channel.buf[give..channel.len],
+        );
         channel.len -= give;
         return give;
     }
