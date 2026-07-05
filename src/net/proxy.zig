@@ -3022,6 +3022,43 @@ const TestOrigin = struct {
     }
 };
 
+/// A one-shot plaintext client on the test IO loop: sends `request`, then
+/// accumulates the proxy's reply into `buf` until the proxy closes (EOF).
+/// Fits the single-request `Connection: close` tests; multi-request and TLS
+/// exchanges keep their own bespoke drivers.
+const OneShotClient = struct {
+    io: *IO,
+    fd: posix.socket_t,
+    request: []const u8,
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    done: bool = false,
+    send_c: Completion = undefined,
+    recv_c: Completion = undefined,
+
+    fn go(c: *OneShotClient) void {
+        assert(c.fd >= 0);
+        assert(c.request.len > 0);
+        c.arm_recv();
+        c.io.send(*OneShotClient, c, on_send, &c.send_c, c.fd, c.request);
+    }
+    fn arm_recv(c: *OneShotClient) void {
+        assert(c.len < c.buf.len); // room for at least one more byte
+        c.io.recv(*OneShotClient, c, on_recv, &c.recv_c, c.fd, c.buf[c.len..]);
+    }
+    fn on_send(_: *OneShotClient, _: *Completion, _: io_mod.SendError!usize) void {}
+    fn on_recv(c: *OneShotClient, _: *Completion, result: io_mod.RecvError!usize) void {
+        const n = result catch 0;
+        if (n == 0) { // EOF: the proxy closed after its Connection: close reply
+            c.done = true;
+            return;
+        }
+        c.len += n;
+        assert(c.len <= c.buf.len);
+        c.arm_recv();
+    }
+};
+
 test "proxy: forwards a request to an upstream and relays the response" {
     const gpa = std.testing.allocator;
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
@@ -3069,34 +3106,11 @@ test "proxy: forwards a request to an upstream and relays the response" {
     const client = try connect_loopback(proxy_listener.bound_address().port);
     defer _ = linux.close(client);
 
-    const Client = struct {
-        io: *IO,
-        fd: posix.socket_t,
-        buf: [512]u8 = undefined,
-        len: usize = 0,
-        done: bool = false,
-        send_c: Completion = undefined,
-        recv_c: Completion = undefined,
-        fn go(c: *@This()) void {
-            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
-            c.io.send(
-                *@This(),
-                c,
-                on_send,
-                &c.send_c,
-                c.fd,
-                "GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n",
-            );
-        }
-        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
-            _ = c;
-        }
-        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
-            c.len = result catch 0;
-            c.done = true;
-        }
+    var c = OneShotClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n",
     };
-    var c = Client{ .io = &io, .fd = client };
     c.go();
 
     try io.run_until_done(&c.done);
@@ -4056,36 +4070,11 @@ test "proxy: a response the proxy will close after announces Connection: close" 
 
     const client = try connect_loopback(proxy_listener.bound_address().port);
     defer _ = linux.close(client);
-    const Client = struct {
-        io: *IO,
-        fd: posix.socket_t,
-        buf: [512]u8 = undefined,
-        len: usize = 0,
-        done: bool = false,
-        send_c: Completion = undefined,
-        recv_c: Completion = undefined,
-        fn go(c: *@This()) void {
-            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\n" ++
-                "Host: origin\r\nConnection: close\r\n\r\n");
-            c.arm_recv();
-        }
-        fn arm_recv(c: *@This()) void {
-            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, c.buf[c.len..]);
-        }
-        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
-            _ = c;
-        }
-        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
-            const n = result catch 0;
-            if (n == 0) { // EOF: the proxy closed, as announced
-                c.done = true;
-                return;
-            }
-            c.len += n;
-            c.arm_recv();
-        }
+    var c = OneShotClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n",
     };
-    var c = Client{ .io = &io, .fd = client };
     c.go();
 
     try io.run_until_done(&c.done);
@@ -4142,32 +4131,16 @@ test "proxy: strips hop-by-hop headers from the forwarded request" {
     // `Connection` names "x-hop", making X-Hop hop-by-hop as well; the whole
     // connection-management block must vanish (nothing is injected: an
     // HTTP/1.1 upstream defaults to keep-alive, which the pool wants).
-    const Client = struct {
-        io: *IO,
-        fd: posix.socket_t,
-        buf: [512]u8 = undefined,
-        len: usize = 0,
-        done: bool = false,
-        send_c: Completion = undefined,
-        recv_c: Completion = undefined,
-        fn go(c: *@This()) void {
-            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
-            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\n" ++
-                "Host: o\r\n" ++
-                "Connection: close, x-hop\r\n" ++
-                "X-Hop: secret\r\n" ++
-                "Keep-Alive: timeout=5\r\n" ++
-                "Accept: */*\r\n\r\n");
-        }
-        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
-            _ = c;
-        }
-        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
-            c.len = result catch 0;
-            c.done = true;
-        }
+    var c = OneShotClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\n" ++
+            "Host: o\r\n" ++
+            "Connection: close, x-hop\r\n" ++
+            "X-Hop: secret\r\n" ++
+            "Keep-Alive: timeout=5\r\n" ++
+            "Accept: */*\r\n\r\n",
     };
-    var c = Client{ .io = &io, .fd = client };
     c.go();
 
     try io.run_until_done(&c.done);
@@ -4303,28 +4276,11 @@ test "proxy: completes promptly when a lingering upstream sends a framed respons
     const client = try connect_loopback(proxy_listener.bound_address().port);
     defer _ = linux.close(client);
 
-    const Client = struct {
-        io: *IO,
-        fd: posix.socket_t,
-        buf: [512]u8 = undefined,
-        len: usize = 0,
-        done: bool = false,
-        send_c: Completion = undefined,
-        recv_c: Completion = undefined,
-        fn go(c: *@This()) void {
-            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
-            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\n" ++
-                "Host: o\r\nConnection: close\r\n\r\n");
-        }
-        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
-            _ = c;
-        }
-        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
-            c.len = result catch 0;
-            c.done = true;
-        }
+    var c = OneShotClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
     };
-    var c = Client{ .io = &io, .fd = client };
     c.go();
 
     const started_ns = monotonic_nanos();
@@ -6352,28 +6308,11 @@ test "proxy: the serving path allocates nothing after startup (zero-alloc gate)"
     const client = try connect_loopback(proxy_listener.bound_address().port);
     defer _ = linux.close(client);
 
-    const Client = struct {
-        io: *IO,
-        fd: posix.socket_t,
-        buf: [512]u8 = undefined,
-        len: usize = 0,
-        done: bool = false,
-        send_c: Completion = undefined,
-        recv_c: Completion = undefined,
-        fn go(c: *@This()) void {
-            c.io.recv(*@This(), c, on_recv, &c.recv_c, c.fd, &c.buf);
-            c.io.send(*@This(), c, on_send, &c.send_c, c.fd, "GET / HTTP/1.1\r\n" ++
-                "Host: o\r\nConnection: close\r\n\r\n");
-        }
-        fn on_send(c: *@This(), _: *Completion, _: io_mod.SendError!usize) void {
-            _ = c;
-        }
-        fn on_recv(c: *@This(), _: *Completion, result: io_mod.RecvError!usize) void {
-            c.len = result catch 0;
-            c.done = true;
-        }
+    var c = OneShotClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
     };
-    var c = Client{ .io = &io, .fd = client };
     c.go();
 
     // Snapshot after every startup allocation (config, pool) is done.
