@@ -2260,17 +2260,20 @@ pub const ProxyConn = struct {
             !connection.overflow and
             !connection.names("close");
         var head_len = response.head_len;
-        if (conn.response_reusable) {
-            // The upstream's connection-management headers (a close
-            // announcement, keep-alive hints) are hop semantics between it
-            // and us; a keep-alive client must not see them and close on us.
+        // A real (>= 200) response: strip the upstream's connection-management
+        // headers (Connection + what it names, Keep-Alive, Proxy-Connection)
+        // in BOTH directions. A reused keep-alive client must not see them and
+        // close on us; a closing head must not carry the upstream's stale
+        // Connection line beside the `Connection: close` we inject below (RFC
+        // 9110 §7.6.1). Interim (1xx) heads are relayed untouched.
+        if (response.status >= 200) {
             head_len -= conn.strip_response_head(response, &connection);
-        } else if (response.status >= 200 and !connection.names("close")) {
-            // We will close the downstream connection after this response;
-            // the head must say so (RFC 9112 §9.6) or an HTTP/1.1 client
-            // assumes keep-alive and reads our close as a failure. Interim
-            // (1xx) heads are relayed untouched — they are not the response.
-            head_len += conn.inject_response_close(head_len);
+            if (!conn.response_reusable) {
+                // We will close the downstream after this response; the head
+                // must say so (RFC 9112 §9.6) or an HTTP/1.1 client assumes
+                // keep-alive and reads our close as a failure.
+                head_len += conn.inject_response_close(head_len);
+            }
         }
         pipe.framer = h1.BodyFramer.init(framing);
         const body = pipe.buf[head_len..pipe.filled];
@@ -4649,8 +4652,42 @@ test "proxy: does not reuse the connection for an HTTP/1.0 client" {
     c.go();
 
     try h.io.run_until_done(&c.eof);
-    // No reuse means no stripping either: the head passes through verbatim.
-    try std.testing.expectEqualStrings(response, c.buf[0..c.total]);
+    // The proxy closes on a 1.0 client (no keep-alive) and strips the
+    // upstream's hop-by-hop Connection header, re-announcing a single
+    // Connection: close in its place (RFC 9110 §7.6.1) — never duplicated.
+    const expected = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO";
+    try std.testing.expectEqualStrings(expected, c.buf[0..c.total]);
+    while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
+}
+
+test "proxy: a closing head replaces the upstream keep-alive Connection, never duplicates it" {
+    const gpa = std.testing.allocator;
+    // The upstream announces keep-alive; the proxy will close on this client
+    // and must strip that stale header, not emit it beside Connection: close
+    // (the regression: two conflicting Connection lines, RFC 9110 §7.6.1).
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+    var h: TestHarness = undefined;
+    try h.init(gpa, .{ .response = response });
+    defer h.deinit(gpa);
+
+    const client = try h.connect();
+    defer _ = linux.close(client);
+
+    // The client asks to close, so the proxy closes after the response.
+    var c = OneShotClient{
+        .io = &h.io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+    };
+    c.go();
+
+    try h.io.run_until_done(&c.done);
+    const received = c.buf[0..c.len];
+    // The upstream's keep-alive is gone, and exactly one Connection: close remains.
+    try std.testing.expect(std.mem.indexOf(u8, received, "keep-alive") == null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "Connection: close\r\n") != null);
+    const first = std.mem.indexOf(u8, received, "Connection:").?;
+    try std.testing.expect(std.mem.indexOf(u8, received[first + 1 ..], "Connection:") == null);
     while (h.pool.free_count != h.pool.capacity) try h.io.run_once();
 }
 
