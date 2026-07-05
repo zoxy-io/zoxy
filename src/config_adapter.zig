@@ -6,6 +6,15 @@
 //! check (unknown keys, ms→ns, address parsing, bounds) stays downstream in
 //! `config.parse_diagnostic`, which consumes the emitted JSON unchanged.
 //!
+//! `config.Dto` stays authoritative for the *field names* too, enforced at
+//! compile time: every emitted JSON key goes through `dto_field` (asserts the
+//! field exists on its DTO struct) and the resilience `Field` tables through
+//! `assert_table` (existence + full coverage + type/kind match). A renamed or
+//! removed DTO field is a build error here, not a silent runtime rejection —
+//! the same "can't drift from the parser" guarantee `config_schema.zig` gives
+//! the JSON Schema via `assert_meta_matches`. Only the DSL *directive* names
+//! (the human vocabulary, e.g. `backoff_base` for `backoff_base_ms`) are free.
+//!
 //! Startup/reload only (the JSON parse is the allocation island), so the
 //! emitted document is accumulated with an allocating writer — no hot path.
 //!
@@ -34,23 +43,44 @@
 //!
 //!   cluster api {
 //!       endpoints 127.0.0.1:9001 127.0.0.1:9002
-//!       lb        maglev header x-user-id   # least_request | maglev [target|header <name>]
-//!       per_try_timeout 500ms
-//!       retry          { max 3 backoff_base 25ms }
-//!       circuit_breaker{ max_requests 100 }
-//!       outlier        { consecutive_failures 5 ejection 30s }
-//!       health_check   { interval 5s timeout 2s }
-//!       tls            { server_name api.internal ca_file ca.pem }
+//!       lb maglev header x-user-id   # least_request | maglev [target|header <name>]
+//!       per_try_timeout 1500ms
+//!       retry {                      # one directive per line; `}` on its own line
+//!           max 2
+//!           backoff_base 25ms
+//!       }
+//!       outlier {
+//!           consecutive_failures 5
+//!           ejection 30s
+//!       }
 //!   }
 //!
-//! Durations accept a `ms` or `s` suffix (bare number = milliseconds) and lower
-//! to the DTO's `*_ms` fields.
+//! One directive per line; a block's opening `{` may trail its directive, its
+//! `}` sits alone. Durations accept a `ms`/`s` suffix (bare number =
+//! milliseconds) and lower to the DTO's `*_ms` fields.
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const config = @import("config.zig");
 
 const assert = std.debug.assert;
 const Writer = std.Io.Writer;
+const Dto = config.Dto;
+
+/// Comptime-checked JSON key: assert `T` (a `config.Dto` struct) declares field
+/// `name`, and return `name` for use as the emitted key. **This is the pin that
+/// keeps `config.Dto` the single source of truth** — the adapter emits JSON that
+/// the DTO parses strictly, so a renamed/removed DTO field turns every hand-
+/// written emit site referencing it into a *compile error* here, not a silent
+/// unknown-key rejection at runtime. (The `Field` tables are pinned the same way
+/// by `assert_table`, which also enforces full coverage.)
+fn dto_field(comptime T: type, comptime name: []const u8) []const u8 {
+    comptime assert(@typeInfo(T) == .@"struct");
+    if (!@hasField(T, name)) {
+        @compileError("config_adapter: " ++ @typeName(T) ++ " has no field '" ++ name ++ "'");
+    }
+    return name;
+}
 
 /// Surfaced on error: the 1-based source line and a short human message. Kept
 /// caller-owned so the adapter never logs (mirrors `config.Diagnostic`).
@@ -112,9 +142,12 @@ pub fn to_json(gpa: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Er
         try w.writeAll(scalars.written());
         try w.writeByte(',');
     }
-    try w.writeAll("\"routes\":[");
+    try emit_string(w, dto_field(Dto, "routes"));
+    try w.writeAll(":[");
     try w.writeAll(routes.written());
-    try w.writeAll("],\"clusters\":[");
+    try w.writeAll("],");
+    try emit_string(w, dto_field(Dto, "clusters"));
+    try w.writeAll(":[");
     try w.writeAll(clusters.written());
     try w.writeAll("]}");
     return try out.toOwnedSlice();
@@ -219,13 +252,13 @@ const Parser = struct {
             if (line.is_close()) return p.fail(error.UnexpectedToken, "unexpected '}'");
             const d = line.directive();
             if (eq(d, "listen")) {
-                try p.scalar(line, &p.scalars, "listen");
+                try p.scalar(line, &p.scalars, dto_field(Dto, "listen"));
             } else if (eq(d, "admin")) {
-                try p.scalar(line, &p.scalars, "admin");
+                try p.scalar(line, &p.scalars, dto_field(Dto, "admin"));
             } else if (eq(d, "handoff")) {
-                try p.scalar(line, &p.scalars, "handoff");
+                try p.scalar(line, &p.scalars, dto_field(Dto, "handoff"));
             } else if (eq(d, "accept_mode")) {
-                try p.scalar(line, &p.scalars, "accept_mode");
+                try p.scalar(line, &p.scalars, dto_field(Dto, "accept_mode"));
             } else if (eq(d, "tls")) {
                 try p.top_tls(line);
             } else if (eq(d, "route")) {
@@ -255,7 +288,7 @@ const Parser = struct {
     fn top_tls(p: *Parser, line: Line) Error!void {
         if (!line.opens_block()) return p.fail(error.UnexpectedToken, "tls must open a block");
         if (line.head().len != 1) return p.fail(error.Syntax, "tls takes no arguments");
-        try p.scalars.field("tls");
+        try p.scalars.field(dto_field(Dto, "tls"));
         const w = p.scalars.w;
         try w.writeByte('{');
         var emit: Emit = .{ .w = w };
@@ -269,7 +302,7 @@ const Parser = struct {
             try p.bump(&seen);
             if (ln.is_close()) {
                 if (!ids_emit.first) {
-                    try emit.field("additional_identities");
+                    try emit.field(dto_field(Dto.TlsDto, "additional_identities"));
                     try w.writeByte('[');
                     try w.writeAll(ids.written());
                     try w.writeByte(']');
@@ -279,13 +312,13 @@ const Parser = struct {
             }
             const d = ln.directive();
             if (eq(d, "certificate")) {
-                try p.kv_string(ln, &emit, "certificate_file");
+                try p.kv_string(ln, &emit, dto_field(Dto.TlsDto, "certificate_file"));
             } else if (eq(d, "key")) {
-                try p.kv_string(ln, &emit, "private_key_file");
+                try p.kv_string(ln, &emit, dto_field(Dto.TlsDto, "private_key_file"));
             } else if (eq(d, "http2")) {
-                try p.kv_flag(ln, &emit, "http2");
+                try p.kv_flag(ln, &emit, dto_field(Dto.TlsDto, "http2"));
             } else if (eq(d, "kernel_offload")) {
-                try p.kv_bool(ln, &emit, "kernel_offload");
+                try p.kv_bool(ln, &emit, dto_field(Dto.TlsDto, "kernel_offload"));
             } else if (eq(d, "identity")) {
                 if (!ln.opens_block()) {
                     return p.fail(error.UnexpectedToken, "identity must open a block");
@@ -311,11 +344,11 @@ const Parser = struct {
             if (ln.is_close()) return;
             const d = ln.directive();
             if (eq(d, "server_names")) {
-                try p.string_array(ln, &emit, "server_names");
+                try p.string_array(ln, &emit, dto_field(Dto.TlsIdentityDto, "server_names"));
             } else if (eq(d, "certificate")) {
-                try p.kv_string(ln, &emit, "certificate_file");
+                try p.kv_string(ln, &emit, dto_field(Dto.TlsIdentityDto, "certificate_file"));
             } else if (eq(d, "key")) {
-                try p.kv_string(ln, &emit, "private_key_file");
+                try p.kv_string(ln, &emit, dto_field(Dto.TlsIdentityDto, "private_key_file"));
             } else {
                 return p.fail(error.UnknownDirective, "unknown identity directive");
             }
@@ -358,11 +391,11 @@ const Parser = struct {
         const w = p.routes.w;
         var emit: Emit = .{ .w = w };
         try w.writeByte('{');
-        try emit.field("host");
+        try emit.field(dto_field(Dto.RouteDto, "host"));
         try emit_string(w, host);
-        try emit.field("path_prefix");
+        try emit.field(dto_field(Dto.RouteDto, "path_prefix"));
         try emit_string(w, path);
-        try emit.field("cluster");
+        try emit.field(dto_field(Dto.RouteDto, "cluster"));
         try emit_string(w, rhs[0]);
         try w.writeByte('}');
     }
@@ -378,7 +411,7 @@ const Parser = struct {
         const w = p.clusters.w;
         var emit: Emit = .{ .w = w };
         try w.writeByte('{');
-        try emit.field("name");
+        try emit.field(dto_field(Dto.ClusterDto, "name"));
         try emit_string(w, name);
 
         var eps: Writer.Allocating = .init(p.gpa);
@@ -390,7 +423,7 @@ const Parser = struct {
             try p.bump(&seen);
             if (ln.is_close()) {
                 if (eps_emit.first) return p.fail(error.NoEndpoints, "cluster has no endpoints");
-                try emit.field("endpoints");
+                try emit.field(dto_field(Dto.ClusterDto, "endpoints"));
                 try w.writeByte('[');
                 try w.writeAll(eps.written());
                 try w.writeByte(']');
@@ -415,19 +448,21 @@ const Parser = struct {
                 try emit_string(eps_emit.w, addr);
             }
         } else if (eq(d, "per_try_timeout")) {
-            try p.kv_duration(ln, emit, "per_try_timeout_ms");
+            try p.kv_duration(ln, emit, dto_field(Dto.ClusterDto, "per_try_timeout_ms"));
         } else if (eq(d, "lb")) {
             try p.lb(ln, emit);
         } else if (eq(d, "retry")) {
-            try p.sub_block(ln, emit, "retry", &retry_fields);
+            try p.sub_block(ln, emit, dto_field(Dto.ClusterDto, "retry"), &retry_fields);
         } else if (eq(d, "circuit_breaker")) {
-            try p.sub_block(ln, emit, "circuit_breaker", &circuit_breaker_fields);
+            const name = dto_field(Dto.ClusterDto, "circuit_breaker");
+            try p.sub_block(ln, emit, name, &circuit_breaker_fields);
         } else if (eq(d, "outlier")) {
-            try p.sub_block(ln, emit, "outlier", &outlier_fields);
+            try p.sub_block(ln, emit, dto_field(Dto.ClusterDto, "outlier"), &outlier_fields);
         } else if (eq(d, "health_check")) {
-            try p.sub_block(ln, emit, "health_check", &health_check_fields);
+            const name = dto_field(Dto.ClusterDto, "health_check");
+            try p.sub_block(ln, emit, name, &health_check_fields);
         } else if (eq(d, "tls")) {
-            try p.sub_block(ln, emit, "tls", &cluster_tls_fields);
+            try p.sub_block(ln, emit, dto_field(Dto.ClusterDto, "tls"), &cluster_tls_fields);
         } else {
             return p.fail(error.UnknownDirective, "unknown cluster directive");
         }
@@ -437,21 +472,21 @@ const Parser = struct {
     fn lb(p: *Parser, ln: Line, emit: *Emit) Error!void {
         if (ln.opens_block()) return p.fail(error.UnexpectedToken, "lb is not a block");
         if (ln.tokens.len < 2) return p.fail(error.MissingValue, "lb needs a policy");
-        try emit.field("lb");
+        try emit.field(dto_field(Dto.ClusterDto, "lb"));
         const w = emit.w;
         try w.writeByte('{');
         var e: Emit = .{ .w = w };
-        try e.field("policy");
+        try e.field(dto_field(Dto.LbDto, "policy"));
         try emit_string(w, ln.tokens[1]);
         if (ln.tokens.len >= 3) {
             const hash = ln.tokens[2];
-            try e.field("hash");
+            try e.field(dto_field(Dto.LbDto, "hash"));
             try emit_string(w, hash);
             if (eq(hash, "header")) {
                 if (ln.tokens.len != 4) {
                     return p.fail(error.Syntax, "lb header needs a header name");
                 }
-                try e.field("header");
+                try e.field(dto_field(Dto.LbDto, "header"));
                 try emit_string(w, ln.tokens[3]);
             } else if (ln.tokens.len != 3) {
                 return p.fail(error.Syntax, "lb takes a policy and an optional hash");
@@ -617,6 +652,47 @@ const cluster_tls_fields = [_]Field{
     .{ .key = "ca_file", .json = "ca_file", .kind = .string },
     .{ .key = "insecure", .json = "insecure", .kind = .flag },
 };
+
+/// Cross-check a DSL `Field` table against DTO struct `T` at comptime so it
+/// cannot drift from the parser: (1) every entry's `.json` is a real field of
+/// `T` whose type matches the entry's `.kind`; (2) every field of `T` is mapped
+/// by exactly one entry — a new DTO knob must gain a DSL directive, a removed
+/// one must lose it. The DSL *directive* names (`.key`) stay a deliberate
+/// human vocabulary; only the emitted JSON keys are pinned. Mirrors config's
+/// `assert_meta_matches` for the schema — `config.Dto` is the single source of
+/// truth for the DSL too, enforced at compile time.
+fn assert_table(comptime T: type, comptime fields: []const Field) void {
+    inline for (fields) |f| {
+        if (!@hasField(T, f.json)) {
+            @compileError("config_adapter: " ++ @typeName(T) ++ " has no field '" ++ f.json ++ "'");
+        }
+        const F = @FieldType(T, f.json);
+        const Base = if (@typeInfo(F) == .optional) @typeInfo(F).optional.child else F;
+        const ok = switch (f.kind) {
+            .integer, .duration => @typeInfo(Base) == .int,
+            .string => Base == []const u8,
+            .flag, .boolean => Base == bool,
+        };
+        if (!ok) @compileError("config_adapter: " ++ @typeName(T) ++ "." ++ f.json ++
+            " type is not compatible with DSL kind ." ++ @tagName(f.kind));
+    }
+    inline for (@typeInfo(T).@"struct".fields) |sf| {
+        comptime var count: usize = 0;
+        inline for (fields) |f| {
+            if (std.mem.eql(u8, f.json, sf.name)) count += 1;
+        }
+        if (count != 1) @compileError("config_adapter: " ++ @typeName(T) ++ "." ++ sf.name ++
+            " must map to exactly one DSL directive");
+    }
+}
+
+comptime {
+    assert_table(Dto.RetryDto, &retry_fields);
+    assert_table(Dto.CircuitBreakerDto, &circuit_breaker_fields);
+    assert_table(Dto.OutlierDto, &outlier_fields);
+    assert_table(Dto.HealthCheckDto, &health_check_fields);
+    assert_table(Dto.ClusterTlsDto, &cluster_tls_fields);
+}
 
 fn find_field(fields: []const Field, key: []const u8) ?Field {
     for (fields) |f| {
