@@ -116,5 +116,6 @@ test {
     _ = terminator;
     _ = @import("tls/heap.zig");
     _ = @import("tls/kernel.zig");
+    _ = @import("tls/wire_relay.zig");
     _ = @import("mem/futex_mutex.zig");
 }

@@ -53,6 +53,7 @@ const access_log = @import("../obs/access_log.zig");
 const AccessLog = access_log.AccessLog;
 const guard = @import("../mem/guard.zig");
 const terminator = @import("../tls/terminator.zig");
+const WireRelay = @import("../tls/wire_relay.zig").WireRelay;
 const kernel_tls = @import("../tls/kernel.zig");
 const h2_proxy = @import("h2_proxy.zig");
 const H2ConnPool = h2_proxy.H2ConnPool;
@@ -507,16 +508,10 @@ pub const ProxyConn = struct {
         /// machinery, like any upstream socket error).
         side: Side,
         handshake_complete: bool,
-        /// Ciphertext between io.recv and the BIO feed; a partial feed
-        /// (pair full) compacts the remainder to the front.
-        wire_recv_buf: [constants.tls_bio_pair_bytes]u8,
-        wire_recv_staged: usize,
-        wire_recv_in_flight: bool,
-        /// Ciphertext between the BIO drain and io.send.
-        wire_send_buf: [constants.tls_bio_pair_bytes]u8,
-        wire_send_filled: usize,
-        wire_send_sent: usize,
-        wire_send_in_flight: bool,
+        /// The ciphertext <-> ring staging (buffers, counters, in-flight
+        /// flags): io.recv stages into it and feeds the BIO; the BIO drains
+        /// into it and io.send flushes it.
+        wire: WireRelay,
         /// Active logical plaintext recv: target borrowed from the caller
         /// until delivery through `recv_callback`.
         recv_target: ?[]u8,
@@ -562,11 +557,7 @@ pub const ProxyConn = struct {
             leg.channel = channel;
             leg.side = side;
             leg.handshake_complete = false;
-            leg.wire_recv_staged = 0;
-            leg.wire_recv_in_flight = false;
-            leg.wire_send_filled = 0;
-            leg.wire_send_sent = 0;
-            leg.wire_send_in_flight = false;
+            leg.wire.reset();
             leg.recv_target = null;
             leg.recv_callback = undefined;
             leg.send_source = "";
@@ -868,8 +859,8 @@ pub const ProxyConn = struct {
     /// Hand a leg back to the worker's pool. The channel is already gone —
     /// deinit'ed by the caller, or parked (upstream pool / kernel switch).
     fn tls_leg_release(conn: *ProxyConn, leg: *Tls) void {
-        assert(!leg.wire_recv_in_flight); // release points are wire-quiescent
-        assert(!leg.wire_send_in_flight);
+        assert(!leg.wire.recv_in_flight()); // release points are wire-quiescent
+        assert(!leg.wire.send_in_flight());
         assert(conn.tls_legs != null); // a leg exists, so the pool does
         conn.tls_legs.?.release(leg);
     }
@@ -1087,9 +1078,9 @@ pub const ProxyConn = struct {
         assert(tls.recv_target == null); // HTTP has not started
         assert(!tls.send_active);
         conn.tls_flush_wire_send(tls);
-        if (tls.wire_send_in_flight or tls.wire_send_sent != tls.wire_send_filled) return;
+        if (!tls.wire.send_idle()) return;
         if (tls.channel.pending_ciphertext() != 0) return; // flush loops back here
-        if (tls.wire_recv_in_flight) return; // its completion loops back here
+        if (tls.wire.recv_in_flight()) return; // its completion loops back here
 
         tls.kernel_switch_pending = false;
         // The wire is now idle (all our ciphertext out, nothing pending, no
@@ -1099,7 +1090,7 @@ pub const ProxyConn = struct {
         // coalesced preface) ride along.
         if (conn.h2_selected(tls)) return conn.hand_off_to_h2(tls);
         const eligible = tls.kernel_offload_enabled and
-            tls.wire_recv_staged == 0 and
+            tls.wire.staged_empty() and
             tls.channel.kernel_switch_eligible();
         if (eligible) switched: {
             const parameters = tls.channel.kernel_parameters(&tls.secrets) catch
@@ -1142,9 +1133,9 @@ pub const ProxyConn = struct {
         assert(!conn.closing);
         assert(tls.side == .downstream);
         assert(tls.handshake_complete);
-        assert(!tls.wire_send_in_flight and tls.wire_send_sent == tls.wire_send_filled);
+        assert(tls.wire.send_idle());
         assert(tls.channel.pending_ciphertext() == 0);
-        assert(!tls.wire_recv_in_flight);
+        assert(!tls.wire.recv_in_flight()); // staged preface may still ride along
         assert(conn.downstream_fd >= 0);
         assert(!conn.request_forwarded); // no HTTP has flowed
         const h2 = conn.h2_conn_pool.?.acquire() orelse {
@@ -1155,7 +1146,7 @@ pub const ProxyConn = struct {
         };
         // The bytes the handshaker read past the handshake — a coalesced
         // client preface — travel with the channel as `staged`.
-        const staged = tls.wire_recv_buf[0..tls.wire_recv_staged];
+        const staged = tls.wire.staged_bytes();
         h2.start(
             conn.io,
             conn.h2_conn_pool.?,
@@ -1281,8 +1272,7 @@ pub const ProxyConn = struct {
         const tls = conn.tls.?;
         assert(tls.notify_then_teardown);
         conn.tls_flush_wire_send(tls);
-        const wire_idle = !tls.wire_send_in_flight and
-            tls.wire_send_sent == tls.wire_send_filled;
+        const wire_idle = tls.wire.send_idle();
         if (wire_idle and tls.channel.pending_ciphertext() == 0) conn.teardown();
     }
 
@@ -1338,8 +1328,7 @@ pub const ProxyConn = struct {
             }
         }
         conn.tls_flush_wire_send(leg);
-        const wire_idle = !leg.wire_send_in_flight and
-            leg.wire_send_sent == leg.wire_send_filled;
+        const wire_idle = leg.wire.send_idle();
         if (leg.send_active and leg.send_consumed == leg.send_source.len and
             leg.channel.pending_ciphertext() == 0 and wire_idle)
         {
@@ -1386,29 +1375,18 @@ pub const ProxyConn = struct {
     /// the remainder forward (the pair drains as plaintext is read).
     fn tls_feed_staged(conn: *ProxyConn, leg: *Tls) void {
         _ = conn;
-        if (leg.wire_recv_staged == 0) return;
-        const fed = leg.channel.feed_ciphertext(leg.wire_recv_buf[0..leg.wire_recv_staged]);
-        assert(fed <= leg.wire_recv_staged);
-        if (fed == 0) return; // pair full: reads will drain it
-        if (fed < leg.wire_recv_staged) {
-            std.mem.copyForwards(
-                u8,
-                leg.wire_recv_buf[0 .. leg.wire_recv_staged - fed],
-                leg.wire_recv_buf[fed..leg.wire_recv_staged],
-            );
-        }
-        leg.wire_recv_staged -= fed;
+        _ = leg.wire.feed_staged(&leg.channel);
     }
 
     fn tls_arm_wire_recv(conn: *ProxyConn, leg: *Tls) void {
         assert(!conn.closing);
         const fd = conn.tls_leg_fd(leg);
         assert(fd >= 0);
-        if (leg.wire_recv_in_flight) return;
+        if (leg.wire.recv_in_flight()) return;
         // Staging full means the pair is also full; reads make the space —
         // wire recv re-arms on the next progress pass.
-        if (leg.wire_recv_staged == leg.wire_recv_buf.len) return;
-        leg.wire_recv_in_flight = true;
+        if (leg.wire.staging_full()) return;
+        leg.wire.begin_recv();
         conn.retain();
         switch (leg.side) {
             .downstream => conn.io.recv(
@@ -1417,7 +1395,7 @@ pub const ProxyConn = struct {
                 on_downstream_wire_recv,
                 &leg.wire_recv_completion,
                 fd,
-                leg.wire_recv_buf[leg.wire_recv_staged..],
+                leg.wire.recv_slot(),
             ),
             .upstream => conn.io.recv(
                 *ProxyConn,
@@ -1425,7 +1403,7 @@ pub const ProxyConn = struct {
                 on_upstream_wire_recv,
                 &leg.wire_recv_completion,
                 fd,
-                leg.wire_recv_buf[leg.wire_recv_staged..],
+                leg.wire.recv_slot(),
             ),
         }
     }
@@ -1451,12 +1429,11 @@ pub const ProxyConn = struct {
     }
 
     fn tls_wire_recv_done(conn: *ProxyConn, leg: *Tls, result: io_mod.RecvError!usize) void {
-        leg.wire_recv_in_flight = false;
+        leg.wire.end_recv();
         if (conn.closing) return;
         const n = result catch return conn.tls_leg_failed(leg);
         if (n == 0) return conn.tls_wire_eof(leg);
-        leg.wire_recv_staged += n;
-        assert(leg.wire_recv_staged <= leg.wire_recv_buf.len);
+        leg.wire.note_recv(n);
         conn.tls_feed_staged(leg);
         conn.tls_progress(leg);
     }
@@ -1482,14 +1459,9 @@ pub const ProxyConn = struct {
         assert(!conn.closing);
         const fd = conn.tls_leg_fd(leg);
         assert(fd >= 0);
-        if (leg.wire_send_in_flight) return;
-        if (leg.wire_send_sent == leg.wire_send_filled) {
-            leg.wire_send_filled = leg.channel.drain_ciphertext(&leg.wire_send_buf);
-            leg.wire_send_sent = 0;
-            if (leg.wire_send_filled == 0) return; // nothing pending
-        }
-        assert(leg.wire_send_sent < leg.wire_send_filled);
-        leg.wire_send_in_flight = true;
+        if (leg.wire.send_in_flight()) return;
+        if (!leg.wire.refill_send(&leg.channel)) return; // nothing pending
+        leg.wire.begin_send();
         conn.retain();
         switch (leg.side) {
             .downstream => conn.io.send(
@@ -1498,7 +1470,7 @@ pub const ProxyConn = struct {
                 on_downstream_wire_send,
                 &leg.wire_send_completion,
                 fd,
-                leg.wire_send_buf[leg.wire_send_sent..leg.wire_send_filled],
+                leg.wire.send_pending(),
             ),
             .upstream => conn.io.send(
                 *ProxyConn,
@@ -1506,7 +1478,7 @@ pub const ProxyConn = struct {
                 on_upstream_wire_send,
                 &leg.wire_send_completion,
                 fd,
-                leg.wire_send_buf[leg.wire_send_sent..leg.wire_send_filled],
+                leg.wire.send_pending(),
             ),
         }
     }
@@ -1530,11 +1502,10 @@ pub const ProxyConn = struct {
     }
 
     fn tls_wire_send_done(conn: *ProxyConn, leg: *Tls, result: io_mod.SendError!usize) void {
-        leg.wire_send_in_flight = false;
+        leg.wire.end_send();
         if (conn.closing) return;
         const m = result catch return conn.tls_leg_failed(leg);
-        leg.wire_send_sent += m;
-        assert(leg.wire_send_sent <= leg.wire_send_filled);
+        leg.wire.note_sent(m);
         conn.tls_progress(leg);
     }
 
@@ -2026,8 +1997,8 @@ pub const ProxyConn = struct {
         // quiescent — no wire op can be in flight (their completions are how
         // the attempt settled); a stale yield is guarded by its callback.
         if (conn.upstream_tls) |leg| {
-            assert(!leg.wire_recv_in_flight);
-            assert(!leg.wire_send_in_flight);
+            assert(!leg.wire.recv_in_flight());
+            assert(!leg.wire.send_in_flight());
             leg.channel.deinit();
             conn.tls_leg_release(leg);
             conn.upstream_tls = null;
@@ -2384,10 +2355,7 @@ pub const ProxyConn = struct {
         var parked_channel: ?terminator.Channel = null;
         if (conn.upstream_tls) |leg| {
             conn.tls_feed_staged(leg); // a record tail may still be staged
-            const quiescent = leg.wire_recv_staged == 0 and
-                !leg.wire_recv_in_flight and
-                !leg.wire_send_in_flight and
-                leg.channel.pending_ciphertext() == 0 and
+            const quiescent = leg.wire.quiescent(&leg.channel) and
                 leg.channel.kernel_switch_eligible(); // nothing buffered in the SSL
             if (!quiescent) return; // finish_request / teardown closes it
             parked_channel = leg.channel; // ownership moves to the upstream pool
