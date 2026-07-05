@@ -102,6 +102,29 @@ fn sim_panic(message: []const u8, first_trace_address: ?usize) noreturn {
     std.debug.defaultPanic(message, first_trace_address);
 }
 
+/// Header hygiene the proxy owes the client (RFC 9110 §7.6.1): the upstream's
+/// hop-by-hop connection headers must be stripped, so the forwarded response
+/// carries at most one Connection line and no Keep-Alive / Proxy-Connection.
+fn check_response_hygiene(response: *const h1.Response) void {
+    var connection_lines: u32 = 0;
+    for (response.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
+            connection_lines += 1;
+        }
+        if (is_hop_by_hop_response_leak(header.name)) {
+            fail("proxy leaked hop-by-hop header '{s}' to the client", .{header.name});
+        }
+    }
+    if (connection_lines > 1) {
+        fail("proxy emitted {d} Connection headers (RFC 9110 §7.6.1)", .{connection_lines});
+    }
+}
+
+fn is_hop_by_hop_response_leak(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "keep-alive") or
+        std.ascii.eqlIgnoreCase(name, "proxy-connection");
+}
+
 fn fail(comptime message: []const u8, extra: anytype) noreturn {
     std.debug.panic("sim: seed {d} FAILED: " ++ message, .{current_seed} ++ extra);
 }
@@ -591,6 +614,11 @@ const Origin = struct {
 
     const Behavior = enum {
         framed_keep_alive,
+        /// Like framed_keep_alive but the head carries a redundant
+        /// `Connection: keep-alive`. On a closing path (the client asked to
+        /// close, or the worker is draining) the proxy must strip it, never
+        /// emit it beside the injected `Connection: close` (RFC 9110 §7.6.1).
+        keep_alive_announced,
         framed_close,
         chunked_keep_alive,
         close_delimited,
@@ -700,6 +728,11 @@ const OriginConn = struct {
                 "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {d}\r\n\r\necho:{s}",
                 .{ echo_len, target },
             ) catch unreachable,
+            .keep_alive_announced => std.fmt.bufPrint(
+                &conn.response_buf,
+                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: {d}\r\n\r\necho:{s}",
+                .{ echo_len, target },
+            ) catch unreachable,
             .chunked_keep_alive => std.fmt.bufPrint(
                 &conn.response_buf,
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\necho:{s}\r\n0\r\n\r\n",
@@ -738,7 +771,10 @@ const OriginConn = struct {
         if (conn.sent < conn.response.len) return conn.arm_send();
         switch (conn.behavior) {
             .framed_close, .close_delimited, .garbage => conn.shutdown(),
-            .framed_keep_alive, .chunked_keep_alive => conn.next_request(),
+            .framed_keep_alive,
+            .chunked_keep_alive,
+            .keep_alive_announced,
+            => conn.next_request(),
             .linger_then_stale_close => {
                 // Serve, then close after a virtual delay — while the proxy
                 // has this connection parked in its pool: the stale-retry path.
@@ -1012,6 +1048,7 @@ const Client = struct {
                 .incomplete => return client.arm_recv(),
                 .complete => |response| response,
             };
+            check_response_hygiene(&response);
             const framing = h1.response_framing(client.method, &response) catch
                 fail("proxy emitted conflicting framing headers", .{});
             var framer = h1.BodyFramer.init(framing);
