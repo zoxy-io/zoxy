@@ -35,8 +35,13 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("zoxy: cannot read config {s}: {s}", .{ config_path, @errorName(err) });
         return err;
     };
-    var cfg = zoxy.config.parse(gpa, text) catch |err| {
-        std.log.err("zoxy: invalid config {s}: {s}", .{ config_path, @errorName(err) });
+    var diagnostic: zoxy.config.Diagnostic = .{};
+    var cfg = zoxy.config.parse_diagnostic(gpa, text, &diagnostic) catch |err| {
+        if (diagnostic.unknown_field) |field| {
+            std.log.err("zoxy: invalid config {s}: unknown field {s}", .{ config_path, field });
+        } else {
+            std.log.err("zoxy: invalid config {s}: {s}", .{ config_path, @errorName(err) });
+        }
         return err;
     };
     const router = Router.init(&cfg);

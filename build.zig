@@ -103,8 +103,44 @@ pub fn build(b: *std.Build) void {
     add_zig_sources(b, run_lint, "src");
     run_lint.addFileArg(b.path("build.zig"));
     run_lint.addFileArg(b.path("scripts/check_line_length.zig"));
+    run_lint.addFileArg(b.path("scripts/config_tool.zig"));
     const lint_step = b.step("lint", "Check the 100-column line-length limit");
     lint_step.dependOn(&run_lint.step);
+
+    // Config JSON Schema (docs/DESIGN.md §7 Phase 6, slice 1). A host tool
+    // reflects the schema from the config DTO — config.zig is FFI-free, so this
+    // links no OpenSSL. `schema` regenerates the committed file; `check-config`
+    // guards it against drift and strict-parses zoxy.json.
+    const config_schema_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_schema.zig"),
+        .target = b.graph.host,
+    });
+    const config_tool = b.addExecutable(.{
+        .name = "config_tool",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/config_tool.zig"),
+            .target = b.graph.host,
+            .imports = &.{.{ .name = "config_schema", .module = config_schema_mod }},
+        }),
+    });
+
+    const emit_schema = b.addRunArtifact(config_tool);
+    emit_schema.addArg("emit");
+    const generated_schema = emit_schema.captureStdOut(.{ .basename = "config.schema.json" });
+    const write_schema = b.addUpdateSourceFiles();
+    write_schema.addCopyFileToSource(generated_schema, "config.schema.json");
+    const schema_step = b.step("schema", "Regenerate config.schema.json from the config DTO");
+    schema_step.dependOn(&write_schema.step);
+
+    const check_config = b.addRunArtifact(config_tool);
+    check_config.addArg("check");
+    check_config.addFileArg(b.path("config.schema.json"));
+    check_config.addFileArg(b.path("zoxy.json"));
+    const check_config_step = b.step(
+        "check-config",
+        "Verify config.schema.json is current and zoxy.json is valid",
+    );
+    check_config_step.dependOn(&check_config.step);
 }
 
 /// Add every `.zig` file under `dir_path` (recursively) to `run` as a file

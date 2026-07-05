@@ -1,0 +1,373 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "zoxy configuration",
+  "type": "object",
+  "description": "Static zoxy proxy configuration, parsed once at startup.",
+  "properties": {
+    "$schema": {
+      "description": "JSON Schema URL for editor completion; ignored by zoxy.",
+      "type": ["string", "null"]
+    },
+    "listen": {
+      "description": "Address the proxy accepts connections on.",
+      "type": "string",
+      "format": "hostport",
+      "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}$",
+      "examples": ["0.0.0.0:8080"]
+    },
+    "admin": {
+      "description": "Address of the admin/metrics endpoint; null disables it.",
+      "type": ["string", "null"],
+      "format": "hostport",
+      "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}$",
+      "examples": ["127.0.0.1:9901"]
+    },
+    "handoff": {
+      "description": "Unix-socket path for hot-restart listener handoff; null disables it.",
+      "type": ["string", "null"],
+      "examples": ["/run/zoxy-handoff.sock"]
+    },
+    "accept_mode": {
+      "description": "How accepted connections spread across workers.",
+      "type": "string",
+      "enum": ["reuseport", "shared"],
+      "x-enumDescriptions": { "reuseport": "One SO_REUSEPORT listener per worker; the kernel hashes.", "shared": "One listener; every worker holds a pending accept." },
+      "default": "reuseport"
+    },
+    "tls": {
+      "description": "TLS termination on the listener; null = plaintext.",
+      "anyOf": [
+        {
+          "type": "object",
+          "description": "TLS termination identity and options for the listener.",
+          "properties": {
+            "certificate_file": {
+              "description": "Path to the PEM certificate (chain) for the default identity.",
+              "type": "string",
+              "examples": ["cert.pem"]
+            },
+            "private_key_file": {
+              "description": "Path to the PEM private key for the default identity.",
+              "type": "string",
+              "examples": ["key.pem"]
+            },
+            "kernel_offload": {
+              "description": "Hand completed handshakes to kernel TLS; off forces the userspace relay.",
+              "type": "boolean",
+              "default": true
+            },
+            "http2": {
+              "description": "Offer HTTP/2 in ALPN; h2-negotiating clients use the HTTP/2 data path.",
+              "type": "boolean",
+              "default": false
+            },
+            "additional_identities": {
+              "description": "Extra SNI-selected server identities beyond the default certificate.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "description": "An additional TLS identity, selected when the client's SNI matches.",
+                "properties": {
+                  "server_names": {
+                    "description": "SNI names this identity serves (exact, or single-label \"*.\" wildcards).",
+                    "type": "array",
+                    "items": { "type": "string" }
+                  },
+                  "certificate_file": {
+                    "description": "Path to this identity's PEM certificate (chain).",
+                    "type": "string"
+                  },
+                  "private_key_file": {
+                    "description": "Path to this identity's PEM private key.",
+                    "type": "string"
+                  }
+                },
+                "required": ["server_names", "certificate_file", "private_key_file"],
+                "additionalProperties": false
+              },
+              "default": []
+            }
+          },
+          "required": ["certificate_file", "private_key_file"],
+          "additionalProperties": false
+        },
+        { "type": "null" }
+      ]
+    },
+    "routes": {
+      "description": "Host/path routing rules, evaluated first-match-wins.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "description": "A routing rule: match a host and path prefix, forward to a cluster.",
+        "properties": {
+          "host": {
+            "description": "Host to match; \"*\" matches any Host header.",
+            "type": "string",
+            "examples": ["api.example.com"],
+            "default": "*"
+          },
+          "path_prefix": {
+            "description": "Prefix matched against the request target; \"/\" matches everything.",
+            "type": "string",
+            "examples": ["/v1"],
+            "default": "/"
+          },
+          "cluster": {
+            "description": "Name of the cluster to route matching requests to.",
+            "type": "string"
+          }
+        },
+        "required": ["cluster"],
+        "additionalProperties": false
+      }
+    },
+    "clusters": {
+      "description": "Upstream clusters that routes target.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "description": "An upstream cluster: endpoints plus optional resilience policy.",
+        "properties": {
+          "name": {
+            "description": "Unique cluster name referenced by routes.",
+            "type": "string"
+          },
+          "endpoints": {
+            "description": "Upstream endpoint addresses, each host:port.",
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "tls": {
+            "description": "Re-encrypt traffic to this cluster's endpoints; null = plaintext.",
+            "anyOf": [
+              {
+                "type": "object",
+                "description": "Upstream re-encryption for a cluster; pick a verification posture explicitly.",
+                "properties": {
+                  "server_name": {
+                    "description": "Certificate hostname to require and offer as SNI; required unless insecure.",
+                    "type": ["string", "null"]
+                  },
+                  "ca_file": {
+                    "description": "PEM trust-store bundle path; required unless insecure.",
+                    "type": ["string", "null"]
+                  },
+                  "insecure": {
+                    "description": "Skip upstream verification; mutually exclusive with server_name/ca_file.",
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              },
+              { "type": "null" }
+            ]
+          },
+          "lb": {
+            "description": "Load-balancing policy; absent = P2C least-request.",
+            "anyOf": [
+              {
+                "type": "object",
+                "description": "Load-balancer selection for a cluster.",
+                "properties": {
+                  "policy": {
+                    "description": "Balancing policy.",
+                    "type": "string",
+                    "enum": ["least_request", "maglev"],
+                    "x-enumDescriptions": { "least_request": "Power-of-two-choices least-request over in-flight counts.", "maglev": "Maglev consistent hashing (see hash); falls back to least-request." }
+                  },
+                  "hash": {
+                    "description": "What the consistent hash keys on (maglev only).",
+                    "type": "string",
+                    "enum": ["target", "header"],
+                    "x-enumDescriptions": { "target": "Hash the request target.", "header": "Hash a named request header (see header)." },
+                    "default": "target"
+                  },
+                  "header": {
+                    "description": "Header name to hash on when hash = header.",
+                    "type": ["string", "null"],
+                    "examples": ["x-user-id"]
+                  }
+                },
+                "required": ["policy"],
+                "additionalProperties": false
+              },
+              { "type": "null" }
+            ]
+          },
+          "retry": {
+            "description": "Retry policy for failed attempts; absent = retries off.",
+            "anyOf": [
+              {
+                "type": "object",
+                "description": "Retry policy: bounded attempts with jittered exponential backoff and a budget.",
+                "properties": {
+                  "max": {
+                    "description": "Retry attempts after the first try.",
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5
+                  },
+                  "backoff_base_ms": {
+                    "description": "Base backoff before the first retry (jittered exponential).",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                    "x-units": "milliseconds"
+                  },
+                  "backoff_cap_ms": {
+                    "description": "Maximum backoff between retries (must be >= backoff_base_ms).",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                    "x-units": "milliseconds"
+                  },
+                  "budget_percent": {
+                    "description": "Retry budget as a percent of active requests.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 100
+                  },
+                  "budget_min": {
+                    "description": "Minimum concurrent retries allowed regardless of the budget percent.",
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": 4294967295
+                  }
+                },
+                "required": ["max"],
+                "additionalProperties": false
+              },
+              { "type": "null" }
+            ]
+          },
+          "circuit_breaker": {
+            "description": "Per-worker admission limits; absent = unbounded.",
+            "anyOf": [
+              {
+                "type": "object",
+                "description": "Per-worker circuit-breaker admission limits.",
+                "properties": {
+                  "max_connections": {
+                    "description": "Max concurrent upstream connections per worker.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  },
+                  "max_pending": {
+                    "description": "Max requests queued awaiting a connection per worker.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  },
+                  "max_requests": {
+                    "description": "Max concurrent upstream requests per worker.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  },
+                  "max_retries": {
+                    "description": "Max concurrent retries per worker.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              },
+              { "type": "null" }
+            ]
+          },
+          "outlier": {
+            "description": "Passive outlier ejection; absent = off.",
+            "anyOf": [
+              {
+                "type": "object",
+                "description": "Passive outlier detection: eject endpoints that fail repeatedly.",
+                "properties": {
+                  "consecutive_failures": {
+                    "description": "Consecutive attempt failures before an endpoint is ejected.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  },
+                  "ejection_ms": {
+                    "description": "How long an ejected endpoint stays out.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                    "x-units": "milliseconds"
+                  },
+                  "max_ejection_percent": {
+                    "description": "Ceiling on the ejected share of a cluster.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 100
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              },
+              { "type": "null" }
+            ]
+          },
+          "health_check": {
+            "description": "Active TCP health probes; absent = off.",
+            "anyOf": [
+              {
+                "type": "object",
+                "description": "Active TCP health probing for a cluster's endpoints.",
+                "properties": {
+                  "interval_ms": {
+                    "description": "Interval between active TCP-connect probes.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                    "x-units": "milliseconds"
+                  },
+                  "timeout_ms": {
+                    "description": "Per-probe connect timeout.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                    "x-units": "milliseconds"
+                  },
+                  "healthy_threshold": {
+                    "description": "Consecutive successes to mark an endpoint healthy.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 65535
+                  },
+                  "unhealthy_threshold": {
+                    "description": "Consecutive failures to mark an endpoint unhealthy.",
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 65535
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              },
+              { "type": "null" }
+            ]
+          },
+          "per_try_timeout_ms": {
+            "description": "Deadline per upstream attempt (connect to first byte); 0 = disabled.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "x-units": "milliseconds",
+            "default": 0
+          }
+        },
+        "required": ["name", "endpoints"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["listen", "routes", "clusters"],
+  "additionalProperties": false
+}

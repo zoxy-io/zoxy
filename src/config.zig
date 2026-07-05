@@ -88,6 +88,11 @@ pub const Cluster = struct {
 
 pub const HashOn = enum { target, header };
 
+/// Balancing policy for a cluster's `lb` block. The accepted policy strings
+/// are these enum names — sourced here so both the parser (`lower_lb`) and the
+/// generated JSON Schema draw the value set from one place.
+pub const LbPolicy = enum { least_request, maglev };
+
 pub const Route = struct {
     /// "*" matches any Host.
     host: []const u8,
@@ -170,8 +175,17 @@ pub const ParseError = error{
 
 pub const AcceptMode = enum { reuseport, shared };
 
-/// JSON shape mirrored 1:1 for decoding, then lowered into `Config`.
-const Dto = struct {
+/// A JSON Schema `pattern`/example hint for "host:port" IPv4 address strings
+/// (validated for real by `parse_address`; the pattern is a docs/editor hint).
+const hostport_pattern = "^(\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}$";
+
+/// JSON shape mirrored 1:1 for decoding, then lowered into `Config`. Public so
+/// `config_schema.zig` can reflect over it to emit the JSON Schema. Each struct
+/// carries `schema_doc` (object prose) and `schema_fields` (per-field docs);
+/// `assert_meta_matches` cross-checks the metadata against the fields at
+/// comptime, so the two can never drift.
+pub const Dto = struct {
+    @"$schema": ?[]const u8 = null,
     listen: []const u8,
     admin: ?[]const u8 = null,
     handoff: ?[]const u8 = null,
@@ -180,29 +194,119 @@ const Dto = struct {
     routes: []const RouteDto,
     clusters: []const ClusterDto,
 
-    const TlsDto = struct {
+    pub const schema_doc = "Static zoxy proxy configuration, parsed once at startup.";
+    pub const schema_fields = .{
+        .@"$schema" = .{ .desc = "JSON Schema URL for editor completion; ignored by zoxy." },
+        .listen = .{
+            .desc = "Address the proxy accepts connections on.",
+            .format = "hostport",
+            .pattern = hostport_pattern,
+            .example = "0.0.0.0:8080",
+        },
+        .admin = .{
+            .desc = "Address of the admin/metrics endpoint; null disables it.",
+            .format = "hostport",
+            .pattern = hostport_pattern,
+            .example = "127.0.0.1:9901",
+        },
+        .handoff = .{
+            .desc = "Unix-socket path for hot-restart listener handoff; null disables it.",
+            .example = "/run/zoxy-handoff.sock",
+        },
+        .accept_mode = .{
+            .desc = "How accepted connections spread across workers.",
+            .enum_type = AcceptMode,
+            .enum_docs = .{
+                .reuseport = "One SO_REUSEPORT listener per worker; the kernel hashes.",
+                .shared = "One listener; every worker holds a pending accept.",
+            },
+        },
+        .tls = .{ .desc = "TLS termination on the listener; null = plaintext." },
+        .routes = .{ .desc = "Host/path routing rules, evaluated first-match-wins." },
+        .clusters = .{ .desc = "Upstream clusters that routes target." },
+    };
+
+    pub const TlsDto = struct {
         certificate_file: []const u8,
         private_key_file: []const u8,
         kernel_offload: bool = true,
         http2: bool = false,
         additional_identities: []const TlsIdentityDto = &.{},
+
+        pub const schema_doc = "TLS termination identity and options for the listener.";
+        pub const schema_fields = .{
+            .certificate_file = .{
+                .desc = "Path to the PEM certificate (chain) for the default identity.",
+                .example = "cert.pem",
+            },
+            .private_key_file = .{
+                .desc = "Path to the PEM private key for the default identity.",
+                .example = "key.pem",
+            },
+            .kernel_offload = .{
+                .desc = "Hand completed handshakes to kernel TLS; off forces the userspace relay.",
+            },
+            .http2 = .{
+                .desc = "Offer HTTP/2 in ALPN; h2-negotiating clients use the HTTP/2 data path.",
+            },
+            .additional_identities = .{
+                .desc = "Extra SNI-selected server identities beyond the default certificate.",
+            },
+        };
     };
-    const TlsIdentityDto = struct {
+    pub const TlsIdentityDto = struct {
         server_names: []const []const u8,
         certificate_file: []const u8,
         private_key_file: []const u8,
+
+        pub const schema_doc =
+            "An additional TLS identity, selected when the client's SNI matches.";
+        pub const schema_fields = .{
+            .server_names = .{
+                .desc = "SNI names this identity serves (exact, or single-label \"*.\" wildcards).",
+            },
+            .certificate_file = .{ .desc = "Path to this identity's PEM certificate (chain)." },
+            .private_key_file = .{ .desc = "Path to this identity's PEM private key." },
+        };
     };
-    const ClusterTlsDto = struct {
+    pub const ClusterTlsDto = struct {
         server_name: ?[]const u8 = null,
         ca_file: ?[]const u8 = null,
         insecure: bool = false,
+
+        pub const schema_doc =
+            "Upstream re-encryption for a cluster; pick a verification posture explicitly.";
+        pub const schema_fields = .{
+            .server_name = .{
+                .desc = "Certificate hostname to require and offer as SNI; " ++
+                    "required unless insecure.",
+            },
+            .ca_file = .{ .desc = "PEM trust-store bundle path; required unless insecure." },
+            .insecure = .{
+                .desc = "Skip upstream verification; mutually exclusive with server_name/ca_file.",
+            },
+        };
     };
-    const RouteDto = struct {
+    pub const RouteDto = struct {
         host: []const u8 = "*",
         path_prefix: []const u8 = "/",
         cluster: []const u8,
+
+        pub const schema_doc =
+            "A routing rule: match a host and path prefix, forward to a cluster.";
+        pub const schema_fields = .{
+            .host = .{
+                .desc = "Host to match; \"*\" matches any Host header.",
+                .example = "api.example.com",
+            },
+            .path_prefix = .{
+                .desc = "Prefix matched against the request target; \"/\" matches everything.",
+                .example = "/v1",
+            },
+            .cluster = .{ .desc = "Name of the cluster to route matching requests to." },
+        };
     };
-    const ClusterDto = struct {
+    pub const ClusterDto = struct {
         name: []const u8,
         endpoints: []const []const u8,
         tls: ?ClusterTlsDto = null,
@@ -212,49 +316,366 @@ const Dto = struct {
         outlier: ?OutlierDto = null,
         health_check: ?HealthCheckDto = null,
         per_try_timeout_ms: u32 = 0,
+
+        pub const schema_doc = "An upstream cluster: endpoints plus optional resilience policy.";
+        pub const schema_fields = .{
+            .name = .{ .desc = "Unique cluster name referenced by routes." },
+            .endpoints = .{ .desc = "Upstream endpoint addresses, each host:port." },
+            .tls = .{ .desc = "Re-encrypt traffic to this cluster's endpoints; null = plaintext." },
+            .lb = .{ .desc = "Load-balancing policy; absent = P2C least-request." },
+            .retry = .{ .desc = "Retry policy for failed attempts; absent = retries off." },
+            .circuit_breaker = .{ .desc = "Per-worker admission limits; absent = unbounded." },
+            .outlier = .{ .desc = "Passive outlier ejection; absent = off." },
+            .health_check = .{ .desc = "Active TCP health probes; absent = off." },
+            .per_try_timeout_ms = .{
+                .desc = "Deadline per upstream attempt (connect to first byte); 0 = disabled.",
+                .units = "milliseconds",
+            },
+        };
     };
     // Absent per-field values fall back to `constants` defaults during
     // lowering (kept out of the DTO so the defaults live in one place).
-    const LbDto = struct {
+    pub const LbDto = struct {
         policy: []const u8,
         hash: []const u8 = "target",
         header: ?[]const u8 = null,
+
+        pub const schema_doc = "Load-balancer selection for a cluster.";
+        pub const schema_fields = .{
+            .policy = .{
+                .desc = "Balancing policy.",
+                .enum_type = LbPolicy,
+                .enum_docs = .{
+                    .least_request = "Power-of-two-choices least-request over in-flight counts.",
+                    .maglev = "Maglev consistent hashing (see hash); falls back to least-request.",
+                },
+            },
+            .hash = .{
+                .desc = "What the consistent hash keys on (maglev only).",
+                .enum_type = HashOn,
+                .enum_docs = .{
+                    .target = "Hash the request target.",
+                    .header = "Hash a named request header (see header).",
+                },
+            },
+            .header = .{
+                .desc = "Header name to hash on when hash = header.",
+                .example = "x-user-id",
+            },
+        };
     };
-    const RetryDto = struct {
+    pub const RetryDto = struct {
         max: u8,
         backoff_base_ms: ?u32 = null,
         backoff_cap_ms: ?u32 = null,
         budget_percent: ?u8 = null,
         budget_min: ?u32 = null,
+
+        pub const schema_doc =
+            "Retry policy: bounded attempts with jittered exponential backoff and a budget.";
+        pub const schema_fields = .{
+            .max = .{
+                .desc = "Retry attempts after the first try.",
+                .minimum = 1,
+                .maximum = constants.retry_attempts_max,
+            },
+            .backoff_base_ms = .{
+                .desc = "Base backoff before the first retry (jittered exponential).",
+                .units = "milliseconds",
+                .minimum = 1,
+            },
+            .backoff_cap_ms = .{
+                .desc = "Maximum backoff between retries (must be >= backoff_base_ms).",
+                .units = "milliseconds",
+                .minimum = 1,
+            },
+            .budget_percent = .{
+                .desc = "Retry budget as a percent of active requests.",
+                .minimum = 1,
+                .maximum = 100,
+            },
+            .budget_min = .{
+                .desc = "Minimum concurrent retries allowed regardless of the budget percent.",
+            },
+        };
     };
-    const CircuitBreakerDto = struct {
+    pub const CircuitBreakerDto = struct {
         max_connections: ?u32 = null,
         max_pending: ?u32 = null,
         max_requests: ?u32 = null,
         max_retries: ?u32 = null,
+
+        pub const schema_doc = "Per-worker circuit-breaker admission limits.";
+        pub const schema_fields = .{
+            .max_connections = .{
+                .desc = "Max concurrent upstream connections per worker.",
+                .minimum = 1,
+            },
+            .max_pending = .{
+                .desc = "Max requests queued awaiting a connection per worker.",
+                .minimum = 1,
+            },
+            .max_requests = .{
+                .desc = "Max concurrent upstream requests per worker.",
+                .minimum = 1,
+            },
+            .max_retries = .{ .desc = "Max concurrent retries per worker.", .minimum = 1 },
+        };
     };
-    const OutlierDto = struct {
+    pub const OutlierDto = struct {
         consecutive_failures: ?u32 = null,
         ejection_ms: ?u32 = null,
         max_ejection_percent: ?u8 = null,
+
+        pub const schema_doc = "Passive outlier detection: eject endpoints that fail repeatedly.";
+        pub const schema_fields = .{
+            .consecutive_failures = .{
+                .desc = "Consecutive attempt failures before an endpoint is ejected.",
+                .minimum = 1,
+            },
+            .ejection_ms = .{
+                .desc = "How long an ejected endpoint stays out.",
+                .units = "milliseconds",
+                .minimum = 1,
+            },
+            .max_ejection_percent = .{
+                .desc = "Ceiling on the ejected share of a cluster.",
+                .minimum = 1,
+                .maximum = 100,
+            },
+        };
     };
-    const HealthCheckDto = struct {
+    pub const HealthCheckDto = struct {
         interval_ms: ?u32 = null,
         timeout_ms: ?u32 = null,
         healthy_threshold: ?u16 = null,
         unhealthy_threshold: ?u16 = null,
+
+        pub const schema_doc = "Active TCP health probing for a cluster's endpoints.";
+        pub const schema_fields = .{
+            .interval_ms = .{
+                .desc = "Interval between active TCP-connect probes.",
+                .units = "milliseconds",
+                .minimum = 1,
+            },
+            .timeout_ms = .{
+                .desc = "Per-probe connect timeout.",
+                .units = "milliseconds",
+                .minimum = 1,
+            },
+            .healthy_threshold = .{
+                .desc = "Consecutive successes to mark an endpoint healthy.",
+                .minimum = 1,
+            },
+            .unhealthy_threshold = .{
+                .desc = "Consecutive failures to mark an endpoint unhealthy.",
+                .minimum = 1,
+            },
+        };
     };
 };
 
+/// The attribute keys a `schema_fields` entry may carry — the vocabulary the
+/// generator reads. A key outside this set would be silently ignored (dropping
+/// the annotation or widening a constraint), so `assert_meta_matches` rejects it.
+const schema_attributes = .{
+    "desc",      "format",    "pattern", "units",
+    "enum_type", "enum_docs", "example", "minimum",
+    "maximum",
+};
+
+/// Cross-check a DTO struct's `schema_fields` metadata against its actual fields
+/// at comptime, so the JSON Schema (shape *and* prose) can never drift from the
+/// parsed shape: (1) every field has exactly one metadata entry and vice versa;
+/// (2) every entry carries a `.desc`; (3) every attribute key is in
+/// `schema_attributes` (a typo like `.minimu` is a compile error, not a silent
+/// drop). Called from the container-scope block below (every build) and
+/// per-object by the generator (catches a nested struct missing from the list).
+pub fn assert_meta_matches(comptime T: type) void {
+    @setEvalBranchQuota(50_000); // the attribute-vocabulary cross-check is string-compare heavy
+    const meta = T.schema_fields;
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (!@hasField(@TypeOf(meta), field.name)) {
+            @compileError(@typeName(T) ++ ": schema_fields missing '" ++ field.name ++ "'");
+        }
+    }
+    inline for (@typeInfo(@TypeOf(meta)).@"struct".fields) |meta_field| {
+        if (!@hasField(T, meta_field.name)) {
+            @compileError(@typeName(T) ++ ": schema_fields has stray '" ++ meta_field.name ++ "'");
+        }
+        const entry = @field(meta, meta_field.name);
+        if (!@hasField(@TypeOf(entry), "desc")) {
+            @compileError(@typeName(T) ++ "." ++ meta_field.name ++ ": entry needs a .desc");
+        }
+        inline for (@typeInfo(@TypeOf(entry)).@"struct".fields) |attribute| {
+            comptime var known = false;
+            inline for (schema_attributes) |name| {
+                if (comptime std.mem.eql(u8, attribute.name, name)) known = true;
+            }
+            if (!known) @compileError(@typeName(T) ++ "." ++ meta_field.name ++
+                ": unknown schema attribute '" ++ attribute.name ++ "'");
+        }
+    }
+}
+
+/// Every DTO struct, checked on every build (config.zig is always compiled).
+pub const dto_types = .{
+    Dto,                   Dto.TlsDto,     Dto.TlsIdentityDto, Dto.ClusterTlsDto,
+    Dto.RouteDto,          Dto.ClusterDto, Dto.LbDto,          Dto.RetryDto,
+    Dto.CircuitBreakerDto, Dto.OutlierDto, Dto.HealthCheckDto,
+};
+
+comptime {
+    for (dto_types) |T| assert_meta_matches(T);
+}
+
+/// Longest config field path rendered in an unknown-field error.
+const config_path_bytes_max: usize = 256;
+/// Loop bounds for the strict-field walk (TigerStyle: bound every loop). Keys or
+/// array items past these fall through to the strict `parseFromValue`, which
+/// still rejects the unknown — just without the pretty path.
+const object_keys_max: u32 = 128;
+const array_items_max: u32 = 1024;
+
+/// Accumulates a dotted/indexed JSON path (e.g. `clusters[2].circuit_breaker`)
+/// into a caller-owned fixed buffer; silently truncates at the buffer end.
+const PathBuilder = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn mark(self: *const PathBuilder) usize {
+        return self.len;
+    }
+    fn rewind(self: *PathBuilder, to: usize) void {
+        assert(to <= self.len);
+        self.len = to;
+    }
+    fn push_key(self: *PathBuilder, name: []const u8) void {
+        if (self.len != 0) self.push_byte('.');
+        self.push_bytes(name);
+    }
+    fn push_index(self: *PathBuilder, index: usize) void {
+        var digits: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&digits, "[{d}]", .{index}) catch return;
+        self.push_bytes(text);
+    }
+    fn push_byte(self: *PathBuilder, byte: u8) void {
+        if (self.len >= self.buf.len) return;
+        self.buf[self.len] = byte;
+        self.len += 1;
+    }
+    fn push_bytes(self: *PathBuilder, bytes: []const u8) void {
+        assert(self.len <= self.buf.len);
+        const take = @min(bytes.len, self.buf.len - self.len);
+        @memcpy(self.buf[self.len..][0..take], bytes[0..take]);
+        self.len += take;
+    }
+    fn path(self: *const PathBuilder) []const u8 {
+        assert(self.len <= self.buf.len);
+        return self.buf[0..self.len];
+    }
+};
+
+fn field_known(comptime T: type, key: []const u8) bool {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (std.mem.eql(u8, field.name, key)) return true;
+    }
+    return false;
+}
+
+/// Walk a decoded JSON object against DTO struct `T`, returning the path of the
+/// first key `T` does not declare, or null. Comptime-monomorphized per DTO type
+/// (Dto → ClusterDto → ClusterTlsDto …): each level is a distinct function over
+/// a distinct type and no type contains itself, so the descent is statically
+/// bounded at the DTO's nesting depth — it terminates and is not runtime
+/// recursion (the same shape as the comptime parsers elsewhere in the tree).
+fn check_object(comptime T: type, value: std.json.Value, pb: *PathBuilder) ?[]const u8 {
+    if (value != .object) return null; // shape mismatches are parseFromValue's job
+    var seen: u32 = 0;
+    var it = value.object.iterator();
+    while (it.next()) |entry| : (seen += 1) {
+        if (seen >= object_keys_max) break;
+        if (!field_known(T, entry.key_ptr.*)) {
+            pb.push_key(entry.key_ptr.*);
+            return pb.path();
+        }
+    }
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (value.object.get(field.name)) |child| {
+            const at = pb.mark();
+            pb.push_key(field.name);
+            if (check_value(field.type, child, pb)) |bad| return bad;
+            pb.rewind(at);
+        }
+    }
+    return null;
+}
+
+fn check_value(comptime T: type, value: std.json.Value, pb: *PathBuilder) ?[]const u8 {
+    switch (@typeInfo(T)) {
+        .optional => |opt| return if (value == .null) null else check_value(opt.child, value, pb),
+        .@"struct" => return check_object(T, value, pb),
+        .pointer => |ptr| {
+            if (ptr.size != .slice) return null;
+            if (@typeInfo(ptr.child) != .@"struct") return null; // strings, []const []const u8
+            if (value != .array) return null;
+            for (value.array.items, 0..) |item, index| {
+                if (index >= array_items_max) break;
+                const at = pb.mark();
+                pb.push_index(index);
+                if (check_object(ptr.child, item, pb)) |bad| return bad;
+                pb.rewind(at);
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// Returns the path of the first unknown config key (into `buf`), or null when
+/// every key maps to a DTO field. Backs the strict rejection in `parse`.
+pub fn find_unknown_field(root: std.json.Value, buf: []u8) ?[]const u8 {
+    var pb = PathBuilder{ .buf = buf };
+    return check_object(Dto, root, &pb);
+}
+
+/// Surfaced from `parse_diagnostic`: on `error.UnknownField`, `unknown_field`
+/// is the offending dotted path (`clusters[2].circuit_breaker`), backed by
+/// `path_buf`. Kept caller-owned so the library never logs on the parse path.
+pub const Diagnostic = struct {
+    unknown_field: ?[]const u8 = null,
+    path_buf: [config_path_bytes_max]u8 = undefined,
+};
+
+/// Parse without surfacing a diagnostic — the library stays quiet. Callers that
+/// want the offending field path (main, the config tool) use `parse_diagnostic`.
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
+    var diag: Diagnostic = .{};
+    return parse_diagnostic(gpa, text, &diag);
+}
+
+pub fn parse_diagnostic(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    diag: *Diagnostic,
+) ParseError!Config {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // Decode into the DTO with a throwaway arena, then dupe what we keep.
-    const parsed = try std.json.parseFromSlice(Dto, gpa, text, .{ .ignore_unknown_fields = true });
+    // Decode to a dynamic tree first so a misspelled key can be reported with
+    // its full path — std.json's UnknownField error carries none. Then decode
+    // strictly into the DTO (rejecting unknowns again, defense in depth) and
+    // dupe what we keep into the arena.
+    const tree = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+    defer tree.deinit();
+    if (find_unknown_field(tree.value, &diag.path_buf)) |bad_path| {
+        diag.unknown_field = bad_path;
+        return error.UnknownField;
+    }
+    const parsed = try std.json.parseFromValue(Dto, gpa, tree.value, .{});
     defer parsed.deinit();
     const dto = parsed.value;
 
@@ -374,13 +795,14 @@ fn lower_lb(
 ) (error{InvalidLb} || std.mem.Allocator.Error)!void {
     const lb = dc.lb orelse return;
     assert(cluster.maglev_table.len == 0); // lowered exactly once per cluster
-    if (std.mem.eql(u8, lb.policy, "least_request")) {
+    const policy = std.meta.stringToEnum(LbPolicy, lb.policy) orelse return error.InvalidLb;
+    if (policy == .least_request) {
         // The default spelled out; hash knobs belong to maglev only.
         if (lb.header != null) return error.InvalidLb;
         if (!std.mem.eql(u8, lb.hash, "target")) return error.InvalidLb;
         return;
     }
-    if (!std.mem.eql(u8, lb.policy, "maglev")) return error.InvalidLb;
+    assert(policy == .maglev);
     if (cluster.endpoints.len == 0) return error.InvalidLb; // nothing to hash onto
     if (std.mem.eql(u8, lb.hash, "target")) {
         if (lb.header != null) return error.InvalidLb;
@@ -913,4 +1335,73 @@ test "config: rejects out-of-range resilience limits" {
             parse(std.testing.allocator, w.buffered()),
         );
     }
+}
+
+test "config: strict parsing rejects an unknown field" {
+    const bad =
+        \\{ "listen": "0.0.0.0:80", "typo_here": 1, "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    ;
+    try std.testing.expectError(error.UnknownField, parse(std.testing.allocator, bad));
+}
+
+test "config: strict parsing accepts a known $schema key" {
+    var config = try parse(std.testing.allocator,
+        \\{ "$schema": "./config.schema.json", "listen": "0.0.0.0:80",
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer config.deinit();
+    try std.testing.expectEqual(@as(u16, 80), config.listen.port);
+}
+
+test "config: find_unknown_field names the offending path" {
+    const Case = struct { json: []const u8, path: []const u8 };
+    const cases = [_]Case{
+        .{
+            .json =
+            \\{ "listen": "0.0.0.0:80", "nope": 1, "routes": [], "clusters": [] }
+            ,
+            .path = "nope",
+        },
+        .{
+            .json =
+            \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c", "hostt": "*" }],
+            \\  "clusters": [] }
+            ,
+            .path = "routes[0].hostt",
+        },
+        .{
+            .json =
+            \\{ "listen": "0.0.0.0:80", "routes": [],
+            \\  "clusters": [{ "name": "c", "endpoints": [],
+            \\    "circuit_breaker": { "max_requsts": 1 } }] }
+            ,
+            .path = "clusters[0].circuit_breaker.max_requsts",
+        },
+    };
+    for (cases) |case| {
+        var tree = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            case.json,
+            .{},
+        );
+        defer tree.deinit();
+        var buf: [config_path_bytes_max]u8 = undefined;
+        const found = find_unknown_field(tree.value, &buf);
+        try std.testing.expect(found != null);
+        try std.testing.expectEqualStrings(case.path, found.?);
+    }
+
+    // A fully valid document has no unknown field.
+    var ok = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        test_config,
+        .{},
+    );
+    defer ok.deinit();
+    var buf: [config_path_bytes_max]u8 = undefined;
+    try std.testing.expect(find_unknown_field(ok.value, &buf) == null);
 }
