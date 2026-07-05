@@ -450,7 +450,11 @@ pub const H2Conn = struct {
 
     fn handle_event(conn: *H2Conn, event: h2.Event) void {
         switch (event) {
-            .request => |request| conn.begin_stream(request.stream_id, request.headers, request.end_stream),
+            .request => |request| conn.begin_stream(
+                request.stream_id,
+                request.headers,
+                request.end_stream,
+            ),
             .trailers => |trailers| {
                 // Trailer fields are dropped (the H1 leg forwards none);
                 // what matters is that the body ended.
@@ -506,7 +510,12 @@ pub const H2Conn = struct {
 
     // ---- stream start: route, admit, dial -----------------------------------
 
-    fn begin_stream(conn: *H2Conn, stream_id: u31, headers: []const hpack.Header, end_stream: bool) void {
+    fn begin_stream(
+        conn: *H2Conn,
+        stream_id: u31,
+        headers: []const hpack.Header,
+        end_stream: bool,
+    ) void {
         conn.metrics.requests.add(1);
         const leg = conn.legs.acquire() orelse {
             conn.metrics.rejected.add(1);

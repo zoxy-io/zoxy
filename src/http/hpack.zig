@@ -1219,7 +1219,11 @@ test "hpack: an entry larger than the table clears it (RFC 7541 4.4)" {
     // Seed one small entry, then insert one whose size exceeds 64.
     var used: usize = 0;
     used += try encode_field_with_indexing("k", "v", block[used..]);
-    used += try encode_field_with_indexing("giant-key", "a-value-well-past-sixty-four-bytes-of-entry-size", block[used..]);
+    used += try encode_field_with_indexing(
+        "giant-key",
+        "a-value-well-past-sixty-four-bytes-of-entry-size",
+        block[used..],
+    );
     const decoded = try decoder.decode(block[0..used], &headers, &storage);
     // Both fields are still emitted; the table lost everything.
     try testing.expectEqual(@as(usize, 2), decoded.len);

@@ -66,6 +66,9 @@ pub const Heap = struct {
     /// nothing on the TLS path needs megabyte-plus single blocks).
     fn class_for(bytes: usize) ?u32 {
         assert(bytes > 0);
+        // Reject before the add so an FFI-supplied `bytes` near maxInt cannot
+        // wrap `total` into a small value that slips past the bound below.
+        if (bytes > block_bytes_max) return null;
         const total = bytes + header_bytes;
         if (total > block_bytes_max) return null;
         const bits = std.math.log2_int_ceil(usize, total);

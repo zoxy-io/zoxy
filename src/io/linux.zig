@@ -185,6 +185,7 @@ pub const IO = struct {
         completion: *Completion,
         socket: posix.socket_t,
     ) void {
+        assert(socket >= 0);
         io.submit(Context, context, AcceptError!posix.socket_t, callback, completion, .{
             .accept = .{ .socket = socket },
         });
@@ -199,6 +200,7 @@ pub const IO = struct {
         socket: posix.socket_t,
         buffer: []u8,
     ) void {
+        assert(socket >= 0);
         assert(buffer.len > 0);
         io.submit(Context, context, RecvError!usize, callback, completion, .{
             .recv = .{ .socket = socket, .buffer = buffer },
@@ -214,6 +216,7 @@ pub const IO = struct {
         socket: posix.socket_t,
         buffer: []const u8,
     ) void {
+        assert(socket >= 0);
         assert(buffer.len > 0);
         io.submit(Context, context, SendError!usize, callback, completion, .{
             .send = .{ .socket = socket, .buffer = buffer },
@@ -231,6 +234,7 @@ pub const IO = struct {
         socket: posix.socket_t,
         message: *const linux.msghdr_const,
     ) void {
+        assert(socket >= 0);
         assert(message.iovlen > 0);
         io.submit(Context, context, SendError!usize, callback, completion, .{
             .send_message = .{ .socket = socket, .message = message },
@@ -246,6 +250,7 @@ pub const IO = struct {
         socket: posix.socket_t,
         addr: linux.sockaddr.in,
     ) void {
+        assert(socket >= 0);
         io.submit(Context, context, ConnectError!void, callback, completion, .{
             .connect = .{ .socket = socket, .addr = addr },
         });
@@ -259,6 +264,7 @@ pub const IO = struct {
         completion: *Completion,
         fd: posix.fd_t,
     ) void {
+        assert(fd >= 0);
         io.submit(Context, context, CloseError!void, callback, completion, .{
             .close = .{ .fd = fd },
         });

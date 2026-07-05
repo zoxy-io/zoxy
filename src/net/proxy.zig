@@ -889,9 +889,8 @@ pub const ProxyConn = struct {
     }
 
     fn teardown(conn: *ProxyConn) void {
-        if (conn.closing) return;
+        if (conn.closing) return; // idempotent: a second call returns here
         conn.closing = true;
-        assert(conn.closing); // idempotent: a second call returns above
         // Whatever was in flight ends here. Aborted, not failed: a client
         // that vanished mid-exchange says nothing about the endpoint.
         conn.settle_accounting(.aborted);
@@ -1869,9 +1868,10 @@ pub const ProxyConn = struct {
     }
 
     /// An upstream attempt died before the response head completed (nothing
-    /// was forwarded downstream yet). Three tiers: the built-in stale-pool
-    /// replay (same endpoint, immediate, free), a configured retry (new
-    /// endpoint pick, jittered backoff, budgeted), or a clean 502/504.
+    /// was forwarded downstream yet). Two retry tiers, then terminal: the
+    /// built-in stale-pool replay (same endpoint, immediate, free), a
+    /// configured retry (new endpoint pick, jittered backoff, budgeted), or
+    /// a clean 502/504.
     fn attempt_failed(conn: *ProxyConn, reason: AttemptFailure) void {
         assert(!conn.closing);
         assert(conn.attempt_open);
