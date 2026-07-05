@@ -51,8 +51,21 @@ and the **proxy-specific deltas**. When in doubt, read the original.
 
 ## Naming
 
-- `snake_case` for functions, variables, **and file names** (no `CamelCase.zig`).
-  Acronyms keep case: `IpAddress`, `HttpReader`.
+- **Follow the [Zig reference naming conventions](https://ziglang.org/documentation/master/#Names)**
+  — case encodes what a name *is*:
+  - `TitleCase` for types and for any function that returns a type
+    (`IpAddress`, `HttpReader`, `Pool(T)`, `Padded(T)`).
+  - `camelCase` for every other function (`readHead`, `beginDrain`).
+  - `snake_case` for variables, non-type constants, and struct fields
+    (`latency_ms_max`, `header_bytes_max`, `connections_max`).
+  - A field-less struct used purely as a namespace is `snake_case`.
+  - **File names follow the same type/namespace split:** a file whose
+    top-level struct has fields is a type → `TitleCase.zig`; a file that is
+    just a namespace of declarations → `snake_case.zig`. Directories are
+    `snake_case`.
+  - Acronyms and initialisms are ordinary words under these rules, even
+    two-letter ones: `IpAddress`/`HttpReader` (not `IPAddress`/`HTTPReader`),
+    `Tcp`, `Io`.
 - **No abbreviations** (except primitive indices in tight math). `source`/`target`
   over `src`/`dest` so `source_offset`/`target_offset` align.
 - **Units/qualifiers last, most-significant word first:** `latency_ms_max`,
@@ -60,7 +73,7 @@ and the **proxy-specific deltas**. When in doubt, read the original.
 - Give allocators meaning: `gpa: Allocator` vs `arena: Allocator` signals whether
   `deinit` is needed.
 - **Callbacks are the last parameter.** Helper naming shows call history:
-  `read_head()` + `read_head_callback()`.
+  `readHead()` + `readHeadCallback()`.
 - File order top-down, important first; `main` first. Struct order:
   **fields, then types (decls), then methods.** When unsure, sort alphabetically.
 - Comments are complete sentences (capital, full stop) — say **why** and **how**,
@@ -69,7 +82,7 @@ and the **proxy-specific deltas**. When in doubt, read the original.
 ## Off-by-one & correctness hygiene (DX)
 
 - Treat `index` (0-based), `count` (1-based), `size` (count × unit) as distinct;
-  cast explicitly. Show division intent: `@divExact` / `@divFloor` / `div_ceil`.
+  cast explicitly. Show division intent: `@divExact` / `@divFloor` / `divCeil`.
 - Pass args > 16 bytes as `*const` to catch accidental stack copies.
 - In-place init via out-pointer (`fn init(target: *T) !void`) for pointer
   stability and no intermediate copies.

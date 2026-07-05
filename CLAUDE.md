@@ -153,7 +153,11 @@ that are actually enforced and easy to violate:
   `catch unreachable` on a reachable error.
 - **Explicitly-sized integers** (`u32`, `u63`, …); avoid `usize` except for real
   machine-word/index quantities.
-- `snake_case` for functions, variables, and **file names**. No abbreviations
+- **Naming follows the [Zig reference convention](https://ziglang.org/documentation/master/#Names):**
+  `TitleCase` for types and type-returning functions, `camelCase` for other
+  functions, `snake_case` for variables/constants/fields and namespace structs.
+  File names split the same way: `TitleCase.zig` for a struct-with-fields,
+  `snake_case.zig` for a namespace; directories `snake_case`. No abbreviations
   (`source`/`target`, not `src`/`dest`). Units/qualifiers last (`connections_max`,
   `header_bytes_max`). Struct order: fields, then types, then methods.
 - **Zero dependencies beyond the Zig toolchain, with one deliberate exception:** the
