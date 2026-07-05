@@ -10,13 +10,15 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
 `io_uring` with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
 
-> **Status: experimental, Phase 4 operability complete.** A working
-> HTTPS/HTTP/1.1 reverse proxy: TLS termination with kernel-TLS offload, SNI
-> multi-cert, verified upstream re-encryption, keep-alive and pooling on both
-> sides, a resilience layer (P2C and Maglev consistent-hash balancing,
-> retries, circuit breaking, outlier detection, health checks), graceful
-> drain, and zero-downtime hot restart — but not yet production-ready — see
-> [Scope & roadmap](#scope--roadmap). Linux only.
+> **Status: experimental — HTTP/2 downstream and config schema + reload now
+> done (Phases 5–6, slices 1–2).** A working HTTPS reverse proxy speaking
+> **HTTP/1.1 and HTTP/2** downstream: TLS termination with kernel-TLS offload,
+> SNI multi-cert and ALPN, verified upstream re-encryption, keep-alive and
+> pooling on both sides, a resilience layer (P2C and Maglev consistent-hash
+> balancing, retries, circuit breaking, outlier detection, health checks),
+> graceful drain, zero-downtime hot restart, and a strict schema-validated
+> config with live SIGHUP reload — but not yet production-ready — see
+> [Scope & roadmap](docs/DESIGN.md#7-build-history--roadmap). Linux only.
 
 ## Highlights
 
@@ -33,6 +35,12 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
   full-jitter backoff, per-try timeouts, circuit breakers, passive outlier ejection, and
   active TCP health probes — all state statically reserved per worker, all timers riding
   the same ring.
+- **HTTP/2 downstream, sans-io and bounded.** An own HTTP/2 core: every knob —
+  concurrent streams, HPACK dynamic-table size, frame size, flow-control windows —
+  is a startup-reserved constant, advertised in SETTINGS and enforced on the wire
+  (a peer setting never grows past what was reserved). Negotiated by ALPN; each
+  stream maps to one HTTP/1.1 upstream transaction over the existing pool, and the
+  stream window *is* the relay backpressure.
 - **TLS on both hops, kernel-offloaded.** OpenSSL terminates the handshake sans-io
   (every byte stays a ring op); after a quiet handshake the record layer moves into
   the kernel (kTLS) and steady-state TLS runs the *plaintext* relay code path. SNI
@@ -235,7 +243,9 @@ Terminate TLS on the listener, and/or re-encrypt to a cluster's origins:
 ```
 
 - **Listener `tls`** terminates TLS 1.3/1.2 (full handshakes; no resumption yet).
-  ALPN negotiates `http/1.1`. `additional_identities` selects certificates by SNI
+  ALPN offers `http/1.1`, and `http2: true` additionally offers `h2` — an
+  h2-negotiating client is served over the HTTP/2 data path (each stream mapped to
+  one HTTP/1.1 upstream transaction). `additional_identities` selects certificates by SNI
   (exact names and single-label `*.` wildcards, declared explicitly — never
   introspected from certificates); absent or unmatched SNI gets the default pair.
 - **`kernel_offload`** (default `true`) hands each connection's record layer to
