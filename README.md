@@ -10,14 +10,15 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
 `io_uring` with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
 
-> **Status: experimental — HTTP/2 downstream and config schema + reload now
-> done (Phases 5–6, slices 1–2).** A working HTTPS reverse proxy speaking
+> **Status: experimental — HTTP/2 downstream and config schema + reload + DSL
+> now done (Phases 5–6, slices 1–3).** A working HTTPS reverse proxy speaking
 > **HTTP/1.1 and HTTP/2** downstream: TLS termination with kernel-TLS offload,
 > SNI multi-cert and ALPN, verified upstream re-encryption, keep-alive and
 > pooling on both sides, a resilience layer (P2C and Maglev consistent-hash
 > balancing, retries, circuit breaking, outlier detection, health checks),
 > graceful drain, zero-downtime hot restart, and a strict schema-validated
-> config with live SIGHUP reload — but not yet production-ready — see
+> config with live SIGHUP reload and an optional terse Zoxyfile DSL — but not
+> yet production-ready — see
 > [Scope & roadmap](docs/DESIGN.md#7-build-history--roadmap). Linux only.
 
 ## Highlights
@@ -172,6 +173,37 @@ requests wins, unhealthy/ejected endpoints are avoided (and when *none* is
 available, zoxy fails open and routes anyway). `admin` (optional) serves
 Prometheus-style counters — `curl http://127.0.0.1:9901/metrics` — on a
 dedicated thread, off the data path.
+
+### Zoxyfile DSL (optional)
+
+Hand-authoring JSON is tedious, so zoxy also accepts a terse, Caddyfile-style
+surface that *lowers to* the JSON above — JSON stays canonical. A config path
+that does not end in `.json` is treated as a Zoxyfile:
+
+```
+listen 127.0.0.1:8080
+admin  127.0.0.1:9901
+
+route api.example.com /v1 -> api
+route -> default
+
+cluster api {
+    endpoints 127.0.0.1:9001 127.0.0.1:9002
+    retry {
+        max 2
+        backoff_base 25ms
+    }
+}
+
+cluster default {
+    endpoints 127.0.0.1:9000
+}
+```
+
+One directive per line; `#` starts a comment; a block's `{` may trail its
+directive with `}` on its own line; durations take a `ms`/`s` suffix. See
+[`examples/example.zoxy`](examples/example.zoxy) for the full surface, and run
+`zig build adapt -- examples/example.zoxy` to see the JSON it produces.
 
 ### Resilience (per cluster, all optional)
 

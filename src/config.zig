@@ -9,6 +9,11 @@ const constants = @import("constants.zig");
 const maglev = @import("proxy/maglev.zig");
 const Ip4Address = std.Io.net.Ip4Address;
 
+/// The Zoxyfile DSL → JSON adapter (docs/DESIGN.md §7 Phase 6, slice 3). A
+/// human-authored surface that lowers to the JSON this module parses; reached
+/// via `load_text` on a non-`.json` path. JSON stays the single source of truth.
+pub const adapter = @import("config_adapter.zig");
+
 pub const Endpoint = struct {
     address: Ip4Address,
 };
@@ -645,7 +650,38 @@ pub fn find_unknown_field(root: std.json.Value, buf: []u8) ?[]const u8 {
 pub const Diagnostic = struct {
     unknown_field: ?[]const u8 = null,
     path_buf: [config_path_bytes_max]u8 = undefined,
+    /// Set when `load_text` fails adapting a DSL (non-`.json`) file before any
+    /// JSON parse: the 1-based source line and a short message. Left zero/null
+    /// for JSON inputs and for JSON-parse failures (use `unknown_field` there).
+    adapt_line: u32 = 0,
+    adapt_message: ?[]const u8 = null,
 };
+
+/// Errors from `load_text`: JSON parse errors plus DSL adapt errors.
+pub const LoadError = ParseError || adapter.Error;
+
+/// Load a config from file `text`, choosing the format by `path` extension: a
+/// `.json` path parses directly; anything else is treated as the Zoxyfile DSL
+/// and adapted to JSON first (docs/DESIGN.md §7 Phase 6, slice 3). Diagnostics
+/// route through `diag`: `adapt_*` for a DSL syntax error, `unknown_field` for
+/// a JSON key error. Startup/reload only — the transient JSON is allocator-owned
+/// and freed here once parsed (the `Config` keeps its own arena copy).
+pub fn load_text(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+    diag: *Diagnostic,
+) LoadError!Config {
+    if (std.mem.endsWith(u8, path, ".json")) return parse_diagnostic(gpa, text, diag);
+    var adapt_diag: adapter.Diagnostic = .{};
+    const json = adapter.to_json(gpa, text, &adapt_diag) catch |err| {
+        diag.adapt_line = adapt_diag.line;
+        diag.adapt_message = adapt_diag.message;
+        return err;
+    };
+    defer gpa.free(json);
+    return parse_diagnostic(gpa, json, diag);
+}
 
 /// Parse without surfacing a diagnostic — the library stays quiet. Callers that
 /// want the offending field path (main, the config tool) use `parse_diagnostic`.
@@ -1404,4 +1440,83 @@ test "config: find_unknown_field names the offending path" {
     defer ok.deinit();
     var buf: [config_path_bytes_max]u8 = undefined;
     try std.testing.expect(find_unknown_field(ok.value, &buf) == null);
+}
+
+test "config: load_text parses a .json path directly" {
+    var diag: Diagnostic = .{};
+    var config = try load_text(std.testing.allocator, "zoxy.json", test_config, &diag);
+    defer config.deinit();
+    try std.testing.expect(config.find_cluster("api") != null);
+}
+
+test "config: load_text adapts a Zoxyfile DSL end to end" {
+    var diag: Diagnostic = .{};
+    var config = try load_text(std.testing.allocator, "zoxy.zoxy",
+        \\listen 0.0.0.0:8080
+        \\route api.example.com /v1 -> api
+        \\route -> web
+        \\cluster api {
+        \\    endpoints 127.0.0.1:9001 127.0.0.1:9002
+        \\    lb maglev header x-user-id
+        \\    per_try_timeout 1500ms
+        \\    retry {
+        \\        max 3
+        \\        backoff_base 25ms
+        \\    }
+        \\    outlier {
+        \\        consecutive_failures 5
+        \\        ejection 30s
+        \\    }
+        \\}
+        \\cluster web {
+        \\    endpoints 127.0.0.1:9000
+        \\}
+    , &diag);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(u16, 8080), config.listen.port);
+    // Routes survive the round trip in order, with the arrow forms lowered.
+    try std.testing.expectEqual(@as(usize, 2), config.routes.len);
+    try std.testing.expectEqualStrings("api.example.com", config.routes[0].host);
+    try std.testing.expectEqualStrings("/v1", config.routes[0].path_prefix);
+    try std.testing.expectEqualStrings("api", config.routes[0].cluster);
+    try std.testing.expectEqualStrings("*", config.routes[1].host);
+    try std.testing.expectEqualStrings("web", config.routes[1].cluster);
+
+    const api = config.find_cluster("api").?;
+    try std.testing.expectEqual(@as(usize, 2), api.endpoints.len);
+    // maglev header hashing resolved a lookup table and the header name.
+    try std.testing.expect(api.maglev_table.len > 0);
+    try std.testing.expectEqualStrings("x-user-id", api.hash_header);
+    // Durations lowered ms→ns through the JSON `*_ms` fields.
+    try std.testing.expectEqual(@as(u8, 3), api.policy.retry_max);
+    const base_ns = api.policy.retry_backoff_base_ns;
+    try std.testing.expectEqual(@as(u63, 25 * std.time.ns_per_ms), base_ns);
+    try std.testing.expectEqual(@as(u63, 1500 * std.time.ns_per_ms), api.policy.per_try_timeout_ns);
+    try std.testing.expectEqual(@as(u32, 5), api.policy.outlier_consecutive_failures);
+    try std.testing.expectEqual(@as(u63, 30 * std.time.ns_per_s), api.policy.outlier_ejection_ns);
+}
+
+test "config: load_text surfaces a DSL syntax error with a line" {
+    var diag: Diagnostic = .{};
+    const result = load_text(std.testing.allocator, "zoxy.zoxy",
+        \\listen 0.0.0.0:80
+        \\route -> c
+        \\cluster c {
+        \\    frobnicate 1
+        \\}
+    , &diag);
+    try std.testing.expectError(error.UnknownDirective, result);
+    try std.testing.expect(diag.adapt_message != null);
+    try std.testing.expectEqual(@as(u32, 4), diag.adapt_line);
+}
+
+test "config: load_text still reports JSON unknown fields on a .json path" {
+    var diag: Diagnostic = .{};
+    const result = load_text(std.testing.allocator, "zoxy.json",
+        \\{ "listen": "0.0.0.0:80", "routes": [], "clusters": [],
+        \\  "handofff": "/x" }
+    , &diag);
+    try std.testing.expectError(error.UnknownField, result);
+    try std.testing.expect(diag.unknown_field != null);
 }

@@ -29,7 +29,9 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(gpa);
-    // NUL-terminated so a SIGHUP reload can pass it straight to execve.
+    // NUL-terminated so a SIGHUP reload can pass it straight to execve. A path
+    // ending in .json is parsed as JSON; anything else is the Zoxyfile DSL
+    // (docs/DESIGN.md §7 Phase 6, slice 3) — see zoxy.config.load_text.
     const config_path: [:0]const u8 = if (args.len > 1) args[1] else "zoxy.json";
 
     const text = std.Io.Dir.cwd().readFileAlloc(init.io, config_path, gpa, .unlimited) catch |err| {
@@ -37,8 +39,14 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     var diagnostic: zoxy.config.Diagnostic = .{};
-    var cfg = zoxy.config.parse_diagnostic(gpa, text, &diagnostic) catch |err| {
-        if (diagnostic.unknown_field) |field| {
+    var cfg = zoxy.config.load_text(gpa, config_path, text, &diagnostic) catch |err| {
+        if (diagnostic.adapt_message) |msg| {
+            std.log.err("zoxy: invalid config {s}: line {d}: {s}", .{
+                config_path,
+                diagnostic.adapt_line,
+                msg,
+            });
+        } else if (diagnostic.unknown_field) |field| {
             std.log.err("zoxy: invalid config {s}: unknown field {s}", .{ config_path, field });
         } else {
             std.log.err("zoxy: invalid config {s}: {s}", .{ config_path, @errorName(err) });
@@ -573,8 +581,13 @@ fn reload_config(
         return reload_rejected(metrics);
     };
     var diagnostic: zoxy.config.Diagnostic = .{};
-    const new_cfg = zoxy.config.parse_diagnostic(alloc, text, &diagnostic) catch |err| {
-        if (diagnostic.unknown_field) |field| {
+    const new_cfg = zoxy.config.load_text(alloc, config_path, text, &diagnostic) catch |err| {
+        if (diagnostic.adapt_message) |msg| {
+            std.log.err("zoxy: reload: invalid config: line {d}: {s}", .{
+                diagnostic.adapt_line,
+                msg,
+            });
+        } else if (diagnostic.unknown_field) |field| {
             std.log.err("zoxy: reload: invalid config: unknown field {s}", .{field});
         } else {
             std.log.err("zoxy: reload: invalid config: {s}", .{@errorName(err)});

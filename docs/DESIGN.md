@@ -453,7 +453,7 @@ Deferred to later slices:
 - **Client-side flow-control stall coverage in the sim** — bodies beyond the
   initial window, needing a window-accounting test client.
 
-### Phase 6 — config: JSON schema + reload (slices 1–2 done; DSL planned)
+### Phase 6 — config: JSON schema + reload + DSL (slices 1–3 done)
 Decided 2026-07-04. Keep JSON as the canonical, machine-facing format (Caddy's
 model): the format was never the problem — `config.zig` already lowers a wire
 DTO into an immutable, arena-owned `Config`, and the allocation island absorbs
@@ -528,12 +528,41 @@ Slices, each behind the usual gates:
    Reusing the process boundary as the reclamation boundary turned a
    many-edge-case in-process surgery into a few dozen lines leaning on
    already-tested machinery.
-3. **Human-readable surface (later).** If hand-authoring JSON hurts, add a
-   Caddyfile-style DSL that *lowers to* JSON — JSON stays canonical, the sugar
-   never becomes a second source of truth.
+3. **Human-readable surface — the Zoxyfile DSL (done).** A terse, line-oriented
+   config surface (`src/config_adapter.zig`) that *lowers to* the JSON slice 1
+   parses — modelled on Caddy's config adapter (`caddy adapt`), which is a
+   *front-end*, not a second config engine. The adapter understands only the
+   surface syntax and emits JSON text; every semantic check (unknown keys,
+   ms→ns, address parsing, bounds, the schema) stays downstream in
+   `config.parse_diagnostic`, unchanged. So **JSON stays the single source of
+   truth** and the sugar cannot drift from the parser — it is validated *by* it.
 
-Deferred within the phase: multi-file/dir includes, env interpolation, and any
-push-based (non-file) config source — all additive over the file-watch core.
+   Chosen shape: **one directive per line**, `#` comments, `{ … }` blocks whose
+   opening brace may trail the directive and whose `}` sits on its own line.
+   `listen`/`admin`/`handoff`/`accept_mode` scalars; a `tls { … }` block with
+   repeatable `identity` sub-blocks (SNI); `route [host] [path] -> cluster`
+   (a lone match token beginning `/` is the path, else the host); `cluster
+   <name> { endpoints … / lb / per_try_timeout / retry / circuit_breaker /
+   outlier / health_check / tls }`. Durations take a `ms`/`s` suffix (bare =
+   ms) and lower to the DTO's `*_ms` fields. `config.load_text` dispatches by
+   path extension — `.json` parses directly, anything else adapts first — and
+   both `main` startup and the SIGHUP reload route through it, so the DSL works
+   everywhere JSON did (including hot restart, which re-execs on the same path).
+   `zig build adapt -- <file>` prints the emitted JSON (the debugging affordance
+   `caddy adapt` gives), and CI's round-trip test confirms it strict-parses.
+
+   Lesson (again): reusing the boundary you already have — here the JSON parser
+   as the validation boundary — turns a "new config language" into a few hundred
+   lines of pure text→text that inherit every existing guarantee for free.
+
+   Deferred within the slice: fully-inline blocks (multiple directives between
+   braces on one line — ambiguous to segment without per-directive arity, so
+   kept out for a predictable rule); source-accurate *semantic* error lines (an
+   `unknown_field` error points at the generated JSON, not the `.zoxy` line —
+   syntax errors already carry the source line); env interpolation.
+
+Deferred within the phase: multi-file/dir includes and any push-based
+(non-file) config source — all additive over the file-watch core.
 
 ### Deferred improvements (recorded decisions, revisit on evidence)
 - io_uring setup flags (`SINGLE_ISSUER` | `COOP_TASKRUN` | `DEFER_TASKRUN`)

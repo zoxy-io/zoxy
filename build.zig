@@ -141,6 +141,14 @@ pub fn build(b: *std.Build) void {
         "Verify config.schema.json is current and zoxy.json is valid",
     );
     check_config_step.dependOn(&check_config.step);
+
+    // Zoxyfile DSL → JSON adapter (docs/DESIGN.md §7 Phase 6, slice 3). Prints
+    // the JSON `config.zig` parses: `zig build adapt -- examples/example.zoxy`.
+    const adapt = b.addRunArtifact(config_tool);
+    adapt.addArg("adapt");
+    if (b.args) |args| adapt.addArgs(args);
+    const adapt_step = b.step("adapt", "Adapt a Zoxyfile DSL config to JSON (args: <file.zoxy>)");
+    adapt_step.dependOn(&adapt.step);
 }
 
 /// Add every `.zig` file under `dir_path` (recursively) to `run` as a file

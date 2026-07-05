@@ -103,6 +103,7 @@ test {
     _ = h2_proxy;
     _ = config;
     _ = @import("config_schema.zig");
+    _ = @import("config_adapter.zig");
     _ = reload;
     _ = @import("proxy/router.zig");
     _ = balancer;

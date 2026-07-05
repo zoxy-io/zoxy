@@ -1,11 +1,14 @@
-//! Host-tool CLI for the config JSON Schema (docs/DESIGN.md §7 Phase 6, slice 1):
+//! Host-tool CLI for the config JSON Schema (docs/DESIGN.md §7 Phase 6, slice 1)
+//! and the Zoxyfile DSL adapter (slice 3):
 //!
 //!   config_tool emit                            → write the schema to stdout
 //!   config_tool check <schema.json> [config…]   → drift gate + strict parse
+//!   config_tool adapt <file.zoxy>               → adapt DSL to JSON on stdout
 //!
 //! `check` regenerates the schema in memory and byte-compares it to the
 //! committed <schema.json> (a stale file fails, prompting `zig build schema`),
-//! then strict-parses each config file. Rooted at `b.graph.host` and importing
+//! then strict-parses each config file. `adapt` lowers a Zoxyfile-style DSL
+//! into the JSON `config.zig` parses. Rooted at `b.graph.host` and importing
 //! only `config_schema` (which pulls in `config.zig`) — no OpenSSL, since the
 //! config graph is FFI-free.
 
@@ -18,8 +21,34 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(gpa);
     if (args.len >= 2 and std.mem.eql(u8, args[1], "emit")) return emit(init.io);
     if (args.len >= 3 and std.mem.eql(u8, args[1], "check")) return check(init.io, gpa, args[2..]);
-    std.log.err("usage: config_tool <emit | check <schema.json> [config.json ...]>", .{});
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "adapt")) return adapt(init.io, gpa, args[2]);
+    std.log.err(
+        "usage: config_tool <emit | check <schema.json> [config.json ...] | adapt <file.zoxy>>",
+        .{},
+    );
     return error.Usage;
+}
+
+/// Adapt a Zoxyfile DSL config file to JSON on stdout (`zig build adapt`).
+fn adapt(io: std.Io, gpa: std.mem.Allocator, path: [:0]const u8) !void {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| {
+        std.log.err("config_tool: cannot read {s}: {s}", .{ path, @errorName(err) });
+        return err;
+    };
+    var diagnostic: config.adapter.Diagnostic = .{};
+    const json = config.adapter.to_json(gpa, text, &diagnostic) catch |err| {
+        if (diagnostic.message) |msg| {
+            std.log.err("config_tool: {s}: line {d}: {s}", .{ path, diagnostic.line, msg });
+        } else {
+            std.log.err("config_tool: {s}: {s}", .{ path, @errorName(err) });
+        }
+        return err;
+    };
+    var buf: [64 * 1024]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writer(io, &buf);
+    try file_writer.interface.writeAll(json);
+    try file_writer.interface.writeByte('\n');
+    try file_writer.flush();
 }
 
 /// Write the generated schema to stdout (captured by `zig build schema`).

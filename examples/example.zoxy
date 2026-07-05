@@ -1,0 +1,51 @@
+# Example Zoxyfile — the terse DSL surface (docs/DESIGN.md §7 Phase 6, slice 3).
+# It lowers to the JSON config.zig parses; run `zig build adapt -- examples/example.zoxy`
+# to see the emitted JSON. JSON stays the canonical format.
+#
+# One directive per line. A block's opening `{` may trail its directive; the
+# closing `}` sits on its own line.
+
+listen      127.0.0.1:8080
+admin       127.0.0.1:9901
+handoff     /tmp/zoxy-handoff.sock
+accept_mode reuseport
+
+# First-match routing: [host] [path] -> cluster. A leading '/' on a lone match
+# token is the path; otherwise it is the host. No match token means any host, any path.
+route api.example.com /v1 -> api
+route /static -> assets
+route -> web
+
+cluster api {
+    endpoints 127.0.0.1:9001 127.0.0.1:9002
+    lb maglev header x-user-id
+    per_try_timeout 1500ms
+    retry {
+        max 3
+        backoff_base 25ms
+        backoff_cap 1s
+    }
+    circuit_breaker {
+        max_requests 100
+        max_pending 50
+    }
+    outlier {
+        consecutive_failures 5
+        ejection 30s
+    }
+    health_check {
+        interval 5s
+        timeout 2s
+        healthy_threshold 2
+        unhealthy_threshold 3
+    }
+}
+
+cluster assets {
+    endpoints 127.0.0.1:9010
+    lb least_request
+}
+
+cluster web {
+    endpoints 127.0.0.1:9000
+}
