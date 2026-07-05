@@ -81,10 +81,12 @@ byte-exact end to end. A failure prints its seed; `zig build sim -- <seed> 1`
 replays the exact schedule, faults included. `zig build sim -- fuzz` runs
 forever on entropy-derived seeds (each still individually replayable).
 
-Or point it at a config file:
+Or point it at a config file — a [Zoxyfile](#configuration) or JSON (the
+extension selects the format):
 
 ```sh
-./zig-out/bin/zoxy path/to/config.json
+./zig-out/bin/zoxy path/to/zoxy.conf    # Zoxyfile DSL (any non-.json path)
+./zig-out/bin/zoxy path/to/config.json  # JSON
 ```
 
 zoxy logs a startup line and per-request access lines to stderr:
@@ -148,12 +150,50 @@ verbatim — e.g. one holding TLS material managed outside Nix.
 
 ## Configuration
 
-Static JSON (parsed once at startup into an immutable config). Routes are matched
-in order; the first whose host (`*` or an exact, port-insensitive match) and
-`path_prefix` match wins.
+zoxy reads one config file at startup (parsed once into an immutable config).
+The friendly surface is the **Zoxyfile** — a terse, line-oriented DSL that
+*lowers to* the canonical JSON format ([below](#json-the-canonical-format)),
+which stays the single source of truth. A path that does **not** end in `.json`
+is parsed as a Zoxyfile. Routes are matched in order; the first whose host (`*`
+or an exact, port-insensitive match) and `path_prefix` match wins.
+
+```
+# zoxy.zoxy — one directive per line, `#` comments, `{ }` blocks
+listen 127.0.0.1:8080
+admin  127.0.0.1:9901
+
+route api.example.com /v1 -> api   # [host] [path] -> cluster
+route -> default                   # no match tokens: any host, any path
+
+cluster api {
+    endpoints 127.0.0.1:9001 127.0.0.1:9002
+}
+
+cluster default {
+    endpoints 127.0.0.1:9000
+}
+```
+
+A block's opening `{` may trail its directive; its `}` sits on its own line.
+Durations take a `ms`/`s` suffix (a bare number is milliseconds). In a `route`,
+`host` defaults to `*` and `path_prefix` to `/`; a lone match token beginning
+`/` is the path, otherwise the host. Endpoints in a cluster are load-balanced
+P2C least-request: two random picks, the one with fewer in-flight requests wins,
+unhealthy/ejected endpoints are avoided (and when *none* is available, zoxy
+fails open and routes anyway). `admin` (optional) serves Prometheus-style
+counters — `curl http://127.0.0.1:9901/metrics` — on a dedicated thread, off the
+data path. See [`examples/example.zoxy`](examples/example.zoxy) for the full
+surface.
+
+### JSON (the canonical format)
+
+A `.json` path is parsed directly. JSON is what the Zoxyfile lowers to and what
+everything downstream validates — run `zig build adapt -- path/to/config.zoxy`
+to see the JSON a Zoxyfile produces. The same config, written as JSON:
 
 ```json
 {
+  "$schema": "./config.schema.json",
   "listen": "127.0.0.1:8080",
   "admin": "127.0.0.1:9901",
   "routes": [
@@ -167,59 +207,44 @@ in order; the first whose host (`*` or an exact, port-insensitive match) and
 }
 ```
 
-`host` defaults to `"*"` and `path_prefix` to `"/"`. Endpoints in a cluster are
-load-balanced P2C least-request: two random picks, the one with fewer in-flight
-requests wins, unhealthy/ejected endpoints are avoided (and when *none* is
-available, zoxy fails open and routes anyway). `admin` (optional) serves
-Prometheus-style counters — `curl http://127.0.0.1:9901/metrics` — on a
-dedicated thread, off the data path.
-
-### Zoxyfile DSL (optional)
-
-Hand-authoring JSON is tedious, so zoxy also accepts a terse, Caddyfile-style
-surface that *lowers to* the JSON above — JSON stays canonical. A config path
-that does not end in `.json` is treated as a Zoxyfile:
-
-```
-listen 127.0.0.1:8080
-admin  127.0.0.1:9901
-
-route api.example.com /v1 -> api
-route -> default
-
-cluster api {
-    endpoints 127.0.0.1:9001 127.0.0.1:9002
-    retry {
-        max 2
-        backoff_base 25ms
-    }
-}
-
-cluster default {
-    endpoints 127.0.0.1:9000
-}
-```
-
-One directive per line; `#` starts a comment; a block's `{` may trail its
-directive with `}` on its own line; durations take a `ms`/`s` suffix. See
-[`examples/example.zoxy`](examples/example.zoxy) for the full surface, and run
-`zig build adapt -- examples/example.zoxy` to see the JSON it produces.
+Parsing is **strict**: an unknown key is rejected by name, so a typo can't
+silently disable a feature. A [JSON Schema](config.schema.json) is generated
+from the config types (`zig build schema`) and guarded against drift in CI
+(`zig build check-config`); the `$schema` key wires up editor completion and is
+otherwise ignored. Both formats share this one validation path — the Zoxyfile is
+only a front-end, never a second source of truth.
 
 ### Resilience (per cluster, all optional)
 
-```json
-{
-  "name": "api",
-  "endpoints": ["127.0.0.1:9001", "127.0.0.1:9002"],
-  "per_try_timeout_ms": 2000,
-  "retry": { "max": 2, "backoff_base_ms": 25, "backoff_cap_ms": 1000,
-             "budget_percent": 20, "budget_min": 3 },
-  "circuit_breaker": { "max_connections": 128, "max_pending": 32,
-                       "max_requests": 256, "max_retries": 16 },
-  "outlier": { "consecutive_failures": 5, "ejection_ms": 30000,
-               "max_ejection_percent": 50 },
-  "health_check": { "interval_ms": 5000, "timeout_ms": 2000,
-                    "healthy_threshold": 2, "unhealthy_threshold": 3 }
+```
+cluster api {
+    endpoints 127.0.0.1:9001 127.0.0.1:9002
+    lb least_request           # or: maglev [target | header <name>]
+    per_try_timeout 2s
+    retry {
+        max 2
+        backoff_base 25ms
+        backoff_cap 1s
+        budget_percent 20
+        budget_min 3
+    }
+    circuit_breaker {
+        max_connections 128
+        max_pending 32
+        max_requests 256
+        max_retries 16
+    }
+    outlier {
+        consecutive_failures 5
+        ejection 30s
+        max_ejection_percent 50
+    }
+    health_check {
+        interval 5s
+        timeout 2s
+        healthy_threshold 2
+        unhealthy_threshold 3
+    }
 }
 ```
 
@@ -228,7 +253,7 @@ take the defaults shown above, except `retry.max` (required) and the
 `circuit_breaker` limits (each absent limit is unbounded — the values above are
 examples). Semantics:
 
-- **`per_try_timeout_ms`** — deadline per upstream attempt (connect through the
+- **`per_try_timeout`** — deadline per upstream attempt (connect through the
   first response byte); expiry aborts the attempt and retries it or answers 504.
   Applies to requests that fit the proxy's buffer (streamed request bodies run
   under the overall request timeout alone).
@@ -241,52 +266,60 @@ examples). Semantics:
 - **`circuit_breaker`** — hard concurrency caps; a breach answers 503
   immediately, nothing queues.
 - **`outlier`** — passive detection: `consecutive_failures` failed attempts
-  eject the endpoint for `ejection_ms`, bounded by `max_ejection_percent` of
+  eject the endpoint for `ejection`, bounded by `max_ejection_percent` of
   the cluster.
 - **`health_check`** — active TCP-connect probes; result streaks flip the
   endpoint's health at the thresholds. Endpoints start healthy.
 
 All limits and budgets are **per worker** (share-nothing — no cross-worker
 coordination): a cluster-wide budget is the configured value × worker count.
+(In JSON these lower to `per_try_timeout_ms`, `ejection_ms`, `interval_ms`, … —
+the Zoxyfile drops the `_ms` suffix and parses the unit instead.)
 
 ### TLS (optional)
 
 Terminate TLS on the listener, and/or re-encrypt to a cluster's origins:
 
-```json
-{
-  "listen": "0.0.0.0:443",
-  "tls": {
-    "certificate_file": "certs/default.pem",
-    "private_key_file": "certs/default.key",
-    "kernel_offload": true,
-    "additional_identities": [
-      { "server_names": ["other.example.com", "*.other.example.com"],
-        "certificate_file": "certs/other.pem",
-        "private_key_file": "certs/other.key" }
-    ]
-  },
-  "routes": [{ "cluster": "api" }],
-  "clusters": [
-    { "name": "api", "endpoints": ["10.0.0.5:8443"],
-      "tls": { "server_name": "api.internal", "ca_file": "certs/internal-ca.pem" } }
-  ]
+```
+listen 0.0.0.0:443
+
+tls {
+    certificate certs/default.pem
+    key certs/default.key
+    kernel_offload on
+    http2                      # also offer h2 in ALPN
+    identity {                 # SNI-selected extra identity (repeatable)
+        server_names other.example.com *.other.example.com
+        certificate certs/other.pem
+        key certs/other.key
+    }
+}
+
+route -> api
+
+cluster api {
+    endpoints 10.0.0.5:8443
+    tls {
+        server_name api.internal
+        ca_file certs/internal-ca.pem
+    }
 }
 ```
 
 - **Listener `tls`** terminates TLS 1.3/1.2 (full handshakes; no resumption yet).
-  ALPN offers `http/1.1`, and `http2: true` additionally offers `h2` — an
+  ALPN offers `http/1.1`, and `http2` additionally offers `h2` — an
   h2-negotiating client is served over the HTTP/2 data path (each stream mapped to
-  one HTTP/1.1 upstream transaction). `additional_identities` selects certificates by SNI
-  (exact names and single-label `*.` wildcards, declared explicitly — never
-  introspected from certificates); absent or unmatched SNI gets the default pair.
-- **`kernel_offload`** (default `true`) hands each connection's record layer to
+  one HTTP/1.1 upstream transaction). An `identity` block selects a certificate by
+  SNI (`server_names`: exact names and single-label `*.` wildcards, declared
+  explicitly — never introspected from certificates); absent or unmatched SNI gets
+  the default pair.
+- **`kernel_offload`** (default `on`) hands each connection's record layer to
   the kernel after the handshake, when provably safe (record sequence zero, AES-GCM,
   `tls` module present) — otherwise that connection transparently stays on the
   userspace relay, which serves identical bytes. Closes send `close_notify` either way.
 - **Cluster `tls`** re-encrypts to the origins. Verification is an explicit choice:
   `ca_file` (a PEM bundle) **and** `server_name` (required of the certificate,
-  offered as SNI) — or `"insecure": true`, spelled out. A failed origin handshake
+  offered as SNI) — or `insecure`, spelled out. A failed origin handshake
   is an attempt failure: retried per the cluster's retry policy, else an honest 502.
   Upstream TLS sessions park in the per-worker pool alongside their connections.
 
