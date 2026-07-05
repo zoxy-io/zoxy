@@ -367,7 +367,8 @@ fn run_iteration(seed: u64) !u64 {
         }
     }
     h2_server.deinit();
-    if (h2_metrics.active.load() != 0) fail("h2c metrics.active = {d}", .{h2_metrics.active.load()});
+    if (h2_metrics.active.load() != 0)
+        fail("h2c metrics.active = {d}", .{h2_metrics.active.load()});
     if (!h2_server.resilience.is_idle()) fail("h2c resilience counters nonzero", .{});
 
     var responses: u64 = 0;
@@ -1061,7 +1062,10 @@ const H2Client = struct {
         len += h2_frame.write_settings(&.{}, client.send_buf[len..]);
         client.abort = client.workload.one_in(8);
         const large = client.workload.one_in(4);
-        client.stream_count = if (large) 1 else client.workload.prng.random().intRangeAtMost(u32, 1, 3);
+        client.stream_count = if (large)
+            1
+        else
+            client.workload.prng.random().intRangeAtMost(u32, 1, 3);
         for (0..client.stream_count) |i| {
             const stream = &client.streams[i];
             stream.id = @intCast(1 + 2 * i);
@@ -1177,7 +1181,11 @@ const H2Client = struct {
             client.dispatch(frame);
             if (client.done) return;
         }
-        std.mem.copyForwards(u8, client.wire[0 .. client.wire_len - offset], client.wire[offset..client.wire_len]);
+        std.mem.copyForwards(
+            u8,
+            client.wire[0 .. client.wire_len - offset],
+            client.wire[offset..client.wire_len],
+        );
         client.wire_len -= offset;
     }
 
@@ -1185,7 +1193,11 @@ const H2Client = struct {
         switch (frame.header.type) {
             .headers => {
                 const stream = client.stream_for(frame.header.stream_id) orelse return;
-                const decoded = client.decoder.decode(frame.payload, &client.fields, &client.fields_storage) catch
+                const decoded = client.decoder.decode(
+                    frame.payload,
+                    &client.fields,
+                    &client.fields_storage,
+                ) catch
                     fail("h2c: proxy emitted a bad HPACK block", .{});
                 if (decoded.len == 0) fail("h2c: response head with no fields", .{});
                 stream.status = std.fmt.parseInt(u16, decoded[0].value, 10) catch
@@ -1228,7 +1240,11 @@ const H2Client = struct {
         client.responses_ok += 1;
         if (stream.status == 200) {
             var echo_buf: [64]u8 = undefined;
-            const echo = std.fmt.bufPrint(&echo_buf, "echo:{s}", .{stream.path()}) catch unreachable;
+            const echo = std.fmt.bufPrint(
+                &echo_buf,
+                "echo:{s}",
+                .{stream.path()},
+            ) catch unreachable;
             const body = stream.body[0..stream.body_len];
             if (!std.mem.eql(u8, echo, body)) {
                 fail("h2c integrity: stream {d} expected \"{s}\", body was \"{s}\"", .{

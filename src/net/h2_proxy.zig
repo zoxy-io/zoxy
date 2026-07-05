@@ -1955,10 +1955,18 @@ const H2TestClient = struct {
     fn stage_request(client: *H2TestClient, path: []const u8, end_stream: bool) void {
         var block: [256]u8 = undefined;
         var block_len: usize = 0;
-        block_len += hpack.encode_header(":method", if (end_stream) "GET" else "POST", block[block_len..]) catch unreachable;
+        block_len += hpack.encode_header(
+            ":method",
+            if (end_stream) "GET" else "POST",
+            block[block_len..],
+        ) catch unreachable;
         block_len += hpack.encode_header(":scheme", "http", block[block_len..]) catch unreachable;
         block_len += hpack.encode_header(":path", path, block[block_len..]) catch unreachable;
-        block_len += hpack.encode_header(":authority", "origin", block[block_len..]) catch unreachable;
+        block_len += hpack.encode_header(
+            ":authority",
+            "origin",
+            block[block_len..],
+        ) catch unreachable;
         var flags: u8 = h2_frame.Flags.end_headers;
         if (end_stream) flags |= h2_frame.Flags.end_stream;
         h2_frame.write_frame_header(.{
@@ -2055,7 +2063,11 @@ const H2TestClient = struct {
                 else => {}, // SETTINGS, WINDOW_UPDATE, PING: ignored
             }
         }
-        std.mem.copyForwards(u8, client.in_buf[0 .. client.in_len - offset], client.in_buf[offset..client.in_len]);
+        std.mem.copyForwards(
+            u8,
+            client.in_buf[0 .. client.in_len - offset],
+            client.in_buf[offset..client.in_len],
+        );
         client.in_len -= offset;
     }
 };
@@ -2369,7 +2381,9 @@ const TlsH2Client = struct {
     fn pump(client: *TlsH2Client) void {
         var budget: u32 = 32;
         while (client.plain_out_encrypted < client.plain_out_len and budget > 0) : (budget -= 1) {
-            switch (client.channel.write_plaintext(client.plain_out[client.plain_out_encrypted..client.plain_out_len])) {
+            switch (client.channel.write_plaintext(
+                client.plain_out[client.plain_out_encrypted..client.plain_out_len],
+            )) {
                 .bytes => |c| client.plain_out_encrypted += c,
                 .want_io => break,
                 .failed => return,
@@ -2458,7 +2472,11 @@ const H2FrameSink = struct {
             offset += frame.wire_bytes();
             switch (frame.header.type) {
                 .headers => {
-                    const decoded = sink.decoder.decode(frame.payload, &sink.fields, &sink.fields_storage) catch unreachable;
+                    const decoded = sink.decoder.decode(
+                        frame.payload,
+                        &sink.fields,
+                        &sink.fields_storage,
+                    ) catch unreachable;
                     sink.status = std.fmt.parseInt(u16, decoded[0].value, 10) catch 0;
                     if (frame.header.flags & h2_frame.Flags.end_stream != 0) sink.done = true;
                 },
@@ -2513,7 +2531,10 @@ const TlsHarness = struct {
         harness.metrics = Counters{};
         harness.access = AccessLog{ .fd = -1 };
         harness.prng = std.Random.DefaultPrng.init(1);
-        harness.server_ctx = try terminator.Context.init_server(test_certificate_pem, test_private_key_pem);
+        harness.server_ctx = try terminator.Context.init_server(
+            test_certificate_pem,
+            test_private_key_pem,
+        );
         terminator.enable_h2(&harness.server_ctx);
         harness.client_ctx = try terminator.Context.init_client(.insecure);
     }
@@ -2530,7 +2551,12 @@ const TlsHarness = struct {
 
     /// Adopt a handshaken server channel + fd into a fresh H2Conn, exactly
     /// as the ProxyConn handoff will.
-    fn adopt(harness: *TlsHarness, fd: posix.socket_t, channel: terminator.Channel, staged: []const u8) void {
+    fn adopt(
+        harness: *TlsHarness,
+        fd: posix.socket_t,
+        channel: terminator.Channel,
+        staged: []const u8,
+    ) void {
         const conn = harness.pool.acquire().?;
         conn.start(
             &harness.io,
@@ -2569,13 +2595,19 @@ fn socket_pair() ![2]posix.socket_t {
 }
 
 /// Build both channels, negotiate ALPN=h2 via an in-memory handshake.
-fn tls_h2_channels(harness: *TlsHarness) !struct { server: terminator.Channel, client: terminator.Channel } {
+fn tls_h2_channels(harness: *TlsHarness) !struct {
+    server: terminator.Channel,
+    client: terminator.Channel,
+} {
     var server = try terminator.Channel.init(&harness.server_ctx);
     errdefer server.deinit();
     var client = try terminator.Channel.init(&harness.client_ctx);
     errdefer client.deinit();
     const alpn_offer = "\x02h2\x08http/1.1";
-    try testing.expectEqual(@as(c_int, 0), openssl.SSL_set_alpn_protos(client.ssl, alpn_offer, alpn_offer.len));
+    try testing.expectEqual(
+        @as(c_int, 0),
+        openssl.SSL_set_alpn_protos(client.ssl, alpn_offer, alpn_offer.len),
+    );
     try handshake_in_memory(&client, &server);
     try testing.expectEqualStrings("h2", server.alpn_selected().?);
     return .{ .server = server, .client = client };
@@ -2613,7 +2645,11 @@ test "h2_proxy: terminates h2 over TLS end to end" {
     try testing.expect(!client.frames.reset);
     try testing.expectEqual(@as(u16, 200), client.frames.status);
     try testing.expectEqualStrings("HELLO", client.frames.body[0..client.frames.body_len]);
-    try testing.expect(std.mem.startsWith(u8, origin.request_buf[0..origin.request_len], "GET /hello HTTP/1.1\r\n"));
+    try testing.expect(std.mem.startsWith(
+        u8,
+        origin.request_buf[0..origin.request_len],
+        "GET /hello HTTP/1.1\r\n",
+    ));
 
     _ = linux.close(pair[0]);
     try harness.settle();
@@ -2670,7 +2706,11 @@ test "h2_proxy: h2 over TLS with a preface coalesced into the handshake flight" 
     try testing.expect(!client.frames.reset);
     try testing.expectEqual(@as(u16, 200), client.frames.status);
     try testing.expectEqualStrings("hi", client.frames.body[0..client.frames.body_len]);
-    try testing.expect(std.mem.startsWith(u8, origin.request_buf[0..origin.request_len], "GET /coalesced HTTP/1.1\r\n"));
+    try testing.expect(std.mem.startsWith(
+        u8,
+        origin.request_buf[0..origin.request_len],
+        "GET /coalesced HTTP/1.1\r\n",
+    ));
 
     _ = linux.close(pair[0]);
     try harness.settle();

@@ -6481,8 +6481,12 @@ const TlsH2ProxyClient = struct {
             client.build_opening();
         }
         var enc_budget: u32 = 16;
-        while (client.plain_out_encrypted < client.plain_out_len and enc_budget > 0) : (enc_budget -= 1) {
-            switch (client.channel.write_plaintext(client.plain_out[client.plain_out_encrypted..client.plain_out_len])) {
+        while (client.plain_out_encrypted < client.plain_out_len and
+            enc_budget > 0) : (enc_budget -= 1)
+        {
+            switch (client.channel.write_plaintext(
+                client.plain_out[client.plain_out_encrypted..client.plain_out_len],
+            )) {
                 .bytes => |c| client.plain_out_encrypted += c,
                 .want_io => break,
                 .failed => return,
@@ -6517,7 +6521,11 @@ const TlsH2ProxyClient = struct {
             offset += frame.wire_bytes();
             switch (frame.header.type) {
                 .headers => {
-                    const decoded = client.decoder.decode(frame.payload, &client.fields, &client.fields_storage) catch unreachable;
+                    const decoded = client.decoder.decode(
+                        frame.payload,
+                        &client.fields,
+                        &client.fields_storage,
+                    ) catch unreachable;
                     client.status = std.fmt.parseInt(u16, decoded[0].value, 10) catch 0;
                     if (frame.header.flags & h2_frame.Flags.end_stream != 0) client.done = true;
                 },
@@ -6533,7 +6541,11 @@ const TlsH2ProxyClient = struct {
                 else => {},
             }
         }
-        std.mem.copyForwards(u8, client.frame_buf[0 .. client.frame_len - offset], client.frame_buf[offset..client.frame_len]);
+        std.mem.copyForwards(
+            u8,
+            client.frame_buf[0 .. client.frame_len - offset],
+            client.frame_buf[offset..client.frame_len],
+        );
         client.frame_len -= offset;
     }
 
@@ -6545,7 +6557,14 @@ const TlsH2ProxyClient = struct {
             if (client.wire_out_filled == 0) return;
         }
         client.send_in_flight = true;
-        client.io.send(*TlsH2ProxyClient, client, on_send, &client.send_c, client.fd, client.wire_out[client.wire_out_sent..client.wire_out_filled]);
+        client.io.send(
+            *TlsH2ProxyClient,
+            client,
+            on_send,
+            &client.send_c,
+            client.fd,
+            client.wire_out[client.wire_out_sent..client.wire_out_filled],
+        );
     }
     fn on_send(client: *TlsH2ProxyClient, _: *Completion, result: io_mod.SendError!usize) void {
         client.send_in_flight = false;
@@ -6555,7 +6574,14 @@ const TlsH2ProxyClient = struct {
     fn arm_wire_recv(client: *TlsH2ProxyClient) void {
         if (client.recv_in_flight or client.done) return;
         client.recv_in_flight = true;
-        client.io.recv(*TlsH2ProxyClient, client, on_recv, &client.recv_c, client.fd, &client.wire_in);
+        client.io.recv(
+            *TlsH2ProxyClient,
+            client,
+            on_recv,
+            &client.recv_c,
+            client.fd,
+            &client.wire_in,
+        );
     }
     fn on_recv(client: *TlsH2ProxyClient, _: *Completion, result: io_mod.RecvError!usize) void {
         client.recv_in_flight = false;

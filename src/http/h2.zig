@@ -259,7 +259,11 @@ pub const Connection = struct {
             @min(connection.peer_settings.max_frame_size, constants.h2_frame_payload_bytes_max);
         const output_cap = output.len - h2_frame.frame_header_bytes;
         var accepted: u32 = @intCast(@min(bytes.len, @as(u64, @intCast(window))));
-        accepted = @min(accepted, frame_cap, @as(u32, @intCast(@min(output_cap, std.math.maxInt(u32)))));
+        accepted = @min(
+            accepted,
+            frame_cap,
+            @as(u32, @intCast(@min(output_cap, std.math.maxInt(u32)))),
+        );
         const complete = end_stream and accepted == bytes.len;
         // An empty DATA frame consumes no window, so a bare END_STREAM
         // always goes through; otherwise zero accepted means blocked.
@@ -286,7 +290,12 @@ pub const Connection = struct {
     }
 
     /// Abort a stream: stage RST_STREAM into `output` and free the slot.
-    pub fn reset_stream(connection: *Connection, stream_id: u31, code: ErrorCode, output: []u8) usize {
+    pub fn reset_stream(
+        connection: *Connection,
+        stream_id: u31,
+        code: ErrorCode,
+        output: []u8,
+    ) usize {
         assert(output.len >= h2_frame.rst_stream_frame_bytes);
         const stream = connection.stream_find(stream_id).?;
         connection.stream_free(stream);
@@ -294,7 +303,12 @@ pub const Connection = struct {
         return h2_frame.rst_stream_frame_bytes;
     }
 
-    fn drive_frame(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize) Result {
+    fn drive_frame(
+        connection: *Connection,
+        frame: h2_frame.Frame,
+        output: []u8,
+        staged: usize,
+    ) Result {
         const consumed = frame.wire_bytes();
         var produced = staged;
         // Mid-block, only CONTINUATION on the block's stream is legal (§4.3).
@@ -342,7 +356,13 @@ pub const Connection = struct {
         }
     }
 
-    fn on_settings(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize, consumed: usize) Result {
+    fn on_settings(
+        connection: *Connection,
+        frame: h2_frame.Frame,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         var produced = staged;
         if (frame.header.flags & h2_frame.Flags.ack != 0) {
             connection.settings_acked = true;
@@ -377,13 +397,25 @@ pub const Connection = struct {
         };
     }
 
-    fn on_window_update(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize, consumed: usize) Result {
+    fn on_window_update(
+        connection: *Connection,
+        frame: h2_frame.Frame,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         const increment = h2_frame.parse_window_update(frame.payload[0..4]) catch {
             // A zero increment: connection error on stream 0, else stream error (§6.9).
             if (frame.header.stream_id == 0) {
                 return connection.fail(.protocol_error, output, staged, consumed);
             }
-            return connection.reset_on_error(frame.header.stream_id, .protocol_error, output, staged, consumed);
+            return connection.reset_on_error(
+                frame.header.stream_id,
+                .protocol_error,
+                output,
+                staged,
+                consumed,
+            );
         };
         if (frame.header.stream_id == 0) {
             connection.send_window += increment;
@@ -397,7 +429,13 @@ pub const Connection = struct {
         if (connection.stream_find(frame.header.stream_id)) |stream| {
             stream.send_window += increment;
             if (stream.send_window > std.math.maxInt(u31)) {
-                return connection.reset_on_error(stream.id, .flow_control_error, output, staged, consumed);
+                return connection.reset_on_error(
+                    stream.id,
+                    .flow_control_error,
+                    output,
+                    staged,
+                    consumed,
+                );
             }
             return .{ .consumed = consumed, .produced = staged, .event = .{
                 .window_open = .{ .stream_id = stream.id },
@@ -410,7 +448,13 @@ pub const Connection = struct {
         return .{ .consumed = consumed, .produced = staged, .event = null };
     }
 
-    fn on_rst_stream(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize, consumed: usize) Result {
+    fn on_rst_stream(
+        connection: *Connection,
+        frame: h2_frame.Frame,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         const stream_id = frame.header.stream_id;
         if (connection.stream_find(stream_id)) |stream| {
             const code = h2_frame.parse_rst_stream(frame.payload[0..4]);
@@ -425,7 +469,13 @@ pub const Connection = struct {
         return .{ .consumed = consumed, .produced = staged, .event = null };
     }
 
-    fn on_data(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize, consumed: usize) Result {
+    fn on_data(
+        connection: *Connection,
+        frame: h2_frame.Frame,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         const flow_bytes: u32 = frame.header.length;
         // Flow control counts every DATA payload byte, padding included,
         // against both windows — whatever the stream state (§6.9).
@@ -435,11 +485,15 @@ pub const Connection = struct {
         }
         const stream = connection.stream_find(frame.header.stream_id) orelse {
             const code: ErrorCode =
-                if (connection.stream_closed(frame.header.stream_id)) .stream_closed else .protocol_error;
+                if (connection.stream_closed(frame.header.stream_id))
+                    .stream_closed
+                else
+                    .protocol_error;
             return connection.fail(code, output, staged, consumed);
         };
         if (stream.state != .open) {
-            return connection.fail(.stream_closed, output, staged, consumed); // §5.1 half-closed (remote)
+            return connection.fail(.stream_closed, output, staged, consumed);
+            // §5.1 half-closed (remote)
         }
         stream.recv_window -= flow_bytes;
         if (stream.recv_window < 0) {
@@ -462,14 +516,21 @@ pub const Connection = struct {
         } } };
     }
 
-    fn on_headers(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize, consumed: usize) Result {
+    fn on_headers(
+        connection: *Connection,
+        frame: h2_frame.Frame,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         assert(connection.block_stream_id == 0); // checked in drive_frame
         const stream_id = frame.header.stream_id;
         const fragment = headers_fragment(frame) orelse {
             return connection.fail(.protocol_error, output, staged, consumed);
         };
         if (stream_id % 2 == 0) {
-            return connection.fail(.protocol_error, output, staged, consumed); // client ids are odd (§5.1.1)
+            return connection.fail(.protocol_error, output, staged, consumed);
+            // client ids are odd (§5.1.1)
         }
         connection.block_end_stream = frame.header.flags & h2_frame.Flags.end_stream != 0;
         if (connection.stream_find(stream_id)) |stream| {
@@ -488,7 +549,8 @@ pub const Connection = struct {
             connection.block_kind = if (refused) .request_refused else .request;
             connection.stream_id_max_started = stream_id;
         } else {
-            return connection.fail(.stream_closed, output, staged, consumed); // closed stream (§5.1)
+            return connection.fail(.stream_closed, output, staged, consumed);
+            // closed stream (§5.1)
         }
         connection.block_stream_id = stream_id;
         connection.block_used = 0;
@@ -501,9 +563,16 @@ pub const Connection = struct {
         return .{ .consumed = consumed, .produced = staged, .event = null };
     }
 
-    fn on_continuation(connection: *Connection, frame: h2_frame.Frame, output: []u8, staged: usize, consumed: usize) Result {
+    fn on_continuation(
+        connection: *Connection,
+        frame: h2_frame.Frame,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         if (connection.block_stream_id == 0) {
-            return connection.fail(.protocol_error, output, staged, consumed); // no block in progress
+            return connection.fail(.protocol_error, output, staged, consumed);
+            // no block in progress
         }
         assert(frame.header.stream_id == connection.block_stream_id); // checked in drive_frame
         if (!connection.block_append(frame.payload)) {
@@ -529,7 +598,12 @@ pub const Connection = struct {
             &connection.header_storage,
         ) catch |err| switch (err) {
             // HPACK state is unrecoverable: the connection dies (§4.3).
-            error.Compression => return connection.fail(.compression_error, output, produced, consumed),
+            error.Compression => return connection.fail(
+                .compression_error,
+                output,
+                produced,
+                consumed,
+            ),
             // Bounds: the request is refused, the connection survives. The
             // decoder kept the dynamic table in sync. (431 is slice 4's call.)
             error.HeaderListTooLarge, error.TooManyHeaders => {
@@ -585,7 +659,13 @@ pub const Connection = struct {
     }
 
     /// Stage a GOAWAY, remember failure, and swallow the offending input.
-    fn fail(connection: *Connection, code: ErrorCode, output: []u8, staged: usize, consumed: usize) Result {
+    fn fail(
+        connection: *Connection,
+        code: ErrorCode,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         assert(connection.state != .failed);
         connection.state = .failed;
         h2_frame.write_goaway(
@@ -601,7 +681,14 @@ pub const Connection = struct {
     }
 
     /// A stream-level error: stage RST_STREAM, free the slot, surface reset.
-    fn reset_on_error(connection: *Connection, stream_id: u31, code: ErrorCode, output: []u8, staged: usize, consumed: usize) Result {
+    fn reset_on_error(
+        connection: *Connection,
+        stream_id: u31,
+        code: ErrorCode,
+        output: []u8,
+        staged: usize,
+        consumed: usize,
+    ) Result {
         const stream = connection.stream_find(stream_id).?;
         connection.stream_free(stream);
         h2_frame.write_rst_stream(
@@ -623,7 +710,11 @@ pub const Connection = struct {
         if (connection.recv_pending >= constants.h2_connection_window_bytes / 2 and
             output.len - produced >= frame_bytes + output_bytes_min)
         {
-            h2_frame.write_window_update(0, @intCast(connection.recv_pending), output[produced..][0..frame_bytes]);
+            h2_frame.write_window_update(
+                0,
+                @intCast(connection.recv_pending),
+                output[produced..][0..frame_bytes],
+            );
             connection.recv_window += connection.recv_pending;
             connection.recv_pending = 0;
             produced += frame_bytes;
@@ -632,7 +723,11 @@ pub const Connection = struct {
             if (stream.id == 0) continue;
             if (stream.recv_pending < constants.h2_stream_window_bytes / 2) continue;
             if (output.len - produced < frame_bytes + output_bytes_min) break;
-            h2_frame.write_window_update(stream.id, @intCast(stream.recv_pending), output[produced..][0..frame_bytes]);
+            h2_frame.write_window_update(
+                stream.id,
+                @intCast(stream.recv_pending),
+                output[produced..][0..frame_bytes],
+            );
             stream.recv_window += stream.recv_pending;
             stream.recv_pending = 0;
             produced += frame_bytes;
@@ -695,7 +790,11 @@ fn write_startup(output: []u8) usize {
         .{ .id = .max_header_list_size, .value = constants.h2_header_list_bytes_max },
     }, output);
     const boost: u31 = constants.h2_connection_window_bytes - 65535;
-    h2_frame.write_window_update(0, boost, output[produced..][0..h2_frame.window_update_frame_bytes]);
+    h2_frame.write_window_update(
+        0,
+        boost,
+        output[produced..][0..h2_frame.window_update_frame_bytes],
+    );
     produced += h2_frame.window_update_frame_bytes;
     assert(produced <= output_bytes_min);
     return produced;
@@ -773,13 +872,27 @@ const TestPeer = struct {
         var block: [128]u8 = undefined;
         var block_used: usize = 0;
         block_used += hpack.encode_header(":method", "GET", block[block_used..]) catch unreachable;
-        block_used += hpack.encode_header(":scheme", "https", block[block_used..]) catch unreachable;
+        block_used += hpack.encode_header(
+            ":scheme",
+            "https",
+            block[block_used..],
+        ) catch unreachable;
         block_used += hpack.encode_header(":path", "/", block[block_used..]) catch unreachable;
-        block_used += hpack.encode_header(":authority", "zoxy.test", block[block_used..]) catch unreachable;
+        block_used += hpack.encode_header(
+            ":authority",
+            "zoxy.test",
+            block[block_used..],
+        ) catch unreachable;
         return headers_frame_bytes(stream_id, block[0..block_used], end_stream, true, out);
     }
 
-    fn headers_frame_bytes(stream_id: u31, block: []const u8, end_stream: bool, end_headers: bool, out: []u8) usize {
+    fn headers_frame_bytes(
+        stream_id: u31,
+        block: []const u8,
+        end_stream: bool,
+        end_headers: bool,
+        out: []u8,
+    ) usize {
         var flags: u8 = 0;
         if (end_stream) flags |= h2_frame.Flags.end_stream;
         if (end_headers) flags |= h2_frame.Flags.end_headers;
@@ -966,7 +1079,10 @@ test "h2: header blocks span CONTINUATION frames" {
         .flags = h2_frame.Flags.end_headers,
         .stream_id = 1,
     }, frame[0..h2_frame.frame_header_bytes]);
-    @memcpy(frame[h2_frame.frame_header_bytes..][0 .. block_used - split], block[split..block_used]);
+    @memcpy(
+        frame[h2_frame.frame_header_bytes..][0 .. block_used - split],
+        block[split..block_used],
+    );
     const event = peer.feed(frame[0 .. h2_frame.frame_header_bytes + block_used - split]).?;
     try testing.expectEqual(@as(usize, 2), event.request.headers.len);
     try testing.expectEqualStrings(":path", event.request.headers[1].name);
@@ -1134,14 +1250,20 @@ test "h2: ping is acked, unknown frames and priority are skipped" {
         frame[0..h2_frame.frame_header_bytes],
     );
     @memcpy(frame[h2_frame.frame_header_bytes..][0..3], "abc");
-    try testing.expectEqual(@as(?Event, null), peer.feed(frame[0 .. h2_frame.frame_header_bytes + 3]));
+    try testing.expectEqual(
+        @as(?Event, null),
+        peer.feed(frame[0 .. h2_frame.frame_header_bytes + 3]),
+    );
 
     h2_frame.write_frame_header(
         .{ .length = 5, .type = .priority, .flags = 0, .stream_id = 7 },
         frame[0..h2_frame.frame_header_bytes],
     );
     @memcpy(frame[h2_frame.frame_header_bytes..][0..5], &[_]u8{ 0, 0, 0, 3, 16 });
-    try testing.expectEqual(@as(?Event, null), peer.feed(frame[0 .. h2_frame.frame_header_bytes + 5]));
+    try testing.expectEqual(
+        @as(?Event, null),
+        peer.feed(frame[0 .. h2_frame.frame_header_bytes + 5]),
+    );
 }
 
 test "h2: trailers end the stream and must carry END_STREAM" {
@@ -1392,7 +1514,10 @@ test "h2: seeded frame fuzz — no panic, output parses, stream slots drain to z
 fn fuzz_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
     const roll = rand.intRangeAtMost(u32, 0, 99);
     if (roll < 50) { // a valid request HEADERS on a fresh (mostly) id
-        const id = if (rand.boolean()) next_id.* else @as(u31, @intCast(rand.intRangeAtMost(u32, 1, 99) | 1));
+        const id = if (rand.boolean())
+            next_id.*
+        else
+            @as(u31, @intCast(rand.intRangeAtMost(u32, 1, 99) | 1));
         if (id >= next_id.*) next_id.* = id + 2;
         var block: [64]u8 = undefined;
         var block_len: usize = 0;
@@ -1402,7 +1527,12 @@ fn fuzz_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
         block_len += encode_fuzz_header(":authority", "z", block[block_len..]);
         var flags: u8 = h2_frame.Flags.end_headers;
         if (rand.boolean()) flags |= h2_frame.Flags.end_stream;
-        h2_frame.write_frame_header(.{ .length = @intCast(block_len), .type = .headers, .flags = flags, .stream_id = id }, out[0..9]);
+        h2_frame.write_frame_header(.{
+            .length = @intCast(block_len),
+            .type = .headers,
+            .flags = flags,
+            .stream_id = id,
+        }, out[0..9]);
         @memcpy(out[9..][0..block_len], block[0..block_len]);
         return 9 + block_len;
     }
@@ -1410,7 +1540,12 @@ fn fuzz_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
         const id: u31 = @intCast(rand.intRangeAtMost(u32, 1, 99) | 1);
         const payload_len = rand.intRangeAtMost(usize, 0, 32);
         const flags: u8 = if (rand.boolean()) h2_frame.Flags.end_stream else 0;
-        h2_frame.write_frame_header(.{ .length = @intCast(payload_len), .type = .data, .flags = flags, .stream_id = id }, out[0..9]);
+        h2_frame.write_frame_header(.{
+            .length = @intCast(payload_len),
+            .type = .data,
+            .flags = flags,
+            .stream_id = id,
+        }, out[0..9]);
         for (out[9..][0..payload_len]) |*b| b.* = rand.int(u8);
         return 9 + payload_len;
     }
@@ -1422,7 +1557,11 @@ fn fuzz_frame(rand: std.Random, next_id: *u31, out: []u8) usize {
                 return h2_frame.rst_stream_frame_bytes;
             },
             1 => {
-                h2_frame.write_window_update(id, rand.intRangeAtMost(u31, 1, 65535), out[0..h2_frame.window_update_frame_bytes]);
+                h2_frame.write_window_update(
+                    id,
+                    rand.intRangeAtMost(u31, 1, 65535),
+                    out[0..h2_frame.window_update_frame_bytes],
+                );
                 return h2_frame.window_update_frame_bytes;
             },
             else => {
@@ -1451,7 +1590,13 @@ fn encode_fuzz_header(name: []const u8, value: []const u8, out: []u8) usize {
 
 /// React to an event the way a server harness would, tracking which streams
 /// remain open so the test can close them at the end.
-fn fuzz_handle(conn: *Connection, event: Event, open: []u31, open_count: *usize, fatal: *bool) void {
+fn fuzz_handle(
+    conn: *Connection,
+    event: Event,
+    open: []u31,
+    open_count: *usize,
+    fatal: *bool,
+) void {
     switch (event) {
         .request => |request| {
             if (request.end_stream) {

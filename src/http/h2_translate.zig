@@ -375,7 +375,8 @@ test "h2 translate: bodies choose content-length or chunked" {
     const sized = try translate(&sized_fields, false, &out);
     try testing.expectEqual(@as(?u64, 12), sized.content_length);
     try testing.expect(!sized.chunked);
-    try testing.expect(std.mem.indexOf(u8, out[0..sized.head_len], "content-length: 12\r\n") != null);
+    const sized_head = out[0..sized.head_len];
+    try testing.expect(std.mem.indexOf(u8, sized_head, "content-length: 12\r\n") != null);
 
     const unsized_fields = sized_fields[0..4];
     const unsized = try translate(unsized_fields, false, &out);
