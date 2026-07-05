@@ -46,6 +46,7 @@ const h2_frame = @import("../http/h2_frame.zig");
 const hpack = @import("../http/hpack.zig");
 const h2_translate = @import("../http/h2_translate.zig");
 const terminator = @import("../tls/terminator.zig");
+const WireRelay = @import("../tls/wire_relay.zig").WireRelay;
 const maglev = @import("../proxy/maglev.zig");
 const balancer = @import("../proxy/balancer.zig");
 const resilience_mod = @import("../proxy/resilience.zig");
@@ -278,13 +279,9 @@ pub const H2Conn = struct {
     /// them and `recv_buf`/`send_buf` — the same BIO-pair relay ProxyConn
     /// runs, adapted to H2's symmetric buffered model. Null = h2c (plaintext).
     tls: ?terminator.Channel,
-    wire_recv_buf: [constants.tls_bio_pair_bytes]u8,
-    wire_recv_staged: u32,
-    wire_recv_in_flight: bool,
-    wire_send_buf: [constants.tls_bio_pair_bytes]u8,
-    wire_send_filled: u32,
-    wire_send_sent: u32,
-    wire_send_in_flight: bool,
+    /// The ciphertext <-> ring staging: the same BIO-pair relay ProxyConn
+    /// runs. When `tls` above is null (h2c plaintext), `wire` stays idle.
+    wire: WireRelay,
     /// A TLS close_notify or wire EOF arrived — teardown after the drain.
     tls_eof: bool,
     tls_wire_recv_completion: Completion,
@@ -359,15 +356,9 @@ pub const H2Conn = struct {
         conn.send_filled = 0;
         conn.send_in_flight = false;
         conn.tls = tls;
-        conn.wire_recv_staged = @intCast(staged_ciphertext.len);
-        conn.wire_recv_in_flight = false;
-        conn.wire_send_filled = 0;
-        conn.wire_send_sent = 0;
-        conn.wire_send_in_flight = false;
+        conn.wire.reset();
+        if (staged_ciphertext.len > 0) conn.wire.seed_staged(staged_ciphertext);
         conn.tls_eof = false;
-        if (staged_ciphertext.len > 0) {
-            @memcpy(conn.wire_recv_buf[0..staged_ciphertext.len], staged_ciphertext);
-        }
         conn.request_timeout_ns = request_timeout_ns;
         conn.idle_timeout_ns = idle_timeout_ns;
         conn.drain_timeout_ns = drain_timeout_ns;
@@ -1390,20 +1381,7 @@ pub const H2Conn = struct {
     /// Feed staged wire ciphertext into the channel; a partial feed compacts
     /// the remainder forward. Returns bytes fed (0 = pair full or nothing).
     fn tls_feed_staged(conn: *H2Conn) u32 {
-        if (conn.wire_recv_staged == 0) return 0;
-        const fed: u32 = @intCast(conn.tls.?.feed_ciphertext(
-            conn.wire_recv_buf[0..conn.wire_recv_staged],
-        ));
-        if (fed == 0) return 0; // pair full: reads will drain it
-        if (fed < conn.wire_recv_staged) {
-            std.mem.copyForwards(
-                u8,
-                conn.wire_recv_buf[0 .. conn.wire_recv_staged - fed],
-                conn.wire_recv_buf[fed..conn.wire_recv_staged],
-            );
-        }
-        conn.wire_recv_staged -= fed;
-        return fed;
+        return conn.wire.feed_staged(&conn.tls.?);
     }
 
     /// Decrypt available ciphertext into `recv_buf`, drive the engine, and
@@ -1453,11 +1431,11 @@ pub const H2Conn = struct {
 
     fn tls_arm_wire_recv(conn: *H2Conn) void {
         if (conn.closing) return;
-        if (conn.wire_recv_in_flight) return;
+        if (conn.wire.recv_in_flight()) return;
         // Staging full means the pair is full too; reads make the room and
         // this re-arms on the next service pass.
-        if (conn.wire_recv_staged == conn.wire_recv_buf.len) return;
-        conn.wire_recv_in_flight = true;
+        if (conn.wire.staging_full()) return;
+        conn.wire.begin_recv();
         conn.retain();
         conn.io.recv(
             *H2Conn,
@@ -1465,21 +1443,20 @@ pub const H2Conn = struct {
             on_tls_wire_recv,
             &conn.tls_wire_recv_completion,
             conn.downstream_fd,
-            conn.wire_recv_buf[conn.wire_recv_staged..],
+            conn.wire.recv_slot(),
         );
     }
 
     fn on_tls_wire_recv(conn: *H2Conn, _: *Completion, result: io_mod.RecvError!usize) void {
         defer conn.release_ref();
-        conn.wire_recv_in_flight = false;
+        conn.wire.end_recv();
         if (conn.closing) return;
         const n = result catch return conn.teardown();
         if (n == 0) {
             conn.tls_eof = true;
             return conn.teardown(); // wire EOF without close_notify: abrupt end
         }
-        conn.wire_recv_staged += @intCast(n);
-        assert(conn.wire_recv_staged <= conn.wire_recv_buf.len);
+        conn.wire.note_recv(n);
         conn.tls_service();
     }
 
@@ -1509,22 +1486,16 @@ pub const H2Conn = struct {
     fn tls_send_drained(conn: *const H2Conn) bool {
         return conn.send_sent == conn.send_filled and
             conn.tls.?.pending_ciphertext() == 0 and
-            !conn.wire_send_in_flight and
-            conn.wire_send_sent == conn.wire_send_filled;
+            conn.wire.send_idle();
     }
 
     /// Keep exactly one wire send in flight while ciphertext is pending,
     /// refilling the staging buffer from the pair between sends.
     fn tls_flush_wire_send(conn: *H2Conn) void {
         if (conn.closing) return;
-        if (conn.wire_send_in_flight) return;
-        if (conn.wire_send_sent == conn.wire_send_filled) {
-            conn.wire_send_filled = @intCast(conn.tls.?.drain_ciphertext(&conn.wire_send_buf));
-            conn.wire_send_sent = 0;
-            if (conn.wire_send_filled == 0) return; // nothing pending
-        }
-        assert(conn.wire_send_sent < conn.wire_send_filled);
-        conn.wire_send_in_flight = true;
+        if (conn.wire.send_in_flight()) return;
+        if (!conn.wire.refill_send(&conn.tls.?)) return; // nothing pending
+        conn.wire.begin_send();
         conn.retain();
         conn.io.send(
             *H2Conn,
@@ -1532,17 +1503,16 @@ pub const H2Conn = struct {
             on_tls_wire_send,
             &conn.tls_wire_send_completion,
             conn.downstream_fd,
-            conn.wire_send_buf[conn.wire_send_sent..conn.wire_send_filled],
+            conn.wire.send_pending(),
         );
     }
 
     fn on_tls_wire_send(conn: *H2Conn, _: *Completion, result: io_mod.SendError!usize) void {
         defer conn.release_ref();
-        conn.wire_send_in_flight = false;
+        conn.wire.end_send();
         if (conn.closing) return;
         const m = result catch return conn.teardown();
-        conn.wire_send_sent += @intCast(m);
-        assert(conn.wire_send_sent <= conn.wire_send_filled);
+        conn.wire.note_sent(m);
         // Drained a bit: encrypt more (the pair freed room) and keep sending.
         conn.tls_flush_send();
         if (conn.closing) return;
