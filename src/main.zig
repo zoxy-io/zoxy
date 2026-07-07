@@ -67,8 +67,13 @@ pub fn main(init: std.process.Init) !void {
     };
     const router = Router.init(&cfg);
 
-    const worker_count = std.Thread.getCpuCount() catch 1;
+    // A pinned `workers` in the config wins (reproducible benchmarks); otherwise
+    // one worker per online CPU. Clamp both to workers_max so the fixed-size
+    // per-worker arrays (listeners, metrics shards) never overflow.
+    const detected: usize = if (cfg.workers) |w| w else (std.Thread.getCpuCount() catch 1);
+    const worker_count = @min(detected, constants.workers_max);
     assert(worker_count >= 1); // one worker thread is spawned even if the count fails
+    assert(worker_count <= constants.workers_max);
 
     // TLS (docs/DESIGN.md §6): install the memory hook first — it must precede
     // any other OpenSSL call, so it runs before either context is built.

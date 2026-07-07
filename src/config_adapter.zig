@@ -24,6 +24,7 @@
 //!   admin  127.0.0.1:9901
 //!   handoff /run/zoxy.sock
 //!   accept_mode shared            # reuseport | shared
+//!   workers 4                     # fixed worker count; omit = one per CPU
 //!
 //!   tls {
 //!       certificate cert.pem
@@ -259,6 +260,8 @@ const Parser = struct {
                 try p.scalar(line, &p.scalars, dto_field(Dto, "handoff"));
             } else if (eq(d, "accept_mode")) {
                 try p.scalar(line, &p.scalars, dto_field(Dto, "accept_mode"));
+            } else if (eq(d, "workers")) {
+                try p.scalar_integer(line, &p.scalars, dto_field(Dto, "workers"));
             } else if (eq(d, "tls")) {
                 try p.top_tls(line);
             } else if (eq(d, "route")) {
@@ -281,6 +284,18 @@ const Parser = struct {
         }
         try emit.field(name);
         try emit_string(emit.w, line.tokens[1]);
+    }
+
+    /// A `name value` scalar integer field into the given emitter (unquoted).
+    fn scalar_integer(p: *Parser, line: Line, emit: *Emit, name: []const u8) Error!void {
+        if (line.opens_block()) {
+            return p.fail(error.UnexpectedToken, "directive takes a value, not a block");
+        }
+        if (line.tokens.len != 2) {
+            return p.fail(error.MissingValue, "directive needs exactly one value");
+        }
+        try emit.field(name);
+        try p.emit_integer(emit.w, line.tokens[1]);
     }
 
     /// `tls { … }` on the listener → the `tls` object; `identity` sub-blocks
@@ -819,6 +834,7 @@ test "adapter: scalars, comments, and blank lines" {
         \\admin 127.0.0.1:9901
         \\handoff /run/zoxy.sock
         \\accept_mode shared
+        \\workers 4
         \\
         \\route -> c
         \\cluster c {
@@ -831,6 +847,7 @@ test "adapter: scalars, comments, and blank lines" {
     try testing.expectEqualStrings("127.0.0.1:9901", root.get("admin").?.string);
     try testing.expectEqualStrings("/run/zoxy.sock", root.get("handoff").?.string);
     try testing.expectEqualStrings("shared", root.get("accept_mode").?.string);
+    try testing.expectEqual(@as(i64, 4), root.get("workers").?.integer);
 }
 
 test "adapter: route arrow match forms" {

@@ -406,6 +406,10 @@ pub const Config = struct {
     /// small-sample variance. `shared`: one listener, every worker holds a
     /// pending accept — idle workers naturally pull more.
     accept_mode: AcceptMode,
+    /// Fixed worker count; null lets the process spawn one worker per online
+    /// CPU (clamped to `constants.workers_max`). Pin it to make benchmarks
+    /// reproducible across machines (docs/DESIGN.md §3, thread-per-core).
+    workers: ?u16,
     /// TLS termination on the listener; null = plaintext.
     tls: ?TlsConfig,
     routes: []const Route,
@@ -456,6 +460,7 @@ pub const Dto = struct {
     admin: ?[]const u8 = null,
     handoff: ?[]const u8 = null,
     accept_mode: []const u8 = "reuseport",
+    workers: ?u16 = null,
     tls: ?TlsDto = null,
     routes: []const RouteDto,
     clusters: []const ClusterDto,
@@ -486,6 +491,11 @@ pub const Dto = struct {
                 .reuseport = "One SO_REUSEPORT listener per worker; the kernel hashes.",
                 .shared = "One listener; every worker holds a pending accept.",
             },
+        },
+        .workers = .{
+            .desc = "Fixed worker count; null uses one worker per online CPU (capped).",
+            .minimum = 1,
+            .maximum = constants.workers_max,
         },
         .tls = .{ .desc = "TLS termination on the listener; null = plaintext." },
         .routes = .{ .desc = "Host/path routing rules, evaluated first-match-wins." },
@@ -1030,6 +1040,10 @@ pub fn parse_resolved(
         } else null,
         .accept_mode = std.meta.stringToEnum(AcceptMode, dto.accept_mode) orelse
             return error.InvalidAcceptMode,
+        .workers = if (dto.workers) |w| blk: {
+            if (w < 1 or w > constants.workers_max) return error.InvalidLimit;
+            break :blk w;
+        } else null,
         .tls = tls,
         .routes = routes,
         .clusters = clusters,
@@ -1681,6 +1695,34 @@ test "config: accept_mode defaults to reuseport, parses shared, rejects junk" {
         \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
     );
     try std.testing.expectError(error.InvalidAcceptMode, junk);
+}
+
+test "config: workers defaults to null, parses a fixed count, rejects out-of-range" {
+    var auto = try parse(std.testing.allocator, test_config);
+    defer auto.deinit();
+    try std.testing.expectEqual(@as(?u16, null), auto.workers);
+
+    var pinned = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "workers": 4,
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer pinned.deinit();
+    try std.testing.expectEqual(@as(?u16, 4), pinned.workers);
+
+    const zero = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "workers": 0,
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidLimit, zero);
+
+    const too_many = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "workers": 65,
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidLimit, too_many);
 }
 
 test "config: lb block — maglev builds a table, knobs validated strictly" {
