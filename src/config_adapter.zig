@@ -25,6 +25,7 @@
 //!   handoff /run/zoxy.sock
 //!   accept_mode shared            # reuseport | shared
 //!   workers 4                     # fixed worker count; omit = one per CPU
+//!   logging                       # flag: presence enables diagnostics + access logs
 //!
 //!   tls {
 //!       certificate cert.pem
@@ -262,6 +263,8 @@ const Parser = struct {
                 try p.scalar(line, &p.scalars, dto_field(Dto, "accept_mode"));
             } else if (eq(d, "workers")) {
                 try p.scalar_integer(line, &p.scalars, dto_field(Dto, "workers"));
+            } else if (eq(d, "logging")) {
+                try p.scalar_flag(line, &p.scalars, dto_field(Dto, "logging"));
             } else if (eq(d, "tls")) {
                 try p.top_tls(line);
             } else if (eq(d, "route")) {
@@ -296,6 +299,14 @@ const Parser = struct {
         }
         try emit.field(name);
         try p.emit_integer(emit.w, line.tokens[1]);
+    }
+
+    /// A bare top-level boolean flag: its presence emits `true` (opt-in switch,
+    /// like the tls `http2` flag). Absence keeps the DTO default.
+    fn scalar_flag(p: *Parser, line: Line, emit: *Emit, name: []const u8) Error!void {
+        if (line.tokens.len != 1) return p.fail(error.UnexpectedToken, "flag takes no value");
+        try emit.field(name);
+        try emit.w.writeAll("true");
     }
 
     /// `tls { … }` on the listener → the `tls` object; `identity` sub-blocks
@@ -835,6 +846,7 @@ test "adapter: scalars, comments, and blank lines" {
         \\handoff /run/zoxy.sock
         \\accept_mode shared
         \\workers 4
+        \\logging
         \\
         \\route -> c
         \\cluster c {
@@ -848,6 +860,7 @@ test "adapter: scalars, comments, and blank lines" {
     try testing.expectEqualStrings("/run/zoxy.sock", root.get("handoff").?.string);
     try testing.expectEqualStrings("shared", root.get("accept_mode").?.string);
     try testing.expectEqual(@as(i64, 4), root.get("workers").?.integer);
+    try testing.expectEqual(true, root.get("logging").?.bool);
 }
 
 test "adapter: route arrow match forms" {

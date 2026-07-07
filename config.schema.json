@@ -40,6 +40,11 @@
       "minimum": 1,
       "maximum": 64
     },
+    "logging": {
+      "description": "Emit diagnostics and per-request access logs; off keeps workers silent.",
+      "type": "boolean",
+      "default": false
+    },
     "tls": {
       "description": "TLS termination on the listener; null = plaintext.",
       "anyOf": [

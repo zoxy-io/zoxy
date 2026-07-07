@@ -24,6 +24,25 @@ const Ip4Address = std.Io.net.Ip4Address;
 
 const stderr_fd = 2;
 
+/// Diagnostics are gated on a runtime flag so a `logging: false` config keeps
+/// worker threads from serializing on the process-global stderr lock (every
+/// `std.log` call takes it) during a benchmark. It starts true so a config
+/// that fails to load still reports why; `main` lowers it to `cfg.logging` the
+/// moment the config parses, before anything past startup logs.
+var logging_enabled: std.atomic.Value(bool) = .init(true);
+
+pub const std_options: std.Options = .{ .logFn = gated_log };
+
+fn gated_log(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (!logging_enabled.load(.monotonic)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
 pub fn main(init: std.process.Init) !void {
     // All allocation here is startup-only; it lives in the process arena.
     const gpa = init.arena.allocator();
@@ -66,6 +85,12 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     const router = Router.init(&cfg);
+
+    // Config parsed: from here on, honor its `logging` choice. Startup errors
+    // above always logged (the flag started true); everything past this point —
+    // the listening banner, worker errors, reload notices — stays silent when
+    // logging is off, and no worker touches the shared stderr lock.
+    logging_enabled.store(cfg.logging, .monotonic);
 
     // A pinned `workers` in the config wins (reproducible benchmarks); otherwise
     // one worker per online CPU. Clamp both to workers_max so the fixed-size
@@ -380,7 +405,7 @@ fn reserve_worker_pools(
     upstream_tls: []const ?*const zoxy.terminator.Context,
 ) !WorkerPools {
     const accesses = try gpa.alloc(cache_line.Padded(AccessLog), worker_count);
-    for (accesses) |*slot| slot.value = .{ .fd = stderr_fd };
+    for (accesses) |*slot| slot.value = .{ .fd = stderr_fd, .enabled = cfg.logging };
 
     const pools = try gpa.alloc(cache_line.Padded(Pool), worker_count);
     for (pools) |*slot| slot.value = try Pool.init(gpa, constants.connections_max);

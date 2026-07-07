@@ -410,6 +410,11 @@ pub const Config = struct {
     /// CPU (clamped to `constants.workers_max`). Pin it to make benchmarks
     /// reproducible across machines (docs/DESIGN.md §3, thread-per-core).
     workers: ?u16,
+    /// Emit diagnostics (`std.log`) and per-request access logs. Off by
+    /// default so worker threads never serialize on the shared stderr fd — a
+    /// benchmark stays silent unless it opts in. Fatal config-load errors log
+    /// regardless (main only lowers to this once the config parses).
+    logging: bool,
     /// TLS termination on the listener; null = plaintext.
     tls: ?TlsConfig,
     routes: []const Route,
@@ -461,6 +466,7 @@ pub const Dto = struct {
     handoff: ?[]const u8 = null,
     accept_mode: []const u8 = "reuseport",
     workers: ?u16 = null,
+    logging: bool = false,
     tls: ?TlsDto = null,
     routes: []const RouteDto,
     clusters: []const ClusterDto,
@@ -496,6 +502,9 @@ pub const Dto = struct {
             .desc = "Fixed worker count; null uses one worker per online CPU (capped).",
             .minimum = 1,
             .maximum = constants.workers_max,
+        },
+        .logging = .{
+            .desc = "Emit diagnostics and per-request access logs; off keeps workers silent.",
         },
         .tls = .{ .desc = "TLS termination on the listener; null = plaintext." },
         .routes = .{ .desc = "Host/path routing rules, evaluated first-match-wins." },
@@ -1044,6 +1053,7 @@ pub fn parse_resolved(
             if (w < 1 or w > constants.workers_max) return error.InvalidLimit;
             break :blk w;
         } else null,
+        .logging = dto.logging,
         .tls = tls,
         .routes = routes,
         .clusters = clusters,
@@ -1723,6 +1733,20 @@ test "config: workers defaults to null, parses a fixed count, rejects out-of-ran
         \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
     );
     try std.testing.expectError(error.InvalidLimit, too_many);
+}
+
+test "config: logging defaults off and parses on" {
+    var off = try parse(std.testing.allocator, test_config);
+    defer off.deinit();
+    try std.testing.expectEqual(false, off.logging);
+
+    var on = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "logging": true,
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    defer on.deinit();
+    try std.testing.expectEqual(true, on.logging);
 }
 
 test "config: lb block — maglev builds a table, knobs validated strictly" {

@@ -71,6 +71,9 @@ pub fn format_line(out: []u8, entry: Entry) []const u8 {
 
 pub const AccessLog = struct {
     fd: linux.fd_t,
+    /// When false, `record` is a no-op: the request path neither formats a line
+    /// nor writes, so workers never touch the shared log fd (config `logging`).
+    enabled: bool = true,
     used: usize = 0,
     buf: [buf_bytes]u8 = undefined,
 
@@ -82,6 +85,10 @@ pub const AccessLog = struct {
     }
 
     pub fn record(log: *AccessLog, entry: Entry) void {
+        if (!log.enabled) {
+            assert(log.used == 0); // disabled logs never accumulate
+            return;
+        }
         assert(log.used <= log.buf.len);
         if (log.used + line_max > log.buf.len) log.flush();
         assert(log.used + line_max <= log.buf.len); // flush guaranteed room
@@ -144,4 +151,11 @@ test "access_log: accumulates records in the buffer" {
     const out = log.buf[0..log.used];
     try std.testing.expect(std.mem.indexOf(u8, out, "GET /a proxied 5\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "POST /b 502 0\n") != null);
+}
+
+test "access_log: disabled log records nothing" {
+    var log = AccessLog{ .fd = -1, .enabled = false };
+    log.record(.{ .method = "GET", .target = "/a", .outcome = .proxied, .bytes_to_client = 5 });
+    log.record(.{ .method = "POST", .target = "/b", .outcome = .aborted, .bytes_to_client = 0 });
+    try std.testing.expectEqual(@as(usize, 0), log.used); // no format, no accumulation
 }
