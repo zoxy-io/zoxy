@@ -86,7 +86,15 @@ fn check(io: std.Io, gpa: std.mem.Allocator, paths: []const [:0]const u8) !void 
             return err;
         };
         var diagnostic: config.Diagnostic = .{};
-        var parsed = config.parse_diagnostic(gpa, text, &diagnostic) catch |err| {
+        // Offline gate: hostnames are syntax-checked, never resolved — CI
+        // must not depend on DNS.
+        var hostname_count: u32 = 0;
+        var parsed = config.parse_resolved(
+            gpa,
+            text,
+            &diagnostic,
+            .{ .context = &hostname_count, .lookup_fn = &counting_placeholder },
+        ) catch |err| {
             if (diagnostic.unknown_field) |field| {
                 std.log.err("config_tool: {s}: unknown field {s}", .{ config_path, field });
             } else {
@@ -95,7 +103,34 @@ fn check(io: std.Io, gpa: std.mem.Allocator, paths: []const [:0]const u8) !void 
             return err;
         };
         parsed.deinit();
+        if (hostname_count > 0) {
+            // What this gate cannot see: each hostname expands to one
+            // endpoint per DNS answer at startup, and the per-cluster bound
+            // applies to the *expanded* count.
+            std.log.warn(
+                "config_tool: {s}: {d} hostname endpoint(s) validated syntactically only; " ++
+                    "DNS fan-out at startup may exceed the per-cluster endpoint limit",
+                .{ config_path, hostname_count },
+            );
+        }
     }
+}
+
+/// `Resolver.validate_only` semantics (loopback placeholder, no network),
+/// plus a count of hostnames seen so `check` can say what it could not
+/// verify offline.
+fn counting_placeholder(
+    context: ?*anyopaque,
+    host: []const u8,
+    port: u16,
+    out: []std.Io.net.IpAddress,
+) config.Resolver.LookupError!u32 {
+    std.debug.assert(host.len > 0);
+    const count: *u32 = @ptrCast(@alignCast(context.?));
+    count.* += 1;
+    if (out.len == 0) return error.TooManyAddresses;
+    out[0] = .{ .ip4 = .loopback(port) };
+    return 1;
 }
 
 fn assert_paths(paths: []const [:0]const u8) void {

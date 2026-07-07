@@ -14,6 +14,8 @@ const assert = std.debug.assert;
 
 const IoUring = linux.IoUring;
 
+const SocketAddress = @import("socket_address.zig").SocketAddress;
+
 /// Maximum completions copied out of the ring per reap. Batching amortizes the
 /// enter() syscall (TigerStyle: "amortize costs by batching").
 const cqes_batch_max = 256;
@@ -93,7 +95,7 @@ const Operation = union(enum) {
     /// (iovecs, control buffer) until the completion fires. Exists for
     /// kTLS control records (a cmsg carries the TLS record type).
     send_message: struct { socket: posix.socket_t, message: *const linux.msghdr_const },
-    connect: struct { socket: posix.socket_t, addr: linux.sockaddr.in },
+    connect: struct { socket: posix.socket_t, addr: SocketAddress },
     close: struct { fd: posix.fd_t },
     timeout: struct { expires: linux.kernel_timespec },
     /// Cancel the in-flight operation whose completion is at `target` (its
@@ -248,7 +250,7 @@ pub const IO = struct {
         comptime callback: fn (Context, *Completion, ConnectError!void) void,
         completion: *Completion,
         socket: posix.socket_t,
-        addr: linux.sockaddr.in,
+        addr: SocketAddress,
     ) void {
         assert(socket >= 0);
         io.submit(Context, context, ConnectError!void, callback, completion, .{
@@ -358,7 +360,7 @@ pub const IO = struct {
                 user_data,
                 op.socket,
                 @ptrCast(&op.addr),
-                @sizeOf(linux.sockaddr.in),
+                op.addr.length(),
             ),
             .close => |op| _ = try io.ring.close(user_data, op.fd),
             .timeout => |*op| _ = try io.ring.timeout(user_data, &op.expires, 0, 0),
@@ -391,9 +393,14 @@ pub const IO = struct {
     }
 
     /// A non-blocking TCP socket with TCP_NODELAY set, or null on failure.
-    pub fn open_tcp_socket(io: *IO) ?posix.socket_t {
+    /// The family must match the address later handed to `connect`.
+    pub fn open_tcp_socket(io: *IO, family: std.Io.net.IpAddress.Family) ?posix.socket_t {
+        const domain: u32 = switch (family) {
+            .ip4 => linux.AF.INET,
+            .ip6 => linux.AF.INET6,
+        };
         const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
-        const rc = linux.socket(linux.AF.INET, flags, 0);
+        const rc = linux.socket(domain, flags, 0);
         if (linux.errno(rc) != .SUCCESS) return null;
         const fd: posix.socket_t = @intCast(rc);
         io.set_tcp_no_delay(fd);

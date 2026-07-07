@@ -57,6 +57,8 @@ const Counters = @import("../obs/metrics.zig").Counters;
 const access_log = @import("../obs/access_log.zig");
 const AccessLog = access_log.AccessLog;
 const Ip4Address = std.Io.net.Ip4Address;
+const IpAddress = std.Io.net.IpAddress;
+const SocketAddress = io_mod.SocketAddress;
 
 pub const H2ConnPool = @import("pool.zig").Pool(H2Conn);
 pub const LegPool = @import("pool.zig").Pool(StreamLeg);
@@ -148,7 +150,7 @@ pub const StreamLeg = struct {
     orphaned: bool,
 
     // Routing and accounting (the H1 fixed points, minus the retry tiers).
-    endpoint_address: Ip4Address,
+    endpoint_address: IpAddress,
     cluster_index: u32,
     endpoint_index: u32,
     policy: *const config.ResiliencePolicy,
@@ -221,7 +223,7 @@ pub const StreamLeg = struct {
         leg.close_pending = false;
         leg.connect_cancel_pending = false;
         leg.orphaned = false;
-        leg.endpoint_address = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 };
+        leg.endpoint_address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
         leg.cluster_index = 0;
         leg.endpoint_index = 0;
         leg.policy = &policy_default;
@@ -613,7 +615,7 @@ pub const H2Conn = struct {
             // settle the attempt as aborted via the early-answer path.
             return conn.leg_answer_early(leg, response_block_503);
         }
-        leg.upstream_fd = conn.io.open_tcp_socket() orelse
+        leg.upstream_fd = conn.io.open_tcp_socket(std.meta.activeTag(leg.endpoint_address)) orelse
             return conn.leg_answer(leg, .bad_gateway);
         leg.upstream_accounted = true;
         conn.resilience.connection_open(leg.cluster_index);
@@ -626,7 +628,7 @@ pub const H2Conn = struct {
             on_leg_connect,
             &leg.connect_completion,
             leg.upstream_fd,
-            sockaddr_in(leg.endpoint_address),
+            SocketAddress.from_ip(leg.endpoint_address),
         );
     }
 
@@ -1845,6 +1847,7 @@ fn endpoint_count(router: *const Router, cluster_index: u32) u32 {
     return @intCast(router.config.clusters[cluster_index].endpoints.len);
 }
 
+/// Test helper: raw-syscall dials of loopback test listeners stay v4.
 fn sockaddr_in(address: Ip4Address) linux.sockaddr.in {
     return .{
         .family = linux.AF.INET,

@@ -12,6 +12,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 const Ip4Address = std.Io.net.Ip4Address;
+const IpAddress = std.Io.net.IpAddress;
 
 /// Seeds for the two permutation hashes and the lookup-key hash. Arbitrary
 /// but fixed: every worker (and every restarted process) must build the
@@ -52,7 +53,7 @@ pub fn lookup(table: []const u8, hash: u64) u8 {
 /// Fill `table` with endpoint indices, each endpoint claiming slots along
 /// its own (offset, skip) permutation in round-robin turns — the classic
 /// Maglev population loop. Deterministic in the endpoint addresses.
-pub fn build(addresses: []const Ip4Address, table: []u8) void {
+pub fn build(addresses: []const IpAddress, table: []u8) void {
     assert(table.len == constants.maglev_table_entries);
     assert(addresses.len >= 1);
     assert(addresses.len <= constants.endpoints_per_cluster_max);
@@ -63,8 +64,8 @@ pub fn build(addresses: []const Ip4Address, table: []u8) void {
     var next: [constants.endpoints_per_cluster_max]u64 = @splat(0);
     for (addresses, 0..) |address, index| {
         const key = address_key(address);
-        offsets[index] = std.hash.Wyhash.hash(seed_offset, &key) % entries;
-        skips[index] = std.hash.Wyhash.hash(seed_skip, &key) % (entries - 1) + 1;
+        offsets[index] = std.hash.Wyhash.hash(seed_offset, key.slice()) % entries;
+        skips[index] = std.hash.Wyhash.hash(seed_skip, key.slice()) % (entries - 1) + 1;
         assert(skips[index] >= 1); // a zero skip would never advance
         assert(skips[index] < entries);
     }
@@ -96,10 +97,34 @@ pub fn build(addresses: []const Ip4Address, table: []u8) void {
     assert(filled == entries);
 }
 
-fn address_key(address: Ip4Address) [6]u8 {
-    var key: [6]u8 = undefined;
-    key[0..4].* = address.bytes;
-    std.mem.writeInt(u16, key[4..6], address.port, .big);
+/// The bytes an endpoint's permutation is derived from. A v4 address keys
+/// exactly as it always has (6 bytes: address + port) so pre-IPv6 tables —
+/// and with them, fleet-wide affinity — never reshuffle; a v6 address keys
+/// on its full 18 bytes, which can never collide with a 6-byte v4 key.
+const AddressKey = struct {
+    bytes: [18]u8,
+    len: u8,
+
+    fn slice(key: *const AddressKey) []const u8 {
+        assert(key.len == 6 or key.len == 18);
+        return key.bytes[0..key.len];
+    }
+};
+
+fn address_key(address: IpAddress) AddressKey {
+    var key = AddressKey{ .bytes = @splat(0), .len = 0 };
+    switch (address) {
+        .ip4 => |ip4| {
+            key.bytes[0..4].* = ip4.bytes;
+            std.mem.writeInt(u16, key.bytes[4..6], ip4.port, .big);
+            key.len = 6;
+        },
+        .ip6 => |ip6| {
+            key.bytes[0..16].* = ip6.bytes;
+            std.mem.writeInt(u16, key.bytes[16..18], ip6.port, .big);
+            key.len = 18;
+        },
+    }
     return key;
 }
 
@@ -107,11 +132,11 @@ fn address_key(address: Ip4Address) [6]u8 {
 
 const testing = std.testing;
 
-fn test_addresses(count: u32) [constants.endpoints_per_cluster_max]Ip4Address {
+fn test_addresses(count: u32) [constants.endpoints_per_cluster_max]IpAddress {
     assert(count <= constants.endpoints_per_cluster_max);
-    var addresses: [constants.endpoints_per_cluster_max]Ip4Address = undefined;
+    var addresses: [constants.endpoints_per_cluster_max]IpAddress = undefined;
     for (addresses[0..count], 0..) |*address, index| {
-        address.* = Ip4Address.loopback(@intCast(9000 + index));
+        address.* = .{ .ip4 = Ip4Address.loopback(@intCast(9000 + index)) };
     }
     return addresses;
 }
@@ -183,6 +208,35 @@ test "maglev: a single endpoint claims the whole table" {
     build(addresses[0..1], table);
     for (table) |entry| try testing.expectEqual(@as(u8, 0), entry);
     try testing.expectEqual(@as(u8, 0), lookup(table, hash_key("/any/target")));
+}
+
+test "maglev: mixed v4/v6 endpoints fill a balanced, deterministic table" {
+    const gpa = testing.allocator;
+    const first = try gpa.alloc(u8, constants.maglev_table_entries);
+    defer gpa.free(first);
+    const second = try gpa.alloc(u8, constants.maglev_table_entries);
+    defer gpa.free(second);
+
+    const addresses = [3]IpAddress{
+        .{ .ip4 = Ip4Address.loopback(9000) },
+        .{ .ip6 = std.Io.net.Ip6Address.loopback(9000) },
+        .{ .ip6 = .{
+            .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 },
+            .port = 9001,
+        } },
+    };
+    build(&addresses, first);
+    build(&addresses, second);
+    try testing.expect(std.mem.eql(u8, first, second));
+
+    var counts = [_]u64{0} ** 3;
+    for (first) |entry| {
+        try testing.expect(entry < 3);
+        counts[entry] += 1;
+    }
+    // Same port on v4 and v6 loopback must still key differently: every
+    // endpoint owns a substantial share.
+    for (counts) |count| try testing.expect(count > constants.maglev_table_entries / 4);
 }
 
 test "maglev: the key hash is stable and spreads distinct keys" {

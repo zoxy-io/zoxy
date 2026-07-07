@@ -9,14 +9,14 @@
       "type": ["string", "null"]
     },
     "listen": {
-      "description": "Address the proxy accepts connections on.",
+      "description": "IPv4 address the proxy accepts connections on.",
       "type": "string",
       "format": "hostport",
       "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}$",
       "examples": ["0.0.0.0:8080"]
     },
     "admin": {
-      "description": "Address of the admin/metrics endpoint; null disables it.",
+      "description": "IPv4 address of the admin/metrics endpoint; null disables it.",
       "type": ["string", "null"],
       "format": "hostport",
       "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}$",
@@ -134,7 +134,7 @@
             "type": "string"
           },
           "endpoints": {
-            "description": "Upstream endpoint addresses, each host:port.",
+            "description": "Upstream endpoint addresses: IPv4 host:port, IPv6 [host]:port, or hostname:port. Hostnames resolve once at startup (and again on SIGHUP reload); every resolved address becomes its own endpoint.",
             "type": "array",
             "items": { "type": "string" }
           },

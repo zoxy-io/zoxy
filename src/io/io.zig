@@ -18,6 +18,9 @@ else switch (builtin.os.tag) {
 pub const IO = impl.IO;
 pub const Completion = impl.Completion;
 
+/// Connect-target sockaddr union (v4/v6), shared by both backends.
+pub const SocketAddress = @import("socket_address.zig").SocketAddress;
+
 pub const AcceptError = impl.AcceptError;
 pub const RecvError = impl.RecvError;
 pub const SendError = impl.SendError;
@@ -29,4 +32,5 @@ pub const KernelTlsError = impl.KernelTlsError;
 
 test {
     _ = impl;
+    _ = @import("socket_address.zig");
 }

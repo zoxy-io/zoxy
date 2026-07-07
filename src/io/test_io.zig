@@ -22,6 +22,8 @@ const linux = std.os.linux;
 const posix = std.posix;
 const assert = std.debug.assert;
 
+const SocketAddress = @import("socket_address.zig").SocketAddress;
+
 /// Virtual fds start here — accidentally passing one to a real syscall (or a
 /// real fd to us) trips range asserts instead of corrupting something.
 const fd_base: posix.socket_t = 1000;
@@ -103,7 +105,7 @@ const Operation = union(enum) {
     send: struct { socket: posix.socket_t, buffer: []const u8 },
     connect: struct {
         socket: posix.socket_t,
-        addr: linux.sockaddr.in,
+        addr: SocketAddress,
         /// Nonzero for a black-holed connect: not ready before this instant,
         /// then fails ETIMEDOUT (decided once, at submit).
         hung_until_ns: u64 = 0,
@@ -241,7 +243,8 @@ pub const IO = struct {
         return fd;
     }
 
-    pub fn open_tcp_socket(io: *IO) ?posix.socket_t {
+    pub fn open_tcp_socket(io: *IO, family: std.Io.net.IpAddress.Family) ?posix.socket_t {
+        _ = family; // virtual sockets are family-agnostic
         return io.allocate(.stream);
     }
 
@@ -386,7 +389,7 @@ pub const IO = struct {
         comptime callback: fn (Context, *Completion, ConnectError!void) void,
         completion: *Completion,
         socket: posix.socket_t,
-        addr: linux.sockaddr.in,
+        addr: SocketAddress,
     ) void {
         const hung_until_ns: u64 = if (io.roll(io.faults.connect_blackhole_ppm))
             io.now + connect_blackhole_timeout_ns
@@ -649,11 +652,13 @@ pub const IO = struct {
         return @intCast(n);
     }
 
-    fn perform_connect(io: *IO, fd: posix.socket_t, addr: linux.sockaddr.in) i32 {
+    fn perform_connect(io: *IO, fd: posix.socket_t, addr: SocketAddress) i32 {
         const socket = io.socket_at(fd);
         assert(socket.state == .stream);
         assert(socket.peer_fd < 0); // never connected twice
-        const port = std.mem.bigToNative(u16, addr.port);
+        // The virtual network keys listeners by port alone: both families
+        // land on the same wire, which is exactly what the sim wants.
+        const port = addr.port();
         const listener_fd = io.find_listener(port) orelse
             return -@as(i32, @intFromEnum(linux.E.CONNREFUSED));
         const listener = io.socket_at(listener_fd);
@@ -907,12 +912,13 @@ test "test_io: listen/connect/accept/send/recv round-trip, deterministically" {
         io.accept(*TestPeer, &server, TestPeer.on_accept, &server.accept_c, listener);
 
         var client = TestPeer{ .io = &io, .message = "hello, deterministic world!" };
-        client.fd = io.open_tcp_socket().?;
-        io.connect(*TestPeer, &client, TestPeer.on_connect, &client.connect_c, client.fd, .{
+        client.fd = io.open_tcp_socket(.ip4).?;
+        const target = SocketAddress{ .in = .{
             .family = linux.AF.INET,
             .port = std.mem.nativeToBig(u16, 8080),
             .addr = 0,
-        });
+        } };
+        io.connect(*TestPeer, &client, TestPeer.on_connect, &client.connect_c, client.fd, target);
 
         var steps: usize = 0;
         while (!server.eof) : (steps += 1) {
@@ -936,12 +942,12 @@ test "test_io: close without shutdown leaves a pending recv hanging" {
 
     // The client never FINs, so nothing external will wake the server's recv.
     var client = TestPeer{ .io = &io, .message = "x", .fin_after_send = false };
-    client.fd = io.open_tcp_socket().?;
-    io.connect(*TestPeer, &client, TestPeer.on_connect, &client.connect_c, client.fd, .{
+    client.fd = io.open_tcp_socket(.ip4).?;
+    io.connect(*TestPeer, &client, TestPeer.on_connect, &client.connect_c, client.fd, .{ .in = .{
         .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, 9090),
         .addr = 0,
-    });
+    } });
     while (server.received < 1) try io.run_once();
 
     // The server arms another recv, then closes its own fd without shutdown:
@@ -991,12 +997,12 @@ test "test_io: an injected RST fails ops on both ends of the connection" {
     var server = Harness{ .io = &io };
     var client = Harness{ .io = &io };
     io.accept(*Harness, &server, Harness.on_accept, &server.accept_c, listener);
-    client.fd = io.open_tcp_socket().?;
-    io.connect(*Harness, &client, Harness.on_connect, &client.connect_c, client.fd, .{
+    client.fd = io.open_tcp_socket(.ip4).?;
+    io.connect(*Harness, &client, Harness.on_connect, &client.connect_c, client.fd, .{ .in = .{
         .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, 7070),
         .addr = 0,
-    });
+    } });
     while (server.fd < 0) try io.run_once();
 
     // Every eligible op now takes the RST.
@@ -1026,12 +1032,12 @@ test "test_io: injected connect refusal reaches the callback" {
     };
     var h = Harness{};
     var connect_c: Completion = undefined;
-    const fd = io.open_tcp_socket().?;
-    io.connect(*Harness, &h, Harness.on_connect, &connect_c, fd, .{
+    const fd = io.open_tcp_socket(.ip4).?;
+    io.connect(*Harness, &h, Harness.on_connect, &connect_c, fd, .{ .in = .{
         .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, 6060),
         .addr = 0,
-    });
+    } });
     while (!h.refused) try io.run_once();
     try std.testing.expect(h.refused);
 }

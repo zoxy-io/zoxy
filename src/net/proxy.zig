@@ -59,6 +59,8 @@ const h2_proxy = @import("h2_proxy.zig");
 const H2ConnPool = h2_proxy.H2ConnPool;
 const H2LegPool = h2_proxy.LegPool;
 const Ip4Address = std.Io.net.Ip4Address;
+const IpAddress = std.Io.net.IpAddress;
+const SocketAddress = io_mod.SocketAddress;
 
 const Pool = @import("pool.zig").Pool(ProxyConn);
 /// TLS legs, pooled per worker like connections. Sized by config —
@@ -334,7 +336,7 @@ pub const ProxyConn = struct {
     /// an unknown protocol state and must not be pooled.
     response_pipe_overflow: bool,
     /// Where the current upstream connection goes (pool key; retry target).
-    endpoint_address: Ip4Address,
+    endpoint_address: IpAddress,
     /// Resilience accounting keys for the current request (valid while the
     /// matching flag below is set).
     cluster_index: u32,
@@ -742,7 +744,7 @@ pub const ProxyConn = struct {
         conn.response_reusable = false;
         conn.request_pipe_overflow = false;
         conn.response_pipe_overflow = false;
-        conn.endpoint_address = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 };
+        conn.endpoint_address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
         conn.cluster_index = 0;
         conn.endpoint_index = 0;
         conn.policy = &policy_default;
@@ -1758,7 +1760,8 @@ pub const ProxyConn = struct {
             conn.close_attempt(.aborted);
             return conn.fail(response_503);
         }
-        conn.upstream_fd = conn.io.open_tcp_socket() orelse return conn.fail(response_502);
+        conn.upstream_fd = conn.io.open_tcp_socket(std.meta.activeTag(conn.endpoint_address)) orelse
+            return conn.fail(response_502);
         assert(conn.upstream_fd >= 0);
         conn.account_upstream_open();
         conn.dial_pending = true;
@@ -1770,7 +1773,7 @@ pub const ProxyConn = struct {
             on_connect,
             &conn.connect_completion,
             conn.upstream_fd,
-            sockaddr_in(conn.endpoint_address),
+            SocketAddress.from_ip(conn.endpoint_address),
         );
     }
 
@@ -2345,7 +2348,7 @@ pub const ProxyConn = struct {
         // (Found by the simulator, seed 1693.)
         if (!conn.request_forwarded) return;
         if (conn.upstream_fd < 0) return;
-        assert(conn.endpoint_address.port != 0); // set when the request routed
+        assert(conn.endpoint_address.getPort() != 0); // set when the request routed
         // A TLS leg parks its channel with the fd — but only fully quiescent:
         // no unfed ciphertext, no wire op in flight, nothing pending in the
         // pair, nothing buffered inside the SSL. Leftover plaintext in the
@@ -2913,6 +2916,7 @@ fn keep_alive_requested(request: *const h1.Request, connection: *const Connectio
     return !connection.names("close");
 }
 
+/// Test helper: raw-syscall dials of loopback test listeners stay v4.
 fn sockaddr_in(address: Ip4Address) linux.sockaddr.in {
     return .{
         .family = linux.AF.INET,
@@ -3174,6 +3178,96 @@ test "proxy: forwards a request to an upstream and relays the response" {
     );
     // Resilience accounting drains with the connection.
     try std.testing.expect(h.server.resilience.is_idle());
+}
+
+/// A `[::1]:0` TCP listener for v6 upstream tests, raw syscalls (the
+/// production `Listener` binds v4 only). Null when the host has no ::1.
+fn open_v6_loopback_listener() ?struct { listener: Listener, port: u16 } {
+    const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
+    const rc = linux.socket(linux.AF.INET6, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: posix.socket_t = @intCast(rc);
+    var sa = linux.sockaddr.in6{
+        .family = linux.AF.INET6,
+        .port = 0,
+        .flowinfo = 0,
+        .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .scope_id = 0,
+    };
+    if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    if (linux.errno(linux.listen(fd, 8)) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    var bound: linux.sockaddr.in6 = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(linux.sockaddr.in6);
+    assert(linux.errno(linux.getsockname(fd, @ptrCast(&bound), &bound_len)) == .SUCCESS);
+    assert(bound.family == linux.AF.INET6);
+    return .{
+        .listener = .{ .fd = fd },
+        .port = std.mem.bigToNative(u16, bound.port),
+    };
+}
+
+test "proxy: dials an IPv6 upstream endpoint end to end" {
+    const gpa = std.testing.allocator;
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nV6";
+
+    var io = try IO.init(64, 0);
+    defer io.deinit();
+
+    var v6 = open_v6_loopback_listener() orelse return error.SkipZigTest;
+    defer v6.listener.close();
+    var origin = TestOrigin{ .io = &io, .listener = v6.listener, .response = response };
+    origin.start();
+
+    var json_buf: [256]u8 = undefined;
+    const cfg_text = try std.fmt.bufPrint(&json_buf,
+        \\{{ "listen": "0.0.0.0:0", "routes": [{{ "cluster": "o" }}],
+        \\   "clusters": [{{ "name": "o", "endpoints": ["[::1]:{d}"] }}] }}
+    , .{v6.port});
+    var cfg = try config.parse(gpa, cfg_text);
+    defer cfg.deinit();
+    const router = Router.init(&cfg);
+
+    var pool = try Pool.init(gpa, 4);
+    defer pool.deinit(gpa);
+    var proxy_listener = try Listener.open(Ip4Address.loopback(0), 8);
+    defer proxy_listener.close();
+    var metrics = Counters{};
+    var access = AccessLog{ .fd = -1 };
+    var server = ProxyServer.init(
+        &io,
+        &pool,
+        proxy_listener,
+        &router,
+        &metrics,
+        &access,
+        constants.request_timeout_ns,
+        constants.idle_timeout_ns,
+    );
+    defer server.deinit();
+    server.start();
+
+    // A v4 client through the proxy to the v6 origin: the upstream dial is
+    // the AF_INET6 socket + sockaddr.in6 path through the real ring.
+    const client = try connect_loopback(proxy_listener.bound_address().port);
+    defer _ = linux.close(client);
+    var c = OneShotClient{
+        .io = &io,
+        .fd = client,
+        .request = "GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n",
+    };
+    c.go();
+    try io.run_until_done(&c.done);
+    try std.testing.expectEqualStrings(response, c.buf[0..c.len]);
+
+    while (pool.free_count != pool.capacity) try io.run_once();
+    try std.testing.expect(server.resilience.is_idle());
+    if (origin.fd >= 0) _ = linux.close(origin.fd);
 }
 
 /// A TLS client on the test IO loop: a client-role `Channel` glued to a real

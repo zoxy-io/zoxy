@@ -794,6 +794,24 @@ test "adapter: minimal config lowers to the expected JSON shape" {
     try testing.expectEqualStrings("127.0.0.1:9000", eps.items[0].string);
 }
 
+test "adapter: IPv6 and hostname endpoint tokens pass through verbatim" {
+    // The adapter only lowers syntax; endpoint validation (and hostname
+    // resolution) stays downstream in config parsing.
+    const parsed = try adapt_to_value(
+        \\listen 127.0.0.1:8080
+        \\route -> origin
+        \\cluster origin {
+        \\    endpoints [::1]:9000 backend.internal:9001
+        \\}
+    );
+    defer parsed.deinit();
+    const clusters = parsed.value.object.get("clusters").?.array;
+    const eps = clusters.items[0].object.get("endpoints").?.array;
+    try testing.expectEqual(@as(usize, 2), eps.items.len);
+    try testing.expectEqualStrings("[::1]:9000", eps.items[0].string);
+    try testing.expectEqualStrings("backend.internal:9001", eps.items[1].string);
+}
+
 test "adapter: scalars, comments, and blank lines" {
     const parsed = try adapt_to_value(
         \\# a comment line

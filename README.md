@@ -177,7 +177,15 @@ cluster default {
 A block's opening `{` may trail its directive; its `}` sits on its own line.
 Durations take a `ms`/`s` suffix (a bare number is milliseconds). In a `route`,
 `host` defaults to `*` and `path_prefix` to `/`; a lone match token beginning
-`/` is the path, otherwise the host. Endpoints in a cluster are load-balanced
+`/` is the path, otherwise the host. An endpoint is `ip4:port`, `[ip6]:port`,
+or `hostname:port` — a hostname resolves **once at startup** (the data path
+never does DNS; a SIGHUP reload re-resolves), each distinct name is looked up
+once, and every resolved address becomes its own endpoint. Addresses the host
+has no route for are dropped (a v4-only machine ignores AAAA answers; if
+nothing survives, startup fails loudly). Link-local IPv6 (`fe80::/10`) is
+rejected — no literal syntax can carry the zone a dial would need.
+`listen`/`admin` are IPv4 for now. Endpoints in a
+cluster are load-balanced
 P2C least-request: two random picks, the one with fewer in-flight requests wins,
 unhealthy/ejected endpoints are avoided (and when *none* is available, zoxy
 fails open and routes anyway). `admin` (optional) serves Prometheus-style

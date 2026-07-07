@@ -875,18 +875,18 @@ const Client = struct {
 
     fn begin(client: *Client) void {
         client.requests_total = client.workload.requests_per_client();
-        client.fd = client.io.open_tcp_socket() orelse fail("virtual fds exhausted", .{});
+        client.fd = client.io.open_tcp_socket(.ip4) orelse fail("virtual fds exhausted", .{});
         client.io.connect(
             *Client,
             client,
             on_connect,
             &client.connect_completion,
             client.fd,
-            .{
+            .{ .in = .{
                 .family = std.os.linux.AF.INET,
                 .port = std.mem.nativeToBig(u16, proxy_port),
                 .addr = 0,
-            },
+            } },
         );
     }
 
@@ -1201,18 +1201,18 @@ const H2Client = struct {
     };
 
     fn begin(client: *H2Client) void {
-        client.fd = client.io.open_tcp_socket() orelse fail("virtual fds exhausted", .{});
+        client.fd = client.io.open_tcp_socket(.ip4) orelse fail("virtual fds exhausted", .{});
         client.io.connect(
             *H2Client,
             client,
             on_connect,
             &client.connect_completion,
             client.fd,
-            .{
+            .{ .in = .{
                 .family = std.os.linux.AF.INET,
                 .port = std.mem.nativeToBig(u16, h2c_proxy_port),
                 .addr = 0,
-            },
+            } },
         );
     }
 

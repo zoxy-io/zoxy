@@ -207,13 +207,13 @@ pub const HealthChecker = struct {
         probe: *Probe,
         cluster: *const config.Cluster,
         endpoint_index: u32,
-        address: std.Io.net.Ip4Address,
+        address: std.Io.net.IpAddress,
     ) void {
         assert(!probe.busy());
         assert(cluster.policy.health_timeout_ns > 0);
         // fd pressure is our problem, not the endpoint's: skip this round
         // rather than record a bogus failure (the due instant has advanced).
-        const fd = checker.io.open_tcp_socket() orelse return;
+        const fd = checker.io.open_tcp_socket(std.meta.activeTag(address)) orelse return;
         probe.cluster_index = @intCast(cluster.index);
         probe.endpoint_index = endpoint_index;
         probe.fd = fd;
@@ -225,7 +225,7 @@ pub const HealthChecker = struct {
             on_probe_connect,
             &probe.connect_completion,
             fd,
-            sockaddr_in(address),
+            io_mod.SocketAddress.from_ip(address),
         );
     }
 
@@ -279,14 +279,6 @@ pub const HealthChecker = struct {
         }
     }
 };
-
-fn sockaddr_in(address: std.Io.net.Ip4Address) linux.sockaddr.in {
-    return .{
-        .family = linux.AF.INET,
-        .port = std.mem.nativeToBig(u16, address.port),
-        .addr = @bitCast(address.bytes),
-    };
-}
 
 // ---- tests ----------------------------------------------------------------
 

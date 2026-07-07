@@ -17,7 +17,7 @@ const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 const terminator = @import("../tls/terminator.zig");
 const IO = @import("../io/io.zig").IO;
-const Ip4Address = std.Io.net.Ip4Address;
+const IpAddress = std.Io.net.IpAddress;
 
 pub const UpstreamPool = struct {
     slots: [constants.upstream_idle_max]Slot = @splat(.{}),
@@ -26,7 +26,7 @@ pub const UpstreamPool = struct {
 
     const Slot = struct {
         fd: posix.socket_t = -1,
-        address: Ip4Address = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 },
+        address: IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
         channel: ?terminator.Channel = null,
     };
 
@@ -38,10 +38,10 @@ pub const UpstreamPool = struct {
     };
 
     /// Take a parked connection to `address`, if any.
-    pub fn checkout(pool: *UpstreamPool, address: Ip4Address) ?Parked {
+    pub fn checkout(pool: *UpstreamPool, address: IpAddress) ?Parked {
         for (&pool.slots) |*slot| {
             if (slot.fd < 0) continue;
-            if (!address_equal(slot.address, address)) continue;
+            if (!slot.address.eql(&address)) continue;
             const parked = Parked{ .fd = slot.fd, .channel = slot.channel };
             slot.fd = -1;
             slot.channel = null;
@@ -59,7 +59,7 @@ pub const UpstreamPool = struct {
     pub fn checkin(
         pool: *UpstreamPool,
         io: *IO,
-        address: Ip4Address,
+        address: IpAddress,
         fd: posix.socket_t,
         channel: ?terminator.Channel,
     ) void {
@@ -93,10 +93,6 @@ pub const UpstreamPool = struct {
     }
 };
 
-fn address_equal(a: Ip4Address, b: Ip4Address) bool {
-    return a.port == b.port and std.mem.eql(u8, &a.bytes, &b.bytes);
-}
-
 // ---- tests ----------------------------------------------------------------
 
 test "upstream_pool: checkout matches the endpoint and empties the slot" {
@@ -105,8 +101,8 @@ test "upstream_pool: checkout matches the endpoint and empties the slot" {
     defer io.deinit();
 
     var pool = UpstreamPool{};
-    const address_a = Ip4Address.loopback(1);
-    const address_b = Ip4Address.loopback(2);
+    const address_a = IpAddress{ .ip4 = .loopback(1) };
+    const address_b = IpAddress{ .ip6 = .loopback(1) }; // same port, other family
 
     // Real fds, so checkin-when-full and drain can close them.
     var pair: [2]i32 = undefined;
@@ -118,8 +114,9 @@ test "upstream_pool: checkout matches the endpoint and empties the slot" {
     try std.testing.expectEqual(@as(u32, 2), pool.count);
 
     // No connection parked for an unrelated endpoint.
-    try std.testing.expect(pool.checkout(Ip4Address.loopback(3)) == null);
-    // The parked fd comes back for its endpoint — exactly once.
+    try std.testing.expect(pool.checkout(.{ .ip4 = .loopback(3) }) == null);
+    // The parked fd comes back for its endpoint — exactly once. The v6
+    // parking on the same port must not answer for the v4 endpoint.
     try std.testing.expectEqual(pair[0], pool.checkout(address_a).?.fd);
     try std.testing.expect(pool.checkout(address_a) == null);
     try std.testing.expectEqual(@as(u32, 1), pool.count);

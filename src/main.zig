@@ -39,7 +39,19 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     var diagnostic: zoxy.config.Diagnostic = .{};
-    var cfg = zoxy.config.load_text(gpa, config_path, text, &diagnostic) catch |err| {
+    // Hostname endpoints resolve right here, once — the data path never
+    // does DNS (docs/DESIGN.md §1). A SIGHUP re-resolves via the successor.
+    var system_resolver = zoxy.config.SystemResolver{
+        .io = init.io,
+        .routable_fn = &address_routable,
+    };
+    var cfg = zoxy.config.load_text(
+        gpa,
+        config_path,
+        text,
+        &diagnostic,
+        system_resolver.resolver(),
+    ) catch |err| {
         if (diagnostic.adapt_message) |msg| {
             std.log.err("zoxy: invalid config {s}: line {d}: {s}", .{
                 config_path,
@@ -560,6 +572,26 @@ fn drain_and_join(
     std.log.info("zoxy: drained, exiting", .{});
 }
 
+/// Route probe for resolved endpoint addresses (ADDRCONFIG in spirit,
+/// RFC 6724-lite): a UDP connect makes the kernel do the route lookup
+/// without sending a packet. Filters AAAA answers on a v4-only host (and
+/// vice versa) so DNS expansion cannot install endpoints every dial would
+/// fail with ENETUNREACH — under the default policy (no retries, no
+/// ejection) such endpoints would 502 forever. Startup/reload only.
+fn address_routable(address: std.Io.net.IpAddress) bool {
+    const sa = zoxy.io.SocketAddress.from_ip(address);
+    const family: u32 = switch (address) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const rc = linux.socket(family, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    // No socket for the family at all (EAFNOSUPPORT: ipv6=off kernel).
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    return linux.errno(linux.connect(fd, @ptrCast(&sa), sa.length())) == .SUCCESS;
+}
+
 /// Handle one SIGHUP: re-read and strict-parse the config, then, if it is
 /// reloadable (same handoff socket, same listen address), fork+exec a successor
 /// that adopts our listeners while we drain. A bad edit or an unreloadable
@@ -581,7 +613,22 @@ fn reload_config(
         return reload_rejected(metrics);
     };
     var diagnostic: zoxy.config.Diagnostic = .{};
-    const new_cfg = zoxy.config.load_text(alloc, config_path, text, &diagnostic) catch |err| {
+    // Re-validate with real resolution: a hostname that no longer resolves
+    // must reject the reload here, not kill the successor mid-adoption.
+    // This blocks the supervisor loop — a pending SIGTERM waits — but the
+    // cost is bounded: one lookup per *distinct* hostname (the resolver
+    // memoizes), each capped by the resolv.conf timeout.
+    var system_resolver = zoxy.config.SystemResolver{
+        .io = io,
+        .routable_fn = &address_routable,
+    };
+    const new_cfg = zoxy.config.load_text(
+        alloc,
+        config_path,
+        text,
+        &diagnostic,
+        system_resolver.resolver(),
+    ) catch |err| {
         if (diagnostic.adapt_message) |msg| {
             std.log.err("zoxy: reload: invalid config: line {d}: {s}", .{
                 diagnostic.adapt_line,

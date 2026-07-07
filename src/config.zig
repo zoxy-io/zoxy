@@ -8,14 +8,273 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const maglev = @import("proxy/maglev.zig");
 const Ip4Address = std.Io.net.Ip4Address;
+const IpAddress = std.Io.net.IpAddress;
+const HostName = std.Io.net.HostName;
 
 /// The Zoxyfile DSL → JSON adapter (docs/DESIGN.md §7 Phase 6, slice 3). A
 /// human-authored surface that lowers to the JSON this module parses; reached
 /// via `load_text` on a non-`.json` path. JSON stays the single source of truth.
 pub const adapter = @import("config_adapter.zig");
 
+/// One resolved upstream address. Endpoint strings are IPv4 (`host:port`),
+/// IPv6 (`[host]:port`), or hostnames (`name:port`); a hostname resolves once
+/// at parse time — the only place allocation (and blocking DNS) is allowed —
+/// and each resolved address becomes its own endpoint.
 pub const Endpoint = struct {
-    address: Ip4Address,
+    address: IpAddress,
+};
+
+/// Hostname resolution seam for endpoint parsing. Injected so tests stay
+/// deterministic and offline tooling (`check-config`, `adapt`) never does
+/// DNS; `main` passes a real resolver built on `std.Io.net.HostName.lookup`
+/// (see `SystemResolver`). Resolution happens only at startup/reload — a
+/// re-resolve is a SIGHUP away (the successor re-parses the config).
+pub const Resolver = struct {
+    context: ?*anyopaque = null,
+    lookup_fn: *const fn (
+        context: ?*anyopaque,
+        host: []const u8,
+        port: u16,
+        out: []IpAddress,
+    ) LookupError!u32,
+
+    pub const LookupError = error{ HostnameUnsupported, LookupFailed, TooManyAddresses };
+
+    /// Rejects every hostname: IP literals only. The default for `parse`,
+    /// the simulator, and unit tests.
+    pub const literals_only: Resolver = .{ .lookup_fn = &lookup_unsupported };
+
+    /// Accepts syntactically valid hostnames without touching the network,
+    /// yielding a loopback placeholder. For offline validation tooling only —
+    /// the resulting `Config` must never serve traffic.
+    pub const validate_only: Resolver = .{ .lookup_fn = &lookup_placeholder };
+
+    pub fn lookup(
+        resolver: Resolver,
+        host: []const u8,
+        port: u16,
+        out: []IpAddress,
+    ) LookupError!u32 {
+        assert(host.len > 0);
+        assert(out.len <= constants.endpoints_per_cluster_max);
+        const count = try resolver.lookup_fn(resolver.context, host, port, out);
+        assert(count > 0); // no addresses is LookupFailed, never a zero count
+        assert(count <= out.len);
+        return count;
+    }
+
+    fn lookup_unsupported(
+        context: ?*anyopaque,
+        host: []const u8,
+        port: u16,
+        out: []IpAddress,
+    ) LookupError!u32 {
+        _ = context;
+        _ = host;
+        _ = port;
+        _ = out;
+        return error.HostnameUnsupported;
+    }
+
+    fn lookup_placeholder(
+        context: ?*anyopaque,
+        host: []const u8,
+        port: u16,
+        out: []IpAddress,
+    ) LookupError!u32 {
+        _ = context;
+        _ = host;
+        if (out.len == 0) return error.TooManyAddresses;
+        out[0] = .{ .ip4 = Ip4Address.loopback(port) };
+        return 1;
+    }
+};
+
+/// The real DNS resolver, backed by `std.Io.net.HostName.lookup`. Startup and
+/// reload only: it blocks and the `Io` implementation may allocate — exactly
+/// the budget config parsing already has. Keep the struct alive for as long
+/// as the `Resolver` handed out by `resolver()` is in use.
+pub const SystemResolver = struct {
+    io: std.Io,
+    /// Keep only resolved addresses this predicate accepts — ADDRCONFIG in
+    /// spirit. `main` injects a kernel route probe so a dual-stack DNS answer
+    /// cannot install endpoints an IPv4-only (or IPv6-only) host can never
+    /// dial; the default keeps everything (tests, non-Linux tooling). When
+    /// every address of a name is rejected, the lookup fails loudly.
+    routable_fn: *const fn (address: IpAddress) bool = &assume_routable,
+    /// One lookup per distinct hostname per parse: repeated names (the same
+    /// backend referenced from several clusters) reuse the first answer, so
+    /// startup cost is bounded by *distinct* names and every cluster expands
+    /// the same name to the same endpoint set.
+    cache: Cache = .{},
+
+    /// Queue buffer between the lookup task and the drain loop below. The
+    /// two run concurrently, so this bounds batching, not total results.
+    const results_max = 128;
+
+    pub fn resolver(system: *SystemResolver) Resolver {
+        return .{ .context = system, .lookup_fn = &system_lookup };
+    }
+
+    fn assume_routable(address: IpAddress) bool {
+        _ = address;
+        return true;
+    }
+
+    fn system_lookup(
+        context: ?*anyopaque,
+        host: []const u8,
+        port: u16,
+        out: []IpAddress,
+    ) Resolver.LookupError!u32 {
+        const system: *SystemResolver = @ptrCast(@alignCast(context.?));
+        assert(host.len > 0);
+        if (system.cache.find(host)) |cached| return copy_stamped(cached, port, out);
+        var results: [results_max]IpAddress = undefined;
+        const count = try system.lookup_host(host, &results);
+        assert(count > 0);
+        assert(count <= results.len);
+        const kept = filter_routable(system.routable_fn, results[0..count]);
+        // All addresses unroutable from this host (e.g. AAAA-only answer on
+        // a v4-only machine): fail the parse rather than install endpoints
+        // every dial would refuse.
+        if (kept == 0) return error.LookupFailed;
+        system.cache.insert(host, results[0..kept]);
+        return copy_stamped(results[0..kept], port, out);
+    }
+
+    /// One DNS/hosts lookup, port-less. The queue is drained *while* the
+    /// lookup task produces (std's own connect-to-host pattern): std only
+    /// guarantees `HostName.lookup` won't block on a queue with >=16 free
+    /// slots, and its /etc/hosts path can emit unboundedly — a concurrent
+    /// consumer is what makes that safe, not the buffer size.
+    fn lookup_host(
+        system: *SystemResolver,
+        host: []const u8,
+        results: []IpAddress,
+    ) Resolver.LookupError!u32 {
+        const name = HostName.init(host) catch return error.LookupFailed;
+        var buffer: [results_max]HostName.LookupResult = undefined;
+        var queue: std.Io.Queue(HostName.LookupResult) = .init(&buffer);
+        var lookup_task = system.io.async(HostName.lookup, .{
+            name,
+            system.io,
+            &queue,
+            .{ .port = 0 },
+        });
+        defer lookup_task.cancel(system.io) catch {};
+        var count: u32 = 0;
+        // Bounded: every turn either stores an address (capped by the
+        // early-return), consumes the single canonical-name record, or ends.
+        var turns: u32 = 0;
+        while (true) {
+            turns += 1;
+            if (turns > results.len * 2) return error.TooManyAddresses;
+            const result = queue.getOne(system.io) catch |err| switch (err) {
+                error.Closed => break, // producer finished; queue fully drained
+                // A canceled drain has NOT seen every result — a truncated
+                // address set must never pass as a successful resolution.
+                error.Canceled => return error.LookupFailed,
+            };
+            switch (result) {
+                .address => |address| {
+                    if (count == results.len) return error.TooManyAddresses;
+                    results[count] = address;
+                    count += 1;
+                },
+                .canonical_name => {},
+            }
+        }
+        lookup_task.await(system.io) catch return error.LookupFailed;
+        if (count == 0) return error.LookupFailed;
+        return count;
+    }
+
+    /// Compact `addresses` down to the routable ones, in place, preserving
+    /// order. Returns how many survive.
+    fn filter_routable(
+        routable_fn: *const fn (address: IpAddress) bool,
+        addresses: []IpAddress,
+    ) u32 {
+        var kept: u32 = 0;
+        for (addresses) |address| {
+            if (!routable_fn(address)) continue;
+            addresses[kept] = address;
+            kept += 1;
+        }
+        assert(kept <= addresses.len);
+        return kept;
+    }
+
+    /// Copy port-less cached/filtered addresses into `out` with `port`
+    /// stamped — the cache is keyed by host alone, so the same name on two
+    /// ports shares one lookup.
+    fn copy_stamped(
+        addresses: []const IpAddress,
+        port: u16,
+        out: []IpAddress,
+    ) Resolver.LookupError!u32 {
+        assert(addresses.len > 0);
+        if (addresses.len > out.len) return error.TooManyAddresses;
+        for (addresses, out[0..addresses.len]) |address, *stamped| {
+            stamped.* = with_port(address, port);
+        }
+        return @intCast(addresses.len);
+    }
+
+    fn with_port(address: IpAddress, port: u16) IpAddress {
+        var stamped = address;
+        switch (stamped) {
+            .ip4 => |*ip4| ip4.port = port,
+            .ip6 => |*ip6| ip6.port = port,
+        }
+        return stamped;
+    }
+
+    /// Fixed-slot host→addresses memo, filled during one parse. Overflowing
+    /// capacity just skips caching (correct, only slower); failures are
+    /// never cached (a transient DNS error must not poison later clusters).
+    const Cache = struct {
+        entries: [hosts_max]Entry = undefined,
+        count: u32 = 0,
+
+        /// Distinct hostnames one config realistically names; beyond this,
+        /// lookups are simply repeated.
+        const hosts_max = 64;
+
+        const Entry = struct {
+            host: [HostName.max_len]u8,
+            host_len: u8,
+            addresses: [constants.endpoints_per_cluster_max]IpAddress,
+            address_count: u8,
+        };
+
+        fn find(cache: *const Cache, host: []const u8) ?[]const IpAddress {
+            assert(cache.count <= hosts_max);
+            for (cache.entries[0..cache.count]) |*entry| {
+                if (!std.ascii.eqlIgnoreCase(entry.host[0..entry.host_len], host)) continue;
+                assert(entry.address_count > 0);
+                return entry.addresses[0..entry.address_count];
+            }
+            return null;
+        }
+
+        fn insert(cache: *Cache, host: []const u8, addresses: []const IpAddress) void {
+            assert(addresses.len > 0);
+            assert(cache.find(host) == null); // one lookup per distinct name
+            if (cache.count == hosts_max) return;
+            if (host.len > HostName.max_len) return;
+            if (addresses.len > constants.endpoints_per_cluster_max) return;
+            const entry = &cache.entries[cache.count];
+            @memcpy(entry.host[0..host.len], host);
+            entry.host_len = @intCast(host.len);
+            for (addresses, entry.addresses[0..addresses.len]) |address, *stored| {
+                stored.* = with_port(address, 0); // port-less: stamped on read
+            }
+            entry.address_count = @intCast(addresses.len);
+            cache.count += 1;
+        }
+    };
 };
 
 /// Sentinel for an unconfigured circuit-breaker limit: never trips.
@@ -167,6 +426,8 @@ pub const Config = struct {
 
 pub const ParseError = error{
     InvalidAddress,
+    HostnameUnsupported,
+    HostnameLookupFailed,
     UnknownCluster,
     NoClusters,
     TooManyClusters,
@@ -181,7 +442,7 @@ pub const ParseError = error{
 pub const AcceptMode = enum { reuseport, shared };
 
 /// A JSON Schema `pattern`/example hint for "host:port" IPv4 address strings
-/// (validated for real by `parse_address`; the pattern is a docs/editor hint).
+/// (validated for real by `parse_ip4_address`; the pattern is a docs/editor hint).
 const hostport_pattern = "^(\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}$";
 
 /// JSON shape mirrored 1:1 for decoding, then lowered into `Config`. Public so
@@ -203,13 +464,13 @@ pub const Dto = struct {
     pub const schema_fields = .{
         .@"$schema" = .{ .desc = "JSON Schema URL for editor completion; ignored by zoxy." },
         .listen = .{
-            .desc = "Address the proxy accepts connections on.",
+            .desc = "IPv4 address the proxy accepts connections on.",
             .format = "hostport",
             .pattern = hostport_pattern,
             .example = "0.0.0.0:8080",
         },
         .admin = .{
-            .desc = "Address of the admin/metrics endpoint; null disables it.",
+            .desc = "IPv4 address of the admin/metrics endpoint; null disables it.",
             .format = "hostport",
             .pattern = hostport_pattern,
             .example = "127.0.0.1:9901",
@@ -325,7 +586,11 @@ pub const Dto = struct {
         pub const schema_doc = "An upstream cluster: endpoints plus optional resilience policy.";
         pub const schema_fields = .{
             .name = .{ .desc = "Unique cluster name referenced by routes." },
-            .endpoints = .{ .desc = "Upstream endpoint addresses, each host:port." },
+            .endpoints = .{
+                .desc = "Upstream endpoint addresses: IPv4 host:port, IPv6 [host]:port, or " ++
+                    "hostname:port. Hostnames resolve once at startup (and again on SIGHUP " ++
+                    "reload); every resolved address becomes its own endpoint.",
+            },
             .tls = .{ .desc = "Re-encrypt traffic to this cluster's endpoints; null = plaintext." },
             .lb = .{ .desc = "Load-balancing policy; absent = P2C least-request." },
             .retry = .{ .desc = "Retry policy for failed attempts; absent = retries off." },
@@ -671,8 +936,9 @@ pub fn load_text(
     path: []const u8,
     text: []const u8,
     diag: *Diagnostic,
+    resolver: Resolver,
 ) LoadError!Config {
-    if (std.mem.endsWith(u8, path, ".json")) return parse_diagnostic(gpa, text, diag);
+    if (std.mem.endsWith(u8, path, ".json")) return parse_resolved(gpa, text, diag, resolver);
     var adapt_diag: adapter.Diagnostic = .{};
     const json = adapter.to_json(gpa, text, &adapt_diag) catch |err| {
         diag.adapt_line = adapt_diag.line;
@@ -680,7 +946,7 @@ pub fn load_text(
         return err;
     };
     defer gpa.free(json);
-    return parse_diagnostic(gpa, json, diag);
+    return parse_resolved(gpa, json, diag, resolver);
 }
 
 /// Parse without surfacing a diagnostic — the library stays quiet. Callers that
@@ -690,10 +956,21 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ParseError!Config {
     return parse_diagnostic(gpa, text, &diag);
 }
 
+/// IP-literal endpoints only: a hostname endpoint fails with
+/// `error.HostnameUnsupported`. Resolution needs `parse_resolved`.
 pub fn parse_diagnostic(
     gpa: std.mem.Allocator,
     text: []const u8,
     diag: *Diagnostic,
+) ParseError!Config {
+    return parse_resolved(gpa, text, diag, Resolver.literals_only);
+}
+
+pub fn parse_resolved(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    diag: *Diagnostic,
+    resolver: Resolver,
 ) ParseError!Config {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena);
@@ -721,12 +998,7 @@ pub fn parse_diagnostic(
     assert(clusters.len == dto.clusters.len);
     assert(clusters.len <= constants.clusters_max);
     for (dto.clusters, clusters, 0..) |dc, *cluster, index| {
-        // Per-endpoint resilience state is reserved statically per worker.
-        if (dc.endpoints.len > constants.endpoints_per_cluster_max) return error.TooManyEndpoints;
-        const endpoints = try a.alloc(Endpoint, dc.endpoints.len);
-        for (dc.endpoints, endpoints) |text_addr, *endpoint| {
-            endpoint.* = .{ .address = try parse_address(text_addr) };
-        }
+        const endpoints = try lower_endpoints(a, dc.endpoints, resolver);
         cluster.* = .{
             .name = try a.dupe(u8, dc.name),
             .endpoints = endpoints,
@@ -746,8 +1018,8 @@ pub fn parse_diagnostic(
     return .{
         .gpa = gpa,
         .arena = arena,
-        .listen = try parse_address(dto.listen),
-        .admin = if (dto.admin) |text_addr| try parse_address(text_addr) else null,
+        .listen = try parse_ip4_address(dto.listen),
+        .admin = if (dto.admin) |text_addr| try parse_ip4_address(text_addr) else null,
         .handoff = if (dto.handoff) |path| blk: {
             // Must fit sockaddr_un.path as a NUL-terminated string.
             const path_max = @typeInfo(
@@ -851,7 +1123,7 @@ fn lower_lb(
     } else {
         return error.InvalidLb;
     }
-    var addresses: [constants.endpoints_per_cluster_max]Ip4Address = undefined;
+    var addresses: [constants.endpoints_per_cluster_max]IpAddress = undefined;
     for (cluster.endpoints, addresses[0..cluster.endpoints.len]) |endpoint, *address| {
         address.* = endpoint.address;
     }
@@ -967,12 +1239,135 @@ fn find_cluster_in(clusters: []const Cluster, name: []const u8) ?*const Cluster 
     return null;
 }
 
-/// Parse "host:port" (IPv4) into an address.
-fn parse_address(text: []const u8) error{InvalidAddress}!Ip4Address {
+/// Parse "host:port" (IPv4) into an address. Listener-side addresses
+/// (`listen`, `admin`) stay IPv4: the listener/handoff/admin plumbing binds
+/// `sockaddr.in`. Endpoints go through `lower_endpoints` instead.
+fn parse_ip4_address(text: []const u8) error{InvalidAddress}!Ip4Address {
     const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.InvalidAddress;
     assert(colon < text.len); // lastIndexOfScalar returns an in-bounds index
     const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.InvalidAddress;
     return Ip4Address.parse(text[0..colon], port) catch return error.InvalidAddress;
+}
+
+/// What one endpoint string means: a literal address, or a name to resolve.
+const EndpointText = union(enum) {
+    literal: IpAddress,
+    hostname: struct { host: []const u8, port: u16 },
+};
+
+/// Classify an endpoint string. Three accepted shapes, port always explicit:
+/// `[v6]:port` (brackets mandatory per RFC 3986 — a bare v6 literal would be
+/// ambiguous with the port colon), `v4:port`, `hostname:port`.
+fn classify_endpoint(text: []const u8) error{InvalidAddress}!EndpointText {
+    if (text.len == 0) return error.InvalidAddress;
+    if (text[0] == '[') {
+        // Bracketed v6 literal; never a hostname (brackets are not name chars).
+        const close = std.mem.indexOfScalar(u8, text, ']') orelse return error.InvalidAddress;
+        if (close + 1 >= text.len or text[close + 1] != ':') return error.InvalidAddress;
+        const port = std.fmt.parseInt(u16, text[close + 2 ..], 10) catch
+            return error.InvalidAddress;
+        const address = std.Io.net.Ip6Address.parse(text[1..close], port) catch
+            return error.InvalidAddress;
+        // A link-local destination needs a zone index in the sockaddr
+        // (RFC 4007), and no literal syntax we accept can carry one — an
+        // unscoped fe80::/10 endpoint would validate here and then fail
+        // every single connect(2) with EINVAL. Reject it up front.
+        if (address.bytes[0] == 0xfe and (address.bytes[1] & 0xc0) == 0x80) {
+            return error.InvalidAddress;
+        }
+        return .{ .literal = .{ .ip6 = address } };
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.InvalidAddress;
+    const host = text[0..colon];
+    if (host.len == 0) return error.InvalidAddress;
+    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.InvalidAddress;
+    if (Ip4Address.parse(host, port)) |address| {
+        return .{ .literal = .{ .ip4 = address } };
+    } else |_| {
+        // Not a v4 literal. Digits-and-dots can only be a *malformed* v4
+        // literal ("10.0.0.256", "127.00.0.1", "1.2.3.4.5") — DNS would
+        // accept it as a name, but resolving a typo is a trap: reject it
+        // here instead of shipping it to a resolver (or, worse, having a
+        // wildcard search domain answer it).
+        if (all_digits_and_dots(host)) return error.InvalidAddress;
+        // A name, if it holds up syntactically. (An unbracketed v6 literal
+        // lands here too and is rejected: ':' is not a hostname character.)
+        HostName.validate(host) catch return error.InvalidAddress;
+        return .{ .hostname = .{ .host = host, .port = port } };
+    }
+}
+
+fn all_digits_and_dots(text: []const u8) bool {
+    assert(text.len > 0);
+    for (text) |char| {
+        if (char != '.' and !std.ascii.isDigit(char)) return false;
+    }
+    return true;
+}
+
+/// Lower a cluster's endpoint strings into resolved addresses. A hostname
+/// expands into one endpoint per resolved address (its block sorted, so the
+/// endpoint order — and with it maglev tables and outlier indices — does not
+/// depend on DNS answer order). The static bound holds *after* expansion:
+/// per-endpoint resilience state is reserved per worker.
+fn lower_endpoints(
+    a: std.mem.Allocator,
+    texts: []const []const u8,
+    resolver: Resolver,
+) ParseError![]Endpoint {
+    var addresses: [constants.endpoints_per_cluster_max]IpAddress = undefined;
+    var count: u32 = 0;
+    for (texts) |text| {
+        switch (try classify_endpoint(text)) {
+            .literal => |address| {
+                if (count == addresses.len) return error.TooManyEndpoints;
+                addresses[count] = address;
+                count += 1;
+            },
+            .hostname => |name| {
+                const added = resolver.lookup(
+                    name.host,
+                    name.port,
+                    addresses[count..],
+                ) catch |err| switch (err) {
+                    error.HostnameUnsupported => return error.HostnameUnsupported,
+                    error.LookupFailed => return error.HostnameLookupFailed,
+                    error.TooManyAddresses => return error.TooManyEndpoints,
+                };
+                assert(added > 0);
+                std.mem.sort(IpAddress, addresses[count..][0..added], {}, address_less_than);
+                count += added;
+            },
+        }
+    }
+    assert(count <= constants.endpoints_per_cluster_max);
+    const endpoints = try a.alloc(Endpoint, count);
+    for (addresses[0..count], endpoints) |address, *endpoint| {
+        endpoint.* = .{ .address = address };
+    }
+    return endpoints;
+}
+
+/// Total order over addresses: family, then bytes, then port. Only for
+/// making DNS expansion order deterministic — the values carry no meaning.
+fn address_less_than(_: void, a: IpAddress, b: IpAddress) bool {
+    const a_family = @intFromEnum(std.meta.activeTag(a));
+    const b_family = @intFromEnum(std.meta.activeTag(b));
+    if (a_family != b_family) return a_family < b_family;
+    switch (a) {
+        .ip4 => |a_ip4| {
+            const b_ip4 = b.ip4;
+            const order = std.mem.order(u8, &a_ip4.bytes, &b_ip4.bytes);
+            if (order != .eq) return order == .lt;
+            return a_ip4.port < b_ip4.port;
+        },
+        .ip6 => |a_ip6| {
+            const b_ip6 = b.ip6;
+            const order = std.mem.order(u8, &a_ip6.bytes, &b_ip6.bytes);
+            if (order != .eq) return order == .lt;
+            return a_ip6.port < b_ip6.port;
+        },
+    }
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -1005,8 +1400,221 @@ test "config: parses listen, routes, clusters" {
 
     const api = config.find_cluster("api").?;
     try std.testing.expectEqual(@as(usize, 2), api.endpoints.len);
-    try std.testing.expectEqual(@as(u16, 9002), api.endpoints[1].address.port);
+    try std.testing.expectEqual(@as(u16, 9002), api.endpoints[1].address.ip4.port);
     try std.testing.expect(config.find_cluster("nope") == null);
+}
+
+test "config: endpoint accepts a bracketed IPv6 literal" {
+    var config = try parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c",
+        \\    "endpoints": ["[::1]:9001", "[2001:db8::7]:9002", "127.0.0.1:9003"] }] }
+    );
+    defer config.deinit();
+
+    const cluster = config.find_cluster("c").?;
+    try std.testing.expectEqual(@as(usize, 3), cluster.endpoints.len);
+    const first = cluster.endpoints[0].address.ip6;
+    try std.testing.expectEqual(@as(u16, 9001), first.port);
+    try std.testing.expect(std.Io.net.Ip6Address.loopback(9001).eql(first));
+    const second = cluster.endpoints[1].address.ip6;
+    try std.testing.expectEqual(@as(u8, 0x20), second.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 7), second.bytes[15]);
+    try std.testing.expectEqual(@as(u16, 9002), second.port);
+    try std.testing.expectEqual(@as(u16, 9003), cluster.endpoints[2].address.ip4.port);
+}
+
+test "config: endpoint rejects malformed v6 and portless shapes" {
+    // Port is mandatory, brackets are mandatory for v6, junk is junk. A
+    // malformed v4 literal (digits-and-dots) must NOT fall through to the
+    // hostname path, and unscoped link-local v6 is undialable by
+    // construction (scope_id 0), so both are config errors.
+    const rejected = [_][]const u8{
+        "[::1]",          "[::1]:",          "[::1]:x",         "[::1:9001",
+        "::1:9001",       "1.2.3.4",         ":9001",           "[not-v6]:9001",
+        "[::1]:65536",    "10.0.0.256:8080", "127.00.0.1:8080", "1.2.3.4.5:8080",
+        "[fe80::1]:8080", "[febf::7]:8080",
+    };
+    for (rejected) |endpoint| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf,
+            \\{{ "listen": "0.0.0.0:80", "routes": [{{ "cluster": "c" }}],
+            \\  "clusters": [{{ "name": "c", "endpoints": ["{s}"] }}] }}
+        , .{endpoint});
+        try std.testing.expectError(error.InvalidAddress, parse(std.testing.allocator, text));
+    }
+}
+
+test "config: listen and admin stay IPv4-only" {
+    const listen_v6 = parse(std.testing.allocator,
+        \\{ "listen": "[::]:8080", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidAddress, listen_v6);
+
+    const admin_v6 = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:8080", "admin": "[::1]:9901",
+        \\  "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["127.0.0.1:9000"] }] }
+    );
+    try std.testing.expectError(error.InvalidAddress, admin_v6);
+}
+
+const hostname_test_config =
+    \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+    \\  "clusters": [{ "name": "c",
+    \\    "endpoints": ["backend.internal:9001", "127.0.0.1:9000"] }] }
+;
+
+test "config: hostname endpoints fail without a resolver" {
+    try std.testing.expectError(
+        error.HostnameUnsupported,
+        parse(std.testing.allocator, hostname_test_config),
+    );
+}
+
+test "config: hostname endpoints reject invalid names outright" {
+    // An underscore is not a hostname character: rejected before any lookup.
+    const bad = parse(std.testing.allocator,
+        \\{ "listen": "0.0.0.0:80", "routes": [{ "cluster": "c" }],
+        \\  "clusters": [{ "name": "c", "endpoints": ["bad_host:9001"] }] }
+    );
+    try std.testing.expectError(error.InvalidAddress, bad);
+}
+
+/// Test stand-in for DNS: every name resolves to two fixed addresses,
+/// deliberately handed back in reverse order to prove expansion sorts.
+fn test_lookup(
+    context: ?*anyopaque,
+    host: []const u8,
+    port: u16,
+    out: []IpAddress,
+) Resolver.LookupError!u32 {
+    _ = context;
+    std.debug.assert(host.len > 0);
+    if (out.len < 2) return error.TooManyAddresses;
+    out[0] = .{ .ip6 = std.Io.net.Ip6Address.loopback(port) };
+    out[1] = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 2 }, .port = port } };
+    return 2;
+}
+
+test "config: a hostname endpoint expands into sorted resolved endpoints" {
+    var diag: Diagnostic = .{};
+    var config = try parse_resolved(
+        std.testing.allocator,
+        hostname_test_config,
+        &diag,
+        .{ .lookup_fn = &test_lookup },
+    );
+    defer config.deinit();
+
+    const cluster = config.find_cluster("c").?;
+    try std.testing.expectEqual(@as(usize, 3), cluster.endpoints.len);
+    // The resolver returned (v6, v4); the expanded block is sorted v4-first.
+    const expanded_v4 = cluster.endpoints[0].address.ip4;
+    try std.testing.expectEqual(@as(u8, 10), expanded_v4.bytes[0]);
+    try std.testing.expectEqual(@as(u16, 9001), expanded_v4.port);
+    const expanded_v6 = cluster.endpoints[1].address.ip6;
+    try std.testing.expect(std.Io.net.Ip6Address.loopback(9001).eql(expanded_v6));
+    // The literal endpoint after the hostname keeps its place.
+    try std.testing.expectEqual(@as(u16, 9000), cluster.endpoints[2].address.ip4.port);
+}
+
+test "config: hostname expansion respects endpoints_per_cluster_max" {
+    // Every entry expands to 2 addresses; enough hostname entries overflow.
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try w.print(
+        \\{{ "listen": "0.0.0.0:80", "routes": [{{ "cluster": "c" }}],
+        \\  "clusters": [{{ "name": "c", "endpoints": [
+    , .{});
+    const entries = constants.endpoints_per_cluster_max / 2 + 1;
+    for (0..entries) |index| {
+        if (index > 0) try w.print(",", .{});
+        try w.print("\"host{d}.internal:9001\"", .{index});
+    }
+    try w.print("] }}] }}", .{});
+
+    var diag: Diagnostic = .{};
+    const overflow = parse_resolved(
+        std.testing.allocator,
+        w.buffered(),
+        &diag,
+        .{ .lookup_fn = &test_lookup },
+    );
+    try std.testing.expectError(error.TooManyEndpoints, overflow);
+}
+
+test "config: SystemResolver cache memoizes case-insensitively, stamps ports" {
+    var cache = SystemResolver.Cache{};
+    try std.testing.expect(cache.find("backend.internal") == null);
+
+    const resolved = [2]IpAddress{
+        .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 2 }, .port = 9001 } },
+        .{ .ip6 = std.Io.net.Ip6Address.loopback(9001) },
+    };
+    cache.insert("backend.internal", &resolved);
+    try std.testing.expectEqual(@as(u32, 1), cache.count);
+
+    // Hit (case-insensitive, RFC 5890), stored port-less.
+    const hit = cache.find("Backend.INTERNAL").?;
+    try std.testing.expectEqual(@as(usize, 2), hit.len);
+    try std.testing.expectEqual(@as(u16, 0), hit[0].ip4.port);
+
+    // A second port on the same name reuses the entry; stamping restores it.
+    var out: [4]IpAddress = undefined;
+    const count = try SystemResolver.copy_stamped(hit, 8443, &out);
+    try std.testing.expectEqual(@as(u32, 2), count);
+    try std.testing.expectEqual(@as(u16, 8443), out[0].ip4.port);
+    try std.testing.expectEqual(@as(u16, 8443), out[1].ip6.port);
+    try std.testing.expectEqual(@as(u8, 10), out[0].ip4.bytes[0]);
+
+    // Too small an out slice is an error, never a truncation.
+    var tiny: [1]IpAddress = undefined;
+    try std.testing.expectError(
+        error.TooManyAddresses,
+        SystemResolver.copy_stamped(hit, 8443, &tiny),
+    );
+}
+
+test "config: SystemResolver routability filter compacts in order, keeps none" {
+    const reject_v6 = struct {
+        fn routable(address: IpAddress) bool {
+            return address == .ip4;
+        }
+    }.routable;
+    var addresses = [3]IpAddress{
+        .{ .ip6 = std.Io.net.Ip6Address.loopback(1) },
+        .{ .ip4 = .loopback(2) },
+        .{ .ip4 = .loopback(3) },
+    };
+    const kept = SystemResolver.filter_routable(&reject_v6, &addresses);
+    try std.testing.expectEqual(@as(u32, 2), kept);
+    try std.testing.expectEqual(@as(u16, 2), addresses[0].ip4.port);
+    try std.testing.expectEqual(@as(u16, 3), addresses[1].ip4.port);
+
+    const reject_all = struct {
+        fn routable(address: IpAddress) bool {
+            _ = address;
+            return false;
+        }
+    }.routable;
+    const none = SystemResolver.filter_routable(&reject_all, &addresses);
+    try std.testing.expectEqual(@as(u32, 0), none);
+}
+
+test "config: the validate_only resolver accepts hostnames offline" {
+    var diag: Diagnostic = .{};
+    var config = try parse_resolved(
+        std.testing.allocator,
+        hostname_test_config,
+        &diag,
+        Resolver.validate_only,
+    );
+    defer config.deinit();
+    const cluster = config.find_cluster("c").?;
+    try std.testing.expectEqual(@as(usize, 2), cluster.endpoints.len);
+    try std.testing.expectEqual(@as(u16, 9001), cluster.endpoints[0].address.ip4.port);
 }
 
 test "config: admin endpoint is optional and parses when present" {
@@ -1444,7 +2052,13 @@ test "config: find_unknown_field names the offending path" {
 
 test "config: load_text parses a .json path directly" {
     var diag: Diagnostic = .{};
-    var config = try load_text(std.testing.allocator, "zoxy.json", test_config, &diag);
+    var config = try load_text(
+        std.testing.allocator,
+        "zoxy.json",
+        test_config,
+        &diag,
+        Resolver.literals_only,
+    );
     defer config.deinit();
     try std.testing.expect(config.find_cluster("api") != null);
 }
@@ -1471,7 +2085,7 @@ test "config: load_text adapts a Zoxyfile DSL end to end" {
         \\cluster web {
         \\    endpoints 127.0.0.1:9000
         \\}
-    , &diag);
+    , &diag, Resolver.literals_only);
     defer config.deinit();
 
     try std.testing.expectEqual(@as(u16, 8080), config.listen.port);
@@ -1505,7 +2119,7 @@ test "config: load_text surfaces a DSL syntax error with a line" {
         \\cluster c {
         \\    frobnicate 1
         \\}
-    , &diag);
+    , &diag, Resolver.literals_only);
     try std.testing.expectError(error.UnknownDirective, result);
     try std.testing.expect(diag.adapt_message != null);
     try std.testing.expectEqual(@as(u32, 4), diag.adapt_line);
@@ -1516,7 +2130,7 @@ test "config: load_text still reports JSON unknown fields on a .json path" {
     const result = load_text(std.testing.allocator, "zoxy.json",
         \\{ "listen": "0.0.0.0:80", "routes": [], "clusters": [],
         \\  "handofff": "/x" }
-    , &diag);
+    , &diag, Resolver.literals_only);
     try std.testing.expectError(error.UnknownField, result);
     try std.testing.expect(diag.unknown_field != null);
 }
