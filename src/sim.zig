@@ -544,9 +544,14 @@ fn dump_pool(pool: *ConnPool) void {
                 "upstream_fd={d} " ++
                 "outcome={s} request_active={} upstream_close_pending={}\n",
             .{
-                conn.refs,           conn.closing,                conn.timeout_armed,
-                conn.downstream_fd,  conn.upstream_fd,            @tagName(conn.outcome),
-                conn.request_active, conn.upstream_close_pending,
+                conn.refs,
+                conn.connection_flags.closing,
+                conn.connection_flags.timeout_armed,
+                conn.downstream_fd,
+                conn.upstream_fd,
+                @tagName(conn.outcome),
+                conn.request_flags.request_active,
+                conn.connection_flags.upstream_close_pending,
             },
         );
     }
