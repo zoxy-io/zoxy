@@ -300,9 +300,12 @@ several runs, not single numbers.
 
 ## Architecture
 
-Design rationale and the Zig-0.16 findings behind these choices are in
-[`docs/DESIGN.md`](docs/DESIGN.md); the coding conventions are in
-[`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md).
+The runtime architecture and request control flow — process/thread topology,
+the completion-I/O model, and the per-connection state machine (HTTP/1.1 and
+HTTP/2, plaintext and TLS) — are documented, with diagrams, in
+[`ARCHITECTURE.md`](ARCHITECTURE.md). Design rationale and the Zig-0.16
+findings behind these choices are in [`docs/DESIGN.md`](docs/DESIGN.md); the
+coding conventions are in [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md).
 
 ## License
 
