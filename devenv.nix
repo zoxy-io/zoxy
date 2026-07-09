@@ -8,7 +8,6 @@
     [
       pkgs.zig_0_16
       pkgs.zls
-      pkgs.nghttp2 # provides h2load, the bench load generator
     ]
     ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.kcov;
 }
