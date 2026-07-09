@@ -1,5 +1,5 @@
 {
-  description = "zoxy — a zero-allocation L7 edge proxy in Zig (Linux only)";
+  description = "zoxy — a zero-allocation L4/L7 edge proxy in Zig";
 
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
 

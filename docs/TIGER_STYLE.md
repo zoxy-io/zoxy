@@ -29,7 +29,6 @@ and the **proxy-specific deltas**. When in doubt, read the original.
 - **Explicitly-sized integers** (`u32`, `u63`, …). Avoid `usize` except for real
   machine-word/index quantities.
 - **Functions ≤ 70 lines.** Hard limit.
-- **Lines ≤ 100 columns.** Hard limit, no exceptions.
 - **4-space indentation.** `zig fmt` clean; trailing comma on wrapped signatures.
 - **Braces on every `if`** unless it fits on one line (defense against
   `goto fail;`-class bugs).
