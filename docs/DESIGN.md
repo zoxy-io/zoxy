@@ -310,7 +310,15 @@ Three shared pools, all owned and touched only by the loop thread:
    not for open connections.
 3. **Upstream connections — `Pool(Upstream)` + per-endpoint idle lists.**
    Checked out by any request, parked on keep-alive, one shared pool for
-   the whole process (§3: the Pingora reuse win).
+   the whole process (§3: the Pingora reuse win). **A parked upstream has
+   no armed op** — deliberately no per-connection poll, which would cost
+   an in-flight op per idle upstream in the ring budget (§8) for a race
+   that is already covered: the parked connection's deadline timer serves
+   as an idle timeout (kept below typical origin keep-alive windows, so
+   most origin-side closes are pre-empted), a close that slips through is
+   detected at checkout and absorbed by the stale-replay rung (§7), and
+   active health checks — when they land (§10) — close the parked
+   connections of ejected endpoints.
 
 Sizing shape (illustrative defaults, all tunable):
 
