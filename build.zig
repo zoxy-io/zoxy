@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "xev", .module = xev_module },
         },
     });
+    // The shipped example config is embedded so tests and the fuzz corpus
+    // stay in sync with the file users actually copy.
+    zoxy_module.addAnonymousImport("example_config", .{
+        .root_source_file = b.path("config/example.json"),
+    });
 
     const exe = b.addExecutable(.{
         .name = "zoxy",

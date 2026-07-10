@@ -50,6 +50,10 @@ pub const clusters_max: u16 = 16;
 /// Upper bound on endpoints in one cluster.
 pub const endpoints_per_cluster_max: u16 = 64;
 
+/// Upper bound on every configured timeout — one hour. A timeout above
+/// this is almost certainly a units mistake in the config.
+pub const timeout_ms_max: u32 = 3_600_000;
+
 /// Worst-case in-flight ring ops (§8: the ring is pre-budgeted, not shed):
 /// every admitted connection at its op peak, one armed accept per
 /// listener, plus the single async wakeup op for signals.
@@ -77,6 +81,7 @@ comptime {
     assert(endpoints_per_cluster_max >= 1);
     assert(loop_completions_per_tick_max >= 1);
     assert(config_bytes_max >= 1024);
+    assert(timeout_ms_max >= 1000);
 }
 
 /// Total pool memory as a closed-form function of the limits. Slot sizes

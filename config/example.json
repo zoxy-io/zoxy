@@ -1,0 +1,13 @@
+{
+    "listeners": [
+        { "bind": "127.0.0.1:8080", "cluster": "origin" }
+    ],
+    "clusters": {
+        "origin": { "endpoints": ["127.0.0.1:9000"] }
+    },
+    "timeouts": {
+        "connect_ms": 5000,
+        "idle_ms": 60000,
+        "drain_deadline_ms": 10000
+    }
+}
