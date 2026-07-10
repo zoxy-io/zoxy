@@ -261,7 +261,7 @@ test "sim: a recv that can never complete is a detected deadlock" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var sim_io: SimIo = undefined;
-    try sim_io.init(arena_state.allocator(), .{ .seed = 13 });
+    try sim_io.init(arena_state.allocator(), .{ .seed = 13, .dump_on_deadlock = false });
 
     var pair: PairScenario = .{ .io = &sim_io };
     try pair.establish();

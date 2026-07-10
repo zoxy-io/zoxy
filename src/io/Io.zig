@@ -13,6 +13,9 @@
 //!   listenClose(io, listener) void                      (sync; cancels accept)
 //!   accept(io, listener, c, U, u, cb(u, AcceptError!Socket))
 //!   connect(io, address, c, U, u, cb(u, ConnectError!Socket))
+//!   connectCancel(io, connect_c, cancel_c, U, u, cb(u))  (teardown of a
+//!       pending connect — a black-holed dial must still reach a terminal
+//!       completion or its slot could never be released, §5)
 //!   recv(io, socket, buffer, c, U, u, cb(u, RecvError!u32))
 //!   send(io, socket, bytes, c, U, u, cb(u, SendError!u32))
 //!   close(io, socket, c, U, u, cb(u))
@@ -105,6 +108,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "listenClose",
             "accept",
             "connect",
+            "connectCancel",
             "recv",
             "send",
             "close",

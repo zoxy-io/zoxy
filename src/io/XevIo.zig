@@ -222,6 +222,34 @@ pub fn connect(
     }).adapter);
 }
 
+/// Teardown of a pending connect (§5): IORING_OP_ASYNC_CANCEL on the
+/// connect op, so even a black-holed dial reaches a terminal completion
+/// (error.Canceled) and its slot can be released.
+pub fn connectCancel(
+    io: *XevIo,
+    connect_completion: *Completion,
+    cancel_completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata) void,
+) void {
+    io.loop.cancel(connect_completion, cancel_completion, Userdata, userdata, (struct {
+        fn adapter(
+            context: ?*Userdata,
+            loop: *xev.Loop,
+            inner_completion: *xev.Completion,
+            result: xev.CancelError!void,
+        ) xev.CallbackAction {
+            _ = loop;
+            _ = inner_completion;
+            // NotFound: the connect already completed — a legal race.
+            result catch {};
+            callback(context.?);
+            return .disarm;
+        }
+    }).adapter);
+}
+
 pub fn recv(
     io: *XevIo,
     socket: Socket,

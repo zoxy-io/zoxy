@@ -49,8 +49,13 @@ now_ns_value: u64,
 prng: std.Random.DefaultPrng,
 adversary: Adversary,
 stopped: bool,
+dump_on_deadlock: bool,
 /// FNV-1a over every delivery; two runs of one seed must end equal (§9).
 trace_hash: u64,
+blackholed_addresses: [blackholed_addresses_max]std.Io.net.IpAddress,
+blackholed_count: u8,
+
+const blackholed_addresses_max: u8 = 4;
 
 pub const Adversary = struct {
     /// Bias deliveries toward 1-byte and full-length reads/writes.
@@ -66,6 +71,9 @@ pub const Adversary = struct {
 pub const Options = struct {
     seed: u64,
     adversary: Adversary = .{},
+    /// Print pending-op forensics when a deadlock is detected. Tests
+    /// that deliberately provoke a deadlock turn this off.
+    dump_on_deadlock: bool = true,
 };
 
 pub const Socket = packed struct(u32) {
@@ -91,12 +99,13 @@ pub const Completion = struct {
 const Op = union(enum) {
     none,
     accept: struct { listener_index: u16 },
-    connect: struct { address: std.Io.net.IpAddress, fate: ConnectFate },
+    connect: struct { address: std.Io.net.IpAddress, fate: ConnectFate, canceled: bool },
     recv: struct { socket: Socket, buffer: []u8 },
     send: struct { socket: Socket, bytes: []const u8 },
     close: struct { socket: Socket },
     timer: struct { fire_at_ns: u64, canceled: bool },
     timer_cancel: struct { target: *Completion },
+    connect_cancel: struct { target: *Completion },
 };
 
 const ConnectFate = enum(u8) { succeed, refuse, blackhole };
@@ -109,6 +118,7 @@ const Result = union(enum) {
     close: void,
     timer: Io.TimerError!void,
     timer_cancel: void,
+    connect_cancel: void,
 };
 
 const ErasedCallback = *const fn (?*anyopaque, *const Result) void;
@@ -189,8 +199,21 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.prng = std.Random.DefaultPrng.init(options.seed);
     io.adversary = options.adversary;
     io.stopped = false;
+    io.dump_on_deadlock = options.dump_on_deadlock;
     io.trace_hash = 0xcbf29ce484222325;
+    io.blackholed_addresses = undefined;
+    io.blackholed_count = 0;
     assert(io.sockets.isFullyReleased());
+}
+
+/// Targeted scenario control: every connect to this address black-holes
+/// (never completes), regardless of the percent knobs. Directed tests
+/// use this to pin one dial while the adversary stays off the harness's
+/// own connects.
+pub fn blackholeAddress(io: *SimIo, address: std.Io.net.IpAddress) void {
+    assert(io.blackholed_count < blackholed_addresses_max);
+    io.blackholed_addresses[io.blackholed_count] = address;
+    io.blackholed_count += 1;
 }
 
 pub fn listen(io: *SimIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
@@ -273,7 +296,9 @@ pub fn connect(
     const random = io.prng.random();
     const roll = random.uintLessThan(u8, 100);
     var fate: ConnectFate = .succeed;
-    if (roll < io.adversary.connect_blackhole_percent) {
+    if (io.isBlackholed(address)) {
+        fate = .blackhole;
+    } else if (roll < io.adversary.connect_blackhole_percent) {
         fate = .blackhole;
     } else if (roll < io.adversary.connect_blackhole_percent + io.adversary.connect_refuse_percent) {
         fate = .refuse;
@@ -283,7 +308,7 @@ pub fn connect(
     else
         random.uintAtMost(u64, io.adversary.connect_delay_ns_max);
     completion.* = .{
-        .op = .{ .connect = .{ .address = address, .fate = fate } },
+        .op = .{ .connect = .{ .address = address, .fate = fate, .canceled = false } },
         .ready_at_ns = if (fate == .blackhole) never_ns else io.now_ns_value + delay_ns,
         .userdata = userdata,
         .callback = (struct {
@@ -418,6 +443,36 @@ pub fn timerCancel(
     io.enqueue(cancel_completion);
 }
 
+/// Teardown of a pending connect (§5): even a black-holed dial must
+/// reach a terminal completion (error.Canceled), or the slot owning the
+/// connect op could never be released. Canceling an already-completed
+/// connect is legal — the cancel still delivers.
+pub fn connectCancel(
+    io: *SimIo,
+    connect_completion: *Completion,
+    cancel_completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata) void,
+) void {
+    assert(cancel_completion.state == .dead);
+    assert(connect_completion != cancel_completion);
+    if (connect_completion.state == .pending) {
+        assert(connect_completion.op == .connect);
+    }
+    cancel_completion.* = .{
+        .op = .{ .connect_cancel = .{ .target = connect_completion } },
+        .userdata = userdata,
+        .callback = (struct {
+            fn erased(context: ?*anyopaque, result: *const Result) void {
+                assert(result.* == .connect_cancel);
+                callback(@ptrCast(@alignCast(context.?)));
+            }
+        }).erased,
+    };
+    io.enqueue(cancel_completion);
+}
+
 /// Persistent waiter: every delivered signal invokes the callback; it
 /// stays armed. One waiter per loop (the Server).
 pub fn signalWait(
@@ -496,6 +551,9 @@ pub fn run(io: *SimIo) Io.RunError!void {
             }
             const wake_ns = io.earliestWakeNs();
             if (wake_ns == never_ns) {
+                if (io.dump_on_deadlock) {
+                    io.dumpPendingOps();
+                }
                 return error.Deadlock;
             }
             assert(wake_ns > io.now_ns_value);
@@ -504,6 +562,28 @@ pub fn run(io: *SimIo) Io.RunError!void {
         }
         io.deliverBatch(ready);
         io.maybeInjectReset();
+    }
+}
+
+/// Deadlock forensics: what is stuck, on which socket, in which state.
+fn dumpPendingOps(io: *const SimIo) void {
+    std.debug.print("SimIo deadlock: {d} pending op(s) can never become ready\n", .{
+        io.pending_count,
+    });
+    for (io.pending[0..io.pending_count]) |completion| {
+        switch (completion.op) {
+            .recv => |op| std.debug.print(
+                "  recv socket={d} gen={d}\n",
+                .{ op.socket.index, op.socket.generation },
+            ),
+            .send => |op| std.debug.print(
+                "  send socket={d} gen={d} len={d}\n",
+                .{ op.socket.index, op.socket.generation, op.bytes.len },
+            ),
+            .accept => |op| std.debug.print("  accept listener={d}\n", .{op.listener_index}),
+            .connect => |op| std.debug.print("  connect fate={s}\n", .{@tagName(op.fate)}),
+            else => std.debug.print("  {s}\n", .{@tagName(completion.op)}),
+        }
     }
 }
 
@@ -547,7 +627,7 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
             const entry = &io.listeners[op.listener_index];
             break :ready !entry.active or entry.accept_queue_len > 0;
         },
-        .connect => io.now_ns_value >= completion.ready_at_ns,
+        .connect => |op| op.canceled or io.now_ns_value >= completion.ready_at_ns,
         .recv => |op| ready: {
             const entry = io.socketEntry(op.socket);
             break :ready entry.reset or entry.inbox.count > 0 or
@@ -558,7 +638,7 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
             if (entry.reset or entry.peer == peer_none) break :ready true;
             break :ready io.peerEntry(entry).inbox.freeSpace() > 0;
         },
-        .close, .timer_cancel => true,
+        .close, .timer_cancel, .connect_cancel => true,
         .timer => |op| op.canceled or io.now_ns_value >= op.fire_at_ns,
     };
 }
@@ -583,7 +663,9 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
     const result: Result = switch (completion.op) {
         .none => unreachable,
         .accept => |op| .{ .accept = io.finishAccept(op.listener_index) },
-        .connect => |op| .{ .connect = io.finishConnect(op.address, op.fate) },
+        .connect => |op| .{
+            .connect = if (op.canceled) error.Canceled else io.finishConnect(op.address, op.fate),
+        },
         .recv => |op| .{ .recv = io.finishRecv(op.socket, op.buffer) },
         .send => |op| .{ .send = io.finishSend(op.socket, op.bytes) },
         .close => |op| close: {
@@ -597,6 +679,13 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
                 op.target.op.timer.canceled = true;
             }
             break :cancel .{ .timer_cancel = {} };
+        },
+        .connect_cancel => |op| cancel: {
+            if (op.target.state == .pending) {
+                assert(op.target.op == .connect);
+                op.target.op.connect.canceled = true;
+            }
+            break :cancel .{ .connect_cancel = {} };
         },
     };
     io.traceMix(completion, &result);
@@ -767,6 +856,15 @@ fn socketHandle(io: *SimIo, entry: *SocketEntry) Socket {
     };
 }
 
+fn isBlackholed(io: *const SimIo, address: std.Io.net.IpAddress) bool {
+    for (io.blackholed_addresses[0..io.blackholed_count]) |blackholed| {
+        if (std.meta.eql(blackholed, address)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn findListener(io: *SimIo, address: std.Io.net.IpAddress) ?*ListenerEntry {
     for (io.listeners[0..io.listeners_count]) |*entry| {
         if (entry.active and std.meta.eql(entry.address, address)) {
@@ -821,6 +919,7 @@ fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) vo
         .timer => |r| if (r) |_| 5000 else |err| 5001 + @intFromError(err),
         .close => 6000,
         .timer_cancel => 7000,
+        .connect_cancel => 8000,
     };
     io.mix(detail);
 }

@@ -646,6 +646,8 @@ Each phase ships behind all four gates of §9.
 ```
 src/
   main.zig            // startup: config → reserve pools → print memory → run loop
+  Server.zig          // composition root: pools, listeners, admission, teardown;
+                      // generic over Io so the simulator instantiates it whole
   constants.zig       // every static limit; total memory is f(these)
   config.zig          // strict JSON → arena-owned immutable Config
   io/
