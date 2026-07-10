@@ -27,4 +27,5 @@ test {
     _ = @import("io/sim_io_test.zig");
     _ = @import("io/xev_smoke_test.zig");
     _ = @import("server_test.zig");
+    _ = @import("zero_alloc_test.zig");
 }

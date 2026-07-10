@@ -635,7 +635,9 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
         },
         .send => |op| ready: {
             const entry = io.socketEntry(op.socket);
-            if (entry.reset or entry.peer == peer_none) break :ready true;
+            if (entry.reset or entry.write_shutdown or entry.peer == peer_none) {
+                break :ready true;
+            }
             break :ready io.peerEntry(entry).inbox.freeSpace() > 0;
         },
         .close, .timer_cancel, .connect_cancel => true,
@@ -751,9 +753,14 @@ fn finishRecv(io: *SimIo, socket: Socket, buffer: []u8) Io.RecvError!u32 {
 
 fn finishSend(io: *SimIo, socket: Socket, bytes: []const u8) Io.SendError!u32 {
     const entry = io.socketEntry(socket);
-    assert(!entry.write_shutdown);
     if (entry.reset) {
         return error.Reset;
+    }
+    if (entry.write_shutdown) {
+        // A send that was already in flight when the teardown shut the
+        // write side down (§2: shutdown flushes pending ops); the kernel
+        // answers EPIPE.
+        return error.Unexpected;
     }
     if (entry.peer == peer_none) {
         // The peer fully closed: real TCP answers a send with RST.

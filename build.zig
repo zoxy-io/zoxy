@@ -66,7 +66,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&lint_tests.step);
 
-    const sim_step = b.step("sim", "Deterministic simulation (inert until slice 10)");
+    const sim_exe = b.addExecutable(.{
+        .name = "zoxy-sim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sim/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zoxy", .module = zoxy_module },
+            },
+        }),
+    });
+    const sim_run = b.addRunArtifact(sim_exe);
+    if (b.args) |args| {
+        sim_run.addArgs(args);
+    }
+    const sim_step = b.step("sim", "Deterministic simulation: -- [seed] [iterations] | fuzz");
+    sim_step.dependOn(&sim_run.step);
 
     const lint_run = b.addRunArtifact(lint_exe);
     lint_run.addDirectoryArg(b.path("src"));
