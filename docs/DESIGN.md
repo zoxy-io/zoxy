@@ -236,7 +236,10 @@ takes its recorded exceptions here, and both are pure Zig, vendored by
 content hash in `build.zig.zon`: **libxev** (this section) and **hparse**
 (the HTTP/1.1 head parser, §7). No C-FFI dependency exists in the codebase;
 any future one (a TLS stack is the known candidate, §10 Phase 3) is a
-separate deliberate decision, not a default.
+separate deliberate decision, not a default. The pinned hash is an
+*audited commit*, never a branch tip — libxev's Zig 0.16 support is a
+self-described compatibility shim (PR #220) with real fixes still
+unmerged behind it, so the pin moves only after re-audit.
 
 - **Caller-owned completions.** Every `xev.Completion` is embedded inline
   in the connection slot; submitting an op writes it in place. Zero
@@ -284,7 +287,10 @@ separate deliberate decision, not a default.
   callback inline.
 - **Clock.** `Io.now_ns` is refreshed once per loop tick (the previous
   iteration measured per-callback `clock_gettime` at ~3% of data-path CPU)
-  and is the seam the simulator's virtual clock replaces.
+  and is the seam the simulator's virtual clock replaces. Anything
+  computed from it may be stale by up to one tick's completion batch —
+  deadline logic must stay correct under that bound, and the simulator
+  makes the staleness adversarial (§9).
 - **Deadlines.** One timer per connection holding an *absolute* deadline.
   A state transition only *stores* the new deadline value — the armed op
   is never touched. When the timer fires, the callback compares the
@@ -482,9 +488,11 @@ the loop thread.
 | request deadline | timer completion | `504` if no response byte sent, else teardown |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
-- **Static error responses.** `503`/`504`/`431`/`414`/`400` bodies are
-  comptime byte arrays written from the connection's own head buffer —
-  shedding costs one send, no allocation.
+- **Static error responses.** `503`/`504`/`431`/`414`/`400` are comptime
+  byte arrays sent directly from static memory — never staged through
+  the connection's head buffer, whose bytes the parsed head's zero-copy
+  slices may still reference (§7). Shedding costs one send, no
+  allocation, no copy.
 - **Accept never pauses.** Accept-and-RST is preferred over un-arming the
   accept: the kernel backlog stays drained, clients get an immediate
   signal instead of a timeout, and there is no re-arm state machine.
@@ -496,7 +504,10 @@ the loop thread.
   by the loop thread as a relaxed atomic — one writer, any number of
   readers, so a metrics/admin thread can read without a data race and
   single-writer stays intact. The simulator asserts counters reconcile
-  (admitted = completed + shed + in-flight) under every seed.
+  (admitted = completed + shed + in-flight) under every seed. Counters
+  live in `counters.zig` (§11); Phase 0 exposure is a SIGUSR1-triggered
+  dump (through the seam's `signal` primitive, §4) — the admin plane
+  stays deferred (§10).
 - **File descriptors are pre-budgeted, not shed.** Worst-case fd count is
   closed-form — listeners + connection slots + upstream slots + ring,
   async and signal fds — computed from `src/constants.zig` and asserted
@@ -558,7 +569,8 @@ a feature without its gate is not done.
      (counter deltas on shared runners are noise) — the Tier-1 band is
      what merges are held to. hyperfine is not used: wall-time-only, and
      poop subsumes it on Linux.
-   - **Tier 1 (CI gate) — `bench/run.sh`, loopback.** nginx origin, direct
+   - **Tier 1 (CI gate) — `bench/run.zig`, loopback.** (Tooling in Zig,
+     per TIGER_STYLE — no shell harness.) nginx origin, direct
      baseline vs proxied path (L4 and L7, keep-alive and
      `Connection: close`), roles pinned to disjoint cores. Compare *bands*
      across runs, never single numbers (p50 swings 3× between identical
@@ -639,6 +651,7 @@ src/
     proxy.zig         // L7 state machine over phases
   phases.zig          // admit / route / upstream_pick / settle
   shed.zig            // exhaustion ladder: decisions + static responses
+  counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
   worker.zig          // SPMC job queue + SPSC completion rings (Phase 3)
 sim/                  // simulator harness + invariants
 bench/                // micro benches (poop) + loopback harness (zrk), §9
