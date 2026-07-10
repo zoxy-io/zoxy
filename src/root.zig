@@ -5,8 +5,10 @@
 const std = @import("std");
 
 pub const constants = @import("constants.zig");
+pub const Pool = @import("mem/Pool.zig").Pool;
 
 test {
     _ = constants;
+    _ = @import("mem/Pool.zig");
     _ = @import("io/xev_smoke_test.zig");
 }
