@@ -109,6 +109,13 @@ pub fn Pool(comptime T: type) type {
             assert(pool.acquired_count <= pool.slots.len);
             return pool.acquired_count == 0;
         }
+
+        /// Whether the slot is currently acquired. Used by the simulator
+        /// to sweep live entries; not part of the data-path API.
+        pub fn isAcquired(pool: *const Self, item: *const T) bool {
+            _ = pool.indexOf(item);
+            return item.pool_next == sentinel_in_use;
+        }
     };
 }
 
