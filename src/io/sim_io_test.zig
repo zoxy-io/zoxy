@@ -1,173 +1,22 @@
-//! Directed SimIo scenario tests (§9): a full echo exchange under the
-//! partial-delivery adversary, half-close both ways, reset visibility,
-//! refused connects, timer ordering and cancellation, signal injection,
-//! deadlock detection, and the same-seed ⇒ same-trace determinism claim.
-//! The harness plays both client and origin through the seam itself —
-//! virtual origins are just more seam users on the same loop.
+//! SimIo-specific scenario tests (§9): half-close both ways, reset
+//! visibility, refused connects, timer ordering and cancellation, signal
+//! injection, deadlock detection, and the same-seed ⇒ same-trace
+//! determinism claim. The generic echo exchange lives in
+//! contract_test.zig and runs against both backends; the determinism
+//! test below reuses it. The harness plays both client and origin
+//! through the seam itself — virtual origins are just more seam users.
 
 const std = @import("std");
 
+const contract = @import("contract_test.zig");
 const Io = @import("Io.zig");
 const SimIo = @import("SimIo.zig");
 
 const assert = std.debug.assert;
 
-const echo_token = "sim-echo-token-0123456789abcdef";
-
 fn testAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9100") catch unreachable;
 }
-
-/// Client sends the token, server echoes it back, server FINs, client
-/// observes EndOfStream and closes both ends. Every send and recv loops
-/// on partial completions, so the adversary's 1-byte deliveries are
-/// exercised on all four paths.
-const EchoScenario = struct {
-    io: *SimIo,
-    listener: SimIo.Listener = undefined,
-    accept_completion: SimIo.Completion = .{},
-    connect_completion: SimIo.Completion = .{},
-    client: Peer = .{},
-    server: Peer = .{},
-    failed: bool = false,
-
-    const Peer = struct {
-        socket: SimIo.Socket = undefined,
-        recv_completion: SimIo.Completion = .{},
-        send_completion: SimIo.Completion = .{},
-        received: [128]u8 = undefined,
-        received_len: u32 = 0,
-        sent_len: u32 = 0,
-        eof: bool = false,
-    };
-
-    fn start(scenario: *EchoScenario) !void {
-        scenario.listener = try scenario.io.listen(testAddress());
-        scenario.io.accept(
-            scenario.listener,
-            &scenario.accept_completion,
-            EchoScenario,
-            scenario,
-            onAccept,
-        );
-        scenario.io.connect(
-            testAddress(),
-            &scenario.connect_completion,
-            EchoScenario,
-            scenario,
-            onConnect,
-        );
-    }
-
-    fn onAccept(scenario: *EchoScenario, result: Io.AcceptError!SimIo.Socket) void {
-        scenario.server.socket = result catch return scenario.fail();
-        scenario.armServerRecv();
-    }
-
-    fn onConnect(scenario: *EchoScenario, result: Io.ConnectError!SimIo.Socket) void {
-        scenario.client.socket = result catch return scenario.fail();
-        scenario.armClientSend();
-    }
-
-    fn armClientSend(scenario: *EchoScenario) void {
-        assert(scenario.client.sent_len < echo_token.len);
-        scenario.io.send(
-            scenario.client.socket,
-            echo_token[scenario.client.sent_len..],
-            &scenario.client.send_completion,
-            EchoScenario,
-            scenario,
-            onClientSend,
-        );
-    }
-
-    fn onClientSend(scenario: *EchoScenario, result: Io.SendError!u32) void {
-        const n = result catch return scenario.fail();
-        scenario.client.sent_len += n;
-        assert(scenario.client.sent_len <= echo_token.len);
-        if (scenario.client.sent_len < echo_token.len) {
-            scenario.armClientSend();
-        } else {
-            scenario.armClientRecv();
-        }
-    }
-
-    fn armServerRecv(scenario: *EchoScenario) void {
-        scenario.io.recv(
-            scenario.server.socket,
-            scenario.server.received[scenario.server.received_len..],
-            &scenario.server.recv_completion,
-            EchoScenario,
-            scenario,
-            onServerRecv,
-        );
-    }
-
-    fn onServerRecv(scenario: *EchoScenario, result: Io.RecvError!u32) void {
-        const n = result catch return scenario.fail();
-        scenario.server.received_len += n;
-        assert(scenario.server.received_len <= echo_token.len);
-        if (scenario.server.received_len < echo_token.len) {
-            scenario.armServerRecv();
-        } else {
-            scenario.armServerSend();
-        }
-    }
-
-    fn armServerSend(scenario: *EchoScenario) void {
-        assert(scenario.server.sent_len < scenario.server.received_len);
-        scenario.io.send(
-            scenario.server.socket,
-            scenario.server.received[scenario.server.sent_len..scenario.server.received_len],
-            &scenario.server.send_completion,
-            EchoScenario,
-            scenario,
-            onServerSend,
-        );
-    }
-
-    fn onServerSend(scenario: *EchoScenario, result: Io.SendError!u32) void {
-        const n = result catch return scenario.fail();
-        scenario.server.sent_len += n;
-        assert(scenario.server.sent_len <= scenario.server.received_len);
-        if (scenario.server.sent_len < scenario.server.received_len) {
-            scenario.armServerSend();
-        } else {
-            // Echo done: announce the close with a FIN (§6 half-close).
-            scenario.io.shutdown(scenario.server.socket, .write);
-        }
-    }
-
-    fn armClientRecv(scenario: *EchoScenario) void {
-        scenario.io.recv(
-            scenario.client.socket,
-            scenario.client.received[scenario.client.received_len..],
-            &scenario.client.recv_completion,
-            EchoScenario,
-            scenario,
-            onClientRecv,
-        );
-    }
-
-    fn onClientRecv(scenario: *EchoScenario, result: Io.RecvError!u32) void {
-        const n = result catch |err| {
-            if (err != error.EndOfStream) return scenario.fail();
-            scenario.client.eof = true;
-            scenario.io.closeNow(scenario.client.socket);
-            scenario.io.closeNow(scenario.server.socket);
-            scenario.io.listenClose(scenario.listener);
-            return;
-        };
-        scenario.client.received_len += n;
-        assert(scenario.client.received_len <= echo_token.len);
-        scenario.armClientRecv();
-    }
-
-    fn fail(scenario: *EchoScenario) void {
-        scenario.failed = true;
-        scenario.io.stop();
-    }
-};
 
 fn runEchoScenario(seed: u64, adversary: SimIo.Adversary) !u64 {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -176,32 +25,12 @@ fn runEchoScenario(seed: u64, adversary: SimIo.Adversary) !u64 {
     var sim_io: SimIo = undefined;
     try sim_io.init(arena_state.allocator(), .{ .seed = seed, .adversary = adversary });
 
-    var scenario: EchoScenario = .{ .io = &sim_io };
-    try scenario.start();
+    var scenario: contract.EchoScenario(SimIo) = .{ .io = &sim_io };
+    try scenario.start(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
     try sim_io.run();
-
-    try std.testing.expect(!scenario.failed);
-    try std.testing.expect(scenario.client.eof);
-    try std.testing.expectEqualStrings(
-        echo_token,
-        scenario.server.received[0..scenario.server.received_len],
-    );
-    try std.testing.expectEqualStrings(
-        echo_token,
-        scenario.client.received[0..scenario.client.received_len],
-    );
+    try scenario.verify();
     try std.testing.expect(sim_io.sockets.isFullyReleased());
     return sim_io.trace_hash;
-}
-
-test "sim: echo survives the partial-delivery adversary across seeds" {
-    var seed: u64 = 1;
-    while (seed <= 20) : (seed += 1) {
-        _ = try runEchoScenario(seed, .{
-            .partial_io = true,
-            .connect_delay_ns_max = 5_000_000,
-        });
-    }
 }
 
 test "sim: same seed same trace, different seed different trace" {

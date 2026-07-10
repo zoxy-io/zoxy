@@ -14,6 +14,7 @@ test {
     _ = constants;
     _ = Io;
     _ = @import("mem/Pool.zig");
+    _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");
     _ = @import("io/xev_smoke_test.zig");
 }

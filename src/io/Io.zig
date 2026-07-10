@@ -28,6 +28,7 @@
 const std = @import("std");
 
 pub const SimIo = @import("SimIo.zig");
+pub const XevIo = @import("XevIo.zig");
 
 /// Signals the loop reacts to, delivered through the seam so the
 /// simulator can inject drain as just another scheduled event (§4).
@@ -127,6 +128,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
     }
 }
 
-test "assertIoInterface: SimIo satisfies the contract" {
+test "assertIoInterface: both backends satisfy the contract" {
     comptime assertIoInterface(SimIo);
+    comptime assertIoInterface(XevIo);
 }
