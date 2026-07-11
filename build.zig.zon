@@ -37,8 +37,8 @@
             .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
         },
         .zrk = .{
-            .url = "git+https://github.com/floatdrop/zrk#bcd2547293a97c24199a253a88d5ac3247504dd8",
-            .hash = "zrk-0.1.0-WqdFO6-kAQBRTJHA2xACNTtFhVe829kH5qPUR4Dp9fFJ",
+            .url = "git+https://github.com/floatdrop/zrk#eceb97607b8858d6f9c1a5ee9af195279fe9aa94",
+            .hash = "zrk-0.1.0-WqdFO-KqAQAQQJjFFAcjnFzuCHhZkckj4wCFt-H9HdYe",
         },
     },
     .paths = .{
