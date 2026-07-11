@@ -468,9 +468,18 @@ pub fn closeNow(io: *XevIo, socket: Socket) void {
     closeFd(@intFromEnum(socket));
 }
 
-pub fn nowNs(io: *const XevIo) u64 {
-    // libxev refreshes cached_now once per loop tick — exactly the §4
-    // clock semantics; callbacks in one batch all see the same value.
+pub fn nowNs(io: *XevIo) u64 {
+    // The io_uring backend does NOT refresh cached_now each tick — the tick
+    // only marks it `now_outdated` and refreshes lazily (in loop.now() or
+    // when a timer is armed). Reading the field raw would return the time
+    // of the last timer submission, arbitrarily stale, so deadlines set on
+    // activity would never actually move (DESIGN.md §4). Refresh here when
+    // stale: update_now() clears the flag and the next tick re-sets it, so
+    // every nowNs within one tick still returns the same value — the §4
+    // once-per-tick semantics, at nanosecond precision (loop.now() is ms).
+    if (io.loop.flags.now_outdated) {
+        io.loop.update_now();
+    }
     const cached = io.loop.cached_now;
     return @as(u64, @intCast(cached.sec)) * std.time.ns_per_s +
         @as(u64, @intCast(cached.nsec));

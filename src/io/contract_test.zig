@@ -217,3 +217,26 @@ test "contract: echo on XevIo over real loopback" {
     try xev_io.run();
     try scenario.verify();
 }
+
+test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" {
+    // Regression for the stale-cached_now bug (review finding 1): the
+    // io_uring backend only marks the clock outdated per tick and refreshes
+    // it lazily, so nowNs must refresh when the flag is set rather than
+    // returning the time of the last timer arm. The monotonic clock strictly
+    // advances between two update_now syscalls, so a correct nowNs returns a
+    // larger value on the second read; the buggy version returned the frozen
+    // cached_now unchanged.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try xev_io.init(arena_state.allocator());
+    defer xev_io.deinit();
+
+    const first = xev_io.nowNs();
+    // Simulate a tick elapsing without a timer being armed — exactly the
+    // relay-activity case where the old code left the clock frozen.
+    xev_io.loop.flags.now_outdated = true;
+    const second = xev_io.nowNs();
+    try std.testing.expect(second > first);
+}

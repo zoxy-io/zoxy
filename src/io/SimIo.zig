@@ -517,7 +517,7 @@ pub fn closeNow(io: *SimIo, socket: Socket) void {
     io.closeEntry(socket);
 }
 
-pub fn nowNs(io: *const SimIo) u64 {
+pub fn nowNs(io: *SimIo) u64 {
     assert(io.now_ns_value >= clock_start_ns);
     return io.now_ns_value;
 }
