@@ -53,6 +53,7 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
     io.notifier = try xev.Async.init();
     errdefer io.notifier.deinit();
     io.timer = try xev.Timer.init();
+    errdefer io.timer.deinit();
     io.listeners = try arena.alloc(ListenerEntry, constants.listeners_max);
     io.listeners_count = 0;
     io.notifier_completion = .{};
