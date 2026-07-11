@@ -277,7 +277,6 @@ pub fn Server(comptime IoType: type) type {
                 // anyway must still be shut down and closed.
                 if (result) |socket| {
                     conn.upstream_socket = socket;
-                    conn.has_upstream = true;
                     server.io.shutdown(socket, .both);
                 } else |_| {}
                 server.continueTeardown(conn);
@@ -290,7 +289,6 @@ pub fn Server(comptime IoType: type) type {
                 return;
             };
             conn.upstream_socket = socket;
-            conn.has_upstream = true;
             server.io.setNodelay(socket) catch {
                 server.counters.increment("kernel_pressure_errors");
             };
@@ -308,8 +306,8 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.state == .connecting or conn.state == .relaying);
             conn.state = .tearing_down;
             server.io.shutdown(conn.client_socket, .both);
-            if (conn.has_upstream) {
-                server.io.shutdown(conn.upstream_socket, .both);
+            if (conn.upstream_socket) |socket| {
+                server.io.shutdown(socket, .both);
             }
             if (conn.armed.connect) {
                 conn.arm(&conn.op_connect_cancel, "connect_cancel");
@@ -352,10 +350,10 @@ pub fn Server(comptime IoType: type) type {
                         conn,
                         onCloseClient,
                     );
-                    if (conn.has_upstream) {
+                    if (conn.upstream_socket) |socket| {
                         conn.arm(&conn.op_close_upstream, "close_upstream");
                         server.io.close(
-                            conn.upstream_socket,
+                            socket,
                             &conn.op_close_upstream.completion,
                             ConnType,
                             conn,

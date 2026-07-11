@@ -40,7 +40,7 @@ pub fn Relay(comptime IoType: type) type {
     return struct {
         pub fn start(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .relaying);
-            assert(conn.has_upstream);
+            assert(conn.upstream_socket != null);
             assert(conn.directions[0].phase == .idle);
             assert(conn.directions[1].phase == .idle);
             armRecv(server, conn, .client_to_upstream);
@@ -176,15 +176,16 @@ pub fn Relay(comptime IoType: type) type {
         }
 
         fn sourceSocket(conn: *const ConnType, comptime direction: Direction) IoType.Socket {
+            // The relay only runs in .relaying, where the upstream is set.
             return switch (direction) {
                 .client_to_upstream => conn.client_socket,
-                .upstream_to_client => conn.upstream_socket,
+                .upstream_to_client => conn.upstream_socket.?,
             };
         }
 
         fn targetSocket(conn: *const ConnType, comptime direction: Direction) IoType.Socket {
             return switch (direction) {
-                .client_to_upstream => conn.upstream_socket,
+                .client_to_upstream => conn.upstream_socket.?,
                 .upstream_to_client => conn.client_socket,
             };
         }

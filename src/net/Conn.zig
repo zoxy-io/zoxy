@@ -21,8 +21,10 @@ pub fn Conn(comptime IoType: type) type {
         server: *ServerType,
         state: State,
         client_socket: IoType.Socket,
-        upstream_socket: IoType.Socket,
-        has_upstream: bool,
+        /// Null until the upstream dial completes; making the socket and
+        /// its presence one field means an unset upstream can never be
+        /// read as a live fd handle.
+        upstream_socket: ?IoType.Socket,
         closes_submitted: bool,
         relay_buffer: *relay.RelayBuffer,
         /// Absolute deadline; state transitions only store a new value —
@@ -94,8 +96,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.server = server;
             conn.state = .connecting;
             conn.client_socket = client_socket;
-            conn.upstream_socket = undefined;
-            conn.has_upstream = false;
+            conn.upstream_socket = null;
             conn.closes_submitted = false;
             conn.relay_buffer = buffer;
             conn.deadline_ns = 0;
