@@ -194,6 +194,14 @@ const Ring = struct {
 /// In-place init; `arena` follows the production shape — this is the
 /// simulator's only allocation point, everything after is zero-alloc.
 pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfMemory}!void {
+    // Validate the adversary knobs at the misuse site: a bad value would
+    // otherwise surface as an opaque arithmetic/uintLessThan panic deep in
+    // a delivery, seeds away from the caller that set it.
+    assert(@as(u16, options.adversary.connect_refuse_percent) +
+        options.adversary.connect_blackhole_percent <= 100);
+    assert(options.adversary.reset_percent <= 100);
+    assert(options.adversary.batch_max >= 1);
+
     io.listeners = try arena.alloc(ListenerEntry, listeners_max);
     io.pending = try arena.alloc(*Completion, pending_ops_max);
     try io.sockets.init(arena, sockets_max);
@@ -574,6 +582,13 @@ pub fn injectAcceptError(io: *SimIo, listener: Listener) void {
 
 pub fn scheduleSignal(io: *SimIo, signal: Io.Signal, at_ns: u64) void {
     assert(io.pending_signals_count < pending_signals_max);
+    assert(at_ns >= io.now_ns_value);
+    // A signal with no waiter can never be delivered: deliverDueSignals
+    // would skip it while it still blocks the clean-exit return and pins
+    // earliestWakeNs, tripping the wake assert in run() far from here.
+    // Fail at the misuse site instead (the Server arms its waiter in
+    // start(), so this holds in-tree).
+    assert(io.signal_callback != null);
     io.pending_signals[io.pending_signals_count] = .{ .signal = signal, .at_ns = at_ns };
     io.pending_signals_count += 1;
 }
