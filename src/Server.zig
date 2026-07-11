@@ -30,7 +30,11 @@ pub fn Server(comptime IoType: type) type {
         relay_buffers: Pool(relay.RelayBuffer),
         listeners: []ListenerState,
         listeners_count: u16,
-        endpoints_next: []u16,
+        /// Per-cluster round-robin cursor. u64 so it never wraps in any
+        /// realistic process lifetime — a u16 wrap reset the rotation
+        /// phase and double-picked one endpoint for non-power-of-two
+        /// cluster sizes.
+        endpoints_next: []u64,
         counters: counters_module.Counters,
         draining: bool,
         drain_deadline_completion: IoType.Completion,
@@ -75,7 +79,7 @@ pub fn Server(comptime IoType: type) type {
             try server.relay_buffers.init(arena, options.relay_buffers);
             server.listeners = try arena.alloc(ListenerState, cfg.listeners.len);
             server.listeners_count = @intCast(cfg.listeners.len);
-            server.endpoints_next = try arena.alloc(u16, cfg.clusters.len);
+            server.endpoints_next = try arena.alloc(u64, cfg.clusters.len);
             @memset(server.endpoints_next, 0);
             server.counters = .{};
             server.draining = false;
@@ -253,8 +257,8 @@ pub fn Server(comptime IoType: type) type {
             assert(cluster_index < server.cfg.clusters.len);
             const cluster = &server.cfg.clusters[cluster_index];
             const endpoint_index: usize =
-                server.endpoints_next[cluster_index] % cluster.endpoints.len;
-            server.endpoints_next[cluster_index] +%= 1;
+                @intCast(server.endpoints_next[cluster_index] % cluster.endpoints.len);
+            server.endpoints_next[cluster_index] += 1;
             conn.arm(&conn.op_connect, "connect");
             server.io.connect(
                 cluster.endpoints[endpoint_index],
