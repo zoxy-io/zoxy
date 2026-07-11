@@ -508,6 +508,11 @@ the loop thread.
 - **Accept never pauses.** Accept-and-RST is preferred over un-arming the
   accept: the kernel backlog stays drained, clients get an immediate
   signal instead of a timeout, and there is no re-arm state machine.
+  The one exception is an accept that *fails* with a kernel-pressure
+  error (ENFILE-class): there is no socket to shed and the failed
+  connection stays in the backlog, so an immediate re-arm would complete
+  instantly with the same error — a tight spin. That path re-arms after
+  a short backoff (`accept_retry_delay_ms`).
 - **Watermarks before walls.** Each pool exposes a high-watermark counter;
   crossing it flips a `pressure` flag that biases decisions (stop honoring
   downstream keep-alive, shrink idle timeouts) so the proxy sheds *idle*

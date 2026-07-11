@@ -414,6 +414,30 @@ test "relay: an origin reset mid-exchange tears the connection down" {
     try bed.expectDrained();
 }
 
+test "server: kernel-pressure accept failure backs off and recovers" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 51 } });
+    defer bed.tearDown();
+
+    // The next accept completes with an ENFILE-class error. The gate must
+    // not spin: it backs off through the retry timer, re-arms, and then
+    // serves the client that was waiting in the backlog all along.
+    bed.sim_io.injectAcceptError(bed.server.listeners[0].listener);
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_errors"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("accepted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    const client = &bed.scenario.clients[0];
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.receive_buffer[0..client.received_len],
+    );
+    try bed.expectDrained();
+}
+
 test "drain: terminate signal stops accepting and reaps stragglers at the drain deadline" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 41 }, .idle_timeout_ms = 60_000 });

@@ -50,6 +50,10 @@ pub fn Server(comptime IoType: type) type {
             server: *Self,
             listener: IoType.Listener,
             accept_completion: IoType.Completion,
+            /// Backoff timer for kernel-pressure accept failures; never
+            /// armed while the accept itself is armed, so the per-listener
+            /// ring budget stays one op (§8).
+            retry_completion: IoType.Completion,
             cluster_index: u16,
             accepting: bool,
         };
@@ -87,6 +91,7 @@ pub fn Server(comptime IoType: type) type {
                     .server = server,
                     .listener = try server.io.listen(listener_config.bind_address),
                     .accept_completion = .{},
+                    .retry_completion = .{},
                     .cluster_index = listener_config.cluster_index,
                     .accepting = false,
                 };
@@ -179,9 +184,21 @@ pub fn Server(comptime IoType: type) type {
                     assert(server.draining);
                     return;
                 }
+                // Kernel pressure (ENFILE-class): the failed connection
+                // stays in the backlog, so an immediate re-arm completes
+                // instantly with the same error — a tight spin starving
+                // the loop. Back off through a short timer instead; the
+                // shed ladder never engages here because there is no
+                // socket to shed (§8).
                 server.counters.increment("kernel_pressure_errors");
                 if (!server.draining) {
-                    server.armAccept(state);
+                    server.io.timerStart(
+                        &state.retry_completion,
+                        @as(u64, constants.accept_retry_delay_ms) * std.time.ns_per_ms,
+                        ListenerState,
+                        state,
+                        onAcceptRetry,
+                    );
                 }
                 return;
             };
@@ -195,6 +212,17 @@ pub fn Server(comptime IoType: type) type {
             }
             server.armAccept(state);
             server.admit(state, client_socket);
+        }
+
+        fn onAcceptRetry(state: *ListenerState, result: Io.TimerError!void) void {
+            const server = state.server;
+            // Nothing ever cancels the retry timer; a drain begun while it
+            // was pending is handled by not re-arming below.
+            result catch return;
+            assert(!state.accepting);
+            if (!server.draining) {
+                server.armAccept(state);
+            }
         }
 
         fn admit(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {

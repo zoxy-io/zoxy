@@ -26,6 +26,11 @@ pub const relay_buffer_bytes: u32 = 16 * 1024;
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
 
+/// Backoff before re-arming an accept that failed with a kernel-pressure
+/// error (ENFILE-class). The failed connection stays in the backlog, so
+/// an immediate re-arm would spin the loop at full speed (§8).
+pub const accept_retry_delay_ms: u32 = 10;
+
 /// io_uring submission queue entries. libxev requires a power of two and
 /// caps entries at 8191, so 4096 is the maximum usable value; the kernel
 /// fixes the completion queue at twice this (§4).
@@ -83,6 +88,7 @@ comptime {
     assert(loop_completions_per_tick_max >= 1);
     assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);
+    assert(accept_retry_delay_ms >= 1);
 }
 
 /// Total pool memory as a closed-form function of the limits. Slot sizes

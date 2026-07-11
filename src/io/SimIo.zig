@@ -146,6 +146,10 @@ const ListenerEntry = struct {
     active: bool,
     accept_queue: [accept_queue_max]Socket,
     accept_queue_len: u16,
+    /// Injected kernel-pressure accept failures still to deliver
+    /// (`injectAcceptError`) — the ENFILE-class path XevIo can hit but a
+    /// virtual socket table never would.
+    pending_accept_errors: u8,
 };
 
 const Ring = struct {
@@ -236,6 +240,7 @@ pub fn listen(io: *SimIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
         .active = true,
         .accept_queue = undefined,
         .accept_queue_len = 0,
+        .pending_accept_errors = 0,
     };
     io.listeners_count += 1;
     return .{ .index = index };
@@ -531,6 +536,17 @@ pub fn injectSignal(io: *SimIo, signal: Io.Signal) void {
     io.scheduleSignal(signal, io.now_ns_value);
 }
 
+/// Targeted scenario control: the next accept delivery on this listener
+/// fails with error.Unexpected — the kernel-pressure (ENFILE-class) path
+/// production can hit but a virtual socket table never would (§9).
+pub fn injectAcceptError(io: *SimIo, listener: Listener) void {
+    assert(listener.index < io.listeners_count);
+    const entry = &io.listeners[listener.index];
+    assert(entry.active);
+    assert(entry.pending_accept_errors < std.math.maxInt(u8));
+    entry.pending_accept_errors += 1;
+}
+
 pub fn scheduleSignal(io: *SimIo, signal: Io.Signal, at_ns: u64) void {
     assert(io.pending_signals_count < pending_signals_max);
     io.pending_signals[io.pending_signals_count] = .{ .signal = signal, .at_ns = at_ns };
@@ -625,7 +641,8 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
         .none => unreachable,
         .accept => |op| ready: {
             const entry = &io.listeners[op.listener_index];
-            break :ready !entry.active or entry.accept_queue_len > 0;
+            break :ready !entry.active or entry.accept_queue_len > 0 or
+                entry.pending_accept_errors > 0;
         },
         .connect => |op| op.canceled or io.now_ns_value >= completion.ready_at_ns,
         .recv => |op| ready: {
@@ -698,6 +715,10 @@ fn finishAccept(io: *SimIo, listener_index: u16) Io.AcceptError!Socket {
     const entry = &io.listeners[listener_index];
     if (!entry.active) {
         return error.Canceled;
+    }
+    if (entry.pending_accept_errors > 0) {
+        entry.pending_accept_errors -= 1;
+        return error.Unexpected;
     }
     assert(entry.accept_queue_len >= 1);
     const socket = entry.accept_queue[0];
