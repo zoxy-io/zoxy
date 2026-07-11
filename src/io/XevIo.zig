@@ -16,14 +16,20 @@ const constants = @import("../constants.zig");
 const Io = @import("io.zig");
 
 const assert = std.debug.assert;
-const linux = std.os.linux;
 const posix = std.posix;
 
 const XevIo = @This();
 
+/// kqueue (macOS, local bench runs) dispatches `.close` ops to a thread
+/// pool — io_uring closes inside the ring, so Linux never spawns a thread.
+/// Pool threads only perform the blocking syscall; completion callbacks
+/// still run on the loop thread, so the single-threaded discipline holds.
+const close_needs_thread_pool = xev.backend == .kqueue;
+
 loop: xev.Loop,
 timer: xev.Timer,
 notifier: xev.Async,
+thread_pool: if (close_needs_thread_pool) xev.ThreadPool else void,
 notifier_completion: xev.Completion,
 signal_mask: std.atomic.Value(u8),
 signal_callback: ?*const fn (?*anyopaque, Io.Signal) void,
@@ -48,7 +54,17 @@ const ListenerEntry = struct {
 };
 
 pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
-    io.loop = try xev.Loop.init(.{ .entries = constants.ring_entries });
+    if (comptime close_needs_thread_pool) {
+        io.thread_pool = xev.ThreadPool.init(.{});
+    }
+    errdefer if (comptime close_needs_thread_pool) {
+        io.thread_pool.shutdown();
+        io.thread_pool.deinit();
+    };
+    io.loop = try xev.Loop.init(.{
+        .entries = constants.ring_entries,
+        .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
+    });
     errdefer io.loop.deinit();
     io.notifier = try xev.Async.init();
     errdefer io.notifier.deinit();
@@ -76,6 +92,10 @@ pub fn deinit(io: *XevIo) void {
     io.timer.deinit();
     io.notifier.deinit();
     io.loop.deinit();
+    if (comptime close_needs_thread_pool) {
+        io.thread_pool.shutdown();
+        io.thread_pool.deinit();
+    }
 }
 
 pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
@@ -133,7 +153,8 @@ pub fn listenClose(io: *XevIo, listener: Listener) void {
     const entry = io.listenerEntry(listener);
     assert(entry.open);
     if (entry.armed_accept) |accept_completion| {
-        io.loop.cancel(
+        loopCancel(
+            &io.loop,
             accept_completion,
             &entry.cancel_completion,
             void,
@@ -220,14 +241,17 @@ pub fn connect(
                 callback(context.?, @as(Socket, @enumFromInt(socket.fd)));
             } else |err| {
                 closeFd(socket.fd);
-                callback(context.?, switch (err) {
+                // Widened to anyerror: each xev backend exposes a different
+                // ConnectError set (io_uring says TimedOut, kqueue says
+                // ConnectionTimedOut), and a switch may only name members.
+                callback(context.?, switch (@as(anyerror, err)) {
                     error.ConnectionRefused => error.Refused,
                     // A routing failure and a dial timeout are both "the
                     // endpoint could not be reached" — distinct from
                     // kernel-pressure/unknown (Unexpected), so upstream
                     // health logic (Phase 2) can tell them apart.
                     error.HostUnreachable => error.Unreachable,
-                    error.TimedOut => error.Unreachable,
+                    error.TimedOut, error.ConnectionTimedOut => error.Unreachable,
                     error.Canceled => error.Canceled,
                     else => error.Unexpected,
                 });
@@ -248,7 +272,7 @@ pub fn connectCancel(
     userdata: *Userdata,
     comptime callback: fn (*Userdata) void,
 ) void {
-    io.loop.cancel(connect_completion, cancel_completion, Userdata, userdata, (struct {
+    loopCancel(&io.loop, connect_completion, cancel_completion, Userdata, userdata, (struct {
         fn adapter(
             context: ?*Userdata,
             loop: *xev.Loop,
@@ -289,9 +313,10 @@ pub fn recv(
             _ = read_completion;
             _ = tcp_inner;
             _ = read_buffer;
+            // anyerror: kqueue's ReadError has no ConnectionResetByPeer.
             callback(context.?, if (result) |n|
                 @as(u32, @intCast(n))
-            else |err| switch (err) {
+            else |err| switch (@as(anyerror, err)) {
                 error.EOF => error.EndOfStream,
                 error.ConnectionResetByPeer => error.Reset,
                 error.Canceled => error.Canceled,
@@ -326,9 +351,10 @@ pub fn send(
             _ = write_completion;
             _ = tcp_inner;
             _ = write_buffer;
+            // anyerror: kqueue's WriteError has no ConnectionResetByPeer.
             callback(context.?, if (result) |n|
                 @as(u32, @intCast(n))
-            else |err| switch (err) {
+            else |err| switch (@as(anyerror, err)) {
                 error.ConnectionResetByPeer => error.Reset,
                 error.Canceled => error.Canceled,
                 else => error.Unexpected,
@@ -449,30 +475,30 @@ pub fn setNodelay(io: *XevIo, socket: Socket) Io.SetOptionError!void {
     const enable: i32 = 1;
     posix.setsockopt(
         @intFromEnum(socket),
-        linux.IPPROTO.TCP,
-        linux.TCP.NODELAY,
+        posix.IPPROTO.TCP,
+        posix.TCP.NODELAY,
         std.mem.asBytes(&enable),
     ) catch return error.Unexpected;
 }
 
 pub fn setLingerRst(io: *XevIo, socket: Socket) Io.SetOptionError!void {
     _ = io;
-    const value: linux.linger = .{ .onoff = 1, .linger = 0 };
+    const value: posix.linger = .{ .onoff = 1, .linger = 0 };
     posix.setsockopt(
         @intFromEnum(socket),
-        linux.SOL.SOCKET,
-        linux.SO.LINGER,
+        posix.SOL.SOCKET,
+        posix.SO.LINGER,
         std.mem.asBytes(&value),
     ) catch return error.Unexpected;
 }
 
 pub fn shutdown(io: *XevIo, socket: Socket, how: Io.ShutdownHow) void {
     _ = io;
-    const linux_how: i32 = switch (how) {
-        .write => linux.SHUT.WR,
-        .both => linux.SHUT.RDWR,
+    const posix_how: i32 = switch (how) {
+        .write => posix.SHUT.WR,
+        .both => posix.SHUT.RDWR,
     };
-    const rc = linux.shutdown(@intFromEnum(socket), linux_how);
+    const rc = posix.system.shutdown(@intFromEnum(socket), posix_how);
     const errno = posix.errno(rc);
     // NOTCONN: the peer tore the connection down first — a legal race.
     assert(errno == .SUCCESS or errno == .NOTCONN);
@@ -492,8 +518,12 @@ pub fn nowNs(io: *XevIo) u64 {
     // stale: update_now() clears the flag and the next tick re-sets it, so
     // every nowNs within one tick still returns the same value — the §4
     // once-per-tick semantics, at nanosecond precision (loop.now() is ms).
-    if (io.loop.flags.now_outdated) {
-        io.loop.update_now();
+    // The kqueue backend (macOS bench runs) has no now_outdated flag: its
+    // tick unconditionally refreshes cached_now, so reading it raw is safe.
+    if (comptime @hasField(@FieldType(xev.Loop, "flags"), "now_outdated")) {
+        if (io.loop.flags.now_outdated) {
+            io.loop.update_now();
+        }
     }
     const cached = io.loop.cached_now;
     return @as(u64, @intCast(cached.sec)) * std.time.ns_per_s +
@@ -501,7 +531,8 @@ pub fn nowNs(io: *XevIo) u64 {
 }
 
 pub fn run(io: *XevIo) Io.RunError!void {
-    io.loop.run(.until_done) catch |err| switch (err) {
+    // anyerror: CompletionQueueOvercommitted exists only on io_uring.
+    io.loop.run(.until_done) catch |err| switch (@as(anyerror, err)) {
         error.CompletionQueueOvercommitted => @panic(
             "ring budget violated: completion queue overcommitted (DESIGN.md §8)",
         ),
@@ -534,6 +565,50 @@ fn onNotifierWake(
     // The internal signal wait is the one legitimate `.rearm`: an eventfd
     // read has no stale-time hazard, unlike timers.
     return .rearm;
+}
+
+/// Portable stand-in for the io_uring backend's `Loop.cancel` helper.
+/// The kqueue backend (macOS, local bench runs) implements the same
+/// `.cancel` op and `Result.cancel` plumbing but never grew the
+/// convenience wrapper, so we build the completion by hand — the exact
+/// body of io_uring's `Loop.cancel`.
+fn loopCancel(
+    loop: *xev.Loop,
+    c: *xev.Completion,
+    c_cancel: *xev.Completion,
+    comptime Userdata: type,
+    userdata: ?*Userdata,
+    comptime cb: *const fn (
+        ud: ?*Userdata,
+        l: *xev.Loop,
+        c: *xev.Completion,
+        r: xev.CancelError!void,
+    ) xev.CallbackAction,
+) void {
+    c_cancel.* = .{
+        .op = .{
+            .cancel = .{
+                .c = c,
+            },
+        },
+        .userdata = userdata,
+        .callback = (struct {
+            fn callback(
+                ud: ?*anyopaque,
+                l_inner: *xev.Loop,
+                c_inner: *xev.Completion,
+                r: xev.Result,
+            ) xev.CallbackAction {
+                return @call(.always_inline, cb, .{
+                    @as(?*Userdata, if (Userdata == void) null else @ptrCast(@alignCast(ud))),
+                    l_inner,
+                    c_inner,
+                    if (r.cancel) |_| {} else |err| err,
+                });
+            }
+        }).callback,
+    };
+    loop.add(c_cancel);
 }
 
 fn onCancelReaped(
@@ -580,20 +655,20 @@ fn listenerEntryConst(io: *const XevIo, listener: Listener) *const ListenerEntry
 /// both address families (IPv4/IPv6 share the family/port prefix). Public
 /// for the raw-libxev smoke test, which lives under src/io/ too.
 pub fn boundPort(fd: posix.socket_t) error{Unexpected}!u16 {
-    var bound: linux.sockaddr.in6 = undefined;
-    var bound_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
-    const rc = linux.getsockname(fd, @ptrCast(&bound), &bound_len);
+    var bound: posix.sockaddr.in6 = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
+    const rc = posix.system.getsockname(fd, @ptrCast(&bound), &bound_len);
     if (posix.errno(rc) != .SUCCESS) {
         return error.Unexpected;
     }
     // sockaddr.in and sockaddr.in6 share the family/port prefix layout.
-    const family_port: *const linux.sockaddr.in = @ptrCast(&bound);
-    assert(family_port.family == linux.AF.INET or family_port.family == linux.AF.INET6);
+    const family_port: *const posix.sockaddr.in = @ptrCast(&bound);
+    assert(family_port.family == posix.AF.INET or family_port.family == posix.AF.INET6);
     return std.mem.bigToNative(u16, family_port.port);
 }
 
 fn closeFd(fd: posix.socket_t) void {
-    const rc = linux.close(fd);
+    const rc = posix.system.close(fd);
     const errno = posix.errno(rc);
     assert(errno == .SUCCESS or errno == .INTR);
 }

@@ -83,7 +83,17 @@ test "async: notify wakes an armed wait" {
 }
 
 test "tcp: loopback echo across the full watcher surface" {
-    var loop = try xev.Loop.init(.{ .entries = ring_entries });
+    // kqueue (macOS) dispatches `.close` ops to a thread pool; io_uring
+    // closes inside the ring. Mirror XevIo's backend-gated pool here.
+    var thread_pool = if (comptime xev.backend == .kqueue) xev.ThreadPool.init(.{}) else {};
+    defer if (comptime xev.backend == .kqueue) {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    };
+    var loop = try xev.Loop.init(.{
+        .entries = ring_entries,
+        .thread_pool = if (comptime xev.backend == .kqueue) &thread_pool else null,
+    });
     defer loop.deinit();
 
     var address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");

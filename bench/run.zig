@@ -12,6 +12,7 @@
 //! deliberately left to the caller (taskset) until the CI band policy
 //! needs it.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 
@@ -388,6 +389,21 @@ fn printOverhead(
 
 fn readRssKb(arena: std.mem.Allocator, io: Io, pid: ?std.process.Child.Id) !u64 {
     assert(pid != null);
+    // macOS has no procfs; libproc's PROC_PIDTASKINFO reports the resident
+    // set in bytes. proc_pidinfo lives in libSystem, which every darwin
+    // binary links, so no extra linking or @cImport is needed.
+    if (comptime builtin.os.tag.isDarwin()) {
+        var info: darwin.proc_taskinfo = undefined;
+        const size = darwin.proc_pidinfo(
+            pid.?,
+            darwin.PROC_PIDTASKINFO,
+            0,
+            &info,
+            @sizeOf(darwin.proc_taskinfo),
+        );
+        if (size != @sizeOf(darwin.proc_taskinfo)) return error.RssUnavailable;
+        return info.pti_resident_size / 1024;
+    }
     const path = try std.fmt.allocPrint(arena, "/proc/{d}/status", .{pid.?});
     // procfs advertises size 0, so this must stream, not trust st_size.
     const file = try Io.Dir.cwd().openFile(io, path, .{});
@@ -408,3 +424,39 @@ fn readRssKb(arena: std.mem.Allocator, io: Io, pid: ?std.process.Child.Id) !u64 
     }
     return error.RssUnavailable;
 }
+
+/// Minimal libproc surface for the darwin branch of readRssKb. Field
+/// layout mirrors <sys/proc_info.h> struct proc_taskinfo exactly —
+/// proc_pidinfo validates buffersize against it.
+const darwin = struct {
+    const PROC_PIDTASKINFO: c_int = 4;
+
+    const proc_taskinfo = extern struct {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    };
+
+    extern "c" fn proc_pidinfo(
+        pid: c_int,
+        flavor: c_int,
+        arg: u64,
+        buffer: ?*anyopaque,
+        buffersize: c_int,
+    ) c_int;
+};

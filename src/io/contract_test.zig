@@ -5,6 +5,7 @@
 //! the two backends semantically aligned.
 
 const std = @import("std");
+const xev = @import("xev");
 
 const Io = @import("io.zig");
 const SimIo = @import("SimIo.zig");
@@ -226,6 +227,12 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     // advances between two update_now syscalls, so a correct nowNs returns a
     // larger value on the second read; the buggy version returned the frozen
     // cached_now unchanged.
+    //
+    // io_uring-only: other backends (kqueue on macOS) refresh cached_now
+    // every tick and have no now_outdated flag to simulate staleness with.
+    if (comptime !@hasField(@FieldType(xev.Loop, "flags"), "now_outdated")) {
+        return error.SkipZigTest;
+    }
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
