@@ -222,6 +222,12 @@ pub fn connect(
                 closeFd(socket.fd);
                 callback(context.?, switch (err) {
                     error.ConnectionRefused => error.Refused,
+                    // A routing failure and a dial timeout are both "the
+                    // endpoint could not be reached" — distinct from
+                    // kernel-pressure/unknown (Unexpected), so upstream
+                    // health logic (Phase 2) can tell them apart.
+                    error.HostUnreachable => error.Unreachable,
+                    error.TimedOut => error.Unreachable,
                     error.Canceled => error.Canceled,
                     else => error.Unexpected,
                 });
