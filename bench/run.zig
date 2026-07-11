@@ -1,14 +1,16 @@
 //! Tier-1 loopback benchmark (DESIGN.md §9): the same constant-throughput
-//! zrk load (coordinated-omission-corrected) against the origin directly
-//! and through zoxy, printed as comparable bands — never single numbers;
-//! compare bands across runs. Also witnesses the zero-alloc promise from
-//! the outside: zoxy's RSS must not grow across the measured run.
+//! zrk load (coordinated-omission-corrected) against the origin directly,
+//! through zoxy, and through haproxy as the state-of-the-art reference,
+//! printed as comparable bands — never single numbers; compare bands
+//! across runs. Also witnesses the zero-alloc promise from the outside:
+//! zoxy's RSS must not grow across the measured run.
 //!
 //! By default an nginx origin is spawned with a generated config (the dev
-//! shell provides nginx); pass `--origin host:port` to reuse any live
-//! HTTP origin instead. zoxy is drained with SIGTERM at the end, so every
-//! run also exercises the drain path. Core pinning is deliberately left
-//! to the caller (taskset) until the CI band policy needs it.
+//! shell provides nginx and haproxy); pass `--origin host:port` to reuse
+//! any live HTTP origin instead. zoxy is drained with SIGTERM at the end,
+//! so every run also exercises the drain path. Core pinning is
+//! deliberately left to the caller (taskset) until the CI band policy
+//! needs it.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,6 +21,7 @@ const assert = std.debug.assert;
 
 const zoxy_port: u16 = 18180;
 const origin_port: u16 = 19180;
+const haproxy_port: u16 = 17180;
 const work_directory = ".zig-cache/zoxy-bench";
 
 const Flags = struct {
@@ -51,9 +54,13 @@ pub fn main(init: std.process.Init) !u8 {
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
 
-    // Warm both paths up and prove they answer before measuring.
+    var haproxy_child = try spawnHaproxy(arena, io, origin_address);
+    defer haproxy_child.kill(io);
+
+    // Warm all paths up and prove they answer before measuring.
     _ = try awaitResponsive(arena, io, originPortOf(origin_address), "origin");
     _ = try awaitResponsive(arena, io, zoxy_port, "zoxy");
+    _ = try awaitResponsive(arena, io, haproxy_port, "haproxy");
 
     const rss_before_kb = try readRssKb(arena, io, zoxy_child.id);
 
@@ -66,9 +73,15 @@ pub fn main(init: std.process.Init) !u8 {
 
     const rss_after_kb = try readRssKb(arena, io, zoxy_child.id);
 
+    // The reference run happens outside the RSS window so the zero-alloc
+    // witness keeps meaning "zoxy sat under load", not "zoxy idled while
+    // haproxy was measured".
+    const reference = try loadTest(arena, io, haproxy_port, &flags);
+
     printReport("direct ", &direct);
     printReport("proxied", &proxied);
-    printOverhead(&direct, &proxied);
+    printReport("haproxy", &reference);
+    printOverhead(&direct, &proxied, &reference);
 
     std.debug.print("zoxy RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
@@ -233,6 +246,49 @@ fn spawnZoxy(
     };
 }
 
+/// haproxy is the state-of-the-art reference band, not a gate: same
+/// origin, same load, `mode tcp` to match zoxy's L4 relay and
+/// `nbthread 1` to match zoxy's single event-loop thread. Timeouts mirror
+/// the generated zoxy config so neither proxy wins by timing out earlier.
+fn spawnHaproxy(
+    arena: std.mem.Allocator,
+    io: Io,
+    origin_address: []const u8,
+) !std.process.Child {
+    const conf_path = work_directory ++ "/haproxy.conf";
+    const conf = try std.fmt.allocPrint(arena,
+        \\global
+        \\    nbthread 1
+        \\    maxconn 4096
+        \\
+        \\defaults
+        \\    mode tcp
+        \\    timeout connect 5s
+        \\    timeout client 60s
+        \\    timeout server 60s
+        \\
+        \\listen bench
+        \\    bind 127.0.0.1:{d}
+        \\    server origin {s}
+        \\
+    , .{ haproxy_port, origin_address });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = conf });
+
+    // -db keeps haproxy in the foreground so kill() reaches the process
+    // itself, not a forked-off daemon.
+    return std.process.spawn(io, .{
+        .argv = &.{ "haproxy", "-db", "-f", conf_path },
+        .stdout = .ignore,
+        .stderr = .inherit,
+    }) catch |err| {
+        std.debug.print(
+            "bench: could not spawn haproxy ({t}); is the dev shell loaded?\n",
+            .{err},
+        );
+        return err;
+    };
+}
+
 /// Short probing runs double as warmup; a target that never answers is a
 /// setup failure, reported before any numbers are printed.
 fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u8) !void {
@@ -315,11 +371,19 @@ fn printReport(label: []const u8, report: *const zrk.runner.Report) void {
     );
 }
 
-fn printOverhead(direct: *const zrk.runner.Report, proxied: *const zrk.runner.Report) void {
+fn printOverhead(
+    direct: *const zrk.runner.Report,
+    proxied: *const zrk.runner.Report,
+    reference: *const zrk.runner.Report,
+) void {
     const direct_p50 = direct.snapshot.hist.valueAtPercentile(50.0);
     const proxied_p50 = proxied.snapshot.hist.valueAtPercentile(50.0);
-    const hop_us = proxied_p50 -| direct_p50;
-    std.debug.print("hop overhead: +{d} us p50 (band, not a single number — §9)\n", .{hop_us});
+    const reference_p50 = reference.snapshot.hist.valueAtPercentile(50.0);
+    std.debug.print(
+        "hop overhead p50: zoxy +{d} us, haproxy +{d} us " ++
+            "(bands, not single numbers — §9)\n",
+        .{ proxied_p50 -| direct_p50, reference_p50 -| direct_p50 },
+    );
 }
 
 fn readRssKb(arena: std.mem.Allocator, io: Io, pid: ?std.process.Child.Id) !u64 {
