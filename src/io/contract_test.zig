@@ -240,3 +240,19 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     const second = xev_io.nowNs();
     try std.testing.expect(second > first);
 }
+
+test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
+    // Regression for the bind-error collapse (review finding 5): an
+    // address that is not assigned to this host (TEST-NET-3, RFC 5737)
+    // must report AddressUnavailable — "address in use" would send an
+    // operator hunting for a conflicting process that does not exist.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try xev_io.init(arena_state.allocator());
+    defer xev_io.deinit();
+
+    const unavailable = std.Io.net.IpAddress.parseLiteral("203.0.113.1:0") catch unreachable;
+    try std.testing.expectError(error.AddressUnavailable, xev_io.listen(unavailable));
+}

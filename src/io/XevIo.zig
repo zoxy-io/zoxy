@@ -83,9 +83,17 @@ pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
         return error.AddressUnavailable;
     }
     const tcp = xev.TCP.init(address) catch return error.Unexpected;
-    tcp.bind(address) catch {
+    tcp.bind(address) catch |err| {
         closeFd(tcp.fd);
-        return error.AddressInUse;
+        // Distinct failures get distinct diagnoses: "address in use" sends
+        // an operator hunting for a conflicting process, which is exactly
+        // wrong for a missing host address or a privileged port.
+        return switch (err) {
+            error.AddressInUse => error.AddressInUse,
+            error.AddressNotAvailable => error.AddressUnavailable,
+            error.AccessDenied => error.AccessDenied,
+            else => error.Unexpected,
+        };
     };
     tcp.listen(constants.accept_backlog) catch {
         closeFd(tcp.fd);

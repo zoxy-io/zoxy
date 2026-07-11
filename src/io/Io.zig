@@ -47,7 +47,10 @@ pub const ShutdownHow = enum(u8) {
 
 pub const ListenError = error{
     AddressInUse,
+    /// The bind address is not assigned to this host.
     AddressUnavailable,
+    /// Privileged port without the capability, or similar permission wall.
+    AccessDenied,
     Unexpected,
 };
 
