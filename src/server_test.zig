@@ -57,6 +57,9 @@ pub const Origin = struct {
     conns_count: u8 = 0,
     listening: bool = false,
     mode: Mode = .echo,
+    /// Orchestration hook: start this client the moment the origin accepts
+    /// a proxied connection (i.e. once the proxy has fully admitted one).
+    on_accept_start: ?*Client = null,
 
     const Mode = enum(u8) { echo, reset_on_first_chunk };
 
@@ -149,6 +152,11 @@ pub const Origin = struct {
         conn.origin = origin;
         conn.socket = socket;
         conn.armRecv();
+        if (origin.on_accept_start) |pending_client| {
+            origin.on_accept_start = null;
+            const scenario: *Scenario = @fieldParentPtr("origin", origin);
+            pending_client.start(scenario, TestBed.bindAddress());
+        }
         origin.armAccept();
     }
 
@@ -171,6 +179,11 @@ pub const Client = struct {
     receive_buffer: [64]u8 = undefined,
     socket: SimIo.Socket = undefined,
     exchange: bool = false,
+    /// Begin the server drain from inside this client's own connect
+    /// delivery — at that instant its socket is queued and the accept is
+    /// armed, so the accept "CQE" has already beaten the listener close:
+    /// the §8 drain race, made deterministic.
+    drain_on_connect: bool = false,
     sent_len: u32 = 0,
     received_len: u32 = 0,
     fin_sent: bool = false,
@@ -192,6 +205,9 @@ pub const Client = struct {
             return;
         };
         client.armRecv();
+        if (client.drain_on_connect) {
+            client.scenario.server.beginDrain();
+        }
         if (client.exchange) {
             client.armSend();
         }
@@ -452,6 +468,41 @@ test "drain: terminate signal stops accepting and reaps stragglers at the drain 
     try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("drained_at_deadline"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "drain: an accept that raced the drain is shed quietly and witnessed" {
+    // The shed_draining rung (§8): an accept whose CQE was already posted
+    // when the drain closed the listener is delivered, not canceled, and
+    // must be shed quietly. A holder client keeps the pools non-empty (so
+    // the drain cannot stop the loop before the raced delivery); once the
+    // origin sees the holder's proxied connection, the racer dials and
+    // triggers the drain from inside its own connect delivery — the exact
+    // instant its socket sits queued behind the armed accept.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 61 },
+        .idle_timeout_ms = 60_000,
+    });
+    defer bed.tearDown();
+
+    bed.scenario.clients_count = 2;
+    const holder = &bed.scenario.clients[0];
+    const racer = &bed.scenario.clients[1];
+    racer.drain_on_connect = true;
+    bed.scenario.origin.on_accept_start = racer;
+    holder.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("accepted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("shed_draining"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("drained_at_deadline"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    // Both end with an orderly FIN: the holder at the drain deadline, the
+    // raced socket via the quiet shed — never an RST (§8 table).
+    try std.testing.expectEqual(@as(u8, 2), bed.scenario.outcomeCount(.eof));
+    try std.testing.expectEqual(@as(u8, 0), bed.scenario.outcomeCount(.reset));
     try bed.expectDrained();
 }
 

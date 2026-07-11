@@ -150,6 +150,10 @@ const ListenerEntry = struct {
     /// (`injectAcceptError`) — the ENFILE-class path XevIo can hit but a
     /// virtual socket table never would.
     pending_accept_errors: u8,
+    /// A socket whose accept "CQE" was already posted when the listener
+    /// closed (§9: the drain race) — delivered to the armed accept as a
+    /// success even though the listener is no longer active.
+    raced_socket: ?Socket,
 };
 
 const Ring = struct {
@@ -241,6 +245,7 @@ pub fn listen(io: *SimIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
         .accept_queue = undefined,
         .accept_queue_len = 0,
         .pending_accept_errors = 0,
+        .raced_socket = null,
     };
     io.listeners_count += 1;
     return .{ .index = index };
@@ -261,10 +266,30 @@ pub fn listenClose(io: *SimIo, listener: Listener) void {
     const entry = &io.listeners[listener.index];
     assert(entry.active);
     entry.active = false;
-    for (entry.accept_queue[0..entry.accept_queue_len]) |queued| {
+    // The drain race (§9): if an accept op is armed and a connection is
+    // already queued, the kernel would have posted the accept CQE before
+    // any cancel could land — that socket is *delivered*, not canceled.
+    // The rest of the backlog resets, as a kernel dropping it would.
+    var queue_start: u16 = 0;
+    if (entry.accept_queue_len > 0 and io.hasArmedAccept(listener.index)) {
+        assert(entry.raced_socket == null);
+        entry.raced_socket = entry.accept_queue[0];
+        queue_start = 1;
+    }
+    for (entry.accept_queue[queue_start..entry.accept_queue_len]) |queued| {
         io.closeEntryWithReset(queued);
     }
     entry.accept_queue_len = 0;
+}
+
+fn hasArmedAccept(io: *const SimIo, listener_index: u16) bool {
+    for (io.pending[0..io.pending_count]) |completion| {
+        switch (completion.op) {
+            .accept => |op| if (op.listener_index == listener_index) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 pub fn accept(
@@ -713,6 +738,11 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
 
 fn finishAccept(io: *SimIo, listener_index: u16) Io.AcceptError!Socket {
     const entry = &io.listeners[listener_index];
+    if (entry.raced_socket) |socket| {
+        // The drain race: this accept's CQE beat the listener close.
+        entry.raced_socket = null;
+        return socket;
+    }
     if (!entry.active) {
         return error.Canceled;
     }
