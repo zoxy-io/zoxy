@@ -9,6 +9,8 @@
 const std = @import("std");
 const xev = @import("xev");
 
+const XevIo = @import("XevIo.zig");
+
 const assert = std.debug.assert;
 
 /// Mirrors the production `ring_entries` (constants.zig lands in slice 2).
@@ -88,7 +90,7 @@ test "tcp: loopback echo across the full watcher surface" {
     const listener = try xev.TCP.init(address);
     try listener.bind(address);
     try listener.listen(1);
-    address.setPort(try boundPort(listener));
+    address.setPort(try XevIo.boundPort(listener.fd));
     assert(address.getPort() != 0);
 
     const client = try xev.TCP.init(address);
@@ -397,18 +399,3 @@ const EchoContext = struct {
         return .disarm;
     }
 };
-
-/// Reads the kernel-assigned port back from an ephemeral bind. Raw syscall:
-/// std.posix no longer wraps getsockname in 0.16, and this file sits under
-/// `src/io/` where raw syscalls are allowed (DESIGN.md §9 lint boundary).
-fn boundPort(listener: xev.TCP) error{GetSockNameFailed}!u16 {
-    var bound: std.os.linux.sockaddr.in = undefined;
-    var bound_len: std.os.linux.socklen_t = @sizeOf(std.os.linux.sockaddr.in);
-    const rc = std.os.linux.getsockname(listener.fd, @ptrCast(&bound), &bound_len);
-    if (rc != 0) {
-        return error.GetSockNameFailed;
-    }
-    assert(bound_len == @sizeOf(std.os.linux.sockaddr.in));
-    assert(bound.family == std.os.linux.AF.INET);
-    return std.mem.bigToNative(u16, bound.port);
-}

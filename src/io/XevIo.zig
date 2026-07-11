@@ -576,7 +576,10 @@ fn listenerEntryConst(io: *const XevIo, listener: Listener) *const ListenerEntry
     return &io.listeners[listener.index];
 }
 
-fn boundPort(fd: posix.socket_t) error{Unexpected}!u16 {
+/// Reads the kernel-assigned port back from an ephemeral bind. Handles
+/// both address families (IPv4/IPv6 share the family/port prefix). Public
+/// for the raw-libxev smoke test, which lives under src/io/ too.
+pub fn boundPort(fd: posix.socket_t) error{Unexpected}!u16 {
     var bound: linux.sockaddr.in6 = undefined;
     var bound_len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
     const rc = linux.getsockname(fd, @ptrCast(&bound), &bound_len);
