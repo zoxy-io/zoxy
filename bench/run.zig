@@ -90,7 +90,20 @@ pub fn main(init: std.process.Init) !u8 {
     if (!completed) {
         std.debug.print("FAIL: a run completed zero requests\n", .{});
     }
-    return if (rss_flat and completed and drained_cleanly) 0 else 1;
+    // A mostly-timing-out proxy still completes a few requests, so
+    // completed>0 is too weak — require the proxied SOCKET error rate to
+    // stay under 1% or a relay stall passes silently. Status errors are
+    // excluded: a faithfully relayed 4xx/5xx is not a proxy failure (and
+    // the loopback origin may legitimately answer non-2xx).
+    const proxied_socket_errors = proxied.snapshot.counters.socketErrors();
+    const errors_ok = proxied_socket_errors * 100 <= proxied.snapshot.counters.completed;
+    if (!errors_ok) {
+        std.debug.print(
+            "FAIL: proxied socket-error rate too high ({d} socket-errors, {d} completed)\n",
+            .{ proxied_socket_errors, proxied.snapshot.counters.completed },
+        );
+    }
+    return if (rss_flat and completed and errors_ok and drained_cleanly) 0 else 1;
 }
 
 fn parseFlags(args: []const [:0]const u8) !Flags {
@@ -109,6 +122,18 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             flags.duration_s = try std.fmt.parseUnsigned(u64, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--origin")) {
             index += 1;
+            // zoxy's config resolves endpoints with parseLiteral (no DNS),
+            // so a hostname would make the spawned proxy exit at config
+            // parse and surface here as a misleading "never answered".
+            // Reject it up front, with the port the harness relies on.
+            _ = std.Io.net.IpAddress.parseLiteral(args[index]) catch {
+                std.debug.print(
+                    "bench: --origin must be an IP literal with a port " ++
+                        "(e.g. 127.0.0.1:9000); hostnames are not resolved\n",
+                    .{},
+                );
+                return error.InvalidOrigin;
+            };
             flags.origin = args[index];
         } else if (std.mem.eql(u8, arg, "--zoxy")) {
             index += 1;
@@ -129,9 +154,10 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
 }
 
 fn originPortOf(origin_address: []const u8) u16 {
-    const colon = std.mem.lastIndexOfScalar(u8, origin_address, ':').?;
-    return std.fmt.parseUnsigned(u16, origin_address[colon + 1 ..], 10) catch
-        @panic("invalid --origin port");
+    // Both callers (--origin, validated in parseFlags; and the generated
+    // "127.0.0.1:{port}") are guaranteed to parse.
+    const address = std.Io.net.IpAddress.parseLiteral(origin_address) catch unreachable;
+    return address.getPort();
 }
 
 fn spawnNginx(arena: std.mem.Allocator, io: Io) !std.process.Child {
@@ -253,10 +279,15 @@ fn printReport(label: []const u8, report: *const zrk.runner.Report) void {
     const counters = &report.snapshot.counters;
     const rate_achieved =
         @as(f64, @floatFromInt(counters.completed)) / report.elapsed_s;
-    // zrk histograms record microseconds (the wrk2 convention).
+    // zrk histograms record microseconds (the wrk2 convention). Socket
+    // errors (connect + read + write + timeouts, via zrk's socketErrors())
+    // are the relay-stall modes and are shown separately from status
+    // errors — a proxy faithfully relaying a 4xx/5xx is healthy, but a
+    // relay that times out is not, and omitting timeouts/read_errors
+    // (as the old sum did) would hide exactly that.
     std.debug.print(
         "{s}  {d:.0} req/s  p50 {d} us  p90 {d} us  p99 {d} us  max {d} us  " ++
-            "({d} completed, {d} errors)\n",
+            "({d} completed, {d} socket-errors, {d} status-errors)\n",
         .{
             label,
             rate_achieved,
@@ -265,7 +296,8 @@ fn printReport(label: []const u8, report: *const zrk.runner.Report) void {
             hist.valueAtPercentile(99.0),
             hist.max(),
             counters.completed,
-            counters.connect_errors + counters.write_errors + counters.status_errors,
+            counters.socketErrors(),
+            counters.status_errors,
         },
     );
 }
