@@ -606,6 +606,7 @@ pub fn run(io: *SimIo) Io.RunError!void {
         const ready = io.collectReady(&ready_buffer);
         if (ready.len == 0) {
             if (io.pending_count == 0 and io.pending_signals_count == 0) {
+                io.reclaimRacedSockets();
                 return;
             }
             const wake_ns = io.earliestWakeNs();
@@ -621,6 +622,20 @@ pub fn run(io: *SimIo) Io.RunError!void {
         }
         io.deliverBatch(ready);
         io.maybeInjectReset();
+    }
+    // The loop was stopped (a completed drain). A raced accept whose CQE
+    // beat the listener close but was never delivered before stop() is an
+    // accepted-but-unshed fd — reclaimed at process exit in production, so
+    // model that here rather than flagging it as an operational leak.
+    io.reclaimRacedSockets();
+}
+
+fn reclaimRacedSockets(io: *SimIo) void {
+    for (io.listeners[0..io.listeners_count]) |*entry| {
+        if (entry.raced_socket) |socket| {
+            entry.raced_socket = null;
+            io.closeEntry(socket);
+        }
     }
 }
 
