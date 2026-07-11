@@ -36,11 +36,15 @@ pub const accept_retry_delay_ms: u32 = 10;
 /// fixes the completion queue at twice this (§4).
 pub const ring_entries: u16 = 4096;
 
-/// Worst-case simultaneously armed ring ops for one connection: two data
-/// ops (strict per-direction alternation, §6), the deadline timer, and the
-/// teardown timer-cancel. Closes are submitted only after the data ops
-/// have delivered, so they never raise this peak (§8).
-pub const conn_ops_max: u32 = 4;
+/// Worst-case simultaneously armed ring ops for one connection: five.
+/// The peak is a teardown racing its own upstream dial — a connecting
+/// conn holds connect + deadline, teardown arms connect_cancel +
+/// deadline_cancel, then the dial completes while its cancel is still in
+/// flight: the connect bit clears and both closes are submitted with the
+/// deadline, connect_cancel, and deadline_cancel completions all still
+/// outstanding. In steady relay the peak is only four (two data ops +
+/// timer + cancel), but the budget must cover the teardown race (§8).
+pub const conn_ops_max: u32 = 5;
 
 /// Completions drained per loop tick before control returns to the kernel;
 /// bounds both callback batches and `Io.now_ns` staleness (§4).
@@ -60,11 +64,13 @@ pub const endpoints_per_cluster_max: u16 = 64;
 pub const timeout_ms_max: u32 = 3_600_000;
 
 /// Worst-case in-flight ring ops (§8: the ring is pre-budgeted, not shed):
-/// every admitted connection at its op peak, one armed accept per
-/// listener, the single async wakeup op for signals, and the server's
-/// one drain-deadline timer.
+/// every admitted connection at its op peak, two ops per listener (a
+/// draining listener holds its armed accept — or the accept-retry
+/// backoff timer — plus the async cancel that reaps it), the single
+/// async wakeup op for signals, and the server's one drain-deadline
+/// timer.
 pub const in_flight_ops_max: u32 =
-    relay_buffers_max * conn_ops_max + listeners_max + 1 + 1;
+    relay_buffers_max * conn_ops_max + 2 * @as(u32, listeners_max) + 1 + 1;
 
 /// Kernel completion queue capacity (io_uring fixes CQ at 2 × SQ).
 pub const completion_queue_entries: u32 = 2 * @as(u32, ring_entries);
