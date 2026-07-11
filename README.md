@@ -25,7 +25,14 @@ zig build              # build zig-out/bin/zoxy
 zig build test         # run the test suite
 zig build sim -- 0 500 # deterministic simulator: [seed] [iterations]
 zig build run          # run using ./zoxy.json
+zig build bench        # loopback bands: direct vs zoxy vs haproxy
 ```
+
+> [!NOTE]
+> The bench harness is always built ReleaseFast, but it measures the
+> `zig-out/bin/zoxy` you last built — and plain `zig build` produces a
+> Debug binary. Run `zig build -Doptimize=ReleaseFast` first before
+> quoting numbers against haproxy.
 
 ## License
 
