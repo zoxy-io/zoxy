@@ -143,7 +143,11 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint", "fd-boundary lint: raw syscalls only under src/io/");
     lint_step.dependOn(&lint_run.step);
 
-    const ci_step = b.step("ci", "Everything CI gates on: test + lint + sim");
+    // The deterministic per-change gates. The Tier-1 `bench` step is
+    // deliberately excluded (DESIGN.md §9): its verdict is a band
+    // comparison across runs, run at merge against a real origin, not a
+    // blind shared-runner pass.
+    const ci_step = b.step("ci", "Per-change gates: test + lint + sim (bench runs at merge)");
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
     ci_step.dependOn(sim_step);

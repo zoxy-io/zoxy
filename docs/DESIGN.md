@@ -549,8 +549,15 @@ is maximum pressure — and the zero-alloc gate runs it (§9).
 
 ## 9. Testing — required from day 0
 
-All four gates exist in `build.zig` from the first commit and run in CI;
-a feature without its gate is not done.
+All four gates exist as `build.zig` steps from the first commit; a
+feature without its gate is not done. The three deterministic gates
+(simulation, fuzz, zero-alloc) plus the fd-boundary lint run on every
+change as `zig build ci`. The benchmark gate (Tier 1) is **run at
+merge, not on every change**: its verdict is a *band comparison across
+runs* (§Tier 1 below), which a single shared-runner pass cannot make —
+so `zig build bench` is invoked deliberately against a real origin, and
+its hard invariants (flat RSS, clean drain, sub-1% socket-error rate)
+are the pass/fail part. `zig build ci` deliberately excludes it.
 
 1. **Deterministic simulation — `zig build sim -- [seed] [iterations]`.**
    The `SimIo` backend (§4) runs the real data path against virtual
@@ -586,13 +593,17 @@ a feature without its gate is not done.
      (counter deltas on shared runners are noise) — the Tier-1 band is
      what merges are held to. hyperfine is not used: wall-time-only, and
      poop subsumes it on Linux.
-   - **Tier 1 (CI gate) — `bench/run.zig`, loopback.** (Tooling in Zig,
-     per TIGER_STYLE — no shell harness.) nginx origin, direct
-     baseline vs proxied path (L4 and L7, keep-alive and
-     `Connection: close`), roles pinned to disjoint cores. Compare *bands*
-     across runs, never single numbers (p50 swings 3× between identical
-     back-to-back runs). A PR that regresses the band explains itself or
-     does not merge.
+   - **Tier 1 (merge gate, run on demand) — `bench/run.zig`, loopback.**
+     (Tooling in Zig, per TIGER_STYLE — no shell harness.) nginx origin
+     (or `--origin host:port`), direct baseline vs proxied path (L4 and
+     L7, keep-alive and `Connection: close`), roles pinned to disjoint
+     cores. Compare *bands* across runs, never single numbers (p50 swings
+     3× between identical back-to-back runs) — which is why this is not a
+     blind per-change CI step. A PR that regresses the band explains
+     itself or does not merge. The run's *hard* invariants are machine-
+     checked and exit non-zero: flat RSS (the zero-alloc promise from
+     outside), a clean SIGTERM drain, and a sub-1% proxied socket-error
+     rate.
    - **Tier 2 (comparison, on demand) — same harness + HAProxy.** The dev
      shell provides `haproxy` as a Nix package; the script runs the
      identical scenario through it on the same pinned cores. No
