@@ -597,9 +597,12 @@ pub fn scheduleSignal(io: *SimIo, signal: Io.Signal, at_ns: u64) void {
 /// nothing can ever become ready (Deadlock — a liveness bug, §9).
 pub fn run(io: *SimIo) Io.RunError!void {
     io.stopped = false;
+    // Hoisted out of the loop: collectReady overwrites the prefix it
+    // returns, so the undefined init is never observed, and a ~32 KiB
+    // buffer need not be re-stacked (and Debug-0xAA-filled) each tick.
+    var ready_buffer: [pending_ops_max]*Completion = undefined;
     while (!io.stopped) {
         io.deliverDueSignals();
-        var ready_buffer: [pending_ops_max]*Completion = undefined;
         const ready = io.collectReady(&ready_buffer);
         if (ready.len == 0) {
             if (io.pending_count == 0 and io.pending_signals_count == 0) {

@@ -44,6 +44,8 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer if (origin_child) |*child| {
         child.kill(io);
+        // Best-effort reap on the cleanup path; the process is already
+        // killed and the harness is exiting either way.
         _ = child.wait(io) catch {};
     };
 
@@ -236,17 +238,23 @@ fn spawnZoxy(
 /// Short probing runs double as warmup; a target that never answers is a
 /// setup failure, reported before any numbers are printed.
 fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u8) !void {
+    assert(port != 0);
+    assert(label.len > 0);
+    const probe_attempts_max: u8 = 10;
+    // The retry sleep is best-effort pacing; a spurious wake only means
+    // the next probe runs a touch sooner, which is harmless.
+    const retry_sleep = Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms);
     var attempt: u8 = 0;
-    while (attempt < 10) : (attempt += 1) {
+    while (attempt < probe_attempts_max) : (attempt += 1) {
         var cfg = benchConfig(port, 4, 100);
         cfg.duration_ns = std.time.ns_per_s / 2;
         const report = zrk.runner.run(arena, io, &cfg, null, null) catch |err| {
-            if (attempt == 9) return err;
-            io.sleep(Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
+            if (attempt == probe_attempts_max - 1) return err;
+            io.sleep(retry_sleep, .awake) catch {};
             continue;
         };
         if (report.snapshot.counters.completed > 0) return;
-        io.sleep(Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms), .awake) catch {};
+        io.sleep(retry_sleep, .awake) catch {};
     }
     std.debug.print("bench: {s} on port {d} never answered\n", .{ label, port });
     return error.TargetUnresponsive;
@@ -258,12 +266,19 @@ fn loadTest(
     port: u16,
     flags: *const Flags,
 ) !zrk.runner.Report {
+    assert(port != 0);
+    assert(flags.duration_s >= 1);
     var cfg = benchConfig(port, flags.connections, flags.rate);
     cfg.duration_ns = flags.duration_s * std.time.ns_per_s;
-    return zrk.runner.run(arena, io, &cfg, null, null);
+    const report = try zrk.runner.run(arena, io, &cfg, null, null);
+    assert(report.launched >= 1);
+    return report;
 }
 
 fn benchConfig(port: u16, connections: u32, rate: u64) zrk.cli.Config {
+    assert(port != 0);
+    assert(connections >= 1);
+    assert(rate >= 1);
     return .{
         .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" },
         .connections = connections,
@@ -310,6 +325,7 @@ fn printOverhead(direct: *const zrk.runner.Report, proxied: *const zrk.runner.Re
 }
 
 fn readRssKb(arena: std.mem.Allocator, io: Io, pid: ?std.process.Child.Id) !u64 {
+    assert(pid != null);
     const path = try std.fmt.allocPrint(arena, "/proc/{d}/status", .{pid.?});
     // procfs advertises size 0, so this must stream, not trust st_size.
     const file = try Io.Dir.cwd().openFile(io, path, .{});
@@ -318,6 +334,7 @@ fn readRssKb(arena: std.mem.Allocator, io: Io, pid: ?std.process.Child.Id) !u64 
     var file_reader = file.reader(io, &read_buffer);
     var status_buffer: [8192]u8 = undefined;
     const status_len = try file_reader.interface.readSliceShort(&status_buffer);
+    assert(status_len > 0);
     const status = status_buffer[0..status_len];
     var lines = std.mem.splitScalar(u8, status, '\n');
     while (lines.next()) |line| {
