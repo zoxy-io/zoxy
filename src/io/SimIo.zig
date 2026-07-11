@@ -122,6 +122,41 @@ const Result = union(enum) {
 };
 
 const ErasedCallback = *const fn (?*anyopaque, *const Result) void;
+const ResultTag = std.meta.Tag(Result);
+
+/// Builds the type-erased trampoline for an op whose completion carries a
+/// value: it asserts the delivered Result matches `tag` and forwards the
+/// projected value to the typed `callback`. Collapses the otherwise
+/// identical per-op trampolines into one shape.
+fn erasedResult(
+    comptime Userdata: type,
+    comptime tag: ResultTag,
+    comptime callback: anytype,
+) ErasedCallback {
+    return (struct {
+        fn erased(context: ?*anyopaque, result: *const Result) void {
+            assert(result.* == tag);
+            const userdata: *Userdata = @ptrCast(@alignCast(context.?));
+            callback(userdata, @field(result.*, @tagName(tag)));
+        }
+    }).erased;
+}
+
+/// The trampoline for an op whose completion carries no value (close and
+/// the two cancels): assert the tag, then invoke the value-less callback.
+fn erasedVoid(
+    comptime Userdata: type,
+    comptime tag: ResultTag,
+    comptime callback: anytype,
+) ErasedCallback {
+    return (struct {
+        fn erased(context: ?*anyopaque, result: *const Result) void {
+            assert(result.* == tag);
+            const userdata: *Userdata = @ptrCast(@alignCast(context.?));
+            callback(userdata);
+        }
+    }).erased;
+}
 
 const PendingSignal = struct {
     signal: Io.Signal,
@@ -313,11 +348,7 @@ pub fn accept(
     completion.* = .{
         .op = .{ .accept = .{ .listener_index = listener.index } },
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                callback(@ptrCast(@alignCast(context.?)), result.accept);
-            }
-        }).erased,
+        .callback = erasedResult(Userdata, .accept, callback),
     };
     io.enqueue(completion);
 }
@@ -349,11 +380,7 @@ pub fn connect(
         .op = .{ .connect = .{ .address = address, .fate = fate, .canceled = false } },
         .ready_at_ns = if (fate == .blackhole) never_ns else io.now_ns_value + delay_ns,
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                callback(@ptrCast(@alignCast(context.?)), result.connect);
-            }
-        }).erased,
+        .callback = erasedResult(Userdata, .connect, callback),
     };
     io.enqueue(completion);
 }
@@ -373,11 +400,7 @@ pub fn recv(
     completion.* = .{
         .op = .{ .recv = .{ .socket = socket, .buffer = buffer } },
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                callback(@ptrCast(@alignCast(context.?)), result.recv);
-            }
-        }).erased,
+        .callback = erasedResult(Userdata, .recv, callback),
     };
     io.enqueue(completion);
 }
@@ -398,11 +421,7 @@ pub fn send(
     completion.* = .{
         .op = .{ .send = .{ .socket = socket, .bytes = bytes } },
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                callback(@ptrCast(@alignCast(context.?)), result.send);
-            }
-        }).erased,
+        .callback = erasedResult(Userdata, .send, callback),
     };
     io.enqueue(completion);
 }
@@ -420,12 +439,7 @@ pub fn close(
     completion.* = .{
         .op = .{ .close = .{ .socket = socket } },
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                assert(result.* == .close);
-                callback(@ptrCast(@alignCast(context.?)));
-            }
-        }).erased,
+        .callback = erasedVoid(Userdata, .close, callback),
     };
     io.enqueue(completion);
 }
@@ -443,11 +457,7 @@ pub fn timerStart(
     completion.* = .{
         .op = .{ .timer = .{ .fire_at_ns = io.now_ns_value + delay_ns, .canceled = false } },
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                callback(@ptrCast(@alignCast(context.?)), result.timer);
-            }
-        }).erased,
+        .callback = erasedResult(Userdata, .timer, callback),
     };
     io.enqueue(completion);
 }
@@ -471,12 +481,7 @@ pub fn timerCancel(
     cancel_completion.* = .{
         .op = .{ .timer_cancel = .{ .target = timer_completion } },
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                assert(result.* == .timer_cancel);
-                callback(@ptrCast(@alignCast(context.?)));
-            }
-        }).erased,
+        .callback = erasedVoid(Userdata, .timer_cancel, callback),
     };
     io.enqueue(cancel_completion);
 }
@@ -501,12 +506,7 @@ pub fn connectCancel(
     cancel_completion.* = .{
         .op = .{ .connect_cancel = .{ .target = connect_completion } },
         .userdata = userdata,
-        .callback = (struct {
-            fn erased(context: ?*anyopaque, result: *const Result) void {
-                assert(result.* == .connect_cancel);
-                callback(@ptrCast(@alignCast(context.?)));
-            }
-        }).erased,
+        .callback = erasedVoid(Userdata, .connect_cancel, callback),
     };
     io.enqueue(cancel_completion);
 }
