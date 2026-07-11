@@ -157,21 +157,33 @@ pub fn Relay(comptime IoType: type) type {
             }
         }
 
+        // The per-direction plumbing derives from one naming convention:
+        // the DirectionState index, the RelayBuffer field, the op field
+        // (`op_data_` + tag), and the armed bit (`data_` + tag) are all
+        // keyed off the direction's tag name, so the only real branch is
+        // which socket is the source (its target is the source of the
+        // opposite direction).
+
         fn directionState(conn: *ConnType, comptime direction: Direction) *ConnType.DirectionState {
             return &conn.directions[@intFromEnum(direction)];
         }
 
         fn dataOp(conn: *ConnType, comptime direction: Direction) *ConnType.Op {
-            return switch (direction) {
-                .client_to_upstream => &conn.op_data_client_to_upstream,
-                .upstream_to_client => &conn.op_data_upstream_to_client,
-            };
+            return &@field(conn, "op_data_" ++ @tagName(direction));
         }
 
         fn armedBitName(comptime direction: Direction) []const u8 {
+            return "data_" ++ @tagName(direction);
+        }
+
+        fn buffer(conn: *ConnType, comptime direction: Direction) []u8 {
+            return &@field(conn.relay_buffer, @tagName(direction));
+        }
+
+        fn opposite(comptime direction: Direction) Direction {
             return switch (direction) {
-                .client_to_upstream => "data_client_to_upstream",
-                .upstream_to_client => "data_upstream_to_client",
+                .client_to_upstream => .upstream_to_client,
+                .upstream_to_client => .client_to_upstream,
             };
         }
 
@@ -184,17 +196,7 @@ pub fn Relay(comptime IoType: type) type {
         }
 
         fn targetSocket(conn: *const ConnType, comptime direction: Direction) IoType.Socket {
-            return switch (direction) {
-                .client_to_upstream => conn.upstream_socket.?,
-                .upstream_to_client => conn.client_socket,
-            };
-        }
-
-        fn buffer(conn: *ConnType, comptime direction: Direction) []u8 {
-            return switch (direction) {
-                .client_to_upstream => &conn.relay_buffer.client_to_upstream,
-                .upstream_to_client => &conn.relay_buffer.upstream_to_client,
-            };
+            return sourceSocket(conn, opposite(direction));
         }
 
         fn onRecvFor(comptime direction: Direction) fn (*ConnType, Io.RecvError!u32) void {
