@@ -663,9 +663,19 @@ Each phase ships behind all four gates of §9.
   narrower than libssl, since the protocol layer stays in Zig and only
   primitives cross the boundary; the fixed FFI heap behind
   `CRYPTO_set_mem_functions` still applies to keep the zero-alloc
-  promise. If ztls hasn't matured by Phase 3, the previous iteration's
-  full OpenSSL recipe (sans-io BIO pair + fixed FFI heap, kTLS
-  switchover) remains the proven fallback.
+  promise. If ztls hasn't matured by Phase 3, the fallback ladder
+  (surveyed 2026-07-12) is: **picotls** (h2o/picotls) — sans-I/O like
+  ztls, battle-tested in H2O/quicly at Fastly, feature-complete where
+  ztls is not (resumption, 0-RTT, HRR, client certs, ECH), injectable
+  `random_bytes`/`get_time` (sim-drivable), kTLS-ready via
+  `ptls_export_secret`/`update_traffic_key`, and its minicrypto backend
+  even drops the system-library link for termination — but the protocol
+  layer itself is C (the §4 exception swallows the whole TLS layer) and
+  it mallocs internally with no allocator hook, so the zero-alloc
+  promise needs link-time interposition or a documented carve-out. Last
+  rung: the previous iteration's full OpenSSL/libssl recipe (sans-io BIO
+  pair + fixed FFI heap, kTLS switchover) — proven by us, heaviest, and
+  now likely displaced by picotls even as a fallback.
 - **Deferred, revisit on evidence:** HTTP/2, richer resilience (breakers,
   outlier ejection, budgets, health checks), hot restart + drain-to-
   successor, config DSL, metrics/admin plane beyond counters-on-a-thread,
