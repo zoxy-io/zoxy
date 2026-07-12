@@ -646,11 +646,26 @@ Each phase ships behind all four gates of §9.
   admitted work, all excess shed with correct status).
 - **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
   activates). The stack is an **open decision under the Zig-first policy**
-  (§4): re-survey pure-Zig server-side TLS when this phase starts (std was
-  client-only as of 0.16). If none qualifies, the previous iteration's
-  OpenSSL recipe (sans-io BIO pair + fixed FFI heap behind
-  `CRYPTO_set_mem_functions`, kTLS switchover) is proven but requires a
-  deliberate exception to the policy.
+  (§4). Leading candidate (surveyed 2026-07-12): **ztls**
+  (github.com/mattrobenolt/ztls) — a sans-I/O TLS 1.3 state machine in
+  Zig. The fit is almost point-for-point: caller-owned buffers and zero
+  allocations in library code (its own claim, matching §5), both server
+  and client roles (termination + upstream re-encryption), ALPN,
+  handshake randomness injected by the caller (drivable from the
+  simulator without sockets), kTLS key-packing helpers matching the
+  proven switchover recipe, CI gated on Zig 0.16, and TLS-Anvil
+  conformance runs. Two eyes-open costs, re-check both at adoption time:
+  (1) pre-alpha — version 0.0.0, API explicitly unstable; no session
+  resumption, 0-RTT, HelloRetryRequest, or client certs yet; TLS 1.3
+  only. (2) Not pure Zig at the bottom: crypto primitives are libcrypto
+  via `@cImport` (OpenSSL/AWS-LC/BoringSSL; no pure-Zig backend), so
+  adopting it is still a deliberate C-FFI exception (§4) — though far
+  narrower than libssl, since the protocol layer stays in Zig and only
+  primitives cross the boundary; the fixed FFI heap behind
+  `CRYPTO_set_mem_functions` still applies to keep the zero-alloc
+  promise. If ztls hasn't matured by Phase 3, the previous iteration's
+  full OpenSSL recipe (sans-io BIO pair + fixed FFI heap, kTLS
+  switchover) remains the proven fallback.
 - **Deferred, revisit on evidence:** HTTP/2, richer resilience (breakers,
   outlier ejection, budgets, health checks), hot restart + drain-to-
   successor, config DSL, metrics/admin plane beyond counters-on-a-thread,
