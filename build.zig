@@ -4,8 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // libxev is vendored by content hash at an audited commit (DESIGN.md §4);
-    // the pin moves only after re-audit.
+    // libxev is pinned by content hash to the floatdrop fork's
+    // zoxy-ring-flags branch: the audited upstream snapshot plus the
+    // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
+    // only after re-audit.
     const xev_dependency = b.dependency("libxev", .{
         .target = target,
         .optimize = optimize,

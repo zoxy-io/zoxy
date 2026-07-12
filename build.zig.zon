@@ -32,9 +32,14 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        // Audited fork: floatdrop/libxev branch zoxy-ring-flags = upstream
+        // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
+        // plus one commit exposing io_uring setup flags through Options.
+        // Diff against that upstream commit to audit; the pin moves only
+        // after re-audit.
         .libxev = .{
-            .url = "git+https://github.com/mitchellh/libxev#9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf",
-            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
+            .url = "git+https://github.com/floatdrop/libxev#c369817ab8bd529432047107967d88fd5674eae0",
+            .hash = "libxev-0.0.0-86vtc1cTFACGErSvTkJp2mZSFDLCgOHl7R45UZwS5wBZ",
         },
         .zrk = .{
             .url = "git+https://github.com/floatdrop/zrk#e13a1fb1ed1278202c170def5502ca4ad37cd0bd",

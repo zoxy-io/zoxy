@@ -61,10 +61,33 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
         io.thread_pool.shutdown();
         io.thread_pool.deinit();
     };
-    io.loop = try xev.Loop.init(.{
+    // SINGLE_ISSUER + COOP_TASKRUN + DEFER_TASKRUN: completion task-work
+    // stays on the loop thread and is batched at the GETEVENTS reap point
+    // instead of interrupting it (measured 2026-07-12: eliminates the
+    // ~10.7% of loop cycles spent in interrupt-driven task_work at the
+    // Tier-1 steady band, ~-3.4% loop CPU). Sound by construction here:
+    // the loop thread is the only submitter (§3), and the loop only runs
+    // .until_done, which always enters the kernel with GETEVENTS (the
+    // fork's Options doc records that DEFER_TASKRUN contract). Kernels
+    // older than 6.1 reject these flags with EINVAL; degrade to a plain
+    // ring rather than refuse to start.
+    const fast_ring_flags: u32 = if (comptime xev.backend == .io_uring)
+        std.os.linux.IORING_SETUP_SINGLE_ISSUER |
+            std.os.linux.IORING_SETUP_COOP_TASKRUN |
+            std.os.linux.IORING_SETUP_DEFER_TASKRUN
+    else
+        0;
+    io.loop = xev.Loop.init(.{
         .entries = constants.ring_entries,
+        .io_uring_flags = fast_ring_flags,
         .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
-    });
+    }) catch |err| switch (err) {
+        error.ArgumentsInvalid => try xev.Loop.init(.{
+            .entries = constants.ring_entries,
+            .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
+        }),
+        else => return err,
+    };
     errdefer io.loop.deinit();
     io.notifier = try xev.Async.init();
     errdefer io.notifier.deinit();
