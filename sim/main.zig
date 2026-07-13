@@ -136,6 +136,7 @@ const Harness = struct {
             .connect_delay_ns_max = random.uintAtMost(u64, 5_000_000),
             .connect_refuse_percent = random.uintAtMost(u8, 20),
             .reset_percent = random.uintAtMost(u8, 10),
+            .kernel_pressure_percent = random.uintAtMost(u8, 8),
         };
         try harness.io.init(arena, .{ .seed = seed, .adversary = adversary });
 

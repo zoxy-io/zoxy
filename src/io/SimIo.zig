@@ -65,6 +65,10 @@ pub const Adversary = struct {
     connect_blackhole_percent: u8 = 0,
     /// Chance per batch to reset one random live connection.
     reset_percent: u8 = 0,
+    /// Chance per batch to fail one random live socket's next data op with
+    /// `error.Unexpected` (ENOBUFS/ENOMEM-class, §8) — local to that
+    /// socket, so the relay witnesses it and tears the connection down.
+    kernel_pressure_percent: u8 = 0,
     batch_max: u32 = constants.loop_completions_per_tick_max,
 };
 
@@ -171,6 +175,11 @@ const SocketEntry = struct {
     read_shutdown: bool,
     write_shutdown: bool,
     reset: bool,
+    /// One-shot: the next recv/send on this socket fails with
+    /// `error.Unexpected`, modeling a transient ENOBUFS/ENOMEM op failure
+    /// (§8 "any completion" kernel-pressure rung). Local to this socket —
+    /// the peer is untouched, unlike `reset`.
+    kernel_pressure: bool,
     linger_rst: bool,
     nodelay: bool,
     inbox: Ring,
@@ -235,6 +244,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     assert(@as(u16, options.adversary.connect_refuse_percent) +
         options.adversary.connect_blackhole_percent <= 100);
     assert(options.adversary.reset_percent <= 100);
+    assert(options.adversary.kernel_pressure_percent <= 100);
     assert(options.adversary.batch_max >= 1);
 
     io.listeners = try arena.alloc(ListenerEntry, listeners_max);
@@ -622,6 +632,7 @@ pub fn run(io: *SimIo) Io.RunError!void {
         }
         io.deliverBatch(ready);
         io.maybeInjectReset();
+        io.maybeInjectKernelPressure();
     }
     // The loop was stopped (a completed drain). A raced accept whose CQE
     // beat the listener close but was never delivered before stop() is an
@@ -705,12 +716,14 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
         .connect => |op| op.canceled or io.now_ns_value >= completion.ready_at_ns,
         .recv => |op| ready: {
             const entry = io.socketEntry(op.socket);
-            break :ready entry.reset or entry.inbox.count > 0 or
+            break :ready entry.kernel_pressure or entry.reset or entry.inbox.count > 0 or
                 entry.read_shutdown or entry.fin_received;
         },
         .send => |op| ready: {
             const entry = io.socketEntry(op.socket);
-            if (entry.reset or entry.write_shutdown or entry.peer == peer_none) {
+            if (entry.kernel_pressure or entry.reset or
+                entry.write_shutdown or entry.peer == peer_none)
+            {
                 break :ready true;
             }
             break :ready io.peerEntry(entry).inbox.freeSpace() > 0;
@@ -820,6 +833,11 @@ fn finishConnect(
 
 fn finishRecv(io: *SimIo, socket: Socket, buffer: []u8) Io.RecvError!u32 {
     const entry = io.socketEntry(socket);
+    if (entry.kernel_pressure) {
+        // Transient op failure: consume the flag, leave the socket usable.
+        entry.kernel_pressure = false;
+        return error.Unexpected;
+    }
     if (entry.reset) {
         return error.Reset;
     }
@@ -837,6 +855,11 @@ fn finishRecv(io: *SimIo, socket: Socket, buffer: []u8) Io.RecvError!u32 {
 
 fn finishSend(io: *SimIo, socket: Socket, bytes: []const u8) Io.SendError!u32 {
     const entry = io.socketEntry(socket);
+    if (entry.kernel_pressure) {
+        // Transient op failure: consume the flag, leave the socket usable.
+        entry.kernel_pressure = false;
+        return error.Unexpected;
+    }
     if (entry.reset) {
         return error.Reset;
     }
@@ -913,6 +936,29 @@ fn maybeInjectReset(io: *SimIo) void {
     }
 }
 
+/// §8 kernel-pressure rung on the data path: flag one random live
+/// socket's next recv/send to fail with `error.Unexpected` (ENOBUFS/
+/// ENOMEM-class). Unlike a reset it is local and one-shot — only the
+/// picked socket's next op fails, the peer is untouched — so the relay
+/// witnesses it and tears the connection down.
+fn maybeInjectKernelPressure(io: *SimIo) void {
+    if (io.adversary.kernel_pressure_percent == 0) return;
+    const random = io.prng.random();
+    if (random.uintLessThan(u8, 100) >= io.adversary.kernel_pressure_percent) return;
+    if (io.sockets.acquired_count == 0) return;
+
+    var probe: u8 = 0;
+    while (probe < 8) : (probe += 1) {
+        const index = random.uintLessThan(u16, sockets_max);
+        const entry = &io.sockets.slots[index];
+        if (io.sockets.isAcquired(entry) and entry.peer != peer_none) {
+            entry.kernel_pressure = true;
+            io.mix(@as(u64, index) +% 0x454e4f42); // "ENOB"
+            return;
+        }
+    }
+}
+
 fn partialLen(io: *SimIo, available: u32) u32 {
     assert(available >= 1);
     if (!io.adversary.partial_io) return available;
@@ -971,6 +1017,7 @@ fn initSocketEntry(entry: *SocketEntry) void {
     entry.read_shutdown = false;
     entry.write_shutdown = false;
     entry.reset = false;
+    entry.kernel_pressure = false;
     entry.linger_rst = false;
     entry.nodelay = false;
     entry.inbox.head = 0;

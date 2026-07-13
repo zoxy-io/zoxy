@@ -357,6 +357,32 @@ test "relay: an origin reset mid-exchange tears the connection down" {
     try bed.expectDrained();
 }
 
+test "relay: a kernel-pressure data-op failure is witnessed and tears down" {
+    // ENOBUFS/ENOMEM on a relay recv/send surfaces as error.Unexpected;
+    // the relay counts it (§8 "any completion" rung) and tears the
+    // connection down. The injection is certain every batch, so at least
+    // one relay data op takes the hit before the exchange completes.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{
+            .seed = 2,
+            .adversary = .{ .partial_io = true, .kernel_pressure_percent = 100 },
+        },
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    // Witnessed on the data path, and the connection still tore down
+    // cleanly — a kernel-pressure teardown is an ordinary teardown that
+    // reconciles (it is a failure, not a shed).
+    try std.testing.expect(bed.server.counters.get("kernel_pressure_errors") >= 1);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("shed_relay_buffers"));
+    try bed.expectDrained();
+}
+
 test "server: kernel-pressure accept failure backs off and recovers" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 51 } });

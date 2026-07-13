@@ -27,7 +27,9 @@ pub const Counters = struct {
     deadline_expired: Value = Value.init(0),
     /// Upstream dial failed (refused/unreachable/canceled-by-teardown).
     upstream_connect_failed: Value = Value.init(0),
-    /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op.
+    /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
+    /// across every completion (accept, connect, setNodelay, and the relay
+    /// recv/send data path).
     kernel_pressure_errors: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
