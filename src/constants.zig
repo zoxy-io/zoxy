@@ -17,11 +17,24 @@ pub const listeners_max: u16 = 8;
 pub const conn_slots_max: u32 = 4096;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the true bound on concurrent
-/// L4 connections plus, in Phase 1, active L7 relays (§5, §6).
-pub const relay_buffers_max: u32 = 1024;
+/// L4 connections plus, in Phase 1, active L7 relays (§5, §6). The binding
+/// constraint is the io_uring completion queue, not fds or memory: every
+/// admitted connection can hold `conn_ops_max` armed ops at once, the ring
+/// is pre-budgeted and never shed (§8), and the budget keeps in-flight ops
+/// under ¾ of the completion queue. With the ring at its usable maximum
+/// (`ring_entries = 4096`, CQ = 8192) that caps this at
+/// `(6144 - 18) / 5 = 1225`. Lifting the ceiling toward c10k needs a
+/// deeper CQ (`IORING_SETUP_CQSIZE`), which the libxev fork does not yet
+/// expose — the same prerequisite as the splice fast path.
+pub const relay_buffers_max: u32 = 1225;
 
-/// Bytes per relay direction; a `RelayBuffer` is a pair of these.
-pub const relay_buffer_bytes: u32 = 16 * 1024;
+/// Bytes per relay direction; a `RelayBuffer` is a pair of these. Held to
+/// 4 KiB: the strict recv→send→recv relay (§6) is correct at any size, so
+/// the smaller buffer cuts relay-pool memory (~32 MiB → ~10 MiB even as
+/// the ceiling rises to 1225) and trades throughput for more round trips
+/// only on high-bandwidth-delay streams — negligible on the loopback and
+/// LAN paths this proxy targets.
+pub const relay_buffer_bytes: u32 = 4 * 1024;
 
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
@@ -128,6 +141,19 @@ test "budgets: memory total matches the closed form" {
 test "budgets: fd count stays under a typical hard limit" {
     // 4096 is the common RLIMIT_NOFILE hard ceiling for unprivileged
     // processes; startup asserts against the real limit (§8), this test
-    // guards the defaults against drifting past the common case.
+    // guards the defaults against drifting past the common case. The fd
+    // budget is not the binding ceiling — the completion queue is (see
+    // relay_buffers_max) — so fds_max has comfortable headroom here.
     try std.testing.expect(fds_max <= 4096);
+    try std.testing.expectEqual(@as(u32, 2464), fds_max);
+}
+
+test "budgets: relay buffers sit at the completion-queue ceiling" {
+    // The ¾-CQ headroom rule is what actually caps concurrent L4
+    // connections; relay_buffers_max is set to the largest value that
+    // still satisfies it, so one more buffer would break the budget.
+    try std.testing.expect(in_flight_ops_max <= completion_queue_entries * 3 / 4);
+    const one_more = (relay_buffers_max + 1) * conn_ops_max +
+        2 * @as(u32, listeners_max) + 1 + 1;
+    try std.testing.expect(one_more > completion_queue_entries * 3 / 4);
 }
