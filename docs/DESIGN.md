@@ -345,7 +345,7 @@ Sizing shape (illustrative defaults, all tunable):
 | pool | count | unit size | subtotal |
 |---|---|---|---|
 | conn slots | 4096 | ~1 KiB state + 8 KiB head | ~36 MiB |
-| relay buffers | 1024 | 2 × 16 KiB | 32 MiB |
+| relay buffers | 1225 | 2 × 4 KiB | ~10 MiB |
 | upstream slots | 2048 | ~0.5 KiB + 8 KiB head | ~17 MiB |
 
 Rules:
