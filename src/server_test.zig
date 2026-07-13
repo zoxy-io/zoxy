@@ -199,6 +199,7 @@ pub const TestBed = struct {
         sim: SimIo.Options,
         origin_listens: bool = true,
         idle_timeout_ms: u32 = 1000,
+        max_lifetime_ms: u32 = 0,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -224,6 +225,7 @@ pub const TestBed = struct {
             .connect_timeout_ms = 50,
             .idle_timeout_ms = options.idle_timeout_ms,
             .drain_deadline_ms = 1000,
+            .max_lifetime_ms = options.max_lifetime_ms,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, options.server);
         try bed.server.start();
@@ -304,6 +306,37 @@ test "relay: idle timeout reaps a silent connection" {
     try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "relay: the max-lifetime cap reaps a connection before its idle timeout" {
+    // The idle timeout is set far in the future (10 s) so it cannot be the
+    // reaper; only the 40 ms lifetime cap (§6) can end the connection. The
+    // discriminator is the virtual clock: if the cap fired, the run ends
+    // near 40 ms, nowhere near the idle deadline.
+    const idle_ms: u32 = 10_000;
+    const lifetime_ms: u32 = 40;
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 41, .adversary = .{ .partial_io = false } },
+        .idle_timeout_ms = idle_ms,
+        .max_lifetime_ms = lifetime_ms,
+    });
+    defer bed.tearDown();
+
+    const start_ns = bed.sim_io.nowNs();
+    bed.startClients(1, false);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+
+    // Reaped at the cap, not the idle deadline: at least the cap elapsed
+    // (never early), and far short of the idle timeout.
+    const elapsed_ns = bed.sim_io.nowNs() - start_ns;
+    try std.testing.expect(elapsed_ns >= @as(u64, lifetime_ms) * std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ns < @as(u64, idle_ms) * std.time.ns_per_ms);
     try bed.expectDrained();
 }
 

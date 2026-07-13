@@ -20,6 +20,13 @@ pub const Config = struct {
     connect_timeout_ms: u32,
     idle_timeout_ms: u32,
     drain_deadline_ms: u32,
+    /// Absolute cap on a connection's age, regardless of activity (§6): it
+    /// rides the same per-connection deadline timer as the idle timeout,
+    /// clamping the activity-refreshed deadline so a continuously busy
+    /// connection is still reaped. `0` disables the cap — the one timeout
+    /// where zero is legal (an unbounded connection age), so it is optional
+    /// in the JSON and defaults off.
+    max_lifetime_ms: u32,
 
     pub const Listener = struct {
         bind_address: std.Io.net.IpAddress,
@@ -74,6 +81,7 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
         .connect_timeout_ms = parsed.timeouts.connect_ms,
         .idle_timeout_ms = parsed.timeouts.idle_ms,
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
+        .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
     };
 }
 
@@ -96,6 +104,9 @@ const TimeoutsJson = struct {
     connect_ms: u32,
     idle_ms: u32,
     drain_deadline_ms: u32,
+    /// Optional: absent or `0` means "no cap" (§6). The default keeps every
+    /// pre-existing config valid and leaves max-lifetime opt-in.
+    max_lifetime_ms: u32 = 0,
 };
 
 /// JSON object map of cluster name → cluster, parsed into a bounded array
@@ -250,14 +261,21 @@ fn clusterIndexOf(
 }
 
 fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
-    const values = [_]u32{ timeouts.connect_ms, timeouts.idle_ms, timeouts.drain_deadline_ms };
-    for (values) |value| {
+    // The three lifecycle timeouts are correctness bounds — a 0 ms connect,
+    // idle, or drain deadline would reap instantly, so zero is a mistake.
+    const required = [_]u32{ timeouts.connect_ms, timeouts.idle_ms, timeouts.drain_deadline_ms };
+    for (required) |value| {
         if (value == 0) {
             return error.TimeoutZero;
         }
         if (value > constants.timeout_ms_max) {
             return error.TimeoutOverLimit;
         }
+    }
+    // max_lifetime_ms is the one optional bound (§6): 0 means "no cap", so
+    // only the shared ceiling is enforced — zero stays legal.
+    if (timeouts.max_lifetime_ms > constants.timeout_ms_max) {
+        return error.TimeoutOverLimit;
     }
 }
 
@@ -277,6 +295,53 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(@as(u32, 5000), parsed.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 60000), parsed.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
+    try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
+}
+
+test "config: max_lifetime_ms is optional and defaults to disabled" {
+    // The field is absent here — pre-existing configs stay valid and the
+    // cap defaults off (§6).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
+}
+
+test "config: max_lifetime_ms accepts zero (the one legal zero timeout) and real values" {
+    // Explicit 0 is legal — it is *not* a TimeoutZero, unlike the other
+    // three timeouts (§6).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,"max_lifetime_ms":0}}
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
+    }
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,"max_lifetime_ms":1800000}}
+        );
+        try std.testing.expectEqual(@as(u32, 1_800_000), parsed.max_lifetime_ms);
+    }
+}
+
+test "config: max_lifetime_ms still obeys the shared ceiling" {
+    try expectParseError(error.TimeoutOverLimit,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,"max_lifetime_ms":3600001}}
+    );
 }
 
 fn expectParseError(expected: ParseError, json_bytes: []const u8) !void {

@@ -148,6 +148,14 @@ const Harness = struct {
             .connect_timeout_ms = 20 + random.uintAtMost(u32, 40),
             .idle_timeout_ms = 30 + random.uintAtMost(u32, 70),
             .drain_deadline_ms = 100,
+            // A third of seeds arm the max-lifetime cap (§6). The range
+            // straddles the idle timeout so the clamp sometimes reaps an
+            // actively-relaying connection and sometimes never bites —
+            // both paths under the adversary. 0 leaves it disabled.
+            .max_lifetime_ms = if (random.uintLessThan(u8, 3) == 0)
+                10 + random.uintAtMost(u32, 90)
+            else
+                0,
         };
 
         // A quarter of seeds shrink the pools to force the §8 rungs.

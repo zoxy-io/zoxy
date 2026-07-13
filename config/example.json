@@ -8,6 +8,7 @@
     "timeouts": {
         "connect_ms": 5000,
         "idle_ms": 60000,
-        "drain_deadline_ms": 10000
+        "drain_deadline_ms": 10000,
+        "max_lifetime_ms": 0
     }
 }

@@ -29,6 +29,10 @@ pub fn Conn(comptime IoType: type) type {
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
+        /// Admission timestamp. The max-lifetime cap is `birth_ns +
+        /// max_lifetime_ms`; `storeDeadline` clamps every deadline to it so
+        /// an always-active connection is still reaped (§6).
+        birth_ns: u64,
         armed: Armed,
         directions: [2]DirectionState,
 
@@ -109,6 +113,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.upstream_socket = null;
             conn.relay_buffer = buffer;
             conn.deadline_ns = 0;
+            conn.birth_ns = server.io.nowNs();
             conn.armed = .{};
             conn.directions = .{ .{}, .{} };
             conn.op_data_client_to_upstream = .{};

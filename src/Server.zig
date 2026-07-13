@@ -426,7 +426,20 @@ pub fn Server(comptime IoType: type) type {
         /// only the stored value moves, never the armed timer op (§4).
         pub fn storeDeadline(server: *Self, conn: *ConnType, timeout_ms: u32) void {
             assert(timeout_ms >= 1);
-            conn.deadline_ns = server.io.nowNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
+            var deadline_ns = server.io.nowNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
+            // Max-lifetime rides the same deadline (§6): clamp the
+            // activity-driven value to the absolute age cap so a
+            // continuously busy connection is still reaped. 0 disables it.
+            // The clamp only ever moves the deadline *earlier*, which the
+            // lazy re-arm in onDeadline handles for free — deadline_ns stays
+            // <= cap, so every arm targets <= cap and the connection dies at
+            // the cap even though the armed timer never moves earlier (§4).
+            if (server.config.max_lifetime_ms != 0) {
+                const cap_ns = conn.birth_ns +
+                    @as(u64, server.config.max_lifetime_ms) * std.time.ns_per_ms;
+                deadline_ns = @min(deadline_ns, cap_ns);
+            }
+            conn.deadline_ns = deadline_ns;
         }
 
         fn armDeadline(server: *Self, conn: *ConnType) void {
