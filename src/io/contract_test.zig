@@ -263,3 +263,31 @@ test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
     const unavailable = std.Io.net.IpAddress.parseLiteral("203.0.113.1:0") catch unreachable;
     try std.testing.expectError(error.AddressUnavailable, xev_io.listen(unavailable));
 }
+
+test "xevio: SO_REUSEPORT lets two listeners share one port" {
+    // Process-per-port scale-out (§1, §3): several zoxy instances bind the
+    // same port and the kernel load-balances across them. Proven in-process
+    // by binding two listeners to one concrete port — without SO_REUSEPORT
+    // the second bind fails EADDRINUSE. SO_REUSEADDR alone (which libxev
+    // sets inside bind) does not permit two live listeners on one port, so
+    // this test fails if the REUSEPORT option is dropped.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try xev_io.init(arena_state.allocator());
+    defer xev_io.deinit();
+
+    // First listener takes an ephemeral port; read the concrete port back.
+    const first = try xev_io.listen(
+        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+    );
+    const port = xev_io.listenerAddress(first).getPort();
+    try std.testing.expect(port != 0);
+
+    // A second listener on the very same port must also succeed.
+    var shared = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
+    shared.setPort(port);
+    const second = try xev_io.listen(shared);
+    try std.testing.expectEqual(port, xev_io.listenerAddress(second).getPort());
+}

@@ -135,6 +135,26 @@ pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
         return error.AddressUnavailable;
     }
     const tcp = xev.TCP.init(address) catch return error.Unexpected;
+    // SO_REUSEPORT before bind is what makes horizontal scale-out real
+    // (§1, §3): N independent zoxy processes bind the same port and the
+    // kernel load-balances new connections across them, with share-nothing
+    // isolation at the process boundary. The intra-process accept imbalance
+    // that made SO_REUSEPORT a liability in the previous iteration (§2)
+    // cannot arise here — each process still has exactly one accepting loop,
+    // so the kernel balances between processes, never between contending
+    // loops. Must precede bind; libxev sets SO_REUSEADDR inside bind, so the
+    // two options compose. On the io_uring kernels zoxy targets REUSEPORT is
+    // always available, so a failure here is genuinely unexpected.
+    const reuse: i32 = 1;
+    posix.setsockopt(
+        tcp.fd,
+        posix.SOL.SOCKET,
+        posix.SO.REUSEPORT,
+        std.mem.asBytes(&reuse),
+    ) catch {
+        closeFd(tcp.fd);
+        return error.Unexpected;
+    };
     tcp.bind(address) catch |err| {
         closeFd(tcp.fd);
         // Distinct failures get distinct diagnoses: "address in use" sends
