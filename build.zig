@@ -140,6 +140,43 @@ pub fn build(b: *std.Build) void {
         micro_step.dependOn(&b.addInstallArtifact(micro_exe, .{}).step);
     }
 
+    // §9 Tier 0: pinned perf + flamegraph of zoxy under load. Two ReleaseFast
+    // binaries — the zoxy under test (shipped-binary fidelity) and the harness
+    // (bench/profile.zig) that spawns nginx + zoxy, pins zoxy to one core so
+    // the PMU and LBR call-graph stay on a single core type, drives zrk load,
+    // and folds perf into a flamegraph. Linux-only — perf/flamegraph/nginx
+    // live in the dev shell. Tooling in Zig, not bash (TIGER_STYLE §Tooling).
+    const profile_zoxy = b.addExecutable(.{
+        .name = "zoxy-profile",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zoxy", .module = zoxy_fast_module },
+            },
+        }),
+    });
+    const profile_harness = b.addExecutable(.{
+        .name = "zoxy-profile-harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/profile.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
+            },
+        }),
+    });
+    const profile_run = b.addRunArtifact(profile_harness);
+    profile_run.addArtifactArg(profile_zoxy);
+    if (b.args) |args| profile_run.addArgs(args);
+    const profile_step = b.step(
+        "profile",
+        "Pinned perf + flamegraph of zoxy under load (Linux; needs the dev shell)",
+    );
+    profile_step.dependOn(&profile_run.step);
+
     const lint_run = b.addRunArtifact(lint_exe);
     lint_run.addDirectoryArg(b.path("src"));
     const lint_step = b.step("lint", "fd-boundary lint: raw syscalls only under src/io/");

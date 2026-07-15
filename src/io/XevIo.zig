@@ -17,6 +17,7 @@ const Io = @import("io.zig");
 
 const assert = std.debug.assert;
 const posix = std.posix;
+const linux = std.os.linux;
 
 const XevIo = @This();
 
@@ -566,14 +567,28 @@ pub fn nowNs(io: *XevIo) u64 {
     // when a timer is armed). Reading the field raw would return the time
     // of the last timer submission, arbitrarily stale, so deadlines set on
     // activity would never actually move (DESIGN.md §4). Refresh here when
-    // stale: update_now() clears the flag and the next tick re-sets it, so
-    // every nowNs within one tick still returns the same value — the §4
-    // once-per-tick semantics, at nanosecond precision (loop.now() is ms).
-    // The kqueue backend (macOS bench runs) has no now_outdated flag: its
-    // tick unconditionally refreshes cached_now, so reading it raw is safe.
+    // stale — but with CLOCK_MONOTONIC_COARSE, not update_now()'s plain
+    // CLOCK_MONOTONIC. Every consumer of this clock is a second-scale
+    // deadline (idle/connect/drain/max-lifetime), so ~ms resolution is ample,
+    // and the coarse read is a vvar-page vDSO load with no TSC access — the
+    // flamegraph (§9) showed the monotonic read at ~7% of on-CPU under load,
+    // and coarse is several times cheaper. Writing cached_now + clearing the
+    // flag mirrors update_now() exactly, so the §4 once-per-tick invariant
+    // still holds (every nowNs within a tick returns the same value) and
+    // libxev's own timer_next shares this value for the rest of the tick; the
+    // hash pin (build.zig.zon) fixes the field layout reached into. Coarse and
+    // precise are the same monotonic timeline, so a tick that arms a timer
+    // before any nowNs (update_now writes precise) then reads nowNs differs by
+    // at most one coarse granule (~ms) — absorbed by second-scale deadlines
+    // and the §4 lazy re-arm. The kqueue backend (macOS bench runs) has no
+    // now_outdated flag: its tick refreshes cached_now, so raw is safe.
     if (comptime @hasField(@FieldType(xev.Loop, "flags"), "now_outdated")) {
         if (io.loop.flags.now_outdated) {
-            io.loop.update_now();
+            var ts: linux.timespec = undefined;
+            if (posix.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC_COARSE, &ts)) == .SUCCESS) {
+                io.loop.cached_now = ts;
+                io.loop.flags.now_outdated = false;
+            }
         }
     }
     const cached = io.loop.cached_now;

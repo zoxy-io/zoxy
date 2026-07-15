@@ -240,12 +240,20 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     try xev_io.init(arena_state.allocator());
     defer xev_io.deinit();
 
+    // Force a coarse refresh for the baseline too — init() seeds cached_now
+    // with a precise read, and the coarse clock lags precise by up to a tick,
+    // so comparing across the two sources would spuriously fail.
+    xev_io.loop.flags.now_outdated = true;
     const first = xev_io.nowNs();
-    // Simulate a tick elapsing without a timer being armed — exactly the
-    // relay-activity case where the old code left the clock frozen.
+    // Poison the cache with an obviously-stale value and mark it outdated —
+    // exactly the relay-activity case where the old code left the clock
+    // frozen. A correct nowNs must refresh *past* the poison; asserting the
+    // poison is gone (rather than strict advancement between two reads) also
+    // holds for the coarse clock, whose two rapid reads can read equal.
+    xev_io.loop.cached_now = .{ .sec = 0, .nsec = 0 };
     xev_io.loop.flags.now_outdated = true;
     const second = xev_io.nowNs();
-    try std.testing.expect(second > first);
+    try std.testing.expect(second >= first);
 }
 
 test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
