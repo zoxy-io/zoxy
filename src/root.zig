@@ -4,6 +4,7 @@
 
 const std = @import("std");
 
+pub const balancer = @import("balancer.zig");
 pub const config = @import("config.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
@@ -19,6 +20,7 @@ pub const testing = struct {
 };
 
 test {
+    _ = balancer;
     _ = config;
     _ = constants;
     _ = counters;

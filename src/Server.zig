@@ -9,6 +9,7 @@
 
 const std = @import("std");
 
+const Balancer = @import("balancer.zig").Balancer;
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const counters_module = @import("counters.zig");
@@ -30,11 +31,10 @@ pub fn Server(comptime IoType: type) type {
         relay_buffers: Pool(relay.RelayBuffer),
         listeners: []ListenerState,
         listeners_count: u16,
-        /// Per-cluster round-robin cursor. u64 so it never wraps in any
-        /// realistic process lifetime — a u16 wrap reset the rotation
-        /// phase and double-picked one endpoint for non-power-of-two
-        /// cluster sizes.
-        endpoints_next: []u64,
+        /// The load-balancing policy: resolves a cluster to the endpoint to
+        /// dial. Owns its own per-cluster state so the serving path never
+        /// hardcodes how an endpoint is chosen (§7).
+        balancer: Balancer,
         counters: counters_module.Counters,
         draining: bool,
         /// §8 watermark state for the relay-buffer pool: set once the pool
@@ -84,8 +84,7 @@ pub fn Server(comptime IoType: type) type {
             try server.relay_buffers.init(arena, options.relay_buffers);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
-            server.endpoints_next = try arena.alloc(u64, config.clusters.len);
-            @memset(server.endpoints_next, 0);
+            try server.balancer.init(arena, config);
             server.counters = .{};
             server.draining = false;
             server.relay_pressure = false;
@@ -268,14 +267,9 @@ pub fn Server(comptime IoType: type) type {
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
-            assert(cluster_index < server.config.clusters.len);
-            const cluster = &server.config.clusters[cluster_index];
-            const endpoint_index: usize =
-                @intCast(server.endpoints_next[cluster_index] % cluster.endpoints.len);
-            server.endpoints_next[cluster_index] += 1;
             conn.arm(&conn.op_connect, "connect");
             server.io.connect(
-                cluster.endpoints[endpoint_index],
+                server.balancer.pick(cluster_index),
                 &conn.op_connect.completion,
                 ConnType,
                 conn,
