@@ -1,8 +1,9 @@
 # Dev environment (https://devenv.sh): the pinned toolchain — zig 0.16 +
 # zls, kcov (Linux, coverage), nginx (the Tier-1 bench origin, §9),
-# haproxy (the Tier-1 state-of-the-art reference proxy, §9) and poop
-# (Tier-0 hardware-counter A/B, Linux only). Activated automatically
-# by `.envrc` via direnv, or manually with `devenv shell`.
+# haproxy (the Tier-1 state-of-the-art reference proxy, §9), poop
+# (Tier-0 hardware-counter A/B) and perf + flamegraph + taskset for the
+# pinned `zig build profile` (all Linux only). Activated automatically by
+# `.envrc` via direnv, or manually with `devenv shell`.
 { pkgs, lib, ... }:
 {
   packages =
@@ -15,5 +16,8 @@
     ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
       pkgs.kcov
       pkgs.poop
+      pkgs.linuxPackages_latest.perf
+      pkgs.flamegraph
+      pkgs.util-linux
     ];
 }

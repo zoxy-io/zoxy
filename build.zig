@@ -140,6 +140,32 @@ pub fn build(b: *std.Build) void {
         micro_step.dependOn(&b.addInstallArtifact(micro_exe, .{}).step);
     }
 
+    // §9 Tier 0: pinned perf + flamegraph of zoxy under load. ReleaseFast so
+    // the profile reflects the shipped binary; the harness (scripts/profile.sh)
+    // pins zoxy to one core so the PMU and LBR call-graph stay on a single
+    // core type. Linux-only — perf/flamegraph/taskset live in the dev shell.
+    const profile_exe = b.addExecutable(.{
+        .name = "zoxy-profile",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zoxy", .module = zoxy_fast_module },
+            },
+        }),
+    });
+    const profile_run = b.addSystemCommand(&.{"bash"});
+    profile_run.addFileArg(b.path("scripts/profile.sh"));
+    profile_run.addArtifactArg(profile_exe);
+    profile_run.addArtifactArg(zrk_dependency.artifact("zrk"));
+    if (b.args) |args| profile_run.addArgs(args);
+    const profile_step = b.step(
+        "profile",
+        "Pinned perf + flamegraph of zoxy under load (Linux; needs the dev shell)",
+    );
+    profile_step.dependOn(&profile_run.step);
+
     const lint_run = b.addRunArtifact(lint_exe);
     lint_run.addDirectoryArg(b.path("src"));
     const lint_step = b.step("lint", "fd-boundary lint: raw syscalls only under src/io/");
