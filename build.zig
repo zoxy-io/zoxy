@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // libxev is pinned by content hash to the floatdrop fork's
+    // libxev is pinned by content hash to the zoxy-io fork's
     // zoxy-ring-flags branch: the audited upstream snapshot plus the
     // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
     // only after re-audit.
