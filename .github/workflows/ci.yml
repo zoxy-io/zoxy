@@ -49,10 +49,11 @@ jobs:
           name: devenv
           skipPush: true
 
-      # The same pinned toolchain as local dev (devenv.nix: zig_0_16),
-      # resolved through devenv.lock and served by the Nix binary cache.
+      # Pin devenv to a fixed release (matches local dev, 2.1.2) instead of the
+      # drifting `nixpkgs#devenv`, so every run resolves the same devenv binary;
+      # --accept-flake-config lets it pull prebuilt from devenv.cachix.org.
       - name: Install devenv
-        run: nix profile install nixpkgs#devenv
+        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
 
       # zig-pkg (vendored, hash-pinned deps) is deliberately not checked.
       - name: Check formatting
@@ -90,7 +91,7 @@ jobs:
           skipPush: true
 
       - name: Install devenv
-        run: nix profile install nixpkgs#devenv
+        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
 
       - name: Measure coverage (kcov)
         run: devenv shell -- zig build coverage
