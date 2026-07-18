@@ -69,10 +69,10 @@ pub fn Proxy(comptime IoType: type) type {
                 // A client that closes or resets before finishing its head
                 // simply leaves — there is nothing to answer. The §7
                 // head-read deadline handles the slowloris that stalls
-                // instead of closing.
-                if (err != error.EndOfStream) {
-                    server.witnessKernelPressure(err);
-                }
+                // instead of closing. The witness filters internally: only
+                // Unexpected (kernel pressure) is counted, so orderly
+                // EndOfStream/Reset pass through it uncounted.
+                server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
                 return;
             };
@@ -213,9 +213,12 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_draining_request);
-            _ = result catch {
+            _ = result catch |err| {
                 // EOF or error: the client's inbound is drained, so the
-                // close is a clean FIN, not a data-discarding RST.
+                // close is a clean FIN, not a data-discarding RST. Kernel
+                // pressure on the drain recv is still witnessed (§8) —
+                // this op fires most during a reject storm under load.
+                server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
                 return;
             };
