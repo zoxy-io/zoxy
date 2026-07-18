@@ -153,7 +153,10 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.upstream_socket = parked.socket;
                 parked.head_len = 0;
                 conn.state = .l7_dialing;
-                renderAndStartLegs(server, conn);
+                // No await happened: this runs in the same callback as the
+                // parse whose result is still live, so the reuse path —
+                // the hot one — skips the re-parse the dial path needs.
+                renderRequestAndStartLegs(server, conn, request);
                 return;
             }
             conn.upstream = server.upstreams.acquire(conn.cluster_index, pick.endpoint_index) orelse {
@@ -198,9 +201,10 @@ pub fn Proxy(comptime IoType: type) type {
             renderAndStartLegs(server, conn);
         }
 
-        /// Re-parse the request head — the bytes are unchanged, so this
-        /// cannot fail — and render it into the upstream slot's staging
-        /// buffer; then both legs begin.
+        /// The fresh-dial completion path: the head bytes are re-parsed —
+        /// only the bytes survive an await (§7), and they are unchanged,
+        /// so this cannot fail — then the legs begin. The checkout path
+        /// calls `renderRequestAndStartLegs` directly instead.
         fn renderAndStartLegs(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_dialing);
             var storage: parser.HeaderStorage = undefined;
@@ -213,12 +217,23 @@ pub fn Proxy(comptime IoType: type) type {
                 &storage,
             ) catch unreachable;
             assert(request.head_len == conn.l7.request_head_len);
+            renderRequestAndStartLegs(server, conn, &request);
+        }
 
+        /// Render the request head into the upstream slot's staging
+        /// buffer and start both legs.
+        fn renderRequestAndStartLegs(
+            server: *ServerType,
+            conn: *ConnType,
+            request: *const parser.RequestHead,
+        ) void {
+            assert(conn.state == .l7_dialing);
+            assert(request.head_len == conn.l7.request_head_len);
             const upstream = conn.upstream.?;
             // No close announcement upstream: the connection is a parking
             // candidate (§5), and stripping the client's Connection header
             // already made persistence the wire default.
-            const rendered = render.renderRequestHead(&request, false, &upstream.head) catch {
+            const rendered = render.renderRequestHead(request, false, &upstream.head) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");
@@ -594,8 +609,8 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.response_head_sent = 0;
             conn.l7.response_framing = framingFromParsed(response.framing);
 
-            // Feed the framing tracker over the excess now; the bytes are
-            // forwarded from upstream.head after the head is sent.
+            // Feed the framing tracker over the body excess that arrived
+            // coalesced with the head.
             const excess = upstream.head[response.head_len..upstream.head_len];
             const feed = feedFraming(&conn.l7.response_framing, excess);
             if (feed.malformed) {
@@ -603,8 +618,22 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             const direction = &conn.directions[1];
-            direction.transfer_len = feed.consumed;
             direction.sent_len = 0;
+            // The common small response arrives from the origin in one
+            // piece; forward it in one piece too. Appending the excess to
+            // the rendered head trades a bounded memcpy for a whole ring
+            // round trip per response. The fallback sends the same bytes
+            // as head, then excess from upstream.head.
+            if (rendered.len + feed.consumed <= conn.head.len) {
+                @memcpy(
+                    conn.head[rendered.len..][0..feed.consumed],
+                    excess[0..feed.consumed],
+                );
+                conn.l7.rendered_response_len = @intCast(rendered.len + feed.consumed);
+                direction.transfer_len = 0;
+            } else {
+                direction.transfer_len = feed.consumed;
+            }
 
             conn.l7.response_leg = .sending_head;
             armResponseHeadSend(server, conn);
