@@ -8,6 +8,11 @@ pub const balancer = @import("balancer.zig");
 pub const config = @import("config.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
+/// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
+/// the trust boundary; the proxy state machine joins it in a later slice.
+pub const http = struct {
+    pub const parser = @import("http/parser.zig");
+};
 pub const Io = @import("io/io.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;
 pub const RelayBuffer = @import("net/relay.zig").RelayBuffer;
@@ -24,6 +29,7 @@ test {
     _ = config;
     _ = constants;
     _ = counters;
+    _ = http.parser;
     _ = Io;
     _ = Server;
     _ = shed;

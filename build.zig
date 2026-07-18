@@ -14,12 +14,23 @@ pub fn build(b: *std.Build) void {
     });
     const xev_module = xev_dependency.module("xev");
 
+    // hparse — the hardened head-parser fork — is pinned by content hash
+    // to an audited zoxy-io/hparse commit (DESIGN.md §7); the pin moves
+    // only after re-audit. Only src/http/parser.zig may import it (lint-
+    // enforced): that wrapper owns every strictness and framing decision.
+    const hparse_dependency = b.dependency("hparse", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const hparse_module = hparse_dependency.module("hparse");
+
     const zoxy_module = b.addModule("zoxy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
+            .{ .name = "hparse", .module = hparse_module },
         },
     });
     // The shipped example config is embedded so tests and the fuzz corpus
@@ -116,12 +127,20 @@ pub fn build(b: *std.Build) void {
 
     // §9 Tier 0: micro binaries for manual poop A/B; installed, never run
     // in CI (counter deltas on shared runners are noise).
+    // The fast module gets its own ReleaseFast hparse instance: hparse's
+    // SIMD paths scalarize under the Debug self-hosted backend, which
+    // would turn a Tier-0 parser A/B into a measurement of the wrong code.
+    const hparse_fast_dependency = b.dependency("hparse", .{
+        .target = target,
+        .optimize = std.builtin.OptimizeMode.ReleaseFast,
+    });
     const zoxy_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
+            .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
         },
     });
     const micro_step = b.step("bench-micro", "Build Tier-0 micro binaries for poop A/B");

@@ -45,6 +45,10 @@
             .url = "git+https://github.com/floatdrop/zrk#e13a1fb1ed1278202c170def5502ca4ad37cd0bd",
             .hash = "zrk-0.1.0-WqdFO9erAQDo_HjVH3qPGzyGOC-7XJ_1k_Cc51HqJ52c",
         },
+        .hparse = .{
+            .url = "git+https://github.com/zoxy-io/hparse#33b42c617a84aff9c863ae672f94f20749aa2d0e",
+            .hash = "hparse-0.2.0-IukW0sBzAQDyDV7Yl4OIbPMKI3yQ8HyRzCH6-wmJFSOZ",
+        },
     },
     .paths = .{
         "build.zig",

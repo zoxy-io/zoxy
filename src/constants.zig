@@ -58,6 +58,27 @@ pub fn relayPressureOff(capacity: u32) u32 {
 /// configured idle timeout is already small.
 pub const relay_pressure_idle_divisor: u32 = 4;
 
+/// Upper bound on one L7 request or response head, including the final
+/// CRLF — the size of a connection slot's head buffer (§5). A request
+/// head that cannot complete inside this budget is answered 414 (request
+/// line still open) or 431 (header section); an oversize origin response
+/// head tears the exchange down (§7).
+pub const head_bytes_max: u32 = 8 * 1024;
+
+/// Bounded per-head header array. Overflowing it is load, not malice: it
+/// maps to 431, distinguishable from malformed input's 400 (§7).
+pub const headers_max: u16 = 64;
+
+/// Upper bound on one chunk-size line (hex size, extensions, CRLF) in a
+/// chunked body (§7). Bounded so a hostile peer cannot stream an endless
+/// size line through the relay; kept under one relay buffer so a legal
+/// line never spans more than two buffer fills.
+pub const chunked_line_bytes_max: u32 = 256;
+
+/// Upper bound on a chunked trailer section, which is forwarded verbatim
+/// (§7). Same bounding argument as the size line.
+pub const chunked_trailer_bytes_max: u32 = 1024;
+
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
 
@@ -131,6 +152,11 @@ comptime {
     assert(timeout_ms_max >= 1000);
     assert(accept_retry_delay_ms >= 1);
     assert(relay_pressure_idle_divisor >= 2);
+    assert(head_bytes_max >= 1024);
+    assert(headers_max >= 8);
+    assert(chunked_line_bytes_max >= 32);
+    assert(chunked_line_bytes_max <= relay_buffer_bytes);
+    assert(chunked_trailer_bytes_max >= chunked_line_bytes_max);
     // The watermarks must leave a hysteresis gap and never engage above
     // the pool's own capacity, checked at the production size.
     assert(relayPressureOn(relay_buffers_max) > relayPressureOff(relay_buffers_max));
