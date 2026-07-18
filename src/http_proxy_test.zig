@@ -29,7 +29,17 @@ const HttpClient = struct {
     send_completion: SimIo.Completion = .{},
     recv_completion: SimIo.Completion = .{},
     socket: SimIo.Socket = undefined,
+    address: std.Io.net.IpAddress = undefined,
     request: []const u8 = undefined,
+    /// Sent on the same connection once the first response is complete —
+    /// sequential keep-alive, never pipelining.
+    second_request: ?[]const u8 = null,
+    /// A client to start when this one finishes (upstream-reuse tests
+    /// chain connections deterministically).
+    next: ?*HttpClient = null,
+    /// The last client begins the drain; a scenario that wants to watch
+    /// the idle sweep instead arms a drain timer and clears this.
+    drain_on_finish: bool = true,
     sent_len: u32 = 0,
     receive_buffer: [4096]u8 = undefined,
     received_len: u32 = 0,
@@ -40,6 +50,7 @@ const HttpClient = struct {
     fn start(client: *HttpClient, io: *SimIo, server: *ServerSim, address: std.Io.net.IpAddress) void {
         client.io = io;
         client.server = server;
+        client.address = address;
         io.connect(address, &client.connect_completion, HttpClient, client, onConnect);
     }
 
@@ -87,15 +98,48 @@ const HttpClient = struct {
         const received = result catch |err| {
             client.outcome = if (err == error.Reset) .reset else .fin;
             client.io.closeNow(client.socket);
-            // Begin the drain so the run winds down instead of idling on
-            // the armed accept — the L4 harness drains from client-end too.
-            client.server.beginDrain();
+            if (client.next) |successor| {
+                client.next = null;
+                successor.start(client.io, client.server, client.address);
+                return;
+            }
+            if (client.drain_on_finish) {
+                // Begin the drain so the run winds down instead of idling
+                // on the armed accept — the L4 harness does the same.
+                client.server.beginDrain();
+            }
             return;
         };
         assert(received >= 1);
         client.received_len += received;
         assert(client.received_len <= client.receive_buffer.len);
+        client.maybeSendSecond();
         client.armRecv();
+    }
+
+    /// Sequential keep-alive: once the first response is complete (its
+    /// content-length body fully received), send the queued second
+    /// request on the same connection.
+    fn maybeSendSecond(client: *HttpClient) void {
+        const queued = client.second_request orelse return;
+        var storage: parser.HeaderStorage = undefined;
+        const first = parser.parseResponseHead(
+            client.receive_buffer[0..client.received_len],
+            false,
+            &storage,
+            .get,
+        ) catch return; // Incomplete head: keep reading.
+        const body_len: u32 = switch (first.framing) {
+            .content_length => |length| @intCast(length),
+            else => 0,
+        };
+        if (client.received_len < first.head_len + body_len) {
+            return;
+        }
+        client.second_request = null;
+        client.request = queued;
+        client.sent_len = 0;
+        client.armSend();
     }
 
     fn response(client: *const HttpClient) []const u8 {
@@ -103,18 +147,24 @@ const HttpClient = struct {
     }
 };
 
-/// A scripted HTTP origin: reads one request (head + framed body, tracked
+/// A scripted HTTP origin: reads requests (head + framed body, tracked
 /// with zoxy's own parser so the test asserts on exactly what the proxy
-/// forwarded), sends a canned `response`, then lingering-closes. One
-/// connection per scenario is enough for the no-keep-alive exchanges.
+/// forwarded) and answers each with the canned `response`. It keeps its
+/// connection alive between requests — parked upstream connections come
+/// back to it — unless `close_after_response` scripts the origin-side
+/// close (until-close bodies, and the stale-parked scenario). One
+/// connection per scenario: a second accept trips an assert, which is
+/// itself the reuse witness.
 const HttpOrigin = struct {
     io: *SimIo = undefined,
     listener: SimIo.Listener = undefined,
     accept_completion: SimIo.Completion = .{},
     listening: bool = false,
     response: []const u8 = "",
+    close_after_response: bool = false,
     conn: OConn = .{},
     accepted: bool = false,
+    requests_served: u32 = 0,
 
     const OConn = struct {
         origin: *HttpOrigin = undefined,
@@ -123,9 +173,13 @@ const HttpOrigin = struct {
         send_completion: SimIo.Completion = .{},
         request_buffer: [16384]u8 = undefined,
         request_len: u32 = 0,
+        /// Start of the request currently being read; earlier requests
+        /// stay captured in the buffer for the tests' assertions.
+        request_offset: u32 = 0,
         request_complete: bool = false,
-        /// Total request bytes expected (head + framed body), known once
-        /// the head parses. 0 means the head has not parsed yet.
+        closed: bool = false,
+        /// Total bytes expected for the current request (head + framed
+        /// body), known once its head parses. 0 means not parsed yet.
         request_expected: u32 = 0,
         response_sent: u32 = 0,
 
@@ -143,6 +197,7 @@ const HttpOrigin = struct {
         fn onRecv(oconn: *OConn, result: Io.RecvError!u32) void {
             const received = result catch {
                 oconn.origin.io.closeNow(oconn.socket);
+                oconn.closed = true;
                 return;
             };
             oconn.request_len += received;
@@ -156,7 +211,7 @@ const HttpOrigin = struct {
             if (oconn.request_expected == 0) {
                 var storage: parser.HeaderStorage = undefined;
                 const request = parser.parseRequestHead(
-                    oconn.request_buffer[0..oconn.request_len],
+                    oconn.request_buffer[oconn.request_offset..oconn.request_len],
                     false,
                     &storage,
                 ) catch |err| {
@@ -165,6 +220,7 @@ const HttpOrigin = struct {
                         return;
                     }
                     oconn.origin.io.closeNow(oconn.socket);
+                    oconn.closed = true;
                     return;
                 };
                 const body_length: u32 = switch (request.framing) {
@@ -173,8 +229,9 @@ const HttpOrigin = struct {
                 };
                 oconn.request_expected = request.head_len + body_length;
             }
-            assert(oconn.request_len <= oconn.request_expected);
-            if (oconn.request_len < oconn.request_expected) {
+            const current_len = oconn.request_len - oconn.request_offset;
+            assert(current_len <= oconn.request_expected);
+            if (current_len < oconn.request_expected) {
                 oconn.armRecv();
                 return;
             }
@@ -197,15 +254,26 @@ const HttpOrigin = struct {
         fn onSend(oconn: *OConn, result: Io.SendError!u32) void {
             const sent = result catch {
                 oconn.origin.io.closeNow(oconn.socket);
+                oconn.closed = true;
                 return;
             };
             oconn.response_sent += sent;
             if (oconn.response_sent < oconn.origin.response.len) {
                 oconn.armSend();
-            } else {
-                // Response delivered; close (Connection: close both ways).
-                oconn.origin.io.closeNow(oconn.socket);
+                return;
             }
+            oconn.origin.requests_served += 1;
+            if (oconn.origin.close_after_response) {
+                oconn.origin.io.closeNow(oconn.socket);
+                oconn.closed = true;
+                return;
+            }
+            // Keep-alive: the next request appends after this one (the
+            // buffer keeps every request for the tests' assertions).
+            oconn.request_offset = oconn.request_len;
+            oconn.request_expected = 0;
+            oconn.response_sent = 0;
+            oconn.armRecv();
         }
     };
 
@@ -233,6 +301,16 @@ const HttpOrigin = struct {
         origin.armAccept();
     }
 
+    /// Close a still-open origin-side connection at scenario end so the
+    /// socket leak check is exact — its EOF delivery may race the loop
+    /// stop (the L4 harness does the same).
+    fn closeRemaining(origin: *HttpOrigin) void {
+        if (origin.accepted and !origin.conn.closed) {
+            origin.io.closeNow(origin.conn.socket);
+            origin.conn.closed = true;
+        }
+    }
+
     fn stopListening(origin: *HttpOrigin) void {
         if (origin.listening) {
             origin.io.listenClose(origin.listener);
@@ -253,6 +331,8 @@ const Http1Bed = struct {
     server: ServerSim,
     origin: HttpOrigin,
     client: HttpClient,
+    client2: HttpClient,
+    drain_timer_completion: SimIo.Completion,
 
     const idle_timeout_ms: u32 = 1000;
 
@@ -269,6 +349,7 @@ const Http1Bed = struct {
         partial_io: bool = false,
         origin_response: []const u8 = "",
         origin_listens: bool = true,
+        origin_closes: bool = false,
     };
 
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
@@ -297,11 +378,34 @@ const Http1Bed = struct {
             .upstream_slots = 2,
         });
         try bed.server.start();
-        bed.origin = .{ .response = options.origin_response };
+        bed.origin = .{
+            .response = options.origin_response,
+            .close_after_response = options.origin_closes,
+        };
         if (options.origin_listens) {
             try bed.origin.start(&bed.sim_io, originAddress());
         }
         bed.client = .{};
+        bed.client2 = .{};
+        bed.drain_timer_completion = .{};
+    }
+
+    /// A sweep-observation scenario cannot let the client drive the drain
+    /// (the drain reaps parked upstreams instantly); this timer drains
+    /// after the idle sweep has had time to act.
+    fn armDrainTimer(bed: *Http1Bed, delay_ms: u32) void {
+        bed.sim_io.timerStart(
+            &bed.drain_timer_completion,
+            @as(u64, delay_ms) * std.time.ns_per_ms,
+            Http1Bed,
+            bed,
+            onDrainTimer,
+        );
+    }
+
+    fn onDrainTimer(bed: *Http1Bed, result: Io.TimerError!void) void {
+        result catch unreachable; // Nothing cancels the test drain timer.
+        bed.server.beginDrain();
     }
 
     fn tearDown(bed: *Http1Bed) void {
@@ -320,6 +424,7 @@ const Http1Bed = struct {
     }
 
     fn expectDrained(bed: *Http1Bed) !void {
+        bed.origin.closeRemaining();
         try std.testing.expect(bed.server.isIdle());
         try std.testing.expect(bed.server.reconcile());
         try std.testing.expect(bed.sim_io.sockets.isFullyReleased());
@@ -421,7 +526,7 @@ test "l7: a GET is proxied and the origin's response relayed back" {
     });
     defer bed.tearDown();
 
-    try bed.exchange("GET /path HTTP/1.1\r\nHost: origin.example\r\n\r\n");
+    try bed.exchange("GET /path HTTP/1.1\r\nHost: origin.example\r\nConnection: close\r\n\r\n");
 
     // The client saw the origin's response, rewritten with Connection:
     // close (the proxy announces the coming close), ending in a FIN.
@@ -440,7 +545,10 @@ test "l7: a GET is proxied and the origin's response relayed back" {
     );
     try std.testing.expectEqual(parser.Method.get, forwarded.method);
     try std.testing.expectEqualStrings("/path", forwarded.target);
-    try std.testing.expect(!forwarded.keep_alive);
+    // The client asked to close, but that is hop-by-hop: the upstream
+    // connection stays reusable (§5) — the client's Connection header is
+    // stripped and no close is injected toward the origin.
+    try std.testing.expect(forwarded.keep_alive);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     try bed.expectDrained();
@@ -457,7 +565,7 @@ test "l7: a POST body is forwarded and a sized response returned, byte-exact und
         });
         defer bed.tearDown();
 
-        try bed.exchange("POST /submit HTTP/1.1\r\nHost: o\r\nContent-Length: 11\r\n\r\nhello world");
+        try bed.exchange("POST /submit HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 11\r\n\r\nhello world");
 
         try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
         try std.testing.expectEqualStrings(
@@ -484,7 +592,7 @@ test "l7: a body coalesced with the head, larger than a relay buffer, forwards i
     // straight from the 8 KiB head buffer, not copied through one.
     const body_len = 6000;
     var request: [7000]u8 = undefined;
-    const head = "POST /big HTTP/1.1\r\nHost: o\r\nContent-Length: 6000\r\n\r\n";
+    const head = "POST /big HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 6000\r\n\r\n";
     @memcpy(request[0..head.len], head);
     for (request[head.len .. head.len + body_len], 0..) |*byte, index| {
         byte.* = @intCast('A' + (index % 26));
@@ -523,8 +631,9 @@ test "l7: a connection-close (until-close) response body relays to the client's 
     try bed.setUp(std.testing.allocator, .{
         .seed = 20,
         // No Content-Length and no Transfer-Encoding: the body runs to
-        // the origin's close (§6.3 until-close).
+        // the origin's close (§6.3 until-close), so the origin must close.
         .origin_response = "HTTP/1.1 200 OK\r\n\r\nstreamed body bytes",
+        .origin_closes = true,
     });
     defer bed.tearDown();
 
@@ -601,7 +710,7 @@ test "l7: the head-ingestion path allocates nothing after init" {
     try bed.setUp(failing.allocator(), .{ .seed = 9, .partial_io = true, .origin_response = response });
     defer bed.tearDown();
     const allocations_after_init = failing.allocations;
-    try bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nContent-Length: 3\r\n\r\nabc");
+    try bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc");
     try bed.expectDrained();
     try std.testing.expectEqual(allocations_after_init, failing.allocations);
 
@@ -611,7 +720,7 @@ test "l7: the head-ingestion path allocates nothing after init" {
     var strict_bed: Http1Bed = undefined;
     try strict_bed.setUp(strict.allocator(), .{ .seed = 9, .partial_io = true, .origin_response = response });
     defer strict_bed.tearDown();
-    try strict_bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nContent-Length: 3\r\n\r\nabc");
+    try strict_bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc");
     try strict_bed.expectDrained();
 }
 
@@ -625,5 +734,132 @@ test "l7: an http listener admits without a relay buffer" {
     try bed.exchange("GET / HTTP/1.1\nHost: a\r\n\r\n");
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_relay_buffers"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try bed.expectDrained();
+}
+
+test "l7: downstream keep-alive serves two requests on one connection" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 50,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // First request asks to keep the connection; the second announces the
+    // close, ending the scenario cleanly.
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    // One client connection, two responses: the first without a close
+    // announcement, the second with one, then FIN.
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_responses"));
+    // The idle turnaround also parked and reused the upstream connection.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(@as(u32, 2), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: a parked upstream connection is reused across client connections" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 51,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // Two separate client connections, each closing downstream — the
+    // upstream connection parks after the first and serves the second
+    // (the origin accepting only once is asserted in its harness).
+    bed.client.next = &bed.client2;
+    bed.client2.request = "GET /b HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client2.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client2.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("completed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(@as(u32, 2), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: the idle sweep reaps a parked upstream past its deadline" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 52,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // The client must not drain (that reaps parked instantly); a timer
+    // drains well after the sweep has had time to act on the idle
+    // deadline.
+    bed.client.drain_on_finish = false;
+    bed.armDrainTimer(Http1Bed.idle_timeout_ms * 3);
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_idle_reaped"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_reused"));
+    try bed.expectDrained();
+}
+
+test "l7: a pipelining client gets its first response, then the close" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 53,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // Both requests in one write: the second is pipelined. Pipelining is
+    // unsupported — the first exchange completes and the connection
+    // closes; the client recovers by retrying per RFC.
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n" ++
+        "GET /two HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "l7: a stale parked connection is answered 502 until Phase 2's replay" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 54,
+        // The origin's response claims keep-alive, but it closes right
+        // after — the §5 stale-parked scenario, detected on first use.
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .origin_closes = true,
+    });
+    defer bed.tearDown();
+
+    bed.client.next = &bed.client2;
+    bed.client2.request = "GET /b HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client2.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client2.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
     try bed.expectDrained();
 }

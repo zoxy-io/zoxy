@@ -51,6 +51,14 @@ pub fn Server(comptime IoType: type) type {
         /// connections return their buffers before the wall is reached.
         relay_pressure: bool,
         drain_deadline_completion: IoType.Completion,
+        /// The one timer covering every parked upstream (§5): a parked
+        /// connection holds no armed op, so this sweep compares stored
+        /// deadlines against the clock and reaps overdue connections with
+        /// a synchronous close. Armed only while anything is parked, so
+        /// an idle process (and a quiescent simulator run) has no ticking
+        /// timer.
+        upstream_sweep_completion: IoType.Completion,
+        upstream_sweep_armed: bool,
 
         const Self = @This();
 
@@ -103,6 +111,8 @@ pub fn Server(comptime IoType: type) type {
             server.draining = false;
             server.relay_pressure = false;
             server.drain_deadline_completion = .{};
+            server.upstream_sweep_completion = .{};
+            server.upstream_sweep_armed = false;
         }
 
         pub fn start(server: *Self) Io.ListenError!void {
@@ -136,6 +146,9 @@ pub fn Server(comptime IoType: type) type {
             for (server.listeners[0..server.listeners_count]) |*state| {
                 server.io.listenClose(state.listener);
             }
+            // Parked upstreams are idle capacity; the drain sheds them
+            // first (§8). Synchronous closes: no armed op to wait for.
+            server.reapParked(true);
             server.io.timerStart(
                 &server.drain_deadline_completion,
                 @as(u64, server.config.drain_deadline_ms) * std.time.ns_per_ms,
@@ -171,8 +184,57 @@ pub fn Server(comptime IoType: type) type {
             if (!server.draining) return;
             if (!server.conns.isFullyReleased()) return;
             assert(server.relay_buffers.isFullyReleased());
+            // beginDrain reaped every parked slot synchronously and no
+            // conn is left to lease one, so the pool must be empty.
             assert(server.upstreams.isFullyReleased());
             server.io.stop();
+        }
+
+        /// Reap parked upstream connections: all of them (drain), or only
+        /// those past their stored idle deadline (the sweep). Bounded by
+        /// the pool capacity; closes are synchronous — a parked slot has
+        /// no armed op (§5), so unpark + close + release is one step.
+        fn reapParked(server: *Self, reap_all: bool) void {
+            const now = server.io.nowNs();
+            for (server.upstreams.slot_pool.slots) |*upstream| {
+                if (!server.upstreams.slot_pool.isAcquired(upstream)) continue;
+                if (!upstream.parked) continue;
+                if (!reap_all and upstream.deadline_ns > now) continue;
+                server.upstreams.unpark(upstream);
+                server.io.closeNow(upstream.socket);
+                server.upstreams.release(upstream);
+                if (!reap_all) {
+                    server.counters.increment("upstream_idle_reaped");
+                }
+            }
+        }
+
+        /// Arm the sweep if anything is parked and it is not ticking; the
+        /// half-interval keeps worst-case parked overstay under 1.5x the
+        /// idle timeout. The §8 pressure bias shortens the interval
+        /// lazily, at the next re-arm — an already-ticking sweep is never
+        /// touched, the same never-move-earlier rule as every timer (§4).
+        pub fn ensureUpstreamSweep(server: *Self) void {
+            if (server.upstream_sweep_armed) return;
+            if (server.upstreams.idle_count == 0) return;
+            server.upstream_sweep_armed = true;
+            const interval_ms = @max(server.idleTimeoutMs() / 2, 1);
+            server.io.timerStart(
+                &server.upstream_sweep_completion,
+                @as(u64, interval_ms) * std.time.ns_per_ms,
+                Self,
+                server,
+                onUpstreamSweep,
+            );
+        }
+
+        fn onUpstreamSweep(server: *Self, result: Io.TimerError!void) void {
+            assert(server.upstream_sweep_armed);
+            server.upstream_sweep_armed = false;
+            // Nothing ever cancels the sweep timer.
+            result catch unreachable;
+            server.reapParked(false);
+            server.ensureUpstreamSweep();
         }
 
         /// The simulator's leak invariant (§9).
@@ -351,6 +413,13 @@ pub fn Server(comptime IoType: type) type {
             const buffer = server.relay_buffers.acquire() orelse return null;
             server.updateRelayPressure();
             return buffer;
+        }
+
+        /// The release pair: an L7 connection going idle on keep-alive
+        /// returns its buffer so idle costs a slot + head buffer only (§5).
+        pub fn releaseRelayBuffer(server: *Self, buffer: *relay.RelayBuffer) void {
+            server.relay_buffers.release(buffer);
+            server.updateRelayPressure();
         }
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {

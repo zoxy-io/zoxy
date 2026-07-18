@@ -13,10 +13,14 @@
 //! the framed body client → origin; the response leg arms as soon as the
 //! request head is on the wire — early responses are legal (§7) and
 //! waiting for the body to finish first can deadlock both windows — and
-//! mirrors head + framed body back. Every exchange currently ends in
-//! teardown with `Connection: close` announced both ways; keep-alive
-//! parking replaces that in the next slice, which also refines the
-//! deadline verdict into §8's 504 (today an expired exchange tears down).
+//! mirrors head + framed body back. A finished exchange settles both
+//! sides independently: the upstream connection parks on its endpoint's
+//! idle list when the origin allowed reuse (checked out again by any
+//! later request — §3's shared-pool win), and the downstream connection
+//! honors what its rendered response announced (§2), going idle at the
+//! cost of a slot + head buffer only (§5). Pipelining is unsupported
+//! (first response, then an announced close); the stale-checkout free
+//! replay and the §8 504 deadline verdict are Phase 2 (docs/PLANS.md).
 //!
 //! Buffer ownership rotates, never overlaps: conn.head holds the request
 //! head until it is rendered, then stages the rendered response head;
@@ -133,14 +137,28 @@ pub fn Proxy(comptime IoType: type) type {
             conn.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, conn, 503, "l7_shed_relay_buffers");
             };
-            const pick = server.balancer.pick(conn.cluster_index);
-            conn.upstream = server.upstreams.acquire(conn.cluster_index, pick.endpoint_index) orelse {
-                return respond(server, conn, 503, "l7_shed_upstream_slots");
-            };
-
             conn.l7.request_method = request.method;
             conn.l7.request_framing = framingFromParsed(request.framing);
             conn.l7.request_head_len = request.head_len;
+            conn.l7.client_keep_alive = request.keep_alive;
+
+            // The §3 reuse win: a parked connection to the picked endpoint
+            // beats a fresh dial. A close that slipped through while it
+            // was parked surfaces as a failure on first use — answered
+            // 502 until Phase 2's free replay (docs/PLANS.md).
+            const pick = server.balancer.pick(conn.cluster_index);
+            if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
+                server.counters.increment("upstream_reused");
+                conn.upstream = parked;
+                conn.upstream_socket = parked.socket;
+                parked.head_len = 0;
+                conn.state = .l7_dialing;
+                renderAndStartLegs(server, conn);
+                return;
+            }
+            conn.upstream = server.upstreams.acquire(conn.cluster_index, pick.endpoint_index) orelse {
+                return respond(server, conn, 503, "l7_shed_upstream_slots");
+            };
             conn.state = .l7_dialing;
             server.storeDeadline(conn, server.config.connect_timeout_ms);
             conn.arm(&conn.op_connect, "connect");
@@ -197,10 +215,12 @@ pub fn Proxy(comptime IoType: type) type {
             assert(request.head_len == conn.l7.request_head_len);
 
             const upstream = conn.upstream.?;
-            const rendered = render.renderRequestHead(&request, true, &upstream.head) catch {
-                // Valid on arrival but no longer fits with the close
-                // announcement rendered in: the §7 oversize-after-edits
-                // verdict.
+            // No close announcement upstream: the connection is a parking
+            // candidate (§5), and stripping the client's Connection header
+            // already made persistence the wire default.
+            const rendered = render.renderRequestHead(&request, false, &upstream.head) catch {
+                // Valid on arrival but no longer fits after edits: the §7
+                // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");
             };
             assert(rendered.len >= 1);
@@ -271,6 +291,9 @@ pub fn Proxy(comptime IoType: type) type {
                 // has been answered yet, so 400 is still legal.
                 respondOrTeardown(server, conn, 400, "l7_bad_request");
                 return;
+            }
+            if (feed.consumed < excess.len) {
+                conn.l7.client_pipelined = true;
             }
             const direction = &conn.directions[0];
             direction.transfer_len = feed.consumed;
@@ -382,8 +405,11 @@ pub fn Proxy(comptime IoType: type) type {
                 server.beginTeardown(conn);
                 return;
             }
-            // Bytes past the body belong to a pipelined next request;
-            // without keep-alive they are dropped with the connection.
+            if (feed.consumed < received) {
+                // Bytes past the body are a pipelined next request; the
+                // connection will close after this exchange (§2 note).
+                conn.l7.client_pipelined = true;
+            }
             const direction = &conn.directions[0];
             direction.transfer_len = feed.consumed;
             direction.sent_len = 0;
@@ -544,7 +570,22 @@ pub fn Proxy(comptime IoType: type) type {
             ) catch unreachable;
             assert(response.head_len == conn.l7.response_head_len_marker);
 
-            const rendered = render.renderResponseHead(&response, true, &conn.head) catch {
+            // The §8 persistence decision, made once and honored: honor
+            // the client's ask unless pipelining, pressure, or drain says
+            // otherwise — then announce whatever was decided (§2). An
+            // until-close body forces the close unconditionally: the FIN
+            // is the only thing delimiting the relayed body for the
+            // client, exactly as it delimited it for us.
+            const keep_downstream = conn.l7.client_keep_alive and
+                !conn.l7.client_pipelined and !server.draining and
+                !server.relay_pressure and response.framing != .until_close;
+            conn.l7.downstream_close_announced = !keep_downstream;
+            conn.l7.upstream_reusable = response.keep_alive;
+            const rendered = render.renderResponseHead(
+                &response,
+                !keep_downstream,
+                &conn.head,
+            ) catch {
                 upstreamFailed(server, conn);
                 return;
             };
@@ -773,16 +814,81 @@ pub fn Proxy(comptime IoType: type) type {
             }
         }
 
-        /// The response reached the client in full. Without keep-alive the
-        /// exchange ends the connection — the close was announced in both
-        /// rendered heads (§2) — and the request leg, done or not, ends
-        /// with it (an early response ends the exchange, §7).
+        /// The response reached the client in full: settle both sides.
+        /// The upstream connection parks for reuse when the origin allowed
+        /// it and the request went out completely (§5); the downstream
+        /// connection honors what its response announced (§2). An early
+        /// response with the request still in flight forfeits both — the
+        /// two byte streams are no longer alignable.
         fn finishExchange(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_started);
             conn.l7.response_leg = .done;
             server.counters.increment("l7_responses");
-            server.beginTeardown(conn);
+
+            const request_complete = conn.l7.request_leg == .done;
+            if (conn.l7.upstream_reusable and request_complete and !server.draining) {
+                parkUpstream(server, conn);
+            }
+            const keep_downstream = !conn.l7.downstream_close_announced and
+                request_complete and !server.draining;
+            if (keep_downstream) {
+                detachUpstream(server, conn);
+                resetForNextRequest(server, conn);
+            } else {
+                // A still-attached upstream closes with the teardown.
+                server.beginTeardown(conn);
+            }
+        }
+
+        /// Park the leased upstream on its endpoint's idle list (§5): the
+        /// socket stays open with no armed op, the stored deadline hands
+        /// reaping to the Server's sweep, and the conn detaches so its
+        /// teardown cannot close a connection it no longer owns.
+        fn parkUpstream(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            const upstream = conn.upstream.?;
+            assert(!upstream.parked);
+            server.upstreams.park(upstream);
+            upstream.deadline_ns = server.io.nowNs() +
+                @as(u64, server.idleTimeoutMs()) * std.time.ns_per_ms;
+            server.ensureUpstreamSweep();
+            conn.upstream = null;
+            conn.upstream_socket = null;
+        }
+
+        /// Close and release an upstream that did not park while the conn
+        /// itself lives on. The socket has no armed op at this point (both
+        /// data ops settled with the exchange), so the close is
+        /// synchronous, like the parked-reap path.
+        fn detachUpstream(server: *ServerType, conn: *ConnType) void {
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            if (conn.upstream) |leased| {
+                server.io.closeNow(conn.upstream_socket.?);
+                server.upstreams.release(leased);
+                conn.upstream = null;
+                conn.upstream_socket = null;
+            }
+            assert(conn.upstream_socket == null);
+        }
+
+        /// Keep-alive turnaround (§5): the relay buffer goes back to its
+        /// pool — an idle connection costs a slot and head buffer only —
+        /// the exchange state resets, and the next head read begins under
+        /// a fresh idle deadline.
+        fn resetForNextRequest(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.upstream == null);
+            assert(conn.armedCount() <= 1); // Only the deadline timer.
+            server.releaseRelayBuffer(conn.relay_buffer.?);
+            conn.relay_buffer = null;
+            conn.head_len = 0;
+            conn.l7 = .{};
+            conn.directions = .{ .{}, .{} };
+            conn.state = .l7_reading_head;
+            server.storeDeadline(conn, server.idleTimeoutMs());
+            armHeadRecv(server, conn);
         }
 
         /// The upstream leg failed. Answer 502 only when the client has

@@ -174,6 +174,22 @@ pub fn Conn(comptime IoType: type) type {
             /// True once any response byte reached the client — the §8
             /// verdict split between answering 502 and plain teardown.
             response_started: bool = false,
+            /// The client's persistence ask (RFC 9112 §9), captured at
+            /// routing; the render-time decision may still announce close
+            /// (pressure, drain, §8).
+            client_keep_alive: bool = false,
+            /// What the rendered response told the client. The connection
+            /// honors its own announcement: a keep-alive answer keeps
+            /// serving, an announced close closes (§2).
+            downstream_close_announced: bool = true,
+            /// The origin's persistence verdict from its response head;
+            /// parking requires it (§5).
+            upstream_reusable: bool = false,
+            /// The client sent bytes past the request's framing — a
+            /// pipelined next request. Pipelining is unsupported: the
+            /// exchange completes and the connection closes, dropping the
+            /// early bytes (§2 note; clients recover per RFC).
+            client_pipelined: bool = false,
 
             pub const Leg = enum(u8) {
                 idle,

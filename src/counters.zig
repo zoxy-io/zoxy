@@ -43,10 +43,16 @@ pub const Counters = struct {
     l7_shed_relay_buffers: Value = Value.init(0),
     l7_shed_upstream_slots: Value = Value.init(0),
     /// Upstream leg failed before any response byte reached the client:
-    /// answered 502 (§7, §8).
+    /// answered 502 (§7, §8). A stale parked connection detected at
+    /// checkout lands here too until Phase 2's free replay.
     l7_bad_gateway: Value = Value.init(0),
     /// Completed L7 exchanges: a parsed origin response relayed back.
     l7_responses: Value = Value.init(0),
+    /// Exchanges served over a parked upstream connection instead of a
+    /// fresh dial — the §3 reuse win, witnessed.
+    upstream_reused: Value = Value.init(0),
+    /// Parked upstream connections reaped by the idle sweep (§5).
+    upstream_idle_reaped: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
     /// across every completion (accept, connect, setNodelay, and the relay
     /// recv/send data path).
