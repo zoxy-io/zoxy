@@ -22,6 +22,7 @@ const Pool = @import("mem/Pool.zig").Pool;
 const proxy = @import("http/proxy.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
+const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
 
@@ -33,6 +34,9 @@ pub fn Server(comptime IoType: type) type {
         config: *const config_module.Config,
         conns: Pool(ConnType),
         relay_buffers: Pool(relay.RelayBuffer),
+        /// The shared upstream connection pool (§3, §5): leased per L7
+        /// exchange today; parking joins with keep-alive.
+        upstreams: upstream_module.UpstreamPool(IoType),
         listeners: []ListenerState,
         listeners_count: u16,
         /// The load-balancing policy: resolves a cluster to the endpoint to
@@ -58,6 +62,7 @@ pub fn Server(comptime IoType: type) type {
         pub const InitOptions = struct {
             conn_slots: u32 = constants.conn_slots_max,
             relay_buffers: u32 = constants.relay_buffers_max,
+            upstream_slots: u32 = constants.upstream_slots_max,
         };
 
         const ListenerState = struct {
@@ -90,6 +95,7 @@ pub fn Server(comptime IoType: type) type {
             server.config = config;
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
+            try server.upstreams.init(arena, options.upstream_slots);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
             try server.balancer.init(arena, config);
@@ -165,13 +171,15 @@ pub fn Server(comptime IoType: type) type {
             if (!server.draining) return;
             if (!server.conns.isFullyReleased()) return;
             assert(server.relay_buffers.isFullyReleased());
+            assert(server.upstreams.isFullyReleased());
             server.io.stop();
         }
 
         /// The simulator's leak invariant (§9).
         pub fn isIdle(server: *const Self) bool {
             return server.conns.isFullyReleased() and
-                server.relay_buffers.isFullyReleased();
+                server.relay_buffers.isFullyReleased() and
+                server.upstreams.isFullyReleased();
         }
 
         pub fn activeCount(server: *const Self) u32 {
@@ -257,7 +265,7 @@ pub fn Server(comptime IoType: type) type {
             assert(!server.draining);
             switch (state.protocol) {
                 .l4 => server.admitL4(state, client_socket),
-                .http => server.admitHttp(client_socket),
+                .http => server.admitHttp(state, client_socket),
             }
         }
 
@@ -283,12 +291,13 @@ pub fn Server(comptime IoType: type) type {
             buffer: ?*relay.RelayBuffer,
             state: ConnType.State,
             timeout_ms: u32,
+            cluster_index: u16,
         ) void {
             assert(!server.draining);
             assert(state == .connecting or state == .l7_reading_head);
             assert(timeout_ms >= 1);
             server.counters.increment("admitted");
-            conn.prepare(server, client_socket, buffer, state);
+            conn.prepare(server, client_socket, buffer, state, cluster_index);
             server.io.setNodelay(client_socket) catch {
                 server.counters.increment("kernel_pressure_errors");
             };
@@ -313,6 +322,7 @@ pub fn Server(comptime IoType: type) type {
                 buffer,
                 .connecting,
                 server.config.connect_timeout_ms,
+                state.cluster_index,
             );
             server.armConnect(conn, state.cluster_index);
         }
@@ -321,7 +331,7 @@ pub fn Server(comptime IoType: type) type {
         /// holds no relay buffer, which is acquired when a body relay
         /// starts. The head-read deadline is armed so a slowloris meets
         /// the clock or `head_bytes_max` first (§7).
-        fn admitHttp(server: *Self, client_socket: IoType.Socket) void {
+        fn admitHttp(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
             const conn = server.admitConn(client_socket) orelse return;
             server.finishAdmission(
                 conn,
@@ -329,8 +339,18 @@ pub fn Server(comptime IoType: type) type {
                 null,
                 .l7_reading_head,
                 server.idleTimeoutMs(),
+                state.cluster_index,
             );
             Proxy.start(server, conn);
+        }
+
+        /// L7 body relays acquire their buffer mid-connection (§5), so
+        /// the proxy needs the acquire-with-pressure-update pair the L4
+        /// admission does inline. Null is the §8 relay-buffer rung.
+        pub fn acquireRelayBuffer(server: *Self) ?*relay.RelayBuffer {
+            const buffer = server.relay_buffers.acquire() orelse return null;
+            server.updateRelayPressure();
+            return buffer;
         }
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
@@ -452,6 +472,15 @@ pub fn Server(comptime IoType: type) type {
             if (conn.relay_buffer) |buffer| {
                 server.relay_buffers.release(buffer);
                 server.updateRelayPressure();
+                conn.relay_buffer = null;
+            }
+            // The leased upstream slot rides the same release rule: its
+            // socket (if any) was closed by this teardown's
+            // close_upstream, so the slot is inert by the time the armed
+            // set empties (§5). Parking replaces this with reuse later.
+            if (conn.upstream) |leased| {
+                server.upstreams.release(leased);
+                conn.upstream = null;
             }
             server.conns.release(conn);
             server.counters.increment("completed");

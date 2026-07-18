@@ -9,12 +9,15 @@
 const std = @import("std");
 
 const constants = @import("../constants.zig");
+const parser = @import("../http/parser.zig");
 const relay = @import("relay.zig");
+const upstream_module = @import("upstream.zig");
 
 const assert = std.debug.assert;
 
 pub fn Conn(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
+    const UpstreamType = upstream_module.UpstreamPool(IoType).Upstream;
 
     return struct {
         pool_next: u32,
@@ -57,6 +60,15 @@ pub fn Conn(comptime IoType: type) type {
         /// memory, shrunk from the front as bytes are sent. Empty
         /// otherwise; idle on the L4 path.
         response_pending: []const u8,
+        /// The listener's cluster; the L7 path routes and dials after the
+        /// head parses, long after admission (§7).
+        cluster_index: u16,
+        /// The leased upstream slot during an L7 exchange; released at
+        /// teardown alongside the conn slot (§5). Null outside exchanges
+        /// and on the whole L4 path.
+        upstream: ?*UpstreamType,
+        /// L7 exchange bookkeeping (§7); reset per exchange.
+        l7: L7State,
 
         op_data_client_to_upstream: Op,
         op_data_upstream_to_client: Op,
@@ -73,14 +85,17 @@ pub fn Conn(comptime IoType: type) type {
             // L4 relay states.
             connecting,
             relaying,
-            // L7 states (§7). More join as the request path fills in;
-            // `l7_reading_head` accumulates and re-parses the request head
-            // (§7 detect-and-retry), `l7_responding` writes a static
-            // error response (§8), and `l7_draining_request` half-closes
-            // the write side after a response and drains the client's
-            // remaining input so the close does not RST away that response
-            // (§2 lingering close).
+            // L7 states (§7): `l7_reading_head` accumulates and re-parses
+            // the request head (detect-and-retry); `l7_dialing` awaits the
+            // upstream connect; `l7_exchanging` runs the two legs (request
+            // out, response back — each with its own sub-state in `l7`);
+            // `l7_responding` writes a static error response (§8); and
+            // `l7_draining_request` half-closes the write side after a
+            // response and drains the client's remaining input so the
+            // close does not RST away that response (§2 lingering close).
             l7_reading_head,
+            l7_dialing,
+            l7_exchanging,
             l7_responding,
             l7_draining_request,
             /// Teardown begun: sockets shut down, pending ops draining,
@@ -100,10 +115,78 @@ pub fn Conn(comptime IoType: type) type {
         /// True in any pre-teardown serving state — the states from which
         /// `beginTeardown` is a legal transition.
         pub fn isLive(conn: *const Self) bool {
-            return conn.state == .connecting or conn.state == .relaying or
-                conn.state == .l7_reading_head or conn.state == .l7_responding or
-                conn.state == .l7_draining_request;
+            return switch (conn.state) {
+                .connecting,
+                .relaying,
+                .l7_reading_head,
+                .l7_dialing,
+                .l7_exchanging,
+                .l7_responding,
+                .l7_draining_request,
+                => true,
+                .tearing_down, .closing => false,
+            };
         }
+
+        /// How a message body is delimited and how much of it remains —
+        /// the §7 framing verdicts turned into countdown state the pumps
+        /// consume chunk by chunk.
+        pub const Framing = union(enum) {
+            none,
+            /// Body bytes still to relay.
+            content_length: u64,
+            /// The scanner owns the end-of-message detection.
+            chunked: parser.ChunkedScanner,
+            /// Responses only: the body runs to the origin's EOF.
+            until_close,
+        };
+
+        /// Per-leg progress of an L7 exchange (§7). The request leg sends
+        /// the rendered head, then pumps the framed body client → origin;
+        /// the response leg starts as soon as the request head is on the
+        /// wire (early responses are legal, §7) and mirrors it back.
+        pub const L7State = struct {
+            request_leg: Leg = .idle,
+            response_leg: Leg = .idle,
+            request_method: parser.Method = .get,
+            request_framing: Framing = .none,
+            response_framing: Framing = .none,
+            /// Bytes of `head` consumed by the request head; body excess
+            /// received with it sits at [request_head_len..head_len].
+            request_head_len: u32 = 0,
+            /// Bytes of `upstream.head` consumed by the response head;
+            /// body excess received with it sits at [marker..head_len].
+            response_head_len_marker: u32 = 0,
+            /// Length of the rendered head being sent (request leg: into
+            /// upstream.head; response leg: into conn.head).
+            rendered_request_len: u32 = 0,
+            rendered_response_len: u32 = 0,
+            /// Send cursors over the rendered heads (short sends resume).
+            request_head_sent: u32 = 0,
+            response_head_sent: u32 = 0,
+            /// True once the request head has been forwarded off conn.head
+            /// (head sent and any coalesced body excess drained), so the
+            /// response head may render into conn.head (§7 buffer rotation).
+            request_head_vacated: bool = false,
+            /// The origin's head parsed while conn.head was still occupied;
+            /// render it once `request_head_vacated`.
+            response_render_pending: bool = false,
+            /// True once any response byte reached the client — the §8
+            /// verdict split between answering 502 and plain teardown.
+            response_started: bool = false,
+
+            pub const Leg = enum(u8) {
+                idle,
+                sending_head,
+                awaiting_head,
+                /// Forwarding body bytes that arrived coalesced with the
+                /// head, sent straight from the head buffer (§7) so a body
+                /// larger than a relay buffer is never copied through one.
+                sending_body_excess,
+                pumping_body,
+                done,
+            };
+        };
 
         pub const Direction = enum(u1) {
             client_to_upstream,
@@ -151,6 +234,7 @@ pub fn Conn(comptime IoType: type) type {
             client_socket: IoType.Socket,
             buffer: ?*relay.RelayBuffer,
             state: State,
+            cluster_index: u16,
         ) void {
             assert(state == .connecting or state == .l7_reading_head);
             conn.server = server;
@@ -164,6 +248,9 @@ pub fn Conn(comptime IoType: type) type {
             conn.directions = .{ .{}, .{} };
             conn.head_len = 0;
             conn.response_pending = &.{};
+            conn.cluster_index = cluster_index;
+            conn.upstream = null;
+            conn.l7 = .{};
             conn.op_data_client_to_upstream = .{};
             conn.op_data_upstream_to_client = .{};
             conn.op_connect = .{};
@@ -176,6 +263,8 @@ pub fn Conn(comptime IoType: type) type {
             assert(conn.armedCount() == 0);
             assert(conn.head_len == 0);
             assert(conn.response_pending.len == 0);
+            assert(conn.upstream == null);
+            assert(conn.l7.request_leg == .idle);
         }
 
         /// Records the arm in the op and the armed set; call immediately

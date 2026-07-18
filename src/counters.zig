@@ -36,6 +36,17 @@ pub const Counters = struct {
     l7_uri_too_long: Value = Value.init(0),
     l7_headers_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
+    /// §8 rungs at the L7 request level, answered 503: relay buffers or
+    /// upstream slots exhausted when a valid request needed them. Like
+    /// the reject counters these connections complete normally, so they
+    /// stay out of `reconcile`'s shed sum.
+    l7_shed_relay_buffers: Value = Value.init(0),
+    l7_shed_upstream_slots: Value = Value.init(0),
+    /// Upstream leg failed before any response byte reached the client:
+    /// answered 502 (§7, §8).
+    l7_bad_gateway: Value = Value.init(0),
+    /// Completed L7 exchanges: a parsed origin response relayed back.
+    l7_responses: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
     /// across every completion (accept, connect, setNodelay, and the relay
     /// recv/send data path).

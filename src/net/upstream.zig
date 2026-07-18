@@ -52,6 +52,10 @@ pub fn UpstreamPool(comptime IoType: type) type {
             idle_next: u32,
             idle_prev: u32,
             head: [constants.head_bytes_max]u8,
+            /// Valid prefix of `head` while it accumulates a response
+            /// head; the rendered upstream request head tracks its own
+            /// length in the owning connection instead.
+            head_len: u32,
         };
 
         /// In-place init via out-pointer for pointer stability. `arena`
@@ -81,6 +85,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.parked = false;
             upstream.idle_next = idle_none;
             upstream.idle_prev = idle_none;
+            upstream.head_len = 0;
             assert(pool.idle_count < pool.slot_pool.acquired_count);
             return upstream;
         }
