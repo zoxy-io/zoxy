@@ -135,10 +135,18 @@ fn appendEndToEndHeaders(
         }
     }
     const nominations = connection_values[0..connection_count];
+    // `close` and `keep-alive` are connection options, not header names —
+    // `keep-alive` is already a hop-by-hop name and `close` names no
+    // forwardable header — so a Connection listing only those nominates
+    // nothing to strip. Detect a real nomination once here; the common
+    // case then skips the per-header token scan entirely, splitting the
+    // Connection value once rather than once per header (§9).
+    const active_nominations =
+        if (nominatesRealHeader(nominations)) nominations else nominations[0..0];
 
     for (headers) |header| {
         assert(header.name.len >= 1);
-        if (isHopByHop(header.name, nominations)) {
+        if (isHopByHop(header.name, active_nominations)) {
             continue;
         }
         try staging.append(header.name);
@@ -148,11 +156,37 @@ fn appendEndToEndHeaders(
     }
 }
 
+/// True when a Connection value names a header to strip beyond the
+/// standard `close`/`keep-alive` options. Splits each token list once so
+/// the per-header hop-by-hop test can skip the (usually empty) nomination
+/// scan in the common case.
+fn nominatesRealHeader(nominations: []const []const u8) bool {
+    assert(nominations.len <= constants.headers_max);
+    for (nominations) |value| {
+        var tokens = std.mem.splitScalar(u8, value, ',');
+        while (tokens.next()) |raw_token| {
+            const token = std.mem.trim(u8, raw_token, " \t");
+            if (token.len == 0) {
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(token, "close")) {
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 /// True when the header must not be forwarded: in the static hop-by-hop
 /// set, or nominated by a Connection header (RFC 9110 §7.6.1) — unless
-/// it is protected (see `protected_names`). `nominations` is the
-/// pre-collected set of Connection header values, so this is O(1) in the
-/// common no-Connection-header case rather than a re-scan per header.
+/// it is protected (see `protected_names`). `nominations` is the set of
+/// Connection values that name a real header (empty in the common
+/// close/keep-alive-only case), so this is O(1) then rather than a token
+/// scan per header.
 fn isHopByHop(name: []const u8, nominations: []const []const u8) bool {
     assert(name.len >= 1);
     assert(nominations.len <= constants.headers_max);
@@ -228,6 +262,27 @@ test "render: nominating a protected header does not strip it" {
     const rendered = try renderRequestHead(&request, false, &buffer);
     try testing.expectEqualStrings(
         "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n",
+        rendered,
+    );
+}
+
+test "render: standard Connection options do not nominate a same-named header" {
+    // `close`/`keep-alive` are persistence directives (RFC 9110 §7.6.1),
+    // not nominations — so the per-header token scan is skipped for them,
+    // and a (bogus) header literally named "Close" is forwarded, not
+    // stripped. A real nomination on the same Connection still strips
+    // (covered by the strips-hop-by-hop-and-nominated test above).
+    const head = "GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, close\r\n" ++
+        "Close: x\r\nKeep-Alive: timeout=5\r\n\r\n";
+    var storage: parser.HeaderStorage = undefined;
+    const request = try parser.parseRequestHead(head, false, &storage);
+    var buffer: [oracle_buffer_bytes]u8 = undefined;
+    const rendered = try renderRequestHead(&request, false, &buffer);
+    // Connection stripped (hop-by-hop) and Keep-Alive stripped (a
+    // hop-by-hop name); the "Close" header survives — close nominates
+    // nothing.
+    try testing.expectEqualStrings(
+        "GET / HTTP/1.1\r\nHost: a\r\nClose: x\r\n\r\n",
         rendered,
     );
 }
