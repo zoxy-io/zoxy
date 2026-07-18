@@ -106,7 +106,7 @@ pub fn Relay(comptime IoType: type) type {
                     maybeFinish(server, conn);
                     return;
                 }
-                witnessKernelPressure(server, err);
+                server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
                 return;
             };
@@ -132,7 +132,7 @@ pub fn Relay(comptime IoType: type) type {
             const state = directionState(conn, direction);
             assert(state.phase == .sending);
             const sent = result catch |err| {
-                witnessKernelPressure(server, err);
+                server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
                 return;
             };
@@ -146,20 +146,6 @@ pub fn Relay(comptime IoType: type) type {
                 // deadline out (§6); the armed timer op is not touched.
                 server.storeDeadline(conn, server.idleTimeoutMs());
                 armRecv(server, conn, direction);
-            }
-        }
-
-        /// §8 kernel-pressure rung on the data path. On an established
-        /// relay socket the orderly failures are EndOfStream (peeled off by
-        /// the caller) and Reset — a normal RST. Anything else is a
-        /// non-orderly op failure, which on a live socket is resource
-        /// exhaustion (ENOBUFS/ENOMEM), so witness it before the teardown,
-        /// matching how the accept/connect/setNodelay sites count kernel
-        /// pressure. The teardown itself is unchanged. (`Canceled` never
-        /// reaches the relay: data ops are never canceled, §5.)
-        fn witnessKernelPressure(server: *ServerType, err: anyerror) void {
-            if (err == error.Unexpected) {
-                server.counters.increment("kernel_pressure_errors");
             }
         }
 
@@ -193,7 +179,9 @@ pub fn Relay(comptime IoType: type) type {
         }
 
         fn buffer(conn: *ConnType, comptime direction: Direction) []u8 {
-            return &@field(conn.relay_buffer, @tagName(direction));
+            // The L4 relay always holds its buffer for the connection's
+            // life (§6); it is only ever null on an idle L7 connection.
+            return &@field(conn.relay_buffer.?, @tagName(direction));
         }
 
         fn opposite(comptime direction: Direction) Direction {

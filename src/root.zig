@@ -9,11 +9,12 @@ pub const config = @import("config.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
-/// the trust boundary, `render` writes upstream/downstream heads; the
-/// proxy state machine joins them in a later slice.
+/// the trust boundary, `render` writes upstream/downstream heads, and
+/// `proxy` is the request-lifecycle state machine over both.
 pub const http = struct {
     pub const parser = @import("http/parser.zig");
     pub const render = @import("http/render.zig");
+    pub const proxy = @import("http/proxy.zig");
 };
 pub const Io = @import("io/io.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;
@@ -33,6 +34,7 @@ test {
     _ = counters;
     _ = http.parser;
     _ = http.render;
+    _ = http.proxy;
     _ = Io;
     _ = Server;
     _ = shed;
@@ -45,5 +47,6 @@ test {
     _ = @import("io/sim_io_test.zig");
     _ = @import("io/xev_smoke_test.zig");
     _ = @import("server_test.zig");
+    _ = @import("http_proxy_test.zig");
     _ = @import("zero_alloc_test.zig");
 }

@@ -2,10 +2,13 @@
 //! listeners, the counters, and the drain flag; generic over the Io
 //! backend so the simulator instantiates the whole serving path without
 //! main. All admission decisions happen here — the ladder's single
-//! choke point. Slice 7 scope: full connection lifecycle (accept gate →
-//! admission → upstream dial → deadline → teardown with armed-op-gated
-//! release); the bidirectional relay lands in slice 8, so a connected
-//! conn currently tears down immediately.
+//! choke point. Admission forks on the listener's protocol: an `l4`
+//! listener runs the strict TCP relay (`net/relay.zig`), an `http`
+//! listener runs the L7 state machine (`http/proxy.zig`); the shared
+//! accept gate, deadline, and teardown machinery serve both. The L7
+//! request path is filling in slice by slice — head ingestion and the
+//! static-response rejects are in; the upstream leg follows — so a valid
+//! L7 request currently tears down once its head is parsed.
 
 const std = @import("std");
 
@@ -16,6 +19,7 @@ const counters_module = @import("counters.zig");
 const conn_module = @import("net/Conn.zig");
 const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
+const proxy = @import("http/proxy.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 
@@ -47,6 +51,7 @@ pub fn Server(comptime IoType: type) type {
         const Self = @This();
 
         pub const ConnType = conn_module.Conn(IoType);
+        const Proxy = proxy.Proxy(IoType);
 
         /// Pool sizes are injectable so tests and the simulator can force
         /// every exhaustion rung; production uses the §5 defaults.
@@ -64,6 +69,9 @@ pub fn Server(comptime IoType: type) type {
             /// ring budget stays one op (§8).
             retry_completion: IoType.Completion,
             cluster_index: u16,
+            /// Copied from config so admission forks without reaching back
+            /// through the listener index (§6, §7).
+            protocol: config_module.Config.Listener.Protocol,
             accepting: bool,
         };
 
@@ -73,19 +81,11 @@ pub fn Server(comptime IoType: type) type {
             io: *IoType,
             config: *const config_module.Config,
             options: InitOptions,
-        ) error{ OutOfMemory, HttpListenersUnimplemented }!void {
+        ) error{OutOfMemory}!void {
             assert(config.listeners.len >= 1);
             assert(config.listeners.len <= constants.listeners_max);
             assert(options.relay_buffers >= 1);
             assert(options.relay_buffers <= options.conn_slots);
-            // Phase-1 gate: until the L7 state machine lands, an http
-            // listener cannot be served — refuse at startup rather than
-            // silently relaying it as L4. The proxy slice removes this.
-            for (config.listeners) |listener| {
-                if (listener.protocol == .http) {
-                    return error.HttpListenersUnimplemented;
-                }
-            }
             server.io = io;
             server.config = config;
             try server.conns.init(arena, options.conn_slots);
@@ -110,6 +110,7 @@ pub fn Server(comptime IoType: type) type {
                     .accept_completion = .{},
                     .retry_completion = .{},
                     .cluster_index = listener_config.cluster_index,
+                    .protocol = listener_config.protocol,
                     .accepting = false,
                 };
                 server.armAccept(state);
@@ -249,7 +250,18 @@ pub fn Server(comptime IoType: type) type {
             }
         }
 
+        /// The admission fork (§6, §7): every protocol shares the accept
+        /// gate, the conn slot, the deadline, and teardown; they diverge
+        /// only in what a fresh connection does next.
         fn admit(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
+            assert(!server.draining);
+            switch (state.protocol) {
+                .l4 => server.admitL4(state, client_socket),
+                .http => server.admitHttp(client_socket),
+            }
+        }
+
+        fn admitL4(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
             assert(!server.draining);
             const conn = server.conns.acquire() orelse {
                 server.counters.increment("shed_conn_slots");
@@ -264,13 +276,34 @@ pub fn Server(comptime IoType: type) type {
             };
             server.counters.increment("admitted");
             server.updateRelayPressure();
-            conn.prepare(server, client_socket, buffer);
+            conn.prepare(server, client_socket, buffer, .connecting);
             server.io.setNodelay(client_socket) catch {
                 server.counters.increment("kernel_pressure_errors");
             };
             server.storeDeadline(conn, server.config.connect_timeout_ms);
             server.armDeadline(conn);
             server.armConnect(conn, state.cluster_index);
+        }
+
+        /// L7 admission (§5, §7): a slot only — an idle L7 connection
+        /// holds no relay buffer, which is acquired when a body relay
+        /// starts (a later slice). The head-read deadline is armed so a
+        /// slowloris meets the clock or `head_bytes_max` first (§7).
+        fn admitHttp(server: *Self, client_socket: IoType.Socket) void {
+            assert(!server.draining);
+            const conn = server.conns.acquire() orelse {
+                server.counters.increment("shed_conn_slots");
+                shed.closeWithRst(IoType, server.io, client_socket);
+                return;
+            };
+            server.counters.increment("admitted");
+            conn.prepare(server, client_socket, null, .l7_reading_head);
+            server.io.setNodelay(client_socket) catch {
+                server.counters.increment("kernel_pressure_errors");
+            };
+            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.armDeadline(conn);
+            Proxy.start(server, conn);
         }
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
@@ -319,7 +352,7 @@ pub fn Server(comptime IoType: type) type {
         /// releases the slot.
         pub fn beginTeardown(server: *Self, conn: *ConnType) void {
             if (conn.isTearingDown()) return;
-            assert(conn.state == .connecting or conn.state == .relaying);
+            assert(conn.isLive());
             conn.state = .tearing_down;
             server.io.shutdown(conn.client_socket, .both);
             if (conn.upstream_socket) |socket| {
@@ -387,11 +420,28 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.isTearingDown());
             if (conn.state != .closing) return;
             if (conn.armedCount() != 0) return;
-            server.relay_buffers.release(conn.relay_buffer);
-            server.updateRelayPressure();
+            // An idle L7 connection holds no relay buffer (§5); only
+            // release one that was actually acquired.
+            if (conn.relay_buffer) |buffer| {
+                server.relay_buffers.release(buffer);
+                server.updateRelayPressure();
+            }
             server.conns.release(conn);
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
+        }
+
+        /// §8 kernel-pressure rung on the data path: a non-orderly op
+        /// failure on a live socket is resource exhaustion (ENOBUFS/
+        /// ENOMEM), which the seam collapses to Unexpected. Orderly
+        /// failures (EndOfStream, Reset, Canceled) are peeled off by the
+        /// caller; only Unexpected is witnessed here, matching the
+        /// accept/connect/setNodelay sites. Shared by the L4 relay and the
+        /// L7 state machine.
+        pub fn witnessKernelPressure(server: *Self, err: anyerror) void {
+            if (err == error.Unexpected) {
+                server.counters.increment("kernel_pressure_errors");
+            }
         }
 
         /// §8 watermarks before walls: recompute the relay-buffer pressure
