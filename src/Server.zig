@@ -73,11 +73,19 @@ pub fn Server(comptime IoType: type) type {
             io: *IoType,
             config: *const config_module.Config,
             options: InitOptions,
-        ) error{OutOfMemory}!void {
+        ) error{ OutOfMemory, HttpListenersUnimplemented }!void {
             assert(config.listeners.len >= 1);
             assert(config.listeners.len <= constants.listeners_max);
             assert(options.relay_buffers >= 1);
             assert(options.relay_buffers <= options.conn_slots);
+            // Phase-1 gate: until the L7 state machine lands, an http
+            // listener cannot be served — refuse at startup rather than
+            // silently relaying it as L4. The proxy slice removes this.
+            for (config.listeners) |listener| {
+                if (listener.protocol == .http) {
+                    return error.HttpListenersUnimplemented;
+                }
+            }
             server.io = io;
             server.config = config;
             try server.conns.init(arena, options.conn_slots);

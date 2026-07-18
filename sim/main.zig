@@ -142,7 +142,7 @@ const Harness = struct {
 
         harness.endpoints = .{originAddress()};
         harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
-        harness.listener_configs = .{.{ .bind_address = bindAddress(), .cluster_index = 0 }};
+        harness.listener_configs = .{.{ .bind_address = bindAddress(), .cluster_index = 0, .protocol = .l4 }};
         harness.config = .{
             .listeners = &harness.listener_configs,
             .clusters = &harness.clusters,

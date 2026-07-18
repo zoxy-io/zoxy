@@ -31,6 +31,16 @@ pub const Config = struct {
     pub const Listener = struct {
         bind_address: std.Io.net.IpAddress,
         cluster_index: u16,
+        protocol: Protocol,
+
+        /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
+        /// `http` runs the HTTP/1.1 reverse-proxy state machine. The
+        /// JSON field is optional and defaults to `l4`, so pre-L7
+        /// configs stay valid.
+        pub const Protocol = enum(u1) {
+            l4,
+            http,
+        };
     };
 
     pub const Cluster = struct {
@@ -45,6 +55,7 @@ pub const ValidationError = error{
     ListenersOverLimit,
     ListenerBindInvalid,
     ListenerBindDuplicate,
+    ListenerProtocolUnknown,
     ClusterUnknown,
     ClustersEmpty,
     ClustersOverLimit,
@@ -94,6 +105,8 @@ const ConfigJson = struct {
 const ListenerJson = struct {
     bind: []const u8,
     cluster: []const u8,
+    /// Optional: absent means `l4`, keeping pre-L7 configs valid.
+    protocol: []const u8 = "l4",
 };
 
 const ClusterJson = struct {
@@ -240,10 +253,23 @@ fn resolveListeners(
         listeners[index] = .{
             .bind_address = bind_address,
             .cluster_index = try clusterIndexOf(clusters, listener_json.cluster),
+            .protocol = try protocolOf(listener_json.protocol),
         };
     }
     assert(listeners.len == listeners_json.len);
     return listeners;
+}
+
+/// The closed protocol vocabulary; anything else is its own error so a
+/// typo ("htpp") fails loudly instead of silently relaying as L4.
+fn protocolOf(literal: []const u8) error{ListenerProtocolUnknown}!Config.Listener.Protocol {
+    if (std.mem.eql(u8, literal, "l4")) {
+        return .l4;
+    }
+    if (std.mem.eql(u8, literal, "http")) {
+        return .http;
+    }
+    return error.ListenerProtocolUnknown;
 }
 
 fn clusterIndexOf(
@@ -289,6 +315,7 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(@as(usize, 1), parsed.listeners.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.clusters.len);
     try std.testing.expectEqual(@as(u16, 0), parsed.listeners[0].cluster_index);
+    try std.testing.expectEqual(Config.Listener.Protocol.l4, parsed.listeners[0].protocol);
     try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
     try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].getPort());
@@ -334,6 +361,39 @@ test "config: max_lifetime_ms accepts zero (the one legal zero timeout) and real
         );
         try std.testing.expectEqual(@as(u32, 1_800_000), parsed.max_lifetime_ms);
     }
+}
+
+test "config: listener protocol defaults to l4 and accepts http" {
+    // Absent field: pre-L7 configs stay valid.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(Config.Listener.Protocol.l4, parsed.listeners[0].protocol);
+    }
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(Config.Listener.Protocol.http, parsed.listeners[0].protocol);
+    }
+}
+
+test "config: unknown listener protocol fails loudly" {
+    // A typo must not silently relay as L4.
+    try expectParseError(error.ListenerProtocolUnknown,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"htpp"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
 }
 
 test "config: max_lifetime_ms still obeys the shared ceiling" {

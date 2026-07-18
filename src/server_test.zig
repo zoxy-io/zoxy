@@ -218,7 +218,7 @@ pub const TestBed = struct {
         try bed.sim_io.init(arena, options.sim);
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
-        bed.listeners = .{.{ .bind_address = bindAddress(), .cluster_index = 0 }};
+        bed.listeners = .{.{ .bind_address = bindAddress(), .cluster_index = 0, .protocol = .l4 }};
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,

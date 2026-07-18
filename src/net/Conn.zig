@@ -8,6 +8,7 @@
 
 const std = @import("std");
 
+const constants = @import("../constants.zig");
 const relay = @import("relay.zig");
 
 const assert = std.debug.assert;
@@ -35,6 +36,18 @@ pub fn Conn(comptime IoType: type) type {
         birth_ns: u64,
         armed: Armed,
         directions: [2]DirectionState,
+        /// L7 request/response head bytes accumulate here across recv
+        /// retries (§5, §7); idle on L4 connections, which relay through
+        /// the relay buffer only. Parsing is detect-and-retry from byte 0
+        /// (§7), so these bytes stay the single source of truth: nothing
+        /// parsed is stored across callbacks, and a re-parse after an
+        /// await costs one bounded scan instead of 2 KiB of per-slot
+        /// header storage. Deliberately not zeroed at admission — bytes
+        /// past `head_len` are never read.
+        head: [constants.head_bytes_max]u8,
+        /// Bytes of `head` filled so far; the head's end is found by
+        /// parsing, the body (or a pipelined next head) follows it.
+        head_len: u32,
 
         op_data_client_to_upstream: Op,
         op_data_upstream_to_client: Op,
@@ -116,6 +129,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.birth_ns = server.io.nowNs();
             conn.armed = .{};
             conn.directions = .{ .{}, .{} };
+            conn.head_len = 0;
             conn.op_data_client_to_upstream = .{};
             conn.op_data_upstream_to_client = .{};
             conn.op_connect = .{};
@@ -126,6 +140,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.op_deadline_cancel = .{};
             assert(conn.state == .connecting);
             assert(conn.armedCount() == 0);
+            assert(conn.head_len == 0);
         }
 
         /// Records the arm in the op and the armed set; call immediately
