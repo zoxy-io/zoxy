@@ -588,12 +588,7 @@ fn analyzeHeaders(
         }
         if (std.ascii.eqlIgnoreCase(raw_header.key, "connection")) {
             // Multiple Connection headers combine as one list (RFC 9110).
-            if (tokenListHas(raw_header.value, "close")) {
-                analysis.connection_close = true;
-            }
-            if (tokenListHas(raw_header.value, "keep-alive")) {
-                analysis.connection_keep_alive = true;
-            }
+            scanConnectionTokens(raw_header.value, &analysis);
             continue;
         }
     }
@@ -602,6 +597,24 @@ fn analyzeHeaders(
         assert(host.len >= 1);
     }
     return analysis;
+}
+
+/// Set the persistence flags from one Connection header value in a single
+/// token pass — scanning the list twice (once per token) was a measured
+/// hot spot (§9). Tokens are OWS-trimmed and matched case-insensitively.
+fn scanConnectionTokens(value: []const u8, analysis: *HeaderAnalysis) void {
+    var tokens = std.mem.splitScalar(u8, value, ',');
+    while (tokens.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, " \t");
+        if (token.len == 0) {
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(token, "close")) {
+            analysis.connection_close = true;
+        } else if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
+            analysis.connection_keep_alive = true;
+        }
+    }
 }
 
 /// Request-side framing (RFC 9112 §6.3): length-delimited or nothing.
