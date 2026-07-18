@@ -16,8 +16,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
-const linux = std.os.linux;
 
+const affinity = @import("affinity.zig");
 const zrk = @import("zrk");
 
 const assert = std.debug.assert;
@@ -69,12 +69,9 @@ pub fn main(init: std.process.Init) !u8 {
     // Topology: dedicate one core to zoxy, run everything else off it. Pin
     // ourselves first so the nginx/zoxy/perf children and the zrk load threads
     // all inherit the "everything else" mask; zoxy is then re-pinned alone.
-    var universe: CpuSet = undefined;
-    _ = linux.sched_getaffinity(0, @sizeOf(CpuSet), &universe);
-    const zoxy_cpu = flags.zoxy_cpu orelse detectPCore(io) orelse maxCpu(&universe);
-    var others = universe;
-    cpuClear(&others, zoxy_cpu);
-    linux.sched_setaffinity(0, &others) catch {};
+    // Non-null: `main` already returned above on non-Linux, the only case
+    // `dedicate` yields null.
+    const zoxy_cpu = affinity.dedicate(io, flags.zoxy_cpu).?;
 
     var origin_child = try spawnNginx(arena, io);
     defer origin_child.kill(io);
@@ -83,9 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
     const zoxy_pid = zoxy_child.id orelse return error.NoZoxyPid;
-    var zoxy_only = cpuZero();
-    cpuSet(&zoxy_only, zoxy_cpu);
-    linux.sched_setaffinity(zoxy_pid, &zoxy_only) catch {};
+    affinity.pinChildTo(zoxy_pid, zoxy_cpu);
 
     // Warm up and prove the path serves before spending a measured run on it.
     try awaitResponsive(arena, io, &flags);
@@ -169,62 +164,6 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
     assert(flags.connections >= 1);
     assert(flags.duration_s >= 1);
     return flags;
-}
-
-// --- CPU affinity (pure Zig; the whole point is single-PMU pinning) ---------
-
-const CpuSet = linux.cpu_set_t;
-const cpu_bits = @bitSizeOf(usize);
-const cpu_set_words = @typeInfo(CpuSet).array.len;
-
-fn cpuZero() CpuSet {
-    return @splat(0);
-}
-
-fn cpuSet(set: *CpuSet, cpu: u16) void {
-    set[cpu / cpu_bits] |= @as(usize, 1) << @intCast(cpu % cpu_bits);
-}
-
-fn cpuClear(set: *CpuSet, cpu: u16) void {
-    set[cpu / cpu_bits] &= ~(@as(usize, 1) << @intCast(cpu % cpu_bits));
-}
-
-fn cpuIsSet(set: *const CpuSet, cpu: u16) bool {
-    return set[cpu / cpu_bits] & (@as(usize, 1) << @intCast(cpu % cpu_bits)) != 0;
-}
-
-fn maxCpu(set: *const CpuSet) u16 {
-    var cpu: u16 = cpu_set_words * cpu_bits;
-    while (cpu > 0) {
-        cpu -= 1;
-        if (cpuIsSet(set, cpu)) return cpu;
-    }
-    return 0;
-}
-
-/// Last cpu id listed in the hybrid P-core sysfs mask (e.g. "0-3" -> 3), so
-/// zoxy lands on a performance core. Null when the file is absent (not hybrid,
-/// or an older kernel) — the caller falls back to the last available cpu.
-fn detectPCore(io: Io) ?u16 {
-    const file = Io.Dir.cwd().openFile(io, "/sys/devices/cpu_core/cpus", .{}) catch return null;
-    defer file.close(io);
-    var read_buffer: [256]u8 = undefined;
-    var file_reader = file.reader(io, &read_buffer);
-    var content: [256]u8 = undefined;
-    const len = file_reader.interface.readSliceShort(&content) catch return null;
-    // Take the last run of digits: the highest cpu id in the mask.
-    var last: ?u16 = null;
-    var current: ?u32 = null;
-    for (content[0..len]) |char| {
-        if (char >= '0' and char <= '9') {
-            current = (current orelse 0) * 10 + (char - '0');
-        } else if (current) |value| {
-            last = std.math.cast(u16, value) orelse last;
-            current = null;
-        }
-    }
-    if (current) |value| last = std.math.cast(u16, value) orelse last;
-    return last;
 }
 
 // --- process orchestration --------------------------------------------------

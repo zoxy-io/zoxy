@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 
+const affinity = @import("affinity.zig");
 const zrk = @import("zrk");
 
 const assert = std.debug.assert;
@@ -43,6 +44,15 @@ pub fn main(init: std.process.Init) !u8 {
 
     try Io.Dir.cwd().createDirPath(io, work_directory);
 
+    // Dedicate one core to the proxy under test and pin this process (its
+    // zrk load threads) and the inherited origin off it, so the bands
+    // measure the proxy rather than its contention with the generator,
+    // and match zoxy's one-loop-per-core topology (§3). Both proxies are
+    // pinned to the same core: the scenarios run sequentially, so only
+    // one is ever under load, and the idle one burns no cycles. Pin self
+    // before spawning so children inherit the "everything else" mask.
+    const proxy_cpu = affinity.dedicate(io, null);
+
     var origin_child: ?std.process.Child = null;
     const origin_address = flags.origin orelse spawn_origin: {
         origin_child = try spawnNginx(arena, io);
@@ -59,6 +69,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     var haproxy_child = try spawnHaproxy(arena, io, origin_address);
     defer haproxy_child.kill(io);
+
+    if (proxy_cpu) |cpu| {
+        affinity.pinChildTo(zoxy_child.id.?, cpu);
+        affinity.pinChildTo(haproxy_child.id.?, cpu);
+        std.debug.print("bench: proxy under test pinned to cpu {d}; origin + load off it\n", .{cpu});
+    }
 
     // Warm all paths up and prove they answer before measuring.
     _ = try awaitResponsive(arena, io, originPortOf(origin_address), "origin");
