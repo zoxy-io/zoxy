@@ -27,6 +27,15 @@ pub const Counters = struct {
     deadline_expired: Value = Value.init(0),
     /// Upstream dial failed (refused/unreachable/canceled-by-teardown).
     upstream_connect_failed: Value = Value.init(0),
+    /// L7 reject responses (§7): a malformed head (400), an oversize
+    /// request line (414) or header section (431), or an unsupported
+    /// method/upgrade (501). Not sheds — the connection was admitted and
+    /// answered a static response, so it completes normally and stays out
+    /// of `reconcile`'s shed sum; these are pure observability.
+    l7_bad_request: Value = Value.init(0),
+    l7_uri_too_long: Value = Value.init(0),
+    l7_headers_too_large: Value = Value.init(0),
+    l7_not_implemented: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
     /// across every completion (accept, connect, setNodelay, and the relay
     /// recv/send data path).

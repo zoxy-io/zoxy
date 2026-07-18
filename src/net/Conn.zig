@@ -26,7 +26,11 @@ pub fn Conn(comptime IoType: type) type {
         /// its presence one field means an unset upstream can never be
         /// read as a live fd handle.
         upstream_socket: ?IoType.Socket,
-        relay_buffer: *relay.RelayBuffer,
+        /// Held for the L4 connection's life; on the L7 path it is null
+        /// until a body relay starts and again once the connection goes
+        /// idle on keep-alive — an idle L7 connection costs a slot and
+        /// head buffer only (§5).
+        relay_buffer: ?*relay.RelayBuffer,
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
@@ -48,6 +52,11 @@ pub fn Conn(comptime IoType: type) type {
         /// Bytes of `head` filled so far; the head's end is found by
         /// parsing, the body (or a pipelined next head) follows it.
         head_len: u32,
+        /// The static error response still to be written to the client
+        /// while in `.l7_responding` (§8): a slice into comptime static
+        /// memory, shrunk from the front as bytes are sent. Empty
+        /// otherwise; idle on the L4 path.
+        response_pending: []const u8,
 
         op_data_client_to_upstream: Op,
         op_data_upstream_to_client: Op,
@@ -61,8 +70,19 @@ pub fn Conn(comptime IoType: type) type {
         const Self = @This();
 
         pub const State = enum(u8) {
+            // L4 relay states.
             connecting,
             relaying,
+            // L7 states (§7). More join as the request path fills in;
+            // `l7_reading_head` accumulates and re-parses the request head
+            // (§7 detect-and-retry), `l7_responding` writes a static
+            // error response (§8), and `l7_draining_request` half-closes
+            // the write side after a response and drains the client's
+            // remaining input so the close does not RST away that response
+            // (§2 lingering close).
+            l7_reading_head,
+            l7_responding,
+            l7_draining_request,
             /// Teardown begun: sockets shut down, pending ops draining,
             /// closes not yet submitted.
             tearing_down,
@@ -75,6 +95,14 @@ pub fn Conn(comptime IoType: type) type {
         /// True once teardown has begun, in either teardown phase.
         pub fn isTearingDown(conn: *const Self) bool {
             return conn.state == .tearing_down or conn.state == .closing;
+        }
+
+        /// True in any pre-teardown serving state — the states from which
+        /// `beginTeardown` is a legal transition.
+        pub fn isLive(conn: *const Self) bool {
+            return conn.state == .connecting or conn.state == .relaying or
+                conn.state == .l7_reading_head or conn.state == .l7_responding or
+                conn.state == .l7_draining_request;
         }
 
         pub const Direction = enum(u1) {
@@ -113,15 +141,20 @@ pub fn Conn(comptime IoType: type) type {
         };
 
         /// Admission-time reset. `pool_next` and `generation` are owned
-        /// by the pool and deliberately untouched.
+        /// by the pool and deliberately untouched. `buffer` is the L4
+        /// relay buffer, or null on the L7 path (§5); `state` is the
+        /// protocol's entry state (`.connecting` for L4, `.l7_reading_head`
+        /// for L7).
         pub fn prepare(
             conn: *Self,
             server: *ServerType,
             client_socket: IoType.Socket,
-            buffer: *relay.RelayBuffer,
+            buffer: ?*relay.RelayBuffer,
+            state: State,
         ) void {
+            assert(state == .connecting or state == .l7_reading_head);
             conn.server = server;
-            conn.state = .connecting;
+            conn.state = state;
             conn.client_socket = client_socket;
             conn.upstream_socket = null;
             conn.relay_buffer = buffer;
@@ -130,6 +163,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.armed = .{};
             conn.directions = .{ .{}, .{} };
             conn.head_len = 0;
+            conn.response_pending = &.{};
             conn.op_data_client_to_upstream = .{};
             conn.op_data_upstream_to_client = .{};
             conn.op_connect = .{};
@@ -138,9 +172,10 @@ pub fn Conn(comptime IoType: type) type {
             conn.op_close_upstream = .{};
             conn.op_deadline = .{};
             conn.op_deadline_cancel = .{};
-            assert(conn.state == .connecting);
+            assert(conn.state == state);
             assert(conn.armedCount() == 0);
             assert(conn.head_len == 0);
+            assert(conn.response_pending.len == 0);
         }
 
         /// Records the arm in the op and the armed set; call immediately
