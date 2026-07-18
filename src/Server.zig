@@ -261,48 +261,75 @@ pub fn Server(comptime IoType: type) type {
             }
         }
 
-        fn admitL4(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
+        /// The shared conn-slot rung (§8): both protocols shed the same
+        /// way when slots run out, so the rung lives in one place.
+        fn admitConn(server: *Self, client_socket: IoType.Socket) ?*ConnType {
             assert(!server.draining);
-            const conn = server.conns.acquire() orelse {
+            return server.conns.acquire() orelse {
                 server.counters.increment("shed_conn_slots");
                 shed.closeWithRst(IoType, server.io, client_socket);
-                return;
+                return null;
             };
+        }
+
+        /// The shared admission tail (§8 single choke point): counting,
+        /// slot prepare, socket options, and the first deadline are
+        /// identical across protocols; only the entry state, buffer, and
+        /// timeout differ.
+        fn finishAdmission(
+            server: *Self,
+            conn: *ConnType,
+            client_socket: IoType.Socket,
+            buffer: ?*relay.RelayBuffer,
+            state: ConnType.State,
+            timeout_ms: u32,
+        ) void {
+            assert(!server.draining);
+            assert(state == .connecting or state == .l7_reading_head);
+            assert(timeout_ms >= 1);
+            server.counters.increment("admitted");
+            conn.prepare(server, client_socket, buffer, state);
+            server.io.setNodelay(client_socket) catch {
+                server.counters.increment("kernel_pressure_errors");
+            };
+            server.storeDeadline(conn, timeout_ms);
+            server.armDeadline(conn);
+            assert(conn.deadline_ns > 0);
+            assert(conn.armed.deadline);
+        }
+
+        fn admitL4(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
+            const conn = server.admitConn(client_socket) orelse return;
             const buffer = server.relay_buffers.acquire() orelse {
                 server.conns.release(conn);
                 server.counters.increment("shed_relay_buffers");
                 shed.closeQuietly(IoType, server.io, client_socket);
                 return;
             };
-            server.counters.increment("admitted");
             server.updateRelayPressure();
-            conn.prepare(server, client_socket, buffer, .connecting);
-            server.io.setNodelay(client_socket) catch {
-                server.counters.increment("kernel_pressure_errors");
-            };
-            server.storeDeadline(conn, server.config.connect_timeout_ms);
-            server.armDeadline(conn);
+            server.finishAdmission(
+                conn,
+                client_socket,
+                buffer,
+                .connecting,
+                server.config.connect_timeout_ms,
+            );
             server.armConnect(conn, state.cluster_index);
         }
 
         /// L7 admission (§5, §7): a slot only — an idle L7 connection
         /// holds no relay buffer, which is acquired when a body relay
-        /// starts (a later slice). The head-read deadline is armed so a
-        /// slowloris meets the clock or `head_bytes_max` first (§7).
+        /// starts. The head-read deadline is armed so a slowloris meets
+        /// the clock or `head_bytes_max` first (§7).
         fn admitHttp(server: *Self, client_socket: IoType.Socket) void {
-            assert(!server.draining);
-            const conn = server.conns.acquire() orelse {
-                server.counters.increment("shed_conn_slots");
-                shed.closeWithRst(IoType, server.io, client_socket);
-                return;
-            };
-            server.counters.increment("admitted");
-            conn.prepare(server, client_socket, null, .l7_reading_head);
-            server.io.setNodelay(client_socket) catch {
-                server.counters.increment("kernel_pressure_errors");
-            };
-            server.storeDeadline(conn, server.idleTimeoutMs());
-            server.armDeadline(conn);
+            const conn = server.admitConn(client_socket) orelse return;
+            server.finishAdmission(
+                conn,
+                client_socket,
+                null,
+                .l7_reading_head,
+                server.idleTimeoutMs(),
+            );
             Proxy.start(server, conn);
         }
 
@@ -310,7 +337,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.state == .connecting);
             conn.arm(&conn.op_connect, "connect");
             server.io.connect(
-                server.balancer.pick(cluster_index),
+                server.balancer.pick(cluster_index).address,
                 &conn.op_connect.completion,
                 ConnType,
                 conn,

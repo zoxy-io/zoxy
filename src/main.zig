@@ -76,9 +76,11 @@ fn ensureFdBudget() !void {
 
 fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
     const constants = zoxy.constants;
+    const UpstreamType = zoxy.UpstreamPool(XevIo).Upstream;
     const memory_total = constants.memoryBytesTotal(
         @sizeOf(ServerXev.ConnType),
         @sizeOf(zoxy.RelayBuffer),
+        @sizeOf(UpstreamType),
     );
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
@@ -86,6 +88,7 @@ fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
     try writer.print(
         \\zoxy budgets (closed-form, DESIGN.md §5/§8):
         \\  memory  pools {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
+        \\          + upstream slots {d} x {d} B
         \\  fds     {d} worst case (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
         \\  config  {d} listener(s), {d} cluster(s)
@@ -96,6 +99,8 @@ fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
         @sizeOf(ServerXev.ConnType),
         constants.relay_buffers_max,
         @sizeOf(zoxy.RelayBuffer),
+        constants.upstream_slots_max,
+        @sizeOf(UpstreamType),
         constants.fds_max,
         constants.ring_entries,
         constants.completion_queue_entries,

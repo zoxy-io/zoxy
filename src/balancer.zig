@@ -31,18 +31,29 @@ pub const Balancer = struct {
         @memset(balancer.cursors, 0);
     }
 
+    /// A pick names the endpoint both ways: the address to dial and the
+    /// index the upstream pool keys its idle lists by (§5).
+    pub const Pick = struct {
+        address: std.Io.net.IpAddress,
+        endpoint_index: u16,
+    };
+
     /// Choose the next endpoint to dial for `cluster_index`, advancing the
     /// policy's state. Round-robin: the cursor modulo the endpoint count,
     /// then incremented — a validated config guarantees at least one
     /// endpoint, so the modulo is always defined.
-    pub fn pick(balancer: *Balancer, cluster_index: u16) std.Io.net.IpAddress {
+    pub fn pick(balancer: *Balancer, cluster_index: u16) Pick {
         assert(cluster_index < balancer.cursors.len);
         const cluster = &balancer.config.clusters[cluster_index];
         assert(cluster.endpoints.len >= 1);
-        const endpoint_index: usize =
+        const endpoint_index: u16 =
             @intCast(balancer.cursors[cluster_index] % cluster.endpoints.len);
         balancer.cursors[cluster_index] += 1;
-        return cluster.endpoints[endpoint_index];
+        assert(endpoint_index < cluster.endpoints.len);
+        return .{
+            .address = cluster.endpoints[endpoint_index],
+            .endpoint_index = endpoint_index,
+        };
     }
 };
 
@@ -75,10 +86,16 @@ test "balancer: round-robin cycles endpoints and wraps per cluster" {
     try balancer.init(arena, &config);
 
     // Cluster 0 rotates a → b → c and wraps back to a; cluster 1 keeps
-    // its own cursor and always returns its single endpoint.
+    // its own cursor and always returns its single endpoint. Address and
+    // index name the same endpoint.
     const expected = [_]std.Io.net.IpAddress{ a, b, c, a, b };
-    for (expected) |want| {
-        try std.testing.expectEqual(want, balancer.pick(0));
-        try std.testing.expectEqual(solo, balancer.pick(1));
+    const expected_indexes = [_]u16{ 0, 1, 2, 0, 1 };
+    for (expected, expected_indexes) |want, want_index| {
+        const picked = balancer.pick(0);
+        try std.testing.expectEqual(want, picked.address);
+        try std.testing.expectEqual(want_index, picked.endpoint_index);
+        const solo_picked = balancer.pick(1);
+        try std.testing.expectEqual(solo, solo_picked.address);
+        try std.testing.expectEqual(@as(u16, 0), solo_picked.endpoint_index);
     }
 }
