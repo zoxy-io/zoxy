@@ -79,6 +79,13 @@ pub const chunked_line_bytes_max: u32 = 256;
 /// (§7). Same bounding argument as the size line.
 pub const chunked_trailer_bytes_max: u32 = 1024;
 
+/// Shared upstream connection slots (`Pool(Upstream)`) — one pool for
+/// the whole process, checked out by any request and parked per endpoint
+/// on keep-alive (§3, §5). The fd, ring, and memory budgets absorb this
+/// pool when the L7 state machine composes it into the Server; until
+/// then the constant only sizes the pool itself.
+pub const upstream_slots_max: u32 = 2048;
+
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
 
@@ -154,6 +161,7 @@ comptime {
     assert(relay_pressure_idle_divisor >= 2);
     assert(head_bytes_max >= 1024);
     assert(headers_max >= 8);
+    assert(upstream_slots_max >= 1);
     assert(chunked_line_bytes_max >= 32);
     assert(chunked_line_bytes_max <= relay_buffer_bytes);
     assert(chunked_trailer_bytes_max >= chunked_line_bytes_max);
