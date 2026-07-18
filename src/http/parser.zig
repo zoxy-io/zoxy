@@ -109,6 +109,9 @@ pub const RequestHead = struct {
 /// as `RequestHead`.
 pub const ResponseHead = struct {
     status: u16,
+    /// The origin's reason phrase, forwarded verbatim by the renderer;
+    /// null when the origin sent none (bare `HTTP/1.1 200\r\n`).
+    status_message: ?[]const u8,
     version: Version,
     headers: []const Header,
     framing: BodyFraming,
@@ -248,6 +251,7 @@ pub fn parseResponseHead(
 
     return .{
         .status = raw_status,
+        .status_message = raw_status_message,
         .version = version,
         .headers = headers_storage[0..raw_header_count],
         .framing = framing,
@@ -1009,6 +1013,7 @@ test "http parser: response heads frame per RFC 9112 §6.3 precedence" {
         .get,
     );
     try testing.expectEqual(@as(u16, 200), sized.status);
+    try testing.expectEqualStrings("OK", sized.status_message.?);
     try testing.expectEqual(BodyFraming{ .content_length = 2 }, sized.framing);
     try testing.expect(sized.keep_alive);
 
@@ -1229,6 +1234,9 @@ fn checkResponseParse(input: []const u8, head_is_full: bool) void {
     assert(response.head_len <= input.len);
     assert(response.status >= 100);
     assert(response.status <= 599);
+    if (response.status_message) |message| {
+        assert(sliceWithin(input, message));
+    }
     for (response.headers) |header| {
         assert(header.name.len >= 1);
         assert(sliceWithin(input, header.name));

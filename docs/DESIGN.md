@@ -667,6 +667,7 @@ src/
     upstream.zig      // shared upstream pool + endpoint idle lists
   http/
     parser.zig        // hparse wrapper: strictness + framing + chunked decoder
+    render.zig        // §7 head rendering: hop-by-hop strip + close injection
     proxy.zig         // L7 state machine over phases
   phases.zig          // admit / route / upstream_pick / settle
   shed.zig            // exhaustion ladder: decisions + static responses
