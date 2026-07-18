@@ -97,39 +97,18 @@ pub fn build(b: *std.Build) void {
     const sim_step = b.step("sim", "Deterministic simulation: -- [seed] [iterations] | fuzz");
     sim_step.dependOn(&sim_run.step);
 
-    // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash)
-    // and always measures ReleaseFast, whatever -Doptimize says.
+    // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash),
+    // and the zoxy under test is a ReleaseFast build — matching the
+    // shipped binary — whatever -Doptimize says. ReleaseFast selects the
+    // LLVM backend (Zig 0.16's default for release modes), so hparse's
+    // SIMD paths are emitted; a Debug/self-hosted zoxy scalarizes them
+    // and would benchmark the wrong code.
     const zrk_dependency = b.dependency("zrk", .{
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseFast,
     });
-    const bench_exe = b.addExecutable(.{
-        .name = "zoxy-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/run.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
-            },
-        }),
-    });
-    const bench_run = b.addRunArtifact(bench_exe);
-    bench_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        bench_run.addArgs(args);
-    }
-    const bench_step = b.step(
-        "bench",
-        "Tier-1 loopback bands: -- [--rate N] [--seconds N] [--origin host:port]",
-    );
-    bench_step.dependOn(&bench_run.step);
-
-    // §9 Tier 0: micro binaries for manual poop A/B; installed, never run
-    // in CI (counter deltas on shared runners are noise).
-    // The fast module gets its own ReleaseFast hparse instance: hparse's
-    // SIMD paths scalarize under the Debug self-hosted backend, which
-    // would turn a Tier-0 parser A/B into a measurement of the wrong code.
+    // The ReleaseFast zoxy shared by the bench and the profiler, with its
+    // own ReleaseFast hparse instance (SIMD, not scalarized).
     const hparse_fast_dependency = b.dependency("hparse", .{
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseFast,
@@ -143,6 +122,47 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
         },
     });
+    const release_zoxy = b.addExecutable(.{
+        .name = "zoxy-release",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zoxy", .module = zoxy_fast_module },
+            },
+        }),
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "zoxy-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/run.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
+            },
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    // Drive the ReleaseFast zoxy, not the default-optimize install
+    // artifact — a Debug zoxy scalarizes hparse and benchmarks the wrong
+    // binary (§9). bench/run.zig takes it via --zoxy.
+    bench_run.addArg("--zoxy");
+    bench_run.addArtifactArg(release_zoxy);
+    if (b.args) |args| {
+        bench_run.addArgs(args);
+    }
+    const bench_step = b.step(
+        "bench",
+        "Tier-1 loopback bands: -- [--rate N] [--seconds N] [--origin host:port]",
+    );
+    bench_step.dependOn(&bench_run.step);
+
+    // §9 Tier 0: micro binaries for manual poop A/B; installed, never run
+    // in CI (counter deltas on shared runners are noise). They reuse the
+    // ReleaseFast `zoxy_fast_module` defined above so the SIMD parser is
+    // what gets measured.
     const micro_step = b.step("bench-micro", "Build Tier-0 micro binaries for poop A/B");
     for ([_][]const u8{ "pool_acquire_release", "relay_chunking", "l7_head_pipeline" }) |micro_name| {
         const micro_exe = b.addExecutable(.{
@@ -165,17 +185,6 @@ pub fn build(b: *std.Build) void {
     // the PMU and LBR call-graph stay on a single core type, drives zrk load,
     // and folds perf into a flamegraph. Linux-only — perf/flamegraph/nginx
     // live in the dev shell. Tooling in Zig, not bash (TIGER_STYLE §Tooling).
-    const profile_zoxy = b.addExecutable(.{
-        .name = "zoxy-profile",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "zoxy", .module = zoxy_fast_module },
-            },
-        }),
-    });
     const profile_harness = b.addExecutable(.{
         .name = "zoxy-profile-harness",
         .root_module = b.createModule(.{
@@ -188,7 +197,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const profile_run = b.addRunArtifact(profile_harness);
-    profile_run.addArtifactArg(profile_zoxy);
+    profile_run.addArtifactArg(release_zoxy);
     if (b.args) |args| profile_run.addArgs(args);
     const profile_step = b.step(
         "profile",
