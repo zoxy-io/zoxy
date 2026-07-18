@@ -22,7 +22,9 @@ behind all four gates of §9.
   (zoxy-io/hparse PR #3: CRLF-only line terminators + extension-method
   tokens; pin at 65521ed).
 - **Phase 2 — shedding hardening + minimal resilience.** P2C pick,
-  stale-replay, per-try deadline, counter reconciliation invariants in
+  stale-replay (a checkout that fails on first use answers 502 today),
+  per-try deadline and the §8 request-deadline 504 verdict (an expired
+  exchange tears down today), counter reconciliation invariants in
   the sim, overload benchmark scenario (offered load ≫ capacity: assert
   flat memory, bounded latency for admitted work, all excess shed with
   correct status). The relay-buffer pressure watermark shipped early

@@ -56,6 +56,11 @@ pub fn UpstreamPool(comptime IoType: type) type {
             /// head; the rendered upstream request head tracks its own
             /// length in the owning connection instead.
             head_len: u32,
+            /// Absolute idle deadline while parked (§5): a parked
+            /// connection holds no armed op, so the Server's single sweep
+            /// timer compares this against the clock and reaps overdue
+            /// connections with a synchronous close.
+            deadline_ns: u64,
         };
 
         /// In-place init via out-pointer for pointer stability. `arena`
@@ -86,6 +91,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.idle_next = idle_none;
             upstream.idle_prev = idle_none;
             upstream.head_len = 0;
+            upstream.deadline_ns = 0;
             assert(pool.idle_count < pool.slot_pool.acquired_count);
             return upstream;
         }
