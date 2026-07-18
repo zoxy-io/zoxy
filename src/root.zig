@@ -39,6 +39,7 @@ test {
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
     _ = @import("net/relay.zig");
+    _ = @import("net/upstream.zig");
     _ = @import("testing/origin.zig");
     _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");
