@@ -123,9 +123,22 @@ fn appendEndToEndHeaders(
     headers: []const parser.Header,
 ) error{Oversize}!void {
     assert(headers.len <= constants.headers_max);
+    // Collect the Connection header value(s) once (usually zero or one).
+    // Re-finding them inside the per-header hop-by-hop test made the walk
+    // O(headers²) — the render's top user-CPU cost under load (§9).
+    var connection_values: [constants.headers_max][]const u8 = undefined;
+    var connection_count: u32 = 0;
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
+            connection_values[connection_count] = header.value;
+            connection_count += 1;
+        }
+    }
+    const nominations = connection_values[0..connection_count];
+
     for (headers) |header| {
         assert(header.name.len >= 1);
-        if (isHopByHop(header.name, headers)) {
+        if (isHopByHop(header.name, nominations)) {
             continue;
         }
         try staging.append(header.name);
@@ -137,9 +150,12 @@ fn appendEndToEndHeaders(
 
 /// True when the header must not be forwarded: in the static hop-by-hop
 /// set, or nominated by a Connection header (RFC 9110 §7.6.1) — unless
-/// it is protected (see `protected_names`).
-fn isHopByHop(name: []const u8, headers: []const parser.Header) bool {
+/// it is protected (see `protected_names`). `nominations` is the
+/// pre-collected set of Connection header values, so this is O(1) in the
+/// common no-Connection-header case rather than a re-scan per header.
+fn isHopByHop(name: []const u8, nominations: []const []const u8) bool {
     assert(name.len >= 1);
+    assert(nominations.len <= constants.headers_max);
     for (hop_by_hop_names) |hop_name| {
         if (std.ascii.eqlIgnoreCase(name, hop_name)) {
             return true;
@@ -150,13 +166,8 @@ fn isHopByHop(name: []const u8, headers: []const parser.Header) bool {
             return false;
         }
     }
-    // Both loops are bounded: headers_max entries, head_bytes_max value
-    // bytes. In practice this is one Connection header with few tokens.
-    for (headers) |header| {
-        if (!std.ascii.eqlIgnoreCase(header.name, "connection")) {
-            continue;
-        }
-        if (parser.tokenListHas(header.value, name)) {
+    for (nominations) |value| {
+        if (parser.tokenListHas(value, name)) {
             return true;
         }
     }
