@@ -720,6 +720,172 @@ fn keepAliveDefault(version: Version, analysis: *const HeaderAnalysis) bool {
     };
 }
 
+/// A canonical origin-form target, split once in the trust boundary
+/// (§7 path routing). `path` lives in the caller's `out` buffer; `query`
+/// is the verbatim suffix of the original target — including its
+/// leading `?` when present — and is opaque to the proxy.
+pub const CanonicalTarget = struct {
+    path: []const u8,
+    query: []const u8,
+};
+
+/// The §7 canonical form: the query splits off untouched, unreserved
+/// percent-escapes (RFC 3986 §2.3) are decoded and surviving escapes'
+/// hex uppercased, then dot-segments are collapsed. Structure-changing
+/// escapes — encoded slash, NUL, truncated or non-hex — are Malformed,
+/// and so is a path that climbs above the root. Routing matches this
+/// form and the renderer forwards it, so the router and the origin can
+/// never disagree about which resource a request names.
+pub fn canonicalTarget(
+    target: []const u8,
+    out: *[constants.head_bytes_max]u8,
+) error{Malformed}!CanonicalTarget {
+    // validateTarget admitted only origin-form here; asterisk-form and
+    // CONNECT never route by path and stay with the caller.
+    assert(target.len >= 1);
+    assert(target[0] == '/');
+    assert(target.len <= out.len);
+    const question = std.mem.indexOfScalar(u8, target, '?');
+    const raw_path = target[0 .. question orelse target.len];
+    const query = target[question orelse target.len ..];
+    const decoded_len = try decodeTargetPath(raw_path, out);
+    const path_len = try collapseDotSegments(out[0..decoded_len]);
+    // Canonicalization only ever shrinks; both stages keep the leading
+    // slash, so the result is itself a valid origin-form path.
+    assert(path_len >= 1);
+    assert(path_len <= raw_path.len);
+    assert(out[0] == '/');
+    return .{ .path = out[0..path_len], .query = query };
+}
+
+/// Stage one of §7 canonicalization: percent-escapes are decoded when
+/// unreserved (decoding them can never change what the path names),
+/// kept with uppercased hex otherwise, and rejected when they would
+/// change the path's structure — an encoded slash or NUL — or are not
+/// two hex digits. Raw bytes pass through verbatim: hparse already
+/// excludes controls, space, and DEL from the target charset.
+fn decodeTargetPath(path: []const u8, out: []u8) error{Malformed}!u32 {
+    assert(path.len >= 1);
+    assert(path[0] == '/');
+    assert(path.len <= out.len);
+    var read: u32 = 0;
+    var write: u32 = 0;
+    while (read < path.len) {
+        assert(write <= read);
+        const byte = path[read];
+        if (byte != '%') {
+            out[write] = byte;
+            write += 1;
+            read += 1;
+            continue;
+        }
+        if (path.len - read < 3) {
+            return error.Malformed; // A truncated escape.
+        }
+        const high = hexNibble(path[read + 1]) orelse return error.Malformed;
+        const low = hexNibble(path[read + 2]) orelse return error.Malformed;
+        const value: u8 = high * 16 + low;
+        if (value == 0) {
+            return error.Malformed; // Encoded NUL.
+        }
+        if (value == '/') {
+            return error.Malformed; // An encoded slash changes structure.
+        }
+        if (isUnreservedByte(value)) {
+            out[write] = value;
+            write += 1;
+        } else {
+            out[write] = '%';
+            out[write + 1] = upperHexDigit(path[read + 1]);
+            out[write + 2] = upperHexDigit(path[read + 2]);
+            write += 3;
+        }
+        read += 3;
+    }
+    assert(write >= 1);
+    assert(write <= path.len);
+    assert(out[0] == '/');
+    return write;
+}
+
+/// Stage two of §7 canonicalization, after escapes are decoded (the
+/// order is the security property: `%2E%2E` must collapse exactly like
+/// `..`). In-place RFC 3986 remove_dot_segments over a decoded path,
+/// except stricter at the root: `..` with nothing left to pop names the
+/// root's parent, which no legitimate client asks for — Malformed, not
+/// the RFC's silent clamp.
+fn collapseDotSegments(bytes: []u8) error{Malformed}!u32 {
+    assert(bytes.len >= 1);
+    assert(bytes[0] == '/');
+    assert(bytes.len <= constants.head_bytes_max);
+    var read: u32 = 0;
+    var write: u32 = 0;
+    while (read < bytes.len) {
+        assert(bytes[read] == '/');
+        assert(write <= read);
+        var segment_end: u32 = read + 1;
+        while (segment_end < bytes.len and bytes[segment_end] != '/') {
+            segment_end += 1;
+        }
+        const segment = bytes[read + 1 .. segment_end];
+        const at_end = segment_end == bytes.len;
+        if (std.mem.eql(u8, segment, ".")) {
+            // "/a/." is "/a/" (RFC 3986 §5.2.4): a trailing dot keeps
+            // its slash; a middle one vanishes with it.
+            if (at_end) {
+                bytes[write] = '/';
+                write += 1;
+            }
+        } else if (std.mem.eql(u8, segment, "..")) {
+            if (write == 0) {
+                return error.Malformed; // Climbs above the root.
+            }
+            // write > 0 implies bytes[0] == '/', so a previous slash
+            // always exists.
+            const previous = std.mem.lastIndexOfScalar(u8, bytes[0..write], '/').?;
+            write = @intCast(previous);
+            if (at_end) {
+                bytes[write] = '/';
+                write += 1;
+            }
+        } else {
+            // An ordinary segment — empty included: `//a` names a
+            // different resource than `/a` and is preserved (§7).
+            bytes[write] = '/';
+            std.mem.copyForwards(u8, bytes[write + 1 .. write + 1 + segment.len], segment);
+            write += 1 + @as(u32, @intCast(segment.len));
+        }
+        read = segment_end;
+    }
+    assert(write >= 1);
+    assert(bytes[0] == '/');
+    return write;
+}
+
+fn hexNibble(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
+fn upperHexDigit(byte: u8) u8 {
+    assert(hexNibble(byte) != null);
+    if (byte >= 'a' and byte <= 'f') {
+        return byte - ('a' - 'A');
+    }
+    return byte;
+}
+
+/// RFC 3986 §2.3 unreserved: decoding these can never change what the
+/// path names, so the canonical form always holds them raw.
+fn isUnreservedByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.' or
+        byte == '_' or byte == '~';
+}
+
 /// A reverse proxy routes origin-form targets (§7 routes host/path);
 /// asterisk-form is legal for OPTIONS. CONNECT's authority-form passes
 /// through so the proxy can answer it with 501 rather than 400.
@@ -1322,4 +1488,116 @@ fn fuzzParserInputs(context: void, smith: *std.testing.Smith) !void {
         assert(whole.consumed == bytewise.consumed);
         assert(whole.done == bytewise.done);
     }
+}
+
+test "canonicalTarget: table of canonical forms and rejects" {
+    const Case = struct {
+        target: []const u8,
+        path: ?[]const u8, // null means Malformed
+        query: []const u8 = "",
+    };
+    const cases = [_]Case{
+        // Identity and query splitting; the query is verbatim, always.
+        .{ .target = "/", .path = "/" },
+        .{ .target = "/a/b", .path = "/a/b" },
+        .{ .target = "/a?x=1", .path = "/a", .query = "?x=1" },
+        .{ .target = "/a?", .path = "/a", .query = "?" },
+        .{ .target = "/?a", .path = "/", .query = "?a" },
+        .{ .target = "/a?%2F%zz/../", .path = "/a", .query = "?%2F%zz/../" },
+        // Unreserved escapes decode; others keep uppercased hex.
+        .{ .target = "/%61%2D%5F%7E", .path = "/a-_~" },
+        .{ .target = "/caf%c3%a9", .path = "/caf%C3%A9" },
+        // A space is not unreserved: %41 decodes, %20 stays encoded —
+        // no raw space can ever reach a request line.
+        .{ .target = "/%41%20x", .path = "/A%20x" },
+        // Dot segments collapse after decoding (the §7 order).
+        .{ .target = "/a/./b", .path = "/a/b" },
+        .{ .target = "/a/../b", .path = "/b" },
+        .{ .target = "/a/b/..", .path = "/a/" },
+        .{ .target = "/a/.", .path = "/a/" },
+        .{ .target = "/./a", .path = "/a" },
+        .{ .target = "/a/%2e%2e/b", .path = "/b" },
+        .{ .target = "/a/%2E", .path = "/a/" },
+        // Duplicate slashes are preserved; ".." still pops them.
+        .{ .target = "//a", .path = "//a" },
+        .{ .target = "/a//b", .path = "/a//b" },
+        .{ .target = "/a/", .path = "/a/" },
+        .{ .target = "/a//../b", .path = "/a/b" },
+        // A leading empty segment is a real segment ".." can pop, so
+        // "//.." is not a root climb — it is consistent, and consistency
+        // (both router and origin see the canonical form) is the property
+        // that matters, not rejection.
+        .{ .target = "//../a", .path = "/a" },
+        .{ .target = "//..", .path = "/" },
+        // Rejects: structure-changing or malformed escapes, root climbs.
+        .{ .target = "/%2F", .path = null },
+        .{ .target = "/%2f", .path = null },
+        .{ .target = "/%00", .path = null },
+        .{ .target = "/%", .path = null },
+        .{ .target = "/%A", .path = null },
+        .{ .target = "/%GG", .path = null },
+        .{ .target = "/..", .path = null },
+        .{ .target = "/../a", .path = null },
+        .{ .target = "/a/../..", .path = null },
+        .{ .target = "/%2e%2e/a", .path = null },
+        .{ .target = "/./..", .path = null },
+    };
+    for (cases) |case| {
+        var out: [constants.head_bytes_max]u8 = undefined;
+        const result = canonicalTarget(case.target, &out);
+        if (case.path) |expected_path| {
+            const canonical = try result;
+            try std.testing.expectEqualStrings(expected_path, canonical.path);
+            try std.testing.expectEqualStrings(case.query, canonical.query);
+        } else {
+            try std.testing.expectError(error.Malformed, result);
+        }
+    }
+}
+
+test "canonicalTarget: canonicalization is idempotent" {
+    const targets = [_][]const u8{ "/a/../b", "/caf%c3%a9", "//a/./b%7e", "/a/b/.." };
+    for (targets) |target| {
+        var out: [constants.head_bytes_max]u8 = undefined;
+        const first = try canonicalTarget(target, &out);
+        var out_again: [constants.head_bytes_max]u8 = undefined;
+        const second = try canonicalTarget(first.path, &out_again);
+        try std.testing.expectEqualStrings(first.path, second.path);
+        try std.testing.expectEqual(@as(usize, 0), second.query.len);
+    }
+}
+
+test "fuzz: canonicalTarget rejects or emits the canonical form" {
+    try std.testing.fuzz({}, fuzzCanonicalTarget, .{ .corpus = &.{
+        "/a/../b%2e?q",
+        "/%2e%2e/x",
+        "/a%2Fb",
+        "/a//b/./c/%7e%ZZ",
+    } });
+}
+
+fn fuzzCanonicalTarget(context: void, smith: *std.testing.Smith) !void {
+    _ = context;
+    var input_buffer: [constants.head_bytes_max]u8 = undefined;
+    input_buffer[0] = '/';
+    const tail_len = smith.slice(input_buffer[1..]);
+    const input = input_buffer[0 .. 1 + tail_len];
+
+    var out: [constants.head_bytes_max]u8 = undefined;
+    // Reject-or-canonical, no third outcome: a reject ends the case.
+    const canonical = canonicalTarget(input, &out) catch return;
+    // Rooted, never grown, and the split covers the input.
+    assert(canonical.path.len >= 1);
+    assert(canonical.path[0] == '/');
+    assert(canonical.path.len + canonical.query.len <= input.len);
+    // No dot-segment survives in canonical form.
+    assert(std.mem.indexOf(u8, canonical.path, "/../") == null);
+    assert(std.mem.indexOf(u8, canonical.path, "/./") == null);
+    assert(!std.mem.endsWith(u8, canonical.path, "/.."));
+    assert(!std.mem.endsWith(u8, canonical.path, "/."));
+    // The canonical form is its own canonical form.
+    var out_again: [constants.head_bytes_max]u8 = undefined;
+    const again = try canonicalTarget(canonical.path, &out_again);
+    assert(std.mem.eql(u8, again.path, canonical.path));
+    assert(again.query.len == 0);
 }
