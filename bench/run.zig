@@ -30,11 +30,27 @@ const work_directory = ".zig-cache/zoxy-bench";
 
 const Flags = struct {
     rate: u64 = 20_000,
+    // Connection: close is one TCP handshake per request, so on loopback
+    // it is connect-bound: at this rate the TIME_WAIT population
+    // (rate x 60 s) already exceeds the ~28k ephemeral-port pool, so the
+    // run leans on net.ipv4.tcp_tw_reuse (on by default on modern Linux
+    // and in the dev shell) to reclaim source ports. Without it, lower
+    // --close-rate toward ~400/s or the socket-error gate will trip on
+    // port exhaustion, not a proxy fault. This is a latency band (the
+    // per-request hop cost), never a throughput number.
+    close_rate: u64 = 2_000,
     connections: u32 = 32,
     duration_s: u64 = 10,
     origin: ?[]const u8 = null,
     zoxy_path: []const u8 = "zig-out/bin/zoxy",
 };
+
+/// The one header that turns a run into the Connection: close scenario.
+/// zrk emits user headers verbatim and only falls back to its default
+/// keep-alive when no Connection header is supplied, so this both forces
+/// the origin/proxy to close after each response and makes zrk reconnect
+/// for the next request — each a completed, CO-corrected sample.
+const close_headers = [_]zrk.cli.Header{.{ .name = "Connection", .value = "close" }};
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
@@ -76,38 +92,24 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("bench: proxy under test pinned to cpu {d}; origin + load off it\n", .{cpu});
     }
 
-    // Warm all paths up and prove they answer before measuring.
-    _ = try awaitResponsive(arena, io, originPortOf(origin_address), "origin");
-    _ = try awaitResponsive(arena, io, zoxy_port, "zoxy L4");
-    _ = try awaitResponsive(arena, io, zoxy_http_port, "zoxy L7");
-    _ = try awaitResponsive(arena, io, haproxy_port, "haproxy tcp");
-    _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http");
+    const direct_port = originPortOf(origin_address);
+    try warmUp(arena, io, direct_port);
 
     const rss_before_kb = try readRssKb(arena, io, zoxy_child.id);
-
     std.debug.print(
-        "bench: rate {d}/s, {d} connections, {d}s per run\n",
-        .{ flags.rate, flags.connections, flags.duration_s },
+        "bench: keep-alive {d}/s, close {d}/s, {d} connections, {d}s per run\n",
+        .{ flags.rate, flags.close_rate, flags.connections, flags.duration_s },
     );
-    const direct = try loadTest(arena, io, originPortOf(origin_address), &flags);
-    const proxied_l4 = try loadTest(arena, io, zoxy_port, &flags);
-    const proxied_l7 = try loadTest(arena, io, zoxy_http_port, &flags);
-
-    // The RSS window closes after both zoxy runs, so the zero-alloc
-    // witness means "zoxy served L4 and L7 load", not "zoxy idled".
+    // Both modes on both zoxy protocols run inside the RSS window, so the
+    // zero-alloc witness covers reconnect-heavy close load too — not just
+    // steady keep-alive. The haproxy references share the window; zoxy is
+    // idle during them, so they cannot inflate its resident set.
+    const keep_alive = try runMode(arena, io, direct_port, &flags, false);
+    const close_mode = try runMode(arena, io, direct_port, &flags, true);
     const rss_after_kb = try readRssKb(arena, io, zoxy_child.id);
 
-    // The reference runs happen outside the RSS window.
-    const reference_tcp = try loadTest(arena, io, haproxy_port, &flags);
-    const reference_http = try loadTest(arena, io, haproxy_http_port, &flags);
-
-    printReport("direct      ", &direct);
-    printReport("zoxy L4     ", &proxied_l4);
-    printReport("zoxy L7     ", &proxied_l7);
-    printReport("haproxy tcp ", &reference_tcp);
-    printReport("haproxy http", &reference_http);
-    printOverhead(&direct, &proxied_l4, &proxied_l7, &reference_tcp, &reference_http);
-
+    printMode("keep-alive", &keep_alive);
+    printMode("Connection: close", &close_mode);
     std.debug.print("zoxy RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
     // Drain, not just death: SIGTERM and wait for a clean exit (§8).
@@ -117,36 +119,53 @@ pub fn main(init: std.process.Init) !u8 {
     const drained_cleanly = term == .exited and term.exited == 0;
     std.debug.print("zoxy drain: {s}\n", .{if (drained_cleanly) "clean exit" else "UNCLEAN"});
 
-    // The outside witness of the zero-alloc promise: serving 2x
-    // duration_s of load must not grow the resident set beyond noise.
+    const passed = benchPassed(rss_before_kb, rss_after_kb, &keep_alive, &close_mode, drained_cleanly);
+    return if (passed) 0 else 1;
+}
+
+/// Prove every path answers before measuring; the short probes double as
+/// warmup. A target that never responds is a setup failure, surfaced
+/// before any numbers are printed.
+fn warmUp(arena: std.mem.Allocator, io: Io, direct_port: u16) !void {
+    assert(direct_port != 0);
+    _ = try awaitResponsive(arena, io, direct_port, "origin");
+    _ = try awaitResponsive(arena, io, zoxy_port, "zoxy L4");
+    _ = try awaitResponsive(arena, io, zoxy_http_port, "zoxy L7");
+    _ = try awaitResponsive(arena, io, haproxy_port, "haproxy tcp");
+    _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http");
+}
+
+/// The §9 pass/fail: flat RSS (the zero-alloc promise witnessed from
+/// outside), both baselines alive, both proxied modes healthy, and a
+/// clean drain. Prints each failure so a red run explains itself.
+fn benchPassed(
+    rss_before_kb: u64,
+    rss_after_kb: u64,
+    keep_alive: *const Runs,
+    close_mode: *const Runs,
+    drained_cleanly: bool,
+) bool {
+    // A live proxy always has resident pages; a zero reading means the
+    // RSS probe failed, not that the process shrank to nothing.
+    assert(rss_before_kb > 0);
+    assert(rss_after_kb > 0);
+    // Serving both modes on both protocols must not grow the resident set
+    // beyond noise.
     const rss_flat = rss_after_kb <= rss_before_kb + 1024;
     if (!rss_flat) {
         std.debug.print("FAIL: zoxy RSS grew under load\n", .{});
     }
-    const completed = direct.snapshot.counters.completed > 0 and
-        proxied_l4.snapshot.counters.completed > 0 and
-        proxied_l7.snapshot.counters.completed > 0;
-    if (!completed) {
-        std.debug.print("FAIL: a run completed zero requests\n", .{});
+    const baselines_ok = keep_alive.direct.snapshot.counters.completed > 0 and
+        close_mode.direct.snapshot.counters.completed > 0;
+    if (!baselines_ok) {
+        std.debug.print("FAIL: a direct baseline completed zero requests\n", .{});
     }
-    // A mostly-timing-out proxy still completes a few requests, so
-    // completed>0 is too weak — require the proxied SOCKET error rate to
-    // stay under 1% or a relay stall passes silently. Status errors are
-    // excluded: a faithfully relayed 4xx/5xx is not a proxy failure (and
-    // the loopback origin may legitimately answer non-2xx).
-    const l4_socket_errors = proxied_l4.snapshot.counters.socketErrors();
-    const l7_socket_errors = proxied_l7.snapshot.counters.socketErrors();
-    const errors_ok =
-        l4_socket_errors * 100 <= proxied_l4.snapshot.counters.completed and
-        l7_socket_errors * 100 <= proxied_l7.snapshot.counters.completed;
-    if (!errors_ok) {
-        std.debug.print(
-            "FAIL: proxied socket-error rate too high " ++
-                "(L4 {d}, L7 {d} socket-errors)\n",
-            .{ l4_socket_errors, l7_socket_errors },
-        );
-    }
-    return if (rss_flat and completed and errors_ok and drained_cleanly) 0 else 1;
+    // The proxied bands carry the hard §9 invariant: complete requests and
+    // a socket-error rate under 1% (a relay stall must not pass silently;
+    // faithfully relayed 4xx/5xx are excluded), in both persistence modes.
+    const proxies_ok = proxiesHealthy("keep-alive", keep_alive) and
+        proxiesHealthy("close", close_mode);
+    return rss_flat and baselines_ok and proxies_ok and drained_cleanly;
 }
 
 fn parseFlags(args: []const [:0]const u8) !Flags {
@@ -157,6 +176,9 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         if (std.mem.eql(u8, arg, "--rate")) {
             index += 1;
             flags.rate = try std.fmt.parseUnsigned(u64, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--close-rate")) {
+            index += 1;
+            flags.close_rate = try std.fmt.parseUnsigned(u64, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--connections")) {
             index += 1;
             flags.connections = try std.fmt.parseUnsigned(u32, args[index], 10);
@@ -183,14 +205,15 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             flags.zoxy_path = args[index];
         } else {
             std.debug.print(
-                "usage: bench [--rate N] [--connections N] [--seconds N] " ++
-                    "[--origin host:port] [--zoxy path]\n",
+                "usage: bench [--rate N] [--close-rate N] [--connections N] " ++
+                    "[--seconds N] [--origin host:port] [--zoxy path]\n",
                 .{},
             );
             return error.InvalidArguments;
         }
     }
     assert(flags.rate >= 1);
+    assert(flags.close_rate >= 1);
     assert(flags.connections >= 1);
     assert(flags.duration_s >= 1);
     return flags;
@@ -360,14 +383,49 @@ fn loadTest(
     io: Io,
     port: u16,
     flags: *const Flags,
+    close: bool,
 ) !zrk.runner.Report {
     assert(port != 0);
     assert(flags.duration_s >= 1);
-    var config = benchConfig(port, flags.connections, flags.rate);
+    const rate = if (close) flags.close_rate else flags.rate;
+    var config = benchConfig(port, flags.connections, rate);
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
+    if (close) {
+        config.headers = &close_headers;
+    }
     const report = try zrk.runner.run(arena, io, &config, 0, null, null);
     assert(report.launched >= 1);
     return report;
+}
+
+/// The five bands of one persistence mode: the direct baseline, zoxy's
+/// two protocols, and the haproxy references.
+const Runs = struct {
+    direct: zrk.runner.Report,
+    l4: zrk.runner.Report,
+    l7: zrk.runner.Report,
+    tcp: zrk.runner.Report,
+    http: zrk.runner.Report,
+};
+
+/// One full band matrix for a persistence mode. `close` sends
+/// `Connection: close` at the reduced close rate; the paths otherwise
+/// match the keep-alive run so the two modes are directly comparable.
+fn runMode(
+    arena: std.mem.Allocator,
+    io: Io,
+    direct_port: u16,
+    flags: *const Flags,
+    close: bool,
+) !Runs {
+    assert(direct_port != 0);
+    return .{
+        .direct = try loadTest(arena, io, direct_port, flags, close),
+        .l4 = try loadTest(arena, io, zoxy_port, flags, close),
+        .l7 = try loadTest(arena, io, zoxy_http_port, flags, close),
+        .tcp = try loadTest(arena, io, haproxy_port, flags, close),
+        .http = try loadTest(arena, io, haproxy_http_port, flags, close),
+    };
 }
 
 fn benchConfig(port: u16, connections: u32, rate: u64) zrk.cli.Config {
@@ -435,6 +493,49 @@ fn printOverhead(
             http_p50 -| direct_p50,
         },
     );
+}
+
+/// One mode's bands under a labelled header, then its hop overheads.
+fn printMode(label: []const u8, runs: *const Runs) void {
+    assert(label.len > 0);
+    std.debug.print("-- {s} --\n", .{label});
+    printReport("direct      ", &runs.direct);
+    printReport("zoxy L4     ", &runs.l4);
+    printReport("zoxy L7     ", &runs.l7);
+    printReport("haproxy tcp ", &runs.tcp);
+    printReport("haproxy http", &runs.http);
+    printOverhead(&runs.direct, &runs.l4, &runs.l7, &runs.tcp, &runs.http);
+}
+
+/// The §9 hard invariant on the proxied bands: both zoxy protocols
+/// complete requests and keep their socket-error rate (relay stalls, not
+/// faithfully relayed 4xx/5xx) under 1%.
+fn proxiesHealthy(mode: []const u8, runs: *const Runs) bool {
+    assert(mode.len > 0);
+    return proxyHealthy(mode, "L4", &runs.l4) and proxyHealthy(mode, "L7", &runs.l7);
+}
+
+/// A single proxied band's health, printing the offending band so a
+/// failure is actionable — a high close-mode rate usually means loopback
+/// ephemeral-port exhaustion, so lower --close-rate rather than blame the
+/// proxy.
+fn proxyHealthy(mode: []const u8, path: []const u8, report: *const zrk.runner.Report) bool {
+    assert(mode.len > 0);
+    assert(path.len > 0);
+    const counters = &report.snapshot.counters;
+    if (counters.completed == 0) {
+        std.debug.print("FAIL: zoxy {s} {s} completed zero requests\n", .{ path, mode });
+        return false;
+    }
+    const socket_errors = counters.socketErrors();
+    if (socket_errors * 100 > counters.completed) {
+        std.debug.print(
+            "FAIL: zoxy {s} {s} socket-error rate too high ({d} of {d} completed)\n",
+            .{ path, mode, socket_errors, counters.completed },
+        );
+        return false;
+    }
+    return true;
 }
 
 fn readRssKb(arena: std.mem.Allocator, io: Io, pid: ?std.process.Child.Id) !u64 {
