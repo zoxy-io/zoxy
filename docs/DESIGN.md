@@ -583,8 +583,19 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
    sockets and a virtual clock under a seeded adversarial scheduler:
    partial reads/writes down to 1 byte, delayed/refused/black-holed
    connects, resets at every point in every exchange, misbehaving origins.
-   Every request carries a token echoed into the body and verified
-   byte-exact. Invariants per seed: no slot leaks (all pools drain to
+   Mixed L4 and L7 clients share one server. L4 clients carry a token
+   echoed into the body and verified byte-exact. L7 clients run HTTP
+   request scripts — the valid shapes, the §7 reject shapes, and the
+   keep-alive/pipelined/silent patterns — against scripted origins
+   (sized, chunked, until-close, truncated, reset, mute, and instant
+   origins that answer before the request finishes), and every byte they
+   receive must be a prefix of a legal transcript. A quarter of seeds run
+   clean — adversary off, origin well-behaved — hardening the L7 oracle
+   from prefix-legality to each script's exact golden outcome, so a
+   silently torn-down exchange that should have been answered fails the
+   seed instead of passing as a cut. The origins are oracles too: no
+   malformed byte (§7) ever reaches one. Invariants per seed: no slot
+   leaks (all pools drain to
    zero), no deadlock, counters reconcile, every shed is witnessed, no
    completion is delivered to a freed or reused slot (slot generations
    checked on every delivery, §5), and no loop-side write ever lands in
