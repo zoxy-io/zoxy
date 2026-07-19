@@ -992,6 +992,19 @@ pub fn Proxy(comptime IoType: type) type {
                 server.releaseRelayBuffer(buffer);
                 conn.relay_buffer = null;
             }
+            // A still-attached upstream (a failed dial with no socket, an
+            // oversize-after-edit reject, a malformed body) closes and frees
+            // its slot now instead of riding the whole lingering drain (§5).
+            // Both data ops are free (asserted above), so nothing is armed on
+            // the upstream socket and the close is synchronous, like detach.
+            if (conn.upstream) |leased| {
+                if (conn.upstream_socket) |socket| {
+                    server.io.closeNow(socket);
+                }
+                server.upstreams.release(leased);
+                conn.upstream = null;
+                conn.upstream_socket = null;
+            }
             server.counters.increment(counter);
             conn.state = .l7_responding;
             conn.response_pending = shed.staticResponse(status, .close);
