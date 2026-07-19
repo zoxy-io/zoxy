@@ -3,20 +3,29 @@
 //! seed-derived tokens, adversary knobs, pool sizes that force the §8
 //! rungs, misbehaving-origin scripts) and runs the *real* serving path
 //! over SimIo — twice, asserting the two trace hashes are identical, so
-//! replayability itself is gated. Invariants per seed: no deadlock,
-//! pools drain to zero, counters reconcile, every byte a client gets
-//! back is a prefix of what it sent (echo integrity), and every virtual
-//! socket is released. A failure prints its seed; the same seed replays
-//! the exact schedule.
+//! replayability itself is gated. Scenarios mix protocols: an L4 echo
+//! population and an L7 HTTP population share one server, so the pools
+//! feel cross-protocol pressure. A quarter of seeds run *clean* — the
+//! adversary off and the origin well-behaved — hardening the oracles
+//! from prefix-legality to the scripts' exact golden outcomes (sim/l7.zig).
+//! Invariants per seed: no deadlock, pools drain to zero, counters
+//! reconcile, every L4 echo byte is a prefix of what was sent, every L7
+//! response is a prefix of a legal transcript, no malformed byte ever
+//! reaches the origin (§7), and every virtual socket is released. A
+//! failure prints its seed; the same seed replays the exact schedule.
 
 const std = @import("std");
 
 const zoxy = @import("zoxy");
 
+const l7 = @import("l7.zig");
+
 const Io = zoxy.Io;
 const SimIo = zoxy.Io.SimIo;
 const ServerSim = zoxy.Server(SimIo);
 const Origin = zoxy.testing.Origin(SimIo);
+const HttpOrigin = l7.HttpOrigin(SimIo);
+const HttpClient = l7.Client(SimIo);
 
 const assert = std.debug.assert;
 
@@ -106,14 +115,22 @@ fn runSeed(arena_state: *std.heap.ArenaAllocator, seed: u64) !u64 {
 const Harness = struct {
     io: SimIo,
     server: ServerSim,
-    endpoints: [1]std.Io.net.IpAddress,
-    clusters: [1]zoxy.config.Config.Cluster,
-    listener_configs: [1]zoxy.config.Config.Listener,
+    endpoints_l4: [1]std.Io.net.IpAddress,
+    endpoints_http: [1]std.Io.net.IpAddress,
+    clusters: [2]zoxy.config.Config.Cluster,
+    listener_configs: [2]zoxy.config.Config.Listener,
     config: zoxy.config.Config,
     origin: Origin,
+    origin_http: HttpOrigin,
     clients: [clients_max]Client,
+    l7_clients: [clients_max]HttpClient,
+    l4_count: u8,
+    l7_count: u8,
     clients_count: u8,
     ended_count: u8,
+    /// Clean seeds run without the adversary and with a well-behaved
+    /// origin, so the L7 oracles demand exact golden outcomes.
+    clean: bool,
     end_timer_completion: SimIo.Completion,
     scenario_prng: std.Random.DefaultPrng,
 
@@ -121,8 +138,16 @@ const Harness = struct {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
     }
 
+    fn httpBindAddress() std.Io.net.IpAddress {
+        return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8081") catch unreachable;
+    }
+
     fn originAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") catch unreachable;
+    }
+
+    fn httpOriginAddress() std.Io.net.IpAddress {
+        return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9001") catch unreachable;
     }
 
     fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
@@ -131,18 +156,53 @@ const Harness = struct {
         harness.scenario_prng = std.Random.DefaultPrng.init(seed ^ 0x5a5a5a5a5a5a5a5a);
         const random = harness.scenario_prng.random();
 
-        const adversary: SimIo.Adversary = .{
+        // A quarter of seeds run clean: adversary off, origin
+        // well-behaved, so the L7 golden oracles demand each script's
+        // exact outcome — a silently dropped 400 or a shed that should
+        // not happen fails the seed instead of passing as a "cut".
+        harness.clean = random.uintLessThan(u8, 4) == 0;
+        try harness.io.init(arena, .{
+            .seed = seed,
+            .adversary = deriveAdversary(random, harness.clean),
+        });
+        harness.deriveTopology(random);
+        try harness.startServerAndOrigins(arena, random);
+        harness.populateClients(random);
+
+        harness.end_timer_completion = .{};
+        harness.io.timerStart(
+            &harness.end_timer_completion,
+            scenario_end_ns,
+            Harness,
+            harness,
+            onScenarioEnd,
+        );
+    }
+
+    fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
+        if (clean) {
+            return .{ .partial_io = false };
+        }
+        return .{
             .partial_io = true,
             .connect_delay_ns_max = random.uintAtMost(u64, 5_000_000),
             .connect_refuse_percent = random.uintAtMost(u8, 20),
             .reset_percent = random.uintAtMost(u8, 10),
             .kernel_pressure_percent = random.uintAtMost(u8, 8),
         };
-        try harness.io.init(arena, .{ .seed = seed, .adversary = adversary });
+    }
 
-        harness.endpoints = .{originAddress()};
-        harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
-        harness.listener_configs = .{.{ .bind_address = bindAddress(), .cluster_index = 0, .protocol = .l4 }};
+    fn deriveTopology(harness: *Harness, random: std.Random) void {
+        harness.endpoints_l4 = .{originAddress()};
+        harness.endpoints_http = .{httpOriginAddress()};
+        harness.clusters = .{
+            .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4 },
+            .{ .name = "origin-http", .endpoints = &harness.endpoints_http },
+        };
+        harness.listener_configs = .{
+            .{ .bind_address = bindAddress(), .cluster_index = 0, .protocol = .l4 },
+            .{ .bind_address = httpBindAddress(), .cluster_index = 1, .protocol = .http },
+        };
         harness.config = .{
             .listeners = &harness.listener_configs,
             .clusters = &harness.clusters,
@@ -158,13 +218,25 @@ const Harness = struct {
             else
                 0,
         };
+    }
 
-        // A quarter of seeds shrink the pools to force the §8 rungs.
-        const force_exhaustion = random.uintLessThan(u8, 4) == 0;
+    fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
+        // A quarter of adversarial seeds shrink the pools to force the
+        // §8 rungs; clean seeds keep ample pools so golden outcomes
+        // never meet a shed.
+        const force_exhaustion = !harness.clean and random.uintLessThan(u8, 4) == 0;
         const options: ServerSim.InitOptions = if (force_exhaustion)
-            .{ .conn_slots = 1 + random.uintLessThan(u32, 2), .relay_buffers = 1 }
+            .{
+                .conn_slots = 1 + random.uintLessThan(u32, 2),
+                .relay_buffers = 1,
+                .upstream_slots = 1,
+            }
         else
-            .{ .conn_slots = 2 * clients_max, .relay_buffers = clients_max };
+            .{
+                .conn_slots = 2 * clients_max,
+                .relay_buffers = clients_max,
+                .upstream_slots = 2 * clients_max,
+            };
         try harness.server.init(arena, &harness.io, &harness.config, options);
         try harness.server.start();
 
@@ -173,30 +245,51 @@ const Harness = struct {
             .context = harness,
         };
         try harness.origin.start(&harness.io, Harness.originAddress());
+        harness.origin_http = .{};
+        try harness.origin_http.start(&harness.io, Harness.httpOriginAddress());
+    }
 
+    fn populateClients(harness: *Harness, random: std.Random) void {
+        // Each client flips a protocol coin: mixed populations put both
+        // serving paths under one schedule and shared pools.
         harness.clients_count = 1 + random.uintLessThan(u8, clients_max);
+        harness.l4_count = 0;
+        harness.l7_count = 0;
         harness.ended_count = 0;
         harness.clients = @splat(.{});
-        for (harness.clients[0..harness.clients_count]) |*client| {
-            client.harness = harness;
-            client.token_len = 1 + random.uintLessThan(u8, token_bytes_max);
-            random.bytes(client.token[0..client.token_len]);
-            client.silent = random.uintLessThan(u8, 5) == 0;
+        harness.l7_clients = @splat(.{});
+        var index: u8 = 0;
+        while (index < harness.clients_count) : (index += 1) {
+            if (random.boolean()) {
+                const client = &harness.l7_clients[harness.l7_count];
+                harness.l7_count += 1;
+                client.prepare(
+                    &harness.io,
+                    httpBindAddress(),
+                    random.enumValue(l7.Script),
+                    harness.clean,
+                );
+                client.on_ended = l7ClientEnded;
+                client.context = harness;
+            } else {
+                const client = &harness.clients[harness.l4_count];
+                harness.l4_count += 1;
+                client.harness = harness;
+                client.token_len = 1 + random.uintLessThan(u8, token_bytes_max);
+                random.bytes(client.token[0..client.token_len]);
+                client.silent = random.uintLessThan(u8, 5) == 0;
+            }
         }
-
-        harness.end_timer_completion = .{};
-        harness.io.timerStart(
-            &harness.end_timer_completion,
-            scenario_end_ns,
-            Harness,
-            harness,
-            onScenarioEnd,
-        );
+        assert(harness.l4_count + harness.l7_count == harness.clients_count);
     }
 
     fn startClients(harness: *Harness) void {
         assert(harness.clients_count >= 1);
-        for (harness.clients[0..harness.clients_count]) |*client| {
+        assert(harness.l4_count + harness.l7_count == harness.clients_count);
+        for (harness.clients[0..harness.l4_count]) |*client| {
+            client.begin();
+        }
+        for (harness.l7_clients[0..harness.l7_count]) |*client| {
             client.begin();
         }
     }
@@ -217,29 +310,49 @@ const Harness = struct {
     }
 
     fn endScenario(harness: *Harness) void {
-        for (harness.clients[0..harness.clients_count]) |*client| {
+        for (harness.clients[0..harness.l4_count]) |*client| {
+            client.cancelIfStuck();
+        }
+        for (harness.l7_clients[0..harness.l7_count]) |*client| {
             client.cancelIfStuck();
         }
         harness.server.beginDrain();
         harness.origin.stopListening();
+        harness.origin_http.stopListening();
     }
 
     fn verify(harness: *Harness) !void {
         // The loop may stop before harness-side terminal completions
         // deliver; close what remains so the socket-leak check is exact.
-        for (harness.clients[0..harness.clients_count]) |*client| {
+        for (harness.clients[0..harness.l4_count]) |*client| {
+            client.closeIfOpen();
+        }
+        for (harness.l7_clients[0..harness.l7_count]) |*client| {
             client.closeIfOpen();
         }
         harness.origin.closeRemaining();
+        harness.origin_http.closeRemaining();
 
         if (!harness.server.isIdle()) return error.PoolLeak;
         if (!harness.server.reconcile()) return error.CountersDiverged;
         if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
-        for (harness.clients[0..harness.clients_count]) |*client| {
+        // §7: no malformed byte may ever reach an origin.
+        if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;
+        for (harness.clients[0..harness.l4_count]) |*client| {
             try client.verifyIntegrity();
+        }
+        for (harness.l7_clients[0..harness.l7_count]) |*client| {
+            try client.verify();
         }
     }
 };
+
+/// The L7 client's ended hook: type-erased because l7.zig cannot know the
+/// harness type.
+fn l7ClientEnded(context: ?*anyopaque) void {
+    const harness: *Harness = @ptrCast(@alignCast(context.?));
+    harness.clientEnded();
+}
 
 /// Per-accept origin behavior, drawn from the harness's scenario PRNG so
 /// each proxied connection meets a random misbehavior (echo / RST / mute /
