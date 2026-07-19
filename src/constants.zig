@@ -128,6 +128,11 @@ pub const clusters_max: u16 = 16;
 /// Upper bound on endpoints in one cluster.
 pub const endpoints_per_cluster_max: u16 = 64;
 
+/// Upper bound on routes in one listener's path-routing table (§7). Config
+/// data, not a runtime pool: routes are immutable arena slices, and the
+/// request-time match is a bounded linear scan over at most this many.
+pub const routes_max: u16 = 32;
+
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
@@ -166,6 +171,7 @@ comptime {
     assert(relay_buffer_bytes >= 512);
     assert(clusters_max >= 1);
     assert(endpoints_per_cluster_max >= 1);
+    assert(routes_max >= 1);
     assert(loop_completions_per_tick_max >= 1);
     assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);

@@ -125,7 +125,10 @@ pub fn Server(comptime IoType: type) type {
                     .listener = try server.io.listen(listener_config.bind_address),
                     .accept_completion = .{},
                     .retry_completion = .{},
-                    .cluster_index = listener_config.cluster_index,
+                    // L4 has one route (the whole listener → one cluster);
+                    // L7 admits under the first route and refines to the
+                    // path's route once the head parses (§7).
+                    .cluster_index = listener_config.routes[0].cluster_index,
                     .protocol = listener_config.protocol,
                     .accepting = false,
                 };

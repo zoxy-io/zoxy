@@ -14,6 +14,7 @@ pub const counters = @import("counters.zig");
 pub const http = struct {
     pub const parser = @import("http/parser.zig");
     pub const render = @import("http/render.zig");
+    pub const router = @import("http/router.zig");
     pub const proxy = @import("http/proxy.zig");
 };
 pub const Io = @import("io/io.zig");
@@ -35,6 +36,7 @@ test {
     _ = counters;
     _ = http.parser;
     _ = http.render;
+    _ = http.router;
     _ = http.proxy;
     _ = Io;
     _ = Server;

@@ -11,6 +11,8 @@
 const std = @import("std");
 
 const constants = @import("constants.zig");
+const router = @import("http/router.zig");
+const parser = @import("http/parser.zig");
 
 const assert = std.debug.assert;
 
@@ -30,7 +32,12 @@ pub const Config = struct {
 
     pub const Listener = struct {
         bind_address: std.Io.net.IpAddress,
-        cluster_index: u16,
+        /// The §7 path-routing table, sorted longest-prefix-first and
+        /// never empty. A listener configured with a single `"cluster"`
+        /// resolves to one catch-all route (`prefix = "/"`); `l4`
+        /// listeners always have exactly that one route (no path to
+        /// match). Matched by `http/router.zig`.
+        routes: []const router.Route,
         protocol: Protocol,
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
@@ -60,6 +67,12 @@ pub const ValidationError = error{
     ClustersEmpty,
     ClustersOverLimit,
     ClusterNameDuplicate,
+    ListenerClusterOrRoutes,
+    ListenerL4Routes,
+    RoutesEmpty,
+    RoutesOverLimit,
+    RoutePrefixNotCanonical,
+    RoutePrefixDuplicate,
     EndpointsEmpty,
     EndpointsOverLimit,
     EndpointInvalid,
@@ -104,9 +117,17 @@ const ConfigJson = struct {
 
 const ListenerJson = struct {
     bind: []const u8,
-    cluster: []const u8,
+    /// Exactly one of `cluster` (sugar for a single catch-all route) or
+    /// `routes` (an explicit §7 path table) must be present.
+    cluster: ?[]const u8 = null,
+    routes: ?[]const RouteJson = null,
     /// Optional: absent means `l4`, keeping pre-L7 configs valid.
     protocol: []const u8 = "l4",
+};
+
+const RouteJson = struct {
+    prefix: []const u8,
+    cluster: []const u8,
 };
 
 const ClusterJson = struct {
@@ -250,14 +271,99 @@ fn resolveListeners(
                 return error.ListenerBindDuplicate;
             }
         }
+        const protocol = try protocolOf(listener_json.protocol);
         listeners[index] = .{
             .bind_address = bind_address,
-            .cluster_index = try clusterIndexOf(clusters, listener_json.cluster),
-            .protocol = try protocolOf(listener_json.protocol),
+            .routes = try resolveRoutes(arena, &listener_json, clusters, protocol),
+            .protocol = protocol,
         };
     }
     assert(listeners.len == listeners_json.len);
     return listeners;
+}
+
+/// Resolve a listener's route table (§7). `"cluster": "x"` is sugar for a
+/// single catch-all route; `"routes": [...]` is the explicit table.
+/// Exactly one form is required. Prefixes must already be canonical (so
+/// they compare directly against the canonical request path) and unique;
+/// the table is sorted longest-prefix-first for the request-time scan.
+/// `l4` listeners have no path, so they take only the `cluster` form.
+fn resolveRoutes(
+    arena: std.mem.Allocator,
+    listener_json: *const ListenerJson,
+    clusters: []const Config.Cluster,
+    protocol: Config.Listener.Protocol,
+) ParseError![]const router.Route {
+    const has_cluster = listener_json.cluster != null;
+    const has_routes = listener_json.routes != null;
+    if (has_cluster == has_routes) {
+        return error.ListenerClusterOrRoutes; // Neither, or both.
+    }
+    if (has_cluster) {
+        const routes = try arena.alloc(router.Route, 1);
+        routes[0] = .{
+            .prefix = "/",
+            .cluster_index = try clusterIndexOf(clusters, listener_json.cluster.?),
+        };
+        assert(routes.len == 1); // The sugar is always one catch-all route.
+        return routes;
+    }
+    if (protocol == .l4) {
+        return error.ListenerL4Routes; // L4 relays bytes; there is no path.
+    }
+    const routes_json = listener_json.routes.?;
+    if (routes_json.len == 0) {
+        return error.RoutesEmpty;
+    }
+    if (routes_json.len > constants.routes_max) {
+        return error.RoutesOverLimit;
+    }
+    const routes = try arena.alloc(router.Route, routes_json.len);
+    for (routes_json, 0..) |route_json, index| {
+        try validateRoutePrefix(route_json.prefix);
+        for (routes_json[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.prefix, route_json.prefix)) {
+                return error.RoutePrefixDuplicate;
+            }
+        }
+        routes[index] = .{
+            .prefix = route_json.prefix,
+            .cluster_index = try clusterIndexOf(clusters, route_json.cluster),
+        };
+    }
+    // Longest-prefix-first, so the router's linear scan finds the most
+    // specific match first (§7). Descending by length; ties are already
+    // rejected as duplicates above, so order among equal lengths is moot.
+    std.mem.sort(router.Route, routes, {}, routeLongerFirst);
+    assert(routes.len >= 1);
+    assert(routes.len <= constants.routes_max);
+    return routes;
+}
+
+fn routeLongerFirst(_: void, left: router.Route, right: router.Route) bool {
+    return left.prefix.len > right.prefix.len;
+}
+
+/// A route prefix must be an origin-form path already in canonical form,
+/// so it compares byte-for-byte against the canonicalized request path
+/// (§7) — no per-request normalization, no router/backend divergence. A
+/// prefix that canonicalization would change (dot-segments, decodable or
+/// structure-changing escapes, a missing leading slash, a query) is
+/// rejected at load, not silently mismatched at request time.
+fn validateRoutePrefix(prefix: []const u8) ParseError!void {
+    if (prefix.len == 0 or prefix[0] != '/') {
+        return error.RoutePrefixNotCanonical;
+    }
+    if (prefix.len > constants.head_bytes_max) {
+        return error.RoutePrefixNotCanonical;
+    }
+    var out: [constants.head_bytes_max]u8 = undefined;
+    const canonical = parser.canonicalTarget(prefix, &out) catch {
+        return error.RoutePrefixNotCanonical;
+    };
+    if (canonical.query.len != 0 or !std.mem.eql(u8, canonical.path, prefix)) {
+        return error.RoutePrefixNotCanonical;
+    }
 }
 
 /// The closed protocol vocabulary; anything else is its own error so a
@@ -314,7 +420,10 @@ test "config: the shipped example parses and resolves" {
     const parsed = try parse(arena_state.allocator(), example_json);
     try std.testing.expectEqual(@as(usize, 1), parsed.listeners.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.clusters.len);
-    try std.testing.expectEqual(@as(u16, 0), parsed.listeners[0].cluster_index);
+    // The `"cluster"` sugar resolves to one catch-all route.
+    try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].routes.len);
+    try std.testing.expectEqualStrings("/", parsed.listeners[0].routes[0].prefix);
+    try std.testing.expectEqual(@as(u16, 0), parsed.listeners[0].routes[0].cluster_index);
     try std.testing.expectEqual(Config.Listener.Protocol.l4, parsed.listeners[0].protocol);
     try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
@@ -385,6 +494,67 @@ test "config: listener protocol defaults to l4 and accepts http" {
         );
         try std.testing.expectEqual(Config.Listener.Protocol.http, parsed.listeners[0].protocol);
     }
+}
+
+test "config: explicit routes resolve, sorted longest-prefix-first" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","routes":[
+        \\   {"prefix":"/","cluster":"root"},
+        \\   {"prefix":"/api/v2","cluster":"v2"},
+        \\   {"prefix":"/api","cluster":"api"}]}],
+        \\ "clusters":{"root":{"endpoints":["127.0.0.1:2"]},
+        \\   "api":{"endpoints":["127.0.0.1:3"]},
+        \\   "v2":{"endpoints":["127.0.0.1:4"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    const routes = parsed.listeners[0].routes;
+    try std.testing.expectEqual(@as(usize, 3), routes.len);
+    // Descending by prefix length, whatever the config order.
+    try std.testing.expectEqualStrings("/api/v2", routes[0].prefix);
+    try std.testing.expectEqualStrings("/api", routes[1].prefix);
+    try std.testing.expectEqualStrings("/", routes[2].prefix);
+    // The cluster the router will hand back for the longest match.
+    try std.testing.expectEqual(
+        @as(?u16, routes[0].cluster_index),
+        router.route(routes, "/api/v2/x"),
+    );
+    try std.testing.expectEqual(
+        @as(?u16, routes[2].cluster_index),
+        router.route(routes, "/elsewhere"),
+    );
+}
+
+test "config: routing schema rejects malformed tables" {
+    const base_clusters =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    ;
+    // Neither cluster nor routes.
+    try expectParseError(error.ListenerClusterOrRoutes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"}]," ++ base_clusters);
+    // Both cluster and routes.
+    try expectParseError(error.ListenerClusterOrRoutes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"," ++
+        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    // Routes on an l4 listener: there is no path to match.
+    try expectParseError(error.ListenerL4Routes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\"," ++
+        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    // Empty routes table.
+    try expectParseError(error.RoutesEmpty, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"routes\":[]}]," ++ base_clusters);
+    // A non-canonical prefix (dot-segment) — would mismatch at request time.
+    try expectParseError(error.RoutePrefixNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"routes\":[{\"prefix\":\"/a/../b\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    // A prefix without a leading slash.
+    try expectParseError(error.RoutePrefixNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"routes\":[{\"prefix\":\"api\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    // Duplicate prefixes.
+    try expectParseError(error.RoutePrefixDuplicate, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"routes\":[{\"prefix\":\"/x\",\"cluster\":\"a\"}," ++
+        "{\"prefix\":\"/x\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    // An unknown cluster named by a route.
+    try expectParseError(error.ClusterUnknown, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"ghost\"}]}]," ++ base_clusters);
 }
 
 test "config: unknown listener protocol fails loudly" {
@@ -538,7 +708,13 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
         assert(parsed.listeners.len >= 1);
         assert(parsed.clusters.len >= 1);
         for (parsed.listeners) |listener| {
-            assert(listener.cluster_index < parsed.clusters.len);
+            assert(listener.routes.len >= 1);
+            assert(listener.routes.len <= constants.routes_max);
+            for (listener.routes) |route| {
+                assert(route.cluster_index < parsed.clusters.len);
+                assert(route.prefix.len >= 1);
+                assert(route.prefix[0] == '/');
+            }
         }
     } else |_| {}
 }
