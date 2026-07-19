@@ -374,6 +374,11 @@ pub fn Proxy(comptime IoType: type) type {
             if (conn.l7.response_render_pending) {
                 conn.l7.response_render_pending = false;
                 beginResponseForward(server, conn);
+                // A deferred render that fails (oversize/malformed origin
+                // head) answers 502 (.l7_responding) or tears down — either
+                // way it leaves .l7_exchanging, and the request leg must not
+                // keep pumping into a connection that is already closing (§7).
+                if (conn.state != .l7_exchanging) return;
             }
             if (framingDone(&conn.l7.request_framing)) {
                 conn.l7.request_leg = .done;
