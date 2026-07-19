@@ -616,12 +616,16 @@ fn analyzeHeaders(
 /// token pass — scanning the list twice (once per token) was a measured
 /// hot spot (§9). Tokens are OWS-trimmed and matched case-insensitively.
 fn scanConnectionTokens(value: []const u8, analysis: *HeaderAnalysis) void {
+    // The value is a slice of the parsed head (an empty value is legal:
+    // `Connection:` with nothing after it), so it is head-buffer bounded.
+    assert(value.len <= constants.head_bytes_max);
     var tokens = std.mem.splitScalar(u8, value, ',');
     while (tokens.next()) |raw_token| {
         const token = std.mem.trim(u8, raw_token, " \t");
         if (token.len == 0) {
             continue;
         }
+        assert(token.len >= 1); // Only real options are classified below.
         if (std.ascii.eqlIgnoreCase(token, "close")) {
             analysis.connection_close = true;
         } else if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
