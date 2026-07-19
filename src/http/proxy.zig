@@ -984,6 +984,14 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!conn.armed.data_client_to_upstream);
             assert(!conn.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
+            // The static response and its lingering drain read/write only
+            // conn.head, never a relay buffer; free any held one now so a
+            // reject or 503 storm cannot pin buffers — and the L4 admissions
+            // they gate — for the whole drain window (§5, §8).
+            if (conn.relay_buffer) |buffer| {
+                server.releaseRelayBuffer(buffer);
+                conn.relay_buffer = null;
+            }
             server.counters.increment(counter);
             conn.state = .l7_responding;
             conn.response_pending = shed.staticResponse(status, .close);
