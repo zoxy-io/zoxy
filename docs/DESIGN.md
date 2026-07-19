@@ -459,6 +459,28 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   duplicate/garbage Content-Length) → 400 before any byte reaches an
   upstream. `Upgrade` → 501 (non-goal). Hop-by-hop headers stripped both
   ways; `Connection: close` injected when the proxy will close (§2).
+- **Path routing on the canonical path only** (settled 2026-07-19). An
+  `http` listener maps the request path to a cluster through a
+  per-listener longest-prefix route table (`"routes": [{ "prefix":
+  "/api", "cluster": "api" }, …]`; the existing `"cluster"` field stays
+  as sugar for a single catch-all route). The table is resolved at
+  config load into an immutable arena table sorted longest-prefix-first
+  — matching is a bounded linear scan, never an allocation — and
+  `routes_max` caps it. No route matches → static `404` (§8). Matching
+  consults only the **canonical path**, computed once in the trust
+  boundary: the query splits off untouched (opaque to the proxy,
+  forwarded verbatim); unreserved percent-escapes (RFC 3986 §2.3) are
+  decoded and surviving escapes' hex uppercased; then dot-segments are
+  collapsed. Structure-changing escapes are rejected as 400 — encoded
+  slash (`%2F`), NUL (`%00`), truncated or non-hex escapes — and so is
+  a path that climbs above the root. Duplicate slashes are preserved:
+  `//a` names a different resource than `/a`, and consistency, not
+  merging, is what makes it safe. The rendered upstream request line
+  carries that same canonical path, so the router and the origin cannot
+  disagree about which resource a request names — the `/api/../admin`
+  confusion class dies structurally, not by backend convention.
+  Host-based rules are deferred: the parser already extracts `Host`,
+  and host rules extend the same table compatibly when needed.
 - **Early responses are legal.** An origin may answer before the request
   body finishes (RFC 9110 — e.g. 413 mid-upload): the response head is
   forwarded when it arrives, and the remaining request body is drained or
@@ -466,9 +488,13 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   from the start instead of assuming strict request-then-response.
 - **Phases, Pingora-style but compile-time.** The request lifecycle
   exposes fixed extension points — `admit`, `route`, `upstream_pick`,
-  `settle` — as plain function calls into one module (`src/phases.zig`),
-  not a runtime filter chain. Programmability can be added later by
-  swapping that module; the proxy core stays generic and small.
+  `settle` — as plain function calls, one module per concern: admission
+  in `Server.zig`, path → cluster in `http/router.zig`, endpoint pick
+  in `balancer.zig`, settlement in `http/proxy.zig`. (Phase 0 sketched
+  these as a single `phases.zig`; they materialized as separate seams,
+  which is the same design with better boundaries.) Not a runtime
+  filter chain: programmability is added by extending the owning module
+  at compile time; the proxy core stays generic and small.
 - **Configurable filters/rules: filters are data, not code.**
   Zero-alloc extensibility means no plugins,
   no closures, no dynamic dispatch chains — instead, a rule is *compiled
@@ -487,8 +513,8 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   everything else. This is nginx/HAProxy's config-rule model, not Envoy's
   runtime filter chain — WASM/scripting is explicitly out (an interpreter
   with unbounded fuel or an embedded allocator cannot satisfy the gate);
-  anything beyond the closed action enum is a Zig function added to
-  `phases.zig` at compile time.
+  anything beyond the closed action enum is a Zig function added to the
+  owning phase module at compile time.
 - **Resilience is minimal by design:** per-request and per-try deadlines
   (head-read gets its own deadline, so a slowloris meets the clock or
   `head_bytes_max`, whichever comes first); one free replay of a request
@@ -519,8 +545,9 @@ the loop thread.
 | request deadline | timer completion | `504` if no response byte sent, else teardown |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
-- **Static error responses.** `503`/`504`/`431`/`414`/`400` are comptime
-  byte arrays sent directly from static memory — never staged through
+- **Static error responses.** `400`/`404`/`414`/`431`/`501`/`503`/`504`
+  are comptime byte arrays sent directly from static memory — never
+  staged through
   the connection's head buffer, whose bytes the parsed head's zero-copy
   slices may still reference (§7). Shedding costs one send, no
   allocation, no copy.
@@ -679,8 +706,9 @@ src/
   http/
     parser.zig        // hparse wrapper: strictness + framing + chunked decoder
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
+    router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
-  phases.zig          // admit / route / upstream_pick / settle
+  balancer.zig        // upstream endpoint pick: round-robin → P2C (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
   worker.zig          // SPMC job queue + SPSC completion rings (Phase 3)

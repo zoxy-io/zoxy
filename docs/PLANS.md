@@ -14,13 +14,25 @@ behind all four gates of §9.
   ladder rungs that exist so far, all four test gates, static-memory and
   fd-budget printout. Spec-complete 2026-07-13: the kernel-pressure
   witness on the relay data path (0a4c0bb) closed the last §8 audit gap.
-- **Phase 1 — L7 HTTP/1.1. Next.** Head parser + framing, routing,
-  upstream pool + keep-alive both sides, relay-buffer decoupling (idle
-  costs no relay memory), static error responses, remaining ladder
-  rungs. Entry gate: the hparse fork must clear the hardening list
-  recorded in §7 before this phase lands — **cleared 2026-07-18**
-  (zoxy-io/hparse PR #3: CRLF-only line terminators + extension-method
-  tokens; pin at 65521ed).
+- **Phase 1 — L7 HTTP/1.1. Shipped.** Head parser + framing, upstream
+  pool + keep-alive both sides, relay-buffer decoupling (idle costs no
+  relay memory), static error responses, remaining ladder rungs. Entry
+  gate: the hparse fork must clear the hardening list recorded in §7
+  before this phase lands — **cleared 2026-07-18** (zoxy-io/hparse
+  PR #3: CRLF-only line terminators + extension-method tokens; pin at
+  65521ed). Spec-complete 2026-07-19 (PR #47) with all four §9 gates
+  covering L7: the mixed-protocol simulation (golden + prefix oracles,
+  retro-validated against two shipped bugs), the keep-alive-reuse
+  zero-alloc gate, and the `Connection: close` Tier-1 bands.
+- **Phase 1.5 — path routing. In progress.** Longest-prefix
+  path → cluster tables per listener, matched on the §7 canonical path
+  (decode unreserved escapes, collapse dot-segments; structure-changing
+  escapes → 400) with the canonical path forwarded upstream, so the
+  router and the origin cannot diverge — the settled §7 decision
+  (2026-07-19). No match → the 404 static verdict. The sim gains a
+  routing-correctness oracle: distinct canonical bodies per cluster
+  plus path-confusion scripts (`/a/../b`, `%2e%2e`, encoded slash).
+  Host rules deferred as a compatible extension of the same table.
 - **Phase 2 — shedding hardening + minimal resilience.** P2C pick,
   stale-replay (a checkout that fails on first use answers 502 today),
   per-try deadline and the §8 request-deadline 504 verdict (an expired
