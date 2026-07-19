@@ -308,14 +308,37 @@ pub fn HttpOrigin(comptime IoType: type) type {
     };
 }
 
-/// The client's request scripts. Slice 1 ships the valid single-exchange
-/// pair; the adversarial matrix (malformed, oversize, CONNECT, keep-alive,
-/// pipelined, silent) follows.
+/// The client's request scripts: the valid shapes, the §7 reject shapes
+/// (each pinned to its exact verdict on clean seeds), and the connection
+/// patterns (keep-alive reuse, pipelining, silence).
 pub const Script = enum(u8) {
     /// A bodyless GET; expects one canonical 200.
     get,
     /// A POST with a 24-byte sized body; expects one canonical 200.
     post_sized,
+    /// A POST with a valid chunked body; expects one canonical 200.
+    post_chunked,
+    /// A chunked POST whose first body byte violates chunk framing —
+    /// the silent-teardown-instead-of-400 shape (§7): clean seeds
+    /// demand the 400.
+    post_chunked_malformed,
+    /// A bare-LF head terminator (smuggling shape); 400.
+    malformed_head,
+    /// A request line alone overflowing the proxy's 8 KiB head buffer;
+    /// 414.
+    oversize_uri,
+    /// CONNECT is a §1 non-goal; 501.
+    connect_method,
+    /// Two sequential GETs on one connection: the §5 parking/checkout
+    /// path — the second is sent only after the first 200 settles
+    /// reusable.
+    keepalive_pair,
+    /// Two GETs in one send: the proxy answers the first, announces
+    /// close (§2), and never serves the second.
+    pipelined,
+    /// Connects and sends nothing: the head-read deadline reaps it;
+    /// any response byte is a violation.
+    silent,
 };
 
 /// A verify-time verdict over everything the client received.
@@ -361,6 +384,8 @@ pub fn Client(comptime IoType: type) type {
         connect_settled: bool = false,
         cancel_requested: bool = false,
         script_satisfied: bool = false,
+        /// The keep-alive pair's second request has been appended.
+        second_sent: bool = false,
         closed: bool = false,
         ended: bool = false,
         send_pending: bool = false,
@@ -375,8 +400,35 @@ pub fn Client(comptime IoType: type) type {
         const responses_max: u8 = 4;
 
         const post_body = "request-body-24-bytes-ab";
+        const get_request = "GET /sim HTTP/1.1\r\nHost: sim\r\n\r\n";
         comptime {
             assert(post_body.len == 24);
+        }
+
+        fn requestBytes(script: Script) []const u8 {
+            return switch (script) {
+                .get => get_request,
+                .post_sized => "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
+                    "Content-Length: 24\r\n\r\n" ++ post_body,
+                .post_chunked => "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
+                    "Transfer-Encoding: chunked\r\n\r\n" ++ "8\r\nabcdefgh\r\n0\r\n\r\n",
+                // "Z" is no chunk-size digit: the framing violation is in
+                // the first body byte, coalesced with the head.
+                .post_chunked_malformed => "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
+                    "Transfer-Encoding: chunked\r\n\r\nZ",
+                // A bare LF terminating the request line (§7 smuggling
+                // shape).
+                .malformed_head => "GET /sim HTTP/1.1\nHost: sim\r\n\r\n",
+                // The request line alone must overflow the proxy's 8 KiB
+                // head buffer with no newline in sight: 414, not 431.
+                .oversize_uri => "GET /" ++ ("a" ** 8500) ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
+                .connect_method => "CONNECT origin:443 HTTP/1.1\r\nHost: origin\r\n\r\n",
+                // The second GET is appended at run time, only after the
+                // first 200 settles reusable.
+                .keepalive_pair => get_request,
+                .pipelined => get_request ++ get_request,
+                .silent => "",
+            };
         }
 
         pub fn prepare(
@@ -390,18 +442,14 @@ pub fn Client(comptime IoType: type) type {
             client.address = address;
             client.script = script;
             client.clean = clean;
-            const bytes: []const u8 = switch (script) {
-                .get => "GET /sim HTTP/1.1\r\nHost: sim\r\n\r\n",
-                .post_sized => "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
-                    "Content-Length: 24\r\n\r\n" ++ post_body,
-            };
+            const bytes = requestBytes(script);
             assert(bytes.len <= client.request.len);
             @memcpy(client.request[0..bytes.len], bytes);
             client.request_len = @intCast(bytes.len);
         }
 
         pub fn begin(client: *Self) void {
-            assert(client.request_len >= 1);
+            assert(client.request_len >= 1 or client.script == .silent);
             client.io.connect(
                 client.address,
                 &client.connect_completion,
@@ -419,7 +467,9 @@ pub fn Client(comptime IoType: type) type {
             };
             client.connected = true;
             client.armRecv();
-            client.armSend();
+            if (client.request_len >= 1) {
+                client.armSend();
+            }
         }
 
         fn armSend(client: *Self) void {
@@ -485,7 +535,8 @@ pub fn Client(comptime IoType: type) type {
                 client.receive_buffer[0..client.received_len],
                 client.script,
             );
-            if (walk.violation == null and walk.complete_count >= expectedResponses(client.script)) {
+            client.maybeSendSecondRequest(&walk);
+            if (walk.violation == null and walk.complete_count >= responsesTarget(client.script, &walk)) {
                 // The script's transcript is fully in hand: close from
                 // this side — the proxy honors keep-alive, so waiting for
                 // its FIN would hang until the drain.
@@ -494,6 +545,46 @@ pub fn Client(comptime IoType: type) type {
                 return;
             }
             client.armRecv();
+        }
+
+        /// The first exchange settled as a reusable success: a 200 that
+        /// did not announce close.
+        fn firstExchangeReusable(walk: *const Walk) bool {
+            assert(walk.complete_count >= 1);
+            return walk.statuses[0] == 200 and walk.keep_alives[0];
+        }
+
+        /// The keep-alive pair's second exchange starts only after the
+        /// first 200 settles reusable — the §5 parked-connection checkout
+        /// under schedule fuzz.
+        fn maybeSendSecondRequest(client: *Self, walk: *const Walk) void {
+            if (client.script != .keepalive_pair or client.second_sent) return;
+            if (walk.violation != null) return;
+            if (walk.complete_count != 1) return;
+            if (!firstExchangeReusable(walk)) return;
+            // A complete first response implies the proxy consumed the
+            // whole first request, so the send op has settled.
+            assert(!client.send_pending);
+            assert(client.sent_len == client.request_len);
+            const second = get_request;
+            assert(client.request_len + second.len <= client.request.len);
+            @memcpy(client.request[client.request_len..][0..second.len], second);
+            client.request_len += @intCast(second.len);
+            client.second_sent = true;
+            client.armSend();
+        }
+
+        /// How many responses the script still legally expects, given
+        /// what has arrived: the keep-alive pair degrades to a single
+        /// exchange when its first response refuses reuse (an error
+        /// status, or an announced close under pressure or drain).
+        fn responsesTarget(script: Script, walk: *const Walk) u8 {
+            const static_target = expectedResponses(script);
+            if (script != .keepalive_pair) return static_target;
+            if (walk.complete_count >= 1 and !firstExchangeReusable(walk)) {
+                return 1;
+            }
+            return static_target;
         }
 
         /// Scenario end: a connect the adversary black-holed must still
@@ -565,6 +656,11 @@ pub fn Client(comptime IoType: type) type {
                         return ClientError.GoldenOutcomeMissed;
                     }
                 }
+                // §2: a pipelined first response must announce the close
+                // that follows it.
+                if (client.script == .pipelined and walk.keep_alives[0]) {
+                    return ClientError.GoldenOutcomeMissed;
+                }
             }
         }
 
@@ -572,6 +668,9 @@ pub fn Client(comptime IoType: type) type {
             complete_count: u8,
             offset: u32,
             statuses: [responses_max]u16,
+            /// Per-response persistence verdicts (§2): version defaults
+            /// plus Connection tokens, as the parser computed them.
+            keep_alives: [responses_max]bool,
             violation: ?ClientError,
         };
 
@@ -586,6 +685,7 @@ pub fn Client(comptime IoType: type) type {
                 .complete_count = 0,
                 .offset = 0,
                 .statuses = @splat(0),
+                .keep_alives = @splat(false),
                 .violation = null,
             };
             while (walk.complete_count < responses_max) {
@@ -616,11 +716,12 @@ pub fn Client(comptime IoType: type) type {
                 }
                 assert(verdict.body_len <= body.len);
                 walk.statuses[walk.complete_count] = response.status;
+                walk.keep_alives[walk.complete_count] = response.keep_alive;
                 walk.complete_count += 1;
                 walk.offset += response.head_len + verdict.body_len;
                 // A complete response beyond the script's transcript is a
                 // duplication bug, not a legal prefix.
-                if (walk.complete_count > expectedResponses(script)) {
+                if (walk.complete_count > transcriptCap(script)) {
                     walk.violation = ClientError.ResponseOverrun;
                     return walk;
                 }
@@ -680,30 +781,69 @@ pub fn Client(comptime IoType: type) type {
 
         fn expectedResponses(script: Script) u8 {
             return switch (script) {
-                .get, .post_sized => 1,
+                .get, .post_sized, .post_chunked => 1,
+                .post_chunked_malformed, .malformed_head => 1,
+                .oversize_uri, .connect_method, .pipelined => 1,
+                .keepalive_pair => 2,
+                .silent => 0,
             };
         }
 
-        /// The exact status a clean seed's script must produce.
+        /// The most complete responses ANY legal transcript can contain —
+        /// the walker's surplus bound. Pipelined admits one more than the
+        /// clean expectation: when adversarial fragmentation lands exactly
+        /// on the request boundary, the proxy never observes the pipelined
+        /// bytes and legally serves both requests as plain keep-alive.
+        /// The clean tier still pins pipelined to exactly one (detection
+        /// is deterministic there).
+        fn transcriptCap(script: Script) u8 {
+            return switch (script) {
+                .pipelined => 2,
+                else => expectedResponses(script),
+            };
+        }
+
+        /// The exact status a clean seed's script must produce. Silent
+        /// never produces one; its zero-response transcript makes the
+        /// value unread.
         fn goldenStatus(script: Script) u16 {
             return switch (script) {
-                .get, .post_sized => 200,
+                .get, .post_sized, .post_chunked, .keepalive_pair, .pipelined => 200,
+                .post_chunked_malformed, .malformed_head => 400,
+                .oversize_uri => 414,
+                .connect_method => 501,
+                .silent => 0,
             };
         }
 
+        /// The method context for response parsing (HEAD-shaped body
+        /// rules). CONNECT maps to GET: the parser refuses to represent a
+        /// CONNECT response (the proxy rejects the method before dialing),
+        /// and the 501 static carries no body either way.
         fn methodOf(script: Script) parser.Method {
             return switch (script) {
-                .get => .get,
-                .post_sized => .post,
+                .post_sized, .post_chunked, .post_chunked_malformed => .post,
+                .get, .malformed_head, .oversize_uri => .get,
+                .connect_method, .keepalive_pair, .pipelined, .silent => .get,
             };
         }
 
         /// Statuses a script may legally see. Valid requests meet the
         /// canonical 200, the §8 rungs (503), or an upstream that the
-        /// adversary killed (502) — anything else is a proxy bug.
+        /// adversary killed (502); parse verdicts precede routing, so the
+        /// reject scripts admit exactly their own verdict — and a silent
+        /// client may see nothing at all.
         fn statusAllowed(script: Script, status: u16) bool {
             return switch (script) {
-                .get, .post_sized => status == 200 or status == 502 or status == 503,
+                .get, .post_sized, .post_chunked, .keepalive_pair, .pipelined => //
+                status == 200 or status == 502 or status == 503,
+                // The head routes before its body is validated, so the §8
+                // rungs and a killed dial can still precede the 400.
+                .post_chunked_malformed => status == 400 or status == 502 or status == 503,
+                .malformed_head => status == 400,
+                .oversize_uri => status == 414,
+                .connect_method => status == 501,
+                .silent => false,
             };
         }
     };

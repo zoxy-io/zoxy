@@ -234,7 +234,12 @@ const Harness = struct {
         else
             .{
                 .conn_slots = 2 * clients_max,
-                .relay_buffers = clients_max,
+                // Clean seeds size the pool so the §8 pressure watermark
+                // (ceil of 3/4 capacity) sits above the whole client
+                // population: a golden outcome must never meet a
+                // pressure-announced close, which is correct behavior
+                // but not the script's exact transcript.
+                .relay_buffers = if (harness.clean) 2 * clients_max else clients_max,
                 .upstream_slots = 2 * clients_max,
             };
         try harness.server.init(arena, &harness.io, &harness.config, options);
