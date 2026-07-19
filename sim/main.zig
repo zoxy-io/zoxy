@@ -118,6 +118,8 @@ const Harness = struct {
     endpoints_l4: [1]std.Io.net.IpAddress,
     endpoints_http: [1]std.Io.net.IpAddress,
     clusters: [2]zoxy.config.Config.Cluster,
+    routes_l4: [1]zoxy.http.router.Route,
+    routes_http: [1]zoxy.http.router.Route,
     listener_configs: [2]zoxy.config.Config.Listener,
     config: zoxy.config.Config,
     origin: Origin,
@@ -199,9 +201,11 @@ const Harness = struct {
             .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4 },
             .{ .name = "origin-http", .endpoints = &harness.endpoints_http },
         };
+        harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
+        harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
         harness.listener_configs = .{
-            .{ .bind_address = bindAddress(), .cluster_index = 0, .protocol = .l4 },
-            .{ .bind_address = httpBindAddress(), .cluster_index = 1, .protocol = .http },
+            .{ .bind_address = bindAddress(), .routes = &harness.routes_l4, .protocol = .l4 },
+            .{ .bind_address = httpBindAddress(), .routes = &harness.routes_http, .protocol = .http },
         };
         harness.config = .{
             .listeners = &harness.listener_configs,

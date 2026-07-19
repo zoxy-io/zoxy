@@ -9,6 +9,7 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
+const router = @import("http/router.zig");
 const Io = @import("io/io.zig");
 const parser = @import("http/parser.zig");
 const Server = @import("Server.zig").Server;
@@ -326,6 +327,7 @@ const Http1Bed = struct {
     sim_io: SimIo,
     endpoints: [1]std.Io.net.IpAddress,
     clusters: [1]config_module.Config.Cluster,
+    routes: [1]router.Route,
     listeners: [1]config_module.Config.Listener,
     config: config_module.Config,
     server: ServerSim,
@@ -363,7 +365,8 @@ const Http1Bed = struct {
         });
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
-        bed.listeners = .{.{ .bind_address = bindAddress(), .cluster_index = 0, .protocol = .http }};
+        bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
+        bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .http }};
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
