@@ -284,29 +284,37 @@ pub fn Proxy(comptime IoType: type) type {
                 armRequestHeadSend(server, conn);
                 return;
             }
-            // Head on the wire: the response leg starts recving now —
-            // before the request body finishes — so an early response
-            // cannot wedge both TCP windows (§7). Its render into conn.head
-            // waits until the request head vacates that buffer.
+            // Head on the wire. Validate the request-body prefix that
+            // arrived coalesced with the head before the response leg
+            // commits its recv op: a body that already violates its own
+            // framing is answered 400 while both data ops are still free
+            // (§7). Once the response recv is armed that op is gone, and an
+            // op is never canceled (§5) — so a malformed body found later
+            // can only tear down. Checking here keeps the 400 reachable.
+            const excess = conn.head[conn.l7.request_head_len..conn.head_len];
+            const feed = feedFraming(&conn.l7.request_framing, excess);
+            if (feed.malformed) {
+                respond(server, conn, 400, "l7_bad_request");
+                return;
+            }
+            // The response leg starts recving now — before the request body
+            // finishes — so an early response cannot wedge both TCP windows
+            // (§7). Its render into conn.head waits until the request head
+            // vacates that buffer.
             startResponseLeg(server, conn);
-            drainRequestExcess(server, conn);
+            forwardRequestExcess(server, conn, feed);
         }
 
         /// Forward the body bytes that arrived coalesced with the head
         /// straight from conn.head (§7): a body larger than a relay buffer
         /// is never squeezed through one, and conn.head is freed for the
-        /// response head exactly when the last excess byte leaves it.
-        fn drainRequestExcess(server: *ServerType, conn: *ConnType) void {
+        /// response head exactly when the last excess byte leaves it. The
+        /// framing was already advanced and validated by the caller.
+        fn forwardRequestExcess(server: *ServerType, conn: *ConnType, feed: FeedResult) void {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .sending_head);
+            assert(!feed.malformed);
             const excess = conn.head[conn.l7.request_head_len..conn.head_len];
-            const feed = feedFraming(&conn.l7.request_framing, excess);
-            if (feed.malformed) {
-                // The body prefix already violates its own framing; nothing
-                // has been answered yet, so 400 is still legal.
-                respondOrTeardown(server, conn, 400, "l7_bad_request");
-                return;
-            }
             if (feed.consumed < excess.len) {
                 conn.l7.client_pipelined = true;
             }
@@ -959,22 +967,6 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             respond(server, conn, 502, "l7_bad_gateway");
-        }
-
-        /// 400/503 with the request-body pump possibly armed: prefer the
-        /// response when the op is free, teardown otherwise.
-        fn respondOrTeardown(
-            server: *ServerType,
-            conn: *ConnType,
-            comptime status: u16,
-            comptime counter: []const u8,
-        ) void {
-            if (conn.armed.data_client_to_upstream or conn.armed.data_upstream_to_client) {
-                server.counters.increment(counter);
-                server.beginTeardown(conn);
-                return;
-            }
-            respond(server, conn, status, counter);
         }
 
         /// Answer a comptime static error response, then close (§8). Legal

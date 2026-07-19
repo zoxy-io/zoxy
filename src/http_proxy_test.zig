@@ -449,6 +449,31 @@ test "l7: a malformed request head is answered 400 and closed with FIN" {
     try bed.expectDrained();
 }
 
+test "l7: a malformed chunked body coalesced with the head is answered 400" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 7,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // The head is valid, so it is sent upstream and the response leg is
+    // about to arm — but the chunk-size line coalesced behind it opens with
+    // a non-hex byte, a framing violation the moment it is fed. The client
+    // still gets a 400, not the bare teardown a post-arm detection forces
+    // (§7): the body is validated before the response recv commits its op.
+    try bed.exchange("POST /x HTTP/1.1\r\nHost: o\r\nTransfer-Encoding: chunked\r\n\r\nZ");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 test "l7: oversize request line is 414, oversize header section is 431" {
     {
         var bed: Http1Bed = undefined;
