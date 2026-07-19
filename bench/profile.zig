@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !u8 {
     var origin_child = try spawnNginx(arena, io);
     defer origin_child.kill(io);
 
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, &flags);
+    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
     const zoxy_pid = zoxy_child.id orelse return error.NoZoxyPid;
@@ -201,7 +201,6 @@ fn spawnZoxy(
     arena: std.mem.Allocator,
     io: Io,
     zoxy_path: []const u8,
-    flags: *const Flags,
 ) !std.process.Child {
     // Both listeners always exist so the flag only picks which one zrk
     // drives; the idle one adds no load.
@@ -217,7 +216,6 @@ fn spawnZoxy(
         \\}}
         \\
     , .{ zoxy_l4_port, zoxy_http_port, origin_port });
-    _ = flags;
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
