@@ -31,14 +31,53 @@ behind all four gates of §9.
   the router and the origin cannot diverge. No match → the 404 static
   verdict. The sim fuzzes canonical forwarding (an origin oracle
   rejecting a non-canonical forward) and a path-confusion script.
-- **Phase 1.6 — host routing. In progress.** Host becomes the route
-  table's outer dimension (§7, settled 2026-07-20): an optional per-route
-  `host`, matched host-specific-first then longest-prefix, so `host +
-  path` composes in one table with one precedence rule. Host is matched
-  on its canonical form (lowercased, port-stripped) computed in the trust
+- **Phase 1.6 — host routing. Shipped 2026-07-20 (PR #51).** Host is the
+  route table's outer dimension (§7): an optional per-route `host`,
+  matched host-specific-first then longest-prefix, so `host + path`
+  composes in one table with one precedence rule. Host is matched on its
+  canonical form (lowercased, port-stripped) computed in the trust
   boundary but forwarded verbatim. No-Host requests match only any-host
   routes. Cluster selection stays the route table's alone — `pick
   cluster` is not a filter action.
+- **Phase 1.7 — programmable filters. Planned.** The "filters are data,
+  not code" model of §7, and the piece that finally gives the `route`
+  phase seam (`http/router.zig`) and the renderer real programmable
+  content — cluster selection already being the route table's alone, so
+  filters never compete with routing for the backend decision. A *rule*
+  is `{ match, actions }`, compiled at config load into bounded immutable
+  arena tables and *interpreted* per request — never scripted, never
+  allocating.
+  - **Match** — a conjunction of predicates over the parsed head:
+    method ∈ set, canonical host/path prefix or exact (reusing the §7
+    canonical forms so a filter and the router agree byte-for-byte), and
+    header present / equals / contains. Zero-copy against head-buffer
+    slices; `match_predicates_max` bounds the conjunction.
+  - **Actions** — a closed enum, ordered list per rule: `reject` (a
+    static status from the §8 set, e.g. 403/404/429), `set`/`add`/`remove`
+    header, `rewrite` a path prefix. No `pick cluster` (routing owns the
+    backend), no WASM/scripting (an interpreter with unbounded fuel or an
+    embedded allocator cannot satisfy §9). Anything past the enum is a
+    Zig function in the owning phase module.
+  - **Where it runs** — reject before the relay buffer/upstream are
+    acquired (like the §8 rejects); header/path mutations applied during
+    the existing head *render* (already required for hop-by-hop stripping
+    and `Connection` injection), so nothing edits the head buffer in
+    place and a head that no longer fits after edits is the existing
+    oversize-after-edits 431. A path rewrite re-canonicalizes and must
+    re-satisfy routing, or it is a config error caught at load.
+  - **Limits** — `rules_per_listener_max`, `actions_per_rule_max`,
+    `header_edits_max`, `match_predicates_max`, all closed-form in the
+    budget; evaluation is bounded loops, load-shed like everything else.
+  - **Gates** — config resolve/reject tests for the rule tables; a fuzz
+    oracle that a rendered head after edits still re-parses (the
+    render-oracle already proves this shape for hop-by-hop edits); sim
+    scripts asserting a reject fires before any dial and a header/path
+    edit reaches the origin exactly once.
+  - **Slices (sketch)** — (1) rule/action config schema + validation +
+    constants; (2) the match interpreter (pure, over a parsed head) +
+    the `reject` action at the route phase; (3) header-edit actions woven
+    into the renderer + the 431-after-edits path; (4) the `rewrite`
+    action with re-canonicalize-and-reroute; (5) sim oracles.
 - **Phase 2 — shedding hardening + minimal resilience.** P2C pick,
   stale-replay (a checkout that fails on first use answers 502 today),
   per-try deadline and the §8 request-deadline 504 verdict (an expired
