@@ -39,7 +39,8 @@ behind all four gates of §9.
   boundary but forwarded verbatim. No-Host requests match only any-host
   routes. Cluster selection stays the route table's alone — `pick
   cluster` is not a filter action.
-- **Phase 1.7 — programmable filters. Planned.** The "filters are data,
+- **Phase 1.7 — programmable filters. Implemented 2026-07-20 (branch
+  `feat/filters`).** The "filters are data,
   not code" model of §7, and the piece that finally gives the `route`
   phase seam (`http/router.zig`) and the renderer real programmable
   content — cluster selection already being the route table's alone, so
@@ -63,21 +64,30 @@ behind all four gates of §9.
     the existing head *render* (already required for hop-by-hop stripping
     and `Connection` injection), so nothing edits the head buffer in
     place and a head that no longer fits after edits is the existing
-    oversize-after-edits 431. A path rewrite re-canonicalizes and must
-    re-satisfy routing, or it is a config error caught at load.
-  - **Limits** — `rules_per_listener_max`, `actions_per_rule_max`,
-    `header_edits_max`, `match_predicates_max`, all closed-form in the
-    budget; evaluation is bounded loops, load-shed like everything else.
+    oversize-after-edits 431. A path rewrite changes *only the forwarded
+    path* — routing already chose the cluster from the original canonical
+    path, so a rewrite never re-routes and never chains (first-applicable
+    rule wins). Its `from`/`to` prefixes are validated canonical at load
+    and the replacement is a segment-correct join, so the forwarded path
+    is canonical by construction (see DESIGN.md §7).
+  - **Limits** (as shipped in `constants.zig`) —
+    `filters_per_listener_max`, `actions_per_filter_max`,
+    `header_matches_per_filter_max`, and `header_edits_max` (the
+    listener's total header edits, bounding the renderer's materialized
+    edit buffer); evaluation is bounded loops, load-shed like everything
+    else.
   - **Gates** — config resolve/reject tests for the rule tables; a fuzz
     oracle that a rendered head after edits still re-parses (the
     render-oracle already proves this shape for hop-by-hop edits); sim
     scripts asserting a reject fires before any dial and a header/path
     edit reaches the origin exactly once.
-  - **Slices (sketch)** — (1) rule/action config schema + validation +
+  - **Slices (as shipped)** — (1) rule/action config schema + validation +
     constants; (2) the match interpreter (pure, over a parsed head) +
     the `reject` action at the route phase; (3) header-edit actions woven
-    into the renderer + the 431-after-edits path; (4) the `rewrite`
-    action with re-canonicalize-and-reroute; (5) sim oracles.
+    into the renderer + the 431-after-edits path + a reserved-name guard
+    against editing proxy-managed headers; (4) the `rewrite` action
+    (forwarded path only, segment-correct join, no re-route); (5) sim +
+    adversarial-cross-seed oracles.
 - **Phase 2 — shedding hardening + minimal resilience.** P2C pick,
   stale-replay (a checkout that fails on first use answers 502 today),
   per-try deadline and the §8 request-deadline 504 verdict (an expired
