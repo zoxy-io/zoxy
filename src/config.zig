@@ -31,6 +31,18 @@ pub const Config = struct {
     /// where zero is legal (an unbounded connection age), so it is optional
     /// in the JSON and defaults off.
     max_lifetime_ms: u32,
+    /// Effective pool sizes (§5, §8). The comptime constants stay the
+    /// hard, budget-asserted ceilings; config may only shrink below them
+    /// — for capacity planning, and so the overload benchmark can hit
+    /// the real shed rungs at loopback-feasible load. Defaulted so the
+    /// test beds' literal configs keep the full pools.
+    limits: Limits = .{},
+
+    pub const Limits = struct {
+        conn_slots: u32 = constants.conn_slots_max,
+        relay_buffers: u32 = constants.relay_buffers_max,
+        upstream_slots: u32 = constants.upstream_slots_max,
+    };
 
     pub const Listener = struct {
         bind_address: std.Io.net.IpAddress,
@@ -112,6 +124,10 @@ pub const ValidationError = error{
     EndpointPortZero,
     TimeoutZero,
     TimeoutOverLimit,
+    LimitConnSlotsOutOfRange,
+    LimitRelayBuffersOutOfRange,
+    LimitRelayBuffersOverConnSlots,
+    LimitUpstreamSlotsOutOfRange,
 };
 
 pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
@@ -129,6 +145,7 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     const clusters = try resolveClusters(arena, &parsed.clusters);
     const listeners = try resolveListeners(arena, parsed.listeners, clusters);
     try validateTimeouts(&parsed.timeouts);
+    const limits = try resolveLimits(&parsed.limits);
 
     assert(listeners.len >= 1);
     assert(clusters.len >= 1);
@@ -139,6 +156,38 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
         .idle_timeout_ms = parsed.timeouts.idle_ms,
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
+        .limits = limits,
+    };
+}
+
+/// Resolve the effective pool sizes (§5, §8): the comptime constants are
+/// the hard, budget-asserted ceilings — config may only shrink below
+/// them, never grow past them, and never to zero. An unspecified
+/// relay-buffer count derives from the effective conn slots (a buffer
+/// beyond the slot count could never be acquired); a *specified* count
+/// above them is a contradiction and fails loudly.
+fn resolveLimits(limits_json: *const LimitsJson) ValidationError!Config.Limits {
+    const conn_slots = limits_json.conn_slots orelse constants.conn_slots_max;
+    if (conn_slots < 1 or conn_slots > constants.conn_slots_max) {
+        return error.LimitConnSlotsOutOfRange;
+    }
+    const relay_buffers = limits_json.relay_buffers orelse
+        @min(constants.relay_buffers_max, conn_slots);
+    if (relay_buffers < 1 or relay_buffers > constants.relay_buffers_max) {
+        return error.LimitRelayBuffersOutOfRange;
+    }
+    if (relay_buffers > conn_slots) {
+        return error.LimitRelayBuffersOverConnSlots;
+    }
+    const upstream_slots = limits_json.upstream_slots orelse constants.upstream_slots_max;
+    if (upstream_slots < 1 or upstream_slots > constants.upstream_slots_max) {
+        return error.LimitUpstreamSlotsOutOfRange;
+    }
+    assert(relay_buffers <= conn_slots);
+    return .{
+        .conn_slots = conn_slots,
+        .relay_buffers = relay_buffers,
+        .upstream_slots = upstream_slots,
     };
 }
 
@@ -146,6 +195,15 @@ const ConfigJson = struct {
     listeners: []const ListenerJson,
     clusters: ClustersJson,
     timeouts: TimeoutsJson,
+    /// Optional pool shrinks (§5, §8); absent fields keep the comptime
+    /// ceilings.
+    limits: LimitsJson = .{},
+};
+
+const LimitsJson = struct {
+    conn_slots: ?u32 = null,
+    relay_buffers: ?u32 = null,
+    upstream_slots: ?u32 = null,
 };
 
 const ListenerJson = struct {
@@ -1109,6 +1167,67 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"pc2"}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
     );
+}
+
+test "config: limits shrink pools below the ceilings, never past them" {
+    // Partial limits: relay buffers derive from the effective conn slots.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1},
+            \\ "limits":{"conn_slots":64}}
+        );
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.relay_buffers);
+        try std.testing.expectEqual(constants.upstream_slots_max, parsed.limits.upstream_slots);
+    }
+    // Full limits resolve verbatim; absent block keeps the ceilings.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1},
+            \\ "limits":{"conn_slots":64,"relay_buffers":8,"upstream_slots":8}}
+        );
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
+        try std.testing.expectEqual(@as(u32, 8), parsed.limits.relay_buffers);
+        try std.testing.expectEqual(@as(u32, 8), parsed.limits.upstream_slots);
+    }
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(constants.conn_slots_max, parsed.limits.conn_slots);
+        try std.testing.expectEqual(constants.relay_buffers_max, parsed.limits.relay_buffers);
+        try std.testing.expectEqual(constants.upstream_slots_max, parsed.limits.upstream_slots);
+    }
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1},
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
+    // Zero and over-ceiling both fail loudly, each with its own error.
+    try expectParseError(error.LimitConnSlotsOutOfRange, head ++ tail ++ "\"limits\":{\"conn_slots\":0}}");
+    try expectParseError(error.LimitConnSlotsOutOfRange, head ++ tail ++ "\"limits\":{\"conn_slots\":99999}}");
+    try expectParseError(error.LimitRelayBuffersOutOfRange, head ++ tail ++ "\"limits\":{\"relay_buffers\":0}}");
+    // Over-ceiling relay buffers alone hit the range check, not the
+    // conn-slot contradiction — the range check has precedence.
+    try expectParseError(error.LimitRelayBuffersOutOfRange, head ++ tail ++ "\"limits\":{\"relay_buffers\":99999}}");
+    try expectParseError(error.LimitUpstreamSlotsOutOfRange, head ++ tail ++ "\"limits\":{\"upstream_slots\":0}}");
+    try expectParseError(error.LimitUpstreamSlotsOutOfRange, head ++ tail ++ "\"limits\":{\"upstream_slots\":99999}}");
+    // A specified relay-buffer count above the conn slots is a
+    // contradiction, not a derivable default.
+    try expectParseError(error.LimitRelayBuffersOverConnSlots, head ++ tail ++
+        "\"limits\":{\"conn_slots\":4,\"relay_buffers\":8}}");
 }
 
 test "config: unknown listener protocol fails loudly" {

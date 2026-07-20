@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
 
     try global_io.init(arena);
     var server: ServerXev = undefined;
-    try server.init(arena, &global_io, &config, .{});
+    try server.init(arena, &global_io, &config, config.limits);
     try server.start();
     installSignalHandlers();
 
@@ -77,9 +77,16 @@ fn ensureFdBudget() !void {
 fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
     const constants = zoxy.constants;
     const UpstreamType = zoxy.UpstreamPool(XevIo).Upstream;
+    // Pool memory reflects the *effective* limits (config may shrink the
+    // pools below the comptime ceilings, §5); fds and ring stay the
+    // comptime worst-case budgets — the asserted ceilings.
+    const limits = config.limits;
     const memory_total = constants.memoryBytesTotal(
+        limits.conn_slots,
         @sizeOf(ServerXev.ConnType),
+        limits.relay_buffers,
         @sizeOf(zoxy.RelayBuffer),
+        limits.upstream_slots,
         @sizeOf(UpstreamType),
     );
     var buffer: [1024]u8 = undefined;
@@ -95,11 +102,11 @@ fn printBudgets(io: std.Io, config: *const zoxy.config.Config) !void {
         \\
     , .{
         memory_total / 1024,
-        constants.conn_slots_max,
+        limits.conn_slots,
         @sizeOf(ServerXev.ConnType),
-        constants.relay_buffers_max,
+        limits.relay_buffers,
         @sizeOf(zoxy.RelayBuffer),
-        constants.upstream_slots_max,
+        limits.upstream_slots,
         @sizeOf(UpstreamType),
         constants.fds_max,
         constants.ring_entries,

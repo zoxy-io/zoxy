@@ -26,7 +26,27 @@ const zoxy_http_port: u16 = 18181;
 const origin_port: u16 = 19180;
 const haproxy_port: u16 = 17180;
 const haproxy_http_port: u16 = 17181;
+const overload_http_port: u16 = 18291;
 const work_directory = ".zig-cache/zoxy-bench";
+
+/// The overload scenario's shape (§9): a second zoxy shrunk via the
+/// config `limits` block so offered load ≫ capacity is loopback-feasible,
+/// and a connection count far past its relay buffers so both §8 rungs
+/// fire — accept-RSTs at the conn wall, 503s at the relay-buffer rung.
+/// The 5xx witness is the thinnest gate (most excess dies at the conn
+/// wall first): if it flakes on a fast box, raise `overload_connections`
+/// or shrink `relay_buffers` rather than deleting the gate.
+const overload_limits = .{ .conn_slots = 64, .relay_buffers = 4, .upstream_slots = 8 };
+const overload_connections: u32 = 256;
+
+comptime {
+    // The scenario's premise, pinned: the offered connections must
+    // overwhelm the conn wall, and the relay rung must sit inside it so
+    // admitted requests still contend for buffers (the 503 witness).
+    assert(overload_connections > overload_limits.conn_slots);
+    assert(overload_limits.relay_buffers < overload_limits.conn_slots);
+    assert(overload_limits.relay_buffers >= 1);
+}
 
 const Flags = struct {
     rate: u64 = 20_000,
@@ -112,15 +132,165 @@ pub fn main(init: std.process.Init) !u8 {
     printMode("Connection: close", &close_mode);
     std.debug.print("zoxy RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
-    // Drain, not just death: SIGTERM and wait for a clean exit (§8).
-    try std.posix.kill(zoxy_child.id.?, .TERM);
-    const term = try zoxy_child.wait(io);
-    zoxy_running = false;
-    const drained_cleanly = term == .exited and term.exited == 0;
-    std.debug.print("zoxy drain: {s}\n", .{if (drained_cleanly) "clean exit" else "UNCLEAN"});
+    // The §9 overload scenario runs against its own shrunken zoxy — the
+    // primary is idle during it, so its RSS window stays clean.
+    const overload_ok = try runOverload(arena, io, &flags, origin_address, proxy_cpu);
 
-    const passed = benchPassed(rss_before_kb, rss_after_kb, &keep_alive, &close_mode, drained_cleanly);
+    const drained_cleanly = try drainChild(io, &zoxy_child, &zoxy_running, "zoxy");
+    const passed = benchPassed(rss_before_kb, rss_after_kb, &keep_alive, &close_mode, drained_cleanly) and
+        overload_ok;
     return if (passed) 0 else 1;
+}
+
+/// Drain, not just death (§8): SIGTERM, wait for a clean exit, report.
+/// Clears `running` so the caller's guarded defer cannot double-kill.
+fn drainChild(
+    io: Io,
+    child: *std.process.Child,
+    running: *bool,
+    label: []const u8,
+) !bool {
+    assert(label.len > 0);
+    assert(running.*);
+    try std.posix.kill(child.id.?, .TERM);
+    const term = try child.wait(io);
+    running.* = false;
+    const drained_cleanly = term == .exited and term.exited == 0;
+    std.debug.print("{s} drain: {s}\n", .{ label, if (drained_cleanly) "clean exit" else "UNCLEAN" });
+    return drained_cleanly;
+}
+
+/// The §9 overload scenario: offered load ≫ capacity against a zoxy
+/// whose pools are shrunk via the config `limits` block. Asserts the §8
+/// promise from the outside: flat memory, admitted work served (2xx),
+/// all excess shed with a correct status (5xx and accept-RSTs — the
+/// latter are the conn-slot wall, so zrk's connect errors are exempt
+/// from the health gate), bounded latency for what was admitted, and a
+/// clean drain. SIGUSR1 lands the counter dump in the run log first.
+fn runOverload(
+    arena: std.mem.Allocator,
+    io: Io,
+    flags: *const Flags,
+    origin_address: []const u8,
+    proxy_cpu: ?u16,
+) !bool {
+    assert(flags.duration_s >= 1);
+    assert(flags.rate >= 1);
+    var child = try spawnOverloadZoxy(arena, io, flags.zoxy_path, origin_address);
+    var running = true;
+    defer if (running) child.kill(io);
+    if (proxy_cpu) |cpu| {
+        affinity.pinChildTo(child.id.?, cpu);
+    }
+    _ = try awaitResponsive(arena, io, overload_http_port, "zoxy overload");
+
+    const rss_before_kb = try readRssKb(arena, io, child.id);
+    var config = benchConfig(overload_http_port, overload_connections, flags.rate);
+    config.duration_ns = flags.duration_s * std.time.ns_per_s;
+    const report = try zrk.runner.run(arena, io, &config, 0, null, null);
+    const rss_after_kb = try readRssKb(arena, io, child.id);
+
+    std.debug.print("-- overload (offered >> capacity) --\n", .{});
+    printReport("zoxy overload", &report);
+    std.debug.print("zoxy overload RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
+
+    // The counter dump (sheds, pressure engagements) lands in the run
+    // log for the human band review before the drain.
+    try std.posix.kill(child.id.?, .USR1);
+    const drained_cleanly = try drainChild(io, &child, &running, "zoxy overload");
+    return overloadPassed(rss_before_kb, rss_after_kb, &report, drained_cleanly);
+}
+
+/// The overload gates. Accept-RSTs (connect errors) are the conn-slot
+/// shed working as designed; read errors and timeouts are relay stalls
+/// and stay under 1% of completions — a shed must be fast and correct,
+/// never a hang.
+fn overloadPassed(
+    rss_before_kb: u64,
+    rss_after_kb: u64,
+    report: *const zrk.runner.Report,
+    drained_cleanly: bool,
+) bool {
+    assert(rss_before_kb > 0);
+    assert(rss_after_kb > 0);
+    const counters = &report.snapshot.counters;
+    const rss_flat = rss_after_kb <= rss_before_kb + 1024;
+    if (!rss_flat) {
+        std.debug.print("FAIL: overload zoxy RSS grew under overload\n", .{});
+    }
+    // Admitted work is served AND the excess is shed with a status: both
+    // ends of the §8 promise, witnessed in one run.
+    const served = counters.status_class[2] > 0;
+    if (!served) {
+        std.debug.print("FAIL: overload run served no 2xx at all\n", .{});
+    }
+    const shed_witnessed = counters.status_class[5] > 0;
+    if (!shed_witnessed) {
+        std.debug.print("FAIL: overload run witnessed no 5xx shed status\n", .{});
+    }
+    // Bounded latency for admitted work: every completion (2xx and fast
+    // 5xx sheds alike) landed within zrk's wire timeout, or it would be
+    // a timeout below, not a sample.
+    const stalls = counters.read_errors + counters.timeouts;
+    const stalls_ok = stalls * 100 <= counters.completed;
+    if (!stalls_ok) {
+        std.debug.print(
+            "FAIL: overload stall rate too high ({d} of {d} completed)\n",
+            .{ stalls, counters.completed },
+        );
+    }
+    if (!drained_cleanly) {
+        std.debug.print("FAIL: overload zoxy did not drain cleanly\n", .{});
+    }
+    return rss_flat and served and shed_witnessed and stalls_ok and drained_cleanly;
+}
+
+/// A second zoxy with its pools shrunk through the config `limits`
+/// block (§5) — the §8 rungs become reachable at loopback-feasible load.
+fn spawnOverloadZoxy(
+    arena: std.mem.Allocator,
+    io: Io,
+    zoxy_path: []const u8,
+    origin_address: []const u8,
+) !std.process.Child {
+    const config_path = work_directory ++ "/zoxy-overload.json";
+    const config_json = try std.fmt.allocPrint(arena,
+        \\{{
+        \\    "listeners": [
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
+        \\    ],
+        \\    "clusters": {{
+        \\        "origin": {{ "endpoints": ["{s}"] }}
+        \\    }},
+        \\    "timeouts": {{
+        \\        "connect_ms": 5000,
+        \\        "idle_ms": 60000,
+        \\        "drain_deadline_ms": 5000
+        \\    }},
+        \\    "limits": {{
+        \\        "conn_slots": {d},
+        \\        "relay_buffers": {d},
+        \\        "upstream_slots": {d}
+        \\    }}
+        \\}}
+        \\
+    , .{
+        overload_http_port,
+        origin_address,
+        overload_limits.conn_slots,
+        overload_limits.relay_buffers,
+        overload_limits.upstream_slots,
+    });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
+
+    return std.process.spawn(io, .{
+        .argv = &.{ zoxy_path, config_path },
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |err| {
+        std.debug.print("bench: could not spawn overload {s} ({t})\n", .{ zoxy_path, err });
+        return err;
+    };
 }
 
 /// Prove every path answers before measuring; the short probes double as

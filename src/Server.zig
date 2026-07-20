@@ -74,12 +74,10 @@ pub fn Server(comptime IoType: type) type {
         const Proxy = proxy.Proxy(IoType);
 
         /// Pool sizes are injectable so tests and the simulator can force
-        /// every exhaustion rung; production uses the §5 defaults.
-        pub const InitOptions = struct {
-            conn_slots: u32 = constants.conn_slots_max,
-            relay_buffers: u32 = constants.relay_buffers_max,
-            upstream_slots: u32 = constants.upstream_slots_max,
-        };
+        /// every exhaustion rung; production passes the config's resolved
+        /// `limits` (§5) — one type, so a new limit cannot silently
+        /// default in a hand-written bridge.
+        pub const InitOptions = config_module.Config.Limits;
 
         const ListenerState = struct {
             server: *Self,

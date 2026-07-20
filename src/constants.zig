@@ -231,21 +231,31 @@ comptime {
     ));
 }
 
-/// Total pool memory as a closed-form function of the limits. Slot sizes
-/// are runtime parameters because `Conn` is generic over the Io backend;
-/// the composition site passes `@sizeOf` of the concrete types and
-/// main.zig prints the result at startup (§5).
+/// Total pool memory as a closed-form function of the *effective* pool
+/// sizes (the config `limits` block may shrink them below the ceilings,
+/// §5). Slot sizes are runtime parameters because `Conn` is generic over
+/// the Io backend; the composition site passes `@sizeOf` of the concrete
+/// types and main.zig prints the result at startup.
 pub fn memoryBytesTotal(
+    conn_slots: u32,
     conn_bytes: u64,
+    relay_buffers: u32,
     relay_buffer_pair_bytes: u64,
+    upstream_slots: u32,
     upstream_bytes: u64,
 ) u64 {
+    assert(conn_slots >= 1);
+    assert(conn_slots <= conn_slots_max);
+    assert(relay_buffers >= 1);
+    assert(relay_buffers <= relay_buffers_max);
+    assert(upstream_slots >= 1);
+    assert(upstream_slots <= upstream_slots_max);
     assert(conn_bytes > 0);
     assert(relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
     assert(upstream_bytes >= head_bytes_max);
-    const total = conn_slots_max * conn_bytes +
-        relay_buffers_max * relay_buffer_pair_bytes +
-        upstream_slots_max * upstream_bytes;
+    const total = @as(u64, conn_slots) * conn_bytes +
+        @as(u64, relay_buffers) * relay_buffer_pair_bytes +
+        @as(u64, upstream_slots) * upstream_bytes;
     assert(total > 0);
     return total;
 }
@@ -274,12 +284,22 @@ test "budgets: memory total matches the closed form" {
     const conn_bytes: u64 = 10240;
     const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
     const upstream_bytes: u64 = head_bytes_max + 64;
-    const expected = @as(u64, conn_slots_max) * conn_bytes +
+    // At the ceilings and at a shrunken (config-limits) shape alike.
+    const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes;
+    try std.testing.expectEqual(expected_max, memoryBytesTotal(
+        conn_slots_max,
+        conn_bytes,
+        relay_buffers_max,
+        pair_bytes,
+        upstream_slots_max,
+        upstream_bytes,
+    ));
+    const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
     try std.testing.expectEqual(
-        expected,
-        memoryBytesTotal(conn_bytes, pair_bytes, upstream_bytes),
+        expected_small,
+        memoryBytesTotal(64, conn_bytes, 8, pair_bytes, 8, upstream_bytes),
     );
 }
 
