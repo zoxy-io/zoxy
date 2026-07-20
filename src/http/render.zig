@@ -165,12 +165,23 @@ fn appendEndToEndHeaders(
     const active_nominations =
         if (nominatesRealHeader(nominations)) nominations else nominations[0..0];
 
+    // Only `set`/`remove` edits suppress source copies; `add` never does.
+    // Decide once whether any suppressing edit exists, so a request with no
+    // edits — or only `add` edits — skips the per-header suppression scan.
+    var has_suppressing_edit = false;
+    for (edits) |edit| {
+        if (edit.kind != .add) {
+            has_suppressing_edit = true;
+            break;
+        }
+    }
+
     for (headers) |header| {
         assert(header.name.len >= 1);
         if (isHopByHop(header.name, active_nominations)) {
             continue;
         }
-        if (suppressedByEdit(header.name, edits)) {
+        if (has_suppressing_edit and suppressedByEdit(header.name, edits)) {
             continue;
         }
         try staging.append(header.name);

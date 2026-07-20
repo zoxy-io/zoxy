@@ -86,6 +86,7 @@ pub const ValidationError = error{
     FilterMethodUnknown,
     FilterHeaderMatchesOverLimit,
     FilterHeaderMatchKind,
+    FilterHeaderContainsEmpty,
     FilterHeaderNameInvalid,
     FilterHeaderNameReserved,
     FilterHeaderValueInvalid,
@@ -361,11 +362,14 @@ fn resolveFilters(
     protocol: Config.Listener.Protocol,
 ) ParseError![]const filter.Rule {
     const filters_json = listener_json.filters orelse return &.{};
+    // Any `filters` key on an l4 listener is a mistake — l4 relays bytes,
+    // there is no head to match on — so reject it whether the array is
+    // populated or (vacuously) empty, before the empty-array shortcut.
+    if (protocol == .l4) {
+        return error.ListenerL4Filters;
+    }
     if (filters_json.len == 0) {
         return &.{};
-    }
-    if (protocol == .l4) {
-        return error.ListenerL4Filters; // No head to match on.
     }
     if (filters_json.len > constants.filters_per_listener_max) {
         return error.FiltersOverLimit;
@@ -458,11 +462,20 @@ fn resolveHeaderMatches(
             }
             match.* = .{ .name = header_json.name, .kind = .present, .value = "" };
         } else if (header_json.equals) |value| {
+            // An `equals: ""` predicate is meaningful — a header present
+            // with an empty value — so the empty value is legal here.
             try validateHeaderValue(value);
             match.* = .{ .name = header_json.name, .kind = .equals, .value = value };
         } else {
-            try validateHeaderValue(header_json.contains.?);
-            match.* = .{ .name = header_json.name, .kind = .contains, .value = header_json.contains.? };
+            const needle = header_json.contains.?;
+            // A `contains: ""` needle would match every present header
+            // (`indexOf(x, "")` is always 0) — a degenerate `present` in
+            // disguise. Reject it so `contains` is always a real substring.
+            if (needle.len == 0) {
+                return error.FilterHeaderContainsEmpty;
+            }
+            try validateHeaderValue(needle);
+            match.* = .{ .name = header_json.name, .kind = .contains, .value = needle };
         }
     }
     assert(matches.len == headers_json.len);
@@ -506,14 +519,10 @@ fn resolveAction(action_json: *const ActionJson) ParseError!filter.Action {
         return .{ .reject = status };
     }
     if (action_json.header_set) |edit| {
-        try validateEditableHeaderName(edit.name);
-        try validateHeaderValue(edit.value);
-        return .{ .header_set = .{ .name = edit.name, .value = edit.value } };
+        return .{ .header_set = try resolveHeaderEdit(&edit) };
     }
     if (action_json.header_add) |edit| {
-        try validateEditableHeaderName(edit.name);
-        try validateHeaderValue(edit.value);
-        return .{ .header_add = .{ .name = edit.name, .value = edit.value } };
+        return .{ .header_add = try resolveHeaderEdit(&edit) };
     }
     if (action_json.header_remove) |name| {
         try validateEditableHeaderName(name);
@@ -525,12 +534,22 @@ fn resolveAction(action_json: *const ActionJson) ParseError!filter.Action {
     return .{ .rewrite_prefix = .{ .from = rewrite.from, .to = rewrite.to } };
 }
 
+/// Validate a name/value header edit shared by `header_set` and
+/// `header_add`: an editable (non-proxy-managed) RFC 9110 token name and an
+/// injection-safe field-value. Both actions carry the identical contract.
+fn resolveHeaderEdit(edit: *const HeaderEditJson) ParseError!filter.HeaderEdit {
+    try validateEditableHeaderName(edit.name);
+    try validateHeaderValue(edit.value);
+    return .{ .name = edit.name, .value = edit.value };
+}
+
 /// A header name must be a non-empty RFC 9110 token (no separators or
 /// controls), so an edit or match names a real, unambiguous header.
 fn validateHeaderName(name: []const u8) ParseError!void {
     if (name.len == 0) {
         return error.FilterHeaderNameInvalid;
     }
+    assert(name.len >= 1); // Past the empty guard: the token scan is non-empty.
     for (name) |byte| {
         if (!isTokenByte(byte)) {
             return error.FilterHeaderNameInvalid;
@@ -568,11 +587,11 @@ fn validateEditableHeaderName(name: []const u8) ParseError!void {
 /// (slice 3), so the compiled edit is proven injection-safe at load —
 /// the same "already safe" guarantee the canonical host/path keys carry.
 /// An empty value is legal. Applied to emitted values and, for symmetry,
-/// to the compared match values.
+/// to the compared match values. The per-byte test is the parser's own
+/// `isForwardableByte`, so a filter and the parser share one definition.
 fn validateHeaderValue(value: []const u8) ParseError!void {
     for (value) |byte| {
-        const legal = byte == '\t' or (byte >= ' ' and byte != 0x7f);
-        if (!legal) {
+        if (!parser.isForwardableByte(byte)) {
             return error.FilterHeaderValueInvalid;
         }
     }
@@ -982,6 +1001,10 @@ test "config: filter schema rejects malformed rules" {
     // L4 listener may not carry filters.
     try expectParseError(error.ListenerL4Filters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
         "\"filters\":[{\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // Even a vacuously empty filters array on l4 is a mistake — the key is
+    // meaningless there, and an empty array must not slip past the guard.
+    try expectParseError(error.ListenerL4Filters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
+        "\"filters\":[]}]," ++ tail);
     // A rule with no actions.
     try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}]," ++ tail);
     // An action object with no kind set.
@@ -994,6 +1017,9 @@ test "config: filter schema rejects malformed rules" {
     try expectParseError(error.FilterMethodUnknown, head ++ "{\"match\":{\"method\":[\"get\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
     // A header match with no predicate kind.
     try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A `contains` predicate with an empty needle: it would match every
+    // present header (a degenerate `present`), so it is rejected.
+    try expectParseError(error.FilterHeaderContainsEmpty, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\",\"contains\":\"\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
     // A non-canonical match path prefix.
     try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"match\":{\"path_prefix\":\"/a/../b\"},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
     // A header edit with an invalid header name.

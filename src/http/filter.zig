@@ -90,13 +90,19 @@ pub const AppliedHeaderEdit = struct {
 };
 
 /// The statuses a `reject` action may name — a subset of the §8 static
-/// responses that make sense as a policy verdict. Config rejects any
-/// other value at load, and `shed.staticResponse` must support each.
+/// responses that make sense as a policy verdict. This array is the single
+/// source of truth: config rejects any other value at load, the proxy's
+/// filter-reject dispatch matches on exactly this set, and
+/// `shed.staticResponse` must support each. Extend it in one place.
+pub const reject_statuses = [_]u16{ 400, 403, 404, 429 };
+
 pub fn isRejectStatus(status: u16) bool {
-    return switch (status) {
-        400, 403, 404, 429 => true,
-        else => false,
-    };
+    for (reject_statuses) |candidate| {
+        if (candidate == status) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// The parsed head a rule matches against, in the §7 canonical forms:
@@ -138,69 +144,73 @@ pub fn firstReject(rules: []const Rule, view: RequestView) ?u16 {
     return null;
 }
 
-/// The header edits of every rule that matches `view`, in rule-then-action
-/// order, written into `out` and returned as its filled prefix (§7).
-/// `reject`/`rewrite_prefix` actions are skipped — this collects only the
-/// header edits the renderer applies. The caller sizes `out` at
-/// `header_edits_max`, which config caps a listener's total header edits
-/// at, so a matching subset always fits: the write is asserted in bounds.
-/// Bounded loops over immutable arena data; no allocation. Called at render
-/// (a matched reject would already have stopped the request at routing, so
-/// here every matched rule forwards and its edits apply).
-pub fn collectHeaderEdits(
+/// What the render phase applies to a forwarded request: the first
+/// applicable path rewrite and the header edits of every matched rule.
+pub const Forward = struct {
+    /// First-applicable rewrite (see `collectForward`), or null.
+    rewrite: ?Rewrite,
+    /// Matched rules' header edits, in rule-then-action order.
+    edits: []const AppliedHeaderEdit,
+};
+
+/// One pass over the rules a request matches, producing everything the
+/// render phase needs (§7): the first applicable path rewrite and every
+/// matched rule's header edits. A single scan — reject is evaluated earlier
+/// at routing, before any resource is acquired, so the two render-phase
+/// concerns share one walk rather than two, and `matches` is evaluated once
+/// per rule.
+///
+/// The rewrite is first-applicable-wins: the first matching rule whose
+/// `rewrite_prefix.from` is a segment-prefix of the path, and it never
+/// chains — a later rule matched the original path, not the rewritten one,
+/// so chaining has no coherent meaning. Header edits, by contrast, gather
+/// from *every* matched rule. The caller sizes `out` at `header_edits_max`,
+/// which config caps a listener's total header edits at, so a matching
+/// subset always fits: the write is asserted in bounds. Bounded loops over
+/// immutable arena data; no allocation. Called at render (a matched reject
+/// would already have stopped the request at routing, so here every matched
+/// rule forwards).
+pub fn collectForward(
     rules: []const Rule,
     view: RequestView,
     out: []AppliedHeaderEdit,
-) []const AppliedHeaderEdit {
+) Forward {
     assert(view.path.len >= 1);
+    assert(view.path[0] == '/');
     assert(out.len <= constants.header_edits_max);
+    var rewrite: ?Rewrite = null;
     var count: usize = 0;
     for (rules) |rule| {
         if (!matches(rule.match, view)) {
             continue;
         }
-        for (rule.actions) |action| {
-            const edit: ?AppliedHeaderEdit = switch (action) {
-                .header_set => |e| .{ .kind = .set, .name = e.name, .value = e.value },
-                .header_add => |e| .{ .kind = .add, .name = e.name, .value = e.value },
-                .header_remove => |name| .{ .kind = .remove, .name = name, .value = "" },
-                .reject, .rewrite_prefix => null,
-            };
-            if (edit) |value| {
-                assert(count < out.len);
-                out[count] = value;
-                count += 1;
-            }
-        }
-    }
-    assert(count <= out.len);
-    return out[0..count];
-}
-
-/// The rewrite of the first matching rule whose `rewrite_prefix.from` is a
-/// segment-prefix of the forwarded path, or null (§7). First-applicable
-/// wins — like `firstReject`, and unlike the collected header edits — so a
-/// rewrite is predictable and never chains: a later rule matches on the
-/// original path, not the rewritten one, so chaining has no coherent
-/// meaning. Routing already chose the cluster from this same path; the
-/// rewrite changes only what is forwarded, never the route.
-pub fn firstRewrite(rules: []const Rule, view: RequestView) ?Rewrite {
-    assert(view.path.len >= 1);
-    assert(view.path[0] == '/');
-    for (rules) |rule| {
-        if (!matches(rule.match, view)) {
-            continue;
-        }
         for (rule.actions) |action| switch (action) {
-            .rewrite_prefix => |rewrite| {
-                if (router.prefixMatches(rewrite.from, view.path)) {
-                    return rewrite;
+            .header_set, .header_add, .header_remove => {
+                assert(count < out.len);
+                out[count] = appliedEdit(action);
+                count += 1;
+            },
+            .rewrite_prefix => |candidate| {
+                if (rewrite == null and router.prefixMatches(candidate.from, view.path)) {
+                    rewrite = candidate;
                 }
             },
-            .reject, .header_set, .header_add, .header_remove => {},
+            .reject => {},
         };
     }
-    return null;
+    assert(count <= out.len);
+    return .{ .rewrite = rewrite, .edits = out[0..count] };
+}
+
+/// Flatten a header-edit action into the renderer's `AppliedHeaderEdit`.
+/// The caller has already narrowed `action` to the three header kinds.
+fn appliedEdit(action: Action) AppliedHeaderEdit {
+    return switch (action) {
+        .header_set => |e| .{ .kind = .set, .name = e.name, .value = e.value },
+        .header_add => |e| .{ .kind = .add, .name = e.name, .value = e.value },
+        .header_remove => |name| .{ .kind = .remove, .name = name, .value = "" },
+        .reject, .rewrite_prefix => unreachable,
+    };
 }
 
 /// The forwarded path with `rewrite.from` replaced by `rewrite.to`, written
@@ -216,7 +226,7 @@ pub fn firstRewrite(rules: []const Rule, view: RequestView) ?Rewrite {
 /// is canonical by construction (canonical form preserves empty segments, so
 /// a second pass would not repair a `//` the join must never create).
 /// `Oversize` when a longer `to` overruns `out` — the §7 oversize verdict.
-/// `firstRewrite` already proved the prefix matches.
+/// `collectForward` already proved the prefix matches.
 pub fn rewritePath(rewrite: Rewrite, path: []const u8, out: []u8) error{Oversize}![]const u8 {
     assert(path.len >= 1);
     assert(path[0] == '/');
@@ -261,6 +271,8 @@ pub fn rewritePath(rewrite: Rewrite, path: []const u8, out: []u8) error{Oversize
 /// canonical forms (the path via the router's segment-boundary match, so
 /// filters and routing agree byte-for-byte).
 fn matches(match: Match, view: RequestView) bool {
+    assert(view.path.len >= 1);
+    assert(view.path[0] == '/'); // Canonical path — callers guarantee it.
     if (match.methods) |set| {
         if (!set.contains(view.method)) {
             return false;
@@ -290,6 +302,8 @@ fn matches(match: Match, view: RequestView) bool {
 /// byte-exact / by substring. Multiple headers of the same name each get
 /// a chance — the predicate holds if any does.
 fn headerMatches(header_match: HeaderMatch, headers: []const parser.Header) bool {
+    assert(header_match.name.len >= 1); // A validated RFC 9110 token.
+    assert(headers.len <= constants.headers_max);
     for (headers) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, header_match.name)) {
             continue;
@@ -297,17 +311,28 @@ fn headerMatches(header_match: HeaderMatch, headers: []const parser.Header) bool
         switch (header_match.kind) {
             .present => return true,
             .equals => if (std.mem.eql(u8, header.value, header_match.value)) return true,
-            .contains => if (std.mem.indexOf(u8, header.value, header_match.value) != null) return true,
+            // Config rejects an empty `contains` needle, so this is a real
+            // substring test — never the always-true `indexOf(x, "")`.
+            .contains => {
+                assert(header_match.value.len >= 1);
+                if (std.mem.indexOf(u8, header.value, header_match.value) != null) return true;
+            },
         }
     }
     return false;
 }
 
-test "filter: isRejectStatus admits the policy set only" {
-    try std.testing.expect(isRejectStatus(403));
-    try std.testing.expect(isRejectStatus(429));
+test "filter: isRejectStatus admits exactly the reject_statuses set" {
+    // Every member of the single-source-of-truth set is admitted.
+    for (reject_statuses) |status| {
+        try std.testing.expect(isRejectStatus(status));
+    }
     try std.testing.expect(!isRejectStatus(200));
+    try std.testing.expect(!isRejectStatus(500));
     try std.testing.expect(!isRejectStatus(503));
+    // Pin the documented set so a drift (and the proxy's matching dispatch)
+    // is caught here rather than at runtime.
+    try std.testing.expectEqualSlices(u16, &.{ 400, 403, 404, 429 }, &reject_statuses);
 }
 
 test "filter: firstReject matches on method, host, path, header" {
@@ -396,7 +421,7 @@ test "filter: an all-any match is unconditional; edit-only rules never reject" {
     }));
 }
 
-test "filter: collectHeaderEdits gathers matching rules' edits in order" {
+test "filter: collectForward gathers matching rules' edits in order" {
     const rules = [_]Rule{
         // Applies to every request: stamp a via header, drop cookies.
         .{ .match = .{}, .actions = &.{
@@ -404,7 +429,7 @@ test "filter: collectHeaderEdits gathers matching rules' edits in order" {
             .{ .header_remove = "Cookie" },
         } },
         // Applies only under /api: add a second via, and a reject that
-        // collectHeaderEdits must skip (it is not a header edit).
+        // collectForward must skip (it is not a header edit).
         .{ .match = .{ .path_prefix = "/api" }, .actions = &.{
             .{ .header_add = .{ .name = "X-Api", .value = "1" } },
             .{ .reject = 429 },
@@ -413,36 +438,38 @@ test "filter: collectHeaderEdits gathers matching rules' edits in order" {
     const empty: []const parser.Header = &.{};
     var buffer: [constants.header_edits_max]AppliedHeaderEdit = undefined;
 
-    // A /public request matches only the first rule: two edits.
-    const public = collectHeaderEdits(&rules, .{
+    // A /public request matches only the first rule: two edits, no rewrite.
+    const public = collectForward(&rules, .{
         .method = .get,
         .host = null,
         .path = "/public",
         .headers = empty,
     }, &buffer);
-    try std.testing.expectEqual(@as(usize, 2), public.len);
-    try std.testing.expectEqual(AppliedHeaderEdit.Kind.set, public[0].kind);
-    try std.testing.expectEqualStrings("X-Via", public[0].name);
-    try std.testing.expectEqual(AppliedHeaderEdit.Kind.remove, public[1].kind);
-    try std.testing.expectEqualStrings("Cookie", public[1].name);
+    try std.testing.expectEqual(@as(?Rewrite, null), public.rewrite);
+    try std.testing.expectEqual(@as(usize, 2), public.edits.len);
+    try std.testing.expectEqual(AppliedHeaderEdit.Kind.set, public.edits[0].kind);
+    try std.testing.expectEqualStrings("X-Via", public.edits[0].name);
+    try std.testing.expectEqual(AppliedHeaderEdit.Kind.remove, public.edits[1].kind);
+    try std.testing.expectEqualStrings("Cookie", public.edits[1].name);
 
     // A /api request matches both rules; the reject action is skipped, so
     // three header edits survive in rule-then-action order.
-    const api = collectHeaderEdits(&rules, .{
+    const api = collectForward(&rules, .{
         .method = .get,
         .host = null,
         .path = "/api/v1",
         .headers = empty,
     }, &buffer);
-    try std.testing.expectEqual(@as(usize, 3), api.len);
-    try std.testing.expectEqualStrings("X-Via", api[0].name);
-    try std.testing.expectEqualStrings("Cookie", api[1].name);
-    try std.testing.expectEqual(AppliedHeaderEdit.Kind.add, api[2].kind);
-    try std.testing.expectEqualStrings("X-Api", api[2].name);
+    try std.testing.expectEqual(@as(usize, 3), api.edits.len);
+    try std.testing.expectEqualStrings("X-Via", api.edits[0].name);
+    try std.testing.expectEqualStrings("Cookie", api.edits[1].name);
+    try std.testing.expectEqual(AppliedHeaderEdit.Kind.add, api.edits[2].kind);
+    try std.testing.expectEqualStrings("X-Api", api.edits[2].name);
 }
 
-test "filter: firstRewrite picks the first applicable rewrite only" {
+test "filter: collectForward picks the first applicable rewrite only" {
     const empty: []const parser.Header = &.{};
+    var buffer: [constants.header_edits_max]AppliedHeaderEdit = undefined;
     const rules = [_]Rule{
         // Matches, but its rewrite's `from` is not a prefix of the path —
         // skipped, so the scan continues to the next rule.
@@ -458,23 +485,25 @@ test "filter: firstRewrite picks the first applicable rewrite only" {
             .{ .rewrite_prefix = .{ .from = "/api", .to = "/v3" } },
         } },
     };
-    const hit = firstRewrite(&rules, .{
+    const hit = collectForward(&rules, .{
         .method = .get,
         .host = null,
         .path = "/api/users",
         .headers = empty,
-    });
-    try std.testing.expect(hit != null);
-    try std.testing.expectEqualStrings("/api", hit.?.from);
-    try std.testing.expectEqualStrings("/v2", hit.?.to);
+    }, &buffer);
+    try std.testing.expect(hit.rewrite != null);
+    try std.testing.expectEqualStrings("/api", hit.rewrite.?.from);
+    try std.testing.expectEqualStrings("/v2", hit.rewrite.?.to);
+    try std.testing.expectEqual(@as(usize, 0), hit.edits.len); // rewrite-only rules
 
     // No rewrite's `from` prefixes a /public path → null.
-    try std.testing.expectEqual(@as(?Rewrite, null), firstRewrite(&rules, .{
+    const miss = collectForward(&rules, .{
         .method = .get,
         .host = null,
         .path = "/public",
         .headers = empty,
-    }));
+    }, &buffer);
+    try std.testing.expectEqual(@as(?Rewrite, null), miss.rewrite);
 }
 
 test "filter: rewritePath is a segment-correct prefix replacement" {

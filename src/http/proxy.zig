@@ -155,13 +155,16 @@ pub fn Proxy(comptime IoType: type) type {
         /// a closed-set static response, all counted as one filter reject.
         fn respondFilter(server: *ServerType, conn: *ConnType, status: u16) void {
             assert(filter.isRejectStatus(status));
-            switch (status) {
-                400 => respond(server, conn, 400, "l7_filtered"),
-                403 => respond(server, conn, 403, "l7_filtered"),
-                404 => respond(server, conn, 404, "l7_filtered"),
-                429 => respond(server, conn, 429, "l7_filtered"),
-                else => unreachable,
+            // `respond` needs a comptime status to select its static
+            // response, so bridge the runtime status by matching it against
+            // the same closed set `filter.isRejectStatus` guards — one
+            // source of truth, no hand-kept switch to drift out of sync.
+            inline for (filter.reject_statuses) |candidate| {
+                if (status == candidate) {
+                    return respond(server, conn, candidate, "l7_filtered");
+                }
             }
+            unreachable;
         }
 
         /// The canonical bytes to forward for `request` (§7): origin-form
@@ -205,6 +208,12 @@ pub fn Proxy(comptime IoType: type) type {
             if (conn.filters.len == 0) {
                 return .{ .target = base, .edits = &.{} };
             }
+            // The canonical host is recomputed here, not reused from the
+            // route phase: on the dial path the route-phase view does not
+            // survive the connect await (its scratch is freed), and the
+            // render form differs from the routing keys anyway (the
+            // forwarded target keeps its query and asterisk-form). One
+            // canonicalization per phase — deliberately not shared.
             const host: ?[]const u8 = if (request.host) |raw|
                 parser.canonicalHost(raw, host_scratch)
             else
@@ -219,15 +228,16 @@ pub fn Proxy(comptime IoType: type) type {
                 .path = match_path,
                 .headers = request.headers,
             };
+            // One scan yields both the rewrite and the header edits (§7).
+            const forward = filter.collectForward(conn.filters, view, edit_buffer);
             // Rewrite only origin-form targets; asterisk-form names no path.
             var target = base;
             if (origin_form) {
-                if (filter.firstRewrite(conn.filters, view)) |rewrite| {
+                if (forward.rewrite) |rewrite| {
                     target.path = try filter.rewritePath(rewrite, base.path, rewrite_scratch);
                 }
             }
-            const edits = filter.collectHeaderEdits(conn.filters, view, edit_buffer);
-            return .{ .target = target, .edits = edits };
+            return .{ .target = target, .edits = forward.edits };
         }
 
         /// Policy gate, then the exchange's admission: tunnels and

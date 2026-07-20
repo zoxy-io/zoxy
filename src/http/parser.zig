@@ -1025,7 +1025,11 @@ fn versionFromRaw(raw_version: hparse.Version) Version {
     };
 }
 
-fn isForwardableByte(byte: u8) bool {
+/// True for a byte legal in a forwarded field-value (RFC 9110): VCHAR, SP,
+/// HTAB, or obs-text — never CR, LF, NUL, or another control. Public so the
+/// filter config compiler validates edit values against the exact set the
+/// parser enforces, one definition for both.
+pub fn isForwardableByte(byte: u8) bool {
     return byte == '\t' or (byte >= ' ' and byte != 0x7f);
 }
 
