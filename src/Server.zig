@@ -495,7 +495,9 @@ pub fn Server(comptime IoType: type) type {
             if (conn.upstream_socket) |socket| {
                 server.io.shutdown(socket, .both);
             }
-            if (conn.armed.connect) {
+            // A dial-timeout verdict (§8) may already have a cancel in
+            // flight; submitting a second would double-arm the op.
+            if (conn.armed.connect and !conn.armed.connect_cancel) {
                 conn.arm(&conn.op_connect_cancel, "connect_cancel");
                 server.io.connectCancel(
                     &conn.op_connect.completion,
@@ -682,9 +684,13 @@ pub fn Server(comptime IoType: type) type {
         /// answered gets the §8 request-deadline verdict — 504 instead of
         /// a silent teardown — with the deadline re-armed to bound the
         /// verdict's own delivery: a second expiry with the verdict still
-        /// pending falls through to teardown, the escape hatch. Every
-        /// other state (L4, head read's slowloris, the static-response
-        /// drain, a pending verdict) tears down as before.
+        /// pending falls through to teardown, the escape hatch. A timed-
+        /// out L7 dial earns the same verdict (RFC 9110 §15.6.5: no
+        /// timely response from the upstream — a connect that never
+        /// completes is exactly that) via the one connect cancel outside
+        /// teardown; a refused dial keeps its prompt 502. Every other
+        /// state (L4, head read's slowloris, the static-response drain, a
+        /// pending verdict) tears down as before.
         fn expireDeadline(server: *Self, conn: *ConnType) void {
             assert(!conn.isTearingDown());
             assert(!conn.armed.deadline); // Delivered; re-armed only below.
@@ -698,12 +704,46 @@ pub fn Server(comptime IoType: type) type {
                 Proxy.beginExpiry(server, conn);
                 return;
             }
+            if (conn.state == .l7_dialing and conn.l7.pending_verdict == .none) {
+                // At loop-rest a dialing L7 connection always has its
+                // connect in flight, no data ops, and no response byte.
+                assert(conn.armed.connect);
+                assert(!conn.armed.connect_cancel);
+                assert(!conn.l7.response_started);
+                conn.l7.pending_verdict = .gateway_timeout;
+                server.storeDeadline(conn, server.idleTimeoutMs());
+                server.armDeadline(conn);
+                conn.arm(&conn.op_connect_cancel, "connect_cancel");
+                server.io.connectCancel(
+                    &conn.op_connect.completion,
+                    &conn.op_connect_cancel.completion,
+                    ConnType,
+                    conn,
+                    onConnectCancel,
+                );
+                return;
+            }
             server.beginTeardown(conn);
         }
 
         fn onConnectCancel(conn: *ConnType) void {
             conn.delivered(&conn.op_connect_cancel, "connect_cancel");
-            conn.server.continueTeardown(conn);
+            if (conn.isTearingDown()) {
+                conn.server.continueTeardown(conn);
+                return;
+            }
+            // A §8 dial-timeout cancel: the connect completion itself
+            // carries the verdict (it may deliver before or after this
+            // one), so there is nothing to do here. The verdict is still
+            // pending, or the 504 answer is already under way.
+            assert(conn.state == .l7_dialing or conn.state == .l7_responding or
+                conn.state == .l7_draining_request);
+            // Still dialing implies the verdict is still pending: only the
+            // connect completion's divert clears it, and that divert
+            // leaves .l7_dialing in the same callback.
+            if (conn.state == .l7_dialing) {
+                assert(conn.l7.pending_verdict == .gateway_timeout);
+            }
         }
 
         fn onDeadlineCancel(conn: *ConnType) void {

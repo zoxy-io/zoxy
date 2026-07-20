@@ -332,6 +332,21 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_dialing);
+            if (conn.l7.pending_verdict != .none) {
+                // The §8 dial-timeout verdict: the deadline canceled this
+                // connect. Whatever the result — the expected Canceled, a
+                // genuine failure, or a success that raced the cancel —
+                // the dial is condemned; a socket that arrived anyway is
+                // attached so respond's upstream disposal closes it.
+                assert(conn.l7.pending_verdict == .gateway_timeout);
+                conn.l7.pending_verdict = .none;
+                if (result) |socket| {
+                    conn.upstream.?.socket = socket;
+                    conn.upstream_socket = socket;
+                } else |_| {}
+                respond(server, conn, 504, "l7_gateway_timeout");
+                return;
+            }
             const socket = result catch {
                 server.counters.increment("upstream_connect_failed");
                 respond(server, conn, 502, "l7_bad_gateway");

@@ -190,6 +190,9 @@ const Harness = struct {
             .partial_io = true,
             .connect_delay_ns_max = random.uintAtMost(u64, 5_000_000),
             .connect_refuse_percent = random.uintAtMost(u8, 20),
+            // A blackholed dial hangs until the connect deadline — the §8
+            // dial-timeout 504 path, exercised under schedule fuzz.
+            .connect_blackhole_percent = random.uintAtMost(u8, 10),
             .reset_percent = random.uintAtMost(u8, 10),
             .kernel_pressure_percent = random.uintAtMost(u8, 8),
         };

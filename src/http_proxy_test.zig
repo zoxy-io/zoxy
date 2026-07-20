@@ -1106,6 +1106,32 @@ test "l7: an unreachable origin is answered 502" {
     try bed.expectDrained();
 }
 
+test "l7: a dial that never completes is answered 504, not 502" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 74, .origin_listens = false });
+    defer bed.tearDown();
+
+    // A blackholed origin: the connect neither succeeds nor refuses, so
+    // only the connect deadline can end the dial — the §8 request-
+    // deadline verdict (RFC 9110 §15.6.5: no timely response from the
+    // upstream), distinct from the refused dial's prompt 502.
+    bed.sim_io.blackholeAddress(Http1Bed.originAddress());
+
+    try bed.exchange("GET /unreachable HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    // A timeout is not a dial failure: the counters stay orthogonal.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_gateway"));
+    try bed.expectDrained();
+}
+
 test "l7: rejects survive 1-byte adversarial delivery across seeds" {
     var seed: u64 = 1;
     while (seed <= 15) : (seed += 1) {
