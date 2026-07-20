@@ -71,7 +71,8 @@ constraints, not suggestions.
   in-flight completion must never be resubmitted — overlapping ops get their
   own completions.
 - **One ticking absolute-deadline timer per connection**; phase transitions
-  move the deadline. No cancel/re-arm races.
+  move the deadline — *later* for free, the single *earlier* move (an L7
+  dial tightening to the connect budget, §8) via a race-free cancel+re-arm.
 - **TCP_NODELAY always** — Nagle + delayed ACK cost warm pooled connections
   a hard 40 ms, invisible on fresh connections.
 - **Announce closes** (`Connection: close` injection per RFC 9112 §9.6) or
@@ -314,7 +315,13 @@ unmerged behind it, so the pin moves only after re-audit.
   stored deadline against `Io.now_ns`: not yet due → re-arm for the
   remainder with a fresh submit (libxev's `.rearm` return reuses the
   stale absolute time and is never used); due → the deadline action.
-  **Teardown is the one place a timer is canceled** (§5 release rule).
+  A timer is canceled in exactly **two** places: teardown (§5 release
+  rule) and an L7 dial that re-bases the head-read deadline *down* to the
+  tighter connect budget (§8) — the lazy rule moves a deadline later for
+  free but must cancel+re-arm to move it earlier. Both drain race-free:
+  the cancel op and the timer's own Canceled both land, whichever is last
+  re-arms at the stored target, and a teardown that overtakes an in-flight
+  re-base drains it through the same `isTearingDown` checks.
   libxev cancellation is internally cancel+resubmit and consumes its own
   caller-owned completion, embedded in the slot like every other op.
 - **Plain ops only.** Multishot accept/recv, buffer rings, `send_zc`,
@@ -383,7 +390,8 @@ Rules:
 - **A slot is released only when its armed-op set is empty.** Every op
   references a completion embedded in the slot, and the slot header
   tracks which are armed. Teardown is a *state*, not an event: shutdown
-  both fds, cancel the timer (the one legal cancel, §4), then wait — the
+  both fds, cancel the timer (§4 — teardown and the §8 dial re-base are
+  the only cancels), then wait — the
   last terminal completion (success, error, or cancellation) releases
   the slot. An active completion is never resubmitted (libxev's
   intrusive queues corrupt on re-enqueue), and LIFO reuse turns a

@@ -361,6 +361,10 @@ const Http1Bed = struct {
     drain_timer_completion: SimIo.Completion,
 
     const idle_timeout_ms: u32 = 1000;
+    /// Deliberately 20× tighter than the idle timeout so a test can witness
+    /// the §8 dial re-base: a hung L7 dial must fire 504 at this budget, not
+    /// the far looser head-read/idle deadline (finding #1).
+    const connect_timeout_ms: u32 = 50;
 
     fn bindAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
@@ -418,7 +422,7 @@ const Http1Bed = struct {
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
-            .connect_timeout_ms = 50,
+            .connect_timeout_ms = connect_timeout_ms,
             .idle_timeout_ms = idle_timeout_ms,
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = 0,
@@ -1129,7 +1133,7 @@ test "l7: an unreachable origin is answered 502" {
     try bed.expectDrained();
 }
 
-test "l7: a dial that never completes is answered 504, not 502" {
+test "l7: a hung dial fires 504 at the connect budget, not the idle timeout" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{ .seed = 74, .origin_listens = false });
     defer bed.tearDown();
@@ -1140,6 +1144,7 @@ test "l7: a dial that never completes is answered 504, not 502" {
     // upstream), distinct from the refused dial's prompt 502.
     bed.sim_io.blackholeAddress(Http1Bed.originAddress());
 
+    const start_ns = bed.sim_io.nowNs();
     try bed.exchange("GET /unreachable HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
@@ -1152,6 +1157,12 @@ test "l7: a dial that never completes is answered 504, not 502" {
     // A timeout is not a dial failure: the counters stay orthogonal.
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_connect_failed"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_gateway"));
+    // Finding #1 (§8): the dial re-bases the head-read/idle timer to the
+    // per-try connect budget, so the verdict lands at connect_timeout_ms —
+    // never the 20×-looser idle_timeout_ms the head read was armed under.
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms >= Http1Bed.connect_timeout_ms);
+    try std.testing.expect(elapsed_ms < Http1Bed.idle_timeout_ms);
     try bed.expectDrained();
 }
 

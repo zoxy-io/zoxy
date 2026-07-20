@@ -509,7 +509,11 @@ pub fn Server(comptime IoType: type) type {
             if (conn.armed.connect and !conn.armed.connect_cancel) {
                 server.armConnectCancel(conn);
             }
-            if (conn.armed.deadline) {
+            // A dial rebase (§8) may already have this timer's cancel in
+            // flight (onDeadlineRebase); submitting a second would double-arm
+            // the op. Its drain routes to teardown via the isTearingDown
+            // checks, so teardown needs no cancel of its own here.
+            if (conn.armed.deadline and !conn.armed.deadline_cancel) {
                 conn.arm(&conn.op_deadline_cancel, "deadline_cancel");
                 server.io.timerCancel(
                     &conn.op_deadline.completion,
@@ -749,6 +753,35 @@ pub fn Server(comptime IoType: type) type {
             );
         }
 
+        /// Re-base the armed deadline to the freshly stored (earlier) target
+        /// (§8): the single lazy timer never moves *earlier* once armed (§4),
+        /// so an L7 dial needing a tighter per-try connect budget than the
+        /// head-read timer cancels it here — the one deadline cancel outside
+        /// teardown. onDeadlineRebase and onDeadline re-arm at the stored
+        /// target once both the cancel and the timer's Canceled have drained
+        /// (so the cancel cannot match the fresh timer). A path that already
+        /// delivered the timer has no armed op to re-base, so it arms fresh.
+        pub fn rebaseDeadline(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .l7_dialing);
+            // A prior dial's rebase cancel can still be draining if the
+            // exchange outran it across a keep-alive turnaround. It re-arms
+            // the timer at the target this dial just stored (deadline_ns is
+            // shared), so defer — a second cancel would double-arm the op.
+            if (conn.armed.deadline_cancel) return;
+            if (!conn.armed.deadline) {
+                server.armDeadline(conn);
+                return;
+            }
+            conn.arm(&conn.op_deadline_cancel, "deadline_cancel");
+            server.io.timerCancel(
+                &conn.op_deadline.completion,
+                &conn.op_deadline_cancel.completion,
+                ConnType,
+                conn,
+                onDeadlineRebase,
+            );
+        }
+
         /// Lazy tick-and-compare (§4): the stored deadline is the truth;
         /// a fire before it is due re-arms for the remainder.
         fn onDeadline(conn: *ConnType, result: Io.TimerError!void) void {
@@ -763,15 +796,48 @@ pub fn Server(comptime IoType: type) type {
                 }
                 if (server.io.nowNs() >= conn.deadline_ns) {
                     server.expireDeadline(conn);
-                } else {
+                } else if (!conn.armed.deadline_cancel) {
                     server.armDeadline(conn);
                 }
+                // else: a rebase cancel (§8) is in flight (an idle timer that
+                // fired as the dial re-based it under pressure); onDeadline-
+                // Rebase re-arms once it drains, so no fresh timer is left for
+                // the cancel to match.
             } else |err| {
                 assert(err == error.Canceled);
-                // The deadline is not a blocking op, so its Canceled
-                // delivery can arrive after closes were submitted (.closing).
-                assert(conn.isTearingDown());
+                if (conn.isTearingDown()) {
+                    // The deadline is not a blocking op, so its Canceled
+                    // delivery can arrive after closes were submitted
+                    // (.closing).
+                    server.continueTeardown(conn);
+                    return;
+                }
+                // A live Canceled means a dialUpstream rebase (§8) shortened
+                // this timer to the per-try connect budget — the one deadline
+                // cancel outside teardown. Re-arm at the stored target, but
+                // only once the cancel op has drained, so the cancel cannot
+                // match the fresh timer; otherwise onDeadlineRebase re-arms.
+                if (!conn.armed.deadline_cancel) {
+                    server.armDeadline(conn);
+                }
+            }
+        }
+
+        /// The rebase cancel's completion (§8): dialUpstream canceled the
+        /// armed head-read timer so a dial could re-base the deadline to the
+        /// tighter connect budget. This cancel and the timer's own Canceled
+        /// delivery both land; whichever arrives second (its sibling op now
+        /// free) re-arms at the stored target. Teardown overtakes both via
+        /// the isTearingDown drain, leaving the timer down for the closes.
+        fn onDeadlineRebase(conn: *ConnType) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_deadline_cancel, "deadline_cancel");
+            if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
+                return;
+            }
+            if (!conn.armed.deadline) {
+                server.armDeadline(conn);
             }
         }
 

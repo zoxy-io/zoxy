@@ -321,7 +321,12 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 503, "l7_shed_upstream_slots");
             };
             conn.state = .l7_dialing;
+            // The head-read/idle timer is already armed; re-base it to the
+            // tighter per-try connect budget so a hung origin fires the §8
+            // 504 at connect_timeout, not idle_timeout (§4: the lazy timer
+            // never moves earlier on its own).
             server.storeDeadline(conn, server.config.connect_timeout_ms);
+            server.rebaseDeadline(conn);
             conn.arm(&conn.op_connect, "connect");
             server.io.connect(
                 pick.address,
@@ -1178,7 +1183,15 @@ pub fn Proxy(comptime IoType: type) type {
         fn resetForNextRequest(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             assert(conn.upstream == null);
-            assert(conn.armedCount() <= 1); // Only the deadline timer.
+            // The exchange is fully settled: no data or dial ops in flight.
+            // The lazy deadline timer stays armed across the turnaround (§4),
+            // and a dial rebase (§8) cancel may still be draining if the
+            // exchange outran it — both re-establish the next idle deadline.
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.armed.connect);
+            assert(!conn.armed.connect_cancel);
+            assert(conn.armed.deadline or conn.armed.deadline_cancel);
             server.releaseRelayBuffer(conn.relay_buffer.?);
             conn.relay_buffer = null;
             conn.head_len = 0;
