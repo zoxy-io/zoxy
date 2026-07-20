@@ -120,6 +120,7 @@ const Harness = struct {
     clusters: [2]zoxy.config.Config.Cluster,
     routes_l4: [1]zoxy.http.router.Route,
     routes_http: [1]zoxy.http.router.Route,
+    filters_http: [3]zoxy.http.filter.Rule,
     listener_configs: [2]zoxy.config.Config.Listener,
     config: zoxy.config.Config,
     origin: Origin,
@@ -203,9 +204,32 @@ const Harness = struct {
         };
         harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
         harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
+        // §7 filters on the HTTP listener, one action each, scoped to a
+        // distinct path so they fire only for the filter_* scripts and
+        // leave every other script's golden outcome untouched: reject
+        // `/reject`, add a header under `/edit`, rewrite `/rewrite` → `/sim`.
+        harness.filters_http = .{
+            .{
+                .match = .{ .path_prefix = "/reject" },
+                .actions = &.{.{ .reject = 403 }},
+            },
+            .{
+                .match = .{ .path_prefix = "/edit" },
+                .actions = &.{.{ .header_set = .{ .name = "X-Sim-Filter", .value = "on" } }},
+            },
+            .{
+                .match = .{ .path_prefix = "/rewrite" },
+                .actions = &.{.{ .rewrite_prefix = .{ .from = "/rewrite", .to = "/sim" } }},
+            },
+        };
         harness.listener_configs = .{
             .{ .bind_address = bindAddress(), .routes = &harness.routes_l4, .protocol = .l4 },
-            .{ .bind_address = httpBindAddress(), .routes = &harness.routes_http, .protocol = .http },
+            .{
+                .bind_address = httpBindAddress(),
+                .routes = &harness.routes_http,
+                .filters = &harness.filters_http,
+                .protocol = .http,
+            },
         };
         harness.config = .{
             .listeners = &harness.listener_configs,

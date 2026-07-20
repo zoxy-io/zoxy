@@ -886,6 +886,74 @@ test "l7: a filter rewrite changes only the forwarded path, not the route" {
     try bed.expectDrained();
 }
 
+test "l7: a header edit reaches the origin exactly once under adversarial delivery" {
+    // The §9 "edit reaches the origin exactly once" oracle under 1-byte
+    // adversarial fragmentation across seeds: no fragmentation may drop,
+    // duplicate, or corrupt the injected header.
+    const rules = [_]filter.Rule{.{
+        .match = .{},
+        .actions = &.{.{ .header_set = .{ .name = "X-Env", .value = "prod" } }},
+    }};
+    var seed: u64 = 50;
+    while (seed < 54) : (seed += 1) {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = seed,
+            .partial_io = true,
+            .filters = &rules,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nX-Env: dev\r\nConnection: close\r\n\r\n");
+
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+        var storage: parser.HeaderStorage = undefined;
+        const forwarded = try parser.parseRequestHead(
+            bed.origin.conn.request_buffer[0..bed.origin.conn.request_len],
+            false,
+            &storage,
+        );
+        // The client sent dev; the edit replaced it with exactly one prod.
+        try std.testing.expectEqualStrings("prod", parser.headerValue(forwarded.headers, "x-env").?);
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a path rewrite forwards the rewritten path under adversarial delivery" {
+    // The §9 "path edit reaches the origin" oracle under 1-byte adversarial
+    // fragmentation across seeds: the origin sees the canonical rewritten
+    // path, whole, however the head was chopped up.
+    const rules = [_]filter.Rule{.{
+        .match = .{},
+        .actions = &.{.{ .rewrite_prefix = .{ .from = "/old", .to = "/new" } }},
+    }};
+    var seed: u64 = 60;
+    while (seed < 64) : (seed += 1) {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = seed,
+            .partial_io = true,
+            .filters = &rules,
+            .route_prefix = "/old",
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /old/x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+        var storage: parser.HeaderStorage = undefined;
+        const forwarded = try parser.parseRequestHead(
+            bed.origin.conn.request_buffer[0..bed.origin.conn.request_len],
+            false,
+            &storage,
+        );
+        try std.testing.expectEqualStrings("/new/x", forwarded.target);
+        try bed.expectDrained();
+    }
+}
+
 test "l7: an HTTP/1.0 request with no Host matches only any-host routes" {
     // Any-host route (the default): a Host-less HTTP/1.0 request still
     // routes.

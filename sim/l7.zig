@@ -521,6 +521,18 @@ pub const Script = enum(u8) {
     /// `/sim` would; the origin's canonical oracle catches a raw-path
     /// forward, and a router matching raw bytes would route it elsewhere.
     confusion,
+    /// A GET under `/reject`: a §7 filter rejects it with 403 before any
+    /// resource is acquired or origin dialed. The golden outcome is exactly
+    /// that 403, and the origin must never see the request.
+    filter_reject,
+    /// A GET under `/edit`: a §7 filter adds a header to the forwarded
+    /// request. It routes and succeeds (200); the origin's §7 oracle proves
+    /// the edited head still forwards canonical.
+    filter_edit,
+    /// A GET under `/rewrite`: a §7 filter rewrites the forwarded path to
+    /// `/sim`. It routes on the original path and succeeds (200); the
+    /// origin sees a canonical rewritten path, never `//`-merged.
+    filter_rewrite,
 };
 
 /// A verify-time verdict over everything the client received.
@@ -627,6 +639,11 @@ pub fn Client(comptime IoType: type) type {
                 // Canonicalizes to /sim (the `/deep` segment is popped by
                 // the decoded `..`), so it routes and forwards as /sim.
                 .confusion => "GET /deep/%2e%2e/sim HTTP/1.1\r\nHost: sim\r\n\r\n",
+                // §7 filter scripts: a distinct path per action so the
+                // listener's rules fire only for these, never the others.
+                .filter_reject => "GET /reject HTTP/1.1\r\nHost: sim\r\n\r\n",
+                .filter_edit => "GET /edit HTTP/1.1\r\nHost: sim\r\n\r\n",
+                .filter_rewrite => "GET /rewrite HTTP/1.1\r\nHost: sim\r\n\r\n",
             };
         }
 
@@ -1015,6 +1032,7 @@ pub fn Client(comptime IoType: type) type {
                 .get, .post_sized, .post_big, .post_chunked, .confusion => 1,
                 .post_chunked_malformed, .malformed_head => 1,
                 .oversize_uri, .connect_method, .pipelined => 1,
+                .filter_reject, .filter_edit, .filter_rewrite => 1,
                 .keepalive_pair => 2,
                 .silent => 0,
             };
@@ -1040,6 +1058,10 @@ pub fn Client(comptime IoType: type) type {
         fn goldenStatus(script: Script) u16 {
             return switch (script) {
                 .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined, .confusion => 200,
+                // The edit and rewrite scripts route and succeed; only the
+                // reject script's golden verdict is its 403.
+                .filter_edit, .filter_rewrite => 200,
+                .filter_reject => 403,
                 .post_chunked_malformed, .malformed_head => 400,
                 .oversize_uri => 414,
                 .connect_method => 501,
@@ -1056,6 +1078,7 @@ pub fn Client(comptime IoType: type) type {
                 .post_sized, .post_big, .post_chunked, .post_chunked_malformed => .post,
                 .get, .malformed_head, .oversize_uri, .confusion => .get,
                 .connect_method, .keepalive_pair, .pipelined, .silent => .get,
+                .filter_reject, .filter_edit, .filter_rewrite => .get,
             };
         }
 
@@ -1068,9 +1091,23 @@ pub fn Client(comptime IoType: type) type {
             return switch (script) {
                 .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined, .confusion => //
                 status == 200 or status == 502 or status == 503,
-                // The head routes before its body is validated, so the §8
-                // rungs and a killed dial can still precede the 400.
-                .post_chunked_malformed => status == 400 or status == 502 or status == 503,
+                // Edit and rewrite route and forward like a plain GET, so
+                // the §8 rungs and a killed dial can precede the 200.
+                .filter_edit, .filter_rewrite => status == 200 or status == 502 or status == 503,
+                // A reject is answered before any resource is acquired or
+                // origin dialed, so no §8 rung or dial failure can precede
+                // it — the only complete verdict is the 403.
+                .filter_reject => status == 403,
+                // The head routes and forwards before its body is
+                // validated, so several outcomes can precede the 400: the §8
+                // rungs, a killed dial, and — the subtlety — an early origin
+                // response. An instant origin answers 200 before the proxy
+                // ever pumps the malformed body (which it then contains,
+                // never forwarding it: the origin's §7 oracle still holds).
+                // Clean seeds pin the origin to `sized`, so they never race
+                // it and `goldenStatus` still demands the exact 400 there.
+                .post_chunked_malformed => //
+                status == 400 or status == 200 or status == 502 or status == 503,
                 .malformed_head => status == 400,
                 .oversize_uri => status == 414,
                 .connect_method => status == 501,
