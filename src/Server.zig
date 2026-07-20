@@ -114,7 +114,7 @@ pub fn Server(comptime IoType: type) type {
             try server.upstreams.init(arena, options.upstream_slots);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
-            try server.balancer.init(arena, config);
+            server.balancer.init(config);
             server.counters = .{};
             server.draining = false;
             server.relay_pressure = false;
@@ -443,8 +443,11 @@ pub fn Server(comptime IoType: type) type {
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
             conn.arm(&conn.op_connect, "connect");
+            // L4 dials hold no Upstream slot, so the load table reflects
+            // L7 leases only — the P2C draw still spreads L4 dials by the
+            // observed L7 load, and evenly when there is none.
             server.io.connect(
-                server.balancer.pick(cluster_index).address,
+                server.balancer.pick(cluster_index, &server.upstreams.leased_counts).address,
                 &conn.op_connect.completion,
                 ConnType,
                 conn,

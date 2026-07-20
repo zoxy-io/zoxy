@@ -290,7 +290,7 @@ pub fn Proxy(comptime IoType: type) type {
             // beats a fresh dial. A close that slipped through while it
             // was parked surfaces as a failure on first use — answered
             // 502 until Phase 2's free replay (docs/PLANS.md).
-            const pick = server.balancer.pick(conn.cluster_index);
+            const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 conn.upstream = parked;

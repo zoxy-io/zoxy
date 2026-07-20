@@ -23,7 +23,7 @@ const idle_none: u32 = std.math.maxInt(u32);
 
 /// Idle lists are indexed by the flattened endpoint key, so the head
 /// array covers the worst-case config shape.
-const endpoint_keys_max: u32 =
+pub const endpoint_keys_max: u32 =
     @as(u32, constants.clusters_max) * constants.endpoints_per_cluster_max;
 
 pub fn UpstreamPool(comptime IoType: type) type {
@@ -32,6 +32,11 @@ pub fn UpstreamPool(comptime IoType: type) type {
         idle_heads: [endpoint_keys_max]u32,
         /// Parked slots across all endpoints; leased = acquired − idle.
         idle_count: u32,
+        /// Slots leased per endpoint — the §7 P2C load signal: a lease
+        /// is a request in flight against that endpoint, so the balancer
+        /// compares two candidates' counts and picks the calmer one.
+        /// u16 holds the whole pool (`upstream_slots_max` ≤ 65535).
+        leased_counts: [endpoint_keys_max]u16,
 
         const Self = @This();
 
@@ -74,6 +79,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             try pool.slot_pool.init(arena, count);
             @memset(&pool.idle_heads, idle_none);
             pool.idle_count = 0;
+            @memset(&pool.leased_counts, 0);
             assert(pool.slot_pool.slots.len == count);
             assert(pool.leasedCount() == 0);
         }
@@ -92,6 +98,9 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.idle_prev = idle_none;
             upstream.head_len = 0;
             upstream.deadline_ns = 0;
+            const key = endpointKey(cluster_index, endpoint_index);
+            pool.leased_counts[key] += 1;
+            assert(pool.leased_counts[key] <= pool.slot_pool.slots.len);
             assert(pool.idle_count < pool.slot_pool.acquired_count);
             return upstream;
         }
@@ -113,6 +122,10 @@ pub fn UpstreamPool(comptime IoType: type) type {
             pool.idle_heads[key] = index;
             upstream.parked = true;
             pool.idle_count += 1;
+            // Parked is not leased: the P2C load signal counts only slots
+            // actually serving a request.
+            assert(pool.leased_counts[key] >= 1);
+            pool.leased_counts[key] -= 1;
             assert(pool.idle_count <= pool.slot_pool.acquired_count);
         }
 
@@ -156,6 +169,10 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.idle_prev = idle_none;
             upstream.parked = false;
             pool.idle_count -= 1;
+            // Back to leased — both for a checkout (serving again) and,
+            // transiently, for the reap path (its release decrements).
+            pool.leased_counts[key] += 1;
+            assert(pool.leased_counts[key] <= pool.slot_pool.slots.len);
         }
 
         /// Returns a leased slot to the free list at connection
@@ -165,6 +182,9 @@ pub fn UpstreamPool(comptime IoType: type) type {
             assert(!upstream.parked);
             assert(upstream.idle_next == idle_none);
             assert(upstream.idle_prev == idle_none);
+            const key = endpointKey(upstream.cluster_index, upstream.endpoint_index);
+            assert(pool.leased_counts[key] >= 1);
+            pool.leased_counts[key] -= 1;
             pool.slot_pool.release(upstream);
             assert(pool.idle_count <= pool.slot_pool.acquired_count);
         }
@@ -184,7 +204,9 @@ pub fn UpstreamPool(comptime IoType: type) type {
     };
 }
 
-fn endpointKey(cluster_index: u16, endpoint_index: u16) u32 {
+/// Flattened per-endpoint key into `idle_heads`/`leased_counts`. Public so
+/// the balancer indexes the same load table the pool maintains (§7 P2C).
+pub fn endpointKey(cluster_index: u16, endpoint_index: u16) u32 {
     assert(cluster_index < constants.clusters_max);
     assert(endpoint_index < constants.endpoints_per_cluster_max);
     return @as(u32, cluster_index) * constants.endpoints_per_cluster_max + endpoint_index;
@@ -310,6 +332,47 @@ test "upstream: exhaustion is a shed signal, parked slots stay counted" {
     pool.release(first);
     try std.testing.expectEqual(second, pool.checkout(0, 1).?);
     pool.release(second);
+    try std.testing.expect(pool.isFullyReleased());
+}
+
+test "upstream: leased counts track every lease transition per endpoint" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var pool: TestPool = undefined;
+    try pool.init(arena_state.allocator(), 4);
+    const key_a = endpointKey(0, 0);
+    const key_b = endpointKey(0, 1);
+
+    // Fresh dials lease against their own endpoints.
+    const first = pool.acquire(0, 0).?;
+    const second = pool.acquire(0, 0).?;
+    const other = pool.acquire(0, 1).?;
+    try std.testing.expectEqual(@as(u16, 2), pool.leased_counts[key_a]);
+    try std.testing.expectEqual(@as(u16, 1), pool.leased_counts[key_b]);
+
+    // Parking returns the lease; checkout takes it again.
+    pool.park(first);
+    try std.testing.expectEqual(@as(u16, 1), pool.leased_counts[key_a]);
+    const reused = pool.checkout(0, 0).?;
+    try std.testing.expectEqual(first, reused);
+    try std.testing.expectEqual(@as(u16, 2), pool.leased_counts[key_a]);
+
+    // The reap path (unpark from parked, then release) nets to zero.
+    pool.park(second);
+    try std.testing.expectEqual(@as(u16, 1), pool.leased_counts[key_a]);
+    pool.unpark(second);
+    try std.testing.expectEqual(@as(u16, 2), pool.leased_counts[key_a]);
+    pool.release(second);
+    try std.testing.expectEqual(@as(u16, 1), pool.leased_counts[key_a]);
+
+    // Releases drain both endpoints back to zero, agreeing with the
+    // pool-wide count the whole way down.
+    try std.testing.expectEqual(pool.leasedCount(), @as(u32, pool.leased_counts[key_a]) +
+        pool.leased_counts[key_b]);
+    pool.release(reused);
+    pool.release(other);
+    try std.testing.expectEqual(@as(u16, 0), pool.leased_counts[key_a]);
+    try std.testing.expectEqual(@as(u16, 0), pool.leased_counts[key_b]);
     try std.testing.expect(pool.isFullyReleased());
 }
 

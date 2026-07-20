@@ -59,6 +59,16 @@ pub const Config = struct {
     pub const Cluster = struct {
         name: []const u8,
         endpoints: []const std.Io.net.IpAddress,
+        /// The §7 endpoint-pick policy the balancer runs for this
+        /// cluster. The JSON field is optional and defaults to `p2c` —
+        /// the design's trajectory (§7: round-robin → P2C) — with `rr`
+        /// kept for strict rotation (predictable spread, cache warming).
+        pick: Pick = .p2c,
+
+        pub const Pick = enum(u1) {
+            rr,
+            p2c,
+        };
     };
 };
 
@@ -73,6 +83,7 @@ pub const ValidationError = error{
     ClustersEmpty,
     ClustersOverLimit,
     ClusterNameDuplicate,
+    ClusterPickUnknown,
     ListenerClusterOrRoutes,
     ListenerL4Routes,
     RoutesEmpty,
@@ -200,6 +211,9 @@ const RouteJson = struct {
 
 const ClusterJson = struct {
     endpoints: []const []const u8,
+    /// Optional §7 pick policy; absent means `p2c` (the design's
+    /// trajectory), `rr` opts back into strict rotation.
+    pick: []const u8 = "p2c",
 };
 
 const TimeoutsJson = struct {
@@ -286,6 +300,7 @@ fn resolveClusters(
         clusters[index] = .{
             .name = entry.name,
             .endpoints = try resolveEndpoints(arena, entry.cluster.endpoints),
+            .pick = try pickOf(entry.cluster.pick),
         };
     }
     assert(clusters.len == count);
@@ -725,6 +740,18 @@ fn validateRoutePrefix(prefix: []const u8) ParseError!void {
     }
 }
 
+/// The closed pick-policy vocabulary; anything else is its own error so
+/// a typo ("pc2") fails loudly instead of silently balancing as p2c.
+fn pickOf(literal: []const u8) error{ClusterPickUnknown}!Config.Cluster.Pick {
+    if (std.mem.eql(u8, literal, "rr")) {
+        return .rr;
+    }
+    if (std.mem.eql(u8, literal, "p2c")) {
+        return .p2c;
+    }
+    return error.ClusterPickUnknown;
+}
+
 /// The closed protocol vocabulary; anything else is its own error so a
 /// typo ("htpp") fails loudly instead of silently relaying as L4.
 fn protocolOf(literal: []const u8) error{ListenerProtocolUnknown}!Config.Listener.Protocol {
@@ -1058,6 +1085,30 @@ test "config: a filter set over the header-edit budget is rejected" {
     const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
         "\"cluster\":\"a\",\"filters\":[" ++ rules ++ "]}]," ++ tail;
     try expectParseError(error.FilterHeaderEditsOverLimit, json);
+}
+
+test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
+    // Explicit rr and p2c both resolve; absent defaults to p2c.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"rr"},
+            \\   "b":{"endpoints":["127.0.0.1:3"],"pick":"p2c"},
+            \\   "c":{"endpoints":["127.0.0.1:4"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(Config.Cluster.Pick.rr, parsed.clusters[0].pick);
+        try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[1].pick);
+        try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[2].pick);
+    }
+    // A typo must not silently balance as the default.
+    try expectParseError(error.ClusterPickUnknown,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"pc2"}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
 }
 
 test "config: unknown listener protocol fails loudly" {

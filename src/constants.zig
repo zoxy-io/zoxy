@@ -207,6 +207,10 @@ comptime {
     assert(headers_max >= 8);
     assert(host_bytes_max >= 1);
     assert(upstream_slots_max >= 1);
+    // The upstream pool's per-endpoint leased counts are u16: a bump past
+    // this ceiling would wrap them in ReleaseFast and silently corrupt
+    // the P2C load signal.
+    assert(upstream_slots_max <= std.math.maxInt(u16));
     assert(chunked_line_bytes_max >= 32);
     assert(chunked_line_bytes_max <= relay_buffer_bytes);
     assert(chunked_trailer_bytes_max >= chunked_line_bytes_max);
