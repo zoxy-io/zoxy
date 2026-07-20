@@ -355,6 +355,9 @@ const Http1Bed = struct {
         /// The single route's prefix; "/" is the catch-all. A narrower
         /// prefix lets a test drive the no-route 404 path (§7).
         route_prefix: []const u8 = "/",
+        /// The single route's host scope; null is any-host. A canonical
+        /// host lets a test drive host routing and its 404 (§7).
+        route_host: ?[]const u8 = null,
     };
 
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
@@ -368,7 +371,7 @@ const Http1Bed = struct {
         });
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
-        bed.routes = .{.{ .prefix = options.route_prefix, .cluster_index = 0 }};
+        bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .http }};
         bed.config = .{
             .listeners = &bed.listeners,
@@ -645,6 +648,87 @@ test "l7: a structure-changing escape in the path is answered 400" {
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
     try bed.expectDrained();
+}
+
+test "l7: the Host header selects a host-scoped route, case- and port-insensitively" {
+    // The route is scoped to a canonical host; a request whose canonical
+    // Host equals it routes there, whatever the wire case or port (§7).
+    const wire_hosts = [_][]const u8{ "api.example", "API.Example", "Api.Example:8080" };
+    for (wire_hosts, 0..) |host, index| {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 20 + index,
+            .route_host = "api.example",
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        var request_buffer: [128]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buffer,
+            "GET /x HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+            .{host},
+        );
+        try bed.exchange(request);
+
+        try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            bed.client.response(),
+        );
+        // The origin got the request verbatim-Host'd (host is a routing
+        // key, forwarded as sent — here the wire Host rides along).
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a request to a host with no route is answered 404" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 24, .route_host = "api.example" });
+    defer bed.tearDown();
+
+    // The only route is scoped to api.example; another host has no
+    // any-host route to fall back to, so it is 404 and never dialed (§7).
+    try bed.exchange("GET /x HTTP/1.1\r\nHost: other.example\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: an HTTP/1.0 request with no Host matches only any-host routes" {
+    // Any-host route (the default): a Host-less HTTP/1.0 request still
+    // routes.
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 25,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+        try bed.exchange("GET /x HTTP/1.0\r\nConnection: close\r\n\r\n");
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+        try bed.expectDrained();
+    }
+    // Host-scoped route: a Host-less request cannot match it, so 404.
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .seed = 26, .route_host = "api.example" });
+        defer bed.tearDown();
+        try bed.exchange("GET /x HTTP/1.0\r\n\r\n");
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
+        try bed.expectDrained();
+    }
 }
 
 test "l7: a POST body is forwarded and a sized response returned, byte-exact under the adversary" {
