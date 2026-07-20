@@ -1088,12 +1088,19 @@ pub fn Client(comptime IoType: type) type {
         /// reject scripts admit exactly their own verdict — and a silent
         /// client may see nothing at all.
         fn statusAllowed(script: Script, status: u16) bool {
+            // Every script that dials may also see the §8 request-deadline
+            // verdict: a mute or stalled origin (adversarial delivery can
+            // stall any of them) earns a 504 once the deadline expires with
+            // no response byte sent. Clean seeds pin the origin to `sized`
+            // and never stall, so `goldenStatus` still demands exact
+            // outcomes there.
             return switch (script) {
                 .get, .post_sized, .post_big, .post_chunked, .keepalive_pair, .pipelined, .confusion => //
-                status == 200 or status == 502 or status == 503,
+                status == 200 or status == 502 or status == 503 or status == 504,
                 // Edit and rewrite route and forward like a plain GET, so
                 // the §8 rungs and a killed dial can precede the 200.
-                .filter_edit, .filter_rewrite => status == 200 or status == 502 or status == 503,
+                .filter_edit, .filter_rewrite => //
+                status == 200 or status == 502 or status == 503 or status == 504,
                 // A reject is answered before any resource is acquired or
                 // origin dialed, so no §8 rung or dial failure can precede
                 // it — the only complete verdict is the 403.
@@ -1107,7 +1114,7 @@ pub fn Client(comptime IoType: type) type {
                 // Clean seeds pin the origin to `sized`, so they never race
                 // it and `goldenStatus` still demands the exact 400 there.
                 .post_chunked_malformed => //
-                status == 400 or status == 200 or status == 502 or status == 503,
+                status == 400 or status == 200 or status == 502 or status == 503 or status == 504,
                 .malformed_head => status == 400,
                 .oversize_uri => status == 414,
                 .connect_method => status == 501,

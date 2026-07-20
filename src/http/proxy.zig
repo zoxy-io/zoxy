@@ -418,6 +418,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.request_leg == .sending_head);
             const l7 = &conn.l7;
             assert(l7.request_head_sent < l7.rendered_request_len);
+            l7.request_op_on_client = false; // A send on the upstream socket.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
@@ -438,6 +439,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .sending_head);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -501,6 +506,7 @@ pub fn Proxy(comptime IoType: type) type {
             const direction = &conn.directions[0];
             assert(direction.sent_len < direction.transfer_len);
             const base = conn.l7.request_head_len;
+            conn.l7.request_op_on_client = false; // A send on the upstream socket.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
@@ -521,6 +527,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .sending_body_excess);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -565,6 +575,9 @@ pub fn Proxy(comptime IoType: type) type {
         fn armRequestBodyRecv(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .pumping_body);
+            // A recv on the CLIENT socket: an expiry cannot force it, so
+            // the deadline verdict is unanswerable while this op is armed.
+            conn.l7.request_op_on_client = true;
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
@@ -585,6 +598,9 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .pumping_body);
+            // A client-side recv is never armed under a pending verdict:
+            // expiry is unanswerable then, and a verdict arms nothing.
+            assert(conn.l7.pending_verdict == .none);
             const received = result catch |err| {
                 // EOF mid-body is a truncated request; any failure here
                 // dooms the exchange in the client's own direction.
@@ -612,6 +628,9 @@ pub fn Proxy(comptime IoType: type) type {
             } else {
                 assert(feed.done);
                 conn.l7.request_leg = .done;
+                // The delivered recv was the flag's referent; keep the
+                // flag self-descriptive now that no request op is armed.
+                conn.l7.request_op_on_client = false;
             }
         }
 
@@ -619,6 +638,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             const direction = &conn.directions[0];
             assert(direction.sent_len < direction.transfer_len);
+            conn.l7.request_op_on_client = false; // A send on the upstream socket.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
@@ -639,6 +659,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .pumping_body);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -694,6 +718,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .awaiting_head);
+            if (conn.l7.pending_verdict != .none) {
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const received = result catch |err| {
                 server.witnessKernelPressure(err);
                 upstreamFailed(server, conn);
@@ -863,6 +891,9 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .sending_head);
+            // response_started blocks the verdict, so none is pending in
+            // any response-send handler (negative space).
+            assert(conn.l7.pending_verdict == .none);
             const sent = result catch |err| {
                 // The client is gone; nothing to answer anyone.
                 server.witnessKernelPressure(err);
@@ -913,6 +944,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .sending_body_excess);
+            assert(conn.l7.pending_verdict == .none); // response_started.
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
@@ -964,6 +996,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .pumping_body);
+            assert(conn.l7.pending_verdict == .none); // response_started.
             const received = result catch |err| {
                 if (err == error.EndOfStream) {
                     if (conn.l7.response_framing == .until_close) {
@@ -1020,6 +1053,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .pumping_body);
+            assert(conn.l7.pending_verdict == .none); // response_started.
             const sent = result catch |err| {
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
@@ -1116,6 +1150,64 @@ pub fn Proxy(comptime IoType: type) type {
             conn.state = .l7_reading_head;
             server.storeDeadline(conn, server.idleTimeoutMs());
             armHeadRecv(server, conn);
+        }
+
+        /// Whether an expired exchange can still be answered 504 (§8): no
+        /// response byte sent, and no armed op held on the *client* socket
+        /// — a client-side recv cannot be forced without closing the very
+        /// client the verdict would answer, and a stalled request body is
+        /// the client's own stall anyway. In the deferred-render window an
+        /// origin response may already sit parsed but unsent; it is
+        /// discarded — no byte of it reached the client, and the exchange
+        /// it belonged to could not complete regardless.
+        pub fn expiryAnswerable(conn: *const ConnType) bool {
+            assert(conn.state == .l7_exchanging);
+            if (conn.l7.response_started) {
+                return false;
+            }
+            if (conn.armed.data_client_to_upstream and conn.l7.request_op_on_client) {
+                return false;
+            }
+            return true;
+        }
+
+        /// Begin the §8 request-deadline verdict. Ops are never canceled
+        /// (§5) — they are *forced*: shutting the upstream socket down
+        /// makes each armed op on it complete with an error its handler
+        /// diverts to `settlePendingVerdict`. In `.l7_exchanging` at least
+        /// one data op is always armed (each leg holds its op while it
+        /// waits), so the verdict always settles in a forced completion,
+        /// never inline here.
+        pub fn beginExpiry(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict == .none);
+            assert(expiryAnswerable(conn));
+            assert(conn.armed.data_client_to_upstream or
+                conn.armed.data_upstream_to_client);
+            conn.l7.pending_verdict = .gateway_timeout;
+            server.io.shutdown(conn.upstream_socket.?, .both);
+        }
+
+        /// A completion landed with a verdict pending: once the last data
+        /// op settles, act on it. The forced op's result — error or a
+        /// racing data delivery already in flight — is deliberately
+        /// ignored, the exchange is condemned either way; and because the
+        /// divert runs before any error handling, a forced EPIPE never
+        /// pollutes the kernel-pressure witness.
+        fn settlePendingVerdict(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.pending_verdict != .none);
+            if (conn.armed.data_client_to_upstream or
+                conn.armed.data_upstream_to_client)
+            {
+                return; // The sibling's forced completion re-enters here.
+            }
+            const verdict = conn.l7.pending_verdict;
+            conn.l7.pending_verdict = .none;
+            switch (verdict) {
+                .none => unreachable,
+                .gateway_timeout => respond(server, conn, 504, "l7_gateway_timeout"),
+            }
         }
 
         /// The upstream leg failed. Answer 502 only when the client has

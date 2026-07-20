@@ -164,6 +164,9 @@ const HttpOrigin = struct {
     listening: bool = false,
     response: []const u8 = "",
     close_after_response: bool = false,
+    /// Read the whole request, then never answer — the stalled origin
+    /// that drives the §8 request-deadline 504 verdict.
+    mute: bool = false,
     conn: OConn = .{},
     accepted: bool = false,
     requests_served: u32 = 0,
@@ -238,6 +241,11 @@ const HttpOrigin = struct {
                 return;
             }
             oconn.request_complete = true;
+            if (oconn.origin.mute) {
+                // The stalled origin: request read in full, no answer, no
+                // armed op — the proxy's deadline is the only way out.
+                return;
+            }
             oconn.armSend();
         }
 
@@ -353,6 +361,8 @@ const Http1Bed = struct {
         origin_response: []const u8 = "",
         origin_listens: bool = true,
         origin_closes: bool = false,
+        /// The origin reads the whole request and never answers (§8 504).
+        origin_mute: bool = false,
         /// The single route's prefix; "/" is the catch-all. A narrower
         /// prefix lets a test drive the no-route 404 path (§7).
         route_prefix: []const u8 = "/",
@@ -400,6 +410,7 @@ const Http1Bed = struct {
         bed.origin = .{
             .response = options.origin_response,
             .close_after_response = options.origin_closes,
+            .mute = options.origin_mute,
         };
         if (options.origin_listens) {
             try bed.origin.start(&bed.sim_io, originAddress());
@@ -1127,6 +1138,95 @@ test "l7: the head-read deadline reaps a slowloris that never completes" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     try bed.expectDrained();
+}
+
+test "l7: a mute origin earns the §8 request-deadline 504 verdict" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 70, .origin_mute = true });
+    defer bed.tearDown();
+
+    // The origin reads the request and never answers: the request
+    // deadline expires with no response byte sent, the armed response
+    // recv is forced by the upstream shutdown, and the client is
+    // answered the exact 504 static response instead of a silent close.
+    try bed.exchange("GET /stalled HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_gateway"));
+    try bed.expectDrained();
+}
+
+test "l7: a client stalling its own body is torn down, never answered 504" {
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 71, .origin_response = response });
+    defer bed.tearDown();
+
+    // The client announces a 10-byte body but sends only 3: the request
+    // leg parks a recv on the CLIENT socket, which no verdict can force
+    // without closing the very client it would answer — the stall is the
+    // client's own, so expiry stays a teardown (§8).
+    try bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nContent-Length: 10\r\n\r\nabc");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqual(@as(usize, 0), bed.client.response().len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
+    try bed.expectDrained();
+}
+
+test "l7: a response already started forfeits the 504 — teardown only" {
+    // The origin sends a complete head but only half its announced body,
+    // then stalls: response_started blocks the verdict (a 504 appended
+    // to a half-relayed 200 would corrupt the stream), so the expiry
+    // tears down and the client sees the truncation.
+    const partial = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 72, .origin_response = partial });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /truncated HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    // The head and the partial body arrived — and nothing else: no 504
+    // bytes were mixed into the condemned stream.
+    try std.testing.expect(std.mem.indexOf(u8, bed.client.response(), "200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bed.client.response(), "504") == null);
+    try std.testing.expect(std.mem.endsWith(u8, bed.client.response(), "hello"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
+    try bed.expectDrained();
+}
+
+test "l7: the 504 verdict path allocates nothing after init" {
+    // §9 zero-alloc gate for the pending-verdict machinery: the forced
+    // completion, the settle, and the static 504 answer must all run
+    // without an allocation. Counting run, then a failing run pinned to
+    // the init count.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var bed: Http1Bed = undefined;
+    try bed.setUp(failing.allocator(), .{ .seed = 73, .origin_mute = true });
+    defer bed.tearDown();
+    const allocations_after_init = failing.allocations;
+    try bed.exchange("GET /stalled HTTP/1.1\r\nHost: o\r\n\r\n");
+    try bed.expectDrained();
+    // The verdict must actually have fired, or this gates nothing.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try std.testing.expectEqual(allocations_after_init, failing.allocations);
+
+    var strict = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = allocations_after_init,
+    });
+    var strict_bed: Http1Bed = undefined;
+    try strict_bed.setUp(strict.allocator(), .{ .seed = 73, .origin_mute = true });
+    defer strict_bed.tearDown();
+    try strict_bed.exchange("GET /stalled HTTP/1.1\r\nHost: o\r\n\r\n");
+    try strict_bed.expectDrained();
 }
 
 test "l7: a single close-terminated exchange allocates nothing after init" {

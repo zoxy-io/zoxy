@@ -52,6 +52,11 @@ pub const Counters = struct {
     /// answered 502 (§7, §8). A stale parked connection detected at
     /// checkout lands here too until Phase 2's free replay.
     l7_bad_gateway: Value = Value.init(0),
+    /// The §8 request-deadline verdict: the deadline expired mid-exchange
+    /// with no response byte sent, answered 504. A verdict, not a shed —
+    /// the connection completes normally — but every one rides a
+    /// `deadline_expired`, an inequality `reconcile` asserts.
+    l7_gateway_timeout: Value = Value.init(0),
     /// Completed L7 exchanges: a parsed origin response relayed back.
     l7_responses: Value = Value.init(0),
     /// Exchanges served over a parked upstream connection instead of a
@@ -103,6 +108,9 @@ pub const Counters = struct {
             counters.get("shed_draining");
         assert(completed <= admitted);
         assert(admitted <= accepted);
+        // Every 504 verdict rides a deadline expiry (§8) — the verdict
+        // path increments both, the teardown path only the expiry.
+        assert(counters.get("l7_gateway_timeout") <= counters.get("deadline_expired"));
         const flow_holds = admitted == completed + active_count;
         const gate_holds = accepted == admitted + shed;
         return flow_holds and gate_holds;

@@ -665,8 +665,7 @@ pub fn Server(comptime IoType: type) type {
                     return;
                 }
                 if (server.io.nowNs() >= conn.deadline_ns) {
-                    server.counters.increment("deadline_expired");
-                    server.beginTeardown(conn);
+                    server.expireDeadline(conn);
                 } else {
                     server.armDeadline(conn);
                 }
@@ -677,6 +676,29 @@ pub fn Server(comptime IoType: type) type {
                 assert(conn.isTearingDown());
                 server.continueTeardown(conn);
             }
+        }
+
+        /// The stored deadline is due. An L7 exchange that can still be
+        /// answered gets the §8 request-deadline verdict — 504 instead of
+        /// a silent teardown — with the deadline re-armed to bound the
+        /// verdict's own delivery: a second expiry with the verdict still
+        /// pending falls through to teardown, the escape hatch. Every
+        /// other state (L4, head read's slowloris, the static-response
+        /// drain, a pending verdict) tears down as before.
+        fn expireDeadline(server: *Self, conn: *ConnType) void {
+            assert(!conn.isTearingDown());
+            assert(!conn.armed.deadline); // Delivered; re-armed only below.
+            server.counters.increment("deadline_expired");
+            if (conn.state == .l7_exchanging and
+                conn.l7.pending_verdict == .none and
+                Proxy.expiryAnswerable(conn))
+            {
+                server.storeDeadline(conn, server.idleTimeoutMs());
+                server.armDeadline(conn);
+                Proxy.beginExpiry(server, conn);
+                return;
+            }
+            server.beginTeardown(conn);
         }
 
         fn onConnectCancel(conn: *ConnType) void {

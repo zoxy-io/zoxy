@@ -184,6 +184,16 @@ pub fn Conn(comptime IoType: type) type {
             /// True once any response byte reached the client — the §8
             /// verdict split between answering 502 and plain teardown.
             response_started: bool = false,
+            /// A verdict decided while data ops were still armed, acted on
+            /// when the last one settles: ops are never canceled (§5), they
+            /// are *forced* — the upstream socket is shut down and each
+            /// armed op completes with an error its handler diverts on.
+            pending_verdict: PendingVerdict = .none,
+            /// The armed request-leg op is a recv on the CLIENT socket
+            /// (the body pump). Such an op cannot be forced without closing
+            /// the client the verdict would answer, so expiry stays a
+            /// teardown then — the stall is the client's own body (§8).
+            request_op_on_client: bool = false,
             /// The client's persistence ask (RFC 9112 §9), captured at
             /// routing; the render-time decision may still announce close
             /// (pressure, drain, §8).
@@ -211,6 +221,13 @@ pub fn Conn(comptime IoType: type) type {
                 sending_body_excess,
                 pumping_body,
                 done,
+            };
+
+            /// The deferred §8 verdicts (`gateway_timeout` now; replay in
+            /// Phase 2's stale-replay slice extends this).
+            pub const PendingVerdict = enum(u8) {
+                none,
+                gateway_timeout,
             };
         };
 
