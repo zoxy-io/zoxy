@@ -244,3 +244,9 @@ queue, in rough value order:
   (§8).
 - Dynamic DNS for upstream endpoints (§1).
 - io_uring op upgrades — the verdict table above.
+- Config JSON Schema — the generator ships (`zig build schema`, reflected
+  from the config definitions, released as an asset per §5). Deferred until
+  there is a reason: host it at its stable `$id`
+  (`https://zoxy.io/schema/config.schema.json`) and add a `"$schema"`
+  pointer to `config/example.json` once it resolves; an optional
+  `zoxy --schema` subcommand so the shipped binary can emit its own schema.

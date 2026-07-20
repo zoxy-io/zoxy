@@ -387,6 +387,18 @@ Rules:
   relays (§6).
 - **The config arena is the only allocating region** — parse-once,
   immutable, shared read-only. (Carried verbatim; it worked.)
+- **The config surface has a generated JSON Schema.** `zig build schema`
+  reflects over the `*Json` parse structs and their co-located metadata
+  (`src/config_schema.zig`) to emit a draft 2020-12 schema — structure,
+  `required`, `additionalProperties: false` (the parser is strict), enums,
+  and every numeric bound traced back to `src/constants.zig`. It is a
+  release-only asset, never committed (so it cannot drift); the emitter's
+  tests run under `zig build ci`, and `assert_meta_matches` fails the build
+  if a field lacks schema metadata. It intentionally stops at what JSON
+  Schema can express: the loader's semantic checks (canonical
+  prefixes/hosts, address literals, reserved header names, port ≠ 0) and
+  the "exactly one of" forks stay the loader's job, so passing the schema
+  means well-shaped, not accepted.
 - **A slot is released only when its armed-op set is empty.** Every op
   references a completion embedded in the slot, and the slot header
   tracks which are armed. Teardown is a *state*, not an event: shutdown

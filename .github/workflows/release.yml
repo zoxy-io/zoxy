@@ -69,6 +69,13 @@ jobs:
             echo "::endgroup::"
           done
 
+          # The config JSON Schema is target-independent, so emit it once
+          # (§5). It is generated from the Zig config definitions, never
+          # committed; shipping it here as an asset keeps a single source of
+          # truth. The sha256sum step below checksums it with the archives.
+          devenv shell -- zig build schema
+          cp zig-out/config.schema.json "dist/zoxy-$version-config.schema.json"
+
           ( cd dist && sha256sum * > SHA256SUMS.txt )
           ls -la dist
 
