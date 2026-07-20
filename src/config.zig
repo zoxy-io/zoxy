@@ -14,6 +14,7 @@ const constants = @import("constants.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
+const render = @import("http/render.zig");
 
 const assert = std.debug.assert;
 
@@ -86,11 +87,13 @@ pub const ValidationError = error{
     FilterHeaderMatchesOverLimit,
     FilterHeaderMatchKind,
     FilterHeaderNameInvalid,
+    FilterHeaderNameReserved,
     FilterHeaderValueInvalid,
     FilterActionsEmpty,
     FilterActionsOverLimit,
     FilterActionKind,
     FilterRejectStatus,
+    FilterHeaderEditsOverLimit,
     EndpointsEmpty,
     EndpointsOverLimit,
     EndpointInvalid,
@@ -368,15 +371,38 @@ fn resolveFilters(
         return error.FiltersOverLimit;
     }
     const rules = try arena.alloc(filter.Rule, filters_json.len);
+    var header_edits: u32 = 0;
     for (filters_json, rules) |rule_json, *rule| {
         rule.* = .{
             .match = try resolveMatch(arena, &rule_json.match),
             .actions = try resolveActions(arena, rule_json.actions),
         };
+        header_edits += countHeaderEdits(rule.actions);
+    }
+    // A request applies the edits of every rule it matches, so the whole
+    // table's edits bound one render's materialized set (§7). Cap the
+    // total so the renderer's fixed buffer can never overflow.
+    if (header_edits > constants.header_edits_max) {
+        return error.FilterHeaderEditsOverLimit;
     }
     assert(rules.len == filters_json.len);
     assert(rules.len <= constants.filters_per_listener_max);
     return rules;
+}
+
+/// The number of header-edit actions (set/add/remove) in a rule — the
+/// reject and rewrite actions contribute no render-time header edit.
+fn countHeaderEdits(actions: []const filter.Action) u32 {
+    assert(actions.len <= constants.actions_per_filter_max);
+    var count: u32 = 0;
+    for (actions) |action| {
+        switch (action) {
+            .header_set, .header_add, .header_remove => count += 1,
+            .reject, .rewrite_prefix => {},
+        }
+    }
+    assert(count <= actions.len); // Edits are a subset of the actions.
+    return count;
 }
 
 fn resolveMatch(
@@ -480,17 +506,17 @@ fn resolveAction(action_json: *const ActionJson) ParseError!filter.Action {
         return .{ .reject = status };
     }
     if (action_json.header_set) |edit| {
-        try validateHeaderName(edit.name);
+        try validateEditableHeaderName(edit.name);
         try validateHeaderValue(edit.value);
         return .{ .header_set = .{ .name = edit.name, .value = edit.value } };
     }
     if (action_json.header_add) |edit| {
-        try validateHeaderName(edit.name);
+        try validateEditableHeaderName(edit.name);
         try validateHeaderValue(edit.value);
         return .{ .header_add = .{ .name = edit.name, .value = edit.value } };
     }
     if (action_json.header_remove) |name| {
-        try validateHeaderName(name);
+        try validateEditableHeaderName(name);
         return .{ .header_remove = name };
     }
     const rewrite = action_json.rewrite_prefix.?;
@@ -508,6 +534,30 @@ fn validateHeaderName(name: []const u8) ParseError!void {
     for (name) |byte| {
         if (!isTokenByte(byte)) {
             return error.FilterHeaderNameInvalid;
+        }
+    }
+}
+
+/// An *edit* target must additionally not be a proxy-managed header: the
+/// renderer owns hop-by-hop stripping, `Connection` injection, `Host`
+/// routing, and the framing headers it committed to (§7). Letting a filter
+/// set/add/remove one of those would smuggle a framing or persistence
+/// change past the render's own decisions, so the compiled edit is proven
+/// harmless at load. Match predicates carry no such restriction — reading
+/// any header is safe.
+fn validateEditableHeaderName(name: []const u8) ParseError!void {
+    try validateHeaderName(name);
+    assert(name.len >= 1); // A valid token; the managed lists are non-empty.
+    for (render.hop_by_hop_names) |managed| {
+        assert(managed.len >= 1);
+        if (std.ascii.eqlIgnoreCase(name, managed)) {
+            return error.FilterHeaderNameReserved;
+        }
+    }
+    for (render.protected_names) |managed| {
+        assert(managed.len >= 1);
+        if (std.ascii.eqlIgnoreCase(name, managed)) {
+            return error.FilterHeaderNameReserved;
         }
     }
 }
@@ -954,6 +1004,34 @@ test "config: filter schema rejects malformed rules" {
     try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\",\"present\":false}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
     // A rewrite whose target is not canonical.
     try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b/../c\"}}]}]}]," ++ tail);
+    // A header edit may not name a proxy-managed header — case-insensitively.
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Host\",\"value\":\"evil\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_remove\":\"content-length\"}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_add\":{\"name\":\"Connection\",\"value\":\"close\"}}]}]}]," ++ tail);
+    // A matched header predicate may still name a managed header (read-only).
+    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"Host\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+}
+
+test "config: a filter set over the header-edit budget is rejected" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    ;
+    // One header_edits_max+1 header edits spread one-per-rule (each rule
+    // stays under actions_per_filter_max): the whole-table total is what
+    // the renderer's fixed buffer must hold, so it is the total that caps.
+    const rules = comptime blk: {
+        var s: []const u8 = "";
+        var edit: u16 = 0;
+        while (edit < constants.header_edits_max + 1) : (edit += 1) {
+            if (edit != 0) s = s ++ ",";
+            s = s ++ "{\"actions\":[{\"header_remove\":\"X-Drop\"}]}";
+        }
+        break :blk s;
+    };
+    const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"cluster\":\"a\",\"filters\":[" ++ rules ++ "]}]," ++ tail;
+    try expectParseError(error.FilterHeaderEditsOverLimit, json);
 }
 
 test "config: unknown listener protocol fails loudly" {

@@ -179,6 +179,38 @@ pub fn Proxy(comptime IoType: type) type {
             return parser.canonicalTarget(request.target, scratch) catch unreachable;
         }
 
+        /// The §7 filter header edits matching `request`, materialized into
+        /// `out`. Empty when the listener has no filters — the common path
+        /// pays nothing (no host canonicalization, no scan). The match view
+        /// mirrors `requestKeys`: canonical host, and the canonical path
+        /// (origin-form, aliasing `target.path`) or "/" (OPTIONS
+        /// asterisk-form) — so the rules matched here are exactly those the
+        /// reject phase saw.
+        fn collectRequestEdits(
+            conn: *const ConnType,
+            request: *const parser.RequestHead,
+            target: parser.CanonicalTarget,
+            host_scratch: *[constants.host_bytes_max]u8,
+            out: *[constants.header_edits_max]filter.AppliedHeaderEdit,
+        ) []const filter.AppliedHeaderEdit {
+            if (conn.filters.len == 0) {
+                return &.{};
+            }
+            const host: ?[]const u8 = if (request.host) |raw|
+                parser.canonicalHost(raw, host_scratch)
+            else
+                null;
+            const match_path: []const u8 = if (request.target[0] == '/') target.path else "/";
+            assert(match_path.len >= 1);
+            assert(match_path[0] == '/');
+            return filter.collectHeaderEdits(conn.filters, .{
+                .method = request.method,
+                .host = host,
+                .path = match_path,
+                .headers = request.headers,
+            }, out);
+        }
+
         /// Policy gate, then the exchange's admission: tunnels and
         /// upgrades are non-goals (§1, §7) — 501; the canonical path
         /// selects a cluster (400 if it will not canonicalize, 404 if no
@@ -317,10 +349,16 @@ pub fn Proxy(comptime IoType: type) type {
             // origin and the router never disagree about the resource.
             var scratch: [constants.head_bytes_max]u8 = undefined;
             const target = effectiveTarget(request, &scratch);
+            // The §7 filter header edits this request matched (empty when
+            // the listener has no filters). Collected against the same
+            // canonical view the reject/route phase used.
+            var host_scratch: [constants.host_bytes_max]u8 = undefined;
+            var edit_buffer: [constants.header_edits_max]filter.AppliedHeaderEdit = undefined;
+            const edits = collectRequestEdits(conn, request, target, &host_scratch, &edit_buffer);
             // No close announcement upstream: the connection is a parking
             // candidate (§5), and stripping the client's Connection header
             // already made persistence the wire default.
-            const rendered = render.renderRequestHead(request, target, false, &upstream.head) catch {
+            const rendered = render.renderRequestHead(request, target, edits, false, &upstream.head) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");

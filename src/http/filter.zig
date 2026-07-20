@@ -10,6 +10,7 @@
 
 const std = @import("std");
 
+const constants = @import("../constants.zig");
 const parser = @import("parser.zig");
 const router = @import("router.zig");
 
@@ -74,6 +75,20 @@ pub const Rule = struct {
     actions: []const Action,
 };
 
+/// A header edit flattened for the renderer: the three header actions
+/// collapsed to one op plus the (config-validated) name and value. The
+/// renderer suppresses source copies of a `set`/`remove` name and appends
+/// a line for each `set`/`add`; `value` is unused for a `remove`. This is
+/// the render's input contract — `collectHeaderEdits` produces it from the
+/// rules a request matched.
+pub const AppliedHeaderEdit = struct {
+    kind: Kind,
+    name: []const u8,
+    value: []const u8,
+
+    pub const Kind = enum(u8) { set, add, remove };
+};
+
 /// The statuses a `reject` action may name — a subset of the §8 static
 /// responses that make sense as a policy verdict. Config rejects any
 /// other value at load, and `shed.staticResponse` must support each.
@@ -121,6 +136,45 @@ pub fn firstReject(rules: []const Rule, view: RequestView) ?u16 {
         }
     }
     return null;
+}
+
+/// The header edits of every rule that matches `view`, in rule-then-action
+/// order, written into `out` and returned as its filled prefix (§7).
+/// `reject`/`rewrite_prefix` actions are skipped — this collects only the
+/// header edits the renderer applies. The caller sizes `out` at
+/// `header_edits_max`, which config caps a listener's total header edits
+/// at, so a matching subset always fits: the write is asserted in bounds.
+/// Bounded loops over immutable arena data; no allocation. Called at render
+/// (a matched reject would already have stopped the request at routing, so
+/// here every matched rule forwards and its edits apply).
+pub fn collectHeaderEdits(
+    rules: []const Rule,
+    view: RequestView,
+    out: []AppliedHeaderEdit,
+) []const AppliedHeaderEdit {
+    assert(view.path.len >= 1);
+    assert(out.len <= constants.header_edits_max);
+    var count: usize = 0;
+    for (rules) |rule| {
+        if (!matches(rule.match, view)) {
+            continue;
+        }
+        for (rule.actions) |action| {
+            const edit: ?AppliedHeaderEdit = switch (action) {
+                .header_set => |e| .{ .kind = .set, .name = e.name, .value = e.value },
+                .header_add => |e| .{ .kind = .add, .name = e.name, .value = e.value },
+                .header_remove => |name| .{ .kind = .remove, .name = name, .value = "" },
+                .reject, .rewrite_prefix => null,
+            };
+            if (edit) |value| {
+                assert(count < out.len);
+                out[count] = value;
+                count += 1;
+            }
+        }
+    }
+    assert(count <= out.len);
+    return out[0..count];
 }
 
 /// Whether a rule's match — a conjunction — holds for the request. A
@@ -261,4 +315,49 @@ test "filter: an all-any match is unconditional; edit-only rules never reject" {
         .path = "/blocked/x",
         .headers = empty,
     }));
+}
+
+test "filter: collectHeaderEdits gathers matching rules' edits in order" {
+    const rules = [_]Rule{
+        // Applies to every request: stamp a via header, drop cookies.
+        .{ .match = .{}, .actions = &.{
+            .{ .header_set = .{ .name = "X-Via", .value = "zoxy" } },
+            .{ .header_remove = "Cookie" },
+        } },
+        // Applies only under /api: add a second via, and a reject that
+        // collectHeaderEdits must skip (it is not a header edit).
+        .{ .match = .{ .path_prefix = "/api" }, .actions = &.{
+            .{ .header_add = .{ .name = "X-Api", .value = "1" } },
+            .{ .reject = 429 },
+        } },
+    };
+    const empty: []const parser.Header = &.{};
+    var buffer: [constants.header_edits_max]AppliedHeaderEdit = undefined;
+
+    // A /public request matches only the first rule: two edits.
+    const public = collectHeaderEdits(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/public",
+        .headers = empty,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 2), public.len);
+    try std.testing.expectEqual(AppliedHeaderEdit.Kind.set, public[0].kind);
+    try std.testing.expectEqualStrings("X-Via", public[0].name);
+    try std.testing.expectEqual(AppliedHeaderEdit.Kind.remove, public[1].kind);
+    try std.testing.expectEqualStrings("Cookie", public[1].name);
+
+    // A /api request matches both rules; the reject action is skipped, so
+    // three header edits survive in rule-then-action order.
+    const api = collectHeaderEdits(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/api/v1",
+        .headers = empty,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 3), api.len);
+    try std.testing.expectEqualStrings("X-Via", api[0].name);
+    try std.testing.expectEqualStrings("Cookie", api[1].name);
+    try std.testing.expectEqual(AppliedHeaderEdit.Kind.add, api[2].kind);
+    try std.testing.expectEqualStrings("X-Api", api[2].name);
 }

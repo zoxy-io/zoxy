@@ -805,6 +805,51 @@ test "l7: a filter reject survives 1-byte adversarial delivery across seeds" {
     }
 }
 
+test "l7: filter header edits reach the origin, applied once" {
+    // set X-Env: prod (client sent dev), add X-Trace, remove Cookie. The
+    // origin must see exactly the edited head, and the client the origin's
+    // response — the edit is invisible downstream.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/api" },
+        .actions = &.{
+            .{ .header_set = .{ .name = "X-Env", .value = "prod" } },
+            .{ .header_add = .{ .name = "X-Trace", .value = "on" } },
+            .{ .header_remove = "Cookie" },
+        },
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 29,
+        .filters = &rules,
+        .route_prefix = "/api",
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET /api/v1 HTTP/1.1\r\nHost: o\r\nX-Env: dev\r\nCookie: sid=1\r\nConnection: close\r\n\r\n",
+    );
+
+    // The client got the origin's response verbatim (edits are upstream).
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    // The origin saw the edited head: X-Env replaced, X-Trace added, Cookie
+    // gone, and exactly one request served.
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try parser.parseRequestHead(
+        bed.origin.conn.request_buffer[0..bed.origin.conn.request_len],
+        false,
+        &storage,
+    );
+    try std.testing.expectEqualStrings("prod", parser.headerValue(forwarded.headers, "x-env").?);
+    try std.testing.expectEqualStrings("on", parser.headerValue(forwarded.headers, "x-trace").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), parser.headerValue(forwarded.headers, "cookie"));
+    try bed.expectDrained();
+}
+
 test "l7: an HTTP/1.0 request with no Host matches only any-host routes" {
     // Any-host route (the default): a Host-less HTTP/1.0 request still
     // routes.

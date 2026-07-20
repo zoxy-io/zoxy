@@ -147,6 +147,14 @@ pub const filters_per_listener_max: u16 = 32;
 pub const actions_per_filter_max: u16 = 8;
 pub const header_matches_per_filter_max: u16 = 8;
 
+/// Upper bound on a listener's *total* header-edit actions (set/add/remove
+/// summed across every rule). A request applies the edits of all rules it
+/// matches, so the worst case — every rule matching — is the whole set;
+/// this bounds the fixed buffer the renderer materializes those edits into
+/// (§7). Config counts the edits across the rule table and rejects a set
+/// over this, so the render buffer can never overflow.
+pub const header_edits_max: u16 = 16;
+
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
@@ -189,6 +197,7 @@ comptime {
     assert(filters_per_listener_max >= 1);
     assert(actions_per_filter_max >= 1);
     assert(header_matches_per_filter_max >= 1);
+    assert(header_edits_max >= 1);
     assert(loop_completions_per_tick_max >= 1);
     assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);
