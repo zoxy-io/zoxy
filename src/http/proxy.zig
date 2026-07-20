@@ -179,36 +179,55 @@ pub fn Proxy(comptime IoType: type) type {
             return parser.canonicalTarget(request.target, scratch) catch unreachable;
         }
 
-        /// The §7 filter header edits matching `request`, materialized into
-        /// `out`. Empty when the listener has no filters — the common path
-        /// pays nothing (no host canonicalization, no scan). The match view
-        /// mirrors `requestKeys`: canonical host, and the canonical path
-        /// (origin-form, aliasing `target.path`) or "/" (OPTIONS
-        /// asterisk-form) — so the rules matched here are exactly those the
-        /// reject phase saw.
-        fn collectRequestEdits(
+        /// The forwarded target and header edits after applying the
+        /// listener's §7 filters to `request` — `base` unchanged and no
+        /// edits when the listener has no filters (the common path pays
+        /// nothing). Routing already chose the cluster from `base.path`; a
+        /// rewrite changes only the forwarded path here, never the route,
+        /// and first-applicable wins. The match view mirrors `requestKeys`:
+        /// canonical host, and the canonical path (origin-form, aliasing
+        /// `base.path`) or "/" (OPTIONS asterisk-form) — so the rules that
+        /// fire are exactly those the reject phase saw. `Oversize` when a
+        /// rewrite's longer `to` overruns the path scratch (§7, 431).
+        const Forwarded = struct {
+            target: parser.CanonicalTarget,
+            edits: []const filter.AppliedHeaderEdit,
+        };
+        fn planForward(
             conn: *const ConnType,
             request: *const parser.RequestHead,
-            target: parser.CanonicalTarget,
+            base: parser.CanonicalTarget,
             host_scratch: *[constants.host_bytes_max]u8,
-            out: *[constants.header_edits_max]filter.AppliedHeaderEdit,
-        ) []const filter.AppliedHeaderEdit {
+            rewrite_scratch: *[constants.head_bytes_max]u8,
+            edit_buffer: *[constants.header_edits_max]filter.AppliedHeaderEdit,
+        ) error{Oversize}!Forwarded {
+            assert(base.path.len >= 1);
             if (conn.filters.len == 0) {
-                return &.{};
+                return .{ .target = base, .edits = &.{} };
             }
             const host: ?[]const u8 = if (request.host) |raw|
                 parser.canonicalHost(raw, host_scratch)
             else
                 null;
-            const match_path: []const u8 = if (request.target[0] == '/') target.path else "/";
+            const origin_form = request.target[0] == '/';
+            const match_path: []const u8 = if (origin_form) base.path else "/";
             assert(match_path.len >= 1);
             assert(match_path[0] == '/');
-            return filter.collectHeaderEdits(conn.filters, .{
+            const view = filter.RequestView{
                 .method = request.method,
                 .host = host,
                 .path = match_path,
                 .headers = request.headers,
-            }, out);
+            };
+            // Rewrite only origin-form targets; asterisk-form names no path.
+            var target = base;
+            if (origin_form) {
+                if (filter.firstRewrite(conn.filters, view)) |rewrite| {
+                    target.path = try filter.rewritePath(rewrite, base.path, rewrite_scratch);
+                }
+            }
+            const edits = filter.collectHeaderEdits(conn.filters, view, edit_buffer);
+            return .{ .target = target, .edits = edits };
         }
 
         /// Policy gate, then the exchange's admission: tunnels and
@@ -345,20 +364,32 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_dialing);
             assert(request.head_len == conn.l7.request_head_len);
             const upstream = conn.upstream.?;
-            // Forward the §7 canonical target the router matched on, so the
-            // origin and the router never disagree about the resource.
+            // The §7 canonical target the router matched on is the base the
+            // origin sees, unless a filter rewrites the forwarded path.
             var scratch: [constants.head_bytes_max]u8 = undefined;
-            const target = effectiveTarget(request, &scratch);
-            // The §7 filter header edits this request matched (empty when
-            // the listener has no filters). Collected against the same
+            const base = effectiveTarget(request, &scratch);
+            // Apply the listener's filters (empty when none): a rewrite of
+            // the forwarded path and any header edits, against the same
             // canonical view the reject/route phase used.
             var host_scratch: [constants.host_bytes_max]u8 = undefined;
+            var rewrite_scratch: [constants.head_bytes_max]u8 = undefined;
             var edit_buffer: [constants.header_edits_max]filter.AppliedHeaderEdit = undefined;
-            const edits = collectRequestEdits(conn, request, target, &host_scratch, &edit_buffer);
+            const plan = planForward(
+                conn,
+                request,
+                base,
+                &host_scratch,
+                &rewrite_scratch,
+                &edit_buffer,
+            ) catch {
+                // A rewritten path too long to forward: the §7 oversize
+                // verdict, answered like an oversize head.
+                return respond(server, conn, 431, "l7_headers_too_large");
+            };
             // No close announcement upstream: the connection is a parking
             // candidate (§5), and stripping the client's Connection header
             // already made persistence the wire default.
-            const rendered = render.renderRequestHead(request, target, edits, false, &upstream.head) catch {
+            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, &upstream.head) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");

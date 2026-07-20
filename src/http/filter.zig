@@ -177,6 +177,85 @@ pub fn collectHeaderEdits(
     return out[0..count];
 }
 
+/// The rewrite of the first matching rule whose `rewrite_prefix.from` is a
+/// segment-prefix of the forwarded path, or null (§7). First-applicable
+/// wins — like `firstReject`, and unlike the collected header edits — so a
+/// rewrite is predictable and never chains: a later rule matches on the
+/// original path, not the rewritten one, so chaining has no coherent
+/// meaning. Routing already chose the cluster from this same path; the
+/// rewrite changes only what is forwarded, never the route.
+pub fn firstRewrite(rules: []const Rule, view: RequestView) ?Rewrite {
+    assert(view.path.len >= 1);
+    assert(view.path[0] == '/');
+    for (rules) |rule| {
+        if (!matches(rule.match, view)) {
+            continue;
+        }
+        for (rule.actions) |action| switch (action) {
+            .rewrite_prefix => |rewrite| {
+                if (router.prefixMatches(rewrite.from, view.path)) {
+                    return rewrite;
+                }
+            },
+            .reject, .header_set, .header_add, .header_remove => {},
+        };
+    }
+    return null;
+}
+
+/// The forwarded path with `rewrite.from` replaced by `rewrite.to`, written
+/// into `out` (§7). A segment-correct join: the segments surviving past
+/// `from` are rejoined to `to` with exactly one slash, so the result never
+/// gains a `//` or merges two segments — whether or not `from`/`to` are
+/// slash-terminated. This matters because a slash-terminated prefix (the
+/// root `/` is one, so it matches every path) leaves a suffix that does NOT
+/// begin with a slash: `from="/"`, `to="/x"`, `/foo` must yield `/x/foo`,
+/// never `/xfoo`; and stripping to root (`to="/"`) yields `/foo`, never the
+/// distinct resource `//foo`. `from` and `to` are validated canonical at
+/// load and the surviving segments are a canonical path's tail, so the join
+/// is canonical by construction (canonical form preserves empty segments, so
+/// a second pass would not repair a `//` the join must never create).
+/// `Oversize` when a longer `to` overruns `out` — the §7 oversize verdict.
+/// `firstRewrite` already proved the prefix matches.
+pub fn rewritePath(rewrite: Rewrite, path: []const u8, out: []u8) error{Oversize}![]const u8 {
+    assert(path.len >= 1);
+    assert(path[0] == '/');
+    assert(router.prefixMatches(rewrite.from, path));
+    assert(rewrite.to.len >= 1);
+    assert(rewrite.to[0] == '/');
+    // An exact match forwards `to` verbatim — its own trailing slash and all.
+    var rest = path[rewrite.from.len..];
+    if (rest.len == 0) {
+        if (rewrite.to.len > out.len) {
+            return error.Oversize;
+        }
+        @memcpy(out[0..rewrite.to.len], rewrite.to);
+        assert(out[0] == '/');
+        return out[0..rewrite.to.len];
+    }
+    // Rejoin with exactly one boundary slash: drop the suffix's leading
+    // slash when it has one (a non-slash-terminated `from` leaves it) and
+    // `to`'s trailing slash when it has one (root `to="/"` collapses to the
+    // empty base, so the single separator we write is the whole prefix).
+    if (rest[0] == '/') {
+        rest = rest[1..];
+    }
+    const to_base = if (rewrite.to[rewrite.to.len - 1] == '/')
+        rewrite.to[0 .. rewrite.to.len - 1]
+    else
+        rewrite.to;
+    const total = to_base.len + 1 + rest.len;
+    if (total > out.len) {
+        return error.Oversize;
+    }
+    @memcpy(out[0..to_base.len], to_base);
+    out[to_base.len] = '/';
+    @memcpy(out[to_base.len + 1 .. total], rest);
+    assert(out[0] == '/'); // `to_base` is empty (to=="/") or starts with '/'.
+    assert(total >= 1);
+    return out[0..total];
+}
+
 /// Whether a rule's match — a conjunction — holds for the request. A
 /// null/empty field is "any"; host and path prefix compare in the §7
 /// canonical forms (the path via the router's segment-boundary match, so
@@ -360,4 +439,91 @@ test "filter: collectHeaderEdits gathers matching rules' edits in order" {
     try std.testing.expectEqualStrings("Cookie", api[1].name);
     try std.testing.expectEqual(AppliedHeaderEdit.Kind.add, api[2].kind);
     try std.testing.expectEqualStrings("X-Api", api[2].name);
+}
+
+test "filter: firstRewrite picks the first applicable rewrite only" {
+    const empty: []const parser.Header = &.{};
+    const rules = [_]Rule{
+        // Matches, but its rewrite's `from` is not a prefix of the path —
+        // skipped, so the scan continues to the next rule.
+        .{ .match = .{}, .actions = &.{
+            .{ .rewrite_prefix = .{ .from = "/other", .to = "/x" } },
+        } },
+        // First applicable rewrite: matches and `/api` prefixes the path.
+        .{ .match = .{}, .actions = &.{
+            .{ .rewrite_prefix = .{ .from = "/api", .to = "/v2" } },
+        } },
+        // A later applicable rewrite that must never win (first wins).
+        .{ .match = .{}, .actions = &.{
+            .{ .rewrite_prefix = .{ .from = "/api", .to = "/v3" } },
+        } },
+    };
+    const hit = firstRewrite(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/api/users",
+        .headers = empty,
+    });
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqualStrings("/api", hit.?.from);
+    try std.testing.expectEqualStrings("/v2", hit.?.to);
+
+    // No rewrite's `from` prefixes a /public path → null.
+    try std.testing.expectEqual(@as(?Rewrite, null), firstRewrite(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/public",
+        .headers = empty,
+    }));
+}
+
+test "filter: rewritePath is a segment-correct prefix replacement" {
+    var out: [64]u8 = undefined;
+    const cases = [_]struct { from: []const u8, to: []const u8, path: []const u8, want: []const u8 }{
+        // Ordinary replacement, suffix carries its own slash.
+        .{ .from = "/api", .to = "/v2", .path = "/api/users", .want = "/v2/users" },
+        // Exact match, empty suffix → just `to`.
+        .{ .from = "/api", .to = "/v2", .path = "/api", .want = "/v2" },
+        // Strip a prefix to root: `to == "/"` must not double the slash.
+        .{ .from = "/api", .to = "/", .path = "/api/users", .want = "/users" },
+        // `to` exactly root, exact match → root.
+        .{ .from = "/api", .to = "/", .path = "/api", .want = "/" },
+        // A `to` that itself ends in a slash also dedups the boundary.
+        .{ .from = "/api", .to = "/v2/", .path = "/api/users", .want = "/v2/users" },
+        // Multi-segment from and to.
+        .{ .from = "/a/b", .to = "/c/d", .path = "/a/b/e/f", .want = "/c/d/e/f" },
+        // Slash-terminated `from` — the root prefix matches every path and
+        // leaves a suffix that does NOT start with a slash; the join must
+        // still put exactly one slash between `to` and the survivors.
+        .{ .from = "/", .to = "/x", .path = "/foo", .want = "/x/foo" },
+        .{ .from = "/", .to = "/x", .path = "/", .want = "/x" },
+        // `to == "/"` with the root `from`: prepend nothing, keep the path.
+        .{ .from = "/", .to = "/", .path = "/foo/bar", .want = "/foo/bar" },
+        // An explicitly slash-terminated `from` prefix.
+        .{ .from = "/api/", .to = "/v2", .path = "/api/foo", .want = "/v2/foo" },
+        // Trailing slash preserved when the whole path is the prefix.
+        .{ .from = "/api", .to = "/v2", .path = "/api/", .want = "/v2/" },
+    };
+    for (cases) |case| {
+        const got = try rewritePath(
+            .{ .from = case.from, .to = case.to },
+            case.path,
+            &out,
+        );
+        try std.testing.expectEqualStrings(case.want, got);
+        // The result must be what canonicalization would produce — the join
+        // yields canonical output directly, no second pass.
+        var canon: [constants.head_bytes_max]u8 = undefined;
+        const recanon = try parser.canonicalTarget(got, &canon);
+        try std.testing.expectEqualStrings(got, recanon.path);
+    }
+}
+
+test "filter: rewritePath reports Oversize when the result would not fit" {
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.Oversize, rewritePath(
+        .{ .from = "/a", .to = "/longer" },
+        "/a/x",
+        &tiny,
+    ));
 }

@@ -850,6 +850,42 @@ test "l7: filter header edits reach the origin, applied once" {
     try bed.expectDrained();
 }
 
+test "l7: a filter rewrite changes only the forwarded path, not the route" {
+    // Routing keys off the original path (/old matches the route); the
+    // rewrite swaps that prefix for /new on the way out, so the origin sees
+    // a path that would NOT have matched the route — proof the rewrite
+    // touches only what is forwarded, never re-routes (§7). The query rides
+    // along verbatim.
+    const rules = [_]filter.Rule{.{
+        .match = .{},
+        .actions = &.{.{ .rewrite_prefix = .{ .from = "/old", .to = "/new" } }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 30,
+        .filters = &rules,
+        .route_prefix = "/old",
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /old/x?q=1 HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try parser.parseRequestHead(
+        bed.origin.conn.request_buffer[0..bed.origin.conn.request_len],
+        false,
+        &storage,
+    );
+    try std.testing.expectEqualStrings("/new/x?q=1", forwarded.target);
+    try bed.expectDrained();
+}
+
 test "l7: an HTTP/1.0 request with no Host matches only any-host routes" {
     // Any-host route (the default): a Host-less HTTP/1.0 request still
     // routes.

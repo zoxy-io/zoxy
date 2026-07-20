@@ -533,7 +533,14 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   upstream head is *rendered* (already required for hop-by-hop stripping
   and `Connection` injection), so header edits are applied during
   rendering into the same fixed staging area, and a head that no longer
-  fits after edits → 431. Evaluation cost is bounded and load-shed like
+  fits after edits → 431. A path rewrite changes *only what is forwarded*:
+  routing already chose the cluster from the original canonical path, so a
+  rewrite never re-routes and never chains (first-applicable rule wins, like
+  the reject verdict — a later rule matches the original path, not the
+  rewritten one). Both prefixes are validated canonical at load and the
+  replacement is a *segment-correct* join (stripping a prefix to root gives
+  `/x`, not the distinct resource `//x`), so the forwarded path is canonical
+  by construction. Evaluation cost is bounded and load-shed like
   everything else. This is nginx/HAProxy's config-rule model, not Envoy's
   runtime filter chain — WASM/scripting is explicitly out (an interpreter
   with unbounded fuel or an embedded allocator cannot satisfy the gate);
