@@ -479,8 +479,28 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   carries that same canonical path, so the router and the origin cannot
   disagree about which resource a request names — the `/api/../admin`
   confusion class dies structurally, not by backend convention.
-  Host-based rules are deferred: the parser already extracts `Host`,
-  and host rules extend the same table compatibly when needed.
+- **Host is the route table's outer dimension** (settled 2026-07-20).
+  A route gains an optional `host` (`{ "host": "api.example.com",
+  "prefix": "/v2", "cluster": "v2" }`); a route with no `host` matches
+  any host, exactly as today. Matching filters to the routes whose host
+  equals the request's — falling back to the any-host routes when none
+  does — then takes the longest prefix within that set, so a
+  host-specific route always beats an any-host route and `host + path`
+  composes without a second routing pass. This is the nginx `server` /
+  Envoy `virtual_host` nesting (host contains routes), *not* a parallel
+  host-picks-cluster path: **cluster selection is the route table's
+  alone**, so there is one precedence rule to reason about. Host is
+  matched on its **canonical form** — lowercased and port-stripped (RFC
+  9110 §4.2.3 makes `Host` case-insensitive, and the authority's port is
+  not part of the routing name) — computed once in the trust boundary
+  like the path. Unlike the path, the `Host` header is **forwarded
+  verbatim**: an origin virtual-host may legitimately be case- or
+  port-sensitive, and the proxy has no per-origin knowledge to justify
+  rewriting it — the canonical form is a routing *key*, not a
+  replacement. A request with no `Host` (legal in HTTP/1.0) or an empty
+  one matches only the any-host routes; config hosts must themselves be
+  canonical (rejected at load otherwise), so a request host compares
+  byte-for-byte against them.
 - **Early responses are legal.** An origin may answer before the request
   body finishes (RFC 9110 — e.g. 413 mid-upload): the response head is
   forwarded when it arrives, and the remaining request body is drained or
@@ -501,8 +521,12 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   at config time* into bounded, immutable tables in the config arena
   (match programs over method/host/path/header slices; action lists drawn
   from a closed enum: reject-with-status, add/remove/set header, rewrite
-  path prefix, pick cluster), each with a static limit
+  path prefix), each with a static limit
   (`rules_per_route_max`, `actions_per_rule_max`, `header_edits_max`).
+  Cluster selection is deliberately *not* a filter action: the route
+  table (host + path) is the single mechanism that decides which backend
+  serves a request, so there is one precedence rule, not two engines
+  competing.
   At request time the phase points *interpret* those tables against the
   parsed head — bounded loops over arena data, zero-copy matches on head-
   buffer slices. Mutations never edit the head buffer in place: the

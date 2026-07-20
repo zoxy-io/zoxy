@@ -24,15 +24,21 @@ behind all four gates of §9.
   covering L7: the mixed-protocol simulation (golden + prefix oracles,
   retro-validated against two shipped bugs), the keep-alive-reuse
   zero-alloc gate, and the `Connection: close` Tier-1 bands.
-- **Phase 1.5 — path routing. In progress.** Longest-prefix
-  path → cluster tables per listener, matched on the §7 canonical path
-  (decode unreserved escapes, collapse dot-segments; structure-changing
-  escapes → 400) with the canonical path forwarded upstream, so the
-  router and the origin cannot diverge — the settled §7 decision
-  (2026-07-19). No match → the 404 static verdict. The sim gains a
-  routing-correctness oracle: distinct canonical bodies per cluster
-  plus path-confusion scripts (`/a/../b`, `%2e%2e`, encoded slash).
-  Host rules deferred as a compatible extension of the same table.
+- **Phase 1.5 — path routing. Shipped 2026-07-20 (PR #50).** Longest-
+  prefix path → cluster tables per listener, matched on the §7 canonical
+  path (decode unreserved escapes, collapse dot-segments; structure-
+  changing escapes → 400) with the canonical path forwarded upstream, so
+  the router and the origin cannot diverge. No match → the 404 static
+  verdict. The sim fuzzes canonical forwarding (an origin oracle
+  rejecting a non-canonical forward) and a path-confusion script.
+- **Phase 1.6 — host routing. In progress.** Host becomes the route
+  table's outer dimension (§7, settled 2026-07-20): an optional per-route
+  `host`, matched host-specific-first then longest-prefix, so `host +
+  path` composes in one table with one precedence rule. Host is matched
+  on its canonical form (lowercased, port-stripped) computed in the trust
+  boundary but forwarded verbatim. No-Host requests match only any-host
+  routes. Cluster selection stays the route table's alone — `pick
+  cluster` is not a filter action.
 - **Phase 2 — shedding hardening + minimal resilience.** P2C pick,
   stale-replay (a checkout that fails on first use answers 502 today),
   per-try deadline and the §8 request-deadline 504 verdict (an expired
