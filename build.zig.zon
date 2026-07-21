@@ -32,14 +32,15 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // Audited fork: zoxy-io/libxev branch zoxy-ring-flags = upstream
+        // Audited fork: zoxy-io/libxev branch zoxy-cqsize = upstream
         // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
-        // plus one commit exposing io_uring setup flags through Options.
-        // Diff against that upstream commit to audit; the pin moves only
-        // after re-audit.
+        // plus two commits: one exposing io_uring setup flags through
+        // Options, one exposing the CQ depth (IORING_SETUP_CQSIZE) — the
+        // c10k lever. Diff against that upstream commit to audit; the pin
+        // moves only after re-audit.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#c369817ab8bd529432047107967d88fd5674eae0",
-            .hash = "libxev-0.0.0-86vtc1cTFACGErSvTkJp2mZSFDLCgOHl7R45UZwS5wBZ",
+            .url = "git+https://github.com/zoxy-io/libxev#6bd950d789629d62c985eb7c625f6439e693ec87",
+            .hash = "libxev-0.0.0-86vtcxUcFAAKN43dhrvWh-caogydO84cmzT2QuHxyc-P",
         },
         .zrk = .{
             .url = "git+https://github.com/floatdrop/zrk#dfab0b0e6bbe01c3db147b5025a0d6b38f37f830",
