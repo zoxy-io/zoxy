@@ -37,6 +37,10 @@ pub const Config = struct {
     /// the real shed rungs at loopback-feasible load. Defaulted so the
     /// test beds' literal configs keep the full pools.
     limits: Limits = .{},
+    /// The admin/metrics listener's bind address (§8, PLANS.md Phase 2.5),
+    /// or null when no `admin` block is configured — the plane stays off.
+    /// A static IP:port literal like every other bind (hostnames rejected).
+    admin_bind: ?std.Io.net.IpAddress = null,
 
     pub const Limits = struct {
         conn_slots: u32 = constants.conn_slots_max,
@@ -129,6 +133,7 @@ pub const ValidationError = error{
     LimitRelayBuffersOutOfRange,
     LimitRelayBuffersOverConnSlots,
     LimitUpstreamSlotsOutOfRange,
+    AdminBindInvalid,
 };
 
 pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
@@ -147,6 +152,7 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     const listeners = try resolveListeners(arena, parsed.listeners, clusters);
     try validateTimeouts(&parsed.timeouts);
     const limits = try resolveLimits(&parsed.limits);
+    const admin_bind = try resolveAdminBind(parsed.admin);
 
     assert(listeners.len >= 1);
     assert(clusters.len >= 1);
@@ -158,7 +164,16 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
         .limits = limits,
+        .admin_bind = admin_bind,
     };
+}
+
+/// Resolve the optional admin/metrics listener (§8, PLANS.md Phase 2.5):
+/// absent means the plane is off; a present `bind` must be a static IP:port
+/// literal (hostnames rejected, like every other bind — DNS is a non-goal).
+fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddress {
+    const admin = admin_json orelse return null;
+    return std.Io.net.IpAddress.parseLiteral(admin.bind) catch error.AdminBindInvalid;
 }
 
 /// Resolve the effective pool sizes (§5, §8): the comptime constants are
@@ -207,6 +222,9 @@ pub const ConfigJson = struct {
     /// Optional pool shrinks (§5, §8); absent fields keep the comptime
     /// ceilings.
     limits: LimitsJson = .{},
+    /// Optional admin/metrics listener (§8, PLANS.md Phase 2.5); absent
+    /// leaves the plane off.
+    admin: ?AdminJson = null,
 
     pub const schema_doc =
         "Startup config for the zoxy L4/L7 proxy. Encodes structure, enums, " ++
@@ -222,6 +240,18 @@ pub const ConfigJson = struct {
         .clusters = .{ .desc = "Named upstream clusters, keyed by cluster name." },
         .timeouts = .{ .desc = "Connection lifecycle deadlines (milliseconds)." },
         .limits = .{ .desc = "Optional pool shrinks; absent keeps the compiled ceilings." },
+        .admin = .{ .desc = "Optional admin/metrics listener; absent leaves it off." },
+    };
+};
+
+pub const AdminJson = struct {
+    bind: []const u8,
+
+    pub const schema_doc =
+        "Optional admin/metrics listener. When present, exposes the process " ++
+        "counters as Prometheus exposition text on `bind`; absent leaves it off.";
+    pub const schema_fields = .{
+        .bind = .{ .desc = "IP:port literal to bind the admin/metrics listener (hostnames are rejected)." },
     };
 };
 
@@ -578,6 +608,7 @@ pub const dto_types = .{
     ConfigJson,  ListenerJson,    RouteJson,    FilterJson,
     MatchJson,   HeaderMatchJson, ActionJson,   HeaderEditJson,
     RewriteJson, ClusterJson,     TimeoutsJson, LimitsJson,
+    AdminJson,
 };
 
 comptime {
@@ -1471,6 +1502,38 @@ test "config: limits shrink pools below the ceilings, never past them" {
     // contradiction, not a derivable default.
     try expectParseError(error.LimitRelayBuffersOverConnSlots, head ++ tail ++
         "\"limits\":{\"conn_slots\":4,\"relay_buffers\":8}}");
+}
+
+test "config: admin block resolves a bind literal, absent leaves it off" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}
+    ;
+    // Absent: the admin plane stays off.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(), head ++ tail ++ "}");
+        try std.testing.expect(parsed.admin_bind == null);
+    }
+    // Present: the bind resolves to the given IP:port.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ tail ++ ",\"admin\":{\"bind\":\"127.0.0.1:9100\"}}",
+        );
+        try std.testing.expect(parsed.admin_bind != null);
+        try std.testing.expectEqual(@as(u16, 9100), parsed.admin_bind.?.getPort());
+    }
+    // A hostname (or any non-literal) is rejected — DNS is a non-goal, like
+    // every other bind.
+    try expectParseError(error.AdminBindInvalid, head ++ tail ++ ",\"admin\":{\"bind\":\"localhost:9100\"}}");
+    // The admin object is strict: `bind` is required and extras are rejected.
+    try expectParseError(error.MissingField, head ++ tail ++ ",\"admin\":{}}");
+    try expectParseError(error.UnknownField, head ++ tail ++ ",\"admin\":{\"bind\":\"127.0.0.1:9100\",\"x\":1}}");
 }
 
 test "config: unknown listener protocol fails loudly" {

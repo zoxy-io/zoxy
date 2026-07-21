@@ -10,6 +10,44 @@ const assert = std.debug.assert;
 /// Upper bound on configured listeners.
 pub const listeners_max: u16 = 8;
 
+/// The single dedicated admin/metrics listener (DESIGN.md §8, PLANS.md
+/// §243): separate from the configured `listeners_max` so a scrape can
+/// never consume a data-path listener slot, and reserved in the fd and
+/// ring budgets below unconditionally — the ceiling is a comptime
+/// constant, so it must cover the worst case (admin enabled) even when a
+/// given config leaves it unbound.
+pub const admin_listeners: u32 = 1;
+
+/// Concurrent admin client connections — one scrape served at a time (the
+/// "reserved slot", §8). It lives outside the three shared pools, so a
+/// metrics scrape and the data path can never shed one another. It counts
+/// once in the fd budget (its socket) and `admin_conn_ops_max` times in
+/// the ring budget.
+pub const admin_conns: u32 = 1;
+
+/// Worst-case simultaneously armed ring ops for one admin client: three.
+/// The admin conn carries its own idle/scrape deadline — like every other
+/// network-facing socket it must not let a peer that connects and never
+/// completes park the reserved slot forever (§8) — so a drain-initiated
+/// teardown that races an in-flight send holds the send, the deadline,
+/// and the deadline-cancel co-armed (the same lazy-timer force pattern as
+/// the data path's `conn_ops_max`); a data op and the `close` never
+/// coexist (close is submitted only after the data op drains), so the peak
+/// is three, not four. The accept op is the listener's, budgeted in the
+/// two-per-listener term.
+pub const admin_conn_ops_max: u32 = 3;
+
+/// Deadline for one admin scrape, from accept to close (§8): the reaper
+/// that keeps a stalled or slowloris scrape client from pinning the single
+/// reserved admin slot forever. Short — a metrics scrape is a localhost
+/// round trip — and independent of the data path's `idle_timeout_ms`.
+pub const admin_scrape_deadline_ms: u32 = 5_000;
+
+/// Throwaway buffer for the admin lingering-close drain (§2): the scrape's
+/// request is discarded, never inspected, so one small fixed buffer read
+/// in a loop to EOF suffices — sized only to keep the read count modest.
+pub const admin_drain_scratch_bytes: u32 = 512;
+
 /// Connection slots (`Pool(Conn)`). The binding constraint is the
 /// io_uring completion queue, not fds or memory (§8): every admitted
 /// connection — L4 relaying or L7 in any phase — can hold up to
@@ -17,12 +55,14 @@ pub const listeners_max: u16 = 8;
 /// (an L7 head read is a data op like any other), so every slot claims
 /// its worst-case share of the pre-budgeted ring. With the ring at its
 /// usable maximum (`ring_entries = 4096`, CQ = 8192, ¾ headroom = 6144)
-/// and the parked-upstream reservation carved out first, that caps this
-/// at `(6144 - 18 - upstream_slots_max) / conn_ops_max = 1020` —
-/// comptime-derived below. Keep-alive surplus beyond this ceiling waits
-/// for the deeper-CQ fork lever (`IORING_SETUP_CQSIZE`, docs/PLANS.md),
-/// the same prerequisite as c10k.
-pub const conn_slots_max: u32 = 1020;
+/// and the parked-upstream and admin reservations carved out first, that
+/// caps this at `(6144 - 23 - upstream_slots_max) / conn_ops_max = 1019` —
+/// comptime-derived below (the 23 is the fixed ops: two per config and
+/// admin listener [18], the admin client's op budget [3], the signal wake
+/// [1], and the drain timer [1]). Keep-alive surplus beyond this ceiling
+/// waits for the deeper-CQ fork lever (`IORING_SETUP_CQSIZE`,
+/// docs/PLANS.md), the same prerequisite as c10k.
+pub const conn_slots_max: u32 = 1019;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -173,24 +213,28 @@ pub const timeout_ms_max: u32 = 3_600_000;
 /// every connection slot at its op peak (L7 slots hold armed ops with or
 /// without a relay buffer, so the term is per slot, not per buffer), one
 /// idle-timer op per parked upstream (§5/§8 — reserved ahead of the
-/// keep-alive slice), two ops per listener (a draining listener holds
-/// its armed accept — or the accept-retry backoff timer — plus the async
-/// cancel that reaps it), the single async wakeup op for signals, and
-/// the server's one drain-deadline timer.
+/// keep-alive slice), two ops per listener — configured *and* admin — (a
+/// draining listener holds its armed accept — or the accept-retry backoff
+/// timer — plus the async cancel that reaps it), `admin_conn_ops_max` ops
+/// per admin client (its send/deadline/teardown peak), the single async
+/// wakeup op for signals, and the server's one drain-deadline timer.
 pub const in_flight_ops_max: u32 =
     conn_slots_max * conn_ops_max + upstream_slots_max +
-    2 * @as(u32, listeners_max) + 1 + 1;
+    2 * (@as(u32, listeners_max) + admin_listeners) +
+    admin_conns * admin_conn_ops_max + 1 + 1;
 
 /// Kernel completion queue capacity (io_uring fixes CQ at 2 × SQ).
 pub const completion_queue_entries: u32 = 2 * @as(u32, ring_entries);
 
 /// Worst-case fd count (§8: fds are pre-budgeted, not shed): stdio + ring
-/// + async eventfd + listeners + two sockets per admitted connection
-/// (client plus the exchange's upstream) + the one transient
-/// just-accepted fd an admission decision is pending on + one socket per
-/// parked upstream, which belongs to no connection.
+/// + async eventfd + listeners (configured + admin) + two sockets per
+/// admitted connection (client plus the exchange's upstream) + the one
+/// transient just-accepted fd an admission decision is pending on + one
+/// socket per in-flight admin scrape + one socket per parked upstream,
+/// which belongs to no connection.
 pub const fds_max: u32 =
-    3 + 1 + 1 + listeners_max + 2 * conn_slots_max + 1 + upstream_slots_max;
+    3 + 1 + 1 + (listeners_max + admin_listeners) +
+    2 * conn_slots_max + 1 + admin_conns + upstream_slots_max;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
@@ -231,12 +275,19 @@ comptime {
     assert(poolPressureOn(relay_buffers_max) <= relay_buffers_max);
     // The conn-slot ceiling is derived, not chosen: the largest slot
     // count whose worst-case ops fit the ¾-CQ budget after the fixed
-    // ops and the parked-upstream reservation are carved out (§8).
+    // ops — the parked-upstream reservation and the admin listener plus
+    // its one client op — are carved out (§8).
     assert(conn_slots_max == @divFloor(
-        completion_queue_entries * 3 / 4 - 2 * @as(u32, listeners_max) - 1 - 1 -
-            upstream_slots_max,
+        completion_queue_entries * 3 / 4 -
+            2 * (@as(u32, listeners_max) + admin_listeners) -
+            admin_conns * admin_conn_ops_max - 1 - 1 - upstream_slots_max,
         conn_ops_max,
     ));
+    assert(admin_listeners >= 1);
+    assert(admin_conns >= 1);
+    assert(admin_conn_ops_max >= 1);
+    assert(admin_scrape_deadline_ms >= 1);
+    assert(admin_drain_scratch_bytes >= 1);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool
@@ -326,6 +377,7 @@ test "budgets: conn slots sit at the completion-queue ceiling" {
     // slot would break the budget.
     try std.testing.expect(in_flight_ops_max <= completion_queue_entries * 3 / 4);
     const one_more = (conn_slots_max + 1) * conn_ops_max + upstream_slots_max +
-        2 * @as(u32, listeners_max) + 1 + 1;
+        2 * (@as(u32, listeners_max) + admin_listeners) +
+        admin_conns * admin_conn_ops_max + 1 + 1;
     try std.testing.expect(one_more > completion_queue_entries * 3 / 4);
 }

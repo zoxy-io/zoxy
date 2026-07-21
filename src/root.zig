@@ -55,5 +55,6 @@ test {
     _ = @import("io/xev_smoke_test.zig");
     _ = @import("server_test.zig");
     _ = @import("http_proxy_test.zig");
+    _ = @import("admin_test.zig");
     _ = @import("zero_alloc_test.zig");
 }

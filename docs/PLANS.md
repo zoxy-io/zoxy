@@ -141,6 +141,51 @@ behind all four gates of §9.
     `upstream_replayed ≤ upstream_reused`), asserted by the sim under
     every seed; the sim's adversary gained blackholed dials and a
     `stale_reuse` origin mode.
+- **Phase 2.5 — admin/metrics listener. Implemented 2026-07-21 (branch
+  `prototype/admin-listener`).** The metrics-exposure half of the §8 admin
+  plane, behind all four §9 gates. One dedicated listener off the three
+  shared pools — a single reserved scrape slot, budgeted separately in
+  `constants.zig` (`admin_listeners`, `admin_conns`, `admin_conn_ops_max`)
+  — that answers any request on the admin port with the Prometheus
+  exposition rendering of the counters. Reserving the admin ops derives
+  `conn_slots_max` 1020 → 1019 (the ¾-CQ budget was exactly saturated);
+  `fds_max` is unchanged (one fewer conn slot frees exactly the two fds the
+  admin listener + client claim).
+  - **Renderer** — `Counters.render`, zero-alloc into a caller-owned buffer
+    sized by a comptime-exact `render_bytes_max`; the SIGUSR1 dump (§8)
+    reuses it, so the dump and the scrape endpoint share one wire format.
+    Body framed by `Connection: close` (no Content-Length needed).
+  - **Scrape lifecycle** — accept → send → lingering close (half-close the
+    write side, drain client input to EOF so the close never RSTs the
+    response away, §2) → re-arm; one scrape at a time. A per-scrape
+    deadline (`admin_scrape_deadline_ms`) reaps a stalled/slowloris client
+    so it cannot pin the slot; accept/send/recv witness kernel pressure and
+    a failed accept backs off (`accept_retry_delay_ms`) like the data path.
+    The request is never parsed — the same counters regardless of method or
+    path, so no routing and no new attack surface.
+  - **Drain** — the server drain (§8) closes the admin listener and tears
+    down any in-flight scrape; `maybeStopAfterDrain` and `isIdle` gate on
+    the admin conn's quiescence.
+  - **Enablement** — an optional `"admin": { "bind": "127.0.0.1:9100" }`
+    config block resolves to `Config.admin_bind` (a static IP:port literal,
+    hostnames rejected like every bind); absent leaves the plane off. It
+    carries schema metadata (`AdminJson` in `dto_types`), so `zig build
+    schema` emits it and the metadata gate covers it. The simulator and
+    tests override via `setAdminBind` before `start`.
+  - **Observability** — `admin_served` / `admin_reaped` counters, pure
+    observability outside `reconcile`'s accounting.
+  - **Gates** — SimIo scrape scenarios (byte-exact across partial_io seeds,
+    reset-prefix robustness, a drain racing an in-flight scrape via the
+    raced-accept holder idiom, the deadline reaper), plus the render bound
+    proven tight at `maxInt(u64)`, and config parse tests for the `admin`
+    block (absent → off, valid literal → resolved, hostname/empty/extra →
+    the matching loader error).
+  - **Deferred** — single-scrape-at-a-time is by design (a localhost round
+    trip); lift only on evidence. A richer admin surface (a control plane)
+    stays out, and metrics stay **pull-only**: a push exporter (OTLP /
+    remote-write) would drag in a protobuf dependency, an outbound socket
+    with export buffering + retry (against §8's no-unbounded-queue rule),
+    and collector DNS (a §1 non-goal) — all the wrong grain for this proxy.
 - **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
   activates). The stack is an **open decision under the Zig-first policy**
   (§4). Leading candidate (surveyed 2026-07-12): **picotls** (h2o/picotls)
@@ -240,8 +285,10 @@ queue, in rough value order:
   active health checks (§7).
 - Hot restart + drain-to-successor (§1).
 - Config DSL (§1 keeps config parse-once immutable).
-- Metrics/admin plane beyond loop-written counters + the SIGUSR1 dump
-  (§8).
+- Metrics/admin plane beyond the pull-only Prometheus scrape endpoint +
+  SIGUSR1 dump (Phase 2.5): a control surface (§8). Push export (OTLP /
+  remote-write) is ruled out, not deferred — it wants a protobuf dep,
+  outbound export buffering, and collector DNS, all against the grain.
 - Dynamic DNS for upstream endpoints (§1).
 - io_uring op upgrades — the verdict table above.
 - Config JSON Schema — the generator ships (`zig build schema`, reflected
