@@ -223,7 +223,18 @@ pub const in_flight_ops_max: u32 =
     2 * (@as(u32, listeners_max) + admin_listeners) +
     admin_conns * admin_conn_ops_max + 1 + 1;
 
-/// Kernel completion queue capacity (io_uring fixes CQ at 2 × SQ).
+/// Kernel maximum for an IORING_SETUP_CQSIZE completion queue
+/// (IORING_MAX_CQ_ENTRIES = 2 × IORING_MAX_ENTRIES) on current kernels.
+/// The upper wall on `completion_queue_entries` when the c10k lift raises
+/// it — a request past this fails `Loop.init` at runtime, so the comptime
+/// assert below keeps it a compile error instead.
+pub const io_uring_cq_entries_max: u32 = 65536;
+
+/// The completion queue depth zoxy requests from the kernel via
+/// IORING_SETUP_CQSIZE (XevIo) and the capacity the §8 budgets are derived
+/// against. Still 2 × SQ today — the kernel's own default — but now
+/// requested explicitly, so the c10k lift can raise it independently of
+/// `ring_entries` up to `io_uring_cq_entries_max`.
 pub const completion_queue_entries: u32 = 2 * @as(u32, ring_entries);
 
 /// Worst-case fd count (§8: fds are pre-budgeted, not shed): stdio + ring
@@ -239,6 +250,12 @@ pub const fds_max: u32 =
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
     assert(ring_entries <= 4096);
+    // The CQ depth is now a real kernel argument (XevIo requests it via
+    // IORING_SETUP_CQSIZE), so it must be a value the kernel accepts: a
+    // power of two, at least the SQ depth, and within the kernel cap.
+    assert(std.math.isPowerOfTwo(completion_queue_entries));
+    assert(completion_queue_entries >= ring_entries);
+    assert(completion_queue_entries <= io_uring_cq_entries_max);
     assert(relay_buffers_max <= conn_slots_max);
     assert(relay_buffers_max >= 1);
     assert(listeners_max >= 1);

@@ -62,6 +62,29 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
         io.thread_pool.shutdown();
         io.thread_pool.deinit();
     };
+    io.loop = try initLoop(
+        if (comptime close_needs_thread_pool) &io.thread_pool else null,
+    );
+    errdefer io.loop.deinit();
+    io.notifier = try xev.Async.init();
+    errdefer io.notifier.deinit();
+    io.timer = try xev.Timer.init();
+    errdefer io.timer.deinit();
+    io.listeners = try arena.alloc(ListenerEntry, constants.listeners_max);
+    io.listeners_count = 0;
+    io.notifier_completion = .{};
+    io.signal_mask = std.atomic.Value(u8).init(0);
+    io.signal_callback = null;
+    io.signal_userdata = null;
+    // cached_now is undefined until the first tick; ops armed before
+    // run() (accepts, timers at startup) must see a sane clock.
+    io.loop.update_now();
+}
+
+/// Build the event loop with zoxy's ring discipline (§3, §4, §8). Split
+/// from `init` so the setup — the fast-ring flags, the deep CQ, and the
+/// old-kernel degrade — stays under the function-length limit.
+fn initLoop(thread_pool: ?*xev.ThreadPool) !xev.Loop {
     // SINGLE_ISSUER + COOP_TASKRUN + DEFER_TASKRUN: completion task-work
     // stays on the loop thread and is batched at the GETEVENTS reap point
     // instead of interrupting it (measured 2026-07-12: eliminates the
@@ -78,39 +101,44 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator) !void {
             std.os.linux.IORING_SETUP_DEFER_TASKRUN
     else
         0;
-    io.loop = xev.Loop.init(.{
+    // Request the completion queue we actually budget against
+    // (IORING_SETUP_CQSIZE via the fork) rather than trusting the kernel's
+    // default CQ = 2 × SQ to coincide: the §8 budgets — and `conn_slots_max`
+    // — are derived from `completion_queue_entries`, so the ring must be
+    // sized to it, not to twice the submission queue. Today the two are
+    // equal (2 × 4096) so this is inert; it is the seam the c10k lift turns
+    // on by raising `completion_queue_entries` past 2 × `ring_entries`.
+    // CQSIZE lands in 5.5, older than the 6.1 the fast flags need, so it
+    // survives the plain-ring degrade below.
+    const completion_queue_depth: u32 = if (comptime xev.backend == .io_uring)
+        constants.completion_queue_entries
+    else
+        0;
+    // The fork requires a CQSIZE request to be at least the SQ depth (0
+    // means "kernel default"); constants.zig comptime-asserts the ceiling.
+    assert(completion_queue_depth == 0 or completion_queue_depth >= constants.ring_entries);
+    return xev.Loop.init(.{
         .entries = constants.ring_entries,
         .io_uring_flags = fast_ring_flags,
-        .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
+        .cq_entries = completion_queue_depth,
+        .thread_pool = thread_pool,
     }) catch |err| retry: {
         // Only the io_uring backend rejects these setup flags
         // (EINVAL -> ArgumentsInvalid on kernels < 6.1). On other
         // backends fast_ring_flags is 0 and Loop.init's error set has
         // no ArgumentsInvalid member, so this prong must be pruned at
-        // comptime rather than referenced unconditionally.
+        // comptime rather than referenced unconditionally. The deeper CQ
+        // is kept on the retry — CQSIZE predates the flags that failed.
         if (comptime xev.backend == .io_uring) switch (err) {
             error.ArgumentsInvalid => break :retry try xev.Loop.init(.{
                 .entries = constants.ring_entries,
-                .thread_pool = if (comptime close_needs_thread_pool) &io.thread_pool else null,
+                .cq_entries = completion_queue_depth,
+                .thread_pool = thread_pool,
             }),
             else => {},
         };
         return err;
     };
-    errdefer io.loop.deinit();
-    io.notifier = try xev.Async.init();
-    errdefer io.notifier.deinit();
-    io.timer = try xev.Timer.init();
-    errdefer io.timer.deinit();
-    io.listeners = try arena.alloc(ListenerEntry, constants.listeners_max);
-    io.listeners_count = 0;
-    io.notifier_completion = .{};
-    io.signal_mask = std.atomic.Value(u8).init(0);
-    io.signal_callback = null;
-    io.signal_userdata = null;
-    // cached_now is undefined until the first tick; ops armed before
-    // run() (accepts, timers at startup) must see a sane clock.
-    io.loop.update_now();
 }
 
 /// Test-only teardown; production never exits except through drain.
