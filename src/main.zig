@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init) !void {
     try global_io.init(arena);
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
+    try enableAdminIfConfigured(&server, init.environ_map);
     try server.start();
     installSignalHandlers();
 
@@ -59,6 +60,25 @@ pub fn main(init: std.process.Init) !void {
 
 /// fds are pre-budgeted, not shed (§8): raise the soft limit up to the
 /// hard limit, and refuse to start if even that cannot cover the budget.
+/// Opt-in admin/metrics listener (§8, PLANS.md §243): `ZOXY_ADMIN_BIND`
+/// (e.g. `127.0.0.1:9100`) turns it on. Kept out of the JSON config for
+/// now — a bad value fails loudly rather than starting a proxy with a
+/// silently-off metrics endpoint.
+fn enableAdminIfConfigured(
+    server: *ServerXev,
+    environ_map: *const std.process.Environ.Map,
+) !void {
+    const literal = environ_map.get("ZOXY_ADMIN_BIND") orelse return;
+    const bind = std.Io.net.IpAddress.parseLiteral(literal) catch {
+        std.debug.print(
+            "zoxy: ZOXY_ADMIN_BIND '{s}' is not a host:port literal\n",
+            .{literal},
+        );
+        return error.AdminBindInvalid;
+    };
+    server.setAdminBind(bind);
+}
+
 fn ensureFdBudget() !void {
     const fds_max: u64 = zoxy.constants.fds_max;
     var limits = try std.posix.getrlimit(.NOFILE);

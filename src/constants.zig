@@ -37,6 +37,12 @@ pub const admin_conns: u32 = 1;
 /// two-per-listener term.
 pub const admin_conn_ops_max: u32 = 3;
 
+/// Deadline for one admin scrape, from accept to close (§8): the reaper
+/// that keeps a stalled or slowloris scrape client from pinning the single
+/// reserved admin slot forever. Short — a metrics scrape is a localhost
+/// round trip — and independent of the data path's `idle_timeout_ms`.
+pub const admin_scrape_deadline_ms: u32 = 5_000;
+
 /// Connection slots (`Pool(Conn)`). The binding constraint is the
 /// io_uring completion queue, not fds or memory (§8): every admitted
 /// connection — L4 relaying or L7 in any phase — can hold up to
@@ -275,6 +281,7 @@ comptime {
     assert(admin_listeners >= 1);
     assert(admin_conns >= 1);
     assert(admin_conn_ops_max >= 1);
+    assert(admin_scrape_deadline_ms >= 1);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool

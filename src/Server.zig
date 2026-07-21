@@ -12,6 +12,7 @@
 
 const std = @import("std");
 
+const admin_module = @import("admin.zig");
 const Balancer = @import("balancer.zig").Balancer;
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
@@ -69,6 +70,10 @@ pub fn Server(comptime IoType: type) type {
         /// timer.
         upstream_sweep_completion: IoType.Completion,
         upstream_sweep_armed: bool,
+        /// The dedicated admin/metrics listener (§8, PLANS.md §243): one
+        /// reserved scrape slot off the shared pools, budgeted separately
+        /// (`constants.admin_*`). Off unless a bind is set before `start`.
+        admin: admin_module.Admin(IoType),
 
         const Self = @This();
 
@@ -129,6 +134,14 @@ pub fn Server(comptime IoType: type) type {
             server.drain_deadline_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
+            server.admin.init(server, null);
+        }
+
+        /// Enable the admin/metrics listener on `bind_address` (main.zig
+        /// from `ZOXY_ADMIN_BIND`; the simulator sets it directly). Must be
+        /// called before `start`; with no call the admin plane stays off.
+        pub fn setAdminBind(server: *Self, bind_address: std.Io.net.IpAddress) void {
+            server.admin.setBind(bind_address);
         }
 
         pub fn start(server: *Self) Io.ListenError!void {
@@ -152,6 +165,7 @@ pub fn Server(comptime IoType: type) type {
                 };
                 server.armAccept(state);
             }
+            try server.admin.start();
             server.io.signalWait(Self, server, onSignal);
         }
 
@@ -167,6 +181,9 @@ pub fn Server(comptime IoType: type) type {
             for (server.listeners[0..server.listeners_count]) |*state| {
                 server.io.listenClose(state.listener);
             }
+            // The admin listener stops accepting and any in-flight scrape
+            // is torn down under the same drain (§8).
+            server.admin.beginDrain();
             // Parked upstreams are idle capacity; the drain sheds them
             // first (§8). Synchronous closes: no armed op to wait for.
             server.reapParked(true);
@@ -201,9 +218,12 @@ pub fn Server(comptime IoType: type) type {
             }
         }
 
-        fn maybeStopAfterDrain(server: *Self) void {
+        pub fn maybeStopAfterDrain(server: *Self) void {
             if (!server.draining) return;
             if (!server.conns.isFullyReleased()) return;
+            // An in-flight scrape holds no pool slot but does hold an armed
+            // op and the admin fd; the loop must not stop until it drains.
+            if (!server.admin.isQuiescent()) return;
             assert(server.relay_buffers.isFullyReleased());
             // beginDrain reaped every parked slot synchronously and no
             // conn is left to lease one, so the pool must be empty.
@@ -258,11 +278,14 @@ pub fn Server(comptime IoType: type) type {
             server.ensureUpstreamSweep();
         }
 
-        /// The simulator's leak invariant (§9).
+        /// The simulator's leak invariant (§9). The admin conn holds no
+        /// pool slot, but a leaked armed op or an open admin fd is a leak
+        /// all the same, so its quiescence is part of "idle".
         pub fn isIdle(server: *const Self) bool {
             return server.conns.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
-                server.upstreams.isFullyReleased();
+                server.upstreams.isFullyReleased() and
+                server.admin.isQuiescent();
         }
 
         pub fn activeCount(server: *const Self) u32 {
