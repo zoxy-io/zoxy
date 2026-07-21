@@ -181,8 +181,8 @@ behind all four gates of §9.
     block (absent → off, valid literal → resolved, hostname/empty/extra →
     the matching loader error).
   - **Deferred** — single-scrape-at-a-time is by design (a localhost round
-    trip); lift only on evidence. Richer admin surface (push/OTLP export,
-    per-route stats, a control plane) stays out.
+    trip); lift only on evidence. Richer admin surface (push/OTLP export, a
+    control plane) stays out.
 - **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
   activates). The stack is an **open decision under the Zig-first policy**
   (§4). Leading candidate (surveyed 2026-07-12): **picotls** (h2o/picotls)
@@ -283,7 +283,7 @@ queue, in rough value order:
 - Hot restart + drain-to-successor (§1).
 - Config DSL (§1 keeps config parse-once immutable).
 - Metrics/admin plane beyond the Prometheus scrape endpoint + SIGUSR1 dump
-  (Phase 2.5): push/OTLP export, per-route stats, a control surface (§8).
+  (Phase 2.5): push/OTLP export, a control surface (§8).
 - Dynamic DNS for upstream endpoints (§1).
 - io_uring op upgrades — the verdict table above.
 - Config JSON Schema — the generator ships (`zig build schema`, reflected
