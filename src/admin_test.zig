@@ -376,3 +376,22 @@ test "admin: the scrape deadline reaps a client that never finishes" {
     try testing.expectEqual(@as(u64, 1), harness.server.counters.get("admin_reaped"));
     try harness.expectDrained();
 }
+
+test "admin: draining an idle-and-accepting listener releases cleanly" {
+    // A direct, timing-independent reproduction of the once-fixed drain bug:
+    // a Canceled accept during drain must clear `listening` so the loop can
+    // reach quiescence. The admin listener is armed and accepting with zero
+    // scrapes ever served when the drain begins, so `beginDrain` closes the
+    // listener, `listenClose` cancels the armed accept, and onAccept's
+    // draining branch must return the admin to quiescent. A regression that
+    // left `listening` set would strand `isQuiescent`, and the run would
+    // deadlock instead of draining.
+    var harness: Harness = undefined;
+    try harness.setUp(testing.allocator, .{ .seed = 1, .adversary = .{ .partial_io = false } });
+    defer harness.tearDown();
+
+    harness.server.beginDrain();
+    try harness.sim_io.run();
+
+    try harness.expectDrained();
+}
