@@ -260,9 +260,24 @@ at `(6144 − 18) / 5 = 1225`. Two levers were on the table:
    documented `RLIMIT_NOFILE` assumption (handled at startup, §8).
 2. **`splice`** (above) — an independent win at saturation, still fork
    work; same re-audit cost.
+3. **Cut `conn_ops_max` 5 → 4** — the one ceiling lever that is *not*
+   fork work. The per-connection ring-op budget is 5 only to cover the
+   teardown-race worst case (a teardown racing its own upstream dial:
+   both closes + the deadline + `connect_cancel` + `deadline_cancel`
+   armed at once); steady-state relay peaks at 4. The ceiling is
+   `(cq_fill_budget − fixed − upstream_slots) / conn_ops_max`, so dropping
+   the divisor to 4 lifts `conn_slots_max` ~25% (11259 → 14074 at ⅞) at
+   the same ring depth and per-slot memory. The cost is in-tree: rework
+   the connect-teardown path so those five ops can never be armed together
+   (serialize cancel-then-close, or drop the deadline during teardown),
+   with a §9 sim case proving the four-op ceiling holds under the race.
+   Lowering the constant without that proof trips the CQ-overcommit
+   assert (§4/§8), not a shed.
 
 Entry gate for further ceiling work: demonstrate a workload that actually
-saturates the 11259 ceiling before spending another fork re-audit on it.
+saturates the 11259 ceiling first — the fork levers cost a re-audit and
+the `conn_ops_max` cut costs a teardown-path proof, neither worth
+spending blind.
 
 ## libxev fork queue
 

@@ -93,12 +93,18 @@ not re-propose.
 Concurrent L4 connections are bound by the io_uring completion queue,
 not fds or memory: each admitted connection holds up to
 `conn_ops_max = 5` armed ops, the ring is pre-budgeted and never shed
-(§8), and in-flight ops must stay under ¾ of the CQ. At the usable ring
-maximum (`ring_entries = 4096`, CQ = 8192) that caps
-`relay_buffers_max` at `(6144 − 18) / 5 = 1225`. `constants.zig` owns
-the arithmetic and comptime-asserts it; fds and memory both have
-headroom (`fds_max = 2464` against a typical 4096 hard limit). The
-levers that lift the ceiling are fork work — PLANS.md, "c10k".
+(§8), and in-flight ops must stay within the configured CQ fill
+(`cq_fill_eighths`, ⅞ by default). First measured before the CQSIZE
+lever, when libxev fixed the CQ at 2 × SQ = 8192 and it capped
+`relay_buffers_max` at `(6144 − 18) / 5 = 1225`. The finding held and
+drove the fork work: `IORING_SETUP_CQSIZE` (#61) lets XevIo request the
+kernel maximum (65536), lifting `conn_slots_max` / `relay_buffers_max` to
+`(57344 − 23 − upstream_slots_max) / 5 = 11259` at ⅞. fds bind next now,
+not memory (`fds_max = 23558` at the ceiling, so a c10k deployment raises
+`RLIMIT_NOFILE` at startup, §8). `constants.zig` owns the arithmetic and
+comptime-asserts it. The remaining ceiling levers — `splice` (fork) and
+cutting `conn_ops_max` 5 → 4 (in-tree teardown work) — are in PLANS.md,
+"c10k".
 
 ## libxev error surfacing is lossy
 
