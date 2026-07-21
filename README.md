@@ -11,11 +11,48 @@ zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — comple
 with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
 
-## Requirements
+## Usage
+
+The built binary takes exactly one argument — the path to a JSON config:
+
+```sh
+zoxy <config.json>   # start the proxy
+zoxy --help          # usage summary (-h)
+zoxy --version       # print the version (-V)
+```
+
+Signals: `SIGTERM`/`SIGINT` drain in-flight connections and exit 0;
+`SIGUSR1` dumps counters to stdout.
+
+A minimal config — an L4 listener forwarding to one origin
+([`config/example.json`](config/example.json)):
+
+```json
+{
+    "listeners": [
+        { "bind": "127.0.0.1:8080", "cluster": "origin", "protocol": "l4" }
+    ],
+    "clusters": {
+        "origin": { "endpoints": ["127.0.0.1:9000"] }
+    },
+    "timeouts": {
+        "connect_ms": 5000,
+        "idle_ms": 60000,
+        "drain_deadline_ms": 10000,
+        "max_lifetime_ms": 0
+    }
+}
+```
+
+The full config format — every field, enum, and numeric bound — is
+described by the JSON Schema shipped as a release asset (also emitted
+locally by `zig build schema`).
+
+## Development
+
+### Requirements
 
 - **Zig 0.16** (pinned by [devenv](devenv.nix): `zig_0_16` + `zls`).
-
-## Build & run
 
 With [devenv](https://devenv.sh) `.envrc` activates the same shell automatically on `cd`):
 

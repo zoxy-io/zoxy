@@ -4,6 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The version string is single-sourced from build.zig.zon and handed to
+    // the binary through a build-options module, so `zoxy --version` and the
+    // package metadata can never drift apart.
+    const zoxy_version = @import("build.zig.zon").version;
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", zoxy_version);
+
     // libxev is pinned by content hash to the zoxy-io fork's
     // zoxy-ring-flags branch: the audited upstream snapshot plus the
     // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
@@ -50,6 +57,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // src/main.zig reads its version from this module (also added to the
+    // ReleaseFast `release_zoxy` below, the other build of that same source).
+    exe.root_module.addOptions("build_options", build_options);
     b.installArtifact(exe);
 
     const run_command = b.addRunArtifact(exe);
@@ -156,6 +166,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    release_zoxy.root_module.addOptions("build_options", build_options);
     const bench_exe = b.addExecutable(.{
         .name = "zoxy-bench",
         .root_module = b.createModule(.{
