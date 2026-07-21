@@ -34,6 +34,7 @@ const std = @import("std");
 const Balancer = @import("../balancer.zig").Balancer;
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
+const pump = @import("../net/pump.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
 const render = @import("render.zig");
@@ -598,7 +599,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // keep pumping into a connection that is already closing (§7).
                 if (conn.state != .l7_exchanging) return;
             }
-            if (framingDone(&conn.l7.request_framing)) {
+            if (framingDoneOf(&conn.l7.request_framing)) {
                 conn.l7.request_leg = .done;
             } else {
                 conn.l7.request_leg = .pumping_body;
@@ -609,118 +610,93 @@ pub fn Proxy(comptime IoType: type) type {
             }
         }
 
-        fn armRequestBodyRecv(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .pumping_body);
-            // A recv on the CLIENT socket: an expiry cannot force it, so
-            // the deadline verdict is unanswerable while this op is armed.
-            conn.l7.request_op_on_client = true;
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
-            server.io.recv(
-                conn.client_socket,
-                &conn.relay_buffer.?.client_to_upstream,
-                &conn.op_data_client_to_upstream.completion,
-                ConnType,
-                conn,
-                onRequestBodyRecv,
-            );
-        }
-
-        fn onRequestBodyRecv(conn: *ConnType, result: Io.RecvError!u32) void {
-            const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
+        /// The request leg's body pump (client → origin, §7). Framed by the
+        /// request's own framing; a client-side recv cannot be forced, so a
+        /// pending verdict makes the arm illegal and a settled verdict on a
+        /// send diverts. A short body tail past the framing is a pipelined
+        /// next request (§2 note). Failures doom the exchange: a recv EOF is
+        /// a truncated request (teardown), a send failure is the origin
+        /// giving out (`upstreamFailed`).
+        const RequestBodyPolicy = struct {
+            pub fn beforeRecv(conn: *ConnType) void {
+                assert(conn.state == .l7_exchanging);
+                assert(conn.l7.request_leg == .pumping_body);
+                // A client-side recv is never armed under a pending verdict:
+                // expiry is unanswerable then, and a verdict arms nothing.
+                assert(conn.l7.pending_verdict == .none);
+                // A recv on the CLIENT socket: an expiry cannot force it, so
+                // the deadline verdict is unanswerable while this op is armed.
+                conn.l7.request_op_on_client = true;
             }
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .pumping_body);
-            // A client-side recv is never armed under a pending verdict:
-            // expiry is unanswerable then, and a verdict arms nothing.
-            assert(conn.l7.pending_verdict == .none);
-            const received = result catch |err| {
+
+            pub fn beforeSend(conn: *ConnType) void {
+                assert(conn.state == .l7_exchanging);
+                conn.l7.request_op_on_client = false; // A send on the upstream socket.
+            }
+
+            /// Completion-time re-checks (post-await): a client-side body
+            /// recv is never armed under a pending verdict — expiry is
+            /// unanswerable then — so none can have arrived during the await.
+            pub fn onRecvEntry(conn: *ConnType) void {
+                assert(conn.state == .l7_exchanging);
+                assert(conn.l7.request_leg == .pumping_body);
+                assert(conn.l7.pending_verdict == .none);
+            }
+
+            pub fn feed(conn: *ConnType, chunk: []const u8) pump.FeedResult {
+                return feedFraming(&conn.l7.request_framing, chunk);
+            }
+
+            pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
+                if (fr.consumed < received) {
+                    // Bytes past the body are a pipelined next request; the
+                    // connection will close after this exchange (§2 note).
+                    conn.l7.client_pipelined = true;
+                }
+            }
+
+            pub fn framingDone(conn: *ConnType) bool {
+                return framingDoneOf(&conn.l7.request_framing);
+            }
+
+            pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
                 // EOF mid-body is a truncated request; any failure here
                 // dooms the exchange in the client's own direction.
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
-                return;
-            };
-            assert(received >= 1);
-            const chunk = conn.relay_buffer.?.client_to_upstream[0..received];
-            const feed = feedFraming(&conn.l7.request_framing, chunk);
-            if (feed.malformed) {
-                server.beginTeardown(conn);
-                return;
             }
-            if (feed.consumed < received) {
-                // Bytes past the body are a pipelined next request; the
-                // connection will close after this exchange (§2 note).
-                conn.l7.client_pipelined = true;
+
+            pub fn onSendError(server: *ServerType, conn: *ConnType, err: Io.SendError) void {
+                server.witnessKernelPressure(err);
+                upstreamFailed(server, conn);
             }
-            const direction = &conn.directions[0];
-            direction.transfer_len = feed.consumed;
-            direction.sent_len = 0;
-            if (feed.consumed >= 1) {
-                armRequestBodySend(server, conn);
-            } else {
-                assert(feed.done);
+
+            pub fn onDrained(server: *ServerType, conn: *ConnType) void {
+                _ = server;
                 conn.l7.request_leg = .done;
                 // The delivered recv was the flag's referent; keep the
                 // flag self-descriptive now that no request op is armed.
                 conn.l7.request_op_on_client = false;
             }
-        }
 
-        fn armRequestBodySend(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_exchanging);
-            const direction = &conn.directions[0];
-            assert(direction.sent_len < direction.transfer_len);
-            conn.l7.request_op_on_client = false; // A send on the upstream socket.
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
-            server.io.send(
-                conn.upstream_socket.?,
-                conn.relay_buffer.?.client_to_upstream[direction.sent_len..direction.transfer_len],
-                &conn.op_data_client_to_upstream.completion,
-                ConnType,
-                conn,
-                onRequestBodySent,
-            );
-        }
-
-        fn onRequestBodySent(conn: *ConnType, result: Io.SendError!u32) void {
-            const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .pumping_body);
-            if (conn.l7.pending_verdict != .none) {
-                settlePendingVerdict(server, conn);
-                return;
-            }
-            const sent = result catch |err| {
-                server.witnessKernelPressure(err);
-                upstreamFailed(server, conn);
-                return;
-            };
-            assert(sent >= 1);
-            const direction = &conn.directions[0];
-            direction.sent_len += sent;
-            assert(direction.sent_len <= direction.transfer_len);
-            if (direction.sent_len < direction.transfer_len) {
-                armRequestBodySend(server, conn);
-                return;
-            }
-            // A full chunk moved: activity refreshes the deadline (§6).
-            server.storeDeadline(conn, server.idleTimeoutMs());
-            if (framingDone(&conn.l7.request_framing)) {
+            pub fn onComplete(server: *ServerType, conn: *ConnType) void {
+                _ = server;
                 conn.l7.request_leg = .done;
-            } else {
-                armRequestBodyRecv(server, conn);
             }
-        }
+
+            pub fn onSendEntry(server: *ServerType, conn: *ConnType) bool {
+                assert(conn.state == .l7_exchanging);
+                assert(conn.l7.request_leg == .pumping_body);
+                if (conn.l7.pending_verdict != .none) {
+                    settlePendingVerdict(server, conn);
+                    return true;
+                }
+                return false;
+            }
+        };
+
+        const RequestBodyPump = pump.Pump(IoType, .client_to_upstream, RequestBodyPolicy);
+        const armRequestBodyRecv = RequestBodyPump.armRecv;
 
         fn startResponseLeg(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
@@ -1010,38 +986,44 @@ pub fn Proxy(comptime IoType: type) type {
         fn afterResponseExcess(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             conn.l7.response_leg = .pumping_body;
-            if (framingDone(&conn.l7.response_framing)) {
+            if (framingDoneOf(&conn.l7.response_framing)) {
                 finishExchange(server, conn);
             } else {
                 armResponseBodyRecv(server, conn);
             }
         }
 
-        fn armResponseBodyRecv(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .pumping_body);
-            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            server.io.recv(
-                conn.upstream_socket.?,
-                &conn.relay_buffer.?.upstream_to_client,
-                &conn.op_data_upstream_to_client.completion,
-                ConnType,
-                conn,
-                onResponseBodyRecv,
-            );
-        }
-
-        fn onResponseBodyRecv(conn: *ConnType, result: Io.RecvError!u32) void {
-            const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
+        /// The response leg's body pump (origin → client, §7). Framed by the
+        /// origin's response framing; the first response byte already
+        /// reached the client, so no verdict can be pending (a 504/replay is
+        /// off the table once bytes flow). An `until_close` body ends on the
+        /// origin's EOF; any other framing's EOF is a truncation the client
+        /// must see, and every failure tears down.
+        const ResponseBodyPolicy = struct {
+            pub fn beforeRecv(conn: *ConnType) void {
+                assert(conn.state == .l7_exchanging);
+                assert(conn.l7.response_leg == .pumping_body);
+                assert(conn.l7.pending_verdict == .none); // response_started.
             }
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .pumping_body);
-            assert(conn.l7.pending_verdict == .none); // response_started.
-            const received = result catch |err| {
+
+            /// Completion-time re-checks (post-await): once a response byte
+            /// has reached the client no verdict can be pending, so the
+            /// invariant must still hold after the await.
+            pub fn onRecvEntry(conn: *ConnType) void {
+                assert(conn.state == .l7_exchanging);
+                assert(conn.l7.response_leg == .pumping_body);
+                assert(conn.l7.pending_verdict == .none); // response_started.
+            }
+
+            pub fn feed(conn: *ConnType, chunk: []const u8) pump.FeedResult {
+                return feedFraming(&conn.l7.response_framing, chunk);
+            }
+
+            pub fn framingDone(conn: *ConnType) bool {
+                return framingDoneOf(&conn.l7.response_framing);
+            }
+
+            pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
                 if (err == error.EndOfStream) {
                     if (conn.l7.response_framing == .until_close) {
                         // The origin's EOF is this framing's terminator.
@@ -1053,71 +1035,32 @@ pub fn Proxy(comptime IoType: type) type {
                 }
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
-                return;
-            };
-            assert(received >= 1);
-            const chunk = conn.relay_buffer.?.upstream_to_client[0..received];
-            const feed = feedFraming(&conn.l7.response_framing, chunk);
-            if (feed.malformed) {
-                server.beginTeardown(conn);
-                return;
             }
-            const direction = &conn.directions[1];
-            direction.transfer_len = feed.consumed;
-            direction.sent_len = 0;
-            if (feed.consumed >= 1) {
-                armResponseBodySend(server, conn);
-            } else {
-                assert(feed.done);
-                finishExchange(server, conn);
-            }
-        }
 
-        fn armResponseBodySend(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_exchanging);
-            const direction = &conn.directions[1];
-            assert(direction.sent_len < direction.transfer_len);
-            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            server.io.send(
-                conn.client_socket,
-                conn.relay_buffer.?.upstream_to_client[direction.sent_len..direction.transfer_len],
-                &conn.op_data_upstream_to_client.completion,
-                ConnType,
-                conn,
-                onResponseBodySent,
-            );
-        }
-
-        fn onResponseBodySent(conn: *ConnType, result: Io.SendError!u32) void {
-            const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .pumping_body);
-            assert(conn.l7.pending_verdict == .none); // response_started.
-            const sent = result catch |err| {
+            pub fn onSendError(server: *ServerType, conn: *ConnType, err: Io.SendError) void {
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
-                return;
-            };
-            assert(sent >= 1);
-            const direction = &conn.directions[1];
-            direction.sent_len += sent;
-            assert(direction.sent_len <= direction.transfer_len);
-            if (direction.sent_len < direction.transfer_len) {
-                armResponseBodySend(server, conn);
-                return;
             }
-            server.storeDeadline(conn, server.idleTimeoutMs());
-            if (framingDone(&conn.l7.response_framing)) {
+
+            pub fn onDrained(server: *ServerType, conn: *ConnType) void {
                 finishExchange(server, conn);
-            } else {
-                armResponseBodyRecv(server, conn);
             }
-        }
+
+            pub fn onComplete(server: *ServerType, conn: *ConnType) void {
+                finishExchange(server, conn);
+            }
+
+            pub fn onSendEntry(server: *ServerType, conn: *ConnType) bool {
+                _ = server;
+                assert(conn.state == .l7_exchanging);
+                assert(conn.l7.response_leg == .pumping_body);
+                assert(conn.l7.pending_verdict == .none); // response_started.
+                return false;
+            }
+        };
+
+        const ResponseBodyPump = pump.Pump(IoType, .upstream_to_client, ResponseBodyPolicy);
+        const armResponseBodyRecv = ResponseBodyPump.armRecv;
 
         /// The response reached the client in full: settle both sides.
         /// The upstream connection parks for reuse when the origin allowed
@@ -1507,11 +1450,7 @@ pub fn Proxy(comptime IoType: type) type {
             armDrainRecv(server, conn);
         }
 
-        const FeedResult = struct {
-            consumed: u32,
-            done: bool,
-            malformed: bool,
-        };
+        const FeedResult = pump.FeedResult;
 
         /// Advance a framing tracker over `bytes`, reporting how many of
         /// them belong to the message. Consumed < bytes.len means the
@@ -1551,7 +1490,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
         }
 
-        fn framingDone(framing: *const Framing) bool {
+        fn framingDoneOf(framing: *const Framing) bool {
             return switch (framing.*) {
                 .none => true,
                 .content_length => |remaining| remaining == 0,

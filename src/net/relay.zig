@@ -5,11 +5,17 @@
 //! and held for the connection's life: a recv must always have a buffer
 //! posted, so `relay_buffers_max`, not conn slots, bounds concurrent L4
 //! connections.
+//!
+//! The recv → send loop itself lives in `pump.zig`; this file supplies only
+//! the L4 *policy* — no framing (relay runs until FIN both ways), EOF becomes
+//! a half-close, and the connection tears down when both directions have
+//! finished.
 
 const std = @import("std");
 
 const constants = @import("../constants.zig");
 const conn_module = @import("Conn.zig");
+const pump = @import("pump.zig");
 const Io = @import("../io/io.zig");
 
 const assert = std.debug.assert;
@@ -38,115 +44,111 @@ pub fn Relay(comptime IoType: type) type {
     const Direction = ConnType.Direction;
 
     return struct {
+        /// The L4 relay policy for one direction: no framing, EOF is a
+        /// half-close, teardown once both directions finish. Instantiated
+        /// once per direction so the terminal handlers know which side
+        /// FIN'd.
+        fn Policy(comptime direction: Direction) type {
+            return struct {
+                fn targetSocket(conn: *const ConnType) IoType.Socket {
+                    return switch (direction) {
+                        .client_to_upstream => conn.upstream_socket.?,
+                        .upstream_to_client => conn.client_socket,
+                    };
+                }
+
+                fn state(conn: *ConnType) *ConnType.DirectionState {
+                    return &conn.directions[@intFromEnum(direction)];
+                }
+
+                pub fn beforeRecv(conn: *ConnType) void {
+                    assert(conn.state == .relaying);
+                    const direction_state = state(conn);
+                    assert(direction_state.phase == .idle or direction_state.phase == .sending);
+                    direction_state.phase = .receiving;
+                }
+
+                pub fn beforeSend(conn: *ConnType) void {
+                    assert(conn.state == .relaying);
+                    const direction_state = state(conn);
+                    assert(direction_state.phase == .receiving or direction_state.phase == .sending);
+                    direction_state.phase = .sending;
+                }
+
+                /// Completion-time re-checks: the invariants must still hold
+                /// after the in-flight await, not only when the op was armed.
+                pub fn onRecvEntry(conn: *ConnType) void {
+                    assert(conn.state == .relaying);
+                    assert(state(conn).phase == .receiving);
+                }
+
+                pub fn onSendEntry(server: *ServerType, conn: *ConnType) bool {
+                    _ = server;
+                    assert(conn.state == .relaying);
+                    assert(state(conn).phase == .sending);
+                    return false; // Relay never diverts: it has no verdict.
+                }
+
+                /// No framing: every received byte is relayed and the
+                /// message never ends short of a FIN, so `done` stays false.
+                pub fn feed(conn: *ConnType, chunk: []const u8) pump.FeedResult {
+                    _ = conn;
+                    return .{ .consumed = @intCast(chunk.len), .done = false, .malformed = false };
+                }
+
+                /// A FIN never arrives through here (relay has no length to
+                /// count down); the loop only leaves on EOF or teardown.
+                pub fn framingDone(conn: *ConnType) bool {
+                    _ = conn;
+                    return false;
+                }
+
+                pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
+                    if (err == error.EndOfStream) {
+                        // Half-close (§6): propagate the FIN, keep the other
+                        // direction relaying under the deadline.
+                        state(conn).phase = .finished;
+                        server.io.shutdown(targetSocket(conn), .write);
+                        server.storeDeadline(conn, server.idleTimeoutMs());
+                        maybeFinish(server, conn);
+                        return;
+                    }
+                    server.witnessKernelPressure(err);
+                    server.beginTeardown(conn);
+                }
+
+                pub fn onSendError(server: *ServerType, conn: *ConnType, err: Io.SendError) void {
+                    server.witnessKernelPressure(err);
+                    server.beginTeardown(conn);
+                }
+
+                /// Unreachable for L4: `feed` never yields 0 consumed bytes
+                /// and never reports `done`.
+                pub fn onDrained(server: *ServerType, conn: *ConnType) void {
+                    _ = server;
+                    _ = conn;
+                    unreachable;
+                }
+
+                /// Unreachable for L4: `framingDone` is always false.
+                pub fn onComplete(server: *ServerType, conn: *ConnType) void {
+                    _ = server;
+                    _ = conn;
+                    unreachable;
+                }
+            };
+        }
+
+        const PumpClientToUpstream = pump.Pump(IoType, .client_to_upstream, Policy(.client_to_upstream));
+        const PumpUpstreamToClient = pump.Pump(IoType, .upstream_to_client, Policy(.upstream_to_client));
+
         pub fn start(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .relaying);
             assert(conn.upstream_socket != null);
             assert(conn.directions[0].phase == .idle);
             assert(conn.directions[1].phase == .idle);
-            armRecv(server, conn, .client_to_upstream);
-            armRecv(server, conn, .upstream_to_client);
-        }
-
-        fn armRecv(server: *ServerType, conn: *ConnType, comptime direction: Direction) void {
-            assert(conn.state == .relaying);
-            const state = directionState(conn, direction);
-            assert(state.phase == .idle or state.phase == .sending);
-            state.phase = .receiving;
-            const op = dataOp(conn, direction);
-            conn.arm(op, armedBitName(direction));
-            server.io.recv(
-                sourceSocket(conn, direction),
-                buffer(conn, direction),
-                &op.completion,
-                ConnType,
-                conn,
-                onRecvFor(direction),
-            );
-        }
-
-        fn armSend(server: *ServerType, conn: *ConnType, comptime direction: Direction) void {
-            assert(conn.state == .relaying);
-            const state = directionState(conn, direction);
-            assert(state.phase == .receiving or state.phase == .sending);
-            assert(state.sent_len < state.transfer_len);
-            state.phase = .sending;
-            const op = dataOp(conn, direction);
-            conn.arm(op, armedBitName(direction));
-            server.io.send(
-                targetSocket(conn, direction),
-                buffer(conn, direction)[state.sent_len..state.transfer_len],
-                &op.completion,
-                ConnType,
-                conn,
-                onSendFor(direction),
-            );
-        }
-
-        fn onRecv(
-            comptime direction: Direction,
-            conn: *ConnType,
-            result: Io.RecvError!u32,
-        ) void {
-            const server = conn.server;
-            conn.delivered(dataOp(conn, direction), armedBitName(direction));
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
-            assert(conn.state == .relaying);
-            const state = directionState(conn, direction);
-            assert(state.phase == .receiving);
-            const received = result catch |err| {
-                if (err == error.EndOfStream) {
-                    // Half-close (§6): propagate the FIN, keep the other
-                    // direction relaying under the deadline.
-                    state.phase = .finished;
-                    server.io.shutdown(targetSocket(conn, direction), .write);
-                    server.storeDeadline(conn, server.idleTimeoutMs());
-                    maybeFinish(server, conn);
-                    return;
-                }
-                server.witnessKernelPressure(err);
-                server.beginTeardown(conn);
-                return;
-            };
-            assert(received >= 1);
-            assert(received <= buffer(conn, direction).len);
-            state.transfer_len = received;
-            state.sent_len = 0;
-            armSend(server, conn, direction);
-        }
-
-        fn onSend(
-            comptime direction: Direction,
-            conn: *ConnType,
-            result: Io.SendError!u32,
-        ) void {
-            const server = conn.server;
-            conn.delivered(dataOp(conn, direction), armedBitName(direction));
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
-            assert(conn.state == .relaying);
-            const state = directionState(conn, direction);
-            assert(state.phase == .sending);
-            const sent = result catch |err| {
-                server.witnessKernelPressure(err);
-                server.beginTeardown(conn);
-                return;
-            };
-            assert(sent >= 1);
-            state.sent_len += sent;
-            assert(state.sent_len <= state.transfer_len);
-            if (state.sent_len < state.transfer_len) {
-                armSend(server, conn, direction);
-            } else {
-                // A full exchange moved: this is activity — push the idle
-                // deadline out (§6); the armed timer op is not touched.
-                server.storeDeadline(conn, server.idleTimeoutMs());
-                armRecv(server, conn, direction);
-            }
+            PumpClientToUpstream.armRecv(server, conn);
+            PumpUpstreamToClient.armRecv(server, conn);
         }
 
         /// Both directions drained: the orderly end of an L4 connection.
@@ -157,66 +159,6 @@ pub fn Relay(comptime IoType: type) type {
                     server.beginTeardown(conn);
                 }
             }
-        }
-
-        // The per-direction plumbing derives from one naming convention:
-        // the DirectionState index, the RelayBuffer field, the op field
-        // (`op_data_` + tag), and the armed bit (`data_` + tag) are all
-        // keyed off the direction's tag name, so the only real branch is
-        // which socket is the source (its target is the source of the
-        // opposite direction).
-
-        fn directionState(conn: *ConnType, comptime direction: Direction) *ConnType.DirectionState {
-            return &conn.directions[@intFromEnum(direction)];
-        }
-
-        fn dataOp(conn: *ConnType, comptime direction: Direction) *ConnType.Op {
-            return &@field(conn, "op_data_" ++ @tagName(direction));
-        }
-
-        fn armedBitName(comptime direction: Direction) []const u8 {
-            return "data_" ++ @tagName(direction);
-        }
-
-        fn buffer(conn: *ConnType, comptime direction: Direction) []u8 {
-            // The L4 relay always holds its buffer for the connection's
-            // life (§6); it is only ever null on an idle L7 connection.
-            return &@field(conn.relay_buffer.?, @tagName(direction));
-        }
-
-        fn opposite(comptime direction: Direction) Direction {
-            return switch (direction) {
-                .client_to_upstream => .upstream_to_client,
-                .upstream_to_client => .client_to_upstream,
-            };
-        }
-
-        fn sourceSocket(conn: *const ConnType, comptime direction: Direction) IoType.Socket {
-            // The relay only runs in .relaying, where the upstream is set.
-            return switch (direction) {
-                .client_to_upstream => conn.client_socket,
-                .upstream_to_client => conn.upstream_socket.?,
-            };
-        }
-
-        fn targetSocket(conn: *const ConnType, comptime direction: Direction) IoType.Socket {
-            return sourceSocket(conn, opposite(direction));
-        }
-
-        fn onRecvFor(comptime direction: Direction) fn (*ConnType, Io.RecvError!u32) void {
-            return (struct {
-                fn callback(conn: *ConnType, result: Io.RecvError!u32) void {
-                    onRecv(direction, conn, result);
-                }
-            }).callback;
-        }
-
-        fn onSendFor(comptime direction: Direction) fn (*ConnType, Io.SendError!u32) void {
-            return (struct {
-                fn callback(conn: *ConnType, result: Io.SendError!u32) void {
-                    onSend(direction, conn, result);
-                }
-            }).callback;
         }
     };
 }
