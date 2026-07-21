@@ -38,10 +38,6 @@ const response_head =
 /// A full response is the fixed head plus one rendering of every counter.
 const response_bytes_max = response_head.len + counters_module.Counters.render_bytes_max;
 
-/// Fixed throwaway buffer for the lingering-close drain — the request is
-/// discarded, so this is never inspected and one small buffer suffices.
-const drain_scratch_bytes = 512;
-
 pub fn Admin(comptime IoType: type) type {
     const ServerType = @import("Server.zig").Server(IoType);
 
@@ -64,9 +60,13 @@ pub fn Admin(comptime IoType: type) type {
         response: [response_bytes_max]u8,
         response_len: u32,
         sent: u32,
-        drain_scratch: [drain_scratch_bytes]u8,
+        drain_scratch: [constants.admin_drain_scratch_bytes]u8,
         armed: Armed,
         op_accept: IoType.Completion,
+        /// Backoff timer re-arming an accept that failed with kernel
+        /// pressure; never armed while `accept` is (§8 tight-spin guard),
+        /// so it reuses the listener's two-op ring budget.
+        op_accept_retry: IoType.Completion,
         op_send: IoType.Completion,
         op_recv: IoType.Completion,
         op_deadline: IoType.Completion,
@@ -96,12 +96,13 @@ pub fn Admin(comptime IoType: type) type {
         /// One bit per embedded op; the slot is quiescent only when clear.
         pub const Armed = packed struct(u8) {
             accept: bool = false,
+            accept_retry: bool = false,
             send: bool = false,
             recv: bool = false,
             deadline: bool = false,
             deadline_cancel: bool = false,
             close: bool = false,
-            _pad: u2 = 0,
+            _pad: u1 = 0,
         };
 
         pub fn init(
@@ -117,6 +118,13 @@ pub fn Admin(comptime IoType: type) type {
             admin.response_len = 0;
             admin.sent = 0;
             admin.armed = .{};
+            admin.op_accept = .{};
+            admin.op_accept_retry = .{};
+            admin.op_send = .{};
+            admin.op_recv = .{};
+            admin.op_deadline = .{};
+            admin.op_deadline_cancel = .{};
+            admin.op_close = .{};
             assert(admin.armedCount() == 0);
             assert(admin.state == .off);
         }
@@ -150,13 +158,17 @@ pub fn Admin(comptime IoType: type) type {
         }
 
         fn onAccept(admin: *Self, result: Io.AcceptError!IoType.Socket) void {
+            assert(admin.state == .accepting);
             admin.disarm("accept");
             if (admin.server.draining) {
                 // The drain reached the listener: a Canceled accept
                 // (`listenClose`), or a scrape that slipped in as the drain
-                // began — shed that socket, do not serve (§8). Either way the
-                // admin plane is done accepting and now quiescent, so the
-                // drain-stop gate must be re-checked.
+                // began — shed that socket, do not serve (§8). No shed
+                // counter: admin accepts are outside `reconcile`'s
+                // accepted/admitted/shed accounting entirely (they never
+                // increment `accepted`), so counting one here would break the
+                // gate identity. Either way the admin plane is done accepting
+                // and now quiescent, so the drain-stop gate is re-checked.
                 if (result) |socket| {
                     shed.closeQuietly(IoType, admin.server.io, socket);
                 } else |_| {}
@@ -165,10 +177,15 @@ pub fn Admin(comptime IoType: type) type {
                 admin.server.maybeStopAfterDrain();
                 return;
             }
-            const socket = result catch {
-                // A transient accept error on a localhost listener (Canceled
-                // cannot occur outside a drain): re-arm, no socket to shed.
-                admin.armAccept();
+            const socket = result catch |err| {
+                // A kernel-pressure accept failure (ENFILE/ENOMEM-class,
+                // process-wide, so reachable even on a localhost listener)
+                // would re-fire instantly on an immediate re-arm — a tight
+                // spin starving the loop (§8). Witness it and back off through
+                // the shared retry delay, exactly as `Server.onAccept` does;
+                // Canceled cannot occur outside a drain, handled above.
+                admin.server.witnessKernelPressure(err);
+                admin.armAcceptRetry();
                 return;
             };
             admin.socket = socket;
@@ -176,6 +193,37 @@ pub fn Admin(comptime IoType: type) type {
             admin.armDeadline();
             admin.renderResponse();
             admin.armSend();
+            assert(admin.state == .sending);
+        }
+
+        fn armAcceptRetry(admin: *Self) void {
+            assert(admin.listening);
+            assert(!admin.server.draining);
+            assert(admin.armedCount() == 0);
+            admin.state = .accepting;
+            admin.arm("accept_retry");
+            admin.server.io.timerStart(
+                &admin.op_accept_retry,
+                @as(u64, constants.accept_retry_delay_ms) * std.time.ns_per_ms,
+                Self,
+                admin,
+                onAcceptRetry,
+            );
+        }
+
+        fn onAcceptRetry(admin: *Self, result: Io.TimerError!void) void {
+            assert(admin.state == .accepting);
+            admin.disarm("accept_retry");
+            // Nothing ever cancels the retry timer; a drain begun while it
+            // was pending is handled by cleaning up instead of re-arming.
+            result catch unreachable;
+            if (admin.server.draining) {
+                admin.listening = false;
+                admin.state = .off;
+                admin.server.maybeStopAfterDrain();
+                return;
+            }
+            admin.armAccept();
         }
 
         /// Build the full response once, into the fixed buffer: the static
@@ -210,9 +258,11 @@ pub fn Admin(comptime IoType: type) type {
                 admin.continueTeardown();
                 return;
             }
-            const n = result catch {
+            const n = result catch |err| {
                 // A reset or unexpected error mid-response: nothing left to
-                // deliver, tear down.
+                // deliver, tear down. Witness kernel pressure (§8) like every
+                // other data-op site.
+                admin.server.witnessKernelPressure(err);
                 admin.beginTeardown();
                 return;
             };
@@ -253,16 +303,18 @@ pub fn Admin(comptime IoType: type) type {
                 // More client input arrived; keep discarding until EOF. The
                 // scrape deadline bounds a client that never closes.
                 admin.armRecv();
-            } else |err| {
-                // EndOfStream (the client closed after reading the response)
-                // and Reset both mean input is done — close cleanly. A live
-                // Canceled cannot happen here (recv is never canceled outside
-                // teardown), but route it through teardown defensively.
-                if (err == error.Canceled) {
+            } else |err| switch (err) {
+                // The client closed after reading the response (EndOfStream)
+                // or reset — input is done, close cleanly.
+                error.EndOfStream, error.Reset => admin.beginClose(),
+                // Canceled cannot occur outside teardown; route through it
+                // defensively.
+                error.Canceled => admin.beginTeardown(),
+                // Kernel pressure on the drain read (§8): witness and tear down.
+                error.Unexpected => {
+                    admin.server.witnessKernelPressure(err);
                     admin.beginTeardown();
-                    return;
-                }
-                admin.beginClose();
+                },
             }
         }
 

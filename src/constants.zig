@@ -43,6 +43,11 @@ pub const admin_conn_ops_max: u32 = 3;
 /// round trip — and independent of the data path's `idle_timeout_ms`.
 pub const admin_scrape_deadline_ms: u32 = 5_000;
 
+/// Throwaway buffer for the admin lingering-close drain (§2): the scrape's
+/// request is discarded, never inspected, so one small fixed buffer read
+/// in a loop to EOF suffices — sized only to keep the read count modest.
+pub const admin_drain_scratch_bytes: u32 = 512;
+
 /// Connection slots (`Pool(Conn)`). The binding constraint is the
 /// io_uring completion queue, not fds or memory (§8): every admitted
 /// connection — L4 relaying or L7 in any phase — can hold up to
@@ -282,6 +287,7 @@ comptime {
     assert(admin_conns >= 1);
     assert(admin_conn_ops_max >= 1);
     assert(admin_scrape_deadline_ms >= 1);
+    assert(admin_drain_scratch_bytes >= 1);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool
