@@ -89,6 +89,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&lint_tests.step);
 
+    // Phase 3a spike (PLANS.md): ztls — sans-I/O TLS 1.3 server, pinned by
+    // content hash like every dependency. The ztls module links libcrypto
+    // (the deliberate §4 C exception under evaluation), so only this step
+    // demands it; `zig build ci` never builds or links any of it.
+    const ztls_dependency = b.dependency("ztls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tls_spike_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tls/spike_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ztls", .module = ztls_dependency.module("ztls") },
+            },
+        }),
+    }));
+    const tls_spike_step = b.step(
+        "tls-spike",
+        "Run the Phase 3a ztls integration spike (needs system libcrypto)",
+    );
+    tls_spike_step.dependOn(&tls_spike_tests.step);
+
     const sim_exe = b.addExecutable(.{
         .name = "zoxy-sim",
         .root_module = b.createModule(.{

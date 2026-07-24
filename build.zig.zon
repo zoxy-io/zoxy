@@ -62,6 +62,10 @@
             .url = "git+https://github.com/zoxy-io/hparse#65521edfc09f19c5574a3360e2ce236c6dbc3be3",
             .hash = "hparse-0.2.0-IukW0rSOAQAmTPCaHzBakxuRRv6dfMds5OGdGU8nxlXw",
         },
+        .ztls = .{
+            .url = "git+https://github.com/mattrobenolt/ztls#41c24d7960873ce174d153abf9da20e0b495fbce",
+            .hash = "ztls-0.0.0-SHHDXsXyFABPDzgUro7LThsIe3AcZEOeA62uYNPkJ-cZ",
+        },
     },
     .paths = .{
         "build.zig",

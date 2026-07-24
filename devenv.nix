@@ -30,6 +30,9 @@ in
         pkgs.zls
         pkgs.nginx
         pkgs.haproxy
+        # libcrypto for `zig build tls-spike` (Phase 3a, PLANS.md); CI
+        # does not run the spike, so it stays out of the CI closure.
+        pkgs.openssl
       ]
       ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
         pkgs.poop
