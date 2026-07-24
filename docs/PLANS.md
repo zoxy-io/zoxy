@@ -71,35 +71,26 @@ Verdicts, so they are not re-litigated:
   with c10k below; TLS and chunked L7 bodies fall back to copy
   regardless.
 
-## c10k — the CQSIZE ceiling (levers #1 and #3 landed)
+## c10k — the CQSIZE ceiling (splice the last lever)
 
-Concurrent L4 connections were CQ-bound, not memory- or fd-bound: before
+Concurrent L4 connections are CQ-bound, not memory- or fd-bound (before
 the CQSIZE lever the CQ was fixed at 2 × SQ, capping `relay_buffers_max`
-at `(6144 − 18) / 5 = 1225`. Three levers were on the table:
+at `(6144 − 18) / 5 = 1225`). Two in-tree levers have landed and set the
+current ceiling — the CQSIZE lever (#61, `IORING_SETUP_CQSIZE` off the
+fixed 2 × SQ, in-flight fill tunable via `limits.cq_fill_eighths`, ⅞
+default) and the `conn_ops_max` 5 → 4 cut (teardown closes serialized
+behind the full armed-set drain, #64) — putting `conn_slots_max` /
+`relay_buffers_max` at 14074 at ⅞ fill, with `fds_max` 29188 (a c10k
+deployment raises the documented `RLIMIT_NOFILE` at startup, §8). The
+arithmetic and its history live in IMPLEMENTATION_NOTES.md.
 
-1. **Deeper CQ** — `IORING_SETUP_CQSIZE`. **Landed (#61):** the in-flight
-   fill is configurable via `limits.cq_fill_eighths` (⅞ default; lowering
-   it toward ⅛ trades the ceiling back down for burst headroom, and a fill
-   that cannot fit the compiled ring is rejected at load, not clamped,
-   §4/§5). `fds_max` scales with `2·relay_buffers`, so a deployment
-   configured toward c10k raises the documented `RLIMIT_NOFILE` assumption
-   (handled at startup, §8).
-2. **`splice`** (above) — an independent win at saturation, still fork
-   work; same re-audit cost.
-3. **Cut `conn_ops_max` 5 → 4** — the one ceiling lever that was *not*
-   fork work. **Landed:** teardown closes are serialized behind the full
-   armed-set drain (`continueTeardown`), so the five-op teardown-vs-dial
-   race is structurally unreachable and the worst case is two tying
-   four-op sets. The budget is enforced at every arm (`Conn.arm`
-   asserts it under every test and sim seed), and a drain-vs-dial sim
-   test pins seeds that co-armed five ops under the old code and now
-   peak at exactly four — the §9 proof the cut required.
-   `conn_slots_max` / `relay_buffers_max` ceiling at 14074 at ⅞ fill
-   (`fds_max` 29188).
+The one remaining lever is **`splice`** (above) — an independent win at
+saturation, still libxev-fork work (a re-audit); TLS and chunked L7
+bodies fall back to copy regardless.
 
 Entry gate for further ceiling work: demonstrate a workload that actually
-saturates the 14074 ceiling first — the remaining fork levers cost a
-re-audit, not worth spending blind.
+saturates the 14074 ceiling first — the splice lever costs a re-audit,
+not worth spending blind.
 
 ## libxev fork queue
 
