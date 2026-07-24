@@ -15,20 +15,66 @@ admin/metrics listener — are shipped on `main` (PRs #47, #50, #51, #54,
 is in git log, not here. Two sub-items they left open are tracked below
 under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
 
-- **Phase 3 — TLS.** CPU worker pool + job queues for handshakes (§3 seam
-  activates). The stack is an **open decision under the Zig-first policy**
-  (§4). Leading candidate (surveyed 2026-07-12): **picotls** (h2o/picotls)
-  — sans-I/O, battle-tested in H2O/quicly at Fastly, feature-complete
-  (resumption, 0-RTT, HRR, client certs, ECH), injectable
-  `random_bytes`/`get_time` (sim-drivable), kTLS-ready via
-  `ptls_export_secret`/`update_traffic_key`, and its minicrypto backend
-  even drops the system-library link for termination — but the protocol
-  layer itself is C (the §4 exception swallows the whole TLS layer) and
-  it mallocs internally with no allocator hook, so the zero-alloc
-  promise needs link-time interposition or a documented carve-out. Last
-  rung: the previous iteration's full OpenSSL/libssl recipe (sans-io BIO
-  pair + fixed FFI heap, kTLS switchover) — proven by us, heaviest, and
-  now likely displaced by picotls even as a fallback.
+- **Phase 3a — single-threaded TLS termination.** Settled 2026-07-24:
+  **no worker threads** — handshakes run on the loop under a per-tick
+  budget. Measured on the pinned toolchain (IMPLEMENTATION_NOTES.md), a
+  full TLS 1.3 server handshake in pure std.crypto costs ~95 µs
+  (Ed25519 cert) to ~380 µs (P256 on a slow core); resumption is
+  µs-class. The ~1–2 ms figure that motivated the worker pool was an
+  RSA number, so RSA certs are simply not supported — ECDSA/Ed25519
+  only, a documented constraint. The worst single uninterruptible step
+  (~275 µs P256 sign) bounds tick inflation; a handshake backlog past
+  the budget is a shed rung like any other (§8). One core absorbs
+  ~3.8k full P256 handshakes/s (~10k Ed25519), resumption effectively
+  unlimited.
+  The stack (surveyed 2026-07-24): a **hardened fork of
+  [tls.zig](https://github.com/ianic/tls.zig)**, pinned at `5452baf` —
+  the last Zig-0.16 commit; builds and tests clean on the pinned
+  toolchain — pure Zig under the §4 policy like libxev and hparse.
+  What makes it fit: sans-I/O `nonblock.Server` (caller buffers both
+  ways) behind our own wrapper; an allocation-free handshake path
+  (allocator appears only in startup cert loading — the config arena);
+  injectable `rng: std.Random` and `now: Io.Timestamp`, so SimIo
+  drives handshakes deterministically (§9); std.crypto primitives;
+  client-cert support; and a `Ktls.zig` that already emits the
+  `setsockopt(SOL_TLS)` key payloads (→ 3b). The fork's hardening
+  gate, hparse-style — cleared before 3a lands:
+  1. **Server-side session resumption** (NewSessionTicket issuance,
+     PSK-DHE acceptance, binder verification) — the one missing hard
+     requirement, and load-bearing: without tickets a full-population
+     reconnect storm is ~14k × ~260 µs ≈ seconds of handshake CPU;
+     with them, µs-class per connection.
+  2. **Fragmented ClientHello** (upstream #36) — a real robustness gap
+     the fuzz gate would find anyway.
+  3. Backport the three post-pin fixes (CBC-padding overflow
+     `106d10b`, dangling `alpn_protocol` `47c402a`, `d633a0f`).
+  4. The server handshake under zoxy's fuzz gate, fuzzed through our
+     wrapper like hparse (§9).
+  Fallback if hardening proves costlier than estimated: **picotls** —
+  functioning, but now two policy exceptions deep (C dependency plus
+  un-hookable malloc, plus OpenSSL libcrypto for acceptable sign
+  speed; verified unchanged 2026-07-24). std.crypto.tls stays
+  client-only (re-verified against the pinned toolchain and upstream
+  master; the stalled upstream server PR ziglang/zig#23005 *is*
+  tls.zig, so the fork adopts the same code with more control).
+- **Phase 3b — kTLS record offload.** Linux-only follow-up to 3a: hand
+  the negotiated keys to the kernel (`setsockopt(SOL_TLS)`, the fork's
+  `Ktls.zig` payloads) so the record layer costs zero userspace CPU
+  and the post-handshake data path stays byte-identical to today's
+  relay — which also keeps the `splice` c10k lever applicable to TLS
+  traffic. The 3a userspace record path remains the portable fallback
+  (macOS dev box, kernels without the TLS ULP). Known fiddly parts:
+  KeyUpdate and post-handshake control messages arrive via CMSG, and
+  session tickets must be sent before the switchover.
+- **Phase 3c — CPU worker pool, behind an evidence gate.** The §3
+  worker seam (SPMC job queue, per-worker completion rings, the §5
+  parked-slot ownership rules) stays designed but inactive — it is the
+  hardest remaining concurrency work in the plan, and the 3a numbers
+  say it buys nothing at realistic handshake rates. Entry gate: a
+  measured workload where handshake demand exceeds the on-loop budget
+  within one process (sustained cold full-handshake load past
+  ~4k/s/core) *and* process-per-core scale-out (§3) is not an
+  acceptable answer. Until then the binary stays single-threaded.
 
 ## io_uring op upgrades — evaluated, all deferred (2026-07-16)
 

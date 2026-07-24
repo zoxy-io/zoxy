@@ -83,10 +83,15 @@ flowchart LR
 
 **The decision.** One event-loop thread owns the single `io_uring` (via
 libxev) and performs *all* socket I/O: accepts, recvs, sends, connects,
-timers. A small, fixed set of CPU worker threads exists only for jobs that
-burn milliseconds of CPU (TLS handshakes, when TLS lands in Phase 3); they
-never touch a socket, a pool, or the ring. Until Phase 3 the worker set is
-empty and the binary is single-threaded.
+timers. A small, fixed set of CPU worker threads exists only for jobs
+that burn milliseconds of CPU; they never touch a socket, a pool, or the
+ring. The seam is designed here but activates only on evidence
+([PLANS.md](PLANS.md) Phase 3c): TLS handshakes — its original
+motivation — measured at ~100–400 µs in pure std.crypto with
+ECDSA/Ed25519 certs (IMPLEMENTATION_NOTES.md), cheap enough to run on
+the loop under a per-tick budget, so TLS lands single-threaded and the
+worker set stays empty until a workload outgrows that budget. Until
+then the binary is single-threaded.
 
 <details>
   <summary><b>Why this is the simplest topology that satisfies the goals</b></summary>
@@ -120,11 +125,14 @@ network-bound. A relay copies each byte twice through userspace
 traffic against tens of GB/s of per-core bandwidth. At 100 k req/s a
 request costs ~4–6 ring ops → ~500 k SQE/s, well inside a single ring's
 capability, batched one submit per loop tick. The previous iteration
-measured itself latency-bound with CPU headroom on the data path; the only
-CPU-heavy work is the TLS handshake (~1–2 ms), which is exactly what the
-worker seam is for. **Horizontal scaling is N independent zoxy processes
-behind SO_REUSEPORT** — share-nothing at the process boundary, where the
-kernel actually isolates — not N loops in one process.
+measured itself latency-bound with CPU headroom on the data path; the
+only CPU-heavy work is the TLS handshake — once estimated at ~1–2 ms
+(the RSA number that motivated the worker seam), since measured at
+~100–400 µs with ECDSA/Ed25519 certs (IMPLEMENTATION_NOTES.md), cheap
+enough for the loop itself under a per-tick budget. **Horizontal
+scaling is N independent zoxy processes behind SO_REUSEPORT** —
+share-nothing at the process boundary, where the kernel actually
+isolates — not N loops in one process.
 
 **Why not one ring per worker.** Ring-per-worker with *shared* pools is the
 hybrid to avoid: the moment several ring-owning threads acquire/release pool
@@ -805,7 +813,7 @@ src/
   balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
-  worker.zig          // SPMC job queue + SPSC completion rings (Phase 3)
+  worker.zig          // SPMC job queue + SPSC completion rings (Phase 3c, evidence-gated)
 sim/                  // simulator harness + invariants
 bench/                // micro benches (poop) + loopback harness (zrk), §9
 ```

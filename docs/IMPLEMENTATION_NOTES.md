@@ -119,6 +119,44 @@ carries only the one-line revisit condition per op.
   and chunked L7 bodies fall back to copy regardless. Revisit under
   genuine CPU/memory-bandwidth saturation.
 
+## TLS handshake CPU — measured, on-loop verdict (2026-07-24)
+
+Decision input for Phase 3a (PLANS.md): do handshakes need the §3
+worker pool, or can they run on the event loop under a per-tick
+budget? Pure std.crypto on the pinned 0.16 toolchain, ReleaseFast,
+200 iterations per primitive, pinned to a fast and a slow core:
+
+| primitive | fast core | slow core |
+|---|---|---|
+| ECDSA-P256 sign (CertificateVerify) | 201 µs (worst 262) | 252 µs (worst 275) |
+| ECDSA-P256 verify (client certs) | 332 µs | 444 µs |
+| Ed25519 sign | 34 µs | 79 µs |
+| X25519 keygen / shared secret | ~30 µs each | ~63 µs each |
+| 8 × HMAC-SHA256 (resumption class) | 1.3 µs | 1.1 µs |
+
+A full TLS 1.3 server handshake ≈ keygen + DH + cert sign: **~260 µs
+(P256) / ~95 µs (Ed25519)** on the fast core, ~380 / ~205 µs on the
+slow one; a PSK resumption is µs-class. One core absorbs ~3.8k full
+P256 handshakes/s (~10k Ed25519). The ~1–2 ms estimate that motivated
+the worker-pool design was an RSA number (RSA-2048 sign ~0.6–1 ms —
+excluded by policy in 3a rather than re-measured). The worst single
+uninterruptible step, ~275 µs of P256 sign, bounds the tick inflation
+of an on-loop handshake budget. Bench: a scratch `zig run` harness
+over std.crypto primitives (note: `std.time.Timer` and
+`std.crypto.random` both relocated in 0.16 — the harness reads raw
+`CLOCK_MONOTONIC` and uses `generateDeterministic` seeds).
+
+Library survey findings from the same day, recorded so they are not
+re-chased: `std.crypto.tls` is still client-only — verified in the
+pinned toolchain's std tree and against upstream master; the stalled
+upstream server PR (ziglang/zig#23005) is tls.zig itself. picotls
+still has no allocator hook (verified against master `picotls.h`),
+and its minicrypto ECDSA is uECC (~1 ms-class sign): acceptable sign
+speed means the OpenSSL libcrypto backend. BearSSL's TLS 1.3 remains
+unshipped. No other production-credible pure-Zig TLS 1.3 server
+exists as of the scan; Geun-Oh/zigtls is aimed the right way but
+0.1.0-dev — watch-list only.
+
 ## The concurrency ceiling is CQ-bound (95d1f8f)
 
 Concurrent L4 connections are bound by the io_uring completion queue,
