@@ -337,7 +337,14 @@ pub fn Conn(comptime IoType: type) type {
             op.generation_at_submit = conn.generation;
             @field(conn.armed, bit) = true;
             assert(conn.armedCount() <= constants.conn_ops_max);
-            conn.server.armed_ops_peak = @max(conn.server.armed_ops_peak, conn.armedCount());
+            // Test-only watermark: tracked wherever the budget assert
+            // above is live (Debug, ReleaseSafe), never in the shipped
+            // ReleaseFast build, so the hot path pays nothing in
+            // production for what only a test reads.
+            if (std.debug.runtime_safety) {
+                conn.server.armed_ops_peak =
+                    @max(conn.server.armed_ops_peak, conn.armedCount());
+            }
         }
 
         /// Every delivery passes through here first: the generation

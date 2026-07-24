@@ -62,9 +62,11 @@ pub fn Server(comptime IoType: type) type {
         conn_pressure: bool,
         upstream_pressure: bool,
         /// Highest armed-op count any one connection has reached (§8):
-        /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and
-        /// records the peak here, so a test can claim a race co-armed
-        /// exactly the budgeted worst case, not merely stayed under it.
+        /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and,
+        /// under runtime safety only (never in the shipped ReleaseFast
+        /// build), records the peak here, so a test can claim a race
+        /// co-armed exactly the budgeted worst case, not merely stayed
+        /// under it.
         armed_ops_peak: u8,
         drain_deadline_completion: IoType.Completion,
         /// The one timer covering every parked upstream (§5): a parked
