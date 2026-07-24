@@ -91,20 +91,23 @@ not re-propose.
 ## The concurrency ceiling is CQ-bound (95d1f8f)
 
 Concurrent L4 connections are bound by the io_uring completion queue,
-not fds or memory: each admitted connection holds up to
-`conn_ops_max = 5` armed ops, the ring is pre-budgeted and never shed
-(§8), and in-flight ops must stay within the configured CQ fill
-(`cq_fill_eighths`, ⅞ by default). First measured before the CQSIZE
-lever, when libxev fixed the CQ at 2 × SQ = 8192 and it capped
-`relay_buffers_max` at `(6144 − 18) / 5 = 1225`. The finding held and
-drove the fork work: `IORING_SETUP_CQSIZE` (#61) lets XevIo request the
-kernel maximum (65536), lifting `conn_slots_max` / `relay_buffers_max` to
-`(57344 − 23 − upstream_slots_max) / 5 = 11259` at ⅞. fds bind next now,
-not memory (`fds_max = 23558` at the ceiling, so a c10k deployment raises
+not fds or memory: each admitted connection holds up to `conn_ops_max`
+armed ops, the ring is pre-budgeted and never shed (§8), and in-flight
+ops must stay within the configured CQ fill (`cq_fill_eighths`, ⅞ by
+default). First measured before the CQSIZE lever, when libxev fixed the
+CQ at 2 × SQ = 8192 and it capped `relay_buffers_max` at
+`(6144 − 18) / 5 = 1225`. The finding held and drove the fork work:
+`IORING_SETUP_CQSIZE` (#61) lets XevIo request the kernel maximum
+(65536), lifting the ceiling to `(57344 − 23 − upstream_slots_max) / 5 =
+11259` at ⅞. Serializing teardown closes behind the full armed-set
+drain then cut `conn_ops_max` to 4 (the five-op teardown-vs-dial race
+became structurally unreachable, proven by a pinned-seed sim test), so
+`conn_slots_max` / `relay_buffers_max` now ceiling at
+`(57344 − 23 − upstream_slots_max) / 4 = 14074`. fds bind next, not
+memory (`fds_max = 29188` at the ceiling, so a c10k deployment raises
 `RLIMIT_NOFILE` at startup, §8). `constants.zig` owns the arithmetic and
-comptime-asserts it. The remaining ceiling levers — `splice` (fork) and
-cutting `conn_ops_max` 5 → 4 (in-tree teardown work) — are in PLANS.md,
-"c10k".
+comptime-asserts it. The remaining ceiling lever — `splice` — is fork
+work, in PLANS.md "c10k".
 
 ## libxev error surfacing is lossy
 

@@ -328,11 +328,23 @@ pub fn Conn(comptime IoType: type) type {
         }
 
         /// Records the arm in the op and the armed set; call immediately
-        /// before submitting through the seam.
+        /// before submitting through the seam. Enforces the §8
+        /// per-connection ring-op budget at the arm site — the CQ is
+        /// sized as `conn_ops_max` per slot, so exceeding it here is the
+        /// invariant violation the ring budget makes unreachable.
         pub fn arm(conn: *Self, op: *Op, comptime bit: []const u8) void {
             assert(!@field(conn.armed, bit));
             op.generation_at_submit = conn.generation;
             @field(conn.armed, bit) = true;
+            assert(conn.armedCount() <= constants.conn_ops_max);
+            // Test-only watermark: tracked wherever the budget assert
+            // above is live (Debug, ReleaseSafe), never in the shipped
+            // ReleaseFast build, so the hot path pays nothing in
+            // production for what only a test reads.
+            if (std.debug.runtime_safety) {
+                conn.server.armed_ops_peak =
+                    @max(conn.server.armed_ops_peak, conn.armedCount());
+            }
         }
 
         /// Every delivery passes through here first: the generation

@@ -71,40 +71,35 @@ Verdicts, so they are not re-litigated:
   with c10k below; TLS and chunked L7 bodies fall back to copy
   regardless.
 
-## c10k — the CQSIZE ceiling (lever #1 landed)
+## c10k — the CQSIZE ceiling (levers #1 and #3 landed)
 
 Concurrent L4 connections were CQ-bound, not memory- or fd-bound: before
 the CQSIZE lever the CQ was fixed at 2 × SQ, capping `relay_buffers_max`
-at `(6144 − 18) / 5 = 1225`. Two levers were on the table:
+at `(6144 − 18) / 5 = 1225`. Three levers were on the table:
 
-1. **Deeper CQ** — `IORING_SETUP_CQSIZE`. **Landed (#61):**
-   `conn_slots_max` / `relay_buffers_max` now ceiling at 11259 on a single
-   ring, with the in-flight fill configurable via `limits.cq_fill_eighths`
-   (⅞ default; lowering it toward ⅛ trades the ceiling back down for burst
-   headroom, and a fill that cannot fit the compiled ring is rejected at
-   load, not clamped, §4/§5). `fds_max` scales with `2·relay_buffers`, so a
-   deployment configured toward c10k raises the documented `RLIMIT_NOFILE`
-   assumption (handled at startup, §8).
+1. **Deeper CQ** — `IORING_SETUP_CQSIZE`. **Landed (#61):** the in-flight
+   fill is configurable via `limits.cq_fill_eighths` (⅞ default; lowering
+   it toward ⅛ trades the ceiling back down for burst headroom, and a fill
+   that cannot fit the compiled ring is rejected at load, not clamped,
+   §4/§5). `fds_max` scales with `2·relay_buffers`, so a deployment
+   configured toward c10k raises the documented `RLIMIT_NOFILE` assumption
+   (handled at startup, §8).
 2. **`splice`** (above) — an independent win at saturation, still fork
    work; same re-audit cost.
-3. **Cut `conn_ops_max` 5 → 4** — the one ceiling lever that is *not*
-   fork work. The per-connection ring-op budget is 5 only to cover the
-   teardown-race worst case (a teardown racing its own upstream dial:
-   both closes + the deadline + `connect_cancel` + `deadline_cancel`
-   armed at once); steady-state relay peaks at 4. The ceiling is
-   `(cq_fill_budget − fixed − upstream_slots) / conn_ops_max`, so dropping
-   the divisor to 4 lifts `conn_slots_max` ~25% (11259 → 14074 at ⅞) at
-   the same ring depth and per-slot memory. The cost is in-tree: rework
-   the connect-teardown path so those five ops can never be armed together
-   (serialize cancel-then-close, or drop the deadline during teardown),
-   with a §9 sim case proving the four-op ceiling holds under the race.
-   Lowering the constant without that proof trips the CQ-overcommit
-   assert (§4/§8), not a shed.
+3. **Cut `conn_ops_max` 5 → 4** — the one ceiling lever that was *not*
+   fork work. **Landed:** teardown closes are serialized behind the full
+   armed-set drain (`continueTeardown`), so the five-op teardown-vs-dial
+   race is structurally unreachable and the worst case is two tying
+   four-op sets. The budget is enforced at every arm (`Conn.arm`
+   asserts it under every test and sim seed), and a drain-vs-dial sim
+   test pins seeds that co-armed five ops under the old code and now
+   peak at exactly four — the §9 proof the cut required.
+   `conn_slots_max` / `relay_buffers_max` ceiling at 14074 at ⅞ fill
+   (`fds_max` 29188).
 
 Entry gate for further ceiling work: demonstrate a workload that actually
-saturates the 11259 ceiling first — the fork levers cost a re-audit and
-the `conn_ops_max` cut costs a teardown-path proof, neither worth
-spending blind.
+saturates the 14074 ceiling first — the remaining fork levers cost a
+re-audit, not worth spending blind.
 
 ## libxev fork queue
 

@@ -61,6 +61,13 @@ pub fn Server(comptime IoType: type) type {
         relay_pressure: bool,
         conn_pressure: bool,
         upstream_pressure: bool,
+        /// Highest armed-op count any one connection has reached (§8):
+        /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and,
+        /// under runtime safety only (never in the shipped ReleaseFast
+        /// build), records the peak here, so a test can claim a race
+        /// co-armed exactly the budgeted worst case, not merely stayed
+        /// under it.
+        armed_ops_peak: u8,
         drain_deadline_completion: IoType.Completion,
         /// The one timer covering every parked upstream (§5): a parked
         /// connection holds no armed op, so this sweep compares stored
@@ -131,6 +138,7 @@ pub fn Server(comptime IoType: type) type {
             server.relay_pressure = false;
             server.conn_pressure = false;
             server.upstream_pressure = false;
+            server.armed_ops_peak = 0;
             server.drain_deadline_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
@@ -519,8 +527,8 @@ pub fn Server(comptime IoType: type) type {
 
         /// Teardown is a state, not an event (§5): shutdown both fds,
         /// cancel pending connect/timer (the only legal cancels, §4),
-        /// then closes once data ops drain; the last terminal completion
-        /// releases the slot.
+        /// then closes once every armed op drains; the last terminal
+        /// completion releases the slot.
         pub fn beginTeardown(server: *Self, conn: *ConnType) void {
             if (conn.isTearingDown()) return;
             assert(conn.isLive());
@@ -551,37 +559,40 @@ pub fn Server(comptime IoType: type) type {
             server.continueTeardown(conn);
         }
 
-        /// Public for the relay: a data completion delivered during
-        /// teardown re-enters here (§5 — ops drain, then closes).
+        /// Public for the relay: a non-close completion delivered during
+        /// teardown re-enters here (§5). Closes are serialized behind the
+        /// full drain — submitted only once every other op (data,
+        /// connect, deadline, both cancels) has delivered — so a dial
+        /// completing against its own teardown peaks at four armed ops,
+        /// never five: the `conn_ops_max` budget the CQ is sized by (§8).
         pub fn continueTeardown(server: *Self, conn: *ConnType) void {
-            assert(conn.isTearingDown());
-            if (conn.state == .tearing_down) {
-                const blocking_ops = conn.armed.connect or
-                    conn.armed.data_client_to_upstream or
-                    conn.armed.data_upstream_to_client;
-                if (!blocking_ops) {
-                    conn.state = .closing;
-                    conn.arm(&conn.op_close_client, "close_client");
-                    server.io.close(
-                        conn.client_socket,
-                        &conn.op_close_client.completion,
-                        ConnType,
-                        conn,
-                        onCloseClient,
-                    );
-                    if (conn.upstream_socket) |socket| {
-                        conn.arm(&conn.op_close_upstream, "close_upstream");
-                        server.io.close(
-                            socket,
-                            &conn.op_close_upstream.completion,
-                            ConnType,
-                            conn,
-                            onCloseUpstream,
-                        );
-                    }
-                }
+            // Only non-close deliveries route here, and a non-close op can
+            // be armed only before .closing; closes deliver into
+            // maybeRelease instead.
+            assert(conn.state == .tearing_down);
+            if (conn.armedCount() != 0) return;
+            conn.state = .closing;
+            conn.arm(&conn.op_close_client, "close_client");
+            server.io.close(
+                conn.client_socket,
+                &conn.op_close_client.completion,
+                ConnType,
+                conn,
+                onCloseClient,
+            );
+            if (conn.upstream_socket) |socket| {
+                conn.arm(&conn.op_close_upstream, "close_upstream");
+                server.io.close(
+                    socket,
+                    &conn.op_close_upstream.completion,
+                    ConnType,
+                    conn,
+                    onCloseUpstream,
+                );
             }
-            server.maybeRelease(conn);
+            // Postcondition: .closing holds the closes and nothing else.
+            assert(conn.armed.close_client);
+            assert(conn.armedCount() <= 2);
         }
 
         /// §5 release rule: closes submitted and the armed-op set empty —
@@ -843,9 +854,9 @@ pub fn Server(comptime IoType: type) type {
             } else |err| {
                 assert(err == error.Canceled);
                 if (conn.isTearingDown()) {
-                    // The deadline is not a blocking op, so its Canceled
-                    // delivery can arrive after closes were submitted
-                    // (.closing).
+                    // Closes wait for this delivery (and every other
+                    // armed op) before they are submitted, so the state
+                    // here is always .tearing_down, never .closing.
                     server.continueTeardown(conn);
                     return;
                 }

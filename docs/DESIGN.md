@@ -368,10 +368,10 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 11259 | ~1.7 KiB state + 8 KiB head |
-| relay buffers | 1386 | 11259 | 2 × 4 KiB |
+| conn slots | 1386 | 14074 | ~1.7 KiB state + 8 KiB head |
+| relay buffers | 1386 | 14074 | 2 × 4 KiB |
 | upstream slots | 1024 | 1024 | ~40 B state + 8 KiB head |
-| **pool memory** | **~32 MiB** | **~203 MiB** | |
+| **pool memory** | **~32 MiB** | **~251 MiB** | |
 
 Rules:
 

@@ -31,10 +31,10 @@ pub const admin_conns: u32 = 1;
 /// completes park the reserved slot forever (§8) — so a drain-initiated
 /// teardown that races an in-flight send holds the send, the deadline,
 /// and the deadline-cancel co-armed (the same lazy-timer force pattern as
-/// the data path's `conn_ops_max`); a data op and the `close` never
-/// coexist (close is submitted only after the data op drains), so the peak
-/// is three, not four. The accept op is the listener's, budgeted in the
-/// two-per-listener term.
+/// the data path's `conn_ops_max`); the `close` never joins the set —
+/// the same close-after-full-drain discipline the data path's
+/// `continueTeardown` follows — so the peak is three, not four. The
+/// accept op is the listener's, budgeted in the two-per-listener term.
 pub const admin_conn_ops_max: u32 = 3;
 
 /// Deadline for one admin scrape, from accept to close (§8): the reaper
@@ -58,13 +58,13 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// IORING_SETUP_CQSIZE) against the 4096 SQ, so at the largest fill a
 /// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
 /// parked-upstream and admin reservations carved out first, this caps at
-/// `(57344 - 23 - upstream_slots_max) / conn_ops_max = 11259` —
+/// `(57344 - 23 - upstream_slots_max) / conn_ops_max = 14074` —
 /// comptime-derived below (the 23 is the fixed ops: two per config and
 /// admin listener [18], the admin client's op budget [3], the signal
 /// wake [1], and the drain timer [1]). That clears a round 10k on a
 /// single ring; a deployment trades the ceiling back down for more burst
 /// headroom via `limits.cq_fill_eighths` (§8).
-pub const conn_slots_max: u32 = 11259;
+pub const conn_slots_max: u32 = 14074;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -159,15 +159,17 @@ pub const accept_retry_delay_ms: u32 = 10;
 /// fixes the completion queue at twice this (§4).
 pub const ring_entries: u16 = 4096;
 
-/// Worst-case simultaneously armed ring ops for one connection: five.
-/// The peak is a teardown racing its own upstream dial — a connecting
-/// conn holds connect + deadline, teardown arms connect_cancel +
-/// deadline_cancel, then the dial completes while its cancel is still in
-/// flight: the connect bit clears and both closes are submitted with the
-/// deadline, connect_cancel, and deadline_cancel completions all still
-/// outstanding. In steady relay the peak is only four (two data ops +
-/// timer + cancel), but the budget must cover the teardown race (§8).
-pub const conn_ops_max: u32 = 5;
+/// Worst-case simultaneously armed ring ops for one connection: four.
+/// Two peaks tie: a teardown racing its own upstream dial holds
+/// {connect, deadline, connect_cancel, deadline_cancel}, and a relay
+/// teardown holds {both data ops, deadline, deadline_cancel}. Closes
+/// never join either set — `continueTeardown` submits them only once
+/// every other op has drained (serialize cancel-then-close), which is
+/// what cut this budget from five: before that, a dial completing
+/// against its own cancel co-armed the closes with the deadline and
+/// both cancels. `Conn.arm` asserts the budget on every arm, and the
+/// drain-vs-dial sim test pins seeds that reach exactly four (§8, §9).
+pub const conn_ops_max: u32 = 4;
 
 /// Completions drained per loop tick before control returns to the kernel;
 /// bounds both callback batches and `Io.now_ns` staleness (§4).
@@ -504,12 +506,12 @@ test "budgets: memory total matches the closed form" {
 }
 
 test "budgets: c10k ceiling fd count needs a raised NOFILE" {
-    // At the c10k ceiling the fd budget is ~24k — well past the common
+    // At the c10k ceiling the fd budget is ~29k — well past the common
     // 4096 unprivileged hard limit, so a deployment that configures up to
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
-    try std.testing.expectEqual(@as(u32, 23558), fds_max);
+    try std.testing.expectEqual(@as(u32, 29188), fds_max);
     try std.testing.expect(fds_max <= 65536);
 }
 
