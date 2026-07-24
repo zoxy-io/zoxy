@@ -10,8 +10,9 @@ Simplicity is prioritized over feature-richness. The coding rules live in
 [`docs/TIGER_STYLE.md`](TIGER_STYLE.md). The previous iteration of this
 project ([zoxy-io/zoxy@main](https://github.com/zoxy-io/zoxy)) shipped an
 L7-only, share-nothing, thread-per-core proxy directly on `io_uring`; its
-measured lessons are carried forward here (§2) and its dead ends are not
-revisited.
+measured lessons — paid for with implementation time and simulator seeds —
+are folded into the relevant sections below as constraints, not
+suggestions, and its dead ends are not revisited.
 
 This document is the settled design. Phasing and future work live in
 [`PLANS.md`](PLANS.md); measured findings and shelved experiments in
@@ -54,42 +55,6 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
 - Dynamic DNS for upstreams. Cluster endpoints are static socket
   addresses resolved once at config load (§7); re-resolution waits for a
   demonstrated need.
-
-## 2. Lessons carried from the previous iteration
-
-Paid for with implementation time and simulator seeds; adopted here as
-constraints, not suggestions.
-
-- **The deterministic-simulation seam is the single highest-leverage testing decision.** 
-  The data path must be written against an `Io` facade from the
-  first commit so a seeded, adversarial, virtual-socket backend can run the
-  *real* code (§9).
-- **Connection reuse is the biggest performance lever** (~3× req/s in the
-  previous iteration). The upstream pool is first-class, not an add-on.
-- **Teardown is where the races live.** `shutdown(SHUT_RDWR)` both fds
-  before async close (a pending recv never completes otherwise); an
-  in-flight completion must never be resubmitted — overlapping ops get their
-  own completions.
-- **One ticking absolute-deadline timer per connection**; phase transitions
-  move the deadline — *later* for free, the single *earlier* move (an L7
-  dial tightening to the connect budget, §8) via a race-free cancel+re-arm.
-- **TCP_NODELAY always** — Nagle + delayed ACK cost warm pooled connections
-  a hard 40 ms, invisible on fresh connections.
-- **Announce closes** (`Connection: close` injection per RFC 9112 §9.6) or
-  clients pipeline into the close and read errors.
-- **Single-writer beats clever synchronization.** Cache-line sharing across
-  writers cost ~60× in HITM snoops; the fix was removing contention, not
-  optimizing it. This iteration makes single-writer *structural* (§3).
-- **SO_REUSEPORT accept imbalance is real** and forced a shared-accept mode
-  late in the previous project. A single accepting loop makes the problem
-  unrepresentable.
-- **Per-worker reservation multiplies memory by core count** for worst
-  cases that never co-occur. Shared pools are the fix and the reason this
-  iteration exists (§5).
-- **The Zig 0.16 std landscape still rules out** `std.Io.Threaded`
-  (allocates per task), the evented executor (stubbed networking,
-  work-stealing), and `std.crypto.tls` for termination (client-only) —
-  verified against the pinned toolchain last iteration.
 
 ## 3. Topology — one loop, one ring, shared pools
 
@@ -136,9 +101,11 @@ empty and the binary is single-threaded.
   connections hold a slot and a head buffer, not relay buffers (§5) —
   memory follows *activity*, not connection count.
 - **Perfect connection reuse.** Pingora's headline win over NGINX was
-  sharing upstream connections across all threads. With one loop, every
-  upstream connection is visible to every request — maximal reuse with zero
-  synchronization, better than work-stealing can do.
+  sharing upstream connections across all threads; the previous iteration
+  measured this as its single biggest performance lever (~3× req/s), which
+  is why the upstream pool here is first-class, not an add-on (§7). With one
+  loop, every upstream connection is visible to every request — maximal
+  reuse with zero synchronization, better than work-stealing can do.
 - **No accept balancing.** One accepting loop distributes nothing, so the
   SO_REUSEPORT small-sample imbalance that plagued the previous iteration
   (hottest worker 23% of connections; H2 made shared accepts mandatory)
@@ -280,13 +247,18 @@ unmerged behind it, so the pin moves only after re-audit.
 - **Backend selection.** Production: `io_uring` (Linux ≥ 5.11). Dev box:
   kqueue (macOS) — same API, same callbacks, so day-to-day development
   does not need a VM. Correctness claims are only made for Linux.
-- **Our own `Io` seam on top.** The data path never names `xev` directly;
-  it calls `src/io/io.zig`, a comptime-selected facade with two backends:
-  `XevIo` (production) and `SimIo` (deterministic simulation — virtual
-  sockets, virtual clock, seeded adversarial scheduler, §9). The seam is
-  thin — accept/recv/send/connect/shutdown/close/timer/async/signal,
-  caller-owned completions — deliberately mirroring xev so it costs
-  nothing in production. `signal` is how SIGTERM reaches the loop: a
+- **Our own `Io` seam on top, not `std.Io`.** The data path never names
+  `xev` directly; it calls `src/io/io.zig`, a comptime-selected facade with
+  two backends: `XevIo` (production) and `SimIo` (deterministic
+  simulation — virtual sockets, virtual clock, seeded adversarial
+  scheduler, §9). The Zig 0.16 std landscape still rules out building this
+  on `std.Io` directly — `std.Io.Threaded` allocates per task, the
+  evented executor has stubbed networking and offers only work-stealing
+  scheduling, and `std.crypto.tls` is client-only — each re-verified
+  against the pinned toolchain, not assumed from the previous iteration.
+  The seam is thin — accept/recv/send/connect/shutdown/close/timer/async/
+  signal, caller-owned completions — deliberately mirroring xev so it
+  costs nothing in production. `signal` is how SIGTERM reaches the loop: a
   `sigaction` handler does an async-signal-safe wake (`xev.Async.notify`,
   an eventfd write) and the loop's callback starts the drain (§8) —
   never `loop.stop()`, which does not wake a blocked loop from another
@@ -299,12 +271,16 @@ unmerged behind it, so the pin moves only after re-audit.
   *blocking* (non-blocking fds risk EAGAIN surfacing in completions) —
   a "quick" direct `write` could stall the whole loop. That choice is
   kept: O_NONBLOCK is never set. The control ops the design needs are
-  seam methods instead — `setNodelay` (§2), `setLingerRst` (§8's
+  seam methods instead — `setNodelay`, `setLingerRst` (§8's
   accept-and-RST), `shutdown(.both)` (which must bypass
   `xev.TCP.shutdown`, hardcoded to SHUT_WR, for the low-level op) —
   direct non-blocking syscalls in `XevIo`, virtual-socket state changes
   in `SimIo`, so the simulator can witness RST-on-shed and half-close
   (§9). A build-time lint enforces the boundary (§9).
+- **TCP_NODELAY always.** Set on every socket via `setNodelay`, no
+  config knob. Nagle's algorithm plus delayed ACK cost a warm pooled
+  connection a hard 40 ms stall — invisible on a connection's first
+  request, measured repeatedly on reused ones in the previous iteration.
 - **Run to completion.** Callbacks never suspend (TigerStyle: assertions
   hold across the whole body). Completions are drained in bounded batches
   per loop tick; a callback may enqueue more work but never runs another
@@ -343,7 +319,12 @@ unmerged behind it, so the pin moves only after re-audit.
 ## 5. Memory — shared pools, fixed at startup
 
 Every limit is a named constant in `src/constants.zig`; total memory is a
-closed-form function of those numbers, printed at startup.
+closed-form function of those numbers, printed at startup. Per-worker
+reservation — sizing a pool per core for a worst case that never co-occurs
+on every core at once — multiplies memory by core count for nothing; the
+previous iteration paid that cost, and shared pools sized for concurrent
+*activity* rather than worst-case-per-core are the fix and the reason this
+iteration exists.
 
 Three shared pools, all owned and touched only by the loop thread:
 
@@ -423,16 +404,19 @@ Rules:
   prefixes/hosts, address literals, reserved header names, port ≠ 0) and
   the "exactly one of" forks stay the loader's job, so passing the schema
   means well-shaped, not accepted.
-- **A slot is released only when its armed-op set is empty.** Every op
-  references a completion embedded in the slot, and the slot header
-  tracks which are armed. Teardown is a *state*, not an event: shutdown
-  both fds, cancel the timer (§4 — teardown and the §8 dial re-base are
-  the only cancels), then wait — the
+- **A slot is released only when its armed-op set is empty.** Teardown is
+  where the races live — a lesson paid for in implementation time and
+  simulator seeds last iteration. Every op references a completion
+  embedded in the slot, and the slot header tracks which are armed.
+  Teardown is a *state*, not an event: shutdown both fds — a pending recv
+  never completes otherwise — cancel the timer (§4 — teardown and the §8
+  dial re-base are the only cancels), then wait — the
   last terminal completion (success, error, or cancellation) releases
   the slot. An active completion is never resubmitted (libxev's
-  intrusive queues corrupt on re-enqueue), and LIFO reuse turns a
-  straggler completion landing in a recycled slot into memory
-  corruption — so slots carry a generation counter asserted on every
+  intrusive queues corrupt on re-enqueue) — overlapping ops on the same
+  connection get their own completions instead of sharing one — and LIFO
+  reuse turns a straggler completion landing in a recycled slot into
+  memory corruption — so slots carry a generation counter asserted on every
   completion delivery, and the simulator asserts no completion is ever
   delivered to a freed or reused slot (§9).
 - **No cross-thread sharing of pool memory.** Workers receive pointers
@@ -505,7 +489,9 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
 - **Both directions framed** (RFC 9112 §6.3). Smuggling shapes (TE+CL,
   duplicate/garbage Content-Length) → 400 before any byte reaches an
   upstream. `Upgrade` → 501 (non-goal). Hop-by-hop headers stripped both
-  ways; `Connection: close` injected when the proxy will close (§2).
+  ways; `Connection: close` injected when the proxy will close — announced,
+  not silent, or a client pipelines into the close and reads the reset as
+  an error instead of a clean end.
 - **Path routing on the canonical path only** (settled 2026-07-19). An
   `http` listener maps the request path to a cluster through a
   per-listener longest-prefix route table (`"routes": [{ "prefix":
@@ -699,7 +685,11 @@ is maximum pressure — and the zero-alloc gate runs it (§9).
 
 ## 9. Testing — required from day 0
 
-All four gates exist as `build.zig` steps from the first commit; a
+The deterministic-simulation seam is the single highest-leverage testing
+decision the previous iteration made: the data path is written against an
+`Io` facade from the first commit (§4) so a seeded, adversarial,
+virtual-socket backend can run the *real* code, not a mock of it. All four
+gates exist as `build.zig` steps from the first commit; a
 feature without its gate is not done. The three deterministic gates
 (simulation, fuzz, zero-alloc) plus the fd-boundary lint run on every
 change as `zig build ci`. The benchmark gate (Tier 1) is **run at
