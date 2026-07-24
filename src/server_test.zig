@@ -202,6 +202,8 @@ pub const TestBed = struct {
         origin_listens: bool = true,
         idle_timeout_ms: u32 = 1000,
         max_lifetime_ms: u32 = 0,
+        connect_timeout_ms: u32 = 50,
+        drain_deadline_ms: u32 = 1000,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -225,9 +227,9 @@ pub const TestBed = struct {
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
-            .connect_timeout_ms = 50,
+            .connect_timeout_ms = options.connect_timeout_ms,
             .idle_timeout_ms = options.idle_timeout_ms,
-            .drain_deadline_ms = 1000,
+            .drain_deadline_ms = options.drain_deadline_ms,
             .max_lifetime_ms = options.max_lifetime_ms,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, options.server);
@@ -617,4 +619,42 @@ test "server: refused upstream tears the connection down and is counted" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
     try bed.expectDrained();
+}
+
+test "teardown: a drain racing its own upstream dial peaks at four armed ops" {
+    // The §8 worst case the ring budget must cover: the drain deadline
+    // reaps a connection whose upstream dial is still in flight, teardown
+    // arms both cancels on top of {connect, deadline}, and the delayed
+    // dial then completes against its own cancel. Closes serialize
+    // behind the full drain (continueTeardown), so the peak stays at
+    // conn_ops_max = 4 — before the serialization these exact seeds
+    // co-armed five ops ({deadline, both cancels, both closes}), found
+    // by sweeping 1..400 against the old code and pinned here so the
+    // race, not just some teardown, is what every run witnesses.
+    const race_seeds = [_]u64{ 40, 109, 116, 163, 211, 334 };
+    for (race_seeds) |seed| {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{
+                .seed = seed,
+                .adversary = .{ .partial_io = true, .connect_delay_ns_max = 5_000_000 },
+            },
+            // Connect and idle stay far out so the drain deadline — not a
+            // request deadline — is what tears the dialing conn down.
+            .idle_timeout_ms = 60_000,
+            .connect_timeout_ms = 60_000,
+            .drain_deadline_ms = 1,
+        });
+        defer bed.tearDown();
+
+        bed.startClients(1, false);
+        bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 2_000_000);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("drained_at_deadline"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+        try std.testing.expectEqual(@as(u8, 4), bed.server.armed_ops_peak);
+        try bed.expectDrained();
+    }
 }
