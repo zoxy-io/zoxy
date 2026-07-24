@@ -33,43 +33,17 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
 ## io_uring op upgrades — evaluated, all deferred (2026-07-16)
 
 §4's "plain ops only" policy holds: on the measured profile —
-latency-bound with CPU headroom, zoxy user code ~1.3% of cycles
-(IMPLEMENTATION_NOTES.md) — none of the deferred ops pays for itself.
-Verdicts, so they are not re-litigated:
+latency-bound with CPU headroom, zoxy user code ~1.3% of cycles — none
+of the deferred ops pays for itself. The measured rationale per op lives
+in [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md); here only the
+standing revisit conditions, so the verdicts are not re-litigated:
 
 | op | verdict | revisit when |
 |---|---|---|
 | multishot accept | parked (unmeasured) | connection-churn workload (`Connection: close` storms) |
 | multishot recv + buffer rings | measured, parked (2026-07-12) | recv-submission-bound workload: many mostly-idle conns |
 | `send_zc` | rejected at 4 KiB buffers | large-body workload with ≥16 KiB sends |
-| `splice` | deferred | genuine CPU/memory-bandwidth saturation |
-
-- **Multishot accept** saves only the userspace re-arm (one SQE prep per
-  connection), invisible under keep-alive; it also needs a fork op and a
-  documented exception to XevIo's every-callback-disarms discipline.
-  Decide with a Tier-0 churn A/B if a churn-heavy workload shows up.
-- **Multishot recv / buffer rings.** The best-case echo microbench gave
-  only ~2–4% CPU and 15–20% fewer enters — it does not pay for the relay
-  redesign it demands (IMPLEMENTATION_NOTES.md). Buffer rings' real
-  payoff is Phase-1 memory shape — idle keep-alive connections arming a
-  recv without a dedicated posted buffer — but multishot recv *is*
-  read-ahead, which the strict §6 relay exists to forbid; single-shot
-  buffer-select keeps the discipline and forfeits most of the syscall
-  win. Revisit only if Phase-1 idle-connection memory is measured as a
-  problem.
-- **`send_zc`.** Below ~10–32 KiB the kernel copy is cheaper than page
-  pinning, and the extra notification CQE per send doubles CQE
-  consumption — eroding the CQ budget that already caps concurrency
-  (next section). At the deliberate 4 KiB relay buffer it is a strict
-  loss.
-- **`splice`.** The only op that removes the userspace copy, and it
-  preserves §6 backpressure naturally (a bounded pipe). But the copy is
-  not the bottleneck (§3's envelope; the profile above), and the costs
-  are real: two pipes per L4 connection (+4 fds — the fd budget
-  triples), a `Pool(Pipe)`, a SimIo virtual-pipe primitive, and a bigger
-  per-connection op budget against the CQ. Shares the fork prerequisite
-  with c10k below; TLS and chunked L7 bodies fall back to copy
-  regardless.
+| `splice` | deferred (the last open c10k lever) | genuine CPU/memory-bandwidth saturation |
 
 ## c10k — the CQSIZE ceiling (splice the last lever)
 
@@ -131,9 +105,3 @@ this way. Known queue, in rough value order:
   one replay per parked conn until the sweep reaps the rest.
 - Dynamic DNS for upstream endpoints (§1).
 - io_uring op upgrades — the verdict table above.
-- Config JSON Schema — the generator ships (`zig build schema`, reflected
-  from the config definitions, released as an asset per §5). Deferred until
-  there is a reason: host it at its stable `$id`
-  (`https://zoxy.io/schema/config.schema.json`) and add a `"$schema"`
-  pointer to `config/example.json` once it resolves; an optional
-  `zoxy --schema` subcommand so the shipped binary can emit its own schema.

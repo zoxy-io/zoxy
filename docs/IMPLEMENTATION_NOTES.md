@@ -88,6 +88,37 @@ loop only blocks when its pipeline is empty and the next arrival is
 ~50 µs out, so the spin budget expires empty every time. Reverted; do
 not re-propose.
 
+## io_uring op upgrades — evaluated, deferred (2026-07-16)
+
+§4's "plain ops only" holds: on the loop profile above (latency-bound,
+zoxy user code ~1.3% of cycles) none of the deferred ops pays for
+itself. The durable "why" for each, so it is not re-chased — PLANS.md
+carries only the one-line revisit condition per op.
+
+- **Multishot accept** — parked, unmeasured. Saves only the userspace
+  re-arm (one SQE prep per connection), invisible under keep-alive, and
+  costs a fork op plus a documented exception to XevIo's
+  every-callback-disarms discipline. A Tier-0 churn A/B decides it, but
+  only under a churn-heavy workload (`Connection: close` storms).
+- **Multishot recv / buffer rings** — its own verdict above ("measured
+  and parked"). The syscall win does not pay for the relay redesign it
+  demands; single-shot buffer-select would keep the strict §6 discipline
+  but forfeits most of that win.
+- **`send_zc`** — rejected at the deliberate 4 KiB relay buffer. Below
+  ~10–32 KiB the kernel copy is cheaper than page pinning, and the extra
+  notification CQE per send doubles CQE consumption, eroding the CQ
+  budget that already caps concurrency (CQ-bound note below). Revisit
+  only for a large-body workload with ≥16 KiB sends.
+- **`splice`** — deferred; the last open c10k lever (PLANS.md). The only
+  op that removes the userspace copy, and it preserves §6 backpressure
+  naturally (a bounded pipe) — but the copy is not the bottleneck (§3's
+  envelope; the profile above), and the costs are real: two pipes per L4
+  connection (+4 fds, tripling the fd budget), a `Pool(Pipe)`, a SimIo
+  virtual-pipe primitive, and a bigger per-connection op budget against
+  the CQ. Shares the libxev-fork prerequisite with the CQSIZE work; TLS
+  and chunked L7 bodies fall back to copy regardless. Revisit under
+  genuine CPU/memory-bandwidth saturation.
+
 ## The concurrency ceiling is CQ-bound (95d1f8f)
 
 Concurrent L4 connections are bound by the io_uring completion queue,
