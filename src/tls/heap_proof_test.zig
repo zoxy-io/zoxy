@@ -14,6 +14,7 @@ const std = @import("std");
 const ztls = @import("ztls");
 const heap_mod = @import("libcrypto_heap.zig");
 const Engine = @import("Engine.zig");
+const Credentials = @import("Credentials.zig");
 
 const assert = std.debug.assert;
 
@@ -23,19 +24,12 @@ comptime {
     _ = heap_mod;
 }
 
-const cert_der = @embedFile("testdata/cert.der");
-const scalar_hex = @embedFile("testdata/scalar.hex");
+const cert_pem = @embedFile("testdata/cert.pem");
+const key_pem = @embedFile("testdata/key.pem");
 
 // 4 MiB: comfortably covers a handshake's transient libcrypto working
 // set; slice 2 sizes the production reservation against measured peak.
 var heap_backing: [4 * 1024 * 1024]u8 align(16) = undefined;
-
-fn testScalar() [32]u8 {
-    var scalar: [32]u8 = undefined;
-    const decoded = std.fmt.hexToBytes(&scalar, scalar_hex) catch unreachable;
-    assert(decoded.len == 32);
-    return scalar;
-}
 
 test "slice 1: a handshake runs entirely on the fixed libcrypto heap" {
     // First libcrypto touch in this process: install the hooks. If this
@@ -44,13 +38,19 @@ test "slice 1: a handshake runs entirely on the fixed libcrypto heap" {
     heap.init(&heap_backing);
     try std.testing.expect(heap_mod.install(&heap));
 
+    // Credentials must load *after* the heap install — Credentials.load
+    // touches libcrypto (fromPem), which must ride the fixed heap too.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var credentials = try Credentials.load(arena_state.allocator(), cert_pem, key_pem, .{});
+    defer credentials.deinit();
+
     // A full in-memory handshake: raw ztls client against the Engine.
     var engine: Engine = undefined;
     try engine.init(&.{
         .x25519_seed = @splat(0x42),
         .random = @splat(0x43),
-        .cert_der = cert_der,
-        .p256_scalar = testScalar(),
+        .credentials = &credentials,
     });
     defer engine.deinit();
 

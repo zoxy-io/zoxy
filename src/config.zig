@@ -68,6 +68,13 @@ pub const Config = struct {
         /// Compiled and interpreted by `http/filter.zig`.
         filters: []const filter.Rule = &.{},
         protocol: Protocol,
+        /// TLS termination (§4, Phase 3a): present makes this an
+        /// HTTPS/TLS-terminating listener, orthogonal to `protocol` — the
+        /// engine decrypts on the client socket, then `l4`/`http` runs on
+        /// the plaintext. Absent (the default) is plain TCP. Carries only
+        /// the file *paths*; `src/tls/` reads and parses them into
+        /// credentials at startup (the loader stays IO-free, §1).
+        tls: ?Tls = null,
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
         /// `http` runs the HTTP/1.1 reverse-proxy state machine. The
@@ -76,6 +83,16 @@ pub const Config = struct {
         pub const Protocol = enum(u1) {
             l4,
             http,
+        };
+
+        /// A resolved TLS block: the cert-chain and private-key file
+        /// paths, borrowed from `json_bytes` like every other resolved
+        /// string. The bytes behind them are read and turned into a
+        /// `tls.Credentials` at startup — one cert per listener (SNI
+        /// multi-cert is deferred, PLANS.md).
+        pub const Tls = struct {
+            cert_path: []const u8,
+            key_path: []const u8,
         };
     };
 
@@ -143,6 +160,8 @@ pub const ValidationError = error{
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     AdminBindInvalid,
+    TlsCertPathEmpty,
+    TlsKeyPathEmpty,
 };
 
 pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
@@ -318,6 +337,20 @@ pub const LimitsJson = struct {
     };
 };
 
+pub const TlsJson = struct {
+    cert: []const u8,
+    key: []const u8,
+
+    pub const schema_doc =
+        "TLS termination for this listener: the PEM certificate-chain and " ++
+        "private-key files, read at startup. Present means the listener " ++
+        "speaks TLS; absent means plain TCP.";
+    pub const schema_fields = .{
+        .cert = .{ .desc = "Path to the PEM certificate chain (leaf first). ECDSA keys only.", .min_length = 1 },
+        .key = .{ .desc = "Path to the PEM private key for the leaf certificate.", .min_length = 1 },
+    };
+};
+
 pub const ListenerJson = struct {
     bind: []const u8,
     /// Exactly one of `cluster` (sugar for a single catch-all route) or
@@ -328,6 +361,8 @@ pub const ListenerJson = struct {
     filters: ?[]const FilterJson = null,
     /// Optional: absent means `l4`, keeping pre-L7 configs valid.
     protocol: []const u8 = "l4",
+    /// Optional TLS termination block; absent means plain TCP.
+    tls: ?TlsJson = null,
 
     pub const schema_doc =
         "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
@@ -348,6 +383,7 @@ pub const ListenerJson = struct {
             .desc = "What the listener speaks: l4 relays bytes blindly, http runs the reverse-proxy state machine.",
             .enum_type = Config.Listener.Protocol,
         },
+        .tls = .{ .desc = "TLS termination block (cert + key paths); absent means plain TCP." },
     };
 };
 
@@ -644,7 +680,7 @@ pub const dto_types = .{
     ConfigJson,  ListenerJson,    RouteJson,    FilterJson,
     MatchJson,   HeaderMatchJson, ActionJson,   HeaderEditJson,
     RewriteJson, ClusterJson,     TimeoutsJson, LimitsJson,
-    AdminJson,
+    AdminJson,   TlsJson,
 };
 
 comptime {
@@ -733,10 +769,24 @@ fn resolveListeners(
             .routes = try resolveRoutes(arena, &listener_json, clusters, protocol),
             .filters = try resolveFilters(arena, &listener_json, protocol),
             .protocol = protocol,
+            .tls = try resolveTls(&listener_json),
         };
     }
     assert(listeners.len == listeners_json.len);
     return listeners;
+}
+
+/// Resolve a listener's optional TLS block: absent → null (plain TCP),
+/// present → the cert/key file paths, borrowed from `json_bytes`. Only
+/// pure checks belong here (§1 — the loader is IO-free): the paths must
+/// be non-empty. Reading the files and parsing them into credentials is
+/// a startup step under `src/tls/` (Phase 3a slices ahead). TLS is
+/// orthogonal to `protocol`, so no protocol coupling is validated.
+fn resolveTls(listener_json: *const ListenerJson) ParseError!?Config.Listener.Tls {
+    const tls = listener_json.tls orelse return null;
+    if (tls.cert.len == 0) return error.TlsCertPathEmpty;
+    if (tls.key.len == 0) return error.TlsKeyPathEmpty;
+    return .{ .cert_path = tls.cert, .key_path = tls.key };
 }
 
 /// Compile a listener's §7 filter rules into immutable arena tables.
@@ -1248,6 +1298,60 @@ test "config: listener protocol defaults to l4 and accepts http" {
         );
         try std.testing.expectEqual(Config.Listener.Protocol.http, parsed.listeners[0].protocol);
     }
+}
+
+test "config: tls block resolves cert/key paths, absent leaves plain TCP" {
+    // Absent: plain TCP.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(?Config.Listener.Tls, null), parsed.listeners[0].tls);
+    }
+    // Present: the cert/key paths resolve, orthogonal to protocol.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a",
+            \\   "tls":{"cert":"/etc/zoxy/cert.pem","key":"/etc/zoxy/key.pem"}}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        const tls = parsed.listeners[0].tls orelse return error.TestExpectedTls;
+        try std.testing.expectEqualStrings("/etc/zoxy/cert.pem", tls.cert_path);
+        try std.testing.expectEqualStrings("/etc/zoxy/key.pem", tls.key_path);
+    }
+}
+
+test "config: an empty cert or key path in a tls block is rejected" {
+    inline for (.{
+        .{ "\"cert\":\"\",\"key\":\"/k\"", ParseError.TlsCertPathEmpty },
+        .{ "\"cert\":\"/c\",\"key\":\"\"", ParseError.TlsKeyPathEmpty },
+    }) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"," ++
+            "\"tls\":{" ++ case[0] ++ "}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+        try std.testing.expectError(case[1], parse(arena_state.allocator(), json));
+    }
+}
+
+test "config: a tls block with an unknown field is rejected (strict parse)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.UnknownField, parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a",
+        \\   "tls":{"cert":"/c","key":"/k","sni":"x"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    ));
 }
 
 test "config: explicit routes resolve, sorted longest-prefix-first" {

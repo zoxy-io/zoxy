@@ -11,14 +11,15 @@ const std = @import("std");
 
 const ztls = @import("ztls");
 const Engine = @import("Engine.zig");
+const Credentials = @import("Credentials.zig");
 
 const assert = std.debug.assert;
 
 // Throwaway self-signed spike fixtures (testdata/README.md): the private
-// scalar is committed on purpose, generated for this test and never used
+// key is committed on purpose, generated for these tests and never used
 // anywhere else.
-const cert_der = @embedFile("testdata/cert.der");
-const scalar_hex = @embedFile("testdata/scalar.hex");
+const cert_pem = @embedFile("testdata/cert.pem");
+const key_pem = @embedFile("testdata/key.pem");
 
 /// A capture buffer for one direction of the in-memory wire, plus the
 /// decrypted application data and close signal a side observed.
@@ -64,13 +65,12 @@ const Capture = struct {
     }
 };
 
-fn testScalar() [32]u8 {
-    var scalar: [32]u8 = undefined;
-    // The fixture is 64 hex chars checked in at generation time; a decode
-    // failure means the repo itself is corrupt, not a runtime input.
-    const decoded = std.fmt.hexToBytes(&scalar, scalar_hex) catch unreachable;
-    assert(decoded.len == 32);
-    return scalar;
+// The spike fixtures load into credentials the engine borrows. A load
+// failure means the checked-in fixtures are corrupt, not a runtime input.
+fn testCredentials(arena: std.mem.Allocator, deterministic_nonce: bool) Credentials {
+    return Credentials.load(arena, cert_pem, key_pem, .{
+        .deterministic_nonce = deterministic_nonce,
+    }) catch unreachable;
 }
 
 /// Drive the raw ztls client against the Engine until the client has no
@@ -139,12 +139,16 @@ const Client = struct {
 };
 
 test "spike: full deterministic handshake, echo, and orderly close" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var credentials = testCredentials(arena_state.allocator(), false);
+    defer credentials.deinit();
+
     var engine: Engine = undefined;
     try engine.init(&.{
         .x25519_seed = @splat(0x42),
         .random = @splat(0x43),
-        .cert_der = cert_der,
-        .p256_scalar = testScalar(),
+        .credentials = &credentials,
     });
     defer engine.deinit();
 
@@ -215,12 +219,16 @@ fn refragmentClientHello(ch_record: []const u8, out: *Capture) void {
 // decode_error alert. Verified meaningful — without the Engine's
 // reassembly buffer this handshake fails.
 test "engine: a ClientHello fragmented across records still handshakes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var credentials = testCredentials(arena_state.allocator(), false);
+    defer credentials.deinit();
+
     var engine: Engine = undefined;
     try engine.init(&.{
         .x25519_seed = @splat(0x42),
         .random = @splat(0x43),
-        .cert_der = cert_der,
-        .p256_scalar = testScalar(),
+        .credentials = &credentials,
     });
     defer engine.deinit();
 
@@ -247,6 +255,15 @@ test "engine: a ClientHello fragmented across records still handshakes" {
 }
 
 test "spike: determinism — identical seeds yield a byte-exact server flight" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // The seam the simulator depends on: with deterministic ECDSA the
+    // whole flight — including the CertificateVerify signature and the
+    // encrypted record framing around it — is a pure function of the
+    // seeds. One shared credential (deterministic nonce) across runs.
+    var credentials = testCredentials(arena_state.allocator(), true);
+    defer credentials.deinit();
+
     var first: [2][]u8 = undefined;
     var storage: [2][4096]u8 = undefined;
     for (0..2) |run| {
@@ -254,13 +271,7 @@ test "spike: determinism — identical seeds yield a byte-exact server flight" {
         try engine.init(&.{
             .x25519_seed = @splat(0x42),
             .random = @splat(0x43),
-            .cert_der = cert_der,
-            .p256_scalar = testScalar(),
-            // The seam the simulator depends on: with deterministic ECDSA
-            // the whole flight — including the CertificateVerify signature
-            // and the encrypted record framing around it — is a pure
-            // function of the seeds.
-            .deterministic_nonce = true,
+            .credentials = &credentials,
         });
         defer engine.deinit();
 
