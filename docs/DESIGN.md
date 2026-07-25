@@ -335,7 +335,8 @@ previous iteration paid that cost, and shared pools sized for concurrent
 *activity* rather than worst-case-per-core are the fix and the reason this
 iteration exists.
 
-Three shared pools, all owned and touched only by the loop thread:
+Three shared pools, all owned and touched only by the loop thread (a
+fourth, TLS engines, joins them when a listener terminates TLS — below):
 
 1. **Connection slots — `Pool(Conn)`.** One contiguous object per
    connection: state machine, embedded completions (one per overlappable
@@ -380,7 +381,18 @@ a raised `RLIMIT_NOFILE`:
 | conn slots | 1386 | 14074 | ~1.7 KiB state + 8 KiB head |
 | relay buffers | 1386 | 14074 | 2 × 4 KiB |
 | upstream slots | 1024 | 1024 | ~40 B state + 8 KiB head |
+| tls engines | 0 / 256 | 1024 | ~116 KiB (ztls buffers) |
 | **pool memory** | **~32 MiB** | **~251 MiB** | |
+
+The fourth pool — **TLS engines** (§4, Phase 3a) — is the one sized by
+what the config asks for rather than by connection count: an engine is
+~116 KiB of ztls record/handshake buffers, so one per conn slot would be
+~1.6 GiB. It defaults to **zero** (a disabled pool reserving nothing)
+unless a listener carries a `tls` block, then 256; exhaustion is its own
+shed rung. Engines hold no socket and arm no ring op, so they enter
+neither the fd nor the CQ budget. The **pool memory** row above is the
+plain-TCP shape; a TLS deployment adds its engine pool on top — ~30 MiB
+at the default (~62 MiB total), ~116 MiB at the ceiling (~367 MiB).
 
 Rules:
 

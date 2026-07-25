@@ -146,6 +146,23 @@ pub const chunked_trailer_bytes_max: u32 = 1024;
 /// ceiling.
 pub const upstream_slots_max: u32 = 1024;
 
+/// TLS engines (`Pool(tls.Engine)`) — the bound on *concurrent TLS
+/// connections* (§4, Phase 3a). An engine is ~116 KiB, dominated by
+/// ztls's caller-owned record/handshake buffers
+/// (IMPLEMENTATION_NOTES.md), so unlike a conn slot it can never be one
+/// per connection: 116 KiB × `conn_slots_max` would be ~1.6 GiB. The
+/// pool is therefore sized for concurrent TLS *activity*, and checkout
+/// failure will be its own §8 shed rung once the handshake phase
+/// acquires from it (PLANS.md). The ceiling is what a c10k-class box can spare for TLS
+/// state (~116 MiB); an engine holds no socket and arms no ring op, so
+/// it enters neither the fd nor the CQ budget.
+///
+/// Phase 3b (kTLS) shrinks the *duration*, not the size: once the kernel
+/// owns the record layer, an engine is returned at handshake completion
+/// instead of at connection close, so the same pool covers far more
+/// concurrent TLS connections.
+pub const tls_engines_max: u32 = 1024;
+
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
 
@@ -359,6 +376,14 @@ pub const conn_slots_default: u32 = 1386;
 pub const relay_buffers_default: u32 = conn_slots_default;
 pub const upstream_slots_default: u32 = upstream_slots_max;
 
+/// TLS engines when a listener terminates TLS but the config names no
+/// count. ~29 MiB at ~116 KiB per engine — roughly the plain-TCP default
+/// footprint again, which is the honest price of TLS state and still an
+/// order under the ceiling. A config with *no* TLS listener defaults to
+/// zero engines and reserves nothing (`Config.Limits.tls_engines`), so
+/// this cost is opt-in by configuring TLS at all.
+pub const tls_engines_default: u32 = 256;
+
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
     assert(ring_entries <= 4096);
@@ -381,6 +406,7 @@ comptime {
     assert(relay_buffers_default >= 1 and relay_buffers_default <= relay_buffers_max);
     assert(relay_buffers_default <= conn_slots_default);
     assert(upstream_slots_default >= 1 and upstream_slots_default <= upstream_slots_max);
+    assert(tls_engines_default >= 1 and tls_engines_default <= tls_engines_max);
     assert(relay_buffers_max <= conn_slots_max);
     assert(relay_buffers_max >= 1);
     assert(listeners_max >= 1);
@@ -456,6 +482,8 @@ pub const PoolSizes = struct {
     relay_buffer_pair_bytes: u64,
     upstream_slots: u32,
     upstream_bytes: u64,
+    tls_engines: u32,
+    tls_engine_bytes: u64,
 };
 
 /// By pointer: `PoolSizes` is past the 16-byte threshold TIGER_STYLE sets
@@ -467,12 +495,17 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     assert(sizes.relay_buffers <= relay_buffers_max);
     assert(sizes.upstream_slots >= 1);
     assert(sizes.upstream_slots <= upstream_slots_max);
+    // Zero engines is the plain-TCP deployment: the pool is disabled and
+    // reserves nothing (§4).
+    assert(sizes.tls_engines <= tls_engines_max);
     assert(sizes.conn_bytes > 0);
     assert(sizes.relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
     assert(sizes.upstream_bytes >= head_bytes_max);
+    assert(sizes.tls_engine_bytes > 0);
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
-        @as(u64, sizes.upstream_slots) * sizes.upstream_bytes;
+        @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
+        @as(u64, sizes.tls_engines) * sizes.tls_engine_bytes;
     assert(total > 0);
     return total;
 }
@@ -502,10 +535,12 @@ test "budgets: memory total matches the closed form" {
     const conn_bytes: u64 = 10240;
     const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
     const upstream_bytes: u64 = head_bytes_max + 64;
+    const engine_bytes: u64 = 116 * 1024;
     // At the ceilings and at a shrunken (config-limits) shape alike.
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
-        @as(u64, upstream_slots_max) * upstream_bytes;
+        @as(u64, upstream_slots_max) * upstream_bytes +
+        @as(u64, tls_engines_max) * engine_bytes;
     try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
@@ -513,8 +548,11 @@ test "budgets: memory total matches the closed form" {
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = upstream_slots_max,
         .upstream_bytes = upstream_bytes,
+        .tls_engines = tls_engines_max,
+        .tls_engine_bytes = engine_bytes,
     }));
-    const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
+    const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes +
+        4 * engine_bytes;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
         .conn_slots = 64,
         .conn_bytes = conn_bytes,
@@ -522,7 +560,34 @@ test "budgets: memory total matches the closed form" {
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = 8,
         .upstream_bytes = upstream_bytes,
+        .tls_engines = 4,
+        .tls_engine_bytes = engine_bytes,
     }));
+}
+
+test "budgets: a plain-TCP deployment reserves no TLS engine memory" {
+    const conn_bytes: u64 = 10240;
+    const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
+    const upstream_bytes: u64 = head_bytes_max + 64;
+    const engine_bytes: u64 = 116 * 1024;
+    // Zero engines is the no-TLS-listener default: the term vanishes, so
+    // linking the TLS engine in costs a plain deployment nothing (§4).
+    const plain: PoolSizes = .{
+        .conn_slots = 64,
+        .conn_bytes = conn_bytes,
+        .relay_buffers = 8,
+        .relay_buffer_pair_bytes = pair_bytes,
+        .upstream_slots = 8,
+        .upstream_bytes = upstream_bytes,
+        .tls_engines = 0,
+        .tls_engine_bytes = engine_bytes,
+    };
+    var with_one = plain;
+    with_one.tls_engines = 1;
+    try std.testing.expectEqual(
+        memoryBytesTotal(&plain) + engine_bytes,
+        memoryBytesTotal(&with_one),
+    );
 }
 
 test "budgets: c10k ceiling fd count needs a raised NOFILE" {
