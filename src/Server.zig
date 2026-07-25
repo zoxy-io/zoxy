@@ -385,10 +385,7 @@ pub fn Server(comptime IoType: type) type {
             const conn = server.admitConn(client_socket) orelse return;
             const buffer: ?*relay.RelayBuffer = switch (state.protocol) {
                 .l4 => server.acquireRelayBuffer() orelse {
-                    server.conns.release(conn);
-                    server.updateConnPressure();
-                    server.counters.increment("shed_relay_buffers");
-                    shed.closeQuietly(IoType, server.io, client_socket);
+                    server.abortAdmission(conn, client_socket, "shed_relay_buffers");
                     return;
                 },
                 .http => null,
@@ -481,6 +478,39 @@ pub fn Server(comptime IoType: type) type {
             return conn;
         }
 
+        /// Undo an admission that cannot proceed: a connection already
+        /// holding a conn slot whose protocol could not get the rest of what
+        /// it needs (§8). Every rung past the slot itself ends the same three
+        /// ways — return the slot with its pressure re-derived (§5), witness
+        /// the rung, close the socket — and none of them ever counted
+        /// `admitted`, which is what keeps the reconcile identity exact (§9).
+        ///
+        /// One call rather than three lines because of the pressure update:
+        /// only its engage crossing carries a counter (§8), so a release that
+        /// omits it leaves the flag engaged over a pool that just shrank with
+        /// nothing witnessing that — every idle timeout quietly divides
+        /// instead of anything failing.
+        ///
+        /// The close is a plain FIN, not the conn-slot rung's RST — §8's
+        /// table names the RST for the slot rung alone, and `shed.zig` owns
+        /// the split; every rung past the slot closes quietly.
+        fn abortAdmission(
+            server: *Self,
+            conn: *ConnType,
+            client_socket: IoType.Socket,
+            comptime rung: []const u8,
+        ) void {
+            // Naming, and only naming: what this witnesses is always a shed.
+            // `reconcile` sums an explicit list (§9), so a new rung has to be
+            // added there too — the simulator's reconcile invariant is what
+            // actually catches a miss, not this assert.
+            comptime assert(std.mem.startsWith(u8, rung, "shed_"));
+            assert(!server.draining);
+            server.releaseConn(conn);
+            server.counters.increment(rung);
+            shed.closeQuietly(IoType, server.io, client_socket);
+        }
+
         /// The shared admission tail (§8 single choke point): counting, slot
         /// prepare, socket options, the routing tables, and the one deadline
         /// timer this connection ever arms are identical across protocols —
@@ -533,6 +563,15 @@ pub fn Server(comptime IoType: type) type {
         pub fn releaseRelayBuffer(server: *Self, buffer: *relay.RelayBuffer) void {
             server.relay_buffers.release(buffer);
             server.updateRelayPressure();
+        }
+
+        /// The same pair for conn slots, with `admitConn` as its acquire
+        /// side: pressure follows occupancy in both directions (§5, §8), so
+        /// every slot return goes through here and the flag can never
+        /// outlive the occupancy that raised it.
+        fn releaseConn(server: *Self, conn: *ConnType) void {
+            server.conns.release(conn);
+            server.updateConnPressure();
         }
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
@@ -657,8 +696,7 @@ pub fn Server(comptime IoType: type) type {
             // An idle L7 connection holds no relay buffer (§5); only
             // release one that was actually acquired.
             if (conn.relay_buffer) |buffer| {
-                server.relay_buffers.release(buffer);
-                server.updateRelayPressure();
+                server.releaseRelayBuffer(buffer);
                 conn.relay_buffer = null;
             }
             // The leased upstream slot rides the same release rule: its
@@ -669,8 +707,7 @@ pub fn Server(comptime IoType: type) type {
                 server.releaseUpstream(leased);
                 conn.upstream = null;
             }
-            server.conns.release(conn);
-            server.updateConnPressure();
+            server.releaseConn(conn);
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
         }

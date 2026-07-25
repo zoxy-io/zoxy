@@ -135,7 +135,7 @@ Sizes are estimates, in diff lines, for sequencing only.
 | A1 | Zero-slot `Pool`: relax `count >= 1`, sentinel `free_head`, one test | 20 | a pool the config never asked for reserves nothing and is permanently exhausted, so its acquire site needs no special case |
 | A2 | `fillRandom` on the Io seam (`getrandom` in XevIo, scenario PRNG in SimIo), with the balancer's p2c seed routed through it | 60 | TLS needs key material through the seam; the side win is seed-replayable p2c in the simulator (§9) |
 | A3 | Lint boundaries as a data table `{import, allowed_prefix, message}` | 50 | the branch's 5th positional bool touched every test call; a new dependency boundary should be one row |
-| A4 | `abortAdmission(server, conn, socket, rung)` | 30 | collapses the release + pressure + counter + close quartet that `admitL4`/`admitHttp` already repeat and `admitTls` repeated twice more |
+| A4 | `abortAdmission(server, conn, socket, rung)` — *landed*, with `releaseConn` as the pool pairing it was missing | 30 | collapses the release + pressure + counter + close quartet that `admitL4`/`admitHttp` already repeat and `admitTls` repeated twice more |
 | A5 | Split `prepare` from `startProtocol(server, conn)` — *landed* | 40 | one protocol fork, callable from accept *or* from a later phase — deletes the branch's duplicated switch and the `tls_protocol` field outright |
 
 **What A5 leaves to the phase that hands a connection over.**
