@@ -19,6 +19,21 @@ pub const Counters = struct {
     shed_conn_slots: Value = Value.init(0),
     /// §8 rung: relay buffers exhausted at admission → close.
     shed_relay_buffers: Value = Value.init(0),
+    /// §8 rung (§4): no TLS engine available at admission → close. The
+    /// engine pool bounds concurrent TLS connections, so this is the wall
+    /// a TLS listener hits first under a handshake storm; engine setup
+    /// failing (key derivation) is folded in, because both mean the same
+    /// thing to the connection and both shed *before* admission — which
+    /// is what keeps this purely an admission counter for `reconcile`.
+    shed_tls_engines: Value = Value.init(0),
+    /// TLS sessions established. Not a shed — the handshake's success
+    /// side, so it stays out of `reconcile`.
+    tls_handshakes_completed: Value = Value.init(0),
+    /// An *admitted* connection whose handshake never established: a
+    /// protocol error or a peer that left mid-flight. Post-admission, so
+    /// it ends in `completed` like any other teardown and stays out of
+    /// the shed sum.
+    tls_handshake_failed: Value = Value.init(0),
     /// §8 "watermarks before walls": pool pressure engaged (false→true
     /// crossings of a pool's high watermark), one counter per pool. Not
     /// sheds — biases that precede the walls — so they stay out of
@@ -166,6 +181,7 @@ pub const Counters = struct {
         const accepted = counters.get("accepted");
         const shed = counters.get("shed_conn_slots") +
             counters.get("shed_relay_buffers") +
+            counters.get("shed_tls_engines") +
             counters.get("shed_draining");
         assert(completed <= admitted);
         assert(admitted <= accepted);

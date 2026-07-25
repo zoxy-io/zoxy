@@ -97,9 +97,21 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      are valid only until the next engine call. Costs ~33 KiB per engine
      (two max wire records, the largest burst one step can produce),
      charged only to TLS connections.
-  8. **The handshake phase in the data path** — its own deadline (the
-     slowloris answer), the per-tick budget + backlog + shed rung +
-     counters: the §8 ladder's new row. Engine checkout lands here.
+  8. **The handshake phase in the data path** — *landed:* admission
+     forks on credentials before the l4/http fork (TLS is orthogonal),
+     checks an engine out of the pool, and drives the handshake one
+     strict step at a time on the client socket — recv ciphertext, feed,
+     send the outbox — under the idle deadline, so a peer that opens a
+     connection and never speaks meets the clock. The engine returns to
+     the pool at teardown. New §8 rung `shed_tls_engines` (pool
+     exhausted *or* engine setup failed — both shed before admission, so
+     `reconcile` stays exact), plus `tls_handshakes_completed` and
+     `tls_handshake_failed`. `fillRandom` joins the Io seam: seeded in
+     SimIo (replayable handshakes), `getrandom` in XevIo. Proven by a
+     real ztls client (`tls/TestClient.zig`, shared with the simulator)
+     completing a handshake over SimIo sockets. **The session then
+     closes** — close_notify, then teardown — because the plaintext
+     behind it has nowhere to go until the next slice.
   9. **Data-path shim** — L4-over-TLS first (terminate, relay
      plaintext), then L7 head-read over decrypted bytes; the strict
      relay discipline is unchanged either way.

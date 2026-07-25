@@ -593,6 +593,28 @@ pub fn closeNow(io: *XevIo, socket: Socket) void {
     closeFd(@intFromEnum(socket));
 }
 
+/// Key material for the TLS engine (§4): the OS CSPRNG, read here
+/// because `src/io/` is the only place a raw syscall may live. Production
+/// randomness is never derived from the clock or a seed — only SimIo
+/// substitutes a deterministic stream, and only to make handshakes
+/// replayable in the simulator. A CSPRNG that cannot answer is not a
+/// condition to degrade around: `getrandom` with no flags fails only on a
+/// programming or kernel bug, so this panics rather than hand back weak
+/// key material.
+pub fn fillRandom(io: *XevIo, buffer: []u8) void {
+    _ = io;
+    assert(buffer.len > 0);
+    var remaining = buffer;
+    while (remaining.len != 0) {
+        const rc = linux.getrandom(remaining.ptr, remaining.len, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => remaining = remaining[rc..],
+            .INTR, .AGAIN => continue,
+            else => |err| std.debug.panic("getrandom failed: {t}", .{err}),
+        }
+    }
+}
+
 pub fn nowNs(io: *XevIo) u64 {
     // The io_uring backend does NOT refresh cached_now each tick — the tick
     // only marks it `now_outdated` and refreshes lazily (in loop.now() or

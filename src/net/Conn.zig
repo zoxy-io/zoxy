@@ -12,6 +12,7 @@ const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const router = @import("../http/router.zig");
 const filter = @import("../http/filter.zig");
+const TlsEngine = @import("../tls/Engine.zig");
 const relay = @import("relay.zig");
 const upstream_module = @import("upstream.zig");
 
@@ -36,6 +37,11 @@ pub fn Conn(comptime IoType: type) type {
         /// idle on keep-alive — an idle L7 connection costs a slot and
         /// head buffer only (§5).
         relay_buffer: ?*relay.RelayBuffer,
+        /// The TLS engine terminating this connection (§4), checked out
+        /// of the shared pool at admission and returned at teardown. Null
+        /// on a plain-TCP connection, which is every connection on a
+        /// listener without credentials.
+        tls: ?*TlsEngine,
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
@@ -92,6 +98,11 @@ pub fn Conn(comptime IoType: type) type {
         const Self = @This();
 
         pub const State = enum(u8) {
+            /// TLS termination (§4): ciphertext in, handshake flights out,
+            /// until the engine reports the session established. Entered
+            /// at admission on a listener that carries credentials, before
+            /// any protocol state — TLS is orthogonal to l4/http.
+            tls_handshaking,
             // L4 relay states.
             connecting,
             relaying,
@@ -126,6 +137,7 @@ pub fn Conn(comptime IoType: type) type {
         /// `beginTeardown` is a legal transition.
         pub fn isLive(conn: *const Self) bool {
             return switch (conn.state) {
+                .tls_handshaking,
                 .connecting,
                 .relaying,
                 .l7_reading_head,
@@ -292,12 +304,14 @@ pub fn Conn(comptime IoType: type) type {
             state: State,
             cluster_index: u16,
         ) void {
-            assert(state == .connecting or state == .l7_reading_head);
+            assert(state == .connecting or state == .l7_reading_head or
+                state == .tls_handshaking);
             conn.server = server;
             conn.state = state;
             conn.client_socket = client_socket;
             conn.upstream_socket = null;
             conn.relay_buffer = buffer;
+            conn.tls = null; // admitTls checks one out after prepare.
             conn.deadline_ns = 0;
             conn.birth_ns = server.io.nowNs();
             conn.armed = .{};
