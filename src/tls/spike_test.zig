@@ -190,6 +190,62 @@ test "spike: full deterministic handshake, echo, and orderly close" {
     try std.testing.expect(client.saw_close);
 }
 
+// A 5-byte TLS record header for a handshake (type 22) fragment.
+fn handshakeRecordHeader(len: u16) [5]u8 {
+    return .{ 22, 0x03, 0x03, @intCast(len >> 8), @intCast(len & 0xff) };
+}
+
+// Re-frame a single ClientHello record as two handshake records, each
+// carrying half the handshake-message body — the fragmentation the
+// standard client never produces but a hostile or MTU-shaped peer can.
+fn refragmentClientHello(ch_record: []const u8, out: *Capture) void {
+    assert(ch_record[0] == 22); // handshake record
+    const body = ch_record[5..];
+    const split = body.len / 2;
+    assert(split > 0);
+    assert(split < body.len);
+    Capture.writeWire(out, &handshakeRecordHeader(@intCast(split)));
+    Capture.writeWire(out, body[0..split]);
+    Capture.writeWire(out, &handshakeRecordHeader(@intCast(body.len - split)));
+    Capture.writeWire(out, body[split..]);
+}
+
+// The reassembly buffer (Engine field, ztls #36): a ClientHello split
+// across two records must still drive a full handshake, not draw a
+// decode_error alert. Verified meaningful — without the Engine's
+// reassembly buffer this handshake fails.
+test "engine: a ClientHello fragmented across records still handshakes" {
+    var engine: Engine = undefined;
+    try engine.init(&.{
+        .x25519_seed = @splat(0x42),
+        .random = @splat(0x43),
+        .cert_der = cert_der,
+        .p256_scalar = testScalar(),
+    });
+    defer engine.deinit();
+
+    var client: Client = undefined;
+    try client.init();
+    defer client.hs.deinit();
+
+    var to_server: Capture = .{};
+    var to_client: Capture = .{};
+
+    // The one fragmented message: the ClientHello, re-framed as two
+    // records before it reaches the engine.
+    const ch = try client.hs.start(&client.out.buffer);
+    refragmentClientHello(ch, &to_server);
+    client.hs.completeWrite();
+
+    var rounds: u8 = 0;
+    while (!(engine.isConnected() and client.hs.isConnected())) : (rounds += 1) {
+        try std.testing.expect(rounds < 8);
+        try engine.feed(to_server.take(), to_client.sink());
+        try client.feed(to_client.take(), &to_server);
+    }
+    try std.testing.expect(engine.isConnected());
+}
+
 test "spike: determinism — identical seeds yield a byte-exact server flight" {
     var first: [2][]u8 = undefined;
     var storage: [2][4096]u8 = undefined;
