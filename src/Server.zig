@@ -25,6 +25,7 @@ const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
+const tls_relay = @import("net/tls_relay.zig");
 const TlsCredentials = @import("tls/Credentials.zig");
 const TlsEngine = @import("tls/Engine.zig");
 const upstream_module = @import("net/upstream.zig");
@@ -578,7 +579,7 @@ pub fn Server(comptime IoType: type) type {
                 // Nothing may arrive before the handshake completes; ztls
                 // rejects early data (0-RTT is not offered), so a callback
                 // here would be a library-contract violation.
-                .appData = tlsUnexpectedPlaintext,
+                .appData = tlsPendingPlaintext,
                 .closed = tlsPeerClosed,
             }) catch {
                 server.counters.increment("tls_handshake_failed");
@@ -632,45 +633,48 @@ pub fn Server(comptime IoType: type) type {
             server.pumpTlsOutbound(conn);
         }
 
-        /// The session is established. Phase 3a stops here: the plaintext
-        /// behind it does not yet reach an upstream (PLANS.md slice 9), so
-        /// the connection is closed the orderly way — close_notify, then
-        /// teardown — rather than left holding an engine it cannot use.
+        /// The session is established: the connection now behaves like any
+        /// other L4 connection, except that the client side is encrypted.
+        /// It claims its relay buffer here — deferred until now so a
+        /// handshake that never completes never held one — and dials the
+        /// upstream under the connect budget.
         fn finishTlsHandshake(server: *Self, conn: *ConnType) void {
             assert(conn.state == .tls_handshaking);
             assert(conn.tls.?.isConnected());
+            assert(conn.relay_buffer == null);
             server.counters.increment("tls_handshakes_completed");
-            conn.tls.?.sendClose() catch {
+            const buffer = server.relay_buffers.acquire() orelse {
+                server.counters.increment("tls_relay_buffer_unavailable");
                 server.beginTeardown(conn);
                 return;
             };
-            const outbound = conn.tls.?.outbound();
-            assert(outbound.len > 0);
-            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            server.io.send(
-                conn.client_socket,
-                outbound,
-                &conn.op_data_upstream_to_client.completion,
-                ConnType,
-                conn,
-                onTlsCloseSent,
-            );
+            server.updateRelayPressure();
+            conn.relay_buffer = buffer;
+            conn.state = .connecting;
+            server.storeDeadline(conn, server.config.connect_timeout_ms);
+            server.armConnect(conn, conn.cluster_index);
         }
 
-        fn onTlsCloseSent(conn: *ConnType, result: Io.SendError!u32) void {
-            const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            // The session is over either way; a failed close_notify only
-            // costs the peer an orderly signal.
-            _ = result catch {};
-            server.beginTeardown(conn);
-        }
-
-        fn tlsUnexpectedPlaintext(ctx: *anyopaque, bytes: []const u8) void {
-            _ = bytes;
+        /// Application data that arrived before the relay was up (see
+        /// `Conn.tls_pending_len`). Staged in the engine inbox, which is
+        /// sized for a full feed's plaintext, and forwarded once the
+        /// upstream is connected. Overflow sheds rather than asserts: the
+        /// client chooses how much to send before we are ready.
+        fn tlsPendingPlaintext(ctx: *anyopaque, bytes: []const u8) void {
             const conn: *ConnType = @ptrCast(@alignCast(ctx));
-            _ = conn;
-            unreachable; // No early data is offered, so none can arrive.
+            const engine = conn.tls.?;
+            assert(conn.state == .tls_handshaking);
+            assert(conn.tls_pending_len <= engine.inbox.len);
+            if (conn.tls_pending_len + bytes.len > engine.inbox.len) {
+                // Pre-relay, so this is a handshake-phase failure, not the
+                // mid-relay class `tls_relay_failed` names.
+                conn.server.counters.increment("tls_handshake_failed");
+                conn.server.beginTeardown(conn);
+                return;
+            }
+            @memcpy(engine.inbox[conn.tls_pending_len..][0..bytes.len], bytes);
+            conn.tls_pending_len += @intCast(bytes.len);
+            assert(conn.tls_pending_len <= engine.inbox.len);
         }
 
         fn tlsPeerClosed(ctx: *anyopaque) void {
@@ -779,7 +783,13 @@ pub fn Server(comptime IoType: type) type {
             };
             conn.state = .relaying;
             server.storeDeadline(conn, server.idleTimeoutMs());
-            relay.Relay(IoType).start(server, conn);
+            // A TLS connection relays the same way, with the engine
+            // spliced into the client side of each direction (§4).
+            if (conn.tls != null) {
+                tls_relay.TlsRelay(IoType).start(server, conn);
+            } else {
+                relay.Relay(IoType).start(server, conn);
+            }
         }
 
         /// Teardown is a state, not an event (§5): shutdown both fds,

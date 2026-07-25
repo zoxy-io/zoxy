@@ -47,7 +47,7 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      handshake-on-the-heap test (`tls-heap-proof`). The universal
      no-mmap-after-init claim rides the zero-alloc syscall gate once TLS
      joins the serving path (slices 5–6).
-  2. **Engine productionization** — *landed:* the ~148 KiB footprint
+  2. **Engine productionization** — *landed:* the ~180 KiB footprint
      measured and the pool-not-embed decision recorded
      (IMPLEMENTATION_NOTES.md); real backpressure (a zero-progress feed
      is `error.RecordTooLarge`, never a ReleaseFast spin); the
@@ -129,10 +129,17 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
        touches the proven L4 and L7 paths.
      - A parallel TLS relay beside `relay.zig`. Leaves the proven paths
        alone at the cost of a second loop to keep honest.
-     The engine side is ready either way: `feed` + `Sink` decrypt,
-     `sendApp` + `outbound`/`outboundSent` encrypt with partial-write
-     credit. `finishTlsHandshake` is where the close_notify shortcut
-     comes out and the upstream connect goes in.
+     *Landed:* the parallel relay (`net/tls_relay.zig`), L4 only — the
+     L7 head-read over decrypted bytes is still owed. Two bugs the
+     shape made easy, both remotely triggerable, both now gated:
+     plaintext is bounded by the *record*, not the read, so the
+     decrypt destination is an engine-owned inbox (a 16 KiB client
+     write overflowed a 4 KiB relay buffer); and both directions share
+     one outbox, so no step may assume it is empty — `hasStagingRoom`
+     sheds instead. A client may also write immediately after its
+     Finished, before the dial completes: that plaintext is staged on
+     the conn and forwarded as the relay's first send, not treated as
+     impossible early data.
   10. **Sim + fuzz gates** — the spike client ported into the sim
      harness (both keyshares seeded), the adversary at TLS record
      granularity, golden byte-exact transcripts on clean seeds; fuzz

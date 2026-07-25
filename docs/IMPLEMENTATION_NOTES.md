@@ -202,17 +202,20 @@ Spike findings, so they are not re-learned (src/tls/ on the
 
 ## TLS engine footprint — pool, don't embed (2026-07-25, slice 2)
 
-`@sizeOf(tls.Engine)` measured **~148 KiB** on the pinned toolchain,
+`@sizeOf(tls.Engine)` measured **~180 KiB** on the pinned toolchain,
 dominated by ztls's caller-owned buffers: `ServerHandshake` ~19 KiB,
 `RecordBuffer.Storage` ~33 KiB (2× a max wire record), `OutBuffer` and
 `FlightBuffer` ~16.6 KiB each, and the ClientHello reassembly buffer
 ~32 KiB (`ch_reassembly_buffer_size` = 2× max plaintext, added this
 slice for the #36 fragmented-ClientHello fix). The `PrivateKey` is
-16 bytes (a libcrypto handle).
+16 bytes (a libcrypto handle). Slice 9 added a **32 KiB plaintext
+inbox**: ztls reassembles a record internally across reads, so one `feed`
+can deliver a full record's plaintext at once and the caller's
+destination must be sized by the record bound, not the read size.
 
 Decision: the serving path holds engines in a **shared `Pool(Engine)`
 sized for concurrent TLS activity**, never one embedded per conn slot —
-148 KiB × the 14074 conn ceiling would be ~2 GiB, absurd, whereas the
+180 KiB × the 14074 conn ceiling would be ~2.4 GiB, absurd, whereas the
 c10k pool memory today is ~251 MiB total (§5). This is the same
 memory-follows-activity decoupling as relay buffers: an engine is
 checked out when a TLS handshake starts and returned when the
