@@ -479,6 +479,7 @@ pub fn Server(comptime IoType: type) type {
                 server.config.idle_timeout_ms,
                 state.cluster_index,
             );
+            conn.tls_protocol = state.protocol;
             conn.tls = engine;
             conn.routes = state.routes;
             conn.filters = state.filters;
@@ -526,6 +527,10 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.armed.deadline);
         }
 
+        /// Handshake ciphertext read per step, bounded by the head buffer
+        /// it reads into — see `armTlsRecv` for why that bound matters.
+        const handshake_read_bytes = constants.head_bytes_max;
+
         /// The TLS handshake drive (§4), one strict step at a time on the
         /// client socket: recv ciphertext → feed the engine → send
         /// whatever it staged → recv again, until the session is
@@ -533,13 +538,25 @@ pub fn Server(comptime IoType: type) type {
         /// throughout, so the handshake obeys the same
         /// one-op-per-direction discipline as the relay (§6) and costs the
         /// same ring budget.
+        ///
+        /// Ciphertext reads into the head buffer, which is idle until the
+        /// plaintext behind it needs one. The read *target* is
+        /// load-bearing beyond that convenience:
+        /// application data arriving in the same feed is staged as
+        /// `tls_pending_len`, and the L7 fork copies it into that same
+        /// head buffer. Decryption only ever shrinks a record, so reading
+        /// at most `head.len` bounds the staged plaintext by `head.len`
+        /// too — which is what makes that copy fit. Widening this read
+        /// (to `Engine.staging`, say, for fewer round trips) would break
+        /// that coupling silently, so the comptime assert below ties them.
         fn armTlsRecv(server: *Self, conn: *ConnType) void {
             assert(conn.state == .tls_handshaking);
             assert(conn.tls != null);
+            comptime assert(handshake_read_bytes <= constants.head_bytes_max);
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
-                &conn.head,
+                conn.head[0..handshake_read_bytes],
                 &conn.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -643,20 +660,47 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls.?.isConnected());
             assert(conn.relay_buffer == null);
             server.counters.increment("tls_handshakes_completed");
-            const buffer = server.relay_buffers.acquire() orelse {
-                server.counters.increment("tls_relay_buffer_unavailable");
-                server.beginTeardown(conn);
-                return;
-            };
-            server.updateRelayPressure();
-            conn.relay_buffer = buffer;
-            conn.state = .connecting;
-            server.storeDeadline(conn, server.config.connect_timeout_ms);
-            server.armConnect(conn, conn.cluster_index);
+            // TLS is orthogonal to the protocol (§4), so the fork the
+            // plain admission path took at accept happens here instead —
+            // the listener's protocol decides what the decrypted stream
+            // is, exactly as it decides what a plain stream is.
+            switch (conn.tls_protocol) {
+                .l4 => {
+                    // The L4 relay needs its buffer for the connection's
+                    // whole life, so it is claimed here — deferred until
+                    // now so a handshake that never completes never held
+                    // one.
+                    const buffer = server.relay_buffers.acquire() orelse {
+                        server.counters.increment("tls_relay_buffer_unavailable");
+                        server.beginTeardown(conn);
+                        return;
+                    };
+                    server.updateRelayPressure();
+                    conn.relay_buffer = buffer;
+                    conn.state = .connecting;
+                    server.storeDeadline(conn, server.config.connect_timeout_ms);
+                    server.armConnect(conn, conn.cluster_index);
+                },
+                .http => {
+                    // No relay buffer: an L7 connection reading a head
+                    // costs a slot and the head buffer only, and acquires
+                    // a relay buffer per body leg (§5). Note this is not
+                    // full parity with a plain idle L7 connection — a
+                    // terminated one also holds its ~180 KiB engine for
+                    // the connection's whole life, idle stretches between
+                    // keep-alive requests included. That is what the
+                    // engine pool is sized and shed for (§5, §8), but it
+                    // is the figure to reason with on capacity, not the
+                    // plain-L7 one.
+                    conn.state = .l7_reading_head;
+                    server.storeDeadline(conn, server.idleTimeoutMs());
+                    Proxy.start(server, conn);
+                },
+            }
         }
 
         /// Application data that arrived before the relay was up (see
-        /// `Conn.tls_pending_len`). Staged in the engine inbox, which is
+        /// `Conn.tls_pending_len`). Staged in the engine staging, which is
         /// sized for a full feed's plaintext, and forwarded once the
         /// upstream is connected. Overflow sheds rather than asserts: the
         /// client chooses how much to send before we are ready.
@@ -664,17 +708,17 @@ pub fn Server(comptime IoType: type) type {
             const conn: *ConnType = @ptrCast(@alignCast(ctx));
             const engine = conn.tls.?;
             assert(conn.state == .tls_handshaking);
-            assert(conn.tls_pending_len <= engine.inbox.len);
-            if (conn.tls_pending_len + bytes.len > engine.inbox.len) {
+            assert(conn.tls_pending_len <= engine.staging.len);
+            if (conn.tls_pending_len + bytes.len > engine.staging.len) {
                 // Pre-relay, so this is a handshake-phase failure, not the
                 // mid-relay class `tls_relay_failed` names.
                 conn.server.counters.increment("tls_handshake_failed");
                 conn.server.beginTeardown(conn);
                 return;
             }
-            @memcpy(engine.inbox[conn.tls_pending_len..][0..bytes.len], bytes);
+            @memcpy(engine.staging[conn.tls_pending_len..][0..bytes.len], bytes);
             conn.tls_pending_len += @intCast(bytes.len);
-            assert(conn.tls_pending_len <= engine.inbox.len);
+            assert(conn.tls_pending_len <= engine.staging.len);
         }
 
         fn tlsPeerClosed(ctx: *anyopaque) void {
