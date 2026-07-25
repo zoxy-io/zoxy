@@ -147,10 +147,10 @@ pub const chunked_trailer_bytes_max: u32 = 1024;
 pub const upstream_slots_max: u32 = 1024;
 
 /// TLS engines (`Pool(tls.Engine)`) — the bound on *concurrent TLS
-/// connections* (§4, Phase 3a). An engine is ~116 KiB, dominated by
+/// connections* (§4, Phase 3a). An engine is ~148 KiB, dominated by
 /// ztls's caller-owned record/handshake buffers
 /// (IMPLEMENTATION_NOTES.md), so unlike a conn slot it can never be one
-/// per connection: 116 KiB × `conn_slots_max` would be ~1.6 GiB. The
+/// per connection: 148 KiB × `conn_slots_max` would be ~2 GiB. The
 /// pool is therefore sized for concurrent TLS *activity*, and checkout
 /// failure will be its own §8 shed rung once the handshake phase
 /// acquires from it (PLANS.md). The ceiling is what a c10k-class box can spare for TLS
@@ -392,7 +392,7 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 pub const upstream_slots_default: u32 = upstream_slots_max;
 
 /// TLS engines when a listener terminates TLS but the config names no
-/// count. ~29 MiB at ~116 KiB per engine — roughly the plain-TCP default
+/// count. ~37 MiB at ~148 KiB per engine — roughly the plain-TCP default
 /// footprint again, which is the honest price of TLS state and still an
 /// order under the ceiling. A config with *no* TLS listener defaults to
 /// zero engines and reserves nothing (`Config.Limits.tls_engines`), so

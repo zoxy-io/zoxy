@@ -33,7 +33,6 @@ const Capture = struct {
     fn sink(capture: *Capture) Engine.Sink {
         return .{
             .ctx = capture,
-            .writeWire = writeWire,
             .appData = appData,
             .closed = closed,
         };
@@ -64,6 +63,26 @@ const Capture = struct {
         return bytes;
     }
 };
+
+/// Drive the engine one step the way the data path will: feed the
+/// ciphertext that arrived, then hand whatever the engine staged to the
+/// "transport" and report it written. Wire bytes leave through the
+/// outbox, plaintext through the sink.
+fn driveEngine(engine: *Engine, wire: []const u8, to_client: *Capture) !void {
+    try engine.feed(wire, to_client.sink());
+    drainOutbound(engine, to_client);
+}
+
+/// Hand everything the engine staged to the "transport" and report it
+/// written, leaving the outbox empty for the next drive step.
+fn drainOutbound(engine: *Engine, to_client: *Capture) void {
+    const outbound = engine.outbound();
+    if (outbound.len > 0) {
+        Capture.writeWire(to_client, outbound);
+        engine.outboundSent(outbound.len);
+    }
+    assert(engine.outbound().len == 0);
+}
 
 // The spike fixtures load into credentials the engine borrows. A load
 // failure means the checked-in fixtures are corrupt, not a runtime input.
@@ -168,7 +187,7 @@ test "spike: full deterministic handshake, echo, and orderly close" {
     var rounds: u8 = 0;
     while (!(engine.isConnected() and client.hs.isConnected())) : (rounds += 1) {
         try std.testing.expect(rounds < 8);
-        try engine.feed(to_server.take(), to_client.sink());
+        try driveEngine(&engine, to_server.take(), &to_client);
         try client.feed(to_client.take(), &to_server);
     }
 
@@ -179,17 +198,19 @@ test "spike: full deterministic handshake, echo, and orderly close" {
         &client.out.buffer,
     ));
     client.hs.completeWrite();
-    try engine.feed(to_server.take(), to_client.sink());
+    try driveEngine(&engine, to_server.take(), &to_client);
     try std.testing.expectEqualStrings(client_says, to_client.app[0..to_client.app_len]);
 
     // Server → client application data.
     const server_says = "hello-from-zoxy-engine";
-    try engine.sendApp(server_says, to_client.sink());
+    try engine.sendApp(server_says);
+    drainOutbound(&engine, &to_client);
     try client.feed(to_client.take(), &to_server);
     try std.testing.expectEqualStrings(server_says, client.app[0..client.app_len]);
 
     // Orderly close from the server; the client must observe close_notify.
-    try engine.sendClose(to_client.sink());
+    try engine.sendClose();
+    drainOutbound(&engine, &to_client);
     try client.feed(to_client.take(), &to_server);
     try std.testing.expect(client.saw_close);
 }
@@ -248,10 +269,61 @@ test "engine: a ClientHello fragmented across records still handshakes" {
     var rounds: u8 = 0;
     while (!(engine.isConnected() and client.hs.isConnected())) : (rounds += 1) {
         try std.testing.expect(rounds < 8);
-        try engine.feed(to_server.take(), to_client.sink());
+        try driveEngine(&engine, to_server.take(), &to_client);
         try client.feed(to_client.take(), &to_server);
     }
     try std.testing.expect(engine.isConnected());
+}
+
+// The outbox contract the data path depends on: ciphertext survives the
+// call that produced it, and a short write is credited partially — the
+// transport drains at its own pace, which is what makes an async send
+// safe against ztls's borrow-until-next-call buffers.
+test "engine: the outbox survives the drive step and credits partial sends" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var credentials = testCredentials(arena_state.allocator(), false);
+    defer credentials.deinit();
+
+    var engine: Engine = undefined;
+    try engine.init(&.{
+        .x25519_seed = @splat(0x42),
+        .random = @splat(0x43),
+        .credentials = &credentials,
+    });
+    defer engine.deinit();
+
+    var client: Client = undefined;
+    try client.init();
+    defer client.hs.deinit();
+
+    var to_server: Capture = .{};
+    var sink_capture: Capture = .{};
+    Capture.writeWire(&to_server, try client.hs.start(&client.out.buffer));
+    client.hs.completeWrite();
+
+    // One drive step: the ServerHello and flight are staged, not handed
+    // to a callback, so they are still here after `feed` returned.
+    try engine.feed(to_server.take(), sink_capture.sink());
+    const staged = engine.outbound();
+    try std.testing.expect(staged.len > 0);
+    // Copy it out so a later engine call cannot alias what we compare.
+    var expected: [8192]u8 = undefined;
+    assert(staged.len <= expected.len);
+    @memcpy(expected[0..staged.len], staged);
+    const total = staged.len;
+
+    // Drain it one byte at a time: each credit shrinks the remainder from
+    // the front, and the bytes never shift.
+    var written: usize = 0;
+    while (written < total) : (written += 1) {
+        const remaining = engine.outbound();
+        try std.testing.expectEqual(total - written, remaining.len);
+        try std.testing.expectEqualSlices(u8, expected[written..total], remaining);
+        engine.outboundSent(1);
+    }
+    // Fully drained, so the engine may be driven again.
+    try std.testing.expectEqual(@as(usize, 0), engine.outbound().len);
 }
 
 test "spike: determinism — identical seeds yield a byte-exact server flight" {
@@ -283,7 +355,7 @@ test "spike: determinism — identical seeds yield a byte-exact server flight" {
         var to_server: Capture = .{};
         Capture.writeWire(&to_server, try client.hs.start(&client.out.buffer));
         client.hs.completeWrite();
-        try engine.feed(to_server.take(), to_client.sink());
+        try driveEngine(&engine, to_server.take(), &to_client);
 
         assert(to_client.wire_len <= storage[run].len);
         @memcpy(storage[run][0..to_client.wire_len], to_client.wire[0..to_client.wire_len]);

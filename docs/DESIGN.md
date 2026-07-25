@@ -381,18 +381,18 @@ a raised `RLIMIT_NOFILE`:
 | conn slots | 1386 | 14074 | ~1.7 KiB state + 8 KiB head |
 | relay buffers | 1386 | 14074 | 2 × 4 KiB |
 | upstream slots | 1024 | 1024 | ~40 B state + 8 KiB head |
-| tls engines | 0 / 256 | 1024 | ~116 KiB (ztls buffers) |
+| tls engines | 0 / 256 | 1024 | ~148 KiB (ztls buffers + outbox) |
 | **pool memory** | **~32 MiB** | **~251 MiB** | |
 
 The fourth pool — **TLS engines** (§4, Phase 3a) — is the one sized by
 what the config asks for rather than by connection count: an engine is
-~116 KiB of ztls record/handshake buffers, so one per conn slot would be
-~1.6 GiB. It defaults to **zero** (a disabled pool reserving nothing)
+~148 KiB of ztls record/handshake buffers plus the ciphertext outbox,
+so one per conn slot would be ~2 GiB. It defaults to **zero** (a disabled pool reserving nothing)
 unless a listener carries a `tls` block, then 256; exhaustion is its own
 shed rung. Engines hold no socket and arm no ring op, so they enter
 neither the fd nor the CQ budget. The **pool memory** row above is the
 plain-TCP shape; a TLS deployment adds its engine pool on top — ~30 MiB
-at the default (~62 MiB total), ~116 MiB at the ceiling (~367 MiB) —
+at the default (~70 MiB total), ~148 MiB at the ceiling (~399 MiB) —
 plus one fixed 4 MiB heap for libcrypto's own allocations
 (`libcrypto_heap_bytes`), reserved only when TLS is configured and
 included in the startup total.

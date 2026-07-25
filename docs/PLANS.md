@@ -47,7 +47,7 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      handshake-on-the-heap test (`tls-heap-proof`). The universal
      no-mmap-after-init claim rides the zero-alloc syscall gate once TLS
      joins the serving path (slices 5–6).
-  2. **Engine productionization** — *landed:* the ~116 KiB footprint
+  2. **Engine productionization** — *landed:* the ~148 KiB footprint
      measured and the pool-not-embed decision recorded
      (IMPLEMENTATION_NOTES.md); real backpressure (a zero-progress feed
      is `error.RecordTooLarge`, never a ReleaseFast spin); the
@@ -88,13 +88,22 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      A missing or malformed certificate aborts startup naming the path,
      so a proxy never comes up unable to present it. Verified in the real
      binary: boots with a live cert, exits 1 on both failure paths.
-  7. **The handshake phase in the data path** — its own deadline (the
+  7. **Engine drive API** — *landed:* the sink-vs-pull question settles
+     as *both*, split by lifetime. Plaintext stays a synchronous `Sink`
+     callback (consumed inside the call). Ciphertext moves to an
+     engine-owned **outbox** (`outbound`/`outboundSent`, partial writes
+     credited), because it must outlive the call that produced it — an
+     async send completes long after `feed` returns, while ztls's buffers
+     are valid only until the next engine call. Costs ~33 KiB per engine
+     (two max wire records, the largest burst one step can produce),
+     charged only to TLS connections.
+  8. **The handshake phase in the data path** — its own deadline (the
      slowloris answer), the per-tick budget + backlog + shed rung +
      counters: the §8 ladder's new row. Engine checkout lands here.
-  8. **Data-path shim** — L4-over-TLS first (terminate, relay
+  9. **Data-path shim** — L4-over-TLS first (terminate, relay
      plaintext), then L7 head-read over decrypted bytes; the strict
      relay discipline is unchanged either way.
-  9. **Sim + fuzz gates** — the spike client ported into the sim
+  10. **Sim + fuzz gates** — the spike client ported into the sim
      harness (both keyshares seeded), the adversary at TLS record
      granularity, golden byte-exact transcripts on clean seeds; fuzz
      raw bytes through the wrapper — never panic, alert-or-progress.
@@ -102,11 +111,11 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      into a fuzz target — new parsing over operator input, unit-tested
      for now but owed §9 fuzz coverage (the ci `--fuzz` gate is
      libcrypto-free, so this rides the TLS fuzz seam this slice builds).
-  10. **Resumption** — `psk_lookup` + ticket issuance over a static
+  11. **Resumption** — `psk_lookup` + ticket issuance over a static
      key table in the memory budget. Last deliberately: full handshakes
      already fit the budget; tickets are the reconnect-storm lever
      (~14k × ~260 µs ≈ seconds of handshake CPU without them).
-  11. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
+  12. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
      support is the open dependency (h2load `--h1` is the interim).
   Cross-cutting entry gate: the ztls audit per §4 (the Zig protocol
   layer read line-by-line; the C primitives trusted institutionally),
