@@ -17,6 +17,75 @@ const upstream_module = @import("upstream.zig");
 
 const assert = std.debug.assert;
 
+/// Strict recv → send → recv per direction (§6): exactly one data op in
+/// flight per direction, phase says which; per-connection memory stays
+/// constant regardless of stream size. Nothing here depends on the Io
+/// backend, so it lives at file scope rather than being re-instantiated
+/// per `Conn(IoType)` — which is also what makes it unit-testable.
+///
+/// The two counts are one debt, kept in the units *framing* works in:
+/// `framed_len` is what framing assigned to this message out of the last
+/// recv, and `credited_len` is how much of that the target has accepted —
+/// a short send resumes from there. Today every send writes those same
+/// bytes, so the debt is settled in the units it was incurred and
+/// `pending` can slice one buffer with both cursors.
+///
+/// A *transforming* direction breaks that symmetry, and §4's TLS
+/// termination is the one coming: the wire would carry ciphertext, which is
+/// neither the same bytes nor the same count, so it has to keep its own
+/// wire cursor and credit this debt only once a whole framed chunk is out.
+/// Naming the debt apart from the wire is what keeps that a change to
+/// `credit` and `pending` rather than a change at every call site — and
+/// until then, that the two are the same bytes is what `pending` asserts.
+pub const DirectionState = struct {
+    phase: Phase = .idle,
+    /// Bytes framing assigned to this message from the last recv.
+    framed_len: u32 = 0,
+    /// How many of those the target has accepted.
+    credited_len: u32 = 0,
+
+    pub const Phase = enum(u8) { idle, receiving, sending, finished };
+
+    /// Framing chose `len` bytes of what the last recv delivered: a fresh
+    /// debt, nothing credited yet. Zero is legal — framing may end a
+    /// message without forwarding a byte.
+    ///
+    /// The previous debt must be settled first. That is the strict
+    /// recv → send → recv discipline (§6) stated as a precondition rather
+    /// than left to the call sites: overwriting an unsettled debt is
+    /// precisely how a direction would forget bytes it still owed the
+    /// target, and losing them silently is the failure mode this vocabulary
+    /// exists to make loud.
+    pub fn owe(state: *DirectionState, len: u32) void {
+        assert(state.owed() == 0);
+        state.framed_len = len;
+        state.credited_len = 0;
+    }
+
+    /// The target accepted `len` more of the debt.
+    pub fn credit(state: *DirectionState, len: u32) void {
+        assert(len >= 1);
+        state.credited_len += len;
+        assert(state.credited_len <= state.framed_len);
+    }
+
+    /// What the target has not accepted yet.
+    pub fn owed(state: *const DirectionState) u32 {
+        assert(state.credited_len <= state.framed_len);
+        return state.framed_len - state.credited_len;
+    }
+
+    /// The window of `buffer` still owed: what a send arms, and what a
+    /// short send resumes from. `buffer` starts where this direction's
+    /// framed bytes start — the relay buffer on a body leg, past the head
+    /// on an excess leg (§7).
+    pub fn pending(state: *const DirectionState, buffer: []const u8) []const u8 {
+        assert(state.owed() >= 1);
+        assert(state.framed_len <= buffer.len);
+        return buffer[state.credited_len..state.framed_len];
+    }
+};
+
 pub fn Conn(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const UpstreamType = upstream_module.UpstreamPool(IoType).Upstream;
@@ -250,19 +319,6 @@ pub fn Conn(comptime IoType: type) type {
             upstream_to_client,
         };
 
-        /// Strict recv → send → recv per direction (§6): exactly one data
-        /// op in flight per direction, phase says which; per-connection
-        /// memory stays constant regardless of stream size.
-        pub const DirectionState = struct {
-            phase: Phase = .idle,
-            /// Bytes filled by the last recv.
-            transfer_len: u32 = 0,
-            /// Bytes of the transfer already sent (short sends resume).
-            sent_len: u32 = 0,
-
-            pub const Phase = enum(u8) { idle, receiving, sending, finished };
-        };
-
         /// One bit per embedded op; release requires all clear (§5).
         pub const Armed = packed struct(u8) {
             data_client_to_upstream: bool = false,
@@ -361,4 +417,45 @@ pub fn Conn(comptime IoType: type) type {
             return @popCount(@as(u8, @bitCast(conn.armed)));
         }
     };
+}
+
+test "direction: a framed chunk is owed until credited, then settled" {
+    var state: DirectionState = .{};
+    const buffer = "0123456789";
+
+    state.owe(6);
+    try std.testing.expectEqual(@as(u32, 6), state.owed());
+    try std.testing.expectEqualStrings("012345", state.pending(buffer));
+
+    // A short send: what is left is the tail, resumed from the credit.
+    state.credit(2);
+    try std.testing.expectEqual(@as(u32, 4), state.owed());
+    try std.testing.expectEqualStrings("2345", state.pending(buffer));
+
+    state.credit(4);
+    try std.testing.expectEqual(@as(u32, 0), state.owed());
+}
+
+test "direction: a settled debt is the precondition for the next one" {
+    var state: DirectionState = .{};
+    state.owe(4);
+    state.credit(4);
+    try std.testing.expectEqual(@as(u32, 0), state.owed());
+
+    // Only now may the next chunk be owed, and it starts from zero rather
+    // than from where the last one ended — every framed chunk is its own
+    // debt over the same buffer. `owe` asserts that settlement, so the
+    // recv → send → recv discipline (§6) cannot be skipped quietly.
+    state.owe(3);
+    try std.testing.expectEqual(@as(u32, 3), state.owed());
+    try std.testing.expectEqualStrings("abc", state.pending("abcdef"));
+}
+
+test "direction: framing may end a message owing nothing" {
+    var state: DirectionState = .{};
+    state.owe(0);
+    // Nothing to forward, so nothing arms a send — `pending` asserts a
+    // non-empty debt precisely because a zero one must not reach a send
+    // (the seam's `bytes.len >= 1` contract, §4).
+    try std.testing.expectEqual(@as(u32, 0), state.owed());
 }

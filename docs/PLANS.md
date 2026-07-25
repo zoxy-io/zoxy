@@ -157,11 +157,29 @@ reviews of A5 landed on it, and neither could guard it from here.
 
 | # | slice | ~ | what it buys |
 |---|---|---|---|
-| B2 | Split the cursor: an explicit wire cursor distinct from the framed one, `assert(wire == framed)` while every policy is identity | 60 | turns the silent-corruption hazard into a failed assertion. A pure refactor today |
+| B2 | Split the cursor: an explicit wire cursor distinct from the framed one, `assert(wire == framed)` while every policy is identity — *landed as vocabulary, not as a field; see below* | 60 | turns the silent-corruption hazard into a failed assertion. A pure refactor today |
 | B1 | Pump transform seam — `recvBuffer`, `transformIn`, `transformOut`, `sendSlice`, `creditSend`, identity by default — and the loop condition becomes *"anything left to write?"* rather than *"cursor reached length"* | 120 | TLS L4 becomes a policy; `tls_relay.zig` never gets written |
 | B5 | A toy transform in the simulator: deterministic and non-identity (XOR mask, or 4-byte length re-framing) on an L4 sim listener, verified byte-exact by the token oracle under the adversary | 150 | proves the seam *without crypto*, so TLS adds only crypto, not new mechanism risk. The de-risking slice for all of Tier B |
 | B3 | One client-write channel over B2's cursor: `armClientWrite(conn, plaintext)` for all three client-directed sends | 150 | TLS changes one place, kTLS none; also settles what §8's "static responses straight from static memory" means once the bytes must be encrypted |
 | B4 | Head-fill source seam: read through a source (socket today), one "head complete? → parse / 431 / 413 / read again" decision | 100 | removes the parallel TLS completion path and the duplicated limit decision |
+
+**What B2 landed, and what it left to B1.** The row above asked for a wire
+cursor *field* asserted equal to the framed one. Written out, that field
+would be a byte-for-byte shadow of the credit cursor: under identity there
+is no second buffer for it to count against, so the equality would be
+tautological on every path rather than an independently derived check —
+a mechanism no code exercises and no gate proves, which is the same
+objection §1 makes to the retired worker seam. So B2 landed the
+*distinction* instead: `DirectionState` speaks `owe`/`credit`/`owed`/
+`pending`, the raw cursors are private to it (no call site outside
+`Conn.zig` touches them), `owe` asserts the previous debt was settled, and
+`pending` asserts the framed window fits the buffer it slices — a live
+check the open-coded version never had.
+**The honest cost: B1 now carries the wire cursor's mechanical shape as
+well as the transform's**, which is the risk this row was sequenced first
+to retire. What is retired is its *spread* — that shape now lands inside
+four methods rather than across the seven sites that used to open-code
+them.
 
 ### Tier C — budget and accounting hygiene
 
