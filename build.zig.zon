@@ -43,8 +43,17 @@
             .hash = "libxev-0.0.0-86vtcxUcFAAKN43dhrvWh-caogydO84cmzT2QuHxyc-P",
         },
         .zrk = .{
-            .url = "git+https://github.com/floatdrop/zrk#dfab0b0e6bbe01c3db147b5025a0d6b38f37f830",
-            .hash = "zrk-0.3.6-WqdFO8JiAwCaTpT5YBAsjbn_73dLTDUA5-qtoX29FwET",
+            .url = "git+https://github.com/zoxy-io/zrk#f05cc6a2e7657409767c3cf63c68fcd54d2621e3",
+            .hash = "zrk-1.1.1-WqdFOyINBACoGOEBa8pY7REiDy4i88WibHjSDDvnQezq",
+        },
+        // zrk 1.1.1 embeds its load off a zio (io_uring) runtime, not the
+        // default std.Io.Threaded backend — plain Threaded is missing
+        // pieces zrk now calls (e.g. connect-with-timeout is still a TODO
+        // stub there). Same pin zrk's own build.zig.zon carries; the bench
+        // harness constructs its own zio.Runtime to match (see bench/run.zig).
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#a8a88c0e85ba87525ec9555aa409544873443142",
+            .hash = "zio-0.16.0-xHbVVGNDIwDYoZmY7GkL3RMCKuyc4JjK2hv_4TOBx8x2",
         },
         // Audited fork: zoxy-io/hparse main at the DESIGN.md §7
         // hardening-gate merge (PR #3: CRLF-only line terminators +
