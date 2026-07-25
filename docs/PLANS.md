@@ -66,15 +66,24 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
   (macOS dev box, kernels without the TLS ULP). Known fiddly parts:
   KeyUpdate and post-handshake control messages arrive via CMSG, and
   session tickets must be sent before the switchover.
-- **Phase 3c — CPU worker pool, behind an evidence gate.** The §3
-  worker seam (SPMC job queue, per-worker completion rings, the §5
-  parked-slot ownership rules) stays designed but inactive — it is the
-  hardest remaining concurrency work in the plan, and the 3a numbers
-  say it buys nothing at realistic handshake rates. Entry gate: a
-  measured workload where handshake demand exceeds the on-loop budget
-  within one process (sustained cold full-handshake load past
-  ~4k/s/core) *and* process-per-core scale-out (§3) is not an
-  acceptable answer. Until then the binary stays single-threaded.
+- **Phase 3c — CPU worker pool: retired, not deferred** (2026-07-25).
+  The §3 worker seam (SPMC job queue, per-worker completion rings, the
+  §5 parked-slot ownership rules) is **removed from the design**, and
+  in-process threads are now a §1 non-goal. The 3a band settled it: a
+  terminated L7-over-TLS hop runs at HAProxy parity in steady state on
+  one thread, and handshake-bound load is bounded by asymmetric crypto
+  that a second thread does not make cheaper per handshake — it only
+  adds cores, which process-per-core behind SO_REUSEPORT already does
+  without a shared-memory concurrency model
+  ([IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md)). Re-entry is a
+  from-scratch design decision, not un-commenting a seam, and needs both
+  halves of a gate: a measured workload where handshake demand exceeds
+  one loop within a single process *and* process-per-core scale-out is
+  not an acceptable answer. The retired trade study (shared queue vs
+  per-worker queues vs work stealing) is in git history. The open
+  handshake-throughput work is not threads: the unexplained close-mode
+  gap to haproxy, session resumption, and a re-measure on the fixed
+  TLS-engine default (all recorded in the notes).
 
 ## io_uring op upgrades — evaluated, all deferred (2026-07-16)
 
