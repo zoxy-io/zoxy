@@ -842,15 +842,19 @@ pub fn Server(comptime IoType: type) type {
                     server.continueTeardown(conn);
                     return;
                 }
+                // A rebase cancel (§8) in flight owns the re-arm — it is
+                // still matching against this very completion, so no path
+                // here may arm a fresh timer for it to find; onDeadline-
+                // Rebase re-arms at the stored target once it drains.
+                // Expiry is not exempt: the §6 lifetime clamp can store a
+                // target already in the past, so the dial's own re-base
+                // leaves the deadline due the moment this delivery lands.
+                if (conn.armed.deadline_cancel) return;
                 if (server.io.nowNs() >= conn.deadline_ns) {
                     server.expireDeadline(conn);
-                } else if (!conn.armed.deadline_cancel) {
+                } else {
                     server.armDeadline(conn);
                 }
-                // else: a rebase cancel (§8) is in flight (an idle timer that
-                // fired as the dial re-based it under pressure); onDeadline-
-                // Rebase re-arms once it drains, so no fresh timer is left for
-                // the cancel to match.
             } else |err| {
                 assert(err == error.Canceled);
                 if (conn.isTearingDown()) {
@@ -903,6 +907,9 @@ pub fn Server(comptime IoType: type) type {
         fn expireDeadline(server: *Self, conn: *ConnType) void {
             assert(!conn.isTearingDown());
             assert(!conn.armed.deadline); // Delivered; re-armed only below.
+            // Both verdict branches re-arm: the caller must have drained the
+            // rebase cancel first, or it could match the fresh timer (§8).
+            assert(!conn.armed.deadline_cancel);
             server.counters.increment("deadline_expired");
             if (conn.state == .l7_exchanging and
                 conn.l7.pending_verdict == .none and
