@@ -173,7 +173,7 @@ recorded pure-Zig fallback at `5452baf`; its gap is server-side
 resumption.
 
 Spike findings, so they are not re-learned (src/tls/ on the
-`phase-3a-ztls` branch, `zig build tls-spike`):
+`phase-3a-ztls` branch, now under `zig build test`):
 
 - **Byte-exact flight replay holds — with two seeding requirements.**
   libcrypto signs CertificateVerify with a random nonce, which varies
