@@ -11,10 +11,10 @@
 //!
 //! Ownership rules the ztls API imposes, encoded here so callers inherit
 //! them:
-//! - `setCredentials` stores the chain *pointer*; the chain array must
-//!   outlive the handshake — it lives in the Engine, never a temporary.
-//! - `PrivateKey` wraps a libcrypto object; it must outlive the
-//!   handshake and be deinit'd exactly once.
+//! - The `Credentials` (cert chain + signing key) is shared per listener
+//!   and borrowed by pointer; `setCredentials` keeps a pointer into its
+//!   chain and key, so the Credentials must outlive every engine that
+//!   references it (a startup-lived object, §4).
 //! - Every `.write` event hands out bytes borrowed from the out buffer;
 //!   `completeWrite` must be called after the bytes are consumed and
 //!   before the next `handleRecord`.
@@ -23,15 +23,13 @@ const std = @import("std");
 
 const ztls = @import("ztls");
 
+const Credentials = @import("Credentials.zig");
+
 const assert = std.debug.assert;
 
 const Engine = @This();
 
 hs: ztls.ServerHandshake,
-/// Owns the libcrypto signing key for the handshake's lifetime.
-key: ztls.signature.PrivateKey,
-/// `setCredentials` keeps a pointer to this array (see header).
-chain: [1][]const u8,
 record_storage: ztls.RecordBuffer.Storage,
 records: ztls.RecordBuffer,
 out: ztls.ServerHandshake.OutBuffer,
@@ -61,36 +59,26 @@ pub const Config = struct {
     x25519_seed: [32]u8,
     /// ServerHello random (RFC 8446 §4.1.3) — same injection rule.
     random: [32]u8,
-    /// Server certificate, DER. Caller-owned, outlives the engine.
-    cert_der: []const u8,
-    /// Raw P-256 signing scalar for the certificate key.
-    p256_scalar: [32]u8,
-    /// RFC 6979 deterministic ECDSA nonce (the zoxy-io/ztls fork,
-    /// mattrobenolt/ztls#82): the simulator sets this so a seeded
-    /// handshake — including the CertificateVerify signature — replays
-    /// byte-for-byte. Production keeps the default random nonce.
-    deterministic_nonce: bool = false,
+    /// This listener's cert chain and signing key. Borrowed, not owned:
+    /// it is shared across the listener's engines and must outlive them.
+    credentials: *const Credentials,
 };
 
 /// In-place init via out-pointer: `records` borrows `record_storage`,
 /// so the Engine must never be copied after init (the zoxy pool-slot
 /// rule).
 pub fn init(engine: *Engine, config: *const Config) !void {
-    assert(config.cert_der.len > 0);
+    assert(config.credentials.chain.len >= 1);
     const keypair = try ztls.x25519.KeyPair.generateDeterministic(
         .init(config.x25519_seed),
     );
-    engine.key = try ztls.signature.PrivateKey.fromP256Scalar(&config.p256_scalar);
-    errdefer engine.key.deinit();
-    engine.key.deterministic_nonce = config.deterministic_nonce;
-    engine.chain = .{config.cert_der};
     engine.reassembly = .empty;
     engine.hs = .init(.{
         .keypairs = .init(keypair),
         .random = .init(config.random),
         .reassembly = &engine.reassembly.buffer,
     });
-    engine.hs.setCredentials(&engine.chain, engine.key.signer());
+    engine.hs.setCredentials(config.credentials.chain, config.credentials.signer());
     engine.record_storage = .empty;
     engine.records = .init(&engine.record_storage.buffer);
     engine.out = .empty;
@@ -100,7 +88,6 @@ pub fn init(engine: *Engine, config: *const Config) !void {
 
 pub fn deinit(engine: *Engine) void {
     engine.hs.deinit();
-    engine.key.deinit();
 }
 
 pub fn isConnected(engine: *const Engine) bool {

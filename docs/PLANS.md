@@ -56,9 +56,16 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      they get a first consumer): the `Pool(Engine)` and its
      `constants.zig` budget, and the drive-API settle (sink vs pull)
      against `Conn`.
-  3. **Config + startup cert loading** — a per-listener `tls` block
-     into the config arena; schema metadata; one cert per listener
-     (SNI multi-cert deferred).
+  3. **Config + cert loading** — *landed:* a per-listener `tls: {cert,
+     key}` block (orthogonal to `protocol`), resolved to file paths with
+     schema metadata and pure path validation (the loader stays IO-free,
+     §1); and `tls.Credentials` — PEM chain + key → cert-chain DER +
+     libcrypto signing key + scheme, ECDSA-only (a non-ECDSA leaf is
+     rejected loudly), shared per listener. The engine now borrows a
+     `*const Credentials` instead of the spike's raw scalar. *Deferred to
+     slice 4:* the startup file read (path → bytes) and per-listener
+     Credentials construction, which happens where the engine pool
+     consumes them (SNI multi-cert stays deferred).
   4. **The handshake phase in the data path** — its own deadline (the
      slowloris answer), the per-tick budget + backlog + shed rung +
      counters: the §8 ladder's new row.
@@ -69,6 +76,10 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      harness (both keyshares seeded), the adversary at TLS record
      granularity, golden byte-exact transcripts on clean seeds; fuzz
      raw bytes through the wrapper — never panic, alert-or-progress.
+     Also fold the slice-3 PEM/base64 cert parser (`tls/Credentials.zig`)
+     into a fuzz target — new parsing over operator input, unit-tested
+     for now but owed §9 fuzz coverage (the ci `--fuzz` gate is
+     libcrypto-free, so this rides the TLS fuzz seam this slice builds).
   7. **Resumption** — `psk_lookup` + ticket issuance over a static
      key table in the memory budget. Last deliberately: full handshakes
      already fit the budget; tickets are the reconnect-storm lever

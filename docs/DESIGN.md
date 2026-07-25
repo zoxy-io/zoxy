@@ -826,6 +826,8 @@ src/
     proxy.zig         // L7 state machine over phases
   tls/
     Engine.zig        // ztls wrapper: sans-I/O TLS 1.3 seam (§4, Phase 3a)
+    Credentials.zig   // per-listener cert chain + signing key (PEM load)
+    libcrypto_heap.zig // fixed heap for libcrypto's allocations (§4)
   balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
