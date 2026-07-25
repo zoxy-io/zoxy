@@ -6,12 +6,16 @@
 //! how a message ends (framing), what EOF and errors mean, and what "the
 //! body finished" does next.
 //!
-//! The mechanical plumbing is keyed entirely off the direction tag, so it
-//! is 100% shared: for a given `direction` the source/target sockets, the
-//! `relay_buffer` field, the embedded `Op`, the armed bit, and the
-//! `DirectionState` cursor all derive from `@tagName(direction)` — exactly
-//! the naming convention `relay.zig` already exploited. What is left is the
-//! `Policy`: a comptime struct of hooks the caller supplies.
+//! The mechanical plumbing is keyed off the direction tag: for a given
+//! `direction` the source/target sockets, the `relay_buffer` field, the
+//! embedded `Op`, the armed bit, and the `DirectionState` debt all derive
+//! from `@tagName(direction)` — exactly the naming convention `relay.zig`
+//! already exploited. What is left is the `Policy`: a comptime struct of
+//! hooks the caller supplies. Two of those hooks (`recvBuffer`, `sendSlice`)
+//! can override *which buffer* a half of the direction uses, because a
+//! transforming direction does not read and write the same one — see the
+//! transform seam below; a policy that declares neither keeps the derived
+//! relay buffer for both halves.
 //!
 //! Required Policy decls:
 //!   feed(conn, chunk) FeedResult      how many bytes belong to the message
@@ -25,6 +29,35 @@
 //!   onRecvEntry(conn)                     post-await recv invariant re-checks
 //!   afterFeed(conn, received, fr)         e.g. pipelined-tail detection
 //!   onSendEntry(server, conn) bool        divert a settled verdict; true = handled
+//!   recvBuffer(conn) []u8                 where a read lands
+//!   transformIn(conn, chunk) ?[]const u8  read bytes → framed bytes
+//!   transformOut(conn, consumed) bool     framed bytes → wire bytes
+//!   sendSlice(conn) []const u8            what a send writes; empty = drained
+//!   creditSend(conn, sent)                credit whichever cursor tracks the wire
+//!
+//! **The transform seam** (the last five). A plain relay recvs and sends the
+//! same bytes, so one buffer per direction serves both halves and the framed
+//! debt (`DirectionState`) is settled in the units it was incurred. A
+//! *transforming* direction is neither: its halves live in different buffers,
+//! and the bytes on the wire are not the bytes that arrived nor the same
+//! count of them — §4's TLS termination decrypts what it reads and encrypts
+//! what it writes. These five hooks are the only places that difference is
+//! encoded, and a policy declaring none of them gets exactly the plain
+//! behaviour, so the L4 and L7 body paths are unaffected by construction.
+//!
+//! Two contracts beyond the signatures:
+//!
+//! 1. **`creditSend` must settle the framed debt by the time `sendSlice`
+//!    runs empty.** A transform may carry its own wire cursor and ignore the
+//!    framed one while a chunk is going out, but when the wire is drained the
+//!    chunk it framed is delivered, and `onSend` asserts exactly that — which
+//!    is what lets the next chunk's `owe` demand a clean slate (§6).
+//! 2. **`sendSlice` must be stable across `beforeSend`.** The pump calls it
+//!    twice per completion: once to decide whether anything is left to arm,
+//!    and again inside `armSend` to arm it, with `beforeSend` in between. A
+//!    `beforeSend` that stages wire bytes would make those two answers
+//!    disagree — stage in `transformOut`, which runs exactly once per chunk,
+//!    and leave `beforeSend` to the bookkeeping it exists for.
 //!
 //! The `on*Entry` hooks fire at completion time — after `delivered`, before
 //! the I/O result is unwrapped — so a Policy can re-assert the invariants
@@ -74,6 +107,58 @@ pub fn Pump(
             return &@field(conn.relay_buffer.?, direction_tag);
         }
 
+        // -- the transform seam (§4, §6; see the module header) --
+
+        /// Where a read lands. Plain: the direction's relay buffer.
+        /// Transforming: wherever the *untransformed* bytes belong, since
+        /// the relay buffer is then the transform's destination and cannot
+        /// also be the read target.
+        fn recvBuffer(conn: *ConnType) []u8 {
+            if (@hasDecl(Policy, "recvBuffer")) return Policy.recvBuffer(conn);
+            return buffer(conn);
+        }
+
+        /// Turn what was read into the bytes framing should see, so framing
+        /// never learns a transform happened. Null is a failed transform,
+        /// which is this connection's alone — a peer chooses what it sends
+        /// (§8) — so the caller tears it down instead of asserting.
+        fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
+            if (@hasDecl(Policy, "transformIn")) return Policy.transformIn(conn, chunk);
+            return chunk;
+        }
+
+        /// Stage the framed chunk for the wire, exactly once per chunk:
+        /// before the first send, never on a resume, or a short write would
+        /// re-transform bytes already gone. False fails the connection for
+        /// the same reason `transformIn` may.
+        fn transformOut(conn: *ConnType, consumed: u32) bool {
+            assert(consumed >= 1);
+            if (@hasDecl(Policy, "transformOut")) return Policy.transformOut(conn, consumed);
+            return true;
+        }
+
+        /// What a send writes, and what a short write resumes from. Plain:
+        /// the framed window still owed, empty once the debt is settled —
+        /// which is how `onSend` asks "anything left to write?" without
+        /// knowing whether a transform is in play. Transforming: the staged
+        /// wire bytes, which carry their own cursor.
+        fn sendSlice(conn: *ConnType) []const u8 {
+            if (@hasDecl(Policy, "sendSlice")) return Policy.sendSlice(conn);
+            const state = directionState(conn);
+            if (state.owed() == 0) return &.{};
+            return state.pending(buffer(conn));
+        }
+
+        /// Credit whichever cursor tracks the wire. Plain: the framed debt
+        /// itself, since the wire carries exactly those bytes. Transforming:
+        /// the transform's own cursor — ciphertext does not count against a
+        /// debt framing measured in plaintext — but the framed debt must
+        /// still be settled by the time `sendSlice` empties (module header).
+        fn creditSend(conn: *ConnType, sent: u32) void {
+            if (@hasDecl(Policy, "creditSend")) return Policy.creditSend(conn, sent);
+            directionState(conn).credit(sent);
+        }
+
         fn source(conn: *const ConnType) IoType.Socket {
             return switch (direction) {
                 .client_to_upstream => conn.client_socket,
@@ -97,7 +182,7 @@ pub fn Pump(
             conn.arm(op(conn), bit);
             server.io.recv(
                 source(conn),
-                buffer(conn),
+                recvBuffer(conn),
                 &op(conn).completion,
                 ConnType,
                 conn,
@@ -115,8 +200,11 @@ pub fn Pump(
             if (@hasDecl(Policy, "onRecvEntry")) Policy.onRecvEntry(conn);
             const received = result catch |err| return Policy.onRecvError(server, conn, err);
             assert(received >= 1);
-            assert(received <= buffer(conn).len);
-            const chunk = buffer(conn)[0..received];
+            assert(received <= recvBuffer(conn).len);
+            const chunk = transformIn(conn, recvBuffer(conn)[0..received]) orelse {
+                server.beginTeardown(conn);
+                return;
+            };
             const fr = Policy.feed(conn, chunk);
             if (fr.malformed) {
                 server.beginTeardown(conn);
@@ -126,6 +214,12 @@ pub fn Pump(
             const state = directionState(conn);
             state.owe(fr.consumed);
             if (state.owed() >= 1) {
+                // Stage the wire bytes once, here: a short write resumes
+                // through `sendSlice`, never back through the transform.
+                if (!transformOut(conn, fr.consumed)) {
+                    server.beginTeardown(conn);
+                    return;
+                }
                 armSend(server, conn);
             } else {
                 assert(fr.done);
@@ -136,11 +230,15 @@ pub fn Pump(
         pub fn armSend(server: *ServerType, conn: *ConnType) void {
             assert(conn.relay_buffer != null);
             if (@hasDecl(Policy, "beforeSend")) Policy.beforeSend(conn);
-            const state = directionState(conn);
+            const wire = sendSlice(conn);
+            // Nothing arms an empty send: the seam's contract is
+            // `bytes.len >= 1` (§4), and an empty slice here would mean a
+            // caller asked to write with nothing staged.
+            assert(wire.len >= 1);
             conn.arm(op(conn), bit);
             server.io.send(
                 target(conn),
-                state.pending(buffer(conn)),
+                wire,
                 &op(conn).completion,
                 ConnType,
                 conn,
@@ -160,12 +258,21 @@ pub fn Pump(
             }
             const sent = result catch |err| return Policy.onSendError(server, conn, err);
             assert(sent >= 1);
-            const state = directionState(conn);
-            state.credit(sent);
-            if (state.owed() >= 1) {
+            creditSend(conn, sent);
+            // "Anything left to write?" rather than "is the framed debt
+            // settled?" — the same question for a plain policy, whose
+            // `sendSlice` empties exactly when the debt does, and the only
+            // form that still holds when the wire carries a different number
+            // of bytes than framing counted.
+            if (sendSlice(conn).len > 0) {
                 armSend(server, conn);
                 return;
             }
+            // The wire is drained, so the chunk framing chose is delivered:
+            // the seam's contract (module header) is that a transform has
+            // settled the framed debt by now, which is what lets the next
+            // chunk's `owe` demand a clean slate.
+            assert(directionState(conn).owed() == 0);
             // A full chunk moved: this is activity — push the idle deadline
             // out (§6); the armed timer op is not touched.
             server.storeDeadline(conn, server.idleTimeoutMs());
