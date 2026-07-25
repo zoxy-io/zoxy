@@ -484,3 +484,41 @@ to admit a newcomer.
 - **Zig 0.16 `Child`.** `kill()` reaps; a `wait()` after it is UB
   (SEGV'd the ReleaseFast bench harness and leaked nginx onto a bench
   port — d3000f5).
+
+## Profile share is not throughput headroom — the `fin_frag` wipe (2026-07-25)
+
+The first TLS handshake profile (§9, `zig build profile --protocol
+https`) put `compiler_rt.memset` at 11.2% of zoxy's CPU, and the folded
+stacks traced ~84% of that to ztls's `secureZero` on teardown —
+dominated by `fin_frag`, a 16 KiB buffer reserved against a client
+flight with a certificate chain and wiped in full on every handshake
+even when it held nothing. 16386 of the 18269 bytes `deinit` zeroed.
+
+Bounding that wipe to a high-water mark **did not change handshake
+throughput**. Measured on a saturated close-mode load, three runs each:
+
+- pinned before the fix: 710 / 712 / 712 req/s, memset 11.2%
+- pinned after the fix:  709 / 709 / 710 req/s, memset 10.1%
+
+The memset share moves exactly as predicted and the throughput does
+not, because the handshake is bounded by asymmetric crypto (~47% of the
+profile: X25519, P-256 ECDSA, ML-KEM), not by the zeroing. A symbol's
+share of samples is what it costs *while running*, not what removing it
+buys — those are the same number only when the symbol is the
+bottleneck.
+
+Two process notes, both paid for:
+
+- An intermediate measurement through a `.path` dependency override
+  read 733 / 733 req/s for the same code that measures 709 / 709 / 710
+  through the pinned `.url`. The build mechanism, not the code. Trust
+  numbers from the shipped configuration.
+- The first attempt put the high-water mark inside `ArrayBuffer`
+  itself, taxing every append in the library to benefit one buffer:
+  633 req/s, an 11% regression, caught only because the baseline had
+  been measured three times first and was stable to ±2 req/s. Measure
+  the baseline's variance before believing a delta.
+
+The change was kept — it is correct and does strictly less work — but
+it is not a throughput lever. The lever for handshake-bound load is
+session resumption, which skips the asymmetric work entirely.
