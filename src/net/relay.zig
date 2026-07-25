@@ -57,7 +57,7 @@ pub fn Relay(comptime IoType: type) type {
                     };
                 }
 
-                fn state(conn: *ConnType) *ConnType.DirectionState {
+                fn state(conn: *ConnType) *conn_module.DirectionState {
                     return &conn.directions[@intFromEnum(direction)];
                 }
 

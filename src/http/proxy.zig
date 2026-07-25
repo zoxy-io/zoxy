@@ -525,10 +525,9 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.l7.client_pipelined = true;
             }
             const direction = &conn.directions[0];
-            direction.transfer_len = feed.consumed;
-            direction.sent_len = 0;
+            direction.owe(feed.consumed);
             conn.l7.request_leg = .sending_body_excess;
-            if (feed.consumed >= 1) {
+            if (direction.owed() >= 1) {
                 armRequestExcessSend(server, conn);
             } else {
                 requestHeadVacated(server, conn);
@@ -539,13 +538,12 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.request_leg == .sending_body_excess);
             const direction = &conn.directions[0];
-            assert(direction.sent_len < direction.transfer_len);
             const base = conn.l7.request_head_len;
             conn.l7.request_op_on_client = false; // A send on the upstream socket.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
-                conn.head[base + direction.sent_len .. base + direction.transfer_len],
+                direction.pending(conn.head[base..]),
                 &conn.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -573,9 +571,8 @@ pub fn Proxy(comptime IoType: type) type {
             };
             assert(sent >= 1);
             const direction = &conn.directions[0];
-            direction.sent_len += sent;
-            assert(direction.sent_len <= direction.transfer_len);
-            if (direction.sent_len < direction.transfer_len) {
+            direction.credit(sent);
+            if (direction.owed() >= 1) {
                 armRequestExcessSend(server, conn);
                 return;
             }
@@ -864,7 +861,6 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             const direction = &conn.directions[1];
-            direction.sent_len = 0;
             // The common small response arrives from the origin in one
             // piece; forward it in one piece too. Appending the excess to
             // the rendered head trades a bounded memcpy for a whole ring
@@ -876,9 +872,10 @@ pub fn Proxy(comptime IoType: type) type {
                     excess[0..feed.consumed],
                 );
                 conn.l7.rendered_response_len = @intCast(rendered.len + feed.consumed);
-                direction.transfer_len = 0;
+                // The excess rides the head send: this leg owes nothing.
+                direction.owe(0);
             } else {
-                direction.transfer_len = feed.consumed;
+                direction.owe(feed.consumed);
             }
 
             conn.l7.response_leg = .sending_head;
@@ -930,7 +927,7 @@ pub fn Proxy(comptime IoType: type) type {
             // Head on the wire; forward the coalesced body excess straight
             // from upstream.head, then pump the rest from the socket.
             const direction = &conn.directions[1];
-            if (direction.transfer_len >= 1) {
+            if (direction.owed() >= 1) {
                 conn.l7.response_leg = .sending_body_excess;
                 armResponseExcessSend(server, conn);
             } else {
@@ -942,12 +939,11 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .sending_body_excess);
             const direction = &conn.directions[1];
-            assert(direction.sent_len < direction.transfer_len);
             const base = conn.l7.response_head_len_marker;
             conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.send(
                 conn.client_socket,
-                conn.upstream.?.head[base + direction.sent_len .. base + direction.transfer_len],
+                direction.pending(conn.upstream.?.head[base..]),
                 &conn.op_data_upstream_to_client.completion,
                 ConnType,
                 conn,
@@ -972,9 +968,8 @@ pub fn Proxy(comptime IoType: type) type {
             };
             assert(sent >= 1);
             const direction = &conn.directions[1];
-            direction.sent_len += sent;
-            assert(direction.sent_len <= direction.transfer_len);
-            if (direction.sent_len < direction.transfer_len) {
+            direction.credit(sent);
+            if (direction.owed() >= 1) {
                 armResponseExcessSend(server, conn);
                 return;
             }

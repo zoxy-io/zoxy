@@ -66,7 +66,7 @@ pub fn Pump(
             return &@field(conn, "op_data_" ++ direction_tag);
         }
 
-        fn directionState(conn: *ConnType) *ConnType.DirectionState {
+        fn directionState(conn: *ConnType) *conn_module.DirectionState {
             return &conn.directions[@intFromEnum(direction)];
         }
 
@@ -124,9 +124,8 @@ pub fn Pump(
             }
             if (@hasDecl(Policy, "afterFeed")) Policy.afterFeed(conn, received, fr);
             const state = directionState(conn);
-            state.transfer_len = fr.consumed;
-            state.sent_len = 0;
-            if (fr.consumed >= 1) {
+            state.owe(fr.consumed);
+            if (state.owed() >= 1) {
                 armSend(server, conn);
             } else {
                 assert(fr.done);
@@ -138,11 +137,10 @@ pub fn Pump(
             assert(conn.relay_buffer != null);
             if (@hasDecl(Policy, "beforeSend")) Policy.beforeSend(conn);
             const state = directionState(conn);
-            assert(state.sent_len < state.transfer_len);
             conn.arm(op(conn), bit);
             server.io.send(
                 target(conn),
-                buffer(conn)[state.sent_len..state.transfer_len],
+                state.pending(buffer(conn)),
                 &op(conn).completion,
                 ConnType,
                 conn,
@@ -163,9 +161,8 @@ pub fn Pump(
             const sent = result catch |err| return Policy.onSendError(server, conn, err);
             assert(sent >= 1);
             const state = directionState(conn);
-            state.sent_len += sent;
-            assert(state.sent_len <= state.transfer_len);
-            if (state.sent_len < state.transfer_len) {
+            state.credit(sent);
+            if (state.owed() >= 1) {
                 armSend(server, conn);
                 return;
             }
