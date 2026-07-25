@@ -54,16 +54,19 @@
             .hash = "hparse-0.2.0-IukW0rSOAQAmTPCaHzBakxuRRv6dfMds5OGdGU8nxlXw",
         },
         // The Phase 3a TLS engine (DESIGN.md §4, PLANS.md): the zoxy-io/ztls
-        // fork = upstream mattrobenolt/ztls@41c24d7 plus opt-in RFC 6979
-        // deterministic ECDSA nonces (mattrobenolt/ztls#82) and the
-        // libcrypto allocation hooks (`mem_hooks`) the zero-alloc gate needs.
+        // fork = upstream mattrobenolt/ztls@41c24d7 plus three changes of
+        // ours — opt-in RFC 6979 deterministic ECDSA nonces
+        // (mattrobenolt/ztls#82) so a seeded handshake replays byte-exact,
+        // the libcrypto allocation hooks (`mem_hooks`) the zero-alloc gate
+        // needs, and a bounded `fin_frag` wipe on server teardown (~3% of
+        // handshake throughput; IMPLEMENTATION_NOTES.md).
         // ztls is the codebase's one C surface (libcrypto primitives behind
         // a Zig protocol layer — the §4 crypto-primitives exception); the
-        // pin moves only after re-audit. Only `zig build tls-spike` links it
-        // and libcrypto today — CI does not — until the data-path slices land.
+        // pin moves only after re-audit. CI links it: the TLS engine, the
+        // L4 and L7 data paths, and the heap proof all depend on it.
         .ztls = .{
-            .url = "git+https://github.com/zoxy-io/ztls#b68b8c9c585b0363e6c53121a7a777338f08fe00",
-            .hash = "ztls-0.0.0-SHHDXoMrFQCiYyRSUe-iv-yaQk4HPSE140MsrFncW_vZ",
+            .url = "git+https://github.com/zoxy-io/ztls#b919eb007b023a5d7fde763eec8ff5d392a5b71f",
+            .hash = "ztls-0.0.0-SHHDXhoxFQAxcIIv3DkpfRXCbqV3iYLuVcXGt16f8rFt",
         },
     },
     .paths = .{
