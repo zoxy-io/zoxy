@@ -25,6 +25,7 @@ const assert = std.debug.assert;
 const origin_port: u16 = 19190;
 const zoxy_l4_port: u16 = 18190;
 const zoxy_http_port: u16 = 18191;
+const zoxy_https_port: u16 = 18192;
 const work_directory = ".zig-cache/zoxy-profile";
 const perf_data_path = work_directory ++ "/zoxy.perf.data";
 const script_path = work_directory ++ "/zoxy.script";
@@ -45,12 +46,17 @@ const Flags = struct {
     protocol: Protocol = .l4,
     zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
 
-    const Protocol = enum { l4, http };
+    const Protocol = enum { l4, http, https };
+
+    fn isTls(flags: *const Flags) bool {
+        return flags.protocol == .https;
+    }
 
     fn zoxyPort(flags: *const Flags) u16 {
         return switch (flags.protocol) {
             .l4 => zoxy_l4_port,
             .http => zoxy_http_port,
+            .https => zoxy_https_port,
         };
     }
 };
@@ -77,6 +83,7 @@ pub fn main(init: std.process.Init) !u8 {
     var origin_child = try spawnNginx(arena, io);
     defer origin_child.kill(io);
 
+    try writeCertificates(arena, io);
     var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
@@ -141,8 +148,10 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
                 flags.protocol = .l4;
             } else if (std.mem.eql(u8, args[index], "http")) {
                 flags.protocol = .http;
+            } else if (std.mem.eql(u8, args[index], "https")) {
+                flags.protocol = .https;
             } else {
-                std.debug.print("profile: --protocol must be l4 or http\n", .{});
+                std.debug.print("profile: --protocol must be l4, http or https\n", .{});
                 return error.InvalidArguments;
             }
         } else if (!zoxy_path_set and !std.mem.startsWith(u8, arg, "--")) {
@@ -165,6 +174,19 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
 }
 
 // --- process orchestration --------------------------------------------------
+
+/// Same fixtures the gates and the Tier-1 bench use, read from the tree
+/// (the profiler is its own module, so `@embedFile` cannot reach them)
+/// and copied beside the generated config.
+fn writeCertificates(arena: std.mem.Allocator, io: Io) !void {
+    const dir = Io.Dir.cwd();
+    const cert = try dir.readFileAlloc(io, "src/tls/testdata/cert.pem", arena, .unlimited);
+    const key = try dir.readFileAlloc(io, "src/tls/testdata/key.pem", arena, .unlimited);
+    assert(cert.len > 0);
+    assert(key.len > 0);
+    try dir.writeFile(io, .{ .sub_path = work_directory ++ "/cert.pem", .data = cert });
+    try dir.writeFile(io, .{ .sub_path = work_directory ++ "/key.pem", .data = key });
+}
 
 fn spawnNginx(arena: std.mem.Allocator, io: Io) !std.process.Child {
     const prefix = work_directory ++ "/nginx";
@@ -209,13 +231,22 @@ fn spawnZoxy(
         \\{{
         \\    "listeners": [
         \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }},
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http",
+        \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
         \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
         \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000 }}
         \\}}
         \\
-    , .{ zoxy_l4_port, zoxy_http_port, origin_port });
+    , .{
+        zoxy_l4_port,
+        zoxy_http_port,
+        zoxy_https_port,
+        work_directory ++ "/cert.pem",
+        work_directory ++ "/key.pem",
+        origin_port,
+    });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
@@ -256,9 +287,25 @@ fn spawnPerf(
 
 // --- load (zrk, in-process, like bench/run.zig) -----------------------------
 
-fn benchConfig(port: u16, rate: u64, connections: u32) zrk.cli.Config {
+/// Profiling the handshake means paying for one per request, so the TLS
+/// mode also forces `Connection: close`. Without it zrk keeps its
+/// sessions open and the samples describe the steady-state record layer
+/// instead — which the keep-alive band already showed is not where the
+/// time goes.
+const close_headers = [_]zrk.cli.Header{.{ .name = "Connection", .value = "close" }};
+
+fn benchConfig(port: u16, rate: u64, connections: u32, tls: bool) zrk.cli.Config {
     return .{
-        .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" },
+        .url = .{
+            .scheme = if (tls) .https else .http,
+            .host = "127.0.0.1",
+            .port = port,
+            .target = "/",
+        },
+        // The fixture certificate is self-signed; anchoring is not what a
+        // profile measures.
+        .insecure = tls,
+        .headers = if (tls) &close_headers else &.{},
         .connections = connections,
         .rate = rate,
         .timeout_ns = 2 * std.time.ns_per_s,
@@ -272,7 +319,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
     const retry_sleep = Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms);
     var attempt: u8 = 0;
     while (attempt < attempts_max) : (attempt += 1) {
-        var config = benchConfig(flags.zoxyPort(), 20_000, 16);
+        var config = benchConfig(flags.zoxyPort(), 20_000, 16, flags.isTls());
         config.duration_ns = std.time.ns_per_s / 2;
         const report = zrk.runner.run(arena, io, &config, 0, null, null) catch {
             if (attempt == attempts_max - 1) return error.TargetUnresponsive;
@@ -286,7 +333,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
 }
 
 fn loadTest(arena: std.mem.Allocator, io: Io, flags: *const Flags) !zrk.runner.Report {
-    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections);
+    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections, flags.isTls());
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
     return zrk.runner.run(arena, io, &config, 0, null, null);
 }
