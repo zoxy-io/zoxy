@@ -202,16 +202,23 @@ existing unverified.
 **Order.** Critical path to a small TLS slice: **A5 → A4 → B2 →
 (B1 + B5) → B3 → B4**, with A1–A3 and Tier C as fill-in.
 
-B1 and B5 are **one slice, not two**. The seam is what introduces a second,
-wire-side cursor, and under identity there is nothing to check it against —
-that is exactly what B2 could not stage (above). A toy transform cannot run
-before the seam, since it *is* a policy on it, but landing it in the same
-slice means the mechanism is never in the tree unverified: the identity
-transforms prove the existing L4 and L7 body tests still pass unchanged (the
-regression net), and the toy transform proves the wire cursor is actually
-independent of the framed one — byte-exact under the adversary, with no
-crypto involved. Only then do TLS transforms hook on. Extend the toy
-transform to a `http` sim listener when B3 and B4 land.
+B1 and B5 are **one unit of done, delivered as two PRs merged back to
+back** (settled 2026-07-25). The seam is what introduces a second, wire-side
+cursor, and under identity there is nothing to check it against — that is
+exactly what B2 could not stage (above). A toy transform cannot run *before*
+the seam, since it *is* a policy on it, so the order is fixed: seam, then
+proof.
+
+Two diffs rather than one because each is separately reviewable — a seam
+with identity defaults, where the existing L4 and L7 body tests passing
+unchanged is the regression net, then a toy transform proving the wire
+cursor is genuinely independent of the framed one, byte-exact under the
+adversary with no crypto involved. The honest cost of splitting: between the
+two merges the seam sits on `main` with its hooks unexercised and its
+failure branches unreachable. That is bounded by treating B1 as **not done
+until B5 lands** — B5 opens immediately, and no TLS transform hooks on until
+both are in. Extend the toy transform to a `http` sim listener when B3 and
+B4 land.
 
 **`tls_relay.zig` is not to be re-created.** Its own header records the
 parallel loop as provisional — "worth doing once TLS is proven, and
