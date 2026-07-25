@@ -43,7 +43,7 @@ pub fn Server(comptime IoType: type) type {
         /// exchange today; parking joins with keep-alive.
         upstreams: upstream_module.UpstreamPool(IoType),
         /// TLS engines (§4): shared, not one per conn slot — an engine is
-        /// ~116 KiB, so the pool is sized for concurrent TLS activity and
+        /// ~148 KiB, so the pool is sized for concurrent TLS activity and
         /// checkout failure is its own shed rung. Disabled (zero slots)
         /// unless a listener terminates TLS, so a plain-TCP deployment
         /// reserves nothing.

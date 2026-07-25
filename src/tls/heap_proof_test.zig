@@ -76,14 +76,19 @@ test "slice 1: a handshake runs entirely on the fixed libcrypto heap" {
     var rounds: u8 = 0;
     while (!(engine.isConnected() and client.isConnected())) : (rounds += 1) {
         try std.testing.expect(rounds < 8);
-        // Server side: feed the client's bytes, capture the response.
+        // Server side: feed the client's bytes, then take the ciphertext
+        // the engine staged (plaintext would arrive via the sink).
         var to_client: WireCapture = .{};
         try engine.feed(wire.take(), .{
             .ctx = &to_client,
-            .writeWire = WireCapture.pushOpaque,
             .appData = ignoreBytes,
             .closed = ignore,
         });
+        const outbound = engine.outbound();
+        if (outbound.len > 0) {
+            WireCapture.push(&to_client, outbound);
+            engine.outboundSent(outbound.len);
+        }
         // Client side: feed the server's bytes back.
         var back: WireCapture = .{};
         try feedClient(&client, &c_records, &c_out, to_client.take(), &back);

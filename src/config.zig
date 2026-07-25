@@ -48,7 +48,7 @@ pub const Config = struct {
         upstream_slots: u32 = constants.upstream_slots_default,
         /// Concurrent TLS connections (§4). Zero — the default when no
         /// listener carries a `tls` block — disables the engine pool, so
-        /// a plain-TCP deployment reserves none of its ~116 KiB slots.
+        /// a plain-TCP deployment reserves none of its ~148 KiB slots.
         tls_engines: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
@@ -1388,7 +1388,7 @@ test "config: an empty cert or key path in a tls block is rejected" {
 
 test "config: the tls engine pool is sized only when a listener terminates TLS" {
     // No TLS listener: the pool is disabled, so a plain deployment
-    // reserves none of the ~116 KiB engine slots.
+    // reserves none of the ~148 KiB engine slots.
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
