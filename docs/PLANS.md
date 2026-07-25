@@ -90,6 +90,101 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
   which the §9 error gates do not cover and which would have caught the
   stall on its first run.
 
+## Prefactoring for Phase 3a — learned on `phase-3a-ztls` (2026-07-25)
+
+Phase 3a was implemented end to end on the `phase-3a-ztls` branch (24
+commits, ~4.8k lines) and measured (IMPLEMENTATION_NOTES.md). It works,
+but it fought main's shape in five places, and each fight left a scar
+worth removing *before* the TLS slices land again. Every item below is
+independently landable on `main`, changes no behavior, and needs no TLS
+to justify it — that is the test for being on this list. (Phase 3a's
+engine survey above predates the branch's ztls decision; the branch's
+own entry is authoritative on the stack until it merges.)
+
+What the branch fought, with the evidence:
+
+- **`pump.zig` assumes one buffer per direction**, because a plain relay
+  recvs and sends the same bytes. TLS does not: each direction's two
+  halves live in different buffers. The branch first wrote a parallel
+  `net/tls_relay.zig` — 357 lines re-deriving the discipline
+  `relay.zig` states in 164 — then added a transform seam to the pump
+  for the L7 body legs, ending with *two* mechanisms for one job.
+- **The direction cursor conflates framed bytes with wire bytes.**
+  `DirectionState.sent_len`/`transfer_len` counts plaintext; under TLS
+  the wire carries ciphertext. The branch needed a `creditSend` hook to
+  keep them apart, and recorded the hazard: a wrong move here silently
+  corrupts the byte stream instead of failing loudly.
+- **Client-directed writes are three hand-rolled arm/credit pairs**
+  (response head, response excess, static response), each with its own
+  cursor field. TLS had to thread an encrypt-and-credit pair through all
+  three and invent all-or-nothing credit semantics at each.
+- **The head read is hardwired to recv-into-`conn.head`**, so TLS grew a
+  parallel completion path, a plaintext accumulator, and a duplicated
+  "431 vs 413 vs read again" decision.
+- **Admission has no pre-protocol stage.** The branch inserted a TLS
+  fork ahead of the `.l4`/`.http` fork, then repeated that same fork
+  after the handshake and carried a `conn.tls_protocol` field solely to
+  remember which way to go.
+
+Sizes are estimates, in diff lines, for sequencing only.
+
+### Tier A — mechanical, no behavior change
+
+| # | slice | ~ | what it buys |
+|---|---|---|---|
+| A1 | Zero-slot `Pool`: relax `count >= 1`, sentinel `free_head`, one test | 20 | a pool the config never asked for reserves nothing and is permanently exhausted, so its acquire site needs no special case |
+| A2 | `fillRandom` on the Io seam (`getrandom` in XevIo, scenario PRNG in SimIo), with the balancer's p2c seed routed through it | 60 | TLS needs key material through the seam; the side win is seed-replayable p2c in the simulator (§9) |
+| A3 | Lint boundaries as a data table `{import, allowed_prefix, message}` | 50 | the branch's 5th positional bool touched every test call; a new dependency boundary should be one row |
+| A4 | `abortAdmission(server, conn, socket, rung)` | 30 | collapses the release + pressure + counter + close quartet that `admitL4`/`admitHttp` already repeat and `admitTls` repeated twice more |
+| A5 | Split `prepare` from `startProtocol(server, conn)` | 40 | one protocol fork, callable from accept *or* from a later phase — deletes the branch's duplicated switch and the `tls_protocol` field outright |
+
+### Tier B — the structural ones, in dependency order
+
+| # | slice | ~ | what it buys |
+|---|---|---|---|
+| B2 | Split the cursor: an explicit wire cursor distinct from the framed one, `assert(wire == framed)` while every policy is identity | 60 | turns the silent-corruption hazard into a failed assertion. A pure refactor today |
+| B1 | Pump transform seam — `recvBuffer`, `transformIn`, `transformOut`, `sendSlice`, `creditSend`, identity by default — and the loop condition becomes *"anything left to write?"* rather than *"cursor reached length"* | 120 | TLS L4 becomes a policy; `tls_relay.zig` never gets written |
+| B5 | A toy transform in the simulator: deterministic and non-identity (XOR mask, or 4-byte length re-framing) on an L4 sim listener, verified byte-exact by the token oracle under the adversary | 150 | proves the seam *without crypto*, so TLS adds only crypto, not new mechanism risk. The de-risking slice for all of Tier B |
+| B3 | One client-write channel over B2's cursor: `armClientWrite(conn, plaintext)` for all three client-directed sends | 150 | TLS changes one place, kTLS none; also settles what §8's "static responses straight from static memory" means once the bytes must be encrypted |
+| B4 | Head-fill source seam: read through a source (socket today), one "head complete? → parse / 431 / 413 / read again" decision | 100 | removes the parallel TLS completion path and the duplicated limit decision |
+
+### Tier C — budget and accounting hygiene
+
+| # | slice | ~ | what it buys |
+|---|---|---|---|
+| C1 | Pool descriptors as one comptime table feeding `memoryBytesTotal`, `fdsRequired`, `inFlightOpsMax`, `completionQueueDepthFor` and the startup print | 150 | the branch added positional args to five call sites; a new pool should be one row, and §5's memory table would generate itself |
+| C2 | Counter groups — `admission_shed` vs `post_admission_failure` — with `reconcile` summing the first structurally | 60 | the branch had to reason that `shed_tls_engines` must precede admission while `tls_relay_buffer_unavailable` must not; make the wrong bucket unrepresentable |
+| C3 | Per-resource release with explicit lifetimes instead of a fixed teardown sequence | 60 | kTLS wants the engine back at *handshake completion*, not teardown — illegal in today's shape |
+
+### Tier D — measurement readiness
+
+| # | slice | ~ | what it buys |
+|---|---|---|---|
+| D1 | Tier-1 gate on achieved rate against offered | 40 | the §9 gates check socket and status errors only, so a run delivering 704 of 2000 req/s passed them |
+| D2 | A large-body band in the harness | 80 | the record layer's per-byte cost is unmeasured, and the kTLS decision (Phase 3b) depends on that number |
+
+**Order.** Critical path to a small TLS slice: **A5 → A4 → B2 → B1 → B5
+→ B3 → B4**, with A1–A3 and Tier C as fill-in. B2 comes before B1
+because the cursor split is provable while every policy is still
+identity — introducing the seam first means building it over the
+ambiguity. B5 follows B1 immediately, so "the seam works" is a tested
+claim rather than an assertion about unexercised code; extend it to a
+toy-transformed `http` sim listener when B3 and B4 land.
+
+**`tls_relay.zig` is not to be re-created.** Its own header records the
+parallel loop as provisional — "worth doing once TLS is proven, and
+deliberately not attempted while the L4 and L7 paths depend on the pump
+unchanged". TLS is now proven on L4, so that deferral condition is met,
+and B1 means the file never needs to exist.
+
+**Deliberately not on this list**, because they belong to the TLS slice
+itself: credentials loading, the engine pool, the libcrypto fixed heap,
+the ztls lint rule, session tickets. Also left off: the `conn.head`
+triple-duty cleanup (request head, response staging, handshake
+ciphertext — with a comptime assert tying the handshake read size to
+`head_bytes_max`). That coupling is real and fragile, but it is better
+solved when the engine owns its own inbox than speculatively now.
+
 ## io_uring op upgrades — evaluated, all deferred (2026-07-16)
 
 §4's "plain ops only" policy holds: on the measured profile —
