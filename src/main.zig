@@ -361,6 +361,35 @@ fn printBudgets(
         config.listeners.len,
         config.clusters.len,
     });
+
+    // The engine pool is the concurrent-HTTPS ceiling, not a throughput
+    // knob: a TLS connection with no engine is refused, because there is
+    // no session to answer through (§8). Stated outright because it is
+    // the one limit whose exhaustion looks like a broken proxy rather
+    // than a full one — the accept path advertises `conn_slots`, and a
+    // client past the engine count sees its connection closed with
+    // nothing on the wire to explain it.
+    if (limits.tls_engines != 0) {
+        try writer.print(
+            "  tls     {d} concurrent HTTPS connections (engine pool)\n",
+            .{limits.tls_engines},
+        );
+        if (limits.tls_engines < limits.conn_slots) {
+            try writer.print(
+                \\  WARNING tls engines {d} < conn slots {d}: HTTPS is capped at
+                \\          {d} concurrent connections, and connection {d} onward
+                \\          is refused (counter: shed_tls_engines). Raise
+                \\          limits.tls_engines to conn slots, or lower conn slots
+                \\          to match, so the advertised capacity is the real one.
+                \\
+            , .{
+                limits.tls_engines,
+                limits.conn_slots,
+                limits.tls_engines,
+                limits.tls_engines + 1,
+            });
+        }
+    }
     try writer.flush();
 }
 

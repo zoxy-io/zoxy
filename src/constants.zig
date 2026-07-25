@@ -392,12 +392,20 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 pub const upstream_slots_default: u32 = upstream_slots_max;
 
 /// TLS engines when a listener terminates TLS but the config names no
-/// count. ~37 MiB at ~148 KiB per engine — roughly the plain-TCP default
-/// footprint again, which is the honest price of TLS state and still an
-/// order under the ceiling. A config with *no* TLS listener defaults to
-/// zero engines and reserves nothing (`Config.Limits.tls_engines`), so
-/// this cost is opt-in by configuring TLS at all.
-pub const tls_engines_default: u32 = 256;
+/// count: `@min(tls_engines_max, conn_slots)`, resolved in the loader
+/// because it follows whatever conn slots the config settled on.
+///
+/// It follows conn slots for the same reason relay buffers do on the L4
+/// path — an engine is held for the connection's whole life — but the
+/// consequence of getting it wrong is sharper. A short relay-buffer pool
+/// throttles; a short engine pool *refuses*, because a TLS connection
+/// with no engine has no session to answer through. So the engine count
+/// is the concurrent-HTTPS ceiling, and any value below `conn_slots`
+/// means the accept path advertises more capacity than TLS can honour.
+///
+/// A config with no TLS listener defaults to zero and reserves nothing,
+/// so this cost is opt-in by configuring TLS at all.
+pub const tls_engines_default: u32 = @min(tls_engines_max, conn_slots_default);
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
