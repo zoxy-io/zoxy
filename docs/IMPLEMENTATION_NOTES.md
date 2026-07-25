@@ -157,6 +157,49 @@ unshipped. No other production-credible pure-Zig TLS 1.3 server
 exists as of the scan; Geun-Oh/zigtls is aimed the right way but
 0.1.0-dev — watch-list only.
 
+## ztls spike — the Phase 3a engine settled (2026-07-25, PR #66)
+
+The scan above missed [ztls](https://github.com/mattrobenolt/ztls) —
+its hybrid shape (Zig protocol layer over libcrypto primitives) fell
+outside the pure-Zig framing. Once evaluated, it displaced tls.zig as
+the 3a engine: TLS 1.3 server with resumption, 0-RTT, HRR, KeyUpdate,
+and kTLS payloads already implemented, sans-I/O with caller-owned
+buffers, an allocation-free protocol layer, and 672/674 tests passing
+on the pinned 0.16 toolchain out of the box. The cost is the §4
+C-primitives exception (settled deliberately — see DESIGN §4) and its
+pre-alpha maturity (the wrapper + hash pin absorb the API churn; the
+correctness risk is bounded by zoxy's own gates). tls.zig remains the
+recorded pure-Zig fallback at `5452baf`; its gap is server-side
+resumption.
+
+Spike findings, so they are not re-learned (src/tls/ on the
+`phase-3a-ztls` branch, `zig build tls-spike`):
+
+- **Byte-exact flight replay holds — with two seeding requirements.**
+  libcrypto signs CertificateVerify with a random nonce, which varies
+  the signature bytes *and the encrypted-flight record length* (DER
+  integer trimming). Fixed with opt-in RFC 6979 deterministic nonces on
+  the zoxy-io/ztls fork (upstream mattrobenolt/ztls#82; OpenSSL 3.2+
+  "nonce-type" provider param; loud `DeterministicNonceUnsupported` on
+  BoringSSL-family/non-ECDSA/pre-3.2 — never a silent random-nonce
+  fallback; validated against the RFC 6979 §A.2.5 vector). Second:
+  *every peer keyshare* must be seeded — `KeyPairs.init` generates a
+  random P-256 share that rides in the ClientHello and so varies the
+  transcript the deterministic signature covers.
+- **Ownership rules the production engine inherits:** `setCredentials`
+  stores the chain *pointer* (the array must outlive the handshake);
+  `PrivateKey` wraps a libcrypto object with strict lifetime; every
+  `.write` event requires `completeWrite` before the next
+  `handleRecord`.
+- **Certificates:** ECDSA-only for CertificateVerify (no Ed25519 in
+  ztls's scheme list); modern validation requires a SAN (a CN-only
+  test cert was rejected); provisioning from embedded DER + raw scalar
+  needs no PEM machinery.
+- **Zero-alloc caveat:** ztls's own path allocates nothing, but
+  libcrypto mallocs internally — the zero-alloc gate's no-mmap/brk
+  counters will see it, hence the `CRYPTO_set_mem_functions`
+  fixed-arena slice as 3a's first code slice.
+
 ## The concurrency ceiling is CQ-bound (95d1f8f)
 
 Concurrent L4 connections are bound by the io_uring completion queue,

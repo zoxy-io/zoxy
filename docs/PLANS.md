@@ -15,51 +15,68 @@ admin/metrics listener — are shipped on `main` (PRs #47, #50, #51, #54,
 is in git log, not here. Two sub-items they left open are tracked below
 under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
 
-- **Phase 3a — single-threaded TLS termination.** Settled 2026-07-24:
-  **no worker threads** — handshakes run on the loop under a per-tick
-  budget. Measured on the pinned toolchain (IMPLEMENTATION_NOTES.md), a
-  full TLS 1.3 server handshake in pure std.crypto costs ~95 µs
-  (Ed25519 cert) to ~380 µs (P256 on a slow core); resumption is
-  µs-class. The ~1–2 ms figure that motivated the worker pool was an
-  RSA number, so RSA certs are simply not supported — ECDSA/Ed25519
-  only, a documented constraint. The worst single uninterruptible step
-  (~275 µs P256 sign) bounds tick inflation; a handshake backlog past
-  the budget is a shed rung like any other (§8). One core absorbs
-  ~3.8k full P256 handshakes/s (~10k Ed25519), resumption effectively
-  unlimited.
-  The stack (surveyed 2026-07-24): a **hardened fork of
-  [tls.zig](https://github.com/ianic/tls.zig)**, pinned at `5452baf` —
-  the last Zig-0.16 commit; builds and tests clean on the pinned
-  toolchain — pure Zig under the §4 policy like libxev and hparse.
-  What makes it fit: sans-I/O `nonblock.Server` (caller buffers both
-  ways) behind our own wrapper; an allocation-free handshake path
-  (allocator appears only in startup cert loading — the config arena);
-  injectable `rng: std.Random` and `now: Io.Timestamp`, so SimIo
-  drives handshakes deterministically (§9); std.crypto primitives;
-  client-cert support; and a `Ktls.zig` that already emits the
-  `setsockopt(SOL_TLS)` key payloads (→ 3b). The fork's hardening
-  gate, hparse-style — cleared before 3a lands:
-  1. **Server-side session resumption** (NewSessionTicket issuance,
-     PSK-DHE acceptance, binder verification) — the one missing hard
-     requirement, and load-bearing: without tickets a full-population
-     reconnect storm is ~14k × ~260 µs ≈ seconds of handshake CPU;
-     with them, µs-class per connection.
-  2. **Fragmented ClientHello** (upstream #36) — a real robustness gap
-     the fuzz gate would find anyway.
-  3. Backport the three post-pin fixes (CBC-padding overflow
-     `106d10b`, dangling `alpn_protocol` `47c402a`, `d633a0f`).
-  4. The server handshake under zoxy's fuzz gate, fuzzed through our
-     wrapper like hparse (§9).
-  Fallback if hardening proves costlier than estimated: **picotls** —
-  functioning, but now two policy exceptions deep (C dependency plus
-  un-hookable malloc, plus OpenSSL libcrypto for acceptable sign
-  speed; verified unchanged 2026-07-24). std.crypto.tls stays
-  client-only (re-verified against the pinned toolchain and upstream
-  master; the stalled upstream server PR ziglang/zig#23005 *is*
-  tls.zig, so the fork adopts the same code with more control).
+- **Phase 3a — single-threaded TLS termination.** Two settlements:
+  2026-07-24, **no worker threads** — handshakes run on the loop under a
+  per-tick budget (measured ~100–400 µs per full handshake in pure
+  std.crypto, IMPLEMENTATION_NOTES.md; the ~1–2 ms figure that motivated
+  the worker pool was an RSA number, so RSA certs are simply not
+  supported); and 2026-07-25 (PR #66 spike), **the engine is ztls** —
+  sans-I/O TLS 1.3 server, Zig protocol layer over libcrypto primitives,
+  the §4 C-crypto exception — pinned by content hash to the zoxy-io/ztls
+  fork (branch `deterministic-ecdsa` = upstream `41c24d7` plus opt-in
+  RFC 6979 deterministic ECDSA nonces, mattrobenolt/ztls#82, offered
+  upstream). Server certs are **ECDSA-only** on this engine (P-256/
+  P-384; ztls's CertificateVerify schemes carry no Ed25519 — supersedes
+  the earlier "ECDSA/Ed25519" wording), and libcrypto's assembly P-256
+  sign is faster than the std.crypto numbers the budget was derived
+  from, so the arithmetic holds with margin. A handshake backlog past
+  the per-tick budget is a §8 shed rung like any other.
+  What the spike proved (src/tls/, `zig build tls-spike`): the sans-I/O
+  drive loop over static caller-owned buffers with zero wrapper
+  allocation; key material injected as plain data; byte-exact
+  server-flight replay under seeded inputs — the §9 property — with the
+  recorded rule that *every* peer keyshare must be seeded (a random
+  P-256 keyshare rides in the ClientHello and varies the signed
+  transcript). Fallback if ztls's pre-alpha state proves untenable:
+  ianic/tls.zig, pure Zig, pinned at `5452baf` for 0.16 — its gap is
+  server-side resumption (survey verdicts in IMPLEMENTATION_NOTES.md).
+  The remaining gate, in slice order — each behind all four §9 gates:
+  1. **libcrypto allocation interposition** — `CRYPTO_set_mem_functions`
+     into a fixed startup arena (helper lives on the fork so zoxy's tree
+     declares no C symbol); the zero-alloc gate extended over a TLS
+     handshake. The one slice with real unknown-unknowns.
+  2. **Engine productionization** — measured per-conn footprint into
+     `constants.zig` (pool-vs-embed decision), backpressure replacing
+     the spike's fits-assert, the ClientHello reassembly buffer, the
+     drive-API settle (sink vs pull) against `Conn`, and the ztls
+     import boundary added to the lint.
+  3. **Config + startup cert loading** — a per-listener `tls` block
+     into the config arena; schema metadata; one cert per listener
+     (SNI multi-cert deferred).
+  4. **The handshake phase in the data path** — its own deadline (the
+     slowloris answer), the per-tick budget + backlog + shed rung +
+     counters: the §8 ladder's new row.
+  5. **Data-path shim** — L4-over-TLS first (terminate, relay
+     plaintext), then L7 head-read over decrypted bytes; the strict
+     relay discipline is unchanged either way.
+  6. **Sim + fuzz gates** — the spike client ported into the sim
+     harness (both keyshares seeded), the adversary at TLS record
+     granularity, golden byte-exact transcripts on clean seeds; fuzz
+     raw bytes through the wrapper — never panic, alert-or-progress.
+  7. **Resumption** — `psk_lookup` + ticket issuance over a static
+     key table in the memory budget. Last deliberately: full handshakes
+     already fit the budget; tickets are the reconnect-storm lever
+     (~14k × ~260 µs ≈ seconds of handshake CPU without them).
+  8. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
+     support is the open dependency (h2load `--h1` is the interim).
+  Cross-cutting entry gate: the ztls audit per §4 (the Zig protocol
+  layer read line-by-line; the C primitives trusted institutionally),
+  and the pre-alpha posture — pin advances are deliberate, batched
+  migrations, with upstream engagement continuing on #82.
 - **Phase 3b — kTLS record offload.** Linux-only follow-up to 3a: hand
-  the negotiated keys to the kernel (`setsockopt(SOL_TLS)`, the fork's
-  `Ktls.zig` payloads) so the record layer costs zero userspace CPU
+  the negotiated keys to the kernel (`setsockopt(SOL_TLS)` — ztls ships
+  the struct payloads in its `ktls` module, and upstream's README
+  claims kTLS offload working) so the record layer costs zero userspace CPU
   and the post-handshake data path stays byte-identical to today's
   relay — which also keeps the `splice` c10k lever applicable to TLS
   traffic. The 3a userspace record path remains the portable fallback
