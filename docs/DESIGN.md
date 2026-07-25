@@ -635,6 +635,7 @@ the loop thread.
 |---|---|---|
 | connection slots | accept completion | close immediately (SO_LINGER 0 → RST); accept stays armed |
 | relay buffers (L4) | accept admission | close immediately |
+| tls engines (§4) | accept admission on a TLS listener | close immediately — there is no session to answer through |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7) / close (L4) |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
@@ -825,6 +826,7 @@ src/
   tls/
     Engine.zig        // ztls wrapper: sans-I/O TLS 1.3 seam (§4, Phase 3a)
     Credentials.zig   // per-listener cert chain + signing key (PEM load)
+    TestClient.zig    // scripted TLS client for the §9 gates
     libcrypto_heap.zig // fixed heap for libcrypto's allocations (§4)
   balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
   shed.zig            // exhaustion ladder: decisions + static responses

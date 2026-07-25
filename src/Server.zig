@@ -435,6 +435,21 @@ pub fn Server(comptime IoType: type) type {
         fn admit(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
             assert(!server.draining);
             const conn = server.admitConn(client_socket) orelse return;
+            // TLS is orthogonal to the protocol (§4): a listener with
+            // credentials terminates the handshake first and the l4/http
+            // fork happens on the plaintext behind it, so this precedes the
+            // protocol switch and hands over through `startProtocol` when
+            // the session establishes.
+            if (state.credentials) |credentials| {
+                const engine = server.acquireTlsEngine(credentials) orelse {
+                    server.abortAdmission(conn, client_socket, "shed_tls_engines");
+                    return;
+                };
+                server.finishAdmission(conn, client_socket, null, state);
+                conn.tls = engine;
+                server.armTlsRecv(conn);
+                return;
+            }
             const buffer: ?*relay.RelayBuffer = switch (state.protocol) {
                 .l4 => server.acquireRelayBuffer() orelse {
                     server.abortAdmission(conn, client_socket, "shed_relay_buffers");
@@ -446,8 +461,35 @@ pub fn Server(comptime IoType: type) type {
             server.startProtocol(conn, state.protocol);
         }
 
+        /// Check an engine out of the shared pool and seed it for one
+        /// handshake (§4). Null is the §8 TLS-engine rung: pool exhaustion
+        /// and a per-connection key-derivation failure shed identically,
+        /// since the credentials already parsed at startup — a failure here
+        /// is this connection's, never the listener's.
+        fn acquireTlsEngine(
+            server: *Self,
+            credentials: *const TlsCredentials,
+        ) ?*TlsEngine {
+            const engine = server.tls_engines.acquire() orelse return null;
+            var seed: [32]u8 = undefined;
+            var random: [32]u8 = undefined;
+            server.io.fillRandom(&seed);
+            server.io.fillRandom(&random);
+            engine.init(&.{
+                .x25519_seed = seed,
+                .random = random,
+                .credentials = credentials,
+            }) catch {
+                server.tls_engines.release(engine);
+                return null;
+            };
+            return engine;
+        }
+
         /// The state a protocol's connection starts serving in, in one
-        /// place so nothing else carries the mapping.
+        /// place so nothing else carries the mapping. This is the
+        /// *protocol's* entry, which a TLS connection reaches only at
+        /// hand-over — `finishAdmission` owns the fork.
         fn entryState(protocol: config_module.Config.Listener.Protocol) ConnType.State {
             return switch (protocol) {
                 .l4 => .connecting,
@@ -575,6 +617,12 @@ pub fn Server(comptime IoType: type) type {
         /// timer this connection ever arms are identical across protocols —
         /// the protocol only chooses which values go in, through
         /// `entryState` and `entryTimeoutMs`.
+        ///
+        /// TLS is the one fork above the protocol (§4): a terminating
+        /// listener enters handshaking on the idle clock — so a peer that
+        /// opens a connection and never speaks still meets it — and the
+        /// protocol's own entry arrives later, when the established session
+        /// hands over through `startProtocol`.
         fn finishAdmission(
             server: *Self,
             conn: *ConnType,
@@ -583,12 +631,21 @@ pub fn Server(comptime IoType: type) type {
             listener: *const ListenerState,
         ) void {
             assert(!server.draining);
+            const terminating_tls = listener.credentials != null;
+            const state: ConnType.State = if (terminating_tls)
+                .tls_handshaking
+            else
+                entryState(listener.protocol);
+            const timeout_ms = if (terminating_tls)
+                server.idleTimeoutMs()
+            else
+                server.entryTimeoutMs(listener.protocol);
             server.counters.increment("admitted");
             conn.prepare(
                 server,
                 client_socket,
                 buffer,
-                entryState(listener.protocol),
+                state,
                 listener.cluster_index,
             );
             server.io.setNodelay(client_socket) catch {
@@ -602,10 +659,165 @@ pub fn Server(comptime IoType: type) type {
             conn.routes = listener.routes;
             conn.filters = listener.filters;
             assert(conn.routes.len >= 1);
-            server.storeDeadline(conn, server.entryTimeoutMs(listener.protocol));
+            server.storeDeadline(conn, timeout_ms);
             server.armDeadline(conn);
             assert(conn.deadline_ns > 0);
             assert(conn.armed.deadline);
+        }
+
+        /// The TLS handshake drive (§4), one strict step at a time on the
+        /// client socket: recv ciphertext → feed the engine → send
+        /// whatever it staged → recv again, until the session is
+        /// established. Exactly one client-side data op is armed
+        /// throughout, so the handshake obeys the same
+        /// one-op-per-direction discipline as the relay (§6) and costs the
+        /// same ring budget.
+        fn armTlsRecv(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            assert(conn.tls != null);
+            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            server.io.recv(
+                conn.client_socket,
+                &conn.head,
+                &conn.op_data_client_to_upstream.completion,
+                ConnType,
+                conn,
+                onTlsRecv,
+            );
+        }
+
+        fn onTlsRecv(conn: *ConnType, result: Io.RecvError!u32) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            const received = result catch |err| {
+                // A peer that vanishes mid-handshake is ordinary, not
+                // kernel pressure — only Unexpected is witnessed (§8).
+                server.witnessKernelPressure(err);
+                server.beginTeardown(conn);
+                return;
+            };
+            if (received == 0) { // Client FIN before the handshake finished.
+                server.beginTeardown(conn);
+                return;
+            }
+            server.driveTlsHandshake(conn, conn.head[0..received]);
+        }
+
+        /// Feed one chunk of ciphertext and act on what the engine says.
+        /// A protocol error is this connection's alone: tear it down and
+        /// count it, never trust a half-negotiated session.
+        fn driveTlsHandshake(server: *Self, conn: *ConnType, wire: []const u8) void {
+            assert(conn.state == .tls_handshaking);
+            const engine = conn.tls.?;
+            engine.feed(wire, .{
+                .ctx = conn,
+                // Nothing may arrive before the handshake completes; ztls
+                // rejects early data (0-RTT is not offered), so a callback
+                // here would be a library-contract violation.
+                .appData = tlsUnexpectedPlaintext,
+                .closed = tlsPeerClosed,
+            }) catch {
+                server.counters.increment("tls_handshake_failed");
+                server.beginTeardown(conn);
+                return;
+            };
+            server.pumpTlsOutbound(conn);
+        }
+
+        /// Send whatever the engine staged, or — with nothing to send —
+        /// take the next step: another recv while handshaking, or the
+        /// established session's own path once it completes.
+        fn pumpTlsOutbound(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            const engine = conn.tls.?;
+            const outbound = engine.outbound();
+            if (outbound.len > 0) {
+                conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+                server.io.send(
+                    conn.client_socket,
+                    outbound,
+                    &conn.op_data_upstream_to_client.completion,
+                    ConnType,
+                    conn,
+                    onTlsSent,
+                );
+                return;
+            }
+            if (engine.isConnected()) {
+                server.finishTlsHandshake(conn);
+                return;
+            }
+            server.armTlsRecv(conn);
+        }
+
+        fn onTlsSent(conn: *ConnType, result: Io.SendError!u32) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            const sent = result catch |err| {
+                server.witnessKernelPressure(err);
+                server.beginTeardown(conn);
+                return;
+            };
+            // A short write leaves the rest staged; the outbox credits the
+            // partial and the next pump sends the remainder.
+            conn.tls.?.outboundSent(sent);
+            server.pumpTlsOutbound(conn);
+        }
+
+        /// The session is established. Phase 3a stops here: the plaintext
+        /// behind it does not yet reach an upstream (PLANS.md slice 9), so
+        /// the connection is closed the orderly way — close_notify, then
+        /// teardown — rather than left holding an engine it cannot use.
+        fn finishTlsHandshake(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            assert(conn.tls.?.isConnected());
+            server.counters.increment("tls_handshakes_completed");
+            conn.tls.?.sendClose() catch {
+                server.beginTeardown(conn);
+                return;
+            };
+            const outbound = conn.tls.?.outbound();
+            assert(outbound.len > 0);
+            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            server.io.send(
+                conn.client_socket,
+                outbound,
+                &conn.op_data_upstream_to_client.completion,
+                ConnType,
+                conn,
+                onTlsCloseSent,
+            );
+        }
+
+        fn onTlsCloseSent(conn: *ConnType, result: Io.SendError!u32) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            // The session is over either way; a failed close_notify only
+            // costs the peer an orderly signal.
+            _ = result catch {};
+            server.beginTeardown(conn);
+        }
+
+        fn tlsUnexpectedPlaintext(ctx: *anyopaque, bytes: []const u8) void {
+            _ = bytes;
+            const conn: *ConnType = @ptrCast(@alignCast(ctx));
+            _ = conn;
+            unreachable; // No early data is offered, so none can arrive.
+        }
+
+        fn tlsPeerClosed(ctx: *anyopaque) void {
+            const conn: *ConnType = @ptrCast(@alignCast(ctx));
+            // Recorded on the conn; the drive loop tears down once the
+            // engine call it arrived from returns.
+            conn.server.beginTeardown(conn);
         }
 
         /// L7 body relays acquire their buffer mid-connection (§5), so
@@ -765,6 +977,14 @@ pub fn Server(comptime IoType: type) type {
             if (conn.upstream) |leased| {
                 server.releaseUpstream(leased);
                 conn.upstream = null;
+            }
+            // The engine dies with the connection it terminated (§4): its
+            // buffers hold that session's keys and plaintext, so it is
+            // returned only here, once every armed op has drained.
+            if (conn.tls) |engine| {
+                engine.deinit();
+                server.tls_engines.release(engine);
+                conn.tls = null;
             }
             server.releaseConn(conn);
             server.counters.increment("completed");
