@@ -671,6 +671,43 @@ test "tls: a client completes a handshake against a tls listener" {
 // echo comes back, byte-exact, through a terminated session. The proxy
 // decrypts on the way in and encrypts on the way out; the origin only
 // ever sees plaintext.
+test "tls: a write landing before the dial completes still relays" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        // The delayed connect is what makes this deliberate rather than a
+        // property of some seed's ordering: the client's first write is
+        // guaranteed to arrive while the conn is still `.tls_handshaking`,
+        // which is legal — a TLS 1.3 client may write as soon as it has
+        // sent Finished. Those bytes must be staged and forwarded as the
+        // relay's first send, not dropped or treated as early data.
+        .sim = .{
+            .seed = 31,
+            .adversary = .{ .connect_delay_ns_max = 5_000_000 },
+        },
+        .tls = true,
+        .connect_timeout_ms = 60_000,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
 test "tls: a post-handshake KeyUpdate interleaves with the relay" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{

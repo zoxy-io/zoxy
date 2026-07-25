@@ -137,6 +137,7 @@ pub const ValidationError = error{
     RouteHostNotCanonical,
     RouteDuplicate,
     ListenerL4Filters,
+    ListenerTlsHttpUnsupported,
     FiltersOverLimit,
     FilterMethodEmpty,
     FilterMethodUnknown,
@@ -812,7 +813,7 @@ fn resolveListeners(
             .routes = try resolveRoutes(arena, &listener_json, clusters, protocol),
             .filters = try resolveFilters(arena, &listener_json, protocol),
             .protocol = protocol,
-            .tls = try resolveTls(&listener_json),
+            .tls = try resolveTls(&listener_json, protocol),
         };
     }
     assert(listeners.len == listeners_json.len);
@@ -823,10 +824,19 @@ fn resolveListeners(
 /// present → the cert/key file paths, borrowed from `json_bytes`. Only
 /// pure checks belong here (§1 — the loader is IO-free): the paths must
 /// be non-empty. Reading the files and parsing them into credentials is
-/// a startup step under `src/tls/` (Phase 3a slices ahead). TLS is
-/// orthogonal to `protocol`, so no protocol coupling is validated.
-fn resolveTls(listener_json: *const ListenerJson) ParseError!?Config.Listener.Tls {
+/// a startup step under `src/tls/` (Phase 3a slices ahead).
+///
+/// TLS is orthogonal to `protocol` by design, but the L7-over-TLS data
+/// path is not built yet: `finishTlsHandshake` hands every terminated
+/// connection to the L4 relay. Accepting `http` + `tls` would silently
+/// serve it as a TLS passthrough — no head parsing, no routing, no
+/// filters — so it is rejected until that slice lands (PLANS.md 3a).
+fn resolveTls(
+    listener_json: *const ListenerJson,
+    protocol: Config.Listener.Protocol,
+) ParseError!?Config.Listener.Tls {
     const tls = listener_json.tls orelse return null;
+    if (protocol != .l4) return error.ListenerTlsHttpUnsupported;
     if (tls.cert.len == 0) return error.TlsCertPathEmpty;
     if (tls.key.len == 0) return error.TlsKeyPathEmpty;
     return .{ .cert_path = tls.cert, .key_path = tls.key };
@@ -1343,6 +1353,19 @@ test "config: listener protocol defaults to l4 and accepts http" {
     }
 }
 
+test "config: a tls block on an http listener is rejected until L7-over-TLS lands" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // Accepting this would silently serve the listener as an L4 TLS
+    // passthrough — no head parsing, routing, or filters.
+    try std.testing.expectError(error.ListenerTlsHttpUnsupported, parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a",
+        \\   "tls":{"cert":"/c.pem","key":"/k.pem"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    ));
+}
+
 test "config: tls block resolves cert/key paths, absent leaves plain TCP" {
     // Absent: plain TCP.
     {
@@ -1355,12 +1378,12 @@ test "config: tls block resolves cert/key paths, absent leaves plain TCP" {
         );
         try std.testing.expectEqual(@as(?Config.Listener.Tls, null), parsed.listeners[0].tls);
     }
-    // Present: the cert/key paths resolve, orthogonal to protocol.
+    // Present on an l4 listener: the cert/key paths resolve.
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
         const parsed = try parse(arena_state.allocator(),
-            \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a",
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a",
             \\   "tls":{"cert":"/etc/zoxy/cert.pem","key":"/etc/zoxy/key.pem"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
