@@ -405,7 +405,10 @@ unless a listener carries a `tls` block, then 256; exhaustion is its own
 shed rung. Engines hold no socket and arm no ring op, so they enter
 neither the fd nor the CQ budget. The **pool memory** row above is the
 plain-TCP shape; a TLS deployment adds its engine pool on top — ~30 MiB
-at the default (~62 MiB total), ~116 MiB at the ceiling (~367 MiB).
+at the default (~62 MiB total), ~116 MiB at the ceiling (~367 MiB) —
+plus one fixed 4 MiB heap for libcrypto's own allocations
+(`libcrypto_heap_bytes`), reserved only when TLS is configured and
+included in the startup total.
 
 Rules:
 

@@ -163,6 +163,21 @@ pub const upstream_slots_max: u32 = 1024;
 /// concurrent TLS connections.
 pub const tls_engines_max: u32 = 1024;
 
+/// The fixed heap backing libcrypto's own allocations (§4). libcrypto
+/// mallocs internally during a handshake; routed here at startup
+/// (`tls.libcrypto_heap`), those never reach the libc heap, so the
+/// serving path issues no allocating syscall (§5). Reserved only when a
+/// listener terminates TLS. 4 MiB covers the transient working set of
+/// the concurrent handshakes the engine pool admits with wide margin —
+/// exhaustion is a refused handshake, never a crash, and the heap's peak
+/// is observable for tightening this later.
+pub const libcrypto_heap_bytes: u32 = 4 * 1024 * 1024;
+
+/// Largest certificate-chain or private-key PEM file the loader will read
+/// (§4). Generous for a chain of a few certificates while still bounding
+/// what a mis-pointed config path can pull into the arena at startup.
+pub const tls_pem_bytes_max: u32 = 256 * 1024;
+
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
 
@@ -407,6 +422,13 @@ comptime {
     assert(relay_buffers_default <= conn_slots_default);
     assert(upstream_slots_default >= 1 and upstream_slots_default <= upstream_slots_max);
     assert(tls_engines_default >= 1 and tls_engines_default <= tls_engines_max);
+    // The two startup file reads are bounded, and a certificate chain is
+    // allowed to be larger than the config that names it.
+    assert(tls_pem_bytes_max >= config_bytes_max);
+    // libcrypto's heap must at least cover its own one-time provider
+    // init (~425 KiB measured, IMPLEMENTATION_NOTES.md) plus room for the
+    // transient per-handshake working set the engine pool admits.
+    assert(libcrypto_heap_bytes >= 1024 * 1024);
     assert(relay_buffers_max <= conn_slots_max);
     assert(relay_buffers_max >= 1);
     assert(listeners_max >= 1);

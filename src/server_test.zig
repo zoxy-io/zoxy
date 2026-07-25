@@ -15,6 +15,12 @@ const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
 const origin_mod = @import("testing/origin.zig");
+const Credentials = @import("tls/Credentials.zig");
+
+// Throwaway fixtures (src/tls/testdata/README.md), standing in for the
+// cert files main.zig reads at startup.
+const tls_cert_pem = @embedFile("tls/testdata/cert.pem");
+const tls_key_pem = @embedFile("tls/testdata/key.pem");
 
 const assert = std.debug.assert;
 
@@ -204,6 +210,9 @@ pub const TestBed = struct {
         max_lifetime_ms: u32 = 0,
         connect_timeout_ms: u32 = 50,
         drain_deadline_ms: u32 = 1000,
+        /// Give the listener a TLS block and real credentials, so `start`
+        /// exercises the §4 credential wiring.
+        tls: bool = false,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -223,7 +232,14 @@ pub const TestBed = struct {
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
-        bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .l4 }};
+        bed.listeners = .{.{
+            .bind_address = bindAddress(),
+            .routes = &bed.routes,
+            .protocol = .l4,
+            // Paths only; the credentials below are loaded from the
+            // embedded fixtures, standing in for main.zig's file read.
+            .tls = if (options.tls) .{ .cert_path = "cert.pem", .key_path = "key.pem" } else null,
+        }};
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
@@ -233,6 +249,13 @@ pub const TestBed = struct {
             .max_lifetime_ms = options.max_lifetime_ms,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, options.server);
+        // Credentials must reach the server before `start`, which copies
+        // each entry's address into its ListenerState (§4).
+        if (options.tls) {
+            const entries = try arena.alloc(?Credentials, bed.listeners.len);
+            entries[0] = try Credentials.load(arena, tls_cert_pem, tls_key_pem, .{});
+            bed.server.setTlsCredentials(entries);
+        }
         try bed.server.start();
 
         bed.scenario = .{
@@ -600,6 +623,38 @@ test "server: idle timeout shortens under pressure, is full otherwise" {
     try std.testing.expectEqual(@as(u32, 1000 / 16), bed.server.parkedTimeoutMs());
     bed.server.conn_pressure = false;
     bed.server.upstream_pressure = false;
+}
+
+// §4 startup wiring: a listener whose config carries a `tls` block comes
+// up holding the credentials main.zig loaded for it, so admission can ask
+// "does this connection start with a handshake?" without reaching back
+// through the config. A plain listener holds none.
+test "server: a tls listener's credentials reach its ListenerState" {
+    {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 5 }, .tls = true });
+        defer bed.tearDown();
+
+        const credentials = bed.server.listeners[0].credentials orelse
+            return error.TestExpectedCredentials;
+        // The listener points at the real loaded entry, not a copy: the
+        // chain and scheme are the fixture's.
+        try std.testing.expect(credentials.chain.len >= 1);
+        try std.testing.expectEqual(
+            &bed.server.tls_credentials[0].?,
+            credentials,
+        );
+    }
+    // Plain TCP: no credentials, and the engine pool stays disabled.
+    {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 5 } });
+        defer bed.tearDown();
+        try std.testing.expectEqual(
+            @as(?*const Credentials, null),
+            bed.server.listeners[0].credentials,
+        );
+    }
 }
 
 test "server: refused upstream tears the connection down and is counted" {
