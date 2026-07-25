@@ -3,7 +3,7 @@
 //! libcrypto allocation served from our buffer — so libcrypto never
 //! calls libc malloc and issues no allocating syscall after startup.
 //!
-//! This is a separate step from `tls-spike` on purpose:
+//! This is a separate step from `zig build test` on purpose:
 //! `CRYPTO_set_mem_functions` must run before libcrypto's first
 //! allocation, so the hooks are installed as the very first libcrypto
 //! touch in a fresh process — impossible to guarantee in a binary that

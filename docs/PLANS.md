@@ -31,7 +31,7 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
   sign is faster than the std.crypto numbers the budget was derived
   from, so the arithmetic holds with margin. A handshake backlog past
   the per-tick budget is a §8 shed rung like any other.
-  What the spike proved (src/tls/, `zig build tls-spike`): the sans-I/O
+  What the spike proved (src/tls/, now under `zig build test`): the sans-I/O
   drive loop over static caller-owned buffers with zero wrapper
   allocation; key material injected as plain data; byte-exact
   server-flight replay under seeded inputs — the §9 property — with the
@@ -46,13 +46,13 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      segregated-fits heap (`src/tls/libcrypto_heap.zig`), proven by a
      handshake-on-the-heap test (`tls-heap-proof`). The universal
      no-mmap-after-init claim rides the zero-alloc syscall gate once TLS
-     joins the serving path (slices 4–5).
+     joins the serving path (slices 5–6).
   2. **Engine productionization** — *landed:* the ~116 KiB footprint
      measured and the pool-not-embed decision recorded
      (IMPLEMENTATION_NOTES.md); real backpressure (a zero-progress feed
      is `error.RecordTooLarge`, never a ReleaseFast spin); the
      ClientHello reassembly buffer (ztls #36, test-verified meaningful);
-     the ztls import boundary in the lint. *Deferred to slice 4* (where
+     the ztls import boundary in the lint. *Deferred to slice 5* (where
      they get a first consumer): the `Pool(Engine)` and its
      `constants.zig` budget, and the drive-API settle (sink vs pull)
      against `Conn`.
@@ -63,16 +63,22 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      libcrypto signing key + scheme, ECDSA-only (a non-ECDSA leaf is
      rejected loudly), shared per listener. The engine now borrows a
      `*const Credentials` instead of the spike's raw scalar. *Deferred to
-     slice 4:* the startup file read (path → bytes) and per-listener
+     slice 5:* the startup file read (path → bytes) and per-listener
      Credentials construction, which happens where the engine pool
      consumes them (SNI multi-cert stays deferred).
-  4. **The handshake phase in the data path** — its own deadline (the
+  4. **Build wiring** — *landed:* ztls is a first-class dependency of the
+     `zoxy` module, so the shipped binary and every gate link libcrypto
+     (openssl moved into the CI closure). The TLS tests fold into
+     `zig build test`; only `tls-heap-proof` keeps its own step, since the
+     allocation hooks must precede libcrypto's first allocation and that
+     needs a fresh process.
+  5. **The handshake phase in the data path** — its own deadline (the
      slowloris answer), the per-tick budget + backlog + shed rung +
      counters: the §8 ladder's new row.
-  5. **Data-path shim** — L4-over-TLS first (terminate, relay
+  6. **Data-path shim** — L4-over-TLS first (terminate, relay
      plaintext), then L7 head-read over decrypted bytes; the strict
      relay discipline is unchanged either way.
-  6. **Sim + fuzz gates** — the spike client ported into the sim
+  7. **Sim + fuzz gates** — the spike client ported into the sim
      harness (both keyshares seeded), the adversary at TLS record
      granularity, golden byte-exact transcripts on clean seeds; fuzz
      raw bytes through the wrapper — never panic, alert-or-progress.
@@ -80,11 +86,11 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      into a fuzz target — new parsing over operator input, unit-tested
      for now but owed §9 fuzz coverage (the ci `--fuzz` gate is
      libcrypto-free, so this rides the TLS fuzz seam this slice builds).
-  7. **Resumption** — `psk_lookup` + ticket issuance over a static
+  8. **Resumption** — `psk_lookup` + ticket issuance over a static
      key table in the memory budget. Last deliberately: full handshakes
      already fit the budget; tickets are the reconnect-storm lever
      (~14k × ~260 µs ≈ seconds of handshake CPU without them).
-  8. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
+  9. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
      support is the open dependency (h2load `--h1` is the interim).
   Cross-cutting entry gate: the ztls audit per §4 (the Zig protocol
   layer read line-by-line; the C primitives trusted institutionally),
