@@ -34,6 +34,7 @@ pub const tls = struct {
     pub const Engine = @import("tls/Engine.zig");
     pub const Credentials = @import("tls/Credentials.zig");
     pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
+    pub const Tickets = @import("tls/Tickets.zig");
 };
 /// Shared test-support harness pieces (used by server_test and the sim).
 pub const testing = struct {
@@ -74,5 +75,6 @@ test {
     _ = tls.Engine;
     _ = tls.Credentials;
     _ = tls.libcrypto_heap;
+    _ = tls.Tickets;
     _ = @import("tls/spike_test.zig");
 }
