@@ -136,7 +136,22 @@ Sizes are estimates, in diff lines, for sequencing only.
 | A2 | `fillRandom` on the Io seam (`getrandom` in XevIo, scenario PRNG in SimIo), with the balancer's p2c seed routed through it | 60 | TLS needs key material through the seam; the side win is seed-replayable p2c in the simulator (§9) |
 | A3 | Lint boundaries as a data table `{import, allowed_prefix, message}` | 50 | the branch's 5th positional bool touched every test call; a new dependency boundary should be one row |
 | A4 | `abortAdmission(server, conn, socket, rung)` | 30 | collapses the release + pressure + counter + close quartet that `admitL4`/`admitHttp` already repeat and `admitTls` repeated twice more |
-| A5 | Split `prepare` from `startProtocol(server, conn)` | 40 | one protocol fork, callable from accept *or* from a later phase — deletes the branch's duplicated switch and the `tls_protocol` field outright |
+| A5 | Split `prepare` from `startProtocol(server, conn)` — *landed* | 40 | one protocol fork, callable from accept *or* from a later phase — deletes the branch's duplicated switch and the `tls_protocol` field outright |
+
+**What A5 leaves to the phase that hands a connection over.**
+`startProtocol` stores the entry state and the entry deadline even at
+admission, where the tail set exactly those values a moment earlier. The
+two writes are identical there because `admit` reaches it through one
+synchronous chain, so neither the per-tick clock nor the pressure flags
+`entryTimeoutMs` reads can move in between. A phase handing over a live
+connection arrives in a *different* tick, where those values legitimately
+differ — so no single assertion covers both callers, and the safety at
+admission is structural rather than asserted. **The hand-over caller owns
+re-establishing that invariant and is where to assert it**; it should also
+decide how a connection recalls its own protocol (a listener pointer on the
+slot would subsume `routes`, `filters` and `cluster_index` — which is how
+the `tls_protocol` field stays deleted). Recorded because two independent
+reviews of A5 landed on it, and neither could guard it from here.
 
 ### Tier B — the structural ones, in dependency order
 
