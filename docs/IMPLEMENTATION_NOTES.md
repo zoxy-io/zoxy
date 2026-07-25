@@ -165,55 +165,82 @@ in front of the same plaintext origin, so the added pair isolates
 termination cost). This is the evidence DESIGN §3 rests on when it
 deletes the CPU-worker seam rather than deferring it.
 
-Steady state — keep-alive, the shape a real HTTPS front end runs in:
+Steady state — keep-alive, the shape a real HTTPS front end runs in
+(three runs at branch tip `ab547a2`, bands not single numbers):
 
 | | req/s | p50 | p90 | p99 |
 |---|---|---|---|---|
-| zoxy L7 + TLS | 19970 | 110 µs | 174 µs | 1374 µs |
-| haproxy https | 19960 | 101 µs | 151 µs | 1043 µs |
+| zoxy L7 + TLS | 19961–19970 | 110–122 µs | 137–174 µs | 784–1374 µs |
+| haproxy https | 19960–19965 | 101–105 µs | 131–151 µs | 223–1043 µs |
 
-Parity. A terminated hop on one thread is not the bottleneck at 20k
-req/s, and nothing about that number wants another thread.
+Parity on rate and p50. A terminated hop on one thread is not the
+bottleneck at 20k req/s, and nothing about that number wants another
+thread. zoxy's tail is the worse half of the band (p99 up to ~1.4 ms
+against haproxy's ~0.3 ms, and a `max` that lands on ~41.8 ms in *every*
+run — see the stall below, which happens once per connection and so
+amortizes away here).
 
 Handshake-bound — `Connection: close`, one full handshake per request,
-neither side resuming (zrk has no session resumption yet):
+neither side resuming (zrk has no session resumption yet). Three runs,
+and the third one is what explains the first two:
 
-| | req/s | p50 |
-|---|---|---|
-| zoxy L7 + TLS | 712 | 3240 ms |
-| haproxy https | 1897 (of 2000 offered — never saturated) | 724 µs |
+| offered | connections | zoxy L7 + TLS | haproxy https |
+|---|---|---|---|
+| 2000/s | 32 | 704 req/s | 1996 req/s |
+| 2000/s | 64 | 1427 req/s | 1996 req/s |
+| 500/s | 32 | 499 req/s, p50 212 µs | 499 req/s, p50 309 µs |
 
-Recorded honestly: this gap is **unexplained**, and it is the one number
-that argues the other way. The handshake profile (`zig build profile
---protocol https`, sampling zoxy alone) accounts for ~13% of zoxy-side
-overhead, not a 2.7× deficit — X25519 ~25%, P-256 ECDSA ~12%, ML-KEM
-~10% (zoxy and haproxy negotiate the same X25519MLKEM768 group against
-this client, so both pay it), `memset` 11.2% (ztls `secureZero`; bounding
-it moved the share to 10.1% and throughput not at all — see below),
-SHA-256 in Zig 2.4%. So ~712 handshakes/s is ~1.4 ms of wall time each
-against ~100–400 µs of crypto, and the rest is unaccounted.
+**The ceiling is per-connection, not per-core.** Doubling the connections
+doubled the throughput, and the implied per-connection handshake cycle is
+the same either way — 32 / 704 = 45.5 ms, 64 / 1427 = 44.8 ms. Below that
+floor (the 500/s run, 64 ms per connection cycle) zoxy keeps up
+completely, and its post-handshake exchange is *faster* than haproxy's.
+So the shape is a fixed ~45 ms serialized stall per handshake connection,
+load-independent, capping each connection at ~22 handshakes/s — not a
+CPU wall, and not the "~1.4 ms of wall time per handshake" the first
+profile's arithmetic suggested. ~40 ms is the signature magnitude of a
+Nagle/delayed-ACK interaction (§4 records the same 40 ms lesson from
+pooled upstream connections), and the recurring ~41.8 ms `max` in the
+keep-alive runs points the same way, but **the mechanism is not yet
+identified**; zoxy sets `TCP_NODELAY` on its own sockets, so it is not
+the obvious half of that classic.
 
-What it does *not* argue for is threads. The work is asymmetric crypto,
-which a worker thread does not make cheaper per handshake; it only adds
-cores, and process-per-core behind SO_REUSEPORT (§3) adds the same cores
-without a shared-memory concurrency model. The in-tree levers are
-session resumption (stateless tickets, landed on the branch — µs-class
-for returning clients) and finding whatever the unaccounted wall time is.
+Two readings to retire, both of them mine:
 
-Two caveats on the close-mode number specifically, both worth clearing
-before treating it as a ceiling:
+- **It is not the TLS-engine ceiling.** These runs have 1024 engines (the
+  default now follows conn slots) and `shed_tls_engines` is **0** in
+  every one of them, alongside 0 socket errors and 0 status errors. The
+  earlier "13× slower than haproxy" reading *was* that bug — 261,322 of
+  261,579 accepts shed at the engine rung against a 256-engine default —
+  but that bug is fixed and the close-mode gap survives it unchanged
+  (712 req/s before, 704 after, at the same 32 connections).
+- **p50 3.2 s was not service time.** It is zrk's
+  coordinated-omission-corrected wait against the offered schedule: at
+  2000/s offered into a ~704/s ceiling the backlog is the measurement.
+  Per-request service latency is the 500/s row.
 
-- It was taken **before** the TLS-engine default followed conn slots. A
-  later, higher-concurrency run read as "13× slower than haproxy" and
-  was not slower at all: 261,322 of 261,579 accepts were shed at the
-  engine rung (default 256 engines against 1386 advertised conn slots),
-  so the load generator ran with most of its connections dead. The
-  712 req/s run passed the sub-1% socket-error gate, so it was not
-  shedding — but the close-mode band is owed a re-measure on the fixed
-  default regardless.
+What none of it argues for is threads. A serialized per-connection stall
+is not CPU work, so a worker pool would buy exactly nothing; and where
+real handshake CPU eventually binds, more cores come from
+process-per-core behind SO_REUSEPORT (§3), not from threads sharing pool
+memory. The in-tree levers are the stall (find it), session resumption
+(stateless tickets, landed on the branch — µs-class for returning
+clients), and only then anything about parallelism.
+
+Measurement caveats worth carrying forward:
+
+- The handshake profile shares (`zig build profile --protocol https`:
+  X25519 ~25%, P-256 ECDSA ~12%, ML-KEM ~10% — zoxy and haproxy negotiate
+  the same X25519MLKEM768 group against this client, so both pay it —
+  `memset` 11.2%, SHA-256 in Zig 2.4%) are **user-space shares only**:
+  `perf_event_paranoid` is 2 on this box, so kernel samples never enter
+  the profile. They cannot be turned into a wall-time budget, which is
+  how "47% crypto" turned into an arithmetic that the 64-connection run
+  then falsified.
 - The §9 health gates check socket and status errors, not achieved rate
-  against offered, so a run delivering 712 of 2000 req/s *passed* them.
-  Rate-versus-offered is not yet a gate.
+  against offered, so a run delivering 704 of 2000 req/s *passed* them.
+  Rate-versus-offered is not yet a gate — and it would have caught this
+  on the first run.
 
 ## Profile share is not throughput headroom — bounding a wipe (2026-07-25)
 

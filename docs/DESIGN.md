@@ -89,15 +89,17 @@ excluded by policy (ECDSA only) and measurement retired the seam
 (settled 2026-07-25, IMPLEMENTATION_NOTES.md): a full ECDSA handshake is
 ~100–400 µs of asymmetric crypto, and a terminated L7-over-TLS hop
 measured at HAProxy parity on steady-state keep-alive load — ~20k req/s,
-p50 110 µs against its 101 µs, one core each, same fixture certificate
-and origin. Handshake-heavy load is bounded by the asymmetric crypto
-itself (~47% of the handshake profile), so its levers are session
-resumption (µs-class for returning clients) and, past that, more cores —
-which this design buys as **N independent processes behind SO_REUSEPORT**,
-never as threads sharing pool memory. Single-threaded is a property of
-the design, not a phase of it; should a workload ever demand in-process
-parallelism, the re-entry gate in [PLANS.md](PLANS.md) treats it as a
-from-scratch decision.
+p50 110–122 µs against its 101–105 µs, one core each, same fixture
+certificate and origin. Handshake-heavy load has a lower ceiling that is
+measurably *not* a CPU wall: it scales with connection count, so what
+binds is a per-connection stall under investigation, which no amount of
+threading would remove. Where handshake CPU does eventually bind, the
+levers are session resumption (µs-class for returning clients) and then
+more cores — which this design buys as **N independent processes behind
+SO_REUSEPORT**, never as threads sharing pool memory. Single-threaded is
+a property of the design, not a phase of it; should a workload ever
+demand in-process parallelism, the re-entry gate in
+[PLANS.md](PLANS.md) treats it as a from-scratch decision.
 
 <details>
   <summary><b>Why this is the simplest topology that satisfies the goals</b></summary>
@@ -132,11 +134,13 @@ traffic against tens of GB/s of per-core bandwidth. At 100 k req/s a
 request costs ~4–6 ring ops → ~500 k SQE/s, well inside a single ring's
 capability, batched one submit per loop tick. The previous iteration
 measured itself latency-bound with CPU headroom on the data path; the
-only CPU-heavy work is the TLS handshake, measured at ~100–400 µs with
-ECDSA certs and at HAProxy parity through the whole terminated hop in
-steady state (IMPLEMENTATION_NOTES.md). The loop absorbs it in steps
-between completions, and the worst single uninterruptible step — ~275 µs
-of P-256 sign — is what bounds tick inflation. **Horizontal
+only CPU-heavy work is the TLS handshake, measured at ~100–400 µs of
+crypto with ECDSA certs and at HAProxy parity through the whole
+terminated hop in steady state (IMPLEMENTATION_NOTES.md, which also
+records the per-connection handshake stall that is *not* CPU and is
+still open). The loop absorbs it in steps between completions, and the
+worst single uninterruptible step — ~275 µs of P-256 sign — is what
+bounds tick inflation. **Horizontal
 scaling is N independent zoxy processes behind SO_REUSEPORT** —
 share-nothing at the process boundary, where the kernel actually
 isolates — not N loops, and not N worker threads, in one process.
