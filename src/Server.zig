@@ -373,13 +373,98 @@ pub fn Server(comptime IoType: type) type {
         }
 
         /// The admission fork (§6, §7): every protocol shares the accept
-        /// gate, the conn slot, the deadline, and teardown; they diverge
-        /// only in what a fresh connection does next.
+        /// gate, the conn slot, the deadline, and teardown. They diverge in
+        /// exactly two places, and this is the first — what a protocol must
+        /// already hold to be admitted at all. An L4 connection relays for
+        /// its whole life, so a missing relay buffer is an admission-time
+        /// shed (§8), counted before `admitted`; an idle L7 connection
+        /// holds a slot and head buffer only and acquires a buffer per body
+        /// leg (§5). The second divergence is `startProtocol`.
         fn admit(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
             assert(!server.draining);
-            switch (state.protocol) {
-                .l4 => server.admitL4(state, client_socket),
-                .http => server.admitHttp(state, client_socket),
+            const conn = server.admitConn(client_socket) orelse return;
+            const buffer: ?*relay.RelayBuffer = switch (state.protocol) {
+                .l4 => server.acquireRelayBuffer() orelse {
+                    server.conns.release(conn);
+                    server.updateConnPressure();
+                    server.counters.increment("shed_relay_buffers");
+                    shed.closeQuietly(IoType, server.io, client_socket);
+                    return;
+                },
+                .http => null,
+            };
+            server.finishAdmission(conn, client_socket, buffer, state);
+            server.startProtocol(conn, state.protocol);
+        }
+
+        /// The state a protocol's connection starts serving in, in one
+        /// place so nothing else carries the mapping.
+        fn entryState(protocol: config_module.Config.Listener.Protocol) ConnType.State {
+            return switch (protocol) {
+                .l4 => .connecting,
+                .http => .l7_reading_head,
+            };
+        }
+
+        /// The first deadline that connection runs under: an L4 connection
+        /// is dialing, so it gets the connect budget (§8); an L7 one is
+        /// reading a head, so a slowloris meets the clock or
+        /// `head_bytes_max`, whichever comes first (§7).
+        fn entryTimeoutMs(
+            server: *const Self,
+            protocol: config_module.Config.Listener.Protocol,
+        ) u32 {
+            return switch (protocol) {
+                .l4 => server.config.connect_timeout_ms,
+                .http => server.idleTimeoutMs(),
+            };
+        }
+
+        /// Start a protocol on an admitted connection: its serving state,
+        /// its first deadline, and its first op. Split from the admission
+        /// tail so it is callable from either side of the fork — at
+        /// admission for a fresh connection, and by any phase that runs
+        /// *ahead* of the protocol and hands a live connection over when it
+        /// finishes. TLS termination is the phase that will need it
+        /// (§4, PLANS.md): it is orthogonal to l4/http, so the protocol
+        /// fork happens after the handshake rather than at accept.
+        ///
+        /// It takes the protocol as an argument rather than reading it off
+        /// the slot deliberately: on this branch the second caller does not
+        /// exist, and a field with one writer and one reader would be state
+        /// kept for a caller that is not here (§1). The phase that needs to
+        /// recall a connection's protocol is the one that should decide how.
+        ///
+        /// The state and deadline stores are idempotent at admission — the
+        /// tail below set exactly these values from the same protocol, and
+        /// `admit` reaches here through one synchronous chain, so the clock
+        /// and the pressure flags `entryTimeoutMs` reads cannot have moved
+        /// between the two writes — and they are load-bearing for a
+        /// hand-over, which arrives in whatever state its phase ran in.
+        /// Keeping them here is what makes both callers a single call.
+        fn startProtocol(
+            server: *Self,
+            conn: *ConnType,
+            protocol: config_module.Config.Listener.Protocol,
+        ) void {
+            assert(!server.draining);
+            assert(!conn.isTearingDown());
+            // The one timer this connection ever arms is already armed
+            // (§4: a state transition only ever *stores* a new deadline).
+            assert(conn.armed.deadline);
+            conn.state = entryState(protocol);
+            server.storeDeadline(conn, server.entryTimeoutMs(protocol));
+            switch (protocol) {
+                .l4 => {
+                    // A recv must always have a buffer posted (§6).
+                    assert(conn.relay_buffer != null);
+                    server.armConnect(conn, conn.cluster_index);
+                },
+                .http => {
+                    // An idle L7 connection holds no relay buffer (§5).
+                    assert(conn.relay_buffer == null);
+                    Proxy.start(server, conn);
+                },
             }
         }
 
@@ -396,74 +481,42 @@ pub fn Server(comptime IoType: type) type {
             return conn;
         }
 
-        /// The shared admission tail (§8 single choke point): counting,
-        /// slot prepare, socket options, and the first deadline are
-        /// identical across protocols; only the entry state, buffer, and
-        /// timeout differ.
+        /// The shared admission tail (§8 single choke point): counting, slot
+        /// prepare, socket options, the routing tables, and the one deadline
+        /// timer this connection ever arms are identical across protocols —
+        /// the protocol only chooses which values go in, through
+        /// `entryState` and `entryTimeoutMs`.
         fn finishAdmission(
             server: *Self,
             conn: *ConnType,
             client_socket: IoType.Socket,
             buffer: ?*relay.RelayBuffer,
-            state: ConnType.State,
-            timeout_ms: u32,
-            cluster_index: u16,
+            listener: *const ListenerState,
         ) void {
             assert(!server.draining);
-            assert(state == .connecting or state == .l7_reading_head);
-            assert(timeout_ms >= 1);
             server.counters.increment("admitted");
-            conn.prepare(server, client_socket, buffer, state, cluster_index);
+            conn.prepare(
+                server,
+                client_socket,
+                buffer,
+                entryState(listener.protocol),
+                listener.cluster_index,
+            );
             server.io.setNodelay(client_socket) catch {
                 server.counters.increment("kernel_pressure_errors");
             };
-            server.storeDeadline(conn, timeout_ms);
+            // The L7 path routes and filters once the head parses (§7);
+            // every connection gets its listener's tables and the protocol
+            // decides whether it reads them — an l4 listener resolves to
+            // exactly one catch-all route and no filters, so this is one
+            // rule rather than a third fork.
+            conn.routes = listener.routes;
+            conn.filters = listener.filters;
+            assert(conn.routes.len >= 1);
+            server.storeDeadline(conn, server.entryTimeoutMs(listener.protocol));
             server.armDeadline(conn);
             assert(conn.deadline_ns > 0);
             assert(conn.armed.deadline);
-        }
-
-        fn admitL4(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
-            const conn = server.admitConn(client_socket) orelse return;
-            const buffer = server.relay_buffers.acquire() orelse {
-                server.conns.release(conn);
-                server.updateConnPressure();
-                server.counters.increment("shed_relay_buffers");
-                shed.closeQuietly(IoType, server.io, client_socket);
-                return;
-            };
-            server.updateRelayPressure();
-            server.finishAdmission(
-                conn,
-                client_socket,
-                buffer,
-                .connecting,
-                server.config.connect_timeout_ms,
-                state.cluster_index,
-            );
-            server.armConnect(conn, state.cluster_index);
-        }
-
-        /// L7 admission (§5, §7): a slot only — an idle L7 connection
-        /// holds no relay buffer, which is acquired when a body relay
-        /// starts. The head-read deadline is armed so a slowloris meets
-        /// the clock or `head_bytes_max` first (§7).
-        fn admitHttp(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
-            const conn = server.admitConn(client_socket) orelse return;
-            server.finishAdmission(
-                conn,
-                client_socket,
-                null,
-                .l7_reading_head,
-                server.idleTimeoutMs(),
-                state.cluster_index,
-            );
-            // The L7 path routes and filters once the head parses; hand it
-            // the listener's tables (§7).
-            conn.routes = state.routes;
-            conn.filters = state.filters;
-            assert(conn.routes.len >= 1);
-            Proxy.start(server, conn);
         }
 
         /// L7 body relays acquire their buffer mid-connection (§5), so

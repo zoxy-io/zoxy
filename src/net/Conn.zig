@@ -66,9 +66,10 @@ pub fn Conn(comptime IoType: type) type {
         /// the L7 path `routeRequest` overwrites it with the request
         /// path's cluster once the head parses (§7).
         cluster_index: u16,
-        /// The listener's §7 route table (empty on the L4 path, which has
-        /// no path to match). Set once at admission and constant for the
-        /// connection's life, so it survives keep-alive turnarounds.
+        /// The listener's §7 route table, never empty — an l4 listener
+        /// resolves to the one catch-all route it can never consult, since
+        /// it has no path to match. Set once at admission and constant for
+        /// the connection's life, so it survives keep-alive turnarounds.
         routes: []const router.Route,
         /// The listener's §7 filter rules, same lifetime as `routes`
         /// (empty on L4 and when no filters are configured).
@@ -305,8 +306,8 @@ pub fn Conn(comptime IoType: type) type {
             conn.head_len = 0;
             conn.response_pending = &.{};
             conn.cluster_index = cluster_index;
-            // L4 never routes or filters; admitHttp installs the real
-            // tables.
+            // Placeholders until the admission tail installs the
+            // listener's real tables (§7); L4 never reads them.
             conn.routes = &.{};
             conn.filters = &.{};
             conn.upstream = null;
