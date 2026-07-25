@@ -3,7 +3,9 @@
 //! named only under `src/io/`, with an explicit allowlist for `main.zig`
 //! startup work (rlimits, sigaction). The `hparse` import is likewise
 //! confined to `src/http/parser.zig` — the wrapper that owns the trust
-//! boundary (§7). `@cImport` is forbidden everywhere — the codebase has no
+//! boundary (§7) — and the `ztls` import to `src/tls/`, the one C-crypto
+//! surface behind its own wrapper (§4). `@cImport` is forbidden
+//! everywhere — the codebase has no
 //! C-FFI dependency (§4). Runs as `zig build lint` with the source root as
 //! its single argument.
 
@@ -81,6 +83,8 @@ fn lintFile(
     const is_main = std.mem.eql(u8, path, "main.zig");
     const is_http_parser = std.mem.eql(u8, path, "http/parser.zig") or
         std.mem.eql(u8, path, "http" ++ std.fs.path.sep_str ++ "parser.zig");
+    const is_tls = std.mem.startsWith(u8, path, "tls/") or
+        std.mem.startsWith(u8, path, "tls" ++ std.fs.path.sep_str);
 
     const contents = try root.readFileAlloc(io, path, arena, .limited(file_bytes_max));
     assert(contents.len < file_bytes_max);
@@ -90,7 +94,7 @@ fn lintFile(
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |line| {
         line_number += 1;
-        if (lintLine(line, in_io_directory, is_main, is_http_parser)) |message| {
+        if (lintLine(line, in_io_directory, is_main, is_http_parser, is_tls)) |message| {
             std.debug.print("{s}:{d}: {s}\n", .{ path, line_number, message });
             violation_count += 1;
         }
@@ -105,12 +109,16 @@ fn lintLine(
     in_io_directory: bool,
     is_main: bool,
     is_http_parser: bool,
+    is_tls: bool,
 ) ?[]const u8 {
     if (std.mem.indexOf(u8, line, "@cImport") != null) {
-        return "@cImport is forbidden: no C-FFI dependency (DESIGN.md §4)";
+        return "@cImport is forbidden: C bindings live inside ztls (DESIGN.md §4)";
     }
     if (!is_http_parser and std.mem.indexOf(u8, line, "@import(\"hparse\")") != null) {
         return "hparse is imported only by src/http/parser.zig — the trust boundary (DESIGN.md §7)";
+    }
+    if (!is_tls and std.mem.indexOf(u8, line, "@import(\"ztls\")") != null) {
+        return "ztls is imported only under src/tls/ — the C-crypto boundary (DESIGN.md §4)";
     }
     if (in_io_directory) {
         return null;
@@ -164,33 +172,40 @@ fn startsWithAllowedMember(member: []const u8) bool {
 }
 
 test "lintLine: raw syscalls flagged outside io, allowed inside" {
-    try std.testing.expect(lintLine("const x = std.posix.socket();", false, false, false) != null);
-    try std.testing.expect(lintLine("const x = std.os.linux.close(fd);", false, false, false) != null);
-    try std.testing.expect(lintLine("const x = std.posix.socket();", true, false, false) == null);
-    try std.testing.expect(lintLine("const clean = a + b;", false, false, false) == null);
+    try std.testing.expect(lintLine("const x = std.posix.socket();", false, false, false, false) != null);
+    try std.testing.expect(lintLine("const x = std.os.linux.close(fd);", false, false, false, false) != null);
+    try std.testing.expect(lintLine("const x = std.posix.socket();", true, false, false, false) == null);
+    try std.testing.expect(lintLine("const clean = a + b;", false, false, false, false) == null);
 }
 
 test "lintLine: main.zig allowlist admits rlimit and sigaction only" {
-    try std.testing.expect(lintLine("try std.posix.setrlimit(.NOFILE, limits);", false, true, false) == null);
-    try std.testing.expect(lintLine("std.posix.sigaction(.TERM, &action, null);", false, true, false) == null);
-    try std.testing.expect(lintLine("_ = std.posix.setsockopt(fd, 0, 0, &opt);", false, true, false) != null);
+    try std.testing.expect(lintLine("try std.posix.setrlimit(.NOFILE, limits);", false, true, false, false) == null);
+    try std.testing.expect(lintLine("std.posix.sigaction(.TERM, &action, null);", false, true, false, false) == null);
+    try std.testing.expect(lintLine("_ = std.posix.setsockopt(fd, 0, 0, &opt);", false, true, false, false) != null);
     // A comment mentioning SIG must not exempt a real forbidden call.
-    try std.testing.expect(lintLine("const s = std.posix.socket(); // closed on SIGTERM", false, true, false) != null);
+    try std.testing.expect(lintLine("const s = std.posix.socket(); // closed on SIGTERM", false, true, false, false) != null);
     // A forbidden call sharing a line with an allowed one is still caught.
-    try std.testing.expect(lintLine("std.posix.sigaction(x); std.posix.socket();", false, true, false) != null);
+    try std.testing.expect(lintLine("std.posix.sigaction(x); std.posix.socket();", false, true, false, false) != null);
     // std.os.linux.* is never allowlisted in main.zig.
-    try std.testing.expect(lintLine("_ = std.os.linux.close(fd);", false, true, false) != null);
+    try std.testing.expect(lintLine("_ = std.os.linux.close(fd);", false, true, false, false) != null);
 }
 
 test "lintLine: xev import and cImport boundaries" {
-    try std.testing.expect(lintLine("const xev = @import(\"xev\");", false, false, false) != null);
-    try std.testing.expect(lintLine("const xev = @import(\"xev\");", true, false, false) == null);
-    try std.testing.expect(lintLine("const c = @cImport({});", true, false, false) != null);
+    try std.testing.expect(lintLine("const xev = @import(\"xev\");", false, false, false, false) != null);
+    try std.testing.expect(lintLine("const xev = @import(\"xev\");", true, false, false, false) == null);
+    try std.testing.expect(lintLine("const c = @cImport({});", true, false, false, false) != null);
 }
 
 test "lintLine: hparse import is confined to the http parser wrapper" {
-    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", false, false, true) == null);
-    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", false, false, false) != null);
+    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", false, false, true, false) == null);
+    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", false, false, false, false) != null);
     // Not even src/io/ may reach around the wrapper.
-    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", true, false, false) != null);
+    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", true, false, false, false) != null);
+}
+
+test "lintLine: ztls import is confined to src/tls/" {
+    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", false, false, false, true) == null);
+    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", false, false, false, false) != null);
+    // Not even src/io/ may reach around the TLS wrapper.
+    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", true, false, false, false) != null);
 }

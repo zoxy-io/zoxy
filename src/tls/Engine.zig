@@ -1,13 +1,16 @@
-//! Phase 3a spike (PLANS.md): the zoxy-shaped seam over ztls's sans-I/O
-//! TLS 1.3 server. Proves the integration shape the production engine
-//! would take — static caller-owned buffers, key material injected as
-//! plain data (deterministic under the simulator), no allocation in the
-//! wrapper — without touching the serving path. Spike scope only: the
-//! production engine grows per-connection pooling, the §8 handshake
-//! budget, and constants.zig sizing.
+//! The Phase 3a TLS engine (DESIGN.md §4, PLANS.md): the zoxy-shaped seam
+//! over ztls's sans-I/O TLS 1.3 server. Static caller-owned buffers, key
+//! material injected as plain data (deterministic under the simulator),
+//! zero allocation in the wrapper (libcrypto's own allocations ride the
+//! fixed heap of slice 1). ~116 KiB per instance (IMPLEMENTATION_NOTES.md),
+//! so the serving path holds these in a shared `Pool`, not one per conn
+//! slot — that pooling, the §8 handshake budget, and the drive-API
+//! coupling to `Conn` land with the data-path slices (PLANS.md 3a 4–5);
+//! this module is the engine those slices drive, exercised until then by
+//! the spike and heap-proof tests.
 //!
-//! Ownership rules learned from the ztls API and encoded here so the
-//! production engine inherits them:
+//! Ownership rules the ztls API imposes, encoded here so callers inherit
+//! them:
 //! - `setCredentials` stores the chain *pointer*; the chain array must
 //!   outlive the handshake — it lives in the Engine, never a temporary.
 //! - `PrivateKey` wraps a libcrypto object; it must outlive the
@@ -33,6 +36,12 @@ record_storage: ztls.RecordBuffer.Storage,
 records: ztls.RecordBuffer,
 out: ztls.ServerHandshake.OutBuffer,
 flight: ztls.ServerHandshake.FlightBuffer,
+/// Caller-owned storage for reassembling a ClientHello fragmented across
+/// records. Without it ztls rejects a fragmented ClientHello with a
+/// decode_error alert (the upstream #36 robustness gap); with it the
+/// engine tolerates the split. Held for the handshake's life; unused
+/// after, but the engine is one object so it costs a field either way.
+reassembly: ztls.ServerHandshake.Storage,
 
 /// What a drive step asks the caller to do. Bytes borrow the engine's
 /// buffers and are valid only until the next engine call.
@@ -75,9 +84,11 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     errdefer engine.key.deinit();
     engine.key.deterministic_nonce = config.deterministic_nonce;
     engine.chain = .{config.cert_der};
+    engine.reassembly = .empty;
     engine.hs = .init(.{
         .keypairs = .init(keypair),
         .random = .init(config.random),
+        .reassembly = &engine.reassembly.buffer,
     });
     engine.hs.setCredentials(&engine.chain, engine.key.signer());
     engine.record_storage = .empty;
@@ -97,15 +108,21 @@ pub fn isConnected(engine: *const Engine) bool {
 }
 
 /// Feed ciphertext read off the wire; sink receives whatever the
-/// protocol produces (handshake flights, app data, close). The spike
-/// asserts the input fits the record buffer; the production engine
-/// turns that into backpressure.
+/// protocol produces (handshake flights, app data, close). Consumes all
+/// of `wire`: each iteration stages a chunk into the record buffer and
+/// drains every complete record, so the buffer's free space is reclaimed
+/// between chunks. ztls sizes the record buffer at two max records, so a
+/// single incomplete record can never fill it and `writable` stays
+/// non-empty — but that is the dependency's invariant, not ours, so a
+/// zero-progress step is surfaced as `error.RecordTooLarge` (a record the
+/// buffer cannot stage) rather than left to spin. Any error is the
+/// connection's: the caller tears down.
 pub fn feed(engine: *Engine, wire: []const u8, sink: Sink) !void {
     var remaining = wire;
     while (remaining.len > 0) {
         const writable = engine.records.writable();
-        assert(writable.len > 0); // Spike: input must fit; prod backpressures.
         const take = @min(writable.len, remaining.len);
+        if (take == 0) return error.RecordTooLarge;
         @memcpy(writable[0..take], remaining[0..take]);
         engine.records.advance(take);
         assert(remaining.len >= take);

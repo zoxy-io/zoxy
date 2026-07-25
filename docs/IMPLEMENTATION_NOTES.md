@@ -200,6 +200,30 @@ Spike findings, so they are not re-learned (src/tls/ on the
   counters will see it, hence the `CRYPTO_set_mem_functions`
   fixed-arena slice as 3a's first code slice.
 
+## TLS engine footprint — pool, don't embed (2026-07-25, slice 2)
+
+`@sizeOf(tls.Engine)` measured **~116 KiB** on the pinned toolchain,
+dominated by ztls's caller-owned buffers: `ServerHandshake` ~19 KiB,
+`RecordBuffer.Storage` ~33 KiB (2× a max wire record), `OutBuffer` and
+`FlightBuffer` ~16.6 KiB each, and the ClientHello reassembly buffer
+~32 KiB (`ch_reassembly_buffer_size` = 2× max plaintext, added this
+slice for the #36 fragmented-ClientHello fix). The `PrivateKey` is
+16 bytes (a libcrypto handle).
+
+Decision: the serving path holds engines in a **shared `Pool(Engine)`
+sized for concurrent TLS activity**, never one embedded per conn slot —
+116 KiB × the 14074 conn ceiling would be ~1.6 GiB, absurd, whereas the
+c10k pool memory today is ~251 MiB total (§5). This is the same
+memory-follows-activity decoupling as relay buffers: an engine is
+checked out when a TLS handshake starts and returned when the
+connection ends — and, once kTLS lands (Phase 3b), returned *at
+handshake completion*, since the kernel then owns the record layer and
+the ~66 KiB of record/out/flight buffers is dead weight held only for
+userspace records. The pool's ceiling and default, its comptime budget
+assertions, and the checkout/return wiring land with the handshake
+phase (slice 4), which is where the pool gets its first consumer; this
+note is the sizing input so that slice does not re-derive it.
+
 ## The concurrency ceiling is CQ-bound (95d1f8f)
 
 Concurrent L4 connections are bound by the io_uring completion queue,

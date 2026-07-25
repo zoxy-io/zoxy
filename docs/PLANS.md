@@ -41,15 +41,21 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
   ianic/tls.zig, pure Zig, pinned at `5452baf` for 0.16 — its gap is
   server-side resumption (survey verdicts in IMPLEMENTATION_NOTES.md).
   The remaining gate, in slice order — each behind all four §9 gates:
-  1. **libcrypto allocation interposition** — `CRYPTO_set_mem_functions`
-     into a fixed startup arena (helper lives on the fork so zoxy's tree
-     declares no C symbol); the zero-alloc gate extended over a TLS
-     handshake. The one slice with real unknown-unknowns.
-  2. **Engine productionization** — measured per-conn footprint into
-     `constants.zig` (pool-vs-embed decision), backpressure replacing
-     the spike's fits-assert, the ClientHello reassembly buffer, the
-     drive-API settle (sink vs pull) against `Conn`, and the ztls
-     import boundary added to the lint.
+  1. **libcrypto allocation interposition** — *landed:* the fork's
+     `mem_hooks` (`CRYPTO_set_mem_functions`) plus zoxy's fixed
+     segregated-fits heap (`src/tls/libcrypto_heap.zig`), proven by a
+     handshake-on-the-heap test (`tls-heap-proof`). The universal
+     no-mmap-after-init claim rides the zero-alloc syscall gate once TLS
+     joins the serving path (slices 4–5).
+  2. **Engine productionization** — *landed:* the ~116 KiB footprint
+     measured and the pool-not-embed decision recorded
+     (IMPLEMENTATION_NOTES.md); real backpressure (a zero-progress feed
+     is `error.RecordTooLarge`, never a ReleaseFast spin); the
+     ClientHello reassembly buffer (ztls #36, test-verified meaningful);
+     the ztls import boundary in the lint. *Deferred to slice 4* (where
+     they get a first consumer): the `Pool(Engine)` and its
+     `constants.zig` budget, and the drive-API settle (sink vs pull)
+     against `Conn`.
   3. **Config + startup cert loading** — a per-listener `tls` block
      into the config arena; schema metadata; one cert per listener
      (SNI multi-cert deferred).
