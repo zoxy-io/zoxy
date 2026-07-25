@@ -25,6 +25,7 @@ const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
+const TlsEngine = @import("tls/Engine.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -40,6 +41,12 @@ pub fn Server(comptime IoType: type) type {
         /// The shared upstream connection pool (§3, §5): leased per L7
         /// exchange today; parking joins with keep-alive.
         upstreams: upstream_module.UpstreamPool(IoType),
+        /// TLS engines (§4): shared, not one per conn slot — an engine is
+        /// ~116 KiB, so the pool is sized for concurrent TLS activity and
+        /// checkout failure is its own shed rung. Disabled (zero slots)
+        /// unless a listener terminates TLS, so a plain-TCP deployment
+        /// reserves nothing.
+        tls_engines: Pool(TlsEngine),
         listeners: []ListenerState,
         listeners_count: u16,
         /// The load-balancing policy: resolves a cluster to the endpoint to
@@ -130,6 +137,10 @@ pub fn Server(comptime IoType: type) type {
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
             try server.upstreams.init(arena, options.upstream_slots);
+            // Reserves the engine *memory* only; a slot becomes a live
+            // engine at `Engine.init` on checkout. Zero when no listener
+            // terminates TLS, which disables the pool (§4).
+            try server.tls_engines.init(arena, options.tls_engines);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
             server.balancer.init(config);

@@ -46,6 +46,10 @@ pub const Config = struct {
         conn_slots: u32 = constants.conn_slots_default,
         relay_buffers: u32 = constants.relay_buffers_default,
         upstream_slots: u32 = constants.upstream_slots_default,
+        /// Concurrent TLS connections (§4). Zero — the default when no
+        /// listener carries a `tls` block — disables the engine pool, so
+        /// a plain-TCP deployment reserves none of its ~116 KiB slots.
+        tls_engines: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -159,6 +163,8 @@ pub const ValidationError = error{
     LimitUpstreamSlotsOutOfRange,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
+    LimitTlsEnginesOutOfRange,
+    LimitTlsEnginesWithoutTlsListener,
     AdminBindInvalid,
     TlsCertPathEmpty,
     TlsKeyPathEmpty,
@@ -179,7 +185,11 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     const clusters = try resolveClusters(arena, &parsed.clusters);
     const listeners = try resolveListeners(arena, parsed.listeners, clusters);
     try validateTimeouts(&parsed.timeouts);
-    const limits = try resolveLimits(&parsed.limits, @intCast(listeners.len));
+    const limits = try resolveLimits(
+        &parsed.limits,
+        @intCast(listeners.len),
+        anyListenerTerminatesTls(listeners),
+    );
     const admin_bind = try resolveAdminBind(parsed.admin);
 
     assert(listeners.len >= 1);
@@ -210,7 +220,20 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 /// relay-buffer count derives from the effective conn slots (a buffer
 /// beyond the slot count could never be acquired); a *specified* count
 /// above them is a contradiction and fails loudly.
-fn resolveLimits(limits_json: *const LimitsJson, listeners_count: u32) ValidationError!Config.Limits {
+/// Whether anything in this config terminates TLS — the input that
+/// decides if the engine pool is sized at all (§4).
+fn anyListenerTerminatesTls(listeners: []const Config.Listener) bool {
+    for (listeners) |listener| {
+        if (listener.tls != null) return true;
+    }
+    return false;
+}
+
+fn resolveLimits(
+    limits_json: *const LimitsJson,
+    listeners_count: u32,
+    tls_listeners: bool,
+) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     // Omitted limits default to the lean out-of-box sizes, not the
     // compiled ceilings (§5): a small footprint unless the operator opts
@@ -232,6 +255,18 @@ fn resolveLimits(limits_json: *const LimitsJson, listeners_count: u32) Validatio
     if (upstream_slots < 1 or upstream_slots > constants.upstream_slots_max) {
         return error.LimitUpstreamSlotsOutOfRange;
     }
+    // TLS engines are the one pool whose default depends on the rest of
+    // the config: with no TLS listener there is nothing to serve, so the
+    // pool is disabled (zero) and reserves nothing. Naming a count
+    // without a TLS listener is a config mistake, not a silent no-op.
+    const tls_engines = if (limits_json.tls_engines) |named| blk: {
+        if (!tls_listeners) return error.LimitTlsEnginesWithoutTlsListener;
+        if (named < 1 or named > constants.tls_engines_max) {
+            return error.LimitTlsEnginesOutOfRange;
+        }
+        break :blk named;
+    } else if (tls_listeners) constants.tls_engines_default else 0;
+
     // The CQ fill is the one limit an operator tightens for headroom, not a
     // pool shrink (§8): a smaller fill demands a deeper ring for the same
     // conn slots. Range-check first, then reject a fill that — with these
@@ -249,6 +284,7 @@ fn resolveLimits(limits_json: *const LimitsJson, listeners_count: u32) Validatio
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
         .upstream_slots = upstream_slots,
+        .tls_engines = tls_engines,
         .cq_fill_eighths = cq_fill_eighths,
     };
 }
@@ -305,6 +341,7 @@ pub const LimitsJson = struct {
     conn_slots: ?u32 = null,
     relay_buffers: ?u32 = null,
     upstream_slots: ?u32 = null,
+    tls_engines: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
 
     pub const schema_doc =
@@ -326,6 +363,12 @@ pub const LimitsJson = struct {
             .desc = "Shared upstream connection slots.",
             .minimum = 1,
             .maximum = constants.upstream_slots_max,
+        },
+        .tls_engines = .{
+            .desc = "Concurrent TLS connections (engine pool). Only meaningful " ++
+                "with a tls listener; a config with none reserves no engines.",
+            .minimum = 1,
+            .maximum = constants.tls_engines_max,
         },
         .cq_fill_eighths = .{
             .desc = "Eighths of the io_uring completion queue the worst-case " ++
@@ -1340,6 +1383,77 @@ test "config: an empty cert or key path in a tls block is rejected" {
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
         try std.testing.expectError(case[1], parse(arena_state.allocator(), json));
+    }
+}
+
+test "config: the tls engine pool is sized only when a listener terminates TLS" {
+    // No TLS listener: the pool is disabled, so a plain deployment
+    // reserves none of the ~116 KiB engine slots.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.tls_engines);
+    }
+    // A TLS listener with no named count takes the default.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a",
+            \\   "tls":{"cert":"/c","key":"/k"}}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(constants.tls_engines_default, parsed.limits.tls_engines);
+    }
+    // An explicit count wins.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a",
+            \\   "tls":{"cert":"/c","key":"/k"}}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "limits":{"tls_engines":8},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(u32, 8), parsed.limits.tls_engines);
+    }
+}
+
+test "config: a tls_engines count is rejected out of range or without TLS" {
+    // Out of range on both sides, with a TLS listener present.
+    inline for (.{ "0", "99999" }) |count| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"," ++
+            "\"tls\":{\"cert\":\"/c\",\"key\":\"/k\"}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"limits\":{\"tls_engines\":" ++ count ++ "}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+        try std.testing.expectError(
+            ParseError.LimitTlsEnginesOutOfRange,
+            parse(arena_state.allocator(), json),
+        );
+    }
+    // Naming a count with nothing to serve is a mistake, not a no-op.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        try std.testing.expectError(
+            ParseError.LimitTlsEnginesWithoutTlsListener,
+            parse(arena_state.allocator(),
+                \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+                \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+                \\ "limits":{"tls_engines":8},
+                \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            ),
+        );
     }
 }
 

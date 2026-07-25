@@ -231,6 +231,8 @@ fn printBudgets(
         @sizeOf(zoxy.RelayBuffer),
         limits.upstream_slots,
         @sizeOf(UpstreamType),
+        limits.tls_engines,
+        @sizeOf(zoxy.tls.Engine),
     );
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
@@ -238,7 +240,7 @@ fn printBudgets(
     try writer.print(
         \\zoxy budgets (closed-form, DESIGN.md §5/§8):
         \\  memory  pools {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
-        \\          + upstream slots {d} x {d} B
+        \\          + upstream slots {d} x {d} B + tls engines {d} x {d} B
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
         \\  config  {d} listener(s), {d} cluster(s)
@@ -251,6 +253,8 @@ fn printBudgets(
         @sizeOf(zoxy.RelayBuffer),
         limits.upstream_slots,
         @sizeOf(UpstreamType),
+        limits.tls_engines,
+        @sizeOf(zoxy.tls.Engine),
         fds_required,
         constants.ring_entries,
         cq_entries,

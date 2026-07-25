@@ -29,6 +29,12 @@ const assert = std.debug.assert;
 
 const Engine = @This();
 
+/// `Pool` slot bookkeeping (§5): the intrusive free-list link and the
+/// generation counter that catches a stale reference into a recycled
+/// engine. Owned by the pool, never touched by the engine itself.
+pool_next: u32,
+generation: u32,
+
 hs: ztls.ServerHandshake,
 record_storage: ztls.RecordBuffer.Storage,
 records: ztls.RecordBuffer,
