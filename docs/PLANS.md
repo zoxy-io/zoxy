@@ -129,6 +129,28 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
        touches the proven L4 and L7 paths.
      - A parallel TLS relay beside `relay.zig`. Leaves the proven paths
        alone at the cost of a second loop to keep honest.
+     *Settled:* the transform seam. The deferral condition ("worth doing
+     once TLS is proven") is met — TLS is proven on L4 — and the L7 body
+     legs run through `pump.zig`, so the alternative is a *third* copy of
+     the recv→send discipline. Duplication is what made the L4 bugs easy
+     to write; one mechanism with three users beats three mechanisms.
+
+     The seam itself **already exists on main** — the prefactoring
+     landed it as B1/B5 (`pump.zig`: `recvBuffer`, `transformIn`,
+     `transformOut`, `sendSlice`, `creditSend`, identity by default via
+     `@hasDecl`), so this slice hooks the TLS transforms onto a seam it
+     no longer has to build. Two things main's version settled that this
+     plan had left open:
+     - The write-side double-count ("the one place the refactor is not
+       mechanical, where a wrong move silently corrupts the byte stream
+       rather than failing loudly") is `creditSend`: ciphertext credits
+       the transform's own cursor, plaintext the framed debt, and the
+       pump asserts the debt is settled by the time `sendSlice` empties.
+     - A transform may yield **nothing** from a read — a fragment of a
+       record it can only decode whole. The pump re-arms the read and
+       asserts nothing is owed across it. TLS meets this on its first
+       split record; without the branch it is an assertion failure, not
+       a wrong answer.
      *Landed:* the parallel relay (`net/tls_relay.zig`), L4 only — the
      L7 head-read over decrypted bytes is still owed. Two bugs the
      shape made easy, both remotely triggerable, both now gated:

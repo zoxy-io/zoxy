@@ -12,10 +12,11 @@
 //!   client → upstream:  recv ciphertext (head) → decrypt → send plaintext
 //!   upstream → client:  recv plaintext (relay) → encrypt → send ciphertext
 //!
-//! Unifying the two loops means teaching the pump that recv and send
-//! buffers can differ; worth doing once TLS is proven, and deliberately
-//! not attempted while the L4 and L7 paths depend on the pump unchanged
-//! (PLANS.md).
+//! That reason has since expired: `pump.zig` grew exactly this seam
+//! (`recvBuffer`/`transformIn`/`transformOut`/`sendSlice`/`creditSend`,
+//! identity for every plain user), so a TLS policy on the shared pump is
+//! now possible and this loop is the duplicate. Folding it in is its own
+//! slice — the seam arrived after this code did (PLANS.md).
 //!
 //! Invariants carried over from `relay.zig`: exactly one op armed per
 //! direction, so the ring budget is the same; a peer's EOF half-closes
