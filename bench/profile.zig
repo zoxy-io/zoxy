@@ -19,6 +19,8 @@ const Io = std.Io;
 
 const affinity = @import("affinity.zig");
 const zrk = @import("zrk");
+const zio = @import("zio");
+const spawn_path = @import("spawn_path.zig");
 
 const assert = std.debug.assert;
 
@@ -61,7 +63,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     const arena = init.arena.allocator();
-    const io = init.io;
+    // See bench/run.zig: zrk's runner needs zio's Io (connect-with-timeout
+    // isn't implemented on the default std.Io.Threaded backend), so the
+    // profiler builds the same zio.Runtime zrk's own CLI would.
+    const rt = try zio.Runtime.init(arena, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const environ = init.minimal.environ;
     const args = try init.minimal.args.toSlice(arena);
     const flags = try parseFlags(args);
 
@@ -74,7 +82,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `dedicate` yields null.
     const zoxy_cpu = affinity.dedicate(io, flags.zoxy_cpu).?;
 
-    var origin_child = try spawnNginx(arena, io);
+    var origin_child = try spawnNginx(arena, io, environ);
     defer origin_child.kill(io);
 
     var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path);
@@ -91,7 +99,7 @@ pub fn main(init: std.process.Init) !u8 {
     );
 
     // Record only the zoxy pid for the load's duration while zrk saturates it.
-    var perf_child = try spawnPerf(arena, io, zoxy_pid, &flags);
+    var perf_child = try spawnPerf(arena, io, environ, zoxy_pid, &flags);
     std.debug.print(
         "profile: measuring {d}s at {d} req/s over {d} connections\n",
         .{ flags.duration_s, flags.rate, flags.connections },
@@ -104,8 +112,8 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     printReport(&report);
-    try generateFlamegraph(arena, io);
-    try printTopSymbols(io);
+    try generateFlamegraph(arena, io, environ);
+    try printTopSymbols(arena, io, environ);
 
     // Drain, not just death (§8): SIGTERM and wait for the clean exit.
     try std.posix.kill(zoxy_pid, .TERM);
@@ -166,7 +174,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
 
 // --- process orchestration --------------------------------------------------
 
-fn spawnNginx(arena: std.mem.Allocator, io: Io) !std.process.Child {
+fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !std.process.Child {
     const prefix = work_directory ++ "/nginx";
     try Io.Dir.cwd().createDirPath(io, prefix ++ "/logs");
     const conf_path = prefix ++ "/profile.conf";
@@ -187,8 +195,9 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io) !std.process.Child {
     , .{origin_port});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = conf });
 
+    const nginx_bin = try spawn_path.resolve(arena, io, environ, "nginx");
     return std.process.spawn(io, .{
-        .argv = &.{ "nginx", "-p", prefix, "-c", "profile.conf" },
+        .argv = &.{ nginx_bin, "-p", prefix, "-c", "profile.conf" },
         .stdout = .ignore,
         .stderr = .inherit,
     }) catch |err| {
@@ -231,6 +240,7 @@ fn spawnZoxy(
 fn spawnPerf(
     arena: std.mem.Allocator,
     io: Io,
+    environ: std.process.Environ,
     zoxy_pid: std.process.Child.Id,
     flags: *const Flags,
 ) !std.process.Child {
@@ -240,11 +250,12 @@ fn spawnPerf(
     const pid = try std.fmt.allocPrint(arena, "{d}", .{zoxy_pid});
     const freq = try std.fmt.allocPrint(arena, "{d}", .{flags.freq});
     const seconds = try std.fmt.allocPrint(arena, "{d}", .{flags.duration_s});
+    const perf_bin = try spawn_path.resolve(arena, io, environ, "perf");
     return std.process.spawn(io, .{
         .argv = &.{
-            "perf", "record", "-p",           pid,   "-e", "cycles:u",
-            "-F",   freq,     "--call-graph", "lbr", "-o", perf_data_path,
-            "--",   "sleep",  seconds,
+            perf_bin, "record", "-p",           pid,   "-e", "cycles:u",
+            "-F",     freq,     "--call-graph", "lbr", "-o", perf_data_path,
+            "--",     "sleep",  seconds,
         },
         .stdout = .ignore,
         .stderr = .inherit,
@@ -309,11 +320,10 @@ fn printReport(report: *const zrk.runner.Report) void {
 
 // --- flamegraph pipeline (file-redirected children, no shell pipe) ----------
 
-fn generateFlamegraph(arena: std.mem.Allocator, io: Io) !void {
-    _ = arena;
-    try runToFile(io, &.{ "perf", "script", "-i", perf_data_path }, script_path);
-    try runToFile(io, &.{ "stackcollapse-perf.pl", script_path }, folded_path);
-    try runToFile(io, &.{
+fn generateFlamegraph(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !void {
+    try runToFile(arena, io, environ, &.{ "perf", "script", "-i", perf_data_path }, script_path);
+    try runToFile(arena, io, environ, &.{ "stackcollapse-perf.pl", script_path }, folded_path);
+    try runToFile(arena, io, environ, &.{
         "flamegraph.pl", "--title",
         "zoxy under load (cycles:u, LBR call-graph) — see run for path",
         folded_path,
@@ -323,12 +333,23 @@ fn generateFlamegraph(arena: std.mem.Allocator, io: Io) !void {
 
 /// Spawn `argv` with stdout redirected to `out_path` — the Zig stand-in for a
 /// shell `argv > out_path`. Each flamegraph stage reads a file arg and writes
-/// its stage output, so no inter-process pipe is needed.
-fn runToFile(io: Io, argv: []const []const u8, out_path: []const u8) !void {
+/// its stage output, so no inter-process pipe is needed. argv[0] is resolved
+/// against $PATH ourselves (see spawn_path.zig: zio doesn't do it for a bare
+/// name the way the default std.Io.Threaded backend does).
+fn runToFile(
+    arena: std.mem.Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    argv: []const []const u8,
+    out_path: []const u8,
+) !void {
+    assert(argv.len > 0);
     const out = try Io.Dir.cwd().createFile(io, out_path, .{});
     defer out.close(io);
+    const resolved_argv = try arena.dupe([]const u8, argv);
+    resolved_argv[0] = try spawn_path.resolve(arena, io, environ, argv[0]);
     var child = std.process.spawn(io, .{
-        .argv = argv,
+        .argv = resolved_argv,
         .stdout = .{ .file = out },
         .stderr = .ignore,
     }) catch |err| {
@@ -342,8 +363,8 @@ fn runToFile(io: Io, argv: []const []const u8, out_path: []const u8) !void {
     }
 }
 
-fn printTopSymbols(io: Io) !void {
-    runToFile(io, &.{
+fn printTopSymbols(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !void {
+    runToFile(arena, io, environ, &.{
         "perf",    "report",        "-i", perf_data_path,
         "--stdio", "--no-children", "-g", "none",
     }, report_path) catch return;

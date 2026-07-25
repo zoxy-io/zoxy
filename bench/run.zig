@@ -11,6 +11,14 @@
 //! so every run also exercises the drain path. Core pinning is
 //! deliberately left to the caller (taskset) until the CI band policy
 //! needs it.
+//!
+//! zrk's runner calls io.net.connect with a timeout; the default
+//! std.Io.Threaded backend (init.io) still stubs that path with a TODO
+//! panic, so the harness drives zrk off its own zio.Runtime instead — the
+//! same runtime zrk's own CLI (main.zig) constructs for itself. Single
+//! executor: this call is synchronous per scenario, and the dedicated-core
+//! split below already reserves everything but the proxy's core for this
+//! process.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -18,6 +26,8 @@ const Io = std.Io;
 
 const affinity = @import("affinity.zig");
 const zrk = @import("zrk");
+const zio = @import("zio");
+const spawn_path = @import("spawn_path.zig");
 
 const assert = std.debug.assert;
 
@@ -74,24 +84,25 @@ const close_headers = [_]zrk.cli.Header{.{ .name = "Connection", .value = "close
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
-    const io = init.io;
+    const rt = try zio.Runtime.init(arena, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const environ = init.minimal.environ;
     const args = try init.minimal.args.toSlice(arena);
     const flags = try parseFlags(args);
 
     try Io.Dir.cwd().createDirPath(io, work_directory);
 
     // Dedicate one core to the proxy under test and pin this process (its
-    // zrk load threads) and the inherited origin off it, so the bands
-    // measure the proxy rather than its contention with the generator,
-    // and match zoxy's one-loop-per-core topology (§3). Both proxies are
-    // pinned to the same core: the scenarios run sequentially, so only
-    // one is ever under load, and the idle one burns no cycles. Pin self
-    // before spawning so children inherit the "everything else" mask.
+    // zrk load threads) and the inherited origin off it, so bands measure
+    // the proxy, not contention with the generator (§3). Both proxies
+    // share that core since scenarios run sequentially; pinning happens
+    // before spawning so children inherit the mask.
     const proxy_cpu = affinity.dedicate(io, null);
 
     var origin_child: ?std.process.Child = null;
     const origin_address = flags.origin orelse spawn_origin: {
-        origin_child = try spawnNginx(arena, io);
+        origin_child = try spawnNginx(arena, io, environ);
         break :spawn_origin try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{origin_port});
     };
     // kill() blocks until the child dies and reaps it (and sets id null),
@@ -103,7 +114,7 @@ pub fn main(init: std.process.Init) !u8 {
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
 
-    var haproxy_child = try spawnHaproxy(arena, io, origin_address);
+    var haproxy_child = try spawnHaproxy(arena, io, environ, origin_address);
     defer haproxy_child.kill(io);
 
     if (proxy_cpu) |cpu| {
@@ -396,7 +407,7 @@ fn originPortOf(origin_address: []const u8) u16 {
     return address.getPort();
 }
 
-fn spawnNginx(arena: std.mem.Allocator, io: Io) !std.process.Child {
+fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !std.process.Child {
     const prefix = work_directory ++ "/nginx";
     try Io.Dir.cwd().createDirPath(io, prefix ++ "/logs");
     const conf_path = prefix ++ "/bench.conf";
@@ -417,8 +428,9 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io) !std.process.Child {
     , .{origin_port});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = conf });
 
+    const nginx_bin = try spawn_path.resolve(arena, io, environ, "nginx");
     return std.process.spawn(io, .{
-        .argv = &.{ "nginx", "-p", prefix, "-c", "bench.conf" },
+        .argv = &.{ nginx_bin, "-p", prefix, "-c", "bench.conf" },
         .stdout = .ignore,
         .stderr = .inherit,
     }) catch |err| {
@@ -482,6 +494,7 @@ fn spawnZoxy(
 fn spawnHaproxy(
     arena: std.mem.Allocator,
     io: Io,
+    environ: std.process.Environ,
     origin_address: []const u8,
 ) !std.process.Child {
     const conf_path = work_directory ++ "/haproxy.conf";
@@ -510,8 +523,9 @@ fn spawnHaproxy(
 
     // -db keeps haproxy in the foreground so kill() reaches the process
     // itself, not a forked-off daemon.
+    const haproxy_bin = try spawn_path.resolve(arena, io, environ, "haproxy");
     return std.process.spawn(io, .{
-        .argv = &.{ "haproxy", "-db", "-f", conf_path },
+        .argv = &.{ haproxy_bin, "-db", "-f", conf_path },
         .stdout = .ignore,
         .stderr = .inherit,
     }) catch |err| {

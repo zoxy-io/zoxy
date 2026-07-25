@@ -140,6 +140,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseFast,
     });
+    // zrk embeds its load off a zio (io_uring) runtime rather than the
+    // default std.Io.Threaded backend, so the harness must build its own
+    // zio.Runtime to drive zrk's runner (bench/run.zig, bench/profile.zig).
+    const zio_dependency = b.dependency("zio", .{
+        .target = target,
+        .optimize = std.builtin.OptimizeMode.ReleaseFast,
+    });
     // The ReleaseFast zoxy shared by the bench and the profiler, with its
     // own ReleaseFast hparse instance (SIMD, not scalarized).
     const hparse_fast_dependency = b.dependency("hparse", .{
@@ -175,6 +182,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
+                .{ .name = "zio", .module = zio_dependency.module("zio") },
             },
         }),
     });
@@ -227,6 +235,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
+                .{ .name = "zio", .module = zio_dependency.module("zio") },
             },
         }),
     });
