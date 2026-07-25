@@ -157,6 +157,95 @@ unshipped. No other production-credible pure-Zig TLS 1.3 server
 exists as of the scan; Geun-Oh/zigtls is aimed the right way but
 0.1.0-dev — watch-list only.
 
+## TLS on the loop — the band that retired the worker pool (2026-07-25)
+
+Measured on the `phase-3a-ztls` branch (ztls engine, ECDSA P-256 fixture
+cert, one core each side, both proxies terminating the *same* certificate
+in front of the same plaintext origin, so the added pair isolates
+termination cost). This is the evidence DESIGN §3 rests on when it
+deletes the CPU-worker seam rather than deferring it.
+
+Steady state — keep-alive, the shape a real HTTPS front end runs in:
+
+| | req/s | p50 | p90 | p99 |
+|---|---|---|---|---|
+| zoxy L7 + TLS | 19970 | 110 µs | 174 µs | 1374 µs |
+| haproxy https | 19960 | 101 µs | 151 µs | 1043 µs |
+
+Parity. A terminated hop on one thread is not the bottleneck at 20k
+req/s, and nothing about that number wants another thread.
+
+Handshake-bound — `Connection: close`, one full handshake per request,
+neither side resuming (zrk has no session resumption yet):
+
+| | req/s | p50 |
+|---|---|---|
+| zoxy L7 + TLS | 712 | 3240 ms |
+| haproxy https | 1897 (of 2000 offered — never saturated) | 724 µs |
+
+Recorded honestly: this gap is **unexplained**, and it is the one number
+that argues the other way. The handshake profile (`zig build profile
+--protocol https`, sampling zoxy alone) accounts for ~13% of zoxy-side
+overhead, not a 2.7× deficit — X25519 ~25%, P-256 ECDSA ~12%, ML-KEM
+~10% (zoxy and haproxy negotiate the same X25519MLKEM768 group against
+this client, so both pay it), `memset` 11.2% (ztls `secureZero`; bounding
+it moved the share to 10.1% and throughput not at all — see below),
+SHA-256 in Zig 2.4%. So ~712 handshakes/s is ~1.4 ms of wall time each
+against ~100–400 µs of crypto, and the rest is unaccounted.
+
+What it does *not* argue for is threads. The work is asymmetric crypto,
+which a worker thread does not make cheaper per handshake; it only adds
+cores, and process-per-core behind SO_REUSEPORT (§3) adds the same cores
+without a shared-memory concurrency model. The in-tree levers are
+session resumption (stateless tickets, landed on the branch — µs-class
+for returning clients) and finding whatever the unaccounted wall time is.
+
+Two caveats on the close-mode number specifically, both worth clearing
+before treating it as a ceiling:
+
+- It was taken **before** the TLS-engine default followed conn slots. A
+  later, higher-concurrency run read as "13× slower than haproxy" and
+  was not slower at all: 261,322 of 261,579 accepts were shed at the
+  engine rung (default 256 engines against 1386 advertised conn slots),
+  so the load generator ran with most of its connections dead. The
+  712 req/s run passed the sub-1% socket-error gate, so it was not
+  shedding — but the close-mode band is owed a re-measure on the fixed
+  default regardless.
+- The §9 health gates check socket and status errors, not achieved rate
+  against offered, so a run delivering 712 of 2000 req/s *passed* them.
+  Rate-versus-offered is not yet a gate.
+
+## Profile share is not throughput headroom — bounding a wipe (2026-07-25)
+
+Same profile: `compiler_rt.memset` at 11.2% of zoxy's CPU, ~84% of it
+traced to ztls's `secureZero` on teardown — dominated by `fin_frag`, a
+16 KiB buffer reserved against a client-auth flight we never request and
+wiped in full on every handshake (16386 of the 18269 bytes `deinit`
+zeroed). Bounding the wipe to a high-water mark **did not change
+handshake throughput**, three runs each on saturated close-mode load:
+
+- before: 710 / 712 / 712 req/s, memset 11.2%
+- after: 709 / 709 / 710 req/s, memset 10.1%
+
+The share moves as predicted; the throughput does not, because the
+handshake is bounded by asymmetric crypto (~47% of the profile), not by
+the zeroing. **A symbol's share of samples is what it costs while
+running, not what removing it buys** — the same number only when that
+symbol is the bottleneck. The change was kept (it is correct and does
+strictly less work), but it is not a lever.
+
+Two process notes, both paid for:
+
+- An intermediate measurement through a `.path` dependency override read
+  733 / 733 req/s for code that measures 709 / 709 / 710 through the
+  pinned `.url`. The build mechanism, not the code. Trust numbers from
+  the shipped configuration.
+- A first attempt put the high-water mark inside `ArrayBuffer` itself,
+  taxing every append to benefit one buffer: 633 req/s, an 11%
+  regression — caught only because the baseline had been measured three
+  times and was stable to ±2 req/s. Measure the baseline's variance
+  before believing a delta.
+
 ## The concurrency ceiling is CQ-bound (95d1f8f)
 
 Concurrent L4 connections are bound by the io_uring completion queue,

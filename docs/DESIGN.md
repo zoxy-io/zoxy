@@ -33,8 +33,9 @@ Goals, in priority order:
 3. **Minimal memory consumption.** Pools are *shared*, sized for concurrent
    *activity*, not for open-connection worst cases multiplied by core count
    (§5). Total memory is a closed-form function of `src/constants.zig`.
-4. **Simplicity.** One event loop, one ring, one writer for every pool.
-   Fewer moving parts than the previous iteration, not more.
+4. **Simplicity.** One thread, one event loop, one ring, one writer for
+   every pool — no worker threads, no cross-thread queues (§3). Fewer
+   moving parts than the previous iteration, not more.
 5. **L4 (TCP relay) and L7 (HTTP/1.1 reverse proxy)** serving, with
    keep-alive and shared upstream connection reuse.
 
@@ -49,6 +50,12 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
 - Multi-process orchestration, xDS, hot restart — until operability demands
   them (the previous iteration's Phase-4 machinery is a known-good recipe
   when they do).
+- **In-process worker threads and cross-thread job queues.** The design
+  reserved a CPU-worker seam for TLS handshakes; measurement retired it
+  (§3, settled 2026-07-25) and it is deleted, not dormant. The binary is
+  single-threaded and CPU scale-out is process-per-core behind
+  SO_REUSEPORT. Re-adding threads is a from-scratch decision behind a
+  measured gate ([PLANS.md](PLANS.md)), not un-commenting a seam.
 - Config reload. Config is parse-once immutable (§5); a change is a
   process restart — consistent with process-per-port scale-out (§3). Hot
   restart / drain-to-successor stays deferred ([PLANS.md](PLANS.md)).
@@ -56,42 +63,41 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   addresses resolved once at config load (§7); re-resolution waits for a
   demonstrated need.
 
-## 3. Topology — one loop, one ring, shared pools
+## 3. Topology — one thread, one loop, one ring, shared pools
 
-The user-visible promise: *one io_uring serves everything; workers exist
-only for CPU-heavy jobs; every pool is shared.*
+The user-visible promise: *one thread owns one io_uring and every pool;
+nothing else runs.*
 
 ```mermaid
 flowchart LR
-    subgraph loop_thread [event-loop thread - owns all I/O and all pools]
+    subgraph loop_thread [the only thread - owns all I/O and all pools]
         A[accept gate] --> L[libxev loop on one io_uring]
         L <--> P[shared pools: conn slots, relay buffers, upstream conns]
         L <--> T[per-connection deadline timers - absolute]
     end
     C[clients] --> A
-    subgraph cpu_workers [cpu worker threads - no sockets, no pools]
-        W1[worker 1]
-        WN[worker n]
-    end
-    L -- push --> J[bounded SPMC job queue]
-    J -- CAS pop --> W1
-    J -- CAS pop --> WN
-    W1 -- SPSC completion ring + xev.Async --> L
-    WN -- SPSC completion ring + xev.Async --> L
     L --> O[origin servers]
 ```
 
 **The decision.** One event-loop thread owns the single `io_uring` (via
-libxev) and performs *all* socket I/O: accepts, recvs, sends, connects,
-timers. A small, fixed set of CPU worker threads exists only for jobs
-that burn milliseconds of CPU; they never touch a socket, a pool, or the
-ring. The seam is designed here but activates only on evidence
-([PLANS.md](PLANS.md) Phase 3c): TLS handshakes — its original
-motivation — measured at ~100–400 µs in pure std.crypto with
-ECDSA/Ed25519 certs (IMPLEMENTATION_NOTES.md), cheap enough to run on
-the loop under a per-tick budget, so TLS lands single-threaded and the
-worker set stays empty until a workload outgrows that budget. Until
-then the binary is single-threaded.
+libxev) and performs *all* socket I/O — accepts, recvs, sends, connects,
+timers — and *all* CPU work, TLS handshakes included. There are no other
+threads: no worker pool, no job queue, no cross-thread completion rings.
+The design reserved that seam for TLS handshakes on a ~1–2 ms
+per-handshake estimate; that was an RSA number, so RSA server certs are
+excluded by policy (ECDSA only) and measurement retired the seam
+(settled 2026-07-25, IMPLEMENTATION_NOTES.md): a full ECDSA handshake is
+~100–400 µs of asymmetric crypto, and a terminated L7-over-TLS hop
+measured at HAProxy parity on steady-state keep-alive load — ~20k req/s,
+p50 110 µs against its 101 µs, one core each, same fixture certificate
+and origin. Handshake-heavy load is bounded by the asymmetric crypto
+itself (~47% of the handshake profile), so its levers are session
+resumption (µs-class for returning clients) and, past that, more cores —
+which this design buys as **N independent processes behind SO_REUSEPORT**,
+never as threads sharing pool memory. Single-threaded is a property of
+the design, not a phase of it; should a workload ever demand in-process
+parallelism, the re-entry gate in [PLANS.md](PLANS.md) treats it as a
+from-scratch decision.
 
 <details>
   <summary><b>Why this is the simplest topology that satisfies the goals</b></summary>
@@ -100,7 +106,7 @@ then the binary is single-threaded.
   acquires and releases pool slots, so pools need no locks, no atomics, no
   cache-line padding on the data path — plain code. The previous iteration
   spent a hardware-counter investigation earning this property; here it
-  holds by construction.
+  holds by construction — there is no second thread that could violate it.
 - **Minimal memory.** One shared pool sized for the global limit replaces
   N per-core pools each sized for a local worst case. Idle keep-alive
   connections hold a slot and a head buffer, not relay buffers (§5) —
@@ -126,13 +132,14 @@ traffic against tens of GB/s of per-core bandwidth. At 100 k req/s a
 request costs ~4–6 ring ops → ~500 k SQE/s, well inside a single ring's
 capability, batched one submit per loop tick. The previous iteration
 measured itself latency-bound with CPU headroom on the data path; the
-only CPU-heavy work is the TLS handshake — once estimated at ~1–2 ms
-(the RSA number that motivated the worker seam), since measured at
-~100–400 µs with ECDSA/Ed25519 certs (IMPLEMENTATION_NOTES.md), cheap
-enough for the loop itself under a per-tick budget. **Horizontal
+only CPU-heavy work is the TLS handshake, measured at ~100–400 µs with
+ECDSA certs and at HAProxy parity through the whole terminated hop in
+steady state (IMPLEMENTATION_NOTES.md). The loop absorbs it in steps
+between completions, and the worst single uninterruptible step — ~275 µs
+of P-256 sign — is what bounds tick inflation. **Horizontal
 scaling is N independent zoxy processes behind SO_REUSEPORT** —
 share-nothing at the process boundary, where the kernel actually
-isolates — not N loops in one process.
+isolates — not N loops, and not N worker threads, in one process.
 
 **Why not one ring per worker.** Ring-per-worker with *shared* pools is the
 hybrid to avoid: the moment several ring-owning threads acquire/release pool
@@ -160,47 +167,23 @@ honest cost: upstream connection reuse becomes per-process rather than
 global. It stays maximal within each process, and single-node deployments —
 the common case — keep the fully global reuse win.
 
-**Worker seam — one shared job queue, not per-worker queues.** Loop →
-workers: the **job queue**, one bounded SPMC ring (single producer: the
-loop; consumers: workers CAS-pop) of job descriptors — pointers into
-the requesting connection's slot, whose scratch memory is part of the slot,
-so enqueue allocates nothing. Workers futex-wait on the queue when empty.
-Worker → loop: a per-worker SPSC **completion ring** plus one `xev.Async`
-to wake the loop (completions stay single-producer/single-consumer, so
-that direction needs no CAS). A full job queue is an exhaustion signal
-like any other: the job is shed (§8), never blocked on.
-
-The trade study, since Pingora offers both shapes (per-worker queues with
-work stealing — the Go/Tokio runtime model — or one shared queue):
-
-- **Work stealing solves a problem we don't have.** Stealing pays off when
-  tasks *spawn tasks* on the worker they run on, creating local imbalance
-  that must be re-spread. Here every job originates from exactly one
-  producer (the loop) and spawns nothing; there is no locality to preserve
-  (a handshake job's cache lines live in the connection slot, foreign to
-  every worker equally) and nothing to steal back. Stealing would add the
-  hardest concurrency artifact in the design (Chase–Lev deques + the
-  victim-selection loop) for zero expected benefit.
-- **Per-worker SPSC without stealing is simpler but strands work:** the
-  loop must pick a worker at enqueue time, and a job pinned behind a slow
-  neighbour waits while other workers idle — head-of-line blocking that
-  turns into spurious sheds under the very burst (handshake storm) the
-  workers exist for. It also splits the exhaustion signal into N queue-full
-  conditions, muddying the shed ladder's single-choke-point property.
-- **One shared queue is the fit:** jobs are few and coarse (~ms-scale TLS
-  handshakes, not µs-scale tasks), so one CAS per pop is noise against the
-  job body; idle workers self-balance by construction (exactly the
-  behaviour the previous iteration had to *build* as `accept_mode=shared`
-  for accepts); and one queue = one depth = one shed rung. The known cost —
-  producer/consumer contention on the queue's cache lines — matters at
-  millions of tiny ops/s, two orders of magnitude past the handshake rate.
-  Determinism (§9) is untouched either way: workers are off the data path
-  and virtualized in the simulator.
-
-If profiling ever shows queue contention (it should not at handshake
-rates), the escape hatch is per-worker queues *fed round-robin by the
-loop* — still no stealing — traded knowingly for the head-of-line cost
-above.
+**Why no CPU worker threads.** This section used to specify a worker
+seam: one bounded SPMC job queue, per-worker SPSC completion rings, an
+`xev.Async` wake, and the parked-slot ownership rules that went with it
+in §5. It existed for exactly one workload — TLS handshakes — and the
+Phase-3a measurements took that workload away (above), so the seam is
+**deleted, not kept dormant.** A dormant design is not free: it leaves
+ownership rules in §5, a rung in §8, and a module in §10 that no code
+exercises and no gate proves, and every later change has to stay
+compatible with a mechanism that may never exist. What replaces it is
+policy: the binary has one thread, and CPU scale-out is process-per-core
+(above). The honest cost is that a sustained handshake storm cannot
+borrow an idle core in-process — the answers there are resumption first,
+more processes second, and neither needs a shared-memory concurrency
+model. The retired trade study (one shared queue vs per-worker queues vs
+work stealing, and why stealing solves a problem this design does not
+have) is in git history; re-adding threads means re-deriving it against
+the measurement that retired it ([PLANS.md](PLANS.md)).
 
 </details>
 
@@ -385,10 +368,9 @@ Rules:
 
 - **Pools never grow.** Exhaustion is a shed signal (§8), never a realloc.
 - **Limit relationships are comptime-asserted** in `src/constants.zig`
-  (TIGER_STYLE): e.g. `relay_buffers ≤ conn_slots`,
-  `worker_jobs_max ≤ conn_slots`. Note that `relay_buffers` — not conn
-  slots — is the true bound on concurrent L4 connections plus active L7
-  relays (§6).
+  (TIGER_STYLE): e.g. `relay_buffers_max ≤ conn_slots_max`, and the same
+  for the defaults. Note that `relay_buffers` — not conn slots — is the
+  true bound on concurrent L4 connections plus active L7 relays (§6).
 - **The CQ fill is a headroom knob, not a pool shrink.**
   `limits.cq_fill_eighths` sets how many eighths of the completion queue
   the worst-case in-flight ops may fill: ⅞ (the default, the fill the c10k
@@ -427,15 +409,13 @@ Rules:
   memory corruption — so slots carry a generation counter asserted on every
   completion delivery, and the simulator asserts no completion is ever
   delivered to a freed or reused slot (§9).
-- **No cross-thread sharing of pool memory.** Workers receive pointers
-  into a slot that is *parked* (no data I/O in flight) for the duration
-  of the job; ownership transfers through the job queue (loop → worker)
-  and that worker's completion ring (worker → loop), one owner at a time.
-  **A completion arriving for a parked slot never touches slot memory:**
-  the deadline timer stays armed on the loop, and its firing (or any
-  straggler completion) only sets a flag in the loop-owned slot header —
-  the state machine acts on flags when the job's completion returns
-  ownership. Teardown of a parked slot is deferred, never concurrent.
+- **Pool memory has exactly one owner, always.** With one thread in the
+  binary (§3) there is no cross-thread handoff to get right: no parked
+  slots, no ownership transfer, no flag protocol for completions that
+  arrive while another thread holds a slot. Single-writer pools are a
+  state the design cannot represent violating, not a rule the code has to
+  remember — which is why the worker seam was deleted rather than left
+  dormant (§3).
 
 ## 6. L4 data path — TCP relay
 
@@ -624,7 +604,6 @@ the loop thread.
 | relay buffers (L4) | accept admission | close immediately |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7) / close (L4) |
-| worker job queue | job enqueue | shed the job's connection (TLS handshake → close) |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
@@ -661,12 +640,14 @@ the loop thread.
   *work*; each engage crossing has a counter.
 - **Metrics witness every shed.** Every rung has a counter, written only
   by the loop thread as a relaxed atomic — one writer, any number of
-  readers, so a metrics/admin thread can read without a data race and
-  single-writer stays intact. The simulator asserts counters reconcile
-  (admitted = completed + shed + in-flight) under every seed. Counters
-  live in `counters.zig` (§10); Phase 0 exposure is a SIGUSR1-triggered
-  dump (through the seam's `signal` primitive, §4) — the admin plane
-  stays deferred ([PLANS.md](PLANS.md)).
+  readers. The admin plane reads them on the loop itself (§3: there is no
+  second thread); the relaxed atomic costs nothing on the write side and
+  keeps any out-of-loop reader race-free by construction. The simulator
+  asserts counters reconcile (admitted = completed + shed + in-flight)
+  under every seed. Counters live in `counters.zig` (§10); exposure is
+  the admin/metrics listener's Prometheus rendering (`admin.zig`, one
+  reserved scrape slot off the shared pools) plus a SIGUSR1 dump through
+  the seam's `signal` primitive (§4).
 - **File descriptors are pre-budgeted, not shed.** The fd count is
   closed-form — listeners + connection slots + upstream slots + ring,
   async and signal fds — evaluated on the *effective* config
@@ -727,10 +708,8 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
    leaks (all pools drain to
    zero), no deadlock, counters reconcile, every shed is witnessed, no
    completion is delivered to a freed or reused slot (slot generations
-   checked on every delivery, §5), and no loop-side write ever lands in
-   a parked slot's scratch (the scheduler deliberately fires deadlines
-   while worker jobs are in flight, §5). A failure prints its seed; the same seed replays the
-   exact schedule.
+   checked on every delivery, §5). A failure prints its seed; the same
+   seed replays the exact schedule.
    `zig build sim -- fuzz` runs forever on entropy-derived seeds.
 2. **Fuzzing — `zig build test --fuzz`.** `std.testing.fuzz` on every
    parser edge: HTTP/1.1 head parser, chunked decoder, config parser.
@@ -813,7 +792,7 @@ src/
   balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
-  worker.zig          // SPMC job queue + SPSC completion rings (Phase 3c, evidence-gated)
+  admin.zig           // admin/metrics listener: one reserved scrape slot (§8)
 sim/                  // simulator harness + invariants
 bench/                // micro benches (poop) + loopback harness (zrk), §9
 ```
