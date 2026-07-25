@@ -50,7 +50,7 @@ comptime {
 
 /// Outbox room a step must find before it may stage anything. One full
 /// wire record is the most a single record can produce.
-const min_outbound_room = Engine.max_record_bytes;
+const min_outbound_room = Engine.max_emitted_record_bytes;
 
 pub fn TlsRelay(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);

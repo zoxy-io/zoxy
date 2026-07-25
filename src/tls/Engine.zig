@@ -27,6 +27,7 @@
 
 const std = @import("std");
 
+const constants = @import("../constants.zig");
 const ztls = @import("ztls");
 
 const Credentials = @import("Credentials.zig");
@@ -92,24 +93,60 @@ pub const Sink = struct {
     closed: *const fn (ctx: *anyopaque) void,
 };
 
-/// Ciphertext staged for the transport. Sized for the largest burst one
-/// drive step can produce: a ServerHello record plus the encrypted
-/// server flight (certificate, CertificateVerify, Finished), each of
-/// which ztls bounds by one maximum wire record.
-const outbox_bytes = 2 * max_record_bytes;
-
-/// The largest record ztls can put on the wire — what a caller must have
-/// room for before driving a step that may stage (see `outboundRoom`).
+/// The largest record ztls can put on the wire. What a *peer* may send;
+/// not what zoxy emits (see `max_emitted_record_bytes`).
 pub const max_record_bytes = ztls.frame.max_wire_record_len;
+
+/// The largest record zoxy itself emits.
+///
+/// The distinction is what shrinks the engine. Inbound buffers must cover
+/// `max_record_bytes`, because a client that does not offer RFC 8449
+/// `record_size_limit` may legally send a full-size record and we have to
+/// accept it. Outbound buffers need cover only what *we* choose to write,
+/// and emitting smaller records is always legal — no negotiation, no
+/// conformance risk.
+///
+/// Two things bound what we write. The server flight is the certificate
+/// chain (bounded at startup, `tls_cert_chain_bytes_max`) plus
+/// CertificateVerify, Finished, and framing. Application records carry at
+/// most a head buffer's worth, which is the largest plaintext any caller
+/// hands `sendApp`.
+const flight_bytes_max: usize = @as(usize, constants.tls_cert_chain_bytes_max) + 512;
+const app_record_bytes_max: usize = @as(usize, constants.head_bytes_max) + 256;
+pub const max_emitted_record_bytes: usize = @max(flight_bytes_max, app_record_bytes_max);
+
+/// Ciphertext staged for the transport. Sized for the largest burst one
+/// drive step can produce — a ServerHello record plus the encrypted
+/// server flight — and, in steady state, one staged application record
+/// while an earlier one is still draining.
+const outbox_bytes: usize = 2 * max_emitted_record_bytes;
+
+comptime {
+    // The handshake burst has to fit alongside a full emitted record:
+    // ServerHello and the flight are staged in the same drive step.
+    assert(outbox_bytes >= server_hello_bytes_max + flight_bytes_max);
+    // Emitting more than a peer must accept would be a protocol error
+    // regardless of our own buffering.
+    assert(max_emitted_record_bytes <= max_record_bytes);
+}
+
+/// A ServerHello record, generously: the fixed fields plus the largest
+/// key share in play (X25519MLKEM768's is ~1.1 KiB).
+const server_hello_bytes_max: usize = 2 * 1024;
 
 /// Decrypted application data staged for the caller. A TLS record is
 /// reassembled *inside* the engine across however many reads it takes, so
 /// one `feed` can deliver a full record's plaintext at once — up to
 /// `max_plaintext_len`, regardless of how small the chunks fed in were.
-/// ztls buffers at most two records, so that is the bound. Sizing the
-/// caller's destination by the read size instead is the trap: a client
-/// that writes 16 KiB in one go overflows it.
-pub const staging_bytes = 2 * max_plaintext_bytes;
+/// Sizing the caller's destination by the read size instead is the trap:
+/// a client that writes 16 KiB in one go overflows it.
+///
+/// One `feed` carries over at most one incomplete record and drains
+/// whatever the caller's chunk completes, so its output is bounded by one
+/// record's plaintext plus that chunk — not by two whole records, which
+/// is what this held before and what `tls_relay`'s comptime tie has
+/// always actually required.
+pub const staging_bytes: usize = max_plaintext_bytes + constants.head_bytes_max;
 
 /// The most plaintext one record can yield — with the caller's read size,
 /// what bounds a single `feed`'s output (see `staging_bytes`).

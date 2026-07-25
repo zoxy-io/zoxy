@@ -178,6 +178,20 @@ pub const libcrypto_heap_bytes: u32 = 4 * 1024 * 1024;
 /// what a mis-pointed config path can pull into the arena at startup.
 pub const tls_pem_bytes_max: u32 = 256 * 1024;
 
+/// Largest DER certificate chain the server will present (§4, §5).
+///
+/// `tls_pem_bytes_max` bounds what the loader reads off disk; this bounds
+/// what goes on the *wire*, and through that the engine's outbound
+/// buffering — the server flight carrying the chain has to be staged
+/// whole before any of it can be written, so an unbounded chain would
+/// force those buffers to the protocol maximum whatever the operator
+/// actually configured. 8 KiB holds a leaf plus two intermediates at
+/// ECDSA sizes, or a leaf plus intermediate at RSA-2048.
+///
+/// Exceeding it is a startup error naming this limit — never a truncated
+/// chain, which a client would reject for reasons it could not see.
+pub const tls_cert_chain_bytes_max: u32 = 8 * 1024;
+
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
 
