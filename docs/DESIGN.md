@@ -198,16 +198,30 @@ submitted, completions are called back — the same shape as the previous
 iteration's hand-rolled TigerBeetle pattern, and the same shape as
 `io_uring` itself.
 
-**Dependency policy: Zig-first only.** The TIGER_STYLE zero-dependency rule
-takes its recorded exceptions here, and both are pure Zig, vendored by
-content hash in `build.zig.zon`: **libxev** (this section) and **hparse**
-(the HTTP/1.1 head parser — as a hardened fork, §7). No C-FFI dependency
-exists in the codebase; any future one (a TLS stack is the known
-Phase-3 candidate — [PLANS.md](PLANS.md)) is a
-separate deliberate decision, not a default. The pinned hash is an
-*audited commit*, never a branch tip — libxev's Zig 0.16 support is a
-self-described compatibility shim (PR #220) with real fixes still
-unmerged behind it, so the pin moves only after re-audit.
+**Dependency policy: Zig-first, with a scoped C exception for proven
+crypto primitives.** The TIGER_STYLE zero-dependency rule takes its
+recorded exceptions here, all vendored by content hash in
+`build.zig.zon` as zoxy-io forks: **libxev** (this section), **hparse**
+(the HTTP/1.1 head parser — as a hardened fork, §7), and **ztls** (the
+Phase-3a TLS 1.3 engine — [PLANS.md](PLANS.md)). libxev and hparse are
+pure Zig. ztls carries the codebase's one C surface, and settles the
+deliberate decision §4 reserved (2026-07-25): **battle-tested C crypto
+*primitive* libraries — the libcrypto family (OpenSSL / AWS-LC /
+BoringSSL) — are acceptable dependencies for the foreseeable future.**
+The trust split runs the right way: constant-time primitives want the
+most-watched assembly on earth, while the protocol state machine —
+where TLS CVEs actually live — stays auditable Zig behind our own
+wrapper. The scope is strict: primitives only, never a C *protocol*
+layer (libssl and picotls stay out); the C binding lives inside the
+dependency, so zoxy's own tree never names a C symbol and `@cImport`
+stays lint-forbidden (§9); and libcrypto's internal allocations are
+routed to a fixed startup arena (`CRYPTO_set_mem_functions`) so the
+zero-alloc gate keeps its teeth (a Phase-3a slice — PLANS.md). The
+pinned hash is an *audited commit*, never a branch tip — libxev's Zig
+0.16 support is a self-described compatibility shim (PR #220) with real
+fixes still unmerged behind it — so a pin moves only after re-audit;
+the ztls audit itself (Zig protocol layer read line-by-line, C
+primitives trusted institutionally) is a Phase-3a entry gate.
 
 - **Caller-owned completions.** Every `xev.Completion` is embedded inline
   in the connection slot; submitting an op writes it in place. Zero
@@ -793,6 +807,8 @@ src/
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
+  tls/
+    Engine.zig        // ztls wrapper: sans-I/O TLS 1.3 seam (§4, Phase 3a)
   balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
