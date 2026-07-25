@@ -218,9 +218,21 @@ pub fn Pump(
             const sent = result catch |err| return Policy.onSendError(server, conn, err);
             assert(sent >= 1);
             const state = directionState(conn);
-            state.sent_len += sent;
-            assert(state.sent_len <= state.transfer_len);
-            if (state.sent_len < state.transfer_len) {
+            // Credit the transform's own cursor first, if it keeps one:
+            // under TLS the wire carries *ciphertext*, so these bytes do
+            // not count against `transfer_len`, which frames plaintext.
+            if (@hasDecl(Policy, "creditSend")) {
+                Policy.creditSend(conn, sent);
+            } else {
+                state.sent_len += sent;
+                assert(state.sent_len <= state.transfer_len);
+            }
+            // "Anything left to write?" rather than "cursor reached the
+            // length" — identical for a plain policy, whose `sendSlice`
+            // empties exactly when `sent_len == transfer_len`, and the
+            // only formulation that also works when the bytes on the wire
+            // outnumber the bytes framed.
+            if (sendSlice(conn).len > 0) {
                 armSend(server, conn);
                 return;
             }

@@ -32,6 +32,7 @@
 const std = @import("std");
 
 const Balancer = @import("../balancer.zig").Balancer;
+const TlsEngine = @import("../tls/Engine.zig");
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
 const pump = @import("../net/pump.zig");
@@ -56,6 +57,28 @@ pub fn Proxy(comptime IoType: type) type {
         pub fn start(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
             assert(conn.head_len == 0);
+            // A TLS client may send its whole request head before the
+            // handshake drive has finished with the connection, so that
+            // plaintext is already staged (Conn.tls_pending_len). Move it
+            // into the head buffer before the first read — both because
+            // the parser needs every byte contiguous from zero, and
+            // because the staging buffer is the ciphertext scratch from
+            // here on (Engine.staging).
+            if (conn.tls) |engine| {
+                const pending = conn.tls_pending_len;
+                assert(pending <= engine.staging.len);
+                assert(pending <= conn.head.len);
+                conn.tls_pending_len = 0;
+                if (pending > 0) {
+                    @memcpy(conn.head[0..pending], engine.staging[0..pending]);
+                    conn.head_len = pending;
+                    // Those bytes may already be a complete head, so parse
+                    // before reading — a read would block on a client with
+                    // nothing left to say.
+                    parseAndDispatch(server, conn);
+                    return;
+                }
+            }
             armHeadRecv(server, conn);
         }
 
@@ -65,6 +88,20 @@ pub fn Proxy(comptime IoType: type) type {
             // we ever get here, so there is always room to read into.
             assert(conn.head_len < constants.head_bytes_max);
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.tls) |engine| {
+                // Under TLS the socket carries ciphertext; the head buffer
+                // is the plaintext accumulator, so the read lands in the
+                // engine's scratch and `onHeadRecvTls` decrypts out of it.
+                server.io.recv(
+                    conn.client_socket,
+                    engine.staging[0..tls_wire_chunk_bytes],
+                    &conn.op_data_client_to_upstream.completion,
+                    ConnType,
+                    conn,
+                    onHeadRecvTls,
+                );
+                return;
+            }
             server.io.recv(
                 conn.client_socket,
                 conn.head[conn.head_len..],
@@ -73,6 +110,94 @@ pub fn Proxy(comptime IoType: type) type {
                 conn,
                 onHeadRecv,
             );
+        }
+
+        /// Ciphertext read per head step. Small on purpose: a TLS record is
+        /// delivered whole, so the plaintext one step yields is bounded by
+        /// the record, not by this — but keeping the read small keeps the
+        /// common case (a head inside one modest record) to one pass.
+        const tls_wire_chunk_bytes = 4096;
+
+        comptime {
+            assert(tls_wire_chunk_bytes <= TlsEngine.staging_bytes);
+        }
+
+        /// Accumulates decrypted head bytes straight into `conn.head`.
+        const HeadPlaintext = struct {
+            conn: *ConnType,
+            /// Set when a record carried more plaintext than the head
+            /// buffer can hold. That is either a genuinely oversize head —
+            /// which the parser answers with 431 — or a head packed into
+            /// the same record as body bytes, which needs a carryover the
+            /// body leg does not have yet. Recorded rather than clamped
+            /// silently so the caller decides.
+            overflowed: bool = false,
+            closed: bool = false,
+
+            fn append(ctx: *anyopaque, bytes: []const u8) void {
+                const self: *HeadPlaintext = @ptrCast(@alignCast(ctx));
+                const conn = self.conn;
+                const room = conn.head.len - conn.head_len;
+                if (bytes.len > room) {
+                    self.overflowed = true;
+                    return;
+                }
+                @memcpy(conn.head[conn.head_len..][0..bytes.len], bytes);
+                conn.head_len += @intCast(bytes.len);
+            }
+
+            fn peerClosed(ctx: *anyopaque) void {
+                const self: *HeadPlaintext = @ptrCast(@alignCast(ctx));
+                self.closed = true;
+            }
+        };
+
+        fn onHeadRecvTls(conn: *ConnType, result: Io.RecvError!u32) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .l7_reading_head);
+            const received = result catch |err| {
+                server.witnessKernelPressure(err);
+                server.beginTeardown(conn);
+                return;
+            };
+            if (received == 0) { // Client left mid-head; nothing to answer.
+                server.beginTeardown(conn);
+                return;
+            }
+            const engine = conn.tls.?;
+            var plaintext: HeadPlaintext = .{ .conn = conn };
+            engine.feed(engine.staging[0..received], .{
+                .ctx = &plaintext,
+                .appData = HeadPlaintext.append,
+                .closed = HeadPlaintext.peerClosed,
+            }) catch {
+                server.counters.increment("tls_relay_failed");
+                server.beginTeardown(conn);
+                return;
+            };
+            if (plaintext.closed) {
+                server.beginTeardown(conn);
+                return;
+            }
+            if (plaintext.overflowed) {
+                // A head that cannot fit is 431 whether or not the excess
+                // was body bytes; the body carryover lands with the body
+                // leg (PLANS.md 3a).
+                return respond(server, conn, 431, "l7_headers_too_large");
+            }
+            if (conn.head_len == 0) {
+                // A record with no application data (a post-handshake
+                // message): nothing parsed, read again.
+                armHeadRecv(server, conn);
+                return;
+            }
+            assert(conn.head_len <= constants.head_bytes_max);
+            parseAndDispatch(server, conn);
         }
 
         fn onHeadRecv(conn: *ConnType, result: Io.RecvError!u32) void {
@@ -693,6 +818,64 @@ pub fn Proxy(comptime IoType: type) type {
                 }
                 return false;
             }
+
+            // -- the TLS transform (§4) --
+            //
+            // Branching at runtime, not comptime: one policy serves both
+            // plain and terminated connections, and only the conn knows
+            // which it is. The upstream leg is plaintext either way, so
+            // only the client side of this direction transforms.
+
+            /// Ciphertext lands in the engine scratch; the relay buffer is
+            /// the *decrypt* destination, so it cannot also be the read
+            /// target.
+            pub fn recvBuffer(conn: *ConnType) []u8 {
+                if (conn.tls) |engine| {
+                    return engine.staging[0..tls_wire_chunk_bytes];
+                }
+                return &conn.relay_buffer.?.client_to_upstream;
+            }
+
+            /// Decrypt into the relay buffer so framing sees plaintext.
+            /// A record yielding more than the buffer holds is this
+            /// connection's failure, not an invariant violation — the
+            /// client chooses its record sizes (§8).
+            pub fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
+                const engine = conn.tls orelse return chunk;
+                var out: DecryptedBody = .{ .conn = conn };
+                engine.feed(chunk, .{
+                    .ctx = &out,
+                    .appData = DecryptedBody.append,
+                    .closed = DecryptedBody.peerClosed,
+                }) catch return null;
+                if (out.overflowed or out.closed) return null;
+                return conn.relay_buffer.?.client_to_upstream[0..out.len];
+            }
+        };
+
+        /// Accumulates a request-body chunk's plaintext into the relay
+        /// buffer. Overflow is a shed, not an assert: see `transformIn`.
+        const DecryptedBody = struct {
+            conn: *ConnType,
+            len: u32 = 0,
+            overflowed: bool = false,
+            closed: bool = false,
+
+            fn append(ctx: *anyopaque, bytes: []const u8) void {
+                const self: *DecryptedBody = @ptrCast(@alignCast(ctx));
+                const buffer = &self.conn.relay_buffer.?.client_to_upstream;
+                if (self.len + bytes.len > buffer.len) {
+                    self.overflowed = true;
+                    return;
+                }
+                @memcpy(buffer[self.len..][0..bytes.len], bytes);
+                self.len += @intCast(bytes.len);
+            }
+
+            fn peerClosed(ctx: *anyopaque) void {
+                const self: *DecryptedBody = @ptrCast(@alignCast(ctx));
+                self.closed = true;
+            }
         };
 
         const RequestBodyPump = pump.Pump(IoType, .client_to_upstream, RequestBodyPolicy);
@@ -1056,6 +1239,46 @@ pub fn Proxy(comptime IoType: type) type {
                 assert(conn.l7.response_leg == .pumping_body);
                 assert(conn.l7.pending_verdict == .none); // response_started.
                 return false;
+            }
+
+            // -- the TLS transform (§4) --
+            //
+            // This direction recvs plaintext from the origin, so only the
+            // *outbound* half transforms. It is also where the cursor
+            // hazard lives: the wire carries ciphertext, which outnumbers
+            // the plaintext `transfer_len` frames, so the outbox keeps its
+            // own cursor and the direction cursor is left alone.
+
+            /// Encrypt the framed chunk once, before the first send.
+            pub fn transformOut(conn: *ConnType, consumed: u32) bool {
+                const engine = conn.tls orelse return true;
+                const plaintext = conn.relay_buffer.?.upstream_to_client[0..consumed];
+                engine.sendApp(plaintext) catch return false;
+                return true;
+            }
+
+            /// Under TLS the staged ciphertext, which empties itself as
+            /// `creditSend` credits it; otherwise the relay buffer under
+            /// the direction's own cursor.
+            pub fn sendSlice(conn: *ConnType) []const u8 {
+                if (conn.tls) |engine| return engine.outbound();
+                const state = &conn.directions[
+                    @intFromEnum(ConnType.Direction.upstream_to_client)
+                ];
+                return conn.relay_buffer.?.upstream_to_client[state.sent_len..state.transfer_len];
+            }
+
+            /// Credit whichever cursor actually tracks the wire.
+            pub fn creditSend(conn: *ConnType, sent: u32) void {
+                if (conn.tls) |engine| {
+                    engine.outboundSent(sent);
+                    return;
+                }
+                const state = &conn.directions[
+                    @intFromEnum(ConnType.Direction.upstream_to_client)
+                ];
+                state.sent_len += sent;
+                assert(state.sent_len <= state.transfer_len);
             }
         };
 
