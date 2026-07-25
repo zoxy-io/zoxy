@@ -63,10 +63,19 @@ outbox_sent: u32,
 /// needs the answer *after* the outbox drains — by which time the alert
 /// bytes it would otherwise have to recognize are gone.
 close_staged: bool,
-/// Where a drive step decrypts plaintext for the caller. Engine-owned
-/// because only the engine knows the bound (see `inbox_bytes`); the
-/// caller supplies the `Sink` that fills it and tracks its own cursor.
-inbox: [inbox_bytes]u8,
+/// Per-connection scratch for whichever side of the transform the caller
+/// does not already have a buffer for. Engine-owned because only the
+/// engine knows the bound (see `staging_bytes`); the caller decides what
+/// goes in it and tracks its own cursor.
+///
+/// Which side that is depends on the protocol, and the two never coexist
+/// on one connection:
+/// - L4 relay: the caller reads ciphertext into its own head buffer and
+///   uses this as the *plaintext* destination its `Sink` fills.
+/// - L7 proxy: plaintext accumulates in the head buffer (the parser
+///   needs it contiguous across reads), so this holds the *ciphertext*
+///   read from the socket before `feed` consumes it.
+staging: [staging_bytes]u8,
 
 /// What a drive step hands back *synchronously*: plaintext the caller
 /// consumes before returning, and the peer's orderly close. Ciphertext
@@ -105,10 +114,10 @@ pub const max_record_bytes = ztls.frame.max_wire_record_len;
 /// ztls buffers at most two records, so that is the bound. Sizing the
 /// caller's destination by the read size instead is the trap: a client
 /// that writes 16 KiB in one go overflows it.
-pub const inbox_bytes = 2 * max_plaintext_bytes;
+pub const staging_bytes = 2 * max_plaintext_bytes;
 
 /// The most plaintext one record can yield — with the caller's read size,
-/// what bounds a single `feed`'s output (see `inbox_bytes`).
+/// what bounds a single `feed`'s output (see `staging_bytes`).
 pub const max_plaintext_bytes = ztls.frame.max_plaintext_len;
 
 pub const Config = struct {

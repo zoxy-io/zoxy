@@ -34,8 +34,8 @@ const assert = std.debug.assert;
 /// yields: ztls reassembles a record across as many reads as it takes, so
 /// a client writing one 16 KiB record gets that whole record decrypted in
 /// the step that completes it, however small the chunks were. The
-/// destination is therefore the engine-owned inbox, sized for that burst
-/// (Engine.inbox_bytes) — not the relay buffer, which is smaller.
+/// destination is therefore the engine-owned staging, sized for that burst
+/// (Engine.staging_bytes) — not the relay buffer, which is smaller.
 const ciphertext_chunk_bytes = constants.relay_buffer_bytes;
 
 comptime {
@@ -46,7 +46,7 @@ comptime {
     // record plus the chunk. Tying the two here (§8) means a later
     // `relay_buffer_bytes` bump cannot silently reopen the overflow this
     // bound exists to prevent.
-    assert(Engine.inbox_bytes >= Engine.max_plaintext_bytes + ciphertext_chunk_bytes);
+    assert(Engine.staging_bytes >= Engine.max_plaintext_bytes + ciphertext_chunk_bytes);
 }
 
 /// Outbox room a step must find before it may stage anything. One full
@@ -65,12 +65,12 @@ pub fn TlsRelay(comptime IoType: type) type {
             assert(conn.upstream_socket != null);
             assert(conn.directions[0].phase == .idle);
             assert(conn.directions[1].phase == .idle);
-            // Plaintext that beat the dial is already staged in the inbox
+            // Plaintext that beat the dial is already staged in the staging
             // (Conn.tls_pending_len), so it must go out before anything
             // this direction reads next — otherwise the client's first
             // write is silently dropped or reordered.
             const pending = conn.tls_pending_len;
-            assert(pending <= conn.tls.?.inbox.len);
+            assert(pending <= conn.tls.?.staging.len);
             conn.tls_pending_len = 0;
             if (pending > 0) {
                 conn.directions[0].owe(pending);
@@ -123,7 +123,7 @@ pub fn TlsRelay(comptime IoType: type) type {
 
             if (!hasStagingRoom(server, conn)) return;
 
-            // Decrypt into the engine inbox. The sink fires once per
+            // Decrypt into the engine staging. The sink fires once per
             // record, so a step's plaintext accumulates across records.
             var decrypted: Decrypted = .{ .conn = conn, .len = 0 };
             conn.tls.?.feed(conn.head[0..received], .{
@@ -152,9 +152,9 @@ pub fn TlsRelay(comptime IoType: type) type {
             armUpstreamSend(server, conn);
         }
 
-        /// Accumulates decrypted application data into the engine inbox,
+        /// Accumulates decrypted application data into the engine staging,
         /// which ztls's own record-buffer bound sizes: at most two full
-        /// records can complete in one `feed`, and the inbox covers two.
+        /// records can complete in one `feed`, and the staging covers two.
         const Decrypted = struct {
             conn: *ConnType,
             len: u32,
@@ -162,7 +162,7 @@ pub fn TlsRelay(comptime IoType: type) type {
 
             fn append(ctx: *anyopaque, bytes: []const u8) void {
                 const self: *Decrypted = @ptrCast(@alignCast(ctx));
-                const buffer = &self.conn.tls.?.inbox;
+                const buffer = &self.conn.tls.?.staging;
                 assert(self.len + bytes.len <= buffer.len);
                 @memcpy(buffer[self.len..][0..bytes.len], bytes);
                 self.len += @intCast(bytes.len);
@@ -183,7 +183,7 @@ pub fn TlsRelay(comptime IoType: type) type {
             // credits what went out and re-arms, so the resume carries no
             // offsets of its own (§6).
             assert(state.owed() >= 1);
-            assert(state.framed_len <= conn.tls.?.inbox.len);
+            assert(state.framed_len <= conn.tls.?.staging.len);
             // Entered from `start` forwarding pre-relay plaintext (.idle),
             // from the decrypt step (.receiving), and from a short write
             // resuming itself (.sending).
@@ -192,7 +192,7 @@ pub fn TlsRelay(comptime IoType: type) type {
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
-                state.pending(&conn.tls.?.inbox),
+                state.pending(&conn.tls.?.staging),
                 &conn.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,

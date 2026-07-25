@@ -1117,6 +1117,62 @@ pub fn Proxy(comptime IoType: type) type {
             armClientWrite(server, conn, conn.head[0..head_write_len], .response_excess);
         }
 
+        // -- the client-write transform (§4) --
+        //
+        // The channel below writes an already-materialized plaintext buffer
+        // under one cursor. Under TLS the wire carries ciphertext instead,
+        // which does not map onto those bytes one-for-one, so these two keep
+        // the two cursors apart: the engine outbox tracks the wire, and the
+        // channel's cursor moves only once a chunk is fully out. Every
+        // caller's plaintext fits one record (the head buffer bounds all of
+        // them, and it is smaller than `max_plaintext_bytes`), so one
+        // `sendApp` per chunk is enough.
+
+        /// What to write now for a client-directed send of `plaintext`,
+        /// encrypting on the first call of each chunk. Null means the
+        /// connection failed (no staging room, or the engine refused).
+        fn clientWriteSlice(conn: *ConnType, plaintext: []const u8) ?[]const u8 {
+            assert(plaintext.len >= 1);
+            const engine = conn.tls orelse return plaintext;
+            if (engine.outbound().len == 0) {
+                // Every caller writes out of the head buffer or the upstream
+                // head, both smaller than one record, so a chunk never needs
+                // splitting across records.
+                assert(plaintext.len <= TlsEngine.max_plaintext_bytes);
+                if (engine.outboundRoom() < TlsEngine.max_record_bytes) {
+                    // The same staging-room rung the L4 relay sheds on (§8);
+                    // counted here too, so the ladder is observable from
+                    // either path.
+                    conn.server.counters.increment("tls_relay_failed");
+                    return null;
+                }
+                engine.sendApp(plaintext) catch {
+                    conn.server.counters.increment("tls_relay_failed");
+                    return null;
+                };
+            }
+            return engine.outbound();
+        }
+
+        /// Credit `sent` wire bytes, returning how many *plaintext* bytes are
+        /// now complete: `sent` itself when plain, and under TLS all of
+        /// `plaintext_len` once the outbox drains but zero before — partial
+        /// ciphertext progress says nothing about plaintext.
+        fn clientWriteCredit(conn: *ConnType, sent: u32, plaintext_len: u32) u32 {
+            assert(sent >= 1);
+            assert(plaintext_len >= 1);
+            const engine = conn.tls orelse {
+                assert(sent <= plaintext_len);
+                return sent;
+            };
+            engine.outboundSent(sent);
+            // All or nothing: a partially written record has delivered no
+            // plaintext the caller may account for.
+            const credit: u32 = if (engine.outbound().len == 0) plaintext_len else 0;
+            assert(credit <= plaintext_len);
+            return credit;
+        }
+
         // -- the client-write channel (§7, §8) --
         //
         // Every client-directed send outside the body pump goes through this
@@ -1145,10 +1201,17 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn resumeClientWrite(server: *ServerType, conn: *ConnType) void {
             assert(conn.client_write.pending.len >= 1);
+            // The one place these writers turn plaintext into wire bytes;
+            // on a short-write resume the outbox is non-empty, so this
+            // returns the remainder rather than encrypting twice.
+            const wire = clientWriteSlice(conn, conn.client_write.pending) orelse {
+                server.beginTeardown(conn);
+                return;
+            };
             conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.send(
                 conn.client_socket,
-                conn.client_write.pending,
+                wire,
                 &conn.op_data_upstream_to_client.completion,
                 ConnType,
                 conn,
@@ -1172,8 +1235,11 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(sent >= 1);
-            assert(sent <= write.pending.len);
-            write.pending = write.pending[sent..];
+            // Not `sent` directly: under TLS those are wire bytes, and the
+            // ciphertext outnumbers the plaintext this cursor counts (§4).
+            const credited = clientWriteCredit(conn, sent, @intCast(write.pending.len));
+            assert(credited <= write.pending.len);
+            write.pending = write.pending[credited..];
             if (write.pending.len > 0) {
                 resumeClientWrite(server, conn); // Short send resumes (§6).
                 return;
@@ -1316,23 +1382,34 @@ pub fn Proxy(comptime IoType: type) type {
             /// the direction's own cursor.
             pub fn sendSlice(conn: *ConnType) []const u8 {
                 if (conn.tls) |engine| return engine.outbound();
-                const state = &conn.directions[
-                    @intFromEnum(ConnType.Direction.upstream_to_client)
-                ];
-                return conn.relay_buffer.?.upstream_to_client[state.sent_len..state.transfer_len];
+                const state = directionState(conn);
+                if (state.owed() == 0) return &.{};
+                return state.pending(&conn.relay_buffer.?.upstream_to_client);
             }
 
             /// Credit whichever cursor actually tracks the wire.
             pub fn creditSend(conn: *ConnType, sent: u32) void {
+                const state = directionState(conn);
                 if (conn.tls) |engine| {
                     engine.outboundSent(sent);
+                    // The framed debt counts plaintext and the wire carries
+                    // ciphertext, so it cannot be credited byte-for-byte: it
+                    // settles all at once, when the outbox empties and every
+                    // plaintext byte this chunk framed is therefore out. The
+                    // pump requires exactly that by the time `sendSlice`
+                    // empties, so the two drain together (§4, §6).
+                    if (engine.outbound().len == 0 and state.owed() >= 1) {
+                        state.credit(state.owed());
+                    }
                     return;
                 }
-                const state = &conn.directions[
+                state.credit(sent);
+            }
+
+            fn directionState(conn: *ConnType) *conn_module.DirectionState {
+                return &conn.directions[
                     @intFromEnum(ConnType.Direction.upstream_to_client)
                 ];
-                state.sent_len += sent;
-                assert(state.sent_len <= state.transfer_len);
             }
         };
 
@@ -1660,6 +1737,11 @@ pub fn Proxy(comptime IoType: type) type {
         fn armDrainRecv(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_draining_request);
             // The head buffer is scratch now — recv into it and discard.
+            // Deliberately not decrypted under TLS: the point is to empty
+            // the client's inbound so the close is a FIN rather than a
+            // data-discarding RST (§2), and discarded ciphertext serves
+            // that exactly as well as discarded plaintext would. Feeding
+            // it to the engine would only add a way to fail.
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,

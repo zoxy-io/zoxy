@@ -448,6 +448,10 @@ pub fn Server(comptime IoType: type) type {
                 };
                 server.finishAdmission(conn, client_socket, null, state);
                 conn.tls = engine;
+                // The listener is in hand here and gone by the time the
+                // handshake completes, so the protocol the hand-over will
+                // need is recorded now (`startProtocol`).
+                conn.tls_protocol = state.protocol;
                 server.armTlsRecv(conn);
                 return;
             }
@@ -517,15 +521,16 @@ pub fn Server(comptime IoType: type) type {
         /// tail so it is callable from either side of the fork — at
         /// admission for a fresh connection, and by any phase that runs
         /// *ahead* of the protocol and hands a live connection over when it
-        /// finishes. TLS termination is the phase that will need it
-        /// (§4, PLANS.md): it is orthogonal to l4/http, so the protocol
-        /// fork happens after the handshake rather than at accept.
+        /// finishes. TLS termination is that phase (§4): it is orthogonal
+        /// to l4/http, so the protocol fork happens after the handshake
+        /// rather than at accept, and `finishTlsHandshake` is the second
+        /// caller.
         ///
         /// It takes the protocol as an argument rather than reading it off
-        /// the slot deliberately: on this branch the second caller does not
-        /// exist, and a field with one writer and one reader would be state
-        /// kept for a caller that is not here (§1). The phase that needs to
-        /// recall a connection's protocol is the one that should decide how.
+        /// the slot: the phase that needs to recall a connection's protocol
+        /// is the one that should decide how, and the TLS phase decided —
+        /// `Conn.tls_protocol`, written at admission because the listener is
+        /// in hand there and gone by the time the handshake completes.
         ///
         /// The state and deadline stores are idempotent at admission — the
         /// tail below set exactly these values from the same protocol, and
@@ -534,12 +539,19 @@ pub fn Server(comptime IoType: type) type {
         /// between the two writes — and they are load-bearing for a
         /// hand-over, which arrives in whatever state its phase ran in.
         /// Keeping them here is what makes both callers a single call.
+        ///
+        /// Draining is not asserted against, unlike at admission: a drain
+        /// closes the listeners and sheds *new* accepts, but an admitted
+        /// connection keeps serving until it finishes or the drain deadline
+        /// reaps it (§8). A handshake in flight when the drain starts is
+        /// admitted work, so it hands over and runs — the same rule that
+        /// lets an admitted L7 connection dial for the request it already
+        /// has. `admit` keeps the assert on its own side, where it holds.
         fn startProtocol(
             server: *Self,
             conn: *ConnType,
             protocol: config_module.Config.Listener.Protocol,
         ) void {
-            assert(!server.draining);
             assert(!conn.isTearingDown());
             // The one timer this connection ever arms is already armed
             // (§4: a state transition only ever *stores* a new deadline).
@@ -666,6 +678,10 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.armed.deadline);
         }
 
+        /// Handshake ciphertext read per step, bounded by the head buffer
+        /// it reads into — see `armTlsRecv` for why that bound matters.
+        const handshake_read_bytes = constants.head_bytes_max;
+
         /// The TLS handshake drive (§4), one strict step at a time on the
         /// client socket: recv ciphertext → feed the engine → send
         /// whatever it staged → recv again, until the session is
@@ -673,13 +689,25 @@ pub fn Server(comptime IoType: type) type {
         /// throughout, so the handshake obeys the same
         /// one-op-per-direction discipline as the relay (§6) and costs the
         /// same ring budget.
+        ///
+        /// Ciphertext reads into the head buffer, which is idle until the
+        /// plaintext behind it needs one. The read *target* is
+        /// load-bearing beyond that convenience:
+        /// application data arriving in the same feed is staged as
+        /// `tls_pending_len`, and the L7 fork copies it into that same
+        /// head buffer. Decryption only ever shrinks a record, so reading
+        /// at most `head.len` bounds the staged plaintext by `head.len`
+        /// too — which is what makes that copy fit. Widening this read
+        /// (to `Engine.staging`, say, for fewer round trips) would break
+        /// that coupling silently, so the comptime assert below ties them.
         fn armTlsRecv(server: *Self, conn: *ConnType) void {
             assert(conn.state == .tls_handshaking);
             assert(conn.tls != null);
+            comptime assert(handshake_read_bytes <= constants.head_bytes_max);
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
-                &conn.head,
+                conn.head[0..handshake_read_bytes],
                 &conn.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -783,20 +811,36 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls.?.isConnected());
             assert(conn.relay_buffer == null);
             server.counters.increment("tls_handshakes_completed");
-            const buffer = server.relay_buffers.acquire() orelse {
-                server.counters.increment("tls_relay_buffer_unavailable");
-                server.beginTeardown(conn);
-                return;
-            };
-            server.updateRelayPressure();
-            conn.relay_buffer = buffer;
-            conn.state = .connecting;
-            server.storeDeadline(conn, server.config.connect_timeout_ms);
-            server.armConnect(conn, conn.cluster_index);
+            // The L4 relay needs its buffer for the connection's whole
+            // life, so it is claimed here — deferred until now so a
+            // handshake that never completes never held one. This is
+            // post-admission, so exhaustion is *not* a shed rung: the
+            // connection was counted in `admitted` and goes on to
+            // `completed` through teardown (§9).
+            //
+            // L7 takes none: a connection reading a head costs a slot and
+            // the head buffer only, and acquires a relay buffer per body
+            // leg (§5). Not full parity with a plain idle L7 connection,
+            // though — a terminated one also holds its ~180 KiB engine for
+            // the connection's whole life, idle keep-alive stretches
+            // included. That is what the engine pool is sized and shed for
+            // (§5, §8), but it is the figure to reason with on capacity.
+            if (conn.tls_protocol == .l4) {
+                conn.relay_buffer = server.acquireRelayBuffer() orelse {
+                    server.counters.increment("tls_relay_buffer_unavailable");
+                    server.beginTeardown(conn);
+                    return;
+                };
+            }
+            // TLS is orthogonal to the protocol (§4), so the fork the plain
+            // admission path took at accept happens here instead — through
+            // the same door, so a terminated connection enters its protocol
+            // in exactly the state a plain one does.
+            server.startProtocol(conn, conn.tls_protocol);
         }
 
         /// Application data that arrived before the relay was up (see
-        /// `Conn.tls_pending_len`). Staged in the engine inbox, which is
+        /// `Conn.tls_pending_len`). Staged in the engine staging, which is
         /// sized for a full feed's plaintext, and forwarded once the
         /// upstream is connected. Overflow sheds rather than asserts: the
         /// client chooses how much to send before we are ready.
@@ -804,17 +848,17 @@ pub fn Server(comptime IoType: type) type {
             const conn: *ConnType = @ptrCast(@alignCast(ctx));
             const engine = conn.tls.?;
             assert(conn.state == .tls_handshaking);
-            assert(conn.tls_pending_len <= engine.inbox.len);
-            if (conn.tls_pending_len + bytes.len > engine.inbox.len) {
+            assert(conn.tls_pending_len <= engine.staging.len);
+            if (conn.tls_pending_len + bytes.len > engine.staging.len) {
                 // Pre-relay, so this is a handshake-phase failure, not the
                 // mid-relay class `tls_relay_failed` names.
                 conn.server.counters.increment("tls_handshake_failed");
                 conn.server.beginTeardown(conn);
                 return;
             }
-            @memcpy(engine.inbox[conn.tls_pending_len..][0..bytes.len], bytes);
+            @memcpy(engine.staging[conn.tls_pending_len..][0..bytes.len], bytes);
             conn.tls_pending_len += @intCast(bytes.len);
-            assert(conn.tls_pending_len <= engine.inbox.len);
+            assert(conn.tls_pending_len <= engine.staging.len);
         }
 
         fn tlsPeerClosed(ctx: *anyopaque) void {

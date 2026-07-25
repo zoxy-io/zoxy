@@ -15,6 +15,13 @@ const Io = @import("io/io.zig");
 const parser = @import("http/parser.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
+const TlsCredentials = @import("tls/Credentials.zig");
+const TlsTestClient = @import("tls/TestClient.zig").TestClient(SimIo);
+
+// Throwaway fixtures (src/tls/testdata/README.md), standing in for the
+// cert files main.zig reads at startup.
+const tls_cert_pem = @embedFile("tls/testdata/cert.pem");
+const tls_key_pem = @embedFile("tls/testdata/key.pem");
 
 const assert = std.debug.assert;
 
@@ -444,6 +451,9 @@ const Http1Bed = struct {
         /// The single route's host scope; null is any-host. A canonical
         /// host lets a test drive host routing and its 404 (§7).
         route_host: ?[]const u8 = null,
+        /// Terminate TLS on the listener, so the whole L7 path runs over
+        /// a real handshake and the transform seam carries every leg.
+        tls: bool = false,
         /// The listener's §7 filter rules; empty by default so existing
         /// scenarios are unfiltered. A test supplies compiled rules to
         /// drive the filter reject/edit paths.
@@ -467,6 +477,12 @@ const Http1Bed = struct {
             .routes = &bed.routes,
             .filters = options.filters,
             .protocol = .http,
+            // Paths only; the credentials below stand in for main.zig's
+            // file read, exactly as the L4 bed does.
+            .tls = if (options.tls) .{
+                .cert_path = "cert.pem",
+                .key_path = "key.pem",
+            } else null,
         }};
         bed.config = .{
             .listeners = &bed.listeners,
@@ -480,7 +496,15 @@ const Http1Bed = struct {
             .conn_slots = options.conn_slots,
             .relay_buffers = options.relay_buffers,
             .upstream_slots = options.upstream_slots,
+            .tls_engines = if (options.tls) 2 else 0,
         });
+        // Credentials must reach the server before `start`, which copies
+        // each entry's address into its ListenerState (§4).
+        if (options.tls) {
+            const entries = try arena.alloc(?TlsCredentials, bed.listeners.len);
+            entries[0] = try TlsCredentials.load(arena, tls_cert_pem, tls_key_pem, .{});
+            bed.server.setTlsCredentials(entries);
+        }
         try bed.server.start();
         bed.origin = .{
             .response = options.origin_response,
@@ -1839,4 +1863,51 @@ test "l7: the replay path allocates nothing after init" {
     strict_bed.client2.request = second_request;
     try strict_bed.exchange(first_request);
     try strict_bed.expectDrained();
+}
+
+test "l7: a GET over a terminated TLS session is proxied and relayed back" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 41,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+    });
+    defer bed.tearDown();
+
+    // A real handshake, then the request head as application data. This
+    // is the whole chain at once: the protocol fork out of
+    // `finishTlsHandshake`, the decrypt-into-head read, the transform
+    // seam on both body legs, and the encrypted response head.
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = "GET /path HTTP/1.1\r\nHost: origin.example\r\n" ++
+            "Connection: close\r\n\r\n",
+    });
+    defer client.deinit();
+    // The plain client starts the drain when it sees the close; the TLS
+    // client needs the same hook or the listeners keep the loop alive.
+    client.on_end = drainOnTlsClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+    bed.origin.stopListening();
+
+    // The plaintext the client decrypted is the origin's response,
+    // rewritten with Connection: close exactly as on the plain path.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expect(bed.origin.conns[0].request_complete);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+}
+
+fn drainOnTlsClientEnd(context: ?*anyopaque) void {
+    const bed: *Http1Bed = @ptrCast(@alignCast(context.?));
+    bed.server.beginDrain();
 }

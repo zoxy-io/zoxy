@@ -8,6 +8,7 @@
 
 const std = @import("std");
 
+const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const router = @import("../http/router.zig");
@@ -141,12 +142,21 @@ pub fn Conn(comptime IoType: type) type {
         /// on a plain-TCP connection, which is every connection on a
         /// listener without credentials.
         tls: ?*TlsEngine,
+        /// What to serve once TLS termination completes. Only the TLS
+        /// path needs it: the plain admission fork picks a state directly
+        /// from the listener, but a terminated connection is handed to
+        /// `finishTlsHandshake` long after that fork, and TLS is
+        /// orthogonal to the protocol (§4). Meaningless when `tls` is
+        /// null.
+        tls_protocol: config_module.Config.Listener.Protocol,
         /// Plaintext the client sent immediately after its Finished, while
-        /// the upstream dial was still in flight. A TLS 1.3 client may
-        /// write as soon as it has sent Finished — it need not wait for
-        /// anything from us — so this is ordinary application data that
-        /// simply beat the relay, not 0-RTT early data. It is staged in
-        /// the engine inbox and forwarded as the relay's first send.
+        /// the connection was still finishing termination. A TLS 1.3
+        /// client may write as soon as it has sent Finished — it need not
+        /// wait for anything from us — so this is ordinary application
+        /// data that simply arrived early, not 0-RTT early data. It is
+        /// held in `Engine.staging` until the protocol fork claims it: the
+        /// L4 relay sends it as its first write, the L7 proxy copies it
+        /// into `head` as the front of the request.
         tls_pending_len: u32,
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
@@ -409,6 +419,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.client_socket = client_socket;
             conn.upstream_socket = null;
             conn.relay_buffer = buffer;
+            conn.tls_protocol = .l4; // admitTls overwrites when it matters.
             conn.tls = null; // admitTls checks one out after prepare.
             conn.tls_pending_len = 0;
             conn.deadline_ns = 0;
