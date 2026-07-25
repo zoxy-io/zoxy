@@ -192,12 +192,15 @@ pub fn Proxy(comptime IoType: type) type {
                 const self: *HeadPlaintext = @ptrCast(@alignCast(ctx));
                 const conn = self.conn;
                 const room = conn.head.len - conn.head_len;
-                if (bytes.len > room) {
-                    self.overflowed = true;
-                    return;
-                }
-                @memcpy(conn.head[conn.head_len..][0..bytes.len], bytes);
-                conn.head_len += @intCast(bytes.len);
+                // Fill as far as it goes before giving up: whether the
+                // head itself parses out of those bytes is what separates
+                // "this head is too large" from "this head is fine and
+                // its body did not fit", and the caller cannot tell them
+                // apart without them.
+                const take = @min(room, bytes.len);
+                @memcpy(conn.head[conn.head_len..][0..take], bytes[0..take]);
+                conn.head_len += @intCast(take);
+                if (take < bytes.len) self.overflowed = true;
             }
 
             fn peerClosed(ctx: *anyopaque) void {
@@ -239,10 +242,18 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             if (plaintext.overflowed) {
-                // A head that cannot fit is 431 whether or not the excess
-                // was body bytes; the body carryover lands with the body
-                // leg (PLANS.md 3a).
-                return respond(server, conn, 431, "l7_headers_too_large");
+                // One record delivered more plaintext than the head buffer
+                // holds. Which answer is honest depends on what those
+                // bytes were, so ask the parser: a head that completes
+                // inside the buffer means the overflow was *body*, and
+                // calling that "header fields too large" would send the
+                // client chasing the wrong thing.
+                var storage: parser.HeaderStorage = undefined;
+                if (parser.parseRequestHead(conn.head[0..conn.head_len], true, &storage)) |_| {
+                    return respond(server, conn, 413, "l7_body_too_large");
+                } else |_| {
+                    return respond(server, conn, 431, "l7_headers_too_large");
+                }
             }
             if (conn.head_len == 0) {
                 // A record with no application data (a post-handshake

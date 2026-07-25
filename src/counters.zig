@@ -61,6 +61,10 @@ pub const Counters = struct {
     /// of `reconcile`'s shed sum; these are pure observability.
     l7_bad_request: Value = Value.init(0),
     l7_uri_too_long: Value = Value.init(0),
+    /// A request whose head parsed but whose coalesced body overran the
+    /// head buffer in one TLS record (§4). Distinct from
+    /// `l7_headers_too_large`: the head was fine, the payload was not.
+    l7_body_too_large: Value = Value.init(0),
     l7_headers_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
     /// No route matched the request's canonical path (§7), answered 404.
