@@ -640,8 +640,19 @@ the loop thread.
 | tls engines (§4) | accept admission on a TLS listener | close immediately — there is no session to answer through |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7) / close (L4) |
+| tls staging room (§4) | a step that would stage past the engine outbox or inbox | tear down that connection; counter |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
+
+The TLS staging rung sheds rather than backpressures because by the time
+it fires the bytes are already off the wire and decrypted inside a
+synchronous `feed`: there is no "ask the peer to pause" primitive at that
+granularity. The real backpressure happens one level up, by simply not
+arming the next read — a peer that outruns us stalls on its own send
+window, so only what fit in one read has to be resolved here. Forwarding
+it if it fits and shedding if it does not are the only two sound options;
+growing past a fixed bound and crashing are both ruled out by this
+section.
 
 - **Static error responses.** `400`/`404`/`414`/`431`/`501`/`503`/`504`
   are comptime byte arrays sent directly from static memory — never
