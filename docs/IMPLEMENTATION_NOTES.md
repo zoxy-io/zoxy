@@ -224,6 +224,22 @@ assertions, and the checkout/return wiring land with the handshake
 phase (slice 4), which is where the pool gets its first consumer; this
 note is the sizing input so that slice does not re-derive it.
 
+## libcrypto's fixed heap — startup alone takes ~425 KiB (2026-07-25)
+
+Measured in the real binary with a TLS listener: after `install`, loading
+one listener's credentials (`Credentials.load` → `PrivateKey.fromPem`)
+leaves the heap frontier at **435152 bytes**. That is libcrypto's
+provider/EVP machinery initializing on first use, not the key itself —
+a one-time startup cost, and the reason the reservation
+(`libcrypto_heap_bytes`, 4 MiB) is sized well above what a handshake's
+transient working set alone would suggest.
+
+The frontier only grows (freed blocks return to their size-class list,
+not to the bump pointer), so this number is the floor for any TLS
+deployment. Handshakes reuse those freed blocks rather than extending
+it. Worth re-measuring under concurrent handshakes before tightening the
+reservation.
+
 ## TLS on the loop — the band that retired the worker pool (2026-07-25)
 
 Measured on the `phase-3a-ztls` branch (ztls engine, ECDSA P-256 fixture

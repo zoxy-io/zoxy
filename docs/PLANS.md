@@ -81,13 +81,20 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      socket and arm no ring op, so the fd and CQ budgets are untouched.
      *Deferred to slice 6:* per-listener `Credentials` built at startup
      from the config paths (the file read), and engine checkout.
-  6. **The handshake phase in the data path** — its own deadline (the
+  6. **Startup credentials** — *landed:* main.zig installs the fixed
+     libcrypto heap (completing slice 1's wiring — nothing had called
+     `install` before), reads each TLS listener's cert/key, and builds a
+     per-listener `Credentials` the Server hands to its `ListenerState`.
+     A missing or malformed certificate aborts startup naming the path,
+     so a proxy never comes up unable to present it. Verified in the real
+     binary: boots with a live cert, exits 1 on both failure paths.
+  7. **The handshake phase in the data path** — its own deadline (the
      slowloris answer), the per-tick budget + backlog + shed rung +
-     counters: the §8 ladder's new row.
-  7. **Data-path shim** — L4-over-TLS first (terminate, relay
+     counters: the §8 ladder's new row. Engine checkout lands here.
+  8. **Data-path shim** — L4-over-TLS first (terminate, relay
      plaintext), then L7 head-read over decrypted bytes; the strict
      relay discipline is unchanged either way.
-  8. **Sim + fuzz gates** — the spike client ported into the sim
+  9. **Sim + fuzz gates** — the spike client ported into the sim
      harness (both keyshares seeded), the adversary at TLS record
      granularity, golden byte-exact transcripts on clean seeds; fuzz
      raw bytes through the wrapper — never panic, alert-or-progress.
@@ -95,11 +102,11 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      into a fuzz target — new parsing over operator input, unit-tested
      for now but owed §9 fuzz coverage (the ci `--fuzz` gate is
      libcrypto-free, so this rides the TLS fuzz seam this slice builds).
-  9. **Resumption** — `psk_lookup` + ticket issuance over a static
+  10. **Resumption** — `psk_lookup` + ticket issuance over a static
      key table in the memory budget. Last deliberately: full handshakes
      already fit the budget; tickets are the reconnect-storm lever
      (~14k × ~260 µs ≈ seconds of handshake CPU without them).
-  10. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
+  11. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
      support is the open dependency (h2load `--h1` is the interim).
   Cross-cutting entry gate: the ztls audit per §4 (the Zig protocol
   layer read line-by-line; the C primitives trusted institutionally),

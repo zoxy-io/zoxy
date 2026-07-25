@@ -25,6 +25,7 @@ const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
+const TlsCredentials = @import("tls/Credentials.zig");
 const TlsEngine = @import("tls/Engine.zig");
 const upstream_module = @import("net/upstream.zig");
 
@@ -47,6 +48,11 @@ pub fn Server(comptime IoType: type) type {
         /// unless a listener terminates TLS, so a plain-TCP deployment
         /// reserves nothing.
         tls_engines: Pool(TlsEngine),
+        /// Per-listener TLS credentials in listener order, null where a
+        /// listener is plain TCP; empty when nothing terminates TLS.
+        /// Loaded at startup (main.zig) and borrowed for the process —
+        /// `Engine.init` keeps pointers into the entry it is handed.
+        tls_credentials: []const ?TlsCredentials,
         listeners: []ListenerState,
         listeners_count: u16,
         /// The load-balancing policy: resolves a cluster to the endpoint to
@@ -118,6 +124,10 @@ pub fn Server(comptime IoType: type) type {
             /// Copied from config so admission forks without reaching back
             /// through the listener index (§6, §7).
             protocol: config_module.Config.Listener.Protocol,
+            /// This listener's TLS credentials, or null for plain TCP —
+            /// the admission-time answer to "does this connection start
+            /// with a handshake?" (§4). Points into `tls_credentials`.
+            credentials: ?*const TlsCredentials,
             accepting: bool,
         };
 
@@ -149,6 +159,10 @@ pub fn Server(comptime IoType: type) type {
             // engine at `Engine.init` on checkout. Zero when no listener
             // terminates TLS, which disables the pool (§4).
             try server.tls_engines.init(arena, options.tls_engines);
+            // No credentials until `setTlsCredentials`: a Server built
+            // without them serves plain TCP, which is what every non-TLS
+            // test and the simulator want.
+            server.tls_credentials = &.{};
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
             server.balancer.init(config);
@@ -171,6 +185,15 @@ pub fn Server(comptime IoType: type) type {
             server.admin.setBind(bind_address);
         }
 
+        /// Hand over the per-listener TLS credentials loaded at startup
+        /// (main.zig), in listener order. Borrowed for the process, so the
+        /// caller keeps them alive; must be called before `start`, which
+        /// copies each entry's address into its `ListenerState`.
+        pub fn setTlsCredentials(server: *Self, credentials: []const ?TlsCredentials) void {
+            assert(credentials.len == 0 or credentials.len == server.listeners_count);
+            server.tls_credentials = credentials;
+        }
+
         pub fn start(server: *Self) Io.ListenError!void {
             assert(!server.draining);
             assert(server.listeners_count >= 1);
@@ -188,6 +211,16 @@ pub fn Server(comptime IoType: type) type {
                     .routes = listener_config.routes,
                     .filters = listener_config.filters,
                     .protocol = listener_config.protocol,
+                    // A config that asks for TLS must have been handed
+                    // credentials (main.zig loads one entry per listener),
+                    // so a missing entry is a composition bug, not a
+                    // runtime fallback to plaintext.
+                    .credentials = if (listener_config.tls == null) null else blk: {
+                        assert(index < server.tls_credentials.len);
+                        const loaded = &server.tls_credentials[index];
+                        assert(loaded.* != null);
+                        break :blk &loaded.*.?;
+                    },
                     .accepting = false,
                 };
                 server.armAccept(state);
