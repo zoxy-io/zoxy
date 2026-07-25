@@ -158,8 +158,8 @@ reviews of A5 landed on it, and neither could guard it from here.
 | # | slice | ~ | what it buys |
 |---|---|---|---|
 | B2 | Split the cursor: an explicit wire cursor distinct from the framed one, `assert(wire == framed)` while every policy is identity — *landed as vocabulary, not as a field; see below* | 60 | turns the silent-corruption hazard into a failed assertion. A pure refactor today |
-| B1 | Pump transform seam — `recvBuffer`, `transformIn`, `transformOut`, `sendSlice`, `creditSend`, identity by default — and the loop condition becomes *"anything left to write?"* rather than *"cursor reached length"* | 120 | TLS L4 becomes a policy; `tls_relay.zig` never gets written |
-| B5 | A toy transform in the simulator: deterministic and non-identity (XOR mask, or 4-byte length re-framing) on an L4 sim listener, verified byte-exact by the token oracle under the adversary | 150 | proves the seam *without crypto*, so TLS adds only crypto, not new mechanism risk. The de-risking slice for all of Tier B |
+| B1 | Pump transform seam — `recvBuffer`, `transformIn`, `transformOut`, `sendSlice`, `creditSend`, identity by default — and the loop condition becomes *"anything left to write?"* rather than *"cursor reached length"*. **Not done without B5** | 120 | TLS L4 becomes a policy; `tls_relay.zig` never gets written |
+| B5 | A toy transform in the simulator: deterministic and non-identity (XOR mask, or 4-byte length re-framing) on an L4 sim listener, verified byte-exact by the token oracle under the adversary. **Lands with B1, not after it** | 150 | proves the seam *without crypto*, so TLS adds only crypto, not new mechanism risk. The de-risking slice for all of Tier B |
 | B3 | One client-write channel over B2's cursor: `armClientWrite(conn, plaintext)` for all three client-directed sends | 150 | TLS changes one place, kTLS none; also settles what §8's "static responses straight from static memory" means once the bytes must be encrypted |
 | B4 | Head-fill source seam: read through a source (socket today), one "head complete? → parse / 431 / 413 / read again" decision | 100 | removes the parallel TLS completion path and the duplicated limit decision |
 
@@ -179,7 +179,10 @@ check the open-coded version never had.
 well as the transform's**, which is the risk this row was sequenced first
 to retire. What is retired is its *spread* — that shape now lands inside
 four methods rather than across the seven sites that used to open-code
-them.
+them. The rest of that cost is answered by fusing B5 into B1 (below): a
+toy transform cannot run *before* the seam it is a policy on, but it can
+land in the same slice, which is what keeps the mechanism from ever
+existing unverified.
 
 ### Tier C — budget and accounting hygiene
 
@@ -196,13 +199,19 @@ them.
 | D1 | Tier-1 gate on achieved rate against offered | 40 | the §9 gates check socket and status errors only, so a run delivering 704 of 2000 req/s passed them |
 | D2 | A large-body band in the harness | 80 | the record layer's per-byte cost is unmeasured, and the kTLS decision (Phase 3b) depends on that number |
 
-**Order.** Critical path to a small TLS slice: **A5 → A4 → B2 → B1 → B5
-→ B3 → B4**, with A1–A3 and Tier C as fill-in. B2 comes before B1
-because the cursor split is provable while every policy is still
-identity — introducing the seam first means building it over the
-ambiguity. B5 follows B1 immediately, so "the seam works" is a tested
-claim rather than an assertion about unexercised code; extend it to a
-toy-transformed `http` sim listener when B3 and B4 land.
+**Order.** Critical path to a small TLS slice: **A5 → A4 → B2 →
+(B1 + B5) → B3 → B4**, with A1–A3 and Tier C as fill-in.
+
+B1 and B5 are **one slice, not two**. The seam is what introduces a second,
+wire-side cursor, and under identity there is nothing to check it against —
+that is exactly what B2 could not stage (above). A toy transform cannot run
+before the seam, since it *is* a policy on it, but landing it in the same
+slice means the mechanism is never in the tree unverified: the identity
+transforms prove the existing L4 and L7 body tests still pass unchanged (the
+regression net), and the toy transform proves the wire cursor is actually
+independent of the framed one — byte-exact under the adversary, with no
+crypto involved. Only then do TLS transforms hook on. Extend the toy
+transform to a `http` sim listener when B3 and B4 land.
 
 **`tls_relay.zig` is not to be re-created.** Its own header records the
 parallel loop as provisional — "worth doing once TLS is proven, and
