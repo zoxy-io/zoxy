@@ -113,6 +113,26 @@ pub fn build(b: *std.Build) void {
     );
     tls_spike_step.dependOn(&tls_spike_tests.step);
 
+    // Phase 3a slice 1: the fixed libcrypto heap. Its own step because
+    // the allocation hooks must be installed before libcrypto's first
+    // allocation — impossible to guarantee alongside the spike's ordinary
+    // handshake tests in one binary.
+    const tls_heap_proof_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tls/heap_proof_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ztls", .module = ztls_dependency.module("ztls") },
+            },
+        }),
+    }));
+    const tls_heap_proof_step = b.step(
+        "tls-heap-proof",
+        "Prove a TLS handshake runs on the fixed libcrypto heap (needs libcrypto)",
+    );
+    tls_heap_proof_step.dependOn(&tls_heap_proof_tests.step);
+
     const sim_exe = b.addExecutable(.{
         .name = "zoxy-sim",
         .root_module = b.createModule(.{
