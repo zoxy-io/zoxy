@@ -30,9 +30,14 @@ const HttpClient = struct {
     connect_completion: SimIo.Completion = .{},
     send_completion: SimIo.Completion = .{},
     recv_completion: SimIo.Completion = .{},
+    delay_completion: SimIo.Completion = .{},
     socket: SimIo.Socket = undefined,
     address: std.Io.net.IpAddress = undefined,
     request: []const u8 = undefined,
+    /// Hold the head back this long after connecting. The scenario that
+    /// needs the head to land at a chosen instant (not at once, under the
+    /// frozen intra-batch clock) sets it; 0 sends immediately.
+    send_delay_ms: u32 = 0,
     /// Sent on the same connection once the first response is complete —
     /// sequential keep-alive, never pipelining.
     second_request: ?[]const u8 = null,
@@ -43,6 +48,7 @@ const HttpClient = struct {
     /// the idle sweep instead arms a drain timer and clears this.
     drain_on_finish: bool = true,
     sent_len: u32 = 0,
+    send_in_flight: bool = false,
     receive_buffer: [4096]u8 = undefined,
     received_len: u32 = 0,
     outcome: Outcome = .pending,
@@ -59,11 +65,31 @@ const HttpClient = struct {
     fn onConnect(client: *HttpClient, result: Io.ConnectError!SimIo.Socket) void {
         client.socket = result catch unreachable;
         client.armRecv();
+        if (client.send_delay_ms == 0) {
+            client.armSend();
+            return;
+        }
+        client.io.timerStart(
+            &client.delay_completion,
+            @as(u64, client.send_delay_ms) * std.time.ns_per_ms,
+            HttpClient,
+            client,
+            onSendDelay,
+        );
+    }
+
+    fn onSendDelay(client: *HttpClient, result: Io.TimerError!void) void {
+        result catch unreachable; // Nothing cancels the client's send delay.
+        // The server may have reaped the silent connection while the delay
+        // ran; its socket is already closed, so there is nothing to send.
+        if (client.outcome != .pending) return;
         client.armSend();
     }
 
     fn armSend(client: *HttpClient) void {
         assert(client.sent_len < client.request.len);
+        assert(!client.send_in_flight);
+        client.send_in_flight = true;
         client.io.send(
             client.socket,
             client.request[client.sent_len..],
@@ -75,14 +101,20 @@ const HttpClient = struct {
     }
 
     fn onSend(client: *HttpClient, result: Io.SendError!u32) void {
+        client.send_in_flight = false;
         // A reject may close the connection before the whole request is
         // sent; a send failure then is expected, not an error.
-        const sent = result catch return;
+        const sent = result catch {
+            client.finish();
+            return;
+        };
         client.sent_len += sent;
         assert(client.sent_len <= client.request.len);
         if (client.sent_len < client.request.len) {
             client.armSend();
+            return;
         }
+        client.finish();
     }
 
     fn armRecv(client: *HttpClient) void {
@@ -96,20 +128,30 @@ const HttpClient = struct {
         );
     }
 
+    /// The peer's close ends this client — but not before its own send has
+    /// drained: closing under a pending send would leave the simulator a
+    /// stale handle (a §5 violation it asserts on), so whichever of the
+    /// close and the send lands second finishes.
+    fn finish(client: *HttpClient) void {
+        if (client.outcome == .pending) return;
+        if (client.send_in_flight) return;
+        client.io.closeNow(client.socket);
+        if (client.next) |successor| {
+            client.next = null;
+            successor.start(client.io, client.server, client.address);
+            return;
+        }
+        if (client.drain_on_finish) {
+            // Begin the drain so the run winds down instead of idling
+            // on the armed accept — the L4 harness does the same.
+            client.server.beginDrain();
+        }
+    }
+
     fn onRecv(client: *HttpClient, result: Io.RecvError!u32) void {
         const received = result catch |err| {
             client.outcome = if (err == error.Reset) .reset else .fin;
-            client.io.closeNow(client.socket);
-            if (client.next) |successor| {
-                client.next = null;
-                successor.start(client.io, client.server, client.address);
-                return;
-            }
-            if (client.drain_on_finish) {
-                // Begin the drain so the run winds down instead of idling
-                // on the armed accept — the L4 harness does the same.
-                client.server.beginDrain();
-            }
+            client.finish();
             return;
         };
         assert(received >= 1);
@@ -389,6 +431,13 @@ const Http1Bed = struct {
         conn_slots: u32 = 4,
         relay_buffers: u32 = 2,
         upstream_slots: u32 = 2,
+        /// The §6 absolute age cap; 0 (the default) disables it. A cap the
+        /// exchange outlives clamps every stored deadline to it, so a
+        /// re-based target can already be in the past.
+        max_lifetime_ms: u32 = 0,
+        /// Hold the client's head back this long after it connects, so it
+        /// lands at a chosen instant rather than at once.
+        send_delay_ms: u32 = 0,
         /// The single route's prefix; "/" is the catch-all. A narrower
         /// prefix lets a test drive the no-route 404 path (§7).
         route_prefix: []const u8 = "/",
@@ -425,7 +474,7 @@ const Http1Bed = struct {
             .connect_timeout_ms = connect_timeout_ms,
             .idle_timeout_ms = idle_timeout_ms,
             .drain_deadline_ms = 1000,
-            .max_lifetime_ms = 0,
+            .max_lifetime_ms = options.max_lifetime_ms,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
@@ -442,7 +491,7 @@ const Http1Bed = struct {
         if (options.origin_listens) {
             try bed.origin.start(&bed.sim_io, originAddress());
         }
-        bed.client = .{};
+        bed.client = .{ .send_delay_ms = options.send_delay_ms };
         bed.client2 = .{};
         bed.drain_timer_completion = .{};
     }
@@ -1261,6 +1310,54 @@ test "l7: a response already started forfeits the 504 — teardown only" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
     try bed.expectDrained();
+}
+
+test "l7: a dial re-basing an already-expired deadline defers past the cancel" {
+    // Issue #65 (§8): the dial's re-base cancel is matching against
+    // op_deadline's own completion, so no path may arm a fresh timer on
+    // it until that cancel drains — the expiry included. The §6 lifetime
+    // cap is what puts expiry on that path: the head lands exactly at the
+    // cap, so the dial's storeDeadline clamps to an already-past target
+    // and the head-read timer — delivered success in the same batch as
+    // the re-base, before the cancel — finds the deadline due with the
+    // cancel still in flight. The oracle is expireDeadline's
+    // `assert(!conn.armed.deadline_cancel)`: with onDeadline's guard
+    // dropped, this seed panics there.
+    //
+    // The client's head is held back to exactly the cap so the two wake
+    // at the same instant (the clock never advances mid-batch, and never
+    // at all while a cancel is pending, so a re-based target can only be
+    // in the past if the cap already is). Only a minority of schedules
+    // then order the batch the way the race needs — seeds 88 and 93
+    // today — so the sweep is the coverage: pinning one seed would let an
+    // unrelated shift in the PRNG draws silently stop reaching the path.
+    const cap_ms: u32 = 25;
+    var seed: u64 = 1;
+    while (seed <= 100) : (seed += 1) {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = seed,
+            .max_lifetime_ms = cap_ms,
+            .send_delay_ms = cap_ms,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /capped HTTP/1.1\r\nHost: o\r\n\r\n");
+
+        // Past the cap every stored deadline clamps into the past, so the
+        // deferred expiry lands the moment the cancel drains and the
+        // verdict's own grace expires with it: the cap reaps the
+        // connection either way. What this pins is the discipline on the
+        // way there, not a response — the exchange is condemned before it
+        // can be answered, so the close is a FIN or (with the client's
+        // head still unread) an RST, and §2 constrains neither: no
+        // response byte was ever delivered.
+        try std.testing.expect(bed.client.outcome != .pending);
+        try std.testing.expect(bed.server.counters.get("deadline_expired") >= 1);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+        try bed.expectDrained();
+    }
 }
 
 test "l7: the 504 verdict path allocates nothing after init" {

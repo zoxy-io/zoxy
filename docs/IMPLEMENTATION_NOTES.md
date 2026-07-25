@@ -194,6 +194,35 @@ the orderly failures (EOF, RST) are peeled off first. SimIo grew a
 one-shot `kernel_pressure` fault and a `kernel_pressure_percent`
 adversary knob to exercise the rung.
 
+## The deadline rebase cancel reaches the expiry path (#65)
+
+Every deadline re-arm guards on `!armed.deadline_cancel` so the in-flight
+rebase cancel (the one deadline cancel outside teardown, §8) cannot match
+a freshly armed timer — every site except `expireDeadline`'s two verdict
+branches, which `onDeadline`'s success path reached unguarded.
+
+Reachable, and by exactly one route: `storeDeadline` writes
+`min(now + timeout, birth + max_lifetime)` and every timeout is ≥ 1 ms,
+so a stored target can only be in the past when the §6 lifetime cap
+already is. Past the cap the dial's re-base stores an already-expired
+target, and the head-read timer delivering *success* in that same batch
+then finds the deadline due with the cancel still in flight. SimIo will
+not stumble into it: its clock never advances inside a batch, and never
+at all while any op is ready — a pending cancel always is — so the head
+and the cap have to wake at the same instant by construction. 2000
+undirected seeds missed it; the directed case (`http_proxy_test.zig`,
+client head held back to exactly the cap) hits it at seeds 88 and 93
+of 200.
+
+Fixed by hoisting the guard over the whole success path: a due deadline
+defers to `onDeadlineRebase`, which re-arms at the stored target once the
+cancel drains, expiring one round-trip later. `expireDeadline` asserts
+`!armed.deadline_cancel` — the directed case's oracle, and it panics
+there if the guard is dropped. Nothing changes at the boundary: past the
+cap the verdict's own grace clamps into the past too, so the connection
+is condemned either way. What changed is that the invariant is uniform
+and now asserted rather than assumed.
+
 ## Occupancy is not overload — conn-pressure keep-alive kill reverted (#57)
 
 The v0.0.0 watermark design (#54) suppressed downstream keep-alive under
