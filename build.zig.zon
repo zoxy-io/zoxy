@@ -53,9 +53,16 @@
             .url = "git+https://github.com/zoxy-io/hparse#65521edfc09f19c5574a3360e2ce236c6dbc3be3",
             .hash = "hparse-0.2.0-IukW0rSOAQAmTPCaHzBakxuRRv6dfMds5OGdGU8nxlXw",
         },
+        // Phase 3a spike candidate (PLANS.md): the zoxy-io/ztls fork,
+        // branch deterministic-ecdsa = upstream mattrobenolt/ztls@41c24d7
+        // plus one commit adding opt-in RFC 6979 deterministic ECDSA nonces
+        // (mattrobenolt/ztls#82) so a seeded handshake replays byte-exact.
+        // Only the `tls-spike` build step links this and its libcrypto; CI
+        // never touches it. A spike pin, not a §4 production dependency —
+        // that decision waits on the 3a engine.
         .ztls = .{
-            .url = "git+https://github.com/mattrobenolt/ztls#41c24d7960873ce174d153abf9da20e0b495fbce",
-            .hash = "ztls-0.0.0-SHHDXsXyFABPDzgUro7LThsIe3AcZEOeA62uYNPkJ-cZ",
+            .url = "git+https://github.com/zoxy-io/ztls#6761378eacef6b586e01a499bfead7d45608ab0b",
+            .hash = "ztls-0.0.0-SHHDXsEbFQCnDr1EBrfpHyq--1lh3k54OentM9E_zGQ4",
         },
     },
     .paths = .{

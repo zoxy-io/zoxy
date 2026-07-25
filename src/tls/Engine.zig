@@ -56,6 +56,11 @@ pub const Config = struct {
     cert_der: []const u8,
     /// Raw P-256 signing scalar for the certificate key.
     p256_scalar: [32]u8,
+    /// RFC 6979 deterministic ECDSA nonce (the zoxy-io/ztls fork,
+    /// mattrobenolt/ztls#82): the simulator sets this so a seeded
+    /// handshake — including the CertificateVerify signature — replays
+    /// byte-for-byte. Production keeps the default random nonce.
+    deterministic_nonce: bool = false,
 };
 
 /// In-place init via out-pointer: `records` borrows `record_storage`,
@@ -68,6 +73,7 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     );
     engine.key = try ztls.signature.PrivateKey.fromP256Scalar(&config.p256_scalar);
     errdefer engine.key.deinit();
+    engine.key.deterministic_nonce = config.deterministic_nonce;
     engine.chain = .{config.cert_der};
     engine.hs = .init(.{
         .keypairs = .init(keypair),

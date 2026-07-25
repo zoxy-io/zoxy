@@ -3,7 +3,9 @@
 //! no sockets, deterministic key material, static buffers throughout.
 //! Proves: the sans-I/O drive loop shape, the data-injection seam the
 //! simulator needs, credential provisioning from an embedded DER cert +
-//! raw scalar, and round-trip application data + orderly close.
+//! raw scalar, round-trip application data + orderly close, and — with
+//! the fork's RFC 6979 nonce plus every peer keyshare seeded — a
+//! byte-exact reproducible server flight (the §9 replay property).
 
 const std = @import("std");
 
@@ -83,11 +85,16 @@ const Client = struct {
     saw_close: bool = false,
 
     fn init(client: *Client) !void {
-        const keypair = try ztls.x25519.KeyPair.generateDeterministic(
-            .init(@splat(0x51)),
-        );
+        // Both keyshares must be seeded: KeyPairs.init would generate a
+        // *random* P-256 share, and that share rides in the ClientHello —
+        // hence in the transcript the server signs — so a random one makes
+        // even a deterministic signature cover a different message each
+        // run. In the real simulator every peer's key material is seeded;
+        // here the test client stands in for that.
+        const x25519 = try ztls.x25519.KeyPair.generateDeterministic(.init(@splat(0x51)));
+        const p256 = try ztls.p256.KeyPair.generateDeterministic(.init(@splat(0x53)));
         client.hs = .init(.{
-            .keypairs = .init(keypair),
+            .keypairs = .initWithP256(x25519, p256),
             .host_name = "spike.zoxy.test",
             .now_sec = 0,
             .random = .init(@splat(0x52)),
@@ -183,7 +190,7 @@ test "spike: full deterministic handshake, echo, and orderly close" {
     try std.testing.expect(client.saw_close);
 }
 
-test "spike: determinism — identical seeds yield identical first flight" {
+test "spike: determinism — identical seeds yield a byte-exact server flight" {
     var first: [2][]u8 = undefined;
     var storage: [2][4096]u8 = undefined;
     for (0..2) |run| {
@@ -193,6 +200,11 @@ test "spike: determinism — identical seeds yield identical first flight" {
             .random = @splat(0x43),
             .cert_der = cert_der,
             .p256_scalar = testScalar(),
+            // The seam the simulator depends on: with deterministic ECDSA
+            // the whole flight — including the CertificateVerify signature
+            // and the encrypted record framing around it — is a pure
+            // function of the seeds.
+            .deterministic_nonce = true,
         });
         defer engine.deinit();
 
@@ -210,25 +222,12 @@ test "spike: determinism — identical seeds yield identical first flight" {
         @memcpy(storage[run][0..to_client.wire_len], to_client.wire[0..to_client.wire_len]);
         first[run] = storage[run][0..to_client.wire_len];
     }
-    // The sim-injection seam, as far as it goes today: same seeds give a
-    // byte-identical ServerHello record (the injected random and the
-    // deterministic X25519 keyshare are directly visible in it). Full-
-    // flight determinism does NOT hold — libcrypto signs
-    // CertificateVerify with a random nonce, so the signature bytes and
-    // (via DER integer trimming) even the encrypted flight record's
-    // *length* vary run to run; divergence starts at that record's
-    // header. Recorded spike finding: byte-exact sim replay of TLS
-    // traffic needs deterministic ECDSA (RFC 6979 — OpenSSL 3.2+
-    // exposes it as the "nonce-type" EVP param; ztls does not surface it
-    // yet), an upstream feature request for the production engine.
-    // Compare exactly the first record: 5-byte header + u16 body length.
-    try std.testing.expect(first[0].len >= 5 and first[1].len >= 5);
-    const body_len = std.mem.readInt(u16, first[0][3..5], .big);
-    const record_len = 5 + @as(usize, body_len);
-    try std.testing.expect(first[0].len >= record_len and first[1].len >= record_len);
-    try std.testing.expectEqualSlices(
-        u8,
-        first[0][0..record_len],
-        first[1][0..record_len],
-    );
+    // Whole server flight (ServerHello through the encrypted
+    // Certificate/CertificateVerify/Finished) is byte-identical across
+    // runs — the property a seeded, replayable simulation (§9) needs.
+    // Before the fork's RFC 6979 nonce this diverged at the
+    // CertificateVerify record: libcrypto's random ECDSA nonce varied the
+    // signature bytes and, via DER integer trimming, the record length.
+    try std.testing.expect(first[0].len > 0);
+    try std.testing.expectEqualSlices(u8, first[0], first[1]);
 }
