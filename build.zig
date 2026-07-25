@@ -110,7 +110,7 @@ pub fn build(b: *std.Build) void {
     // only a fresh process whose first libcrypto touch is the install can
     // guarantee. Every other TLS test runs under `zig build test`.
     const tls_heap_proof_module = b.createModule(.{
-        .root_source_file = b.path("src/tls/heap_proof_test.zig"),
+        .root_source_file = b.path("src/tls_heap_proof.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{

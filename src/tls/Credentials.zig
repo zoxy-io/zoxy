@@ -15,6 +15,7 @@
 //! is the caller's (a startup step); this takes the bytes.
 
 const std = @import("std");
+const constants = @import("../constants.zig");
 
 const ztls = @import("ztls");
 
@@ -32,6 +33,10 @@ scheme: ztls.SignatureScheme,
 
 pub const LoadError = error{
     NoCertificates,
+    /// The DER chain exceeds `constants.tls_cert_chain_bytes_max`.
+    /// The engine sizes its outbound staging from that bound, so a
+    /// larger chain has nowhere to be staged whole.
+    CertChainTooLarge,
     MalformedPem,
     /// The leaf certificate's key is not ECDSA P-256/P-384.
     UnsupportedCertKey,
@@ -55,6 +60,17 @@ pub fn load(
 ) LoadError!Credentials {
     const chain = try decodePemChain(arena, cert_pem);
     assert(chain.len >= 1);
+    // Bound what goes on the wire, not just what came off disk: the
+    // engine sizes its outbound staging from this, because the server
+    // flight carrying the chain is staged whole before any of it is
+    // written (§5). Caught here so an oversized chain is a startup error
+    // naming the limit, rather than a `stage` assertion on the first
+    // client to arrive.
+    var chain_bytes: usize = 0;
+    for (chain) |entry| chain_bytes += entry.len;
+    if (chain_bytes > constants.tls_cert_chain_bytes_max) {
+        return error.CertChainTooLarge;
+    }
     // Parse every chain entry at load so a corrupt intermediate fails
     // here, not mid-handshake against a real client — ztls forwards
     // non-leaf entries as opaque bytes without validating them.
@@ -193,5 +209,26 @@ test "credentials: a whitespace-only certificate block is malformed" {
     try std.testing.expectError(
         error.MalformedPem,
         Credentials.load(arena_state.allocator(), empty_block, fixture_key_pem, .{}),
+    );
+}
+
+// The engine sizes its outbound staging from `tls_cert_chain_bytes_max`,
+// so a chain past it has nowhere to be staged whole. Catching that at
+// load makes it a startup error naming the limit, instead of a `stage`
+// assertion the first time a real client connects.
+test "credentials: a chain past the wire bound is refused at load" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Repeat the fixture until the DER total clears the bound. Each copy
+    // parses, so this fails on size and nothing else.
+    const copies = (constants.tls_cert_chain_bytes_max / 400) + 4;
+    var pem: std.ArrayList(u8) = .empty;
+    for (0..copies) |_| try pem.appendSlice(arena, fixture_cert_pem);
+
+    try std.testing.expectError(
+        error.CertChainTooLarge,
+        load(arena, pem.items, fixture_key_pem, .{}),
     );
 }

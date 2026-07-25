@@ -1150,7 +1150,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // head, both smaller than one record, so a chunk never needs
                 // splitting across records.
                 assert(plaintext.len <= TlsEngine.max_plaintext_bytes);
-                if (engine.outboundRoom() < TlsEngine.max_record_bytes) {
+                if (engine.outboundRoom() < TlsEngine.max_emitted_record_bytes) {
                     // The same staging-room rung the L4 relay sheds on (§8);
                     // counted here too, so the ladder is observable from
                     // either path.
