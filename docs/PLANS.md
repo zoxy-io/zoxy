@@ -114,7 +114,25 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
      behind it has nowhere to go until the next slice.
   9. **Data-path shim** — L4-over-TLS first (terminate, relay
      plaintext), then L7 head-read over decrypted bytes; the strict
-     relay discipline is unchanged either way.
+     recv→send→recv discipline is unchanged either way — but the
+     *plumbing* is not, and that is this slice's real work. `pump.zig`
+     is shared by L4 and both L7 body legs, and its mechanics assume a
+     direction recvs and sends from **one** buffer (everything derives
+     from the direction tag). TLS breaks that symmetry in both
+     directions: client→upstream recvs ciphertext (the head buffer,
+     idle on L4), decrypts, and sends plaintext from the relay buffer;
+     upstream→client recvs plaintext into the relay buffer, encrypts,
+     and sends from the engine outbox. Two ways to take it, to be
+     settled with the code in front of you:
+     - Teach the pump a transform seam (recv buffer and send buffer
+       become separate policy-supplied slices). One mechanism, but it
+       touches the proven L4 and L7 paths.
+     - A parallel TLS relay beside `relay.zig`. Leaves the proven paths
+       alone at the cost of a second loop to keep honest.
+     The engine side is ready either way: `feed` + `Sink` decrypt,
+     `sendApp` + `outbound`/`outboundSent` encrypt with partial-write
+     credit. `finishTlsHandshake` is where the close_notify shortcut
+     comes out and the upstream connect goes in.
   10. **Sim + fuzz gates** — the spike client ported into the sim
      harness (both keyshares seeded), the adversary at TLS record
      granularity, golden byte-exact transcripts on clean seeds; fuzz
