@@ -736,7 +736,7 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
    parser edge: HTTP/1.1 head parser, chunked decoder, config parser.
    Assertion: never panic, never overrun a bound, reject-or-parse with no
    third outcome.
-3. **Benchmarks — [zrk](https://github.com/floatdrop/zrk), three tiers.**
+3. **Benchmarks — [zrk](https://github.com/zoxy-io/zrk), three tiers.**
    The load generator is zrk — a pure-Zig wrk2 rewrite: *constant-throughput*
    (open-loop) pacing with coordinated-omission-corrected HdrHistogram
    latency, so a stalling proxy accrues the stall instead of hiding it.
@@ -831,7 +831,7 @@ bench/                // micro benches (poop) + loopback harness (zrk), §9
 - [hparse](https://github.com/nikneym/hparse) — pure-Zig SIMD HTTP/1.1
   head parser (zero-alloc, zero-copy); adopted as a hardened fork
   behind the recorded gate in §7.
-- [zrk](https://github.com/floatdrop/zrk) — pure-Zig constant-throughput
+- [zrk](https://github.com/zoxy-io/zrk) — pure-Zig constant-throughput
   load generator (wrk2 model, coordinated-omission-corrected); the bench
   driver. [zoxy-io/benchmark](https://github.com/zoxy-io/benchmark) — the
   multi-host comparison fleet (Tier 3).
