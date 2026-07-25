@@ -74,6 +74,52 @@ pub fn Pump(
             return &@field(conn.relay_buffer.?, direction_tag);
         }
 
+        // -- the transform seam (§4) --
+        //
+        // A plain relay recvs and sends the same bytes, so one buffer per
+        // direction serves both halves. A transforming relay (TLS) does
+        // not: each half lives in a different buffer, and the bytes that
+        // go out are not the bytes that came in. These four hooks are the
+        // only places that assumption is encoded. A policy that declares
+        // none of them gets exactly the plain behaviour — identity — so
+        // the L4 and L7 body paths are unaffected by construction.
+
+        /// Where the read lands. Plain: the direction's relay buffer.
+        /// Transforming: wherever the *untransformed* bytes belong (for
+        /// TLS client→upstream, the engine scratch — the relay buffer is
+        /// the decrypt destination).
+        fn recvBuffer(conn: *ConnType) []u8 {
+            if (@hasDecl(Policy, "recvBuffer")) return Policy.recvBuffer(conn);
+            return buffer(conn);
+        }
+
+        /// Turn what was read into the bytes framing should see. Returns
+        /// null if the transform failed, which is that connection's
+        /// (the caller tears down). Identity by default.
+        fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
+            if (@hasDecl(Policy, "transformIn")) return Policy.transformIn(conn, chunk);
+            return chunk;
+        }
+
+        /// Turn the framed bytes into what goes on the wire, once per
+        /// chunk — never per retry, or a short write would re-transform
+        /// bytes already sent. Returns false if the transform failed.
+        /// Identity by default.
+        fn transformOut(conn: *ConnType, consumed: u32) bool {
+            if (@hasDecl(Policy, "transformOut")) return Policy.transformOut(conn, consumed);
+            return true;
+        }
+
+        /// What `armSend` writes, and what a short write resumes from.
+        /// Plain: the relay buffer under the direction's own cursor.
+        /// Transforming: the staged output, which may carry its own
+        /// cursor — hence a slice, not an offset pair.
+        fn sendSlice(conn: *ConnType) []const u8 {
+            if (@hasDecl(Policy, "sendSlice")) return Policy.sendSlice(conn);
+            const state = directionState(conn);
+            return buffer(conn)[state.sent_len..state.transfer_len];
+        }
+
         fn source(conn: *const ConnType) IoType.Socket {
             return switch (direction) {
                 .client_to_upstream => conn.client_socket,
@@ -97,7 +143,7 @@ pub fn Pump(
             conn.arm(op(conn), bit);
             server.io.recv(
                 source(conn),
-                buffer(conn),
+                recvBuffer(conn),
                 &op(conn).completion,
                 ConnType,
                 conn,
@@ -115,8 +161,11 @@ pub fn Pump(
             if (@hasDecl(Policy, "onRecvEntry")) Policy.onRecvEntry(conn);
             const received = result catch |err| return Policy.onRecvError(server, conn, err);
             assert(received >= 1);
-            assert(received <= buffer(conn).len);
-            const chunk = buffer(conn)[0..received];
+            assert(received <= recvBuffer(conn).len);
+            const chunk = transformIn(conn, recvBuffer(conn)[0..received]) orelse {
+                server.beginTeardown(conn);
+                return;
+            };
             const fr = Policy.feed(conn, chunk);
             if (fr.malformed) {
                 server.beginTeardown(conn);
@@ -127,6 +176,12 @@ pub fn Pump(
             state.transfer_len = fr.consumed;
             state.sent_len = 0;
             if (fr.consumed >= 1) {
+                // Once per chunk, before the first send: a short write
+                // resumes through `sendSlice`, never back through here.
+                if (!transformOut(conn, fr.consumed)) {
+                    server.beginTeardown(conn);
+                    return;
+                }
                 armSend(server, conn);
             } else {
                 assert(fr.done);
@@ -142,7 +197,7 @@ pub fn Pump(
             conn.arm(op(conn), bit);
             server.io.send(
                 target(conn),
-                buffer(conn)[state.sent_len..state.transfer_len],
+                sendSlice(conn),
                 &op(conn).completion,
                 ConnType,
                 conn,

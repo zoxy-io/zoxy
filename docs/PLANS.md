@@ -129,6 +129,34 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
        touches the proven L4 and L7 paths.
      - A parallel TLS relay beside `relay.zig`. Leaves the proven paths
        alone at the cost of a second loop to keep honest.
+     *Settled:* the transform seam. The deferral condition ("worth doing
+     once TLS is proven") is met — TLS is proven on L4 — and the L7 body
+     legs run through `pump.zig`, so the alternative is a *third* copy of
+     the recv→send discipline. Duplication is what made the L4 bugs easy
+     to write; one mechanism with three users beats three mechanisms.
+
+     The seam, read off `pump.zig` as it stands (`buffer`/`source`/
+     `target` derive everything from the direction tag; `armSend` slices
+     `buffer(conn)[sent_len..transfer_len]`):
+     - `recvBuffer(conn)` replaces `buffer(conn)` on the read side. Plain:
+       the relay buffer, as today. TLS client→upstream: the engine
+       scratch (`Engine.staging`), because the relay buffer receives the
+       *decrypted* bytes.
+     - An inbound transform between recv and `Policy.feed`, so framing
+       always sees plaintext. Identity on plain; `Engine.feed` into the
+       relay buffer on TLS client→upstream.
+     - An outbound transform before `armSend`. Identity on plain;
+       `Engine.sendApp` into the outbox on TLS upstream→client.
+     - `sendSlice(conn)` replaces `buffer(conn)` on the write side. Plain:
+       the relay buffer under the existing `sent_len`/`transfer_len`
+       cursor. TLS upstream→client: `Engine.outbound()`, which carries
+       its *own* cursor — so the direction cursor must not double-count.
+       This is the one place the refactor is not mechanical, and where a
+       wrong move silently corrupts the byte stream rather than failing
+       loudly.
+     Order of work: land the seam with identity transforms first and
+     prove the existing L4 and L7 body tests still pass unchanged — that
+     is the regression net — *then* hook the TLS transforms onto it.
      *Landed:* the parallel relay (`net/tls_relay.zig`), L4 only — the
      L7 head-read over decrypted bytes is still owed. Two bugs the
      shape made easy, both remotely triggerable, both now gated:
