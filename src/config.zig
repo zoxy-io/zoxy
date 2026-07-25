@@ -259,13 +259,21 @@ fn resolveLimits(
     // the config: with no TLS listener there is nothing to serve, so the
     // pool is disabled (zero) and reserves nothing. Naming a count
     // without a TLS listener is a config mistake, not a silent no-op.
+    //
+    // With TLS, the default follows conn slots exactly as relay buffers
+    // do, because an engine is held for the connection's whole life:
+    // fewer engines than conn slots is not a smaller buffer pool, it is a
+    // lower ceiling on concurrent HTTPS connections, and every connection
+    // past it is refused. A default that did not follow conn slots made
+    // that ceiling 256 while the accept path advertised 1386, and the
+    // gap read as the proxy being broken rather than full (§8).
     const tls_engines = if (limits_json.tls_engines) |named| blk: {
         if (!tls_listeners) return error.LimitTlsEnginesWithoutTlsListener;
         if (named < 1 or named > constants.tls_engines_max) {
             return error.LimitTlsEnginesOutOfRange;
         }
         break :blk named;
-    } else if (tls_listeners) constants.tls_engines_default else 0;
+    } else if (tls_listeners) @min(constants.tls_engines_max, conn_slots) else 0;
 
     // The CQ fill is the one limit an operator tightens for headroom, not a
     // pool shrink (§8): a smaller fill demands a deeper ring for the same
@@ -1996,4 +2004,38 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
             }
         }
     } else |_| {}
+}
+
+// The 256-engine default let the accept path advertise 1386 conn slots
+// while HTTPS was capped at 256, so a 500-connection load shed 99.9% of
+// its connections and read as a broken proxy rather than a full one.
+// The default must never promise more than TLS can honour.
+test "config: the tls engine default never sits below conn slots" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a",
+        \\   "tls":{"cert":"/c.pem","key":"/k.pem"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "limits":{"conn_slots":600},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    try std.testing.expectEqual(@as(u32, 600), parsed.limits.conn_slots);
+    try std.testing.expectEqual(@as(u32, 600), parsed.limits.tls_engines);
+}
+
+test "config: the tls engine default is clamped by the compiled ceiling" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // Past the engine ceiling the two cannot match, which is exactly when
+    // main.zig warns: HTTPS tops out below the advertised accept capacity.
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a",
+        \\   "tls":{"cert":"/c.pem","key":"/k.pem"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "limits":{"conn_slots":4000},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    try std.testing.expectEqual(constants.tls_engines_max, parsed.limits.tls_engines);
+    try std.testing.expect(parsed.limits.tls_engines < parsed.limits.conn_slots);
 }
