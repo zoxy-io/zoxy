@@ -667,6 +667,114 @@ test "tls: a client completes a handshake against a tls listener" {
     try bed.expectDrained();
 }
 
+// §4 + §6 end to end: a TLS client's plaintext reaches the origin and the
+// echo comes back, byte-exact, through a terminated session. The proxy
+// decrypts on the way in and encrypts on the way out; the origin only
+// ever sees plaintext.
+test "tls: a post-handshake KeyUpdate interleaves with the relay" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 23 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    // This gates two distinct fixes at once.
+    //
+    // 1. The KeyUpdate response is staged into the engine outbox from the
+    //    client-to-upstream step while the other direction sits idle in a
+    //    recv — the interleaving that made an emptiness assert unsound.
+    // 2. Under this schedule the client's first write also beats the
+    //    upstream dial, so it lands while the conn is still
+    //    `.tls_handshaking` and must be staged and forwarded when the
+    //    relay starts, not treated as impossible early data. That is a
+    //    property of the seed's ordering, not something the client asks
+    //    for, so keep the seed pinned.
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .key_update = true,
+        .app_data = echo_token,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    // Both round-trips come back byte-exact: the KeyUpdate rekeys the
+    // session mid-relay without disturbing the bytes either way.
+    try std.testing.expectEqualStrings(
+        echo_token ++ echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("tls_relay_failed"),
+    );
+    // expectDrained does not cover the engine pool (Server.isIdle).
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+test "tls: a large write spanning records relays intact" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 17 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    // One write larger than a relay buffer: the client packs it into a
+    // TLS record the proxy reassembles across several recvs.
+    const big = "x" ** 9000;
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = big,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expectEqualStrings(big, client.app_received[0..client.app_received_len]);
+    try bed.expectDrained();
+}
+
+test "tls: plaintext relays end to end through a terminated session" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 13 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // The echo came back decrypted and intact.
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    // The origin saw exactly one connection, carrying plaintext.
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.origin.conns_count);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
 // §8 rung: the engine pool is the wall a TLS listener hits first. With no
 // engines, a TLS connection is refused at admission — never admitted, so
 // the accepted = admitted + shed identity still holds.

@@ -2,7 +2,7 @@
 //! over ztls's sans-I/O TLS 1.3 server. Static caller-owned buffers, key
 //! material injected as plain data (deterministic under the simulator),
 //! zero allocation in the wrapper (libcrypto's own allocations ride the
-//! fixed heap of slice 1). ~148 KiB per instance (IMPLEMENTATION_NOTES.md),
+//! fixed heap of slice 1). ~180 KiB per instance (IMPLEMENTATION_NOTES.md),
 //! so the serving path holds these in a shared `Pool`, not one per conn
 //! slot — that pooling, the §8 handshake budget, and the drive-API
 //! coupling to `Conn` land with the data-path slices (PLANS.md 3a 4–5);
@@ -58,6 +58,15 @@ reassembly: ztls.ServerHandshake.Storage,
 outbox: [outbox_bytes]u8,
 outbox_len: u32,
 outbox_sent: u32,
+/// Whether this session's close_notify has been staged. The engine owns
+/// it because `sendClose` is its only writer, and because the transport
+/// needs the answer *after* the outbox drains — by which time the alert
+/// bytes it would otherwise have to recognize are gone.
+close_staged: bool,
+/// Where a drive step decrypts plaintext for the caller. Engine-owned
+/// because only the engine knows the bound (see `inbox_bytes`); the
+/// caller supplies the `Sink` that fills it and tracks its own cursor.
+inbox: [inbox_bytes]u8,
 
 /// What a drive step hands back *synchronously*: plaintext the caller
 /// consumes before returning, and the peer's orderly close. Ciphertext
@@ -83,7 +92,24 @@ pub const Sink = struct {
 /// drive step can produce: a ServerHello record plus the encrypted
 /// server flight (certificate, CertificateVerify, Finished), each of
 /// which ztls bounds by one maximum wire record.
-const outbox_bytes = 2 * ztls.frame.max_wire_record_len;
+const outbox_bytes = 2 * max_record_bytes;
+
+/// The largest record ztls can put on the wire — what a caller must have
+/// room for before driving a step that may stage (see `outboundRoom`).
+pub const max_record_bytes = ztls.frame.max_wire_record_len;
+
+/// Decrypted application data staged for the caller. A TLS record is
+/// reassembled *inside* the engine across however many reads it takes, so
+/// one `feed` can deliver a full record's plaintext at once — up to
+/// `max_plaintext_len`, regardless of how small the chunks fed in were.
+/// ztls buffers at most two records, so that is the bound. Sizing the
+/// caller's destination by the read size instead is the trap: a client
+/// that writes 16 KiB in one go overflows it.
+pub const inbox_bytes = 2 * max_plaintext_bytes;
+
+/// The most plaintext one record can yield — with the caller's read size,
+/// what bounds a single `feed`'s output (see `inbox_bytes`).
+pub const max_plaintext_bytes = ztls.frame.max_plaintext_len;
 
 pub const Config = struct {
     /// Ephemeral X25519 seed — deterministic in the simulator, from
@@ -117,13 +143,23 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     engine.flight = .empty;
     engine.outbox_len = 0;
     engine.outbox_sent = 0;
+    engine.close_staged = false;
     assert(!engine.hs.isConnected());
 }
 
+/// Room left to stage. The relay drives both directions at once, so a
+/// step may append while an earlier send is still in flight — safe,
+/// because staged bytes never move and `outboundSent` credits off the
+/// front, but only while the append fits.
+pub fn outboundRoom(engine: *const Engine) usize {
+    assert(engine.outbox_len <= engine.outbox.len);
+    return engine.outbox.len - engine.outbox_len;
+}
+
 /// Ciphertext waiting for the transport; empty when there is nothing to
-/// write. Valid until the next `feed`/`sendApp`/`sendClose`, which is
-/// safe because the caller must drain it (`outboundSent`) before driving
-/// the engine again — asserted below.
+/// write. A later `feed`/`sendApp` may *append* while this slice is in
+/// flight — staged bytes never move, so the in-flight region stays
+/// valid; only the remainder grows.
 pub fn outbound(engine: *const Engine) []const u8 {
     assert(engine.outbox_sent <= engine.outbox_len);
     return engine.outbox[engine.outbox_sent..engine.outbox_len];
@@ -142,8 +178,9 @@ pub fn outboundSent(engine: *Engine, n: usize) void {
 
 /// Stage ciphertext for the transport. Overflow is impossible by
 /// construction — the outbox covers the largest burst one step can
-/// produce, and the caller drains before stepping again — so it is an
-/// invariant violation, not a runtime condition to shed.
+/// produce, and `outboundRoom` bounds what a caller may add on top of an
+/// in-flight send — so it is an invariant violation, not a runtime
+/// condition to shed.
 fn stage(engine: *Engine, wire: []const u8) void {
     assert(wire.len > 0);
     assert(engine.outbox_len + wire.len <= engine.outbox.len);
@@ -170,9 +207,9 @@ pub fn isConnected(engine: *const Engine) bool {
 /// buffer cannot stage) rather than left to spin. Any error is the
 /// connection's: the caller tears down.
 pub fn feed(engine: *Engine, wire: []const u8, sink: Sink) !void {
-    // Driving the engine invalidates whatever `outbound` last returned,
-    // so the transport must have taken it first.
-    assert(engine.outbox_len == 0);
+    // Staging appends, so an in-flight send is undisturbed (outboundRoom):
+    // its slice sits earlier in the buffer and never moves.
+    assert(engine.outboundRoom() > 0);
     var remaining = wire;
     while (remaining.len > 0) {
         const writable = engine.records.writable();
@@ -189,7 +226,7 @@ pub fn feed(engine: *Engine, wire: []const u8, sink: Sink) !void {
 /// Encrypt application data into the outbox. Handshake must be complete.
 pub fn sendApp(engine: *Engine, bytes: []const u8) !void {
     assert(engine.hs.isConnected());
-    assert(engine.outbox_len == 0);
+    assert(engine.outboundRoom() > 0);
     const wire = try engine.hs.sendApplicationData(bytes, &engine.out.buffer);
     assert(wire.len > bytes.len); // Record header + AEAD tag overhead.
     engine.stage(wire);
@@ -198,11 +235,19 @@ pub fn sendApp(engine: *Engine, bytes: []const u8) !void {
 
 /// Stage an orderly TLS close (close_notify) for the transport.
 pub fn sendClose(engine: *Engine) !void {
-    assert(engine.outbox_len == 0);
+    assert(engine.outboundRoom() > 0);
     const wire = try engine.hs.sendAlert(.close_notify, &engine.out.buffer);
     assert(wire.len > 0);
     engine.stage(wire);
     engine.hs.completeWrite();
+    engine.close_staged = true;
+}
+
+/// True once `sendClose` has staged this session's close_notify: the
+/// transport's answer to "is this the last thing I will ever send here?",
+/// which survives the outbox draining out from under it.
+pub fn closeStaged(engine: *const Engine) bool {
+    return engine.close_staged;
 }
 
 fn pump(engine: *Engine, sink: Sink) !void {

@@ -29,6 +29,15 @@ pub const Counters = struct {
     /// TLS sessions established. Not a shed — the handshake's success
     /// side, so it stays out of `reconcile`.
     tls_handshakes_completed: Value = Value.init(0),
+    /// A TLS session that failed mid-relay: a record the engine refused
+    /// to decrypt, or plaintext it could not encrypt. Post-admission, so
+    /// it completes like any other teardown.
+    tls_relay_failed: Value = Value.init(0),
+    /// A completed handshake that found no relay buffer free. Post-
+    /// admission, so it is *not* a shed rung: the connection was already
+    /// counted in `admitted` and goes on to `completed` via teardown.
+    /// Folding it into `shed_relay_buffers` would break reconcile (§9).
+    tls_relay_buffer_unavailable: Value = Value.init(0),
     /// An *admitted* connection whose handshake never established: a
     /// protocol error or a peer that left mid-flight. Post-admission, so
     /// it ends in `completed` like any other teardown and stays out of

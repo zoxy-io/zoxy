@@ -141,6 +141,13 @@ pub fn Conn(comptime IoType: type) type {
         /// on a plain-TCP connection, which is every connection on a
         /// listener without credentials.
         tls: ?*TlsEngine,
+        /// Plaintext the client sent immediately after its Finished, while
+        /// the upstream dial was still in flight. A TLS 1.3 client may
+        /// write as soon as it has sent Finished — it need not wait for
+        /// anything from us — so this is ordinary application data that
+        /// simply beat the relay, not 0-RTT early data. It is staged in
+        /// the engine inbox and forwarded as the relay's first send.
+        tls_pending_len: u32,
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
@@ -403,6 +410,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.upstream_socket = null;
             conn.relay_buffer = buffer;
             conn.tls = null; // admitTls checks one out after prepare.
+            conn.tls_pending_len = 0;
             conn.deadline_ns = 0;
             conn.birth_ns = server.io.nowNs();
             conn.armed = .{};

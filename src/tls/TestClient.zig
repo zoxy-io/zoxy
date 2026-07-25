@@ -37,6 +37,19 @@ pub fn TestClient(comptime IoType: type) type {
         handshake_done: bool,
         saw_close: bool,
         ended: bool,
+        /// Application data to send once the handshake completes, and the
+        /// decrypted bytes that came back — how a test asserts the proxy
+        /// carried plaintext end to end.
+        app_to_send: []const u8,
+        app_sent: bool,
+        /// Whether the scenario asks for a post-handshake KeyUpdate, and
+        /// whether it has gone out (see `Options.key_update`).
+        key_update_wanted: bool,
+        key_update_sent: bool,
+        /// Whether the second payload (after the KeyUpdate) has gone.
+        app_resent: bool,
+        app_received: [65536]u8,
+        app_received_len: u32,
         /// Runs once the client is done — how a scenario learns to wind
         /// down (drain the server, stop the origin).
         on_end: ?*const fn (ctx: ?*anyopaque) void = null,
@@ -48,6 +61,23 @@ pub fn TestClient(comptime IoType: type) type {
             /// Must match the certificate's SAN; the fixtures use
             /// `spike.zoxy.test`.
             host_name: []const u8,
+            /// Application data to send once the session is up; empty
+            /// means the client only handshakes.
+            app_data: []const u8 = &.{},
+            /// Drive a post-handshake KeyUpdate(update_requested), then a
+            /// second copy of `app_data`, once the *first* echo is back.
+            ///
+            /// The ordering is the whole point. A KeyUpdate sent the
+            /// instant the session comes up is consumed by the server's
+            /// handshake drive, which drains the outbox itself — the relay
+            /// never sees it. Waiting for the first echo proves the relay
+            /// is running, so the response is staged by the
+            /// `client → upstream` step into an outbox only the
+            /// `upstream → client` step drains; the second echo then
+            /// arrives with that response still staged. That is the
+            /// shared-outbox interleaving the staging-room guard exists
+            /// for, and an emptiness precondition there is unsound.
+            key_update: bool = false,
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -94,6 +124,12 @@ pub fn TestClient(comptime IoType: type) type {
             // before the loop does.
             client.on_end = null;
             client.on_end_context = null;
+            client.app_to_send = options.app_data;
+            client.app_sent = false;
+            client.key_update_wanted = options.key_update;
+            client.key_update_sent = false;
+            client.app_resent = false;
+            client.app_received_len = 0;
             io.connect(address, &client.connect_completion, Self, client, onConnect);
         }
 
@@ -129,11 +165,7 @@ pub fn TestClient(comptime IoType: type) type {
             };
             assert(sent <= client.pending_send.len);
             client.pending_send = client.pending_send[sent..];
-            if (client.pending_send.len > 0) {
-                client.armSend();
-                return;
-            }
-            client.armRecv();
+            client.nextStep();
         }
 
         fn armRecv(client: *Self) void {
@@ -160,13 +192,72 @@ pub fn TestClient(comptime IoType: type) type {
                 client.finish();
                 return;
             };
+            client.nextStep();
+        }
+
+        /// What to do once nothing is left to write: send the scripted
+        /// application data if the session is up and it has not gone yet,
+        /// otherwise keep reading until the peer closes. Reached from both
+        /// completion paths — after the Finished flight is written as well
+        /// as after a record arrives — because the server has nothing to
+        /// say until the client speaks, so waiting on a recv would hang.
+        fn nextStep(client: *Self) void {
             if (client.pending_send.len > 0) {
                 client.armSend();
-            } else if (!client.saw_close) {
-                client.armRecv();
-            } else {
-                client.finish();
+                return;
             }
+            // Strictly after the first echo: see `Options.key_update`.
+            if (client.handshake_done and client.key_update_wanted and
+                !client.key_update_sent and client.app_sent and
+                client.app_received_len >= client.app_to_send.len)
+            {
+                client.key_update_sent = true;
+                client.pending_send = client.hs.sendKeyUpdate(
+                    &client.out.buffer,
+                    .update_requested,
+                ) catch {
+                    client.finish();
+                    return;
+                };
+                client.hs.completeWrite();
+                client.armSend();
+                return;
+            }
+            // The second payload: its echo is what arrives while the
+            // KeyUpdate response is still staged.
+            if (client.key_update_sent and !client.app_resent) {
+                client.app_resent = true;
+                client.pending_send = client.hs.sendApplicationData(
+                    client.app_to_send,
+                    &client.out.buffer,
+                ) catch {
+                    client.finish();
+                    return;
+                };
+                client.hs.completeWrite();
+                client.armSend();
+                return;
+            }
+            if (client.handshake_done and !client.app_sent and
+                client.app_to_send.len > 0)
+            {
+                client.app_sent = true;
+                client.pending_send = client.hs.sendApplicationData(
+                    client.app_to_send,
+                    &client.out.buffer,
+                ) catch {
+                    client.finish();
+                    return;
+                };
+                client.hs.completeWrite();
+                client.armSend();
+                return;
+            }
+            if (client.saw_close) {
+                client.finish();
+                return;
+            }
+            client.armRecv();
         }
 
         fn feed(client: *Self, wire: []const u8) !void {
@@ -185,11 +276,16 @@ pub fn TestClient(comptime IoType: type) type {
                             client.hs.completeWrite();
                         },
                         .closed => client.saw_close = true,
-                        .application_data,
-                        .key_update,
-                        .new_session_ticket,
-                        .none,
-                        => {},
+                        .application_data => |bytes| {
+                            assert(client.app_received_len + bytes.len <=
+                                client.app_received.len);
+                            @memcpy(
+                                client.app_received[client.app_received_len..][0..bytes.len],
+                                bytes,
+                            );
+                            client.app_received_len += @intCast(bytes.len);
+                        },
+                        .key_update, .new_session_ticket, .none => {},
                     }
                 }
                 if (client.hs.isConnected()) client.handshake_done = true;
