@@ -1814,3 +1814,43 @@ fn drainOnTlsClientEnd(context: ?*anyopaque) void {
     const bed: *Http1Bed = @ptrCast(@alignCast(context.?));
     bed.server.beginDrain();
 }
+
+test "l7: over TLS, one oversized record is 413 when only its body overran" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 43,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // A perfectly good head, then a body far past the head buffer, all in
+    // one record. Answering 431 here would blame the headers for a
+    // payload problem and send the client chasing the wrong thing.
+    const head = "POST /path HTTP/1.1\r\nHost: origin.example\r\n" ++
+        "Content-Length: 10000\r\nConnection: close\r\n\r\n";
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = head ++ ("b" ** 10000),
+    });
+    defer client.deinit();
+    client.on_end = drainOnTlsClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+    bed.origin.stopListening();
+
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_body_too_large"),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("l7_headers_too_large"),
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        client.app_received[0..client.app_received_len],
+        "HTTP/1.1 413 ",
+    ));
+}
