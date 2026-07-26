@@ -383,23 +383,36 @@ fn benchPassed(
     var bands_ok = true;
     for (bands) |band| {
         const offered = band.scenario.rate(flags);
-        // The direct baseline gates too, and not only on liveness: if the
-        // origin cannot keep up, every proxied band beside it is bounded by
-        // the origin and the comparison measures nothing.
+        // The direct baseline gates on liveness too: if the origin cannot
+        // keep up, every proxied band beside it is bounded by the origin and
+        // the comparison measures nothing.
         if (band.runs.direct.snapshot.counters.completed == 0) {
             std.debug.print("FAIL: {s} direct baseline completed zero requests\n", .{band.label});
             bands_ok = false;
-        } else if (!rateHeld(band.label, "direct", offered, &band.runs.direct)) {
-            std.debug.print("       (the origin, not the proxy, is the limit here)\n", .{});
-            bands_ok = false;
         }
-        // The proxied bands carry the hard §9 invariants: complete requests,
-        // a socket-error rate under 1% (a relay stall must not pass silently;
-        // faithfully relayed 4xx/5xx are excluded), and now an achieved rate
-        // that actually reaches what was offered.
+        // The proxied bands carry the hard §9 invariants: complete requests
+        // and a socket-error rate under 1% (a relay stall must not pass
+        // silently; faithfully relayed 4xx/5xx are excluded).
         if (!proxiesHealthy(band.label, band.runs)) bands_ok = false;
-        if (!rateHeld(band.label, "L4", offered, &band.runs.l4)) bands_ok = false;
-        if (!rateHeld(band.label, "L7", offered, &band.runs.l7)) bands_ok = false;
+        // And *every* path holds its offered rate — by reflection over
+        // `Runs`, so adding a path to that struct is what puts it under the
+        // floor, instead of also remembering a line here. The gate exists
+        // because a band once delivered 704 of 2000 req/s through green
+        // error checks (IMPLEMENTATION_NOTES.md); a gate you have to
+        // remember to extend reopens that hole the first time someone
+        // doesn't. The reference bands are in scope for the same reason the
+        // baseline is: haproxy missing the offer means the *offer* is wrong,
+        // and a comparison against a reference that could not keep up
+        // measures nothing.
+        inline for (@typeInfo(Runs).@"struct".fields) |field| {
+            comptime assert(field.type == zrk.runner.Report);
+            if (!rateHeld(band.label, field.name, offered, &@field(band.runs, field.name))) {
+                bands_ok = false;
+                if (comptime std.mem.eql(u8, field.name, "direct")) {
+                    std.debug.print("       (the origin, not the proxy, is the limit here)\n", .{});
+                }
+            }
+        }
     }
     return rss_flat and bands_ok and drained_cleanly;
 }
@@ -693,6 +706,9 @@ fn loadTest(
 
 /// The five bands of one persistence mode: the direct baseline, zoxy's
 /// two protocols, and the haproxy references.
+/// One scenario's bands. Every field is a path the same offered load ran
+/// against, and `bandsHealthy` reflects over them — so a path added here is
+/// gated by that alone, with no second list to keep in step.
 const Runs = struct {
     direct: zrk.runner.Report,
     l4: zrk.runner.Report,
