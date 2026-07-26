@@ -46,15 +46,132 @@ pub const Version = enum(u1) {
     http_1_1,
 };
 
+/// The header names a §7 decision keys off: the connection-specific set
+/// that is never forwarded, the set a Connection header may not nominate
+/// away, and the framing headers the analysis reads. Everything else is
+/// `other`, which is almost every header on almost every request.
+///
+/// The point of naming them is to compare them *once*. Both the analysis
+/// walk and the render walk used to re-run `std.ascii.eqlIgnoreCase` down
+/// a list of literals for every header — up to four in `analyzeHeaders`
+/// and the whole hop-by-hop and protected lists again in `isHopByHop`, on
+/// both the request and the response head. Classifying on the walk that
+/// already visits every header turns each of those into an integer test.
+///
+/// `render.hop_by_hop_names` and `render.protected_names` stay the
+/// documented source of truth; a comptime check there pins them to
+/// `hopByHop` and `protected` in both directions, so a name added to one
+/// spelling and not the other fails the build rather than opening a §7
+/// hole.
+pub const HeaderName = enum(u8) {
+    /// Any name no §7 decision special-cases.
+    other,
+    host,
+    content_length,
+    transfer_encoding,
+    connection,
+    keep_alive,
+    proxy_connection,
+    te,
+    upgrade,
+
+    /// Connection-specific headers (RFC 9110 §7.6.1): never forwarded.
+    pub fn hopByHop(tag: HeaderName) bool {
+        return switch (tag) {
+            .connection, .keep_alive, .proxy_connection, .te, .upgrade => true,
+            .other, .host, .content_length, .transfer_encoding => false,
+        };
+    }
+
+    /// Headers a Connection value may not nominate away — stripping them
+    /// would desynchronize framing (a smuggling vector) or unroute the
+    /// request.
+    pub fn protected(tag: HeaderName) bool {
+        return switch (tag) {
+            .host, .content_length, .transfer_encoding => true,
+            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade => false,
+        };
+    }
+
+    /// The canonical lowercase spelling, so the comptime check in
+    /// `render` can compare the lists against the enum both ways.
+    pub fn text(tag: HeaderName) []const u8 {
+        return switch (tag) {
+            .other => "",
+            .host => "host",
+            .content_length => "content-length",
+            .transfer_encoding => "transfer-encoding",
+            .connection => "connection",
+            .keep_alive => "keep-alive",
+            .proxy_connection => "proxy-connection",
+            .te => "te",
+            .upgrade => "upgrade",
+        };
+    }
+};
+
+/// Classify one header name, exactly as the `eqlIgnoreCase` chains it
+/// replaces would have: a variant is returned only where the old compare
+/// matched. Dispatching on length first means the common `other` costs
+/// one integer compare instead of a walk down every literal.
+pub fn classifyHeaderName(name: []const u8) HeaderName {
+    assert(name.len >= 1);
+    const eql = std.ascii.eqlIgnoreCase;
+    const tag: HeaderName = switch (name.len) {
+        2 => if (eql(name, "te")) .te else .other,
+        4 => if (eql(name, "host")) .host else .other,
+        7 => if (eql(name, "upgrade")) .upgrade else .other,
+        10 => length_10: {
+            if (eql(name, "connection")) break :length_10 .connection;
+            if (eql(name, "keep-alive")) break :length_10 .keep_alive;
+            break :length_10 .other;
+        },
+        14 => if (eql(name, "content-length")) .content_length else .other,
+        16 => if (eql(name, "proxy-connection")) .proxy_connection else .other,
+        17 => if (eql(name, "transfer-encoding")) .transfer_encoding else .other,
+        else => .other,
+    };
+    return tag;
+}
+
+comptime {
+    // Every variant must be reachable from the length arm that matches its
+    // canonical spelling: one placed in the wrong arm would simply never
+    // match, silently reclassifying a real header as `other` and
+    // forwarding something §7 means to strip.
+    //
+    // Deliberately comptime. The same check written as a runtime
+    // postcondition in `classifyHeaderName` cost ~540 instructions per
+    // request — it is decidable here for free, and a runtime assert on a
+    // fact the compiler already knows is the expensive way to be sure.
+    for (@typeInfo(HeaderName).@"enum".fields) |field| {
+        const tag: HeaderName = @enumFromInt(field.value);
+        if (tag == .other) continue;
+        assert(classifyHeaderName(tag.text()) == tag);
+    }
+}
+
 /// One parsed header. Both slices point into the head buffer the head was
 /// parsed from — zero-copy, valid only while that buffer holds this head.
+/// `tag` is the §7 classification, assigned once during analysis.
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
+    tag: HeaderName,
+
+    /// Build one, classifying the name. `tag` carries no default and this
+    /// is the only constructor on purpose: a header whose tag disagreed
+    /// with its name would be stripped or forwarded against what it says
+    /// it is, which is a §7 hole rather than a stale field.
+    pub fn init(name: []const u8, value: []const u8) Header {
+        assert(name.len >= 1);
+        return .{ .name = name, .value = value, .tag = classifyHeaderName(name) };
+    }
 };
 
-/// Caller-owned header storage for one parsed head; the connection slot
-/// embeds one of these per direction it parses.
+/// Header storage for one parsed head. A stack local at every call site —
+/// nothing parsed survives the callback that parsed it (§7 detect-and-retry
+/// re-parses from byte 0), so this costs frame, not a connection slot.
 pub const HeaderStorage = [constants.headers_max]Header;
 
 /// How the message body is delimited (RFC 9112 §6.3). `until_close` is
@@ -576,46 +693,48 @@ fn analyzeHeaders(
     };
     for (raw_headers, 0..) |raw_header, index| {
         assert(raw_header.key.len >= 1);
-        headers_storage[index] = .{ .name = raw_header.key, .value = raw_header.value };
-        if (std.ascii.eqlIgnoreCase(raw_header.key, "host")) {
-            // A second Host changes routing depending on who reads which —
-            // a smuggling shape, like an empty one (RFC 9112 §3.2).
-            if (analysis.host != null) {
-                return error.Malformed;
-            }
-            if (raw_header.value.len == 0) {
-                return error.Malformed;
-            }
-            analysis.host = raw_header.value;
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(raw_header.key, "content-length")) {
-            // Duplicate Content-Length is rejected outright, identical
-            // values included (§7 "duplicate/garbage Content-Length").
-            if (analysis.content_length != null) {
-                return error.Malformed;
-            }
-            analysis.content_length = try parseContentLength(raw_header.value);
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(raw_header.key, "transfer-encoding")) {
-            // A second Transfer-Encoding header is the list form in
-            // disguise; only the single exact "chunked" is ever legal
-            // here, so any repeat is malformed.
-            if (analysis.te_chunked or analysis.te_other) {
-                return error.Malformed;
-            }
-            if (std.ascii.eqlIgnoreCase(raw_header.value, "chunked")) {
-                analysis.te_chunked = true;
-            } else {
-                analysis.te_other = true;
-            }
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(raw_header.key, "connection")) {
-            // Multiple Connection headers combine as one list (RFC 9110).
-            scanConnectionTokens(raw_header.value, &analysis);
-            continue;
+        // The one name comparison this header will cost: every later §7
+        // decision, here and in the render walk, tests the tag instead.
+        const header: Header = .init(raw_header.key, raw_header.value);
+        headers_storage[index] = header;
+        switch (header.tag) {
+            .host => {
+                // A second Host changes routing depending on who reads which —
+                // a smuggling shape, like an empty one (RFC 9112 §3.2).
+                if (analysis.host != null) {
+                    return error.Malformed;
+                }
+                if (raw_header.value.len == 0) {
+                    return error.Malformed;
+                }
+                analysis.host = raw_header.value;
+            },
+            .content_length => {
+                // Duplicate Content-Length is rejected outright, identical
+                // values included (§7 "duplicate/garbage Content-Length").
+                if (analysis.content_length != null) {
+                    return error.Malformed;
+                }
+                analysis.content_length = try parseContentLength(raw_header.value);
+            },
+            .transfer_encoding => {
+                // A second Transfer-Encoding header is the list form in
+                // disguise; only the single exact "chunked" is ever legal
+                // here, so any repeat is malformed.
+                if (analysis.te_chunked or analysis.te_other) {
+                    return error.Malformed;
+                }
+                if (std.ascii.eqlIgnoreCase(raw_header.value, "chunked")) {
+                    analysis.te_chunked = true;
+                } else {
+                    analysis.te_other = true;
+                }
+            },
+            .connection => {
+                // Multiple Connection headers combine as one list (RFC 9110).
+                scanConnectionTokens(raw_header.value, &analysis);
+            },
+            .other, .keep_alive, .proxy_connection, .te, .upgrade => {},
         }
     }
     assert(!(analysis.te_chunked and analysis.te_other));
@@ -1347,8 +1466,8 @@ test "http parser: origin smuggling shapes and alien statuses tear down" {
 
 test "http parser: header helpers are case-insensitive" {
     const headers = [_]Header{
-        .{ .name = "Content-Type", .value = "text/plain" },
-        .{ .name = "Upgrade", .value = "h2c" },
+        Header.init("Content-Type", "text/plain"),
+        Header.init("Upgrade", "h2c"),
     };
     try testing.expectEqualStrings("h2c", headerValue(&headers, "upgrade").?);
     try testing.expectEqual(@as(?[]const u8, null), headerValue(&headers, "host"));

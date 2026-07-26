@@ -353,8 +353,8 @@ test "filter: firstReject matches on method, host, path, header" {
             .actions = &.{.{ .reject = 403 }},
         },
     };
-    const prod = [_]H{.{ .name = "x-env", .value = "prod" }};
-    const dev = [_]H{.{ .name = "X-Env", .value = "dev" }};
+    const prod = [_]H{H.init("x-env", "prod")};
+    const dev = [_]H{H.init("X-Env", "dev")};
 
     // Full match → 403.
     try std.testing.expectEqual(@as(?u16, 403), firstReject(&rules, .{
