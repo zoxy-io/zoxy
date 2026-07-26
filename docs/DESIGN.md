@@ -4,7 +4,8 @@ An L4/L7 proxy in Zig 0.16 in the spirit of Cloudflare's Pingora, with two
 hard constraints: **nothing allocates on the hot path** and **exhaustion
 sheds load — it never crashes, never queues unboundedly, never allocates.**
 Steady-state operation issues zero heap allocations and zero allocating
-syscalls; total memory is a startup-time function of the static limits.
+syscalls; zoxy's own memory is a startup-time function of the static
+limits (the kernel's per-socket buffers are outside that form — §5).
 
 Simplicity is prioritized over feature-richness. The coding rules live in
 [`docs/TIGER_STYLE.md`](TIGER_STYLE.md). The previous iteration of this
@@ -32,7 +33,8 @@ Goals, in priority order:
    aspired to.
 3. **Minimal memory consumption.** Pools are *shared*, sized for concurrent
    *activity*, not for open-connection worst cases multiplied by core count
-   (§5). Total memory is a closed-form function of `src/constants.zig`.
+   (§5). Pool memory is a closed-form function of `src/constants.zig`
+   (kernel socket buffers are outside it — §5).
 4. **Simplicity.** One thread, one event loop, one ring, one writer for
    every pool — no worker threads, no cross-thread queues (§3). Fewer
    moving parts than the previous iteration, not more.
@@ -92,7 +94,8 @@ measured at HAProxy parity on steady-state keep-alive load — ~20k req/s,
 p50 110–122 µs against its 101–105 µs, one core each, same fixture
 certificate and origin. Handshake-heavy load has a lower ceiling that is
 measurably *not* a CPU wall: it scales with connection count, so what
-binds is a per-connection stall under investigation, which no amount of
+binds is a per-connection stall — since identified as a Nagle/delayed-ACK
+deadlock, fix pending (IMPLEMENTATION_NOTES.md) — which no amount of
 threading would remove. Where handshake CPU does eventually bind, the
 levers are session resumption (µs-class for returning clients) and then
 more cores — which this design buys as **N independent processes behind
@@ -137,8 +140,8 @@ measured itself latency-bound with CPU headroom on the data path; the
 only CPU-heavy work is the TLS handshake, measured at ~100–400 µs of
 crypto with ECDSA certs and at HAProxy parity through the whole
 terminated hop in steady state (IMPLEMENTATION_NOTES.md, which also
-records the per-connection handshake stall that is *not* CPU and is
-still open). The loop absorbs it in steps between completions, and the
+records the per-connection handshake stall that is *not* CPU — mechanism
+identified, fix pending). The loop absorbs it in steps between completions, and the
 worst single uninterruptible step — ~275 µs of P-256 sign — is what
 bounds tick inflation. **Horizontal
 scaling is N independent zoxy processes behind SO_REUSEPORT** —
@@ -313,8 +316,23 @@ unmerged behind it, so the pin moves only after re-audit.
 
 ## 5. Memory — shared pools, fixed at startup
 
-Every limit is a named constant in `src/constants.zig`; total memory is a
-closed-form function of those numbers, printed at startup. Per-worker
+Every limit is a named constant in `src/constants.zig`; **zoxy's own**
+memory is a closed-form function of those numbers, printed at startup.
+
+That qualifier is load-bearing. The closed form covers what this process
+allocates — the pools below, and the startup arena. It does **not** cover
+the kernel's per-socket buffers, which are charged to the connection and
+scale with it: on a stock Linux the defaults are 144 KiB per socket and
+an L7 connection holds two, so a deployment sized at the printed default
+carries an order of magnitude more socket memory than the budget names,
+growing further under receive autotuning. The failure mode
+is not OOM but `tcp_mem` pressure, where the kernel starts collapsing
+queues — invisible to this budget, and with no counter of ours on it.
+Closing that gap means setting `SO_RCVBUF`/`SO_SNDBUF` explicitly so the
+per-socket cap becomes a named constant like everything else; the
+measurement and the autotuning trade-off are in
+[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md), the revisit
+condition in [`PLANS.md`](PLANS.md). Per-worker
 reservation — sizing a pool per core for a worst case that never co-occurs
 on every core at once — multiplies memory by core count for nothing; the
 previous iteration paid that cost, and shared pools sized for concurrent
@@ -776,7 +794,7 @@ src/
   main.zig            // startup: config → reserve pools → print memory → run loop
   Server.zig          // composition root: pools, listeners, admission, teardown;
                       // generic over Io so the simulator instantiates it whole
-  constants.zig       // every static limit; total memory is f(these)
+  constants.zig       // every static limit; pool memory is f(these)
   config.zig          // strict JSON → arena-owned immutable Config
   io/
     io.zig            // the seam: comptime backend select

@@ -201,9 +201,10 @@ CPU wall, and not the "~1.4 ms of wall time per handshake" the first
 profile's arithmetic suggested. ~40 ms is the signature magnitude of a
 Nagle/delayed-ACK interaction (§4 records the same 40 ms lesson from
 pooled upstream connections), and the recurring ~41.8 ms `max` in the
-keep-alive runs points the same way, but **the mechanism is not yet
-identified**; zoxy sets `TCP_NODELAY` on its own sockets, so it is not
-the obvious half of that classic.
+keep-alive runs points the same way. It is that classic; the mechanism
+and the fix are the section below. The reasoning that dismissed it here —
+"zoxy sets `TCP_NODELAY` on its own sockets" — was the wrong half of the
+pair, and is corrected there.
 
 Two readings to retire, both of them mine:
 
@@ -241,6 +242,139 @@ Measurement caveats worth carrying forward:
   against offered, so a run delivering 704 of 2000 req/s *passed* them.
   Rate-versus-offered is not yet a gate — and it would have caught this
   on the first run.
+
+## The ~45 ms stall, identified — nobody ACKs a silent server (2026-07-26)
+
+The stall above is a Nagle/delayed-ACK deadlock, and zoxy's half of it is
+**sending nothing between the client's `Finished` and the client's first
+request**.
+
+The sequence: the client writes `Finished`, which goes out immediately
+because nothing is outstanding. It then writes the encrypted request —
+and Nagle holds that second small write, because the first is still
+unacknowledged. zoxy has nothing to send back, so no ACK piggybacks, and
+the client waits out Linux's delayed-ACK timer. That timer caps at 40 ms.
+
+**The earlier dismissal was the wrong half of the pair.** `TCP_NODELAY`
+on zoxy's sockets governs what *zoxy* may send without waiting. What is
+held here is the *client's* send, waiting on *zoxy's* ACK. Our own
+NODELAY cannot touch it.
+
+Evidence, all against the same origin:
+
+| | first response byte |
+|---|---|
+| zoxy, curl (its default `TCP_NODELAY`) | 2.1 ms — faster than haproxy |
+| zoxy, curl `--no-tcp-nodelay` | **42–47 ms, every request** |
+| haproxy, curl `--no-tcp-nodelay` | 4.1–6.2 ms |
+| zoxy plaintext, curl `--no-tcp-nodelay` | 0.2–0.8 ms |
+| zoxy, `--no-tcp-nodelay`, 200 KB POST | **2.4 ms** |
+
+The handshake phase stays at 2–5 ms in every stalling run: the gap is
+entirely *after* it. The 200 KB POST is the proof of mechanism rather
+than correlation — a first write larger than the loopback MSS is exempt
+from Nagle, and the stall vanishes. And the load generator never sets
+`TCP_NODELAY`, which is why the bands saw it and curl did not.
+
+**It is not a zoxy bug, and not a TLS bug.** A two-small-writes probe
+issued mid-connection stalls ~41 ms against *everything* — zoxy L4, zoxy
+L7, haproxy, and nginx spoken to directly. What differs is reachability:
+a connection's first data segment is covered by Linux's initial quickack
+window, so the shape needs a pathological client on plaintext. Under
+TLS 1.3 it is unavoidable — every client writes `Finished` then the
+request, always past that window.
+
+**What haproxy does differently is not an ACK policy.** It sends two
+NewSessionTickets the moment the handshake completes; that segment
+carries the ACK and the client's Nagle releases. Probed mid-connection,
+haproxy stalls exactly as hard as zoxy.
+
+So the fix is the message, not the socket: **emit the post-handshake
+flight after processing the client's `Finished`**, which is what every
+other TLS server does and what resumption wants anyway. TLS 1.3 also
+permits sending it alongside the server flight — that would be legal and
+would *not* fix this, because the ACK must cover the `Finished`.
+
+`TCP_QUICKACK` was considered and rejected: it treats universal TCP
+behaviour as a zoxy bug, it is Linux-only on a seam that also serves
+kqueue, and it decays — making it robust means re-arming per read, a
+syscall on the data path.
+
+## Kernel socket buffers are outside the §5 budget (2026-07-26)
+
+The startup printout is a closed form over zoxy's pools and says nothing
+about the kernel memory each connection also costs. On this box the
+stock defaults are `tcp_rmem` 131072 and `tcp_wmem` 16384 — 144 KiB per
+socket, and an L7 connection holds two, client and upstream. Against the
+1386-conn-slot default, whose printout reads **31.5 MiB of pools**, that
+is **~390 MiB of kernel socket memory** — twelve times the advertised
+figure, before receive autotuning, which may take `rmem` to 32 MiB per
+socket. At the 14074-connection ceiling the same arithmetic reaches
+~3.9 GiB against ~251 MiB of pools.
+
+These are caps rather than committed pages — the kernel allocates as data
+arrives, and `tcp_mem` bounds it globally (~3.09 GiB here). That is the
+point: the bound that actually applies is the kernel's, not ours, and
+crossing it means queue collapse rather than an allocation failure we
+would see.
+
+Closing it is cheap, because the options are **inherited**: measured on a
+listener, an accepted socket carries the parent's `SO_RCVBUF`/`SO_SNDBUF`
+(and `TCP_NODELAY`) — so one `setsockopt` at bind makes the per-socket cap
+a named constant covering every accepted connection, at no per-connection
+cost.
+
+The caveat that has to ship with it: setting `SO_RCVBUF` explicitly
+disables receive-window autotuning. On loopback and LAN that is free;
+across a WAN a fixed small buffer caps the window and therefore
+BDP-limited throughput. So this wants a `constants.zig` value with a
+config override sized for the deployment, never a hardcoded shrink.
+
+## Reading the memory hierarchy on this box (2026-07-26)
+
+Chasing whether `Conn`'s layout costs cache misses produced one durable
+tooling lesson and one settled verdict.
+
+**`LLC-load-misses` does not count here — validate the counter first.** A
+randomised pointer chase over 256 MiB, unambiguously DRAM-bound at 552
+cycles per step, reports **exactly zero** LLC load misses. perf accepts
+the event name and silently returns 0 rather than `<not supported>`. The
+events that work are the precise ones: `mem_load_retired.l1_miss`,
+`.l2_miss`, `.l3_miss` — the last reported 20,195,083 against 20,000,000
+designed misses, so it is calibrated. (A first attempt at that chase
+walked memory *sequentially* and was eaten by the prefetcher at 25 cycles
+a step, which is exactly how a dead counter looks plausible.)
+
+**The misses scale with connection count, not with bytes per
+connection.** The 2000-connection baseline reads **2.27–2.31**
+misses/request across runs; single figures below are individual runs
+inside that band, not restatements of one number. Holding the offered
+rate fixed and varying only concurrency, DRAM traffic goes 0.05 → 1.22 →
+2.19 → 2.31 across 128 → 512 → 1000 → 2000 connections. Cutting the
+`Conn` stride 4× at 2000 connections — 19.1 MB of slots down to 4.8 MB,
+from over-L3 to comfortably inside a 12 MiB L3 — bought only 21%
+(2.29 → 1.80). The controlled pair settles it: **512 connections at
+4.9 MB take 1.22 misses; 2000 connections at 4.8 MB take 1.80.** Same
+footprint, 4× the connections, 48% more DRAM traffic.
+
+Two hypotheses died on the way, both worth not re-forming. L3 contention
+with the co-resident load generator: the 12 MiB L3 is shared by cpus 0–3
+only, and moving the generator to the E-cores (4–7, outside that domain)
+changed the result by nothing — 2.32 against 2.27. And `align(8)` to pull
+`state`/`armed` off the struct's last cache line made it *worse*, because
+it split two fields that were sharing one line.
+
+**Verdict on structure-of-arrays for `Conn`: not worth building.** The
+per-completion metadata is a genuine target — `delivered()` touches nine
+bytes (`generation` 4, `armed` 1, the op's `generation_at_submit` 4),
+spread across three cache lines 8 KiB apart, and is 18.9% of all DRAM
+misses on its own. But eliminating that share entirely takes 2.29 → 1.86
+misses/request, about 240 cycles of ~3900: **~6% at 2000 connections and
+nothing below ~500**. Against ~130 call sites and
+breaking `Pool`'s `comptime assert(@FieldType(T, "generation") == u32)`,
+which three pools share. If c10k pressure ever makes this worth
+revisiting, the relay-buffer pool's free list is already 10.9% of misses
+on its own and is the cheaper target.
 
 ## Profile share is not throughput headroom — bounding a wipe (2026-07-25)
 
