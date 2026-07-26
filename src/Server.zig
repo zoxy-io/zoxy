@@ -123,18 +123,18 @@ pub fn Server(comptime IoType: type) type {
         ) error{OutOfMemory}!void {
             assert(config.listeners.len >= 1);
             assert(config.listeners.len <= constants.listeners_max);
-            assert(options.relay_buffers >= 1);
-            assert(options.relay_buffers <= options.conn_slots);
-            server.io = io;
-            server.config = config;
             // `Pool` permits an empty pool — that is how an unconfigured
-            // feature reserves nothing (§5) — so the requirement that *these*
+            // feature reserves nothing (§5) — so the requirement that these
             // three are non-empty lives here, where it is true: a proxy with
             // no conn slots, no relay buffers or no upstream slots cannot
-            // serve a single request.
+            // serve a single request. `relay_buffers` was always checked
+            // here; the other two move down from `Pool.init`.
             assert(options.conn_slots >= 1);
             assert(options.relay_buffers >= 1);
             assert(options.upstream_slots >= 1);
+            assert(options.relay_buffers <= options.conn_slots);
+            server.io = io;
+            server.config = config;
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
             try server.upstreams.init(arena, options.upstream_slots);
