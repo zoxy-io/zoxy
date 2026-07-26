@@ -236,12 +236,14 @@ read against it.
   fourth pool is a field plus a term. Unifying the count-only functions with
   the sizing one would have coupled things that share nothing.
 - **C3 needs nothing.** The row claims a resource can only be released at
-  teardown; the code already releases per-resource, early, in five places —
+  teardown; the code already releases per-resource and early in five places —
   the relay buffer on a keep-alive turnaround and inside `respond`, the
-  upstream slot mid-exchange and at reject — each the `if (conn.x) |held| {
-  release; conn.x = null; }` shape the row asks for. A TLS engine adds one
-  more such block, and kTLS returning it at handshake completion is already
-  legal. Removed rather than left looking pending.
+  upstream slot when parked, detached, and at reject. Three of those guard on
+  the optional (`if (conn.x) |held|`) and two unwrap it outright, because
+  their preconditions already guarantee it is held; either way the lifetime is
+  the resource's own, not teardown's. A TLS engine adds one more such site,
+  and kTLS returning it at handshake completion is already legal. Removed
+  rather than left looking pending.
 
 ### Tier D — measurement readiness
 

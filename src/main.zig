@@ -224,7 +224,7 @@ fn printBudgets(
         limits.upstream_slots,
         @intCast(config.listeners.len),
     );
-    const memory_total = constants.memoryBytesTotal(.{
+    const memory_total = constants.memoryBytesTotal(&.{
         .conn_slots = limits.conn_slots,
         .conn_bytes = @sizeOf(ServerXev.ConnType),
         .relay_buffers = limits.relay_buffers,
