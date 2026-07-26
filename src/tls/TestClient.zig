@@ -91,6 +91,11 @@ pub fn TestClient(comptime IoType: type) type {
             /// shared-outbox interleaving the staging-room guard exists
             /// for, and an emptiness precondition there is unsound.
             key_update: bool = false,
+            /// The three `close_*` options below are mutually exclusive:
+            /// they share `close_sent`, and `nextStep` checks them in a
+            /// fixed order, so combining them would let the earliest one
+            /// silently consume the close and the others never fire.
+            ///
             /// Send close_notify once the echo is back, instead of waiting
             /// for the peer to close. That is a client saying "no more
             /// application data from me" *in protocol* — an EOF the proxy

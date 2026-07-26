@@ -934,6 +934,11 @@ test "tls: a client that closes inside its handshake flight ends cleanly" {
     try std.testing.expect(client.handshake_done);
     // It never became a relay: no upstream was dialed on its behalf.
     try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
+    // Admitted work still reaches `completed`, whichever state teardown
+    // began from (§9). `expectDrained` reconciles this too; pinning it
+    // here names the invariant the scenario is actually about.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     // And the engine came back, so a client that does this in a loop
     // cannot drain the pool (§5, §8).
     try std.testing.expect(bed.server.tls_engines.isFullyReleased());

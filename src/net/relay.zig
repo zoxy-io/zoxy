@@ -392,23 +392,35 @@ pub fn Relay(comptime IoType: type) type {
         /// Accumulates decrypted application data into the engine staging,
         /// whose bound the ciphertext chunk size is tied to at comptime
         /// above, so a record's plaintext always fits.
+        ///
+        /// One `feed` drains every complete record in the read, so both
+        /// sinks can fire in one call and their *order* is the whole
+        /// meaning: data then goodbye is a client signing off after a last
+        /// write, and every one of those bytes is forwarded. Goodbye then
+        /// data is a peer talking past its own close — illegal, and RFC
+        /// 8446 §6.1 says anything after the alert is ignored, so it is
+        /// dropped here rather than relayed to an origin on behalf of a
+        /// session that had already ended.
         const Decrypted = struct {
             conn: *ConnType,
             len: u32 = 0,
+            closed: bool = false,
 
             fn append(ctx: *anyopaque, bytes: []const u8) void {
                 const self: *Decrypted = @ptrCast(@alignCast(ctx));
+                if (self.closed) return;
                 const buffer = &self.conn.tls.?.staging;
                 assert(self.len + bytes.len <= buffer.len);
                 @memcpy(buffer[self.len..][0..bytes.len], bytes);
                 self.len += @intCast(bytes.len);
             }
 
-            /// The engine records the close itself (`Engine.peerClosed`),
-            /// which is what `transformEnded` reads once `feed` returns;
-            /// nothing to do here but satisfy the sink.
+            /// The engine records the close for `transformEnded` to read
+            /// once `feed` returns; this copy is what makes the *rest of
+            /// this same call* stop accepting data.
             fn peerClosed(ctx: *anyopaque) void {
-                _ = ctx;
+                const self: *Decrypted = @ptrCast(@alignCast(ctx));
+                self.closed = true;
             }
         };
 

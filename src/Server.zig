@@ -851,6 +851,12 @@ pub fn Server(comptime IoType: type) type {
         fn tlsPendingPlaintext(ctx: *anyopaque, bytes: []const u8) void {
             const conn: *ConnType = @ptrCast(@alignCast(ctx));
             const engine = conn.tls.?;
+            // One `feed` drains every complete record in the read and keeps
+            // going after a sink ends the connection — including this one's
+            // own overflow branch below, and `tlsPeerClosed`. So a later
+            // record's plaintext can arrive after the state has already
+            // moved on, and there is nowhere left to stage it.
+            if (conn.isTearingDown()) return;
             assert(conn.state == .tls_handshaking);
             assert(conn.tls_pending_len <= engine.staging.len);
             if (conn.tls_pending_len + bytes.len > engine.staging.len) {
