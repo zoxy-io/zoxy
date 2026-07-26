@@ -86,6 +86,36 @@ pub const DirectionState = struct {
     }
 };
 
+/// One client-directed write in flight (§7, §8): the plaintext still to
+/// deliver, and where control goes once it is all out.
+///
+/// Three writes on the L7 path go to the client outside the body pump — the
+/// rendered response head, the body excess that arrived coalesced with it,
+/// and a static error response — and they differ only in which bytes they
+/// carry and what happens next. One channel for all three means one cursor,
+/// one short-write resume, one teardown interlock, and (§4) one place for a
+/// transforming client side to turn plaintext into wire bytes. The body pump
+/// is the fourth client-directed writer and carries that same seam of its
+/// own (`pump.zig`).
+pub const ClientWrite = struct {
+    /// Shrunk from the front as bytes leave, so a resume is the same code
+    /// whether they live in static memory (§8), the head buffer, or an
+    /// upstream head. Empty means no write is in flight.
+    pending: []const u8 = &.{},
+    then: Then = .lingering_close,
+
+    /// What the channel does when `pending` empties.
+    pub const Then = enum(u8) {
+        /// The rendered response head is out: forward any coalesced body
+        /// excess, else move on to the body pump.
+        response_excess,
+        /// The coalesced excess is out: the body pump, or the exchange ends.
+        response_body,
+        /// A static response is out: the lingering close (§2, §8).
+        lingering_close,
+    };
+};
+
 pub fn Conn(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const UpstreamType = upstream_module.UpstreamPool(IoType).Upstream;
@@ -126,11 +156,9 @@ pub fn Conn(comptime IoType: type) type {
         /// Bytes of `head` filled so far; the head's end is found by
         /// parsing, the body (or a pipelined next head) follows it.
         head_len: u32,
-        /// The static error response still to be written to the client
-        /// while in `.l7_responding` (§8): a slice into comptime static
-        /// memory, shrunk from the front as bytes are sent. Empty
-        /// otherwise; idle on the L4 path.
-        response_pending: []const u8,
+        /// The client-directed write in flight, if any (§7, §8) — see
+        /// `ClientWrite`. Idle on the L4 path, which relays through the pump.
+        client_write: ClientWrite,
         /// The cluster to dial. Seeded from the listener at admission; on
         /// the L7 path `routeRequest` overwrites it with the request
         /// path's cluster once the head parses (§7).
@@ -237,13 +265,19 @@ pub fn Conn(comptime IoType: type) type {
             /// Bytes of `upstream.head` consumed by the response head;
             /// body excess received with it sits at [marker..head_len].
             response_head_len_marker: u32 = 0,
-            /// Length of the rendered head being sent (request leg: into
-            /// upstream.head; response leg: into conn.head).
+            /// Length of the rendered request head being sent into
+            /// upstream.head, and the cursor over it (short sends resume).
+            /// The response head has no pair here: it goes out through the
+            /// client-write channel, which owns its own cursor
+            /// (`ClientWrite`).
             rendered_request_len: u32 = 0,
-            rendered_response_len: u32 = 0,
-            /// Send cursors over the rendered heads (short sends resume).
             request_head_sent: u32 = 0,
-            response_head_sent: u32 = 0,
+            /// Response body bytes that arrived coalesced with the response
+            /// head and did not fit in `conn.head` beside the rendered head:
+            /// they follow it from `upstream.head[response_head_len_marker..]`
+            /// as the channel's next write. Zero when the excess rode along
+            /// with the head, or when there was none.
+            response_excess_len: u32 = 0,
             /// True once the request head has been forwarded off conn.head
             /// (head sent and any coalesced body excess drained), so the
             /// response head may render into conn.head (§7 buffer rotation).
@@ -360,7 +394,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.armed = .{};
             conn.directions = .{ .{}, .{} };
             conn.head_len = 0;
-            conn.response_pending = &.{};
+            conn.client_write = .{};
             conn.cluster_index = cluster_index;
             // Placeholders until the admission tail installs the
             // listener's real tables (§7); L4 never reads them.
@@ -379,7 +413,7 @@ pub fn Conn(comptime IoType: type) type {
             assert(conn.state == state);
             assert(conn.armedCount() == 0);
             assert(conn.head_len == 0);
-            assert(conn.response_pending.len == 0);
+            assert(conn.client_write.pending.len == 0);
             assert(conn.upstream == null);
             assert(conn.l7.request_leg == .idle);
         }
