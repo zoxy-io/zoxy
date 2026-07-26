@@ -105,7 +105,7 @@ pub fn renderRequestHead(
         .http_1_0 => " HTTP/1.0\r\n",
         .http_1_1 => " HTTP/1.1\r\n",
     });
-    try appendEndToEndHeaders(&staging, request.headers, edits);
+    try appendEndToEndHeaders(&staging, request.headers, request.connection_nominates_header, edits);
     if (inject_close) {
         try staging.append("Connection: close\r\n");
     }
@@ -139,7 +139,7 @@ pub fn renderResponseHead(
     }
     try staging.append("\r\n");
     // Filters are request-side only (§7); the response carries no edits.
-    try appendEndToEndHeaders(&staging, response.headers, &.{});
+    try appendEndToEndHeaders(&staging, response.headers, response.connection_nominates_header, &.{});
     if (inject_close) {
         try staging.append("Connection: close\r\n");
     }
@@ -210,6 +210,7 @@ const Staging = struct {
 fn appendEndToEndHeaders(
     staging: *Staging,
     headers: []const parser.Header,
+    connection_nominates_header: bool,
     edits: []const filter.AppliedHeaderEdit,
 ) error{Oversize}!void {
     assert(headers.len <= constants.headers_max);
@@ -229,14 +230,19 @@ fn appendEndToEndHeaders(
         }
     }
     const nominations = connection_values[0..connection_count];
-    // `close` and `keep-alive` are connection options, not header names —
-    // `keep-alive` is already a hop-by-hop name and `close` names no
-    // forwardable header — so a Connection listing only those nominates
-    // nothing to strip. Detect a real nomination once here; the common
-    // case then skips the per-header token scan entirely, splitting the
-    // Connection value once rather than once per header (§9).
+    // Whether anything is nominated was settled by `parser.scanConnectionTokens`,
+    // which already walked these same tokens to decide keep-alive. In the
+    // common case — no nomination — the per-header scan below is skipped
+    // entirely and the value is never split here at all (§9).
+    //
+    // The flag and the values it describes are now filled in by two
+    // different passes, joined only by this bool: a nomination without a
+    // Connection header to have carried it means they have desynchronized.
+    if (connection_nominates_header) {
+        assert(connection_count >= 1);
+    }
     const active_nominations =
-        if (nominatesRealHeader(nominations)) nominations else nominations[0..0];
+        if (connection_nominates_header) nominations else nominations[0..0];
 
     // Only `set`/`remove` edits suppress source copies; `add` never does.
     // Decide once whether any suppressing edit exists, so a request with no
@@ -278,31 +284,6 @@ fn suppressedByEdit(name: []const u8, edits: []const filter.AppliedHeaderEdit) b
         switch (edit.kind) {
             .set, .remove => if (std.ascii.eqlIgnoreCase(name, edit.name)) return true,
             .add => {},
-        }
-    }
-    return false;
-}
-
-/// True when a Connection value names a header to strip beyond the
-/// standard `close`/`keep-alive` options. Splits each token list once so
-/// the per-header hop-by-hop test can skip the (usually empty) nomination
-/// scan in the common case.
-fn nominatesRealHeader(nominations: []const []const u8) bool {
-    assert(nominations.len <= constants.headers_max);
-    for (nominations) |value| {
-        var tokens = std.mem.splitScalar(u8, value, ',');
-        while (tokens.next()) |raw_token| {
-            const token = std.mem.trim(u8, raw_token, " \t");
-            if (token.len == 0) {
-                continue;
-            }
-            if (std.ascii.eqlIgnoreCase(token, "close")) {
-                continue;
-            }
-            if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
-                continue;
-            }
-            return true;
         }
     }
     return false;
@@ -471,6 +452,26 @@ test "render: nominating a protected header does not strip it" {
     const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, &buffer);
     try testing.expectEqualStrings(
         "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n",
+        rendered,
+    );
+}
+
+test "render: a nomination on a second Connection line still strips" {
+    // Connection is a list field: two header lines combine as one list
+    // (RFC 9110), so the nomination flag has to accumulate across them —
+    // it is set by whichever line carries a non-option token. Pins that
+    // OR, which the render walk now depends on and cannot see for itself.
+    const head = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n" ++
+        "Connection: X-Nominated\r\nX-Nominated: v\r\nX-Keep: k\r\n\r\n";
+    var storage: parser.HeaderStorage = undefined;
+    const request = try parser.parseRequestHead(head, false, &storage);
+    try testing.expect(request.connection_nominates_header);
+    var buffer: [oracle_buffer_bytes]u8 = undefined;
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, &buffer);
+    // Both Connection lines are hop-by-hop; X-Nominated goes because the
+    // second line named it; X-Keep is untouched.
+    try testing.expectEqualStrings(
+        "GET / HTTP/1.1\r\nHost: a\r\nX-Keep: k\r\n\r\n",
         rendered,
     );
 }
