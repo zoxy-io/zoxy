@@ -730,6 +730,34 @@ test "l7: CONNECT and Upgrade are answered 501" {
     }
 }
 
+test "l7: OPTIONS asterisk-form is forwarded as \"*\", not as the \"/\" it matched" {
+    // §7 keeps two views of a target: the *match* view, which routes and
+    // filters asterisk-form as the origin root, and the *forward* view,
+    // which sends "*" verbatim. They are built together from one
+    // canonicalization, so nothing but this test stops the forward view
+    // from silently becoming the match view — which would turn a
+    // server-wide OPTIONS into a request for the root resource.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 21,
+        .origin_response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("OPTIONS * HTTP/1.1\r\nHost: origin.example\r\n\r\n");
+
+    try std.testing.expect(bed.origin.conns[0].request_complete);
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try parser.parseRequestHead(
+        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
+        false,
+        &storage,
+    );
+    try std.testing.expectEqual(parser.Method.options, forwarded.method);
+    try std.testing.expectEqualStrings("*", forwarded.target);
+    try bed.expectDrained();
+}
+
 test "l7: a GET is proxied and the origin's response relayed back" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
