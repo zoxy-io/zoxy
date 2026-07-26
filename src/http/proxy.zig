@@ -26,8 +26,10 @@
 //! Buffer ownership rotates, never overlaps: conn.head holds the request
 //! head until it is rendered, then stages the rendered response head;
 //! upstream.head stages the rendered request head, then accumulates the
-//! response head; the relay-buffer halves carry only framed body bytes
-//! (head-adjacent excess is copied across once at each pump start).
+//! response head; the relay-buffer halves carry only framed body bytes.
+//! Head-adjacent excess never enters a relay half — it is forwarded
+//! straight from the head buffer holding it, so a coalesced body larger
+//! than a half is never squeezed through one.
 
 const std = @import("std");
 
@@ -1022,6 +1024,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             conn.l7.response_leg = .sending_body_excess;
+            server.counters.increment("l7_response_excess_sent");
             const base = conn.l7.response_head_len_marker;
             // These are bytes the origin actually delivered past its head —
             // the bound `DirectionState.pending` used to check for this write

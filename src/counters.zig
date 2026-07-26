@@ -62,6 +62,15 @@ pub const Counters = struct {
     l7_gateway_timeout: Value = Value.init(0),
     /// Completed L7 exchanges: a parsed origin response relayed back.
     l7_responses: Value = Value.init(0),
+    /// Responses whose coalesced body excess did not fit beside the
+    /// rendered head and left in a second write of its own (§7) — one
+    /// extra ring round trip, paid whenever the origin's delivery fills
+    /// the head buffer and the render grows the head. The client receives
+    /// the same bytes either way, so this counter is the only witness
+    /// that the branch ran: without it neither an operator nor a test can
+    /// tell the two paths apart (#77). Pure observability, so it stays
+    /// out of `reconcile`.
+    l7_response_excess_sent: Value = Value.init(0),
     /// Exchanges served over a parked upstream connection instead of a
     /// fresh dial — the §3 reuse win, witnessed.
     upstream_reused: Value = Value.init(0),
