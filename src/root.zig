@@ -50,6 +50,7 @@ test {
     _ = @import("net/relay.zig");
     _ = @import("net/upstream.zig");
     _ = @import("testing/origin.zig");
+    _ = @import("net/pump_transform_test.zig");
     _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");
     _ = @import("io/xev_smoke_test.zig");

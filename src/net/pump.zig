@@ -58,6 +58,10 @@
 //!    `beforeSend` that stages wire bytes would make those two answers
 //!    disagree — stage in `transformOut`, which runs exactly once per chunk,
 //!    and leave `beforeSend` to the bookkeeping it exists for.
+//! 3. **A policy whose `transformIn` can yield nothing must tolerate
+//!    `beforeRecv` twice with no send between**, because that is how the pump
+//!    reads on for the rest of a fragment (see `onRecv`). Identity never can:
+//!    a recv delivers at least one byte and identity forwards all of them.
 //!
 //! The `on*Entry` hooks fire at completion time — after `delivered`, before
 //! the I/O result is unwrapped — so a Policy can re-assert the invariants
@@ -205,6 +209,22 @@ pub fn Pump(
                 server.beginTeardown(conn);
                 return;
             };
+            // A transform may legally yield nothing from a read: what
+            // arrived is a fragment of a unit it can only decode whole — a
+            // TLS record, a length-prefixed frame. Framing must never see an
+            // empty chunk, because `feed` reporting `consumed == 0` means
+            // *end of message*, so the read is re-armed and the transform
+            // keeps the fragment until the rest lands. A policy whose
+            // transform can do this must therefore tolerate `beforeRecv`
+            // twice with no send between (identity never can: a recv
+            // delivers at least one byte and identity forwards all of them).
+            if (chunk.len == 0) {
+                // Nothing was framed, so nothing is owed: a fragment must
+                // never leave a debt deferred across the next read.
+                assert(directionState(conn).owed() == 0);
+                armRecv(server, conn);
+                return;
+            }
             const fr = Policy.feed(conn, chunk);
             if (fr.malformed) {
                 server.beginTeardown(conn);
