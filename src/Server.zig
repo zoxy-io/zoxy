@@ -25,7 +25,6 @@ const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
-const tls_relay = @import("net/tls_relay.zig");
 const TlsCredentials = @import("tls/Credentials.zig");
 const TlsEngine = @import("tls/Engine.zig");
 const upstream_module = @import("net/upstream.zig");
@@ -933,13 +932,10 @@ pub fn Server(comptime IoType: type) type {
             };
             conn.state = .relaying;
             server.storeDeadline(conn, server.idleTimeoutMs());
-            // A TLS connection relays the same way, with the engine
-            // spliced into the client side of each direction (§4).
-            if (conn.tls != null) {
-                tls_relay.TlsRelay(IoType).start(server, conn);
-            } else {
-                relay.Relay(IoType).start(server, conn);
-            }
+            // One relay for both: a TLS connection runs the same discipline
+            // with the engine spliced into the client side of each direction,
+            // which is the pump's transform seam (§4, §6).
+            relay.Relay(IoType).start(server, conn);
         }
 
         /// Teardown is a state, not an event (§5): shutdown both fds,

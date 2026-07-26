@@ -64,6 +64,12 @@ outbox_sent: u32,
 /// needs the answer *after* the outbox drains — by which time the alert
 /// bytes it would otherwise have to recognize are gone.
 close_staged: bool,
+/// Whether the *peer's* close_notify has arrived. `Sink.closed` reports it
+/// to whoever drove the `feed` that saw it, but the fact outlives that
+/// call: a caller that only learns "this read yielded no plaintext" has to
+/// ask afterwards whether that was a fragment or the end of the stream,
+/// and those two answers could not differ more (§6 half-close).
+peer_closed: bool,
 /// Per-connection scratch for whichever side of the transform the caller
 /// does not already have a buffer for. Engine-owned because only the
 /// engine knows the bound (see `staging_bytes`); the caller decides what
@@ -190,6 +196,7 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     engine.outbox_len = 0;
     engine.outbox_sent = 0;
     engine.close_staged = false;
+    engine.peer_closed = false;
     assert(!engine.hs.isConnected());
 }
 
@@ -296,6 +303,13 @@ pub fn closeStaged(engine: *const Engine) bool {
     return engine.close_staged;
 }
 
+/// True once the peer's close_notify has arrived: an in-band EOF that no
+/// socket-level EOF need follow, so a caller seeing an empty decrypt asks
+/// this to tell "the record was a fragment" from "the stream ended".
+pub fn peerClosed(engine: *const Engine) bool {
+    return engine.peer_closed;
+}
+
 fn pump(engine: *Engine, sink: Sink) !void {
     while (try engine.records.next()) |record| {
         assert(record.len > 0);
@@ -317,7 +331,10 @@ fn pump(engine: *Engine, sink: Sink) !void {
                     engine.hs.completeWrite();
                 }
             },
-            .closed => sink.closed(sink.ctx),
+            .closed => {
+                engine.peer_closed = true;
+                sink.closed(sink.ctx);
+            },
             .none => {},
         }
     }

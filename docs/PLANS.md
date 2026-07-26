@@ -151,9 +151,26 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
        asserts nothing is owed across it. TLS meets this on its first
        split record; without the branch it is an assertion failure, not
        a wrong answer.
-     *Landed:* the parallel relay (`net/tls_relay.zig`), L4 only — the
-     L7 head-read over decrypted bytes is still owed. Two bugs the
-     shape made easy, both remotely triggerable, both now gated:
+     *Landed:* the L4 relay, first as a parallel loop
+     (`net/tls_relay.zig`) and now **folded onto the seam** — one
+     `relay.zig` policy whose transform hooks branch on `conn.tls`, the
+     same runtime-branch shape the L7 body legs already use. The parallel
+     loop is deleted; the fold is net negative on lines and removes the
+     second copy of the recv→send discipline that motivated B1 in the
+     first place.
+
+     The fold needed one addition to the seam, `transformEnded`: a
+     transform yielding no bytes means either "mid-unit, read on" or "the
+     stream ended", and only the policy can tell. A TLS close_notify is
+     the second — an in-band EOF that **no socket EOF ever follows**,
+     because the connection stays open for the other direction. Without
+     it the direction waits for bytes that will never come until the idle
+     deadline reaps a connection that said a clean goodbye: no error, no
+     counter, just a slow silent leak of the half-close contract. The
+     test pins it by asserting `deadline_expired == 0`.
+
+     Two bugs the parallel shape made easy, both remotely triggerable,
+     both now gated:
      plaintext is bounded by the *record*, not the read, so the
      decrypt destination is an engine-owned inbox (a 16 KiB client
      write overflowed a 4 KiB relay buffer); and both directions share

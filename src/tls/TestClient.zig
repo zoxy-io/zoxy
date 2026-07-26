@@ -48,6 +48,18 @@ pub fn TestClient(comptime IoType: type) type {
         key_update_sent: bool,
         /// Whether the second payload (after the KeyUpdate) has gone.
         app_resent: bool,
+        /// Whether the scenario asks the client to close in protocol once
+        /// its echo is back, and whether that alert has gone out.
+        close_after_echo: bool,
+        close_sent: bool,
+        /// Whether the close rides the data write (`close_with_data`), and
+        /// the scratch that makes that one write: `hs` renders each record
+        /// into the shared out buffer and `completeWrite` invalidates the
+        /// previous one, so two records in one segment must be copied out
+        /// as they are produced.
+        close_with_data: bool,
+        coalesced: [2048]u8,
+        coalesced_len: u32,
         app_received: [65536]u8,
         app_received_len: u32,
         /// Runs once the client is done — how a scenario learns to wind
@@ -78,6 +90,18 @@ pub fn TestClient(comptime IoType: type) type {
             /// shared-outbox interleaving the staging-room guard exists
             /// for, and an emptiness precondition there is unsound.
             key_update: bool = false,
+            /// Send close_notify once the echo is back, instead of waiting
+            /// for the peer to close. That is a client saying "no more
+            /// application data from me" *in protocol* — an EOF the proxy
+            /// can only learn from a decrypt, never from a socket, since the
+            /// TCP connection stays open for the other direction (§6).
+            close_after_echo: bool = false,
+            /// Send the application data and close_notify as one write, the
+            /// way a client that calls write() then shutdown() does. The
+            /// proxy then decrypts both out of a single read, so its final
+            /// chunk is non-empty *and* the session has ended — the case an
+            /// "empty decrypt means goodbye" rule misses entirely.
+            close_with_data: bool = false,
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -129,6 +153,10 @@ pub fn TestClient(comptime IoType: type) type {
             client.key_update_wanted = options.key_update;
             client.key_update_sent = false;
             client.app_resent = false;
+            client.close_after_echo = options.close_after_echo;
+            client.close_sent = false;
+            client.close_with_data = options.close_with_data;
+            client.coalesced_len = 0;
             client.app_received_len = 0;
             io.connect(address, &client.connect_completion, Self, client, onConnect);
         }
@@ -253,11 +281,68 @@ pub fn TestClient(comptime IoType: type) type {
                 client.armSend();
                 return;
             }
+            // Both close scenarios wait for the first echo, for the same
+            // reason the KeyUpdate does: anything sent before it is consumed
+            // by the server's handshake drive and never reaches the relay.
+            // The coalesced one sends a *second* payload with the alert
+            // riding the same segment, so the relay's final decrypt yields
+            // plaintext and the end of the session together.
+            if (client.close_with_data and !client.close_sent and
+                client.app_sent and
+                client.app_received_len >= client.app_to_send.len)
+            {
+                client.close_sent = true;
+                client.stageCoalescedClose() catch {
+                    client.finish();
+                    return;
+                };
+                client.pending_send = client.coalesced[0..client.coalesced_len];
+                client.armSend();
+                return;
+            }
+            if (client.close_after_echo and !client.close_sent and
+                client.app_sent and
+                client.app_received_len >= client.app_to_send.len)
+            {
+                client.close_sent = true;
+                client.pending_send = client.hs.sendAlert(
+                    .close_notify,
+                    &client.out.buffer,
+                ) catch {
+                    client.finish();
+                    return;
+                };
+                client.hs.completeWrite();
+                client.armSend();
+                return;
+            }
             if (client.saw_close) {
                 client.finish();
                 return;
             }
             client.armRecv();
+        }
+
+        /// Render the application data and close_notify back to back into
+        /// `coalesced`, so they leave in one segment and arrive in one read.
+        fn stageCoalescedClose(client: *Self) !void {
+            assert(client.coalesced_len == 0);
+            const data = try client.hs.sendApplicationData(
+                client.app_to_send,
+                &client.out.buffer,
+            );
+            assert(data.len >= 1);
+            assert(data.len <= client.coalesced.len);
+            @memcpy(client.coalesced[0..data.len], data);
+            client.coalesced_len = @intCast(data.len);
+            client.hs.completeWrite();
+
+            const alert = try client.hs.sendAlert(.close_notify, &client.out.buffer);
+            assert(alert.len >= 1);
+            assert(client.coalesced_len + alert.len <= client.coalesced.len);
+            @memcpy(client.coalesced[client.coalesced_len..][0..alert.len], alert);
+            client.coalesced_len += @intCast(alert.len);
+            client.hs.completeWrite();
         }
 
         fn feed(client: *Self, wire: []const u8) !void {

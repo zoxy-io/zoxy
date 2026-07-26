@@ -812,6 +812,99 @@ test "tls: plaintext relays end to end through a terminated session" {
     try bed.expectDrained();
 }
 
+// A client's close_notify is an EOF the proxy can only learn from a
+// *decrypt*: the TCP connection stays open for the other direction, so no
+// socket EOF ever arrives (§6 half-close, §4). The relay must recognize it
+// and shut the upstream's write side, which the origin then sees as its own
+// EOF — closing the loop back through `upstream → client`. Get this wrong
+// and nothing fails loudly: the direction simply waits for bytes that will
+// never come, until the idle deadline reaps a connection that had said a
+// clean goodbye. That is what the zero-deadline assertion pins.
+test "tls: a client's close_notify half-closes the upstream" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 17 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+        .close_after_echo = true,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // The exchange completed before the close: the goodbye is orderly, not
+    // an abort that happened to look like one.
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    // The proxy answered in protocol rather than with a bare FIN (§2).
+    try std.testing.expect(client.saw_close);
+    // The whole teardown ran on the peers' own signals: no clock involved.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+// The same goodbye, riding the same read as the data — write() then
+// shutdown(), which is what a real client does. One decrypt yields *both*
+// the last plaintext and the end of the session, so the chunk is non-empty
+// and the "empty decrypt means goodbye" rule never fires. Two ways to get
+// this wrong, and this pins both: forward the bytes and then wait forever
+// for a client that already left (the idle deadline covers it up), or spot
+// the close and drop the bytes that came with it (nothing covers that up —
+// the echo simply never comes back).
+test "tls: a close_notify coalesced with the last write loses neither" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 19 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+        .close_with_data = true,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // Two payloads went out — one plain, one riding the alert — and both
+    // came back. The second is the one at issue: dropping the bytes that
+    // shared a read with the goodbye is exactly the other way to get this
+    // wrong, and it shows up here as a short echo.
+    try std.testing.expectEqual(
+        @as(u32, 2 * echo_token.len),
+        client.app_received_len,
+    );
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[echo_token.len..client.app_received_len],
+    );
+    try std.testing.expect(client.saw_close);
+    // And the direction ended on that alert, not on the clock.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
 // §8 rung: the engine pool is the wall a TLS listener hits first. With no
 // engines, a TLS connection is refused at admission — never admitted, so
 // the accepted = admitted + shed identity still holds.
