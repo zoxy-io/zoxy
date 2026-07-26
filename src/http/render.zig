@@ -39,6 +39,39 @@ pub const protected_names = [_][]const u8{
     "transfer-encoding",
 };
 
+/// True when `list` names `name` exactly. Comptime-only, for the check
+/// below; the runtime path compares tags, not strings.
+fn nameListHas(list: []const []const u8, name: []const u8) bool {
+    for (list) |entry| {
+        if (std.mem.eql(u8, entry, name)) return true;
+    }
+    return false;
+}
+
+comptime {
+    // These lists and `parser.HeaderName`'s predicates are two spellings
+    // of one rule, and the runtime path now reads the second. Pin them in
+    // both directions so divergence is a build failure rather than a §7
+    // hole: a list entry no variant claims would stop being stripped, and
+    // a variant no list claims would strip a header nothing documents.
+    for (hop_by_hop_names) |name| {
+        assert(parser.classifyHeaderName(name).hopByHop());
+    }
+    for (protected_names) |name| {
+        assert(parser.classifyHeaderName(name).protected());
+    }
+    for (@typeInfo(parser.HeaderName).@"enum".fields) |field| {
+        const tag: parser.HeaderName = @enumFromInt(field.value);
+        if (tag.hopByHop()) assert(nameListHas(&hop_by_hop_names, tag.text()));
+        if (tag.protected()) assert(nameListHas(&protected_names, tag.text()));
+        // `isHopByHop` tests hop-by-hop first, so a name in both sets
+        // would be stripped despite being protected — the smuggling shape
+        // `protected_names` exists to prevent. Say it, rather than leave
+        // it to whoever next edits a list to notice.
+        assert(!(tag.hopByHop() and tag.protected()));
+    }
+}
+
 /// Renders the upstream request line and end-to-end headers from a
 /// parsed head. The client's version is preserved — framing decisions on
 /// both hops key off the real versions — and `inject_close` announces
@@ -149,8 +182,11 @@ fn appendEndToEndHeaders(
     // O(headers²) — the render's top user-CPU cost under load (§9).
     var connection_values: [constants.headers_max][]const u8 = undefined;
     var connection_count: u32 = 0;
-    for (headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
+    // Both walks capture by pointer: `parser.Header` is 40 bytes, and
+    // copying one per header is the cost this classification exists to
+    // remove, not to relocate.
+    for (headers) |*header| {
+        if (header.tag == .connection) {
             connection_values[connection_count] = header.value;
             connection_count += 1;
         }
@@ -176,9 +212,9 @@ fn appendEndToEndHeaders(
         }
     }
 
-    for (headers) |header| {
+    for (headers) |*header| {
         assert(header.name.len >= 1);
-        if (isHopByHop(header.name, active_nominations)) {
+        if (isHopByHop(header, active_nominations)) {
             continue;
         }
         if (has_suppressing_edit and suppressedByEdit(header.name, edits)) {
@@ -249,21 +285,20 @@ fn nominatesRealHeader(nominations: []const []const u8) bool {
 /// Connection values that name a real header (empty in the common
 /// close/keep-alive-only case), so this is O(1) then rather than a token
 /// scan per header.
-fn isHopByHop(name: []const u8, nominations: []const []const u8) bool {
-    assert(name.len >= 1);
+fn isHopByHop(header: *const parser.Header, nominations: []const []const u8) bool {
+    assert(header.name.len >= 1);
     assert(nominations.len <= constants.headers_max);
-    for (hop_by_hop_names) |hop_name| {
-        if (std.ascii.eqlIgnoreCase(name, hop_name)) {
-            return true;
-        }
+    if (header.tag.hopByHop()) {
+        return true;
     }
-    for (protected_names) |protected_name| {
-        if (std.ascii.eqlIgnoreCase(name, protected_name)) {
-            return false;
-        }
+    if (header.tag.protected()) {
+        return false;
     }
+    // Only a nomination can still strip this one, and only a Connection
+    // value naming a real header gets here (see `active_nominations`), so
+    // the token scan stays off the common path.
     for (nominations) |value| {
-        if (parser.tokenListHas(value, name)) {
+        if (parser.tokenListHas(value, header.name)) {
             return true;
         }
     }
