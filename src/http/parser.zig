@@ -219,6 +219,9 @@ pub const RequestHead = struct {
     /// Whether the downstream connection may serve another request after
     /// this exchange, per version defaults and Connection tokens.
     keep_alive: bool,
+    /// Whether a Connection token names a header to strip (§7). Carried
+    /// from the analysis pass so rendering need not re-split the value.
+    connection_nominates_header: bool,
     head_len: u32,
 };
 
@@ -235,6 +238,9 @@ pub const ResponseHead = struct {
     /// Whether the upstream connection may be parked for reuse after this
     /// exchange; always false for `until_close` framing.
     keep_alive: bool,
+    /// Whether a Connection token names a header to strip (§7). Carried
+    /// from the analysis pass so rendering need not re-split the value.
+    connection_nominates_header: bool,
     head_len: u32,
 };
 
@@ -335,6 +341,7 @@ pub fn parseRequestHead(
         .host = analysis.host,
         .framing = framing,
         .keep_alive = keepAliveDefault(version, &analysis),
+        .connection_nominates_header = analysis.connection_nominates_header,
         .head_len = head_len,
     };
 }
@@ -399,6 +406,7 @@ pub fn parseResponseHead(
         .headers = headers_storage[0..raw_header_count],
         .framing = framing,
         .keep_alive = keepAliveDefault(version, &analysis) and framing != .until_close,
+        .connection_nominates_header = analysis.connection_nominates_header,
         .head_len = @intCast(head_len),
     };
 }
@@ -676,6 +684,13 @@ const HeaderAnalysis = struct {
     te_other: bool,
     connection_close: bool,
     connection_keep_alive: bool,
+    /// Whether any Connection token names a header to strip, rather than
+    /// only the `close`/`keep-alive` connection *options*. The render walk
+    /// needs exactly this to decide whether the per-header nomination scan
+    /// can be skipped, and the token pass that sets the two flags above
+    /// already knows it — so it is recorded here rather than recomputed by
+    /// splitting the same value a second time (§9).
+    connection_nominates_header: bool,
 };
 
 fn analyzeHeaders(
@@ -690,6 +705,7 @@ fn analyzeHeaders(
         .te_other = false,
         .connection_close = false,
         .connection_keep_alive = false,
+        .connection_nominates_header = false,
     };
     for (raw_headers, 0..) |raw_header, index| {
         assert(raw_header.key.len >= 1);
@@ -744,9 +760,16 @@ fn analyzeHeaders(
     return analysis;
 }
 
-/// Set the persistence flags from one Connection header value in a single
-/// token pass — scanning the list twice (once per token) was a measured
-/// hot spot (§9). Tokens are OWS-trimmed and matched case-insensitively.
+/// Read one Connection header value in a single token pass — the
+/// persistence flags *and* whether anything here nominates a header to
+/// strip. Scanning the list twice (once per token) was a measured hot
+/// spot (§9), and so was splitting it again in the render walk. Tokens
+/// are OWS-trimmed and matched case-insensitively.
+///
+/// `close` and `keep-alive` are connection options, not header names —
+/// `keep-alive` is itself hop-by-hop and `close` names no forwardable
+/// header — so a value listing only those nominates nothing. Any other
+/// token does.
 fn scanConnectionTokens(value: []const u8, analysis: *HeaderAnalysis) void {
     // The value is a slice of the parsed head (an empty value is legal:
     // `Connection:` with nothing after it), so it is head-buffer bounded.
@@ -757,11 +780,15 @@ fn scanConnectionTokens(value: []const u8, analysis: *HeaderAnalysis) void {
         if (token.len == 0) {
             continue;
         }
-        assert(token.len >= 1); // Only real options are classified below.
+        // Every non-empty token is classified below: close/keep-alive as
+        // connection options, anything else as a nomination.
+        assert(token.len >= 1);
         if (std.ascii.eqlIgnoreCase(token, "close")) {
             analysis.connection_close = true;
         } else if (std.ascii.eqlIgnoreCase(token, "keep-alive")) {
             analysis.connection_keep_alive = true;
+        } else {
+            analysis.connection_nominates_header = true;
         }
     }
 }
