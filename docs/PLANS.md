@@ -57,6 +57,14 @@ under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
   client-only (re-verified against the pinned toolchain and upstream
   master; the stalled upstream server PR ziglang/zig#23005 *is*
   tls.zig, so the fork adopts the same code with more control).
+  **Requirement the ~45 ms stall imposes** (IMPLEMENTATION_NOTES.md):
+  the server must emit its post-handshake flight — a NewSessionTicket —
+  *after* processing the client's `Finished`, not alongside the server
+  flight. Both are legal TLS 1.3; only the first carries the ACK that
+  releases a Nagle-held client request, and without it every terminated
+  connection pays a 40 ms delayed-ACK timer once. This is why resumption
+  is not merely a latency nicety on this engine, and it is the whole of
+  what separates zoxy's close-mode band from haproxy's.
 - **Phase 3b — kTLS record offload.** Linux-only follow-up to 3a: hand
   the negotiated keys to the kernel (`setsockopt(SOL_TLS)`, the fork's
   `Ktls.zig` payloads) so the record layer costs zero userspace CPU
@@ -414,3 +422,24 @@ this way. Known queue, in rough value order:
   one replay per parked conn until the sweep reaps the rest.
 - Dynamic DNS for upstream endpoints (§1).
 - io_uring op upgrades — the verdict table above.
+- **Kernel socket buffers inside the §5 budget** — set
+  `SO_RCVBUF`/`SO_SNDBUF` on each listener (accepted sockets inherit
+  them, so it costs one `setsockopt` at bind) so the per-socket cap is a
+  named constant like every other limit. Today the printed total omits
+  memory larger than the pools it does count
+  (IMPLEMENTATION_NOTES.md). Not deferred for lack of value — the
+  measurement is done and the mechanism is trivial — but because the
+  right *default* needs a deployment to size it against: fixing the
+  buffer disables receive autotuning, which is free on a LAN and caps
+  BDP-limited throughput across a WAN. Revisit with the first
+  deployment that has a real network to size against, or sooner if
+  `tcp_mem` pressure is ever observed.
+- **`somaxconn` clamp check at startup** — the listen backlog asks for
+  `accept_backlog` and the kernel silently clamps it to `somaxconn`. The
+  fd budget is already asserted against `RLIMIT_NOFILE` at startup (§8);
+  this deserves the same treatment rather than a silent downgrade.
+- **`TCP_DEFER_ACCEPT` on http listeners** — a connection that never
+  sends data then costs no conn slot or relay buffer (§7 names the
+  slowloris shape; §8 is why holding no slot is the point).
+  Must be per-protocol: it would break an `l4` listener fronting an
+  origin that speaks first.
