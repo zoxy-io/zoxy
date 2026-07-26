@@ -905,6 +905,41 @@ test "tls: a close_notify coalesced with the last write loses neither" {
     try bed.expectDrained();
 }
 
+// A peer may say goodbye before the session it is establishing has ever
+// been used, and the handshake drive runs its sinks *synchronously inside*
+// `Engine.feed` — so the connection can be torn down underneath the step
+// that is still driving it. Continuing to pump one is not a matter of
+// tidiness: it drives a connection whose state has already moved on.
+// No relay is involved and no upstream is ever dialed; the whole exchange
+// ends inside the handshake.
+test "tls: a client that closes inside its handshake flight ends cleanly" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 23 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .close_in_handshake = true,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // It never became a relay: no upstream was dialed on its behalf.
+    try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
+    // And the engine came back, so a client that does this in a loop
+    // cannot drain the pool (§5, §8).
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
 // §8 rung: the engine pool is the wall a TLS listener hits first. With no
 // engines, a TLS connection is refused at admission — never admitted, so
 // the accepted = admitted + shed identity still holds.

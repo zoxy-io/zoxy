@@ -753,6 +753,11 @@ pub fn Server(comptime IoType: type) type {
                 server.beginTeardown(conn);
                 return;
             };
+            // A sink runs *inside* `feed`, so it can end the connection
+            // before this returns: a peer that says goodbye in the same
+            // flight as its Finished does exactly that (§4). Driving on
+            // would pump a connection that is already tearing down.
+            if (conn.isTearingDown()) return;
             server.pumpTlsOutbound(conn);
         }
 
@@ -860,10 +865,12 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls_pending_len <= engine.staging.len);
         }
 
+        /// The peer closed before the session was ever established. There
+        /// is nothing to relay and nothing to answer, so the connection
+        /// ends here — and `driveTlsHandshake` checks for that on the way
+        /// out, because this runs synchronously inside its `feed`.
         fn tlsPeerClosed(ctx: *anyopaque) void {
             const conn: *ConnType = @ptrCast(@alignCast(ctx));
-            // Recorded on the conn; the drive loop tears down once the
-            // engine call it arrived from returns.
             conn.server.beginTeardown(conn);
         }
 

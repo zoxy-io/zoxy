@@ -58,6 +58,7 @@ pub fn TestClient(comptime IoType: type) type {
         /// previous one, so two records in one segment must be copied out
         /// as they are produced.
         close_with_data: bool,
+        close_in_handshake: bool,
         coalesced: [2048]u8,
         coalesced_len: u32,
         app_received: [65536]u8,
@@ -102,6 +103,13 @@ pub fn TestClient(comptime IoType: type) type {
             /// chunk is non-empty *and* the session has ended — the case an
             /// "empty decrypt means goodbye" rule misses entirely.
             close_with_data: bool = false,
+            /// Close in protocol *immediately*, without waiting for the
+            /// echo — so the alert rides the same flight as the client's
+            /// Finished and reaches the server's handshake drive rather
+            /// than its relay. A peer is free to do this, and the drive
+            /// runs its sinks synchronously inside `feed`, so the session
+            /// can end underneath the step that is still driving it.
+            close_in_handshake: bool = false,
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -156,6 +164,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.close_after_echo = options.close_after_echo;
             client.close_sent = false;
             client.close_with_data = options.close_with_data;
+            client.close_in_handshake = options.close_in_handshake;
             client.coalesced_len = 0;
             client.app_received_len = 0;
             io.connect(address, &client.connect_completion, Self, client, onConnect);
@@ -281,7 +290,24 @@ pub fn TestClient(comptime IoType: type) type {
                 client.armSend();
                 return;
             }
-            // Both close scenarios wait for the first echo, for the same
+            // Deliberately *not* waiting for the echo: the point is to
+            // reach the server's handshake drive, not its relay.
+            if (client.close_in_handshake and !client.close_sent and
+                client.handshake_done)
+            {
+                client.close_sent = true;
+                client.pending_send = client.hs.sendAlert(
+                    .close_notify,
+                    &client.out.buffer,
+                ) catch {
+                    client.finish();
+                    return;
+                };
+                client.hs.completeWrite();
+                client.armSend();
+                return;
+            }
+            // Both other close scenarios wait for the first echo, for the same
             // reason the KeyUpdate does: anything sent before it is consumed
             // by the server's handshake drive and never reaches the relay.
             // The coalesced one sends a *second* payload with the alert
