@@ -848,8 +848,6 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(rendered.len >= 1);
-            conn.l7.rendered_response_len = @intCast(rendered.len);
-            conn.l7.response_head_sent = 0;
             conn.l7.response_framing = framingFromParsed(response.framing);
 
             // Feed the framing tracker over the body excess that arrived
@@ -860,120 +858,128 @@ pub fn Proxy(comptime IoType: type) type {
                 upstreamFailed(server, conn);
                 return;
             }
-            const direction = &conn.directions[1];
             // The common small response arrives from the origin in one
             // piece; forward it in one piece too. Appending the excess to
             // the rendered head trades a bounded memcpy for a whole ring
-            // round trip per response. The fallback sends the same bytes
-            // as head, then excess from upstream.head.
+            // round trip per response. The fallback writes the head, then
+            // the excess from upstream.head as the channel's next write.
+            var head_write_len: u32 = @intCast(rendered.len);
             if (rendered.len + feed.consumed <= conn.head.len) {
                 @memcpy(
                     conn.head[rendered.len..][0..feed.consumed],
                     excess[0..feed.consumed],
                 );
-                conn.l7.rendered_response_len = @intCast(rendered.len + feed.consumed);
-                // The excess rides the head send: this leg owes nothing.
-                direction.owe(0);
+                head_write_len = @intCast(rendered.len + feed.consumed);
+                conn.l7.response_excess_len = 0; // It rides the head write.
             } else {
-                direction.owe(feed.consumed);
+                conn.l7.response_excess_len = feed.consumed;
             }
 
             conn.l7.response_leg = .sending_head;
-            armResponseHeadSend(server, conn);
+            // Committed to answering: no verdict may intervene from here (§7).
+            conn.l7.response_started = true;
+            armClientWrite(server, conn, conn.head[0..head_write_len], .response_excess);
         }
 
-        fn armResponseHeadSend(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .sending_head);
-            const l7 = &conn.l7;
-            assert(l7.response_head_sent < l7.rendered_response_len);
-            l7.response_started = true;
+        // -- the client-write channel (§7, §8) --
+        //
+        // Every client-directed send outside the body pump goes through this
+        // one pair: the rendered response head, the body excess that arrived
+        // coalesced with it, and the static error responses. They differ only
+        // in their bytes and their continuation, which is what
+        // `Conn.ClientWrite` holds — so the cursor, the short-write resume,
+        // the teardown interlock and the error handling exist once each.
+        // Under a transforming client side (§4) this is also the single place
+        // these three writers turn plaintext into wire bytes.
+
+        fn armClientWrite(
+            server: *ServerType,
+            conn: *ConnType,
+            bytes: []const u8,
+            then: conn_module.ClientWrite.Then,
+        ) void {
+            assert(bytes.len >= 1);
+            assert(conn.state == .l7_exchanging or conn.state == .l7_responding);
+            // One write at a time: the channel is the only writer of this op,
+            // and a previous write either drained or ended in teardown.
+            assert(conn.client_write.pending.len == 0);
+            conn.client_write = .{ .pending = bytes, .then = then };
+            resumeClientWrite(server, conn);
+        }
+
+        fn resumeClientWrite(server: *ServerType, conn: *ConnType) void {
+            assert(conn.client_write.pending.len >= 1);
             conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.send(
                 conn.client_socket,
-                conn.head[l7.response_head_sent..l7.rendered_response_len],
+                conn.client_write.pending,
                 &conn.op_data_upstream_to_client.completion,
                 ConnType,
                 conn,
-                onResponseHeadSent,
+                onClientWritten,
             );
         }
 
-        fn onResponseHeadSent(conn: *ConnType, result: Io.SendError!u32) void {
+        fn onClientWritten(conn: *ConnType, result: Io.SendError!u32) void {
             const server = conn.server;
             conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
             }
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .sending_head);
-            // response_started blocks the verdict, so none is pending in
-            // any response-send handler (negative space).
-            assert(conn.l7.pending_verdict == .none);
+            assert(conn.state == .l7_exchanging or conn.state == .l7_responding);
+            const write = &conn.client_write;
             const sent = result catch |err| {
-                // The client is gone; nothing to answer anyone.
+                // The client is gone; there is no one left to answer.
                 server.witnessKernelPressure(err);
                 server.beginTeardown(conn);
                 return;
             };
             assert(sent >= 1);
-            conn.l7.response_head_sent += sent;
-            assert(conn.l7.response_head_sent <= conn.l7.rendered_response_len);
-            if (conn.l7.response_head_sent < conn.l7.rendered_response_len) {
-                armResponseHeadSend(server, conn);
+            assert(sent <= write.pending.len);
+            write.pending = write.pending[sent..];
+            if (write.pending.len > 0) {
+                resumeClientWrite(server, conn); // Short send resumes (§6).
                 return;
             }
-            // Head on the wire; forward the coalesced body excess straight
-            // from upstream.head, then pump the rest from the socket.
-            const direction = &conn.directions[1];
-            if (direction.owed() >= 1) {
-                conn.l7.response_leg = .sending_body_excess;
-                armResponseExcessSend(server, conn);
-            } else {
+            if (write.then != .lingering_close) {
+                // `response_started` blocks a verdict, so none can be pending
+                // once response bytes are flowing (negative space).
+                assert(conn.state == .l7_exchanging);
+                assert(conn.l7.pending_verdict == .none);
+            }
+            switch (write.then) {
+                .response_excess => sendResponseExcess(server, conn),
+                .response_body => {
+                    assert(conn.l7.response_leg == .sending_body_excess);
+                    afterResponseExcess(server, conn);
+                },
+                .lingering_close => beginLingeringClose(server, conn),
+            }
+        }
+
+        /// The rendered head is on the wire. Any body excess that arrived
+        /// coalesced with it but did not fit beside it follows straight from
+        /// `upstream.head`; otherwise the body pump takes over.
+        fn sendResponseExcess(server: *ServerType, conn: *ConnType) void {
+            assert(conn.l7.response_leg == .sending_head);
+            const excess_len = conn.l7.response_excess_len;
+            if (excess_len == 0) {
                 afterResponseExcess(server, conn);
+                return;
             }
-        }
-
-        fn armResponseExcessSend(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .sending_body_excess);
-            const direction = &conn.directions[1];
+            conn.l7.response_leg = .sending_body_excess;
             const base = conn.l7.response_head_len_marker;
-            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            server.io.send(
-                conn.client_socket,
-                direction.pending(conn.upstream.?.head[base..]),
-                &conn.op_data_upstream_to_client.completion,
-                ConnType,
+            // These are bytes the origin actually delivered past its head —
+            // the bound `DirectionState.pending` used to check for this write
+            // before the channel owned the cursor.
+            assert(base + excess_len <= conn.upstream.?.head_len);
+            armClientWrite(
+                server,
                 conn,
-                onResponseExcessSent,
+                conn.upstream.?.head[base..][0..excess_len],
+                .response_body,
             );
-        }
-
-        fn onResponseExcessSent(conn: *ConnType, result: Io.SendError!u32) void {
-            const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
-            assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .sending_body_excess);
-            assert(conn.l7.pending_verdict == .none); // response_started.
-            const sent = result catch |err| {
-                server.witnessKernelPressure(err);
-                server.beginTeardown(conn);
-                return;
-            };
-            assert(sent >= 1);
-            const direction = &conn.directions[1];
-            direction.credit(sent);
-            if (direction.owed() >= 1) {
-                armResponseExcessSend(server, conn);
-                return;
-            }
-            afterResponseExcess(server, conn);
         }
 
         /// The head and its coalesced excess are on the wire; finish if the
@@ -1134,6 +1140,10 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!conn.armed.connect);
             assert(!conn.armed.connect_cancel);
             assert(conn.armed.deadline or conn.armed.deadline_cancel);
+            // The channel's cursor lives on the conn, not in `l7`, so the
+            // reset below does not wipe it: assert it drained instead of
+            // trusting the control flow that got us here.
+            assert(conn.client_write.pending.len == 0);
             server.releaseRelayBuffer(conn.relay_buffer.?);
             conn.relay_buffer = null;
             conn.head_len = 0;
@@ -1352,48 +1362,9 @@ pub fn Proxy(comptime IoType: type) type {
             }
             server.counters.increment(counter);
             conn.state = .l7_responding;
-            conn.response_pending = shed.staticResponse(status, .close);
-            assert(conn.response_pending.len >= 1);
-            armResponseSend(server, conn);
-        }
-
-        fn armResponseSend(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_responding);
-            assert(conn.response_pending.len >= 1);
-            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            server.io.send(
-                conn.client_socket,
-                conn.response_pending,
-                &conn.op_data_upstream_to_client.completion,
-                ConnType,
-                conn,
-                onResponseSent,
-            );
-        }
-
-        fn onResponseSent(conn: *ConnType, result: Io.SendError!u32) void {
-            const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
-            assert(conn.state == .l7_responding);
-            const sent = result catch |err| {
-                server.witnessKernelPressure(err);
-                server.beginTeardown(conn);
-                return;
-            };
-            assert(sent >= 1);
-            assert(sent <= conn.response_pending.len);
-            conn.response_pending = conn.response_pending[sent..];
-            if (conn.response_pending.len > 0) {
-                // Short send: resume from the new front of the slice (§6).
-                armResponseSend(server, conn);
-            } else {
-                // Response delivered; close it out without RST (§2).
-                beginLingeringClose(server, conn);
-            }
+            // Straight from static memory (§8): the channel carries the slice
+            // and never copies it, so a shed still costs one send.
+            armClientWrite(server, conn, shed.staticResponse(status, .close), .lingering_close);
         }
 
         /// A client can still be sending its request — a body, or the rest
