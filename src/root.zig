@@ -25,6 +25,17 @@ pub const RelayBuffer = @import("net/relay.zig").RelayBuffer;
 pub const UpstreamPool = @import("net/upstream.zig").UpstreamPool;
 pub const Server = @import("Server.zig").Server;
 pub const shed = @import("shed.zig");
+/// TLS termination (§4, Phase 3a). `Engine` is the sans-I/O seam over
+/// ztls, `Credentials` loads a listener's cert chain and signing key,
+/// and `libcrypto_heap` keeps libcrypto's own allocations off the libc
+/// heap. `src/tls/` is the only directory that may name ztls, so the
+/// C-crypto surface stays behind these wrappers (lint-enforced).
+pub const tls = struct {
+    pub const Engine = @import("tls/Engine.zig");
+    pub const Credentials = @import("tls/Credentials.zig");
+    pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
+    pub const Tickets = @import("tls/Tickets.zig");
+};
 /// Shared test-support harness pieces (used by server_test and the sim).
 pub const testing = struct {
     pub const Origin = @import("testing/origin.zig").Origin;
@@ -58,4 +69,13 @@ test {
     _ = @import("http_proxy_test.zig");
     _ = @import("admin_test.zig");
     _ = @import("zero_alloc_test.zig");
+    // The TLS engine, its credentials loader, and the fixed libcrypto
+    // heap's allocator tests (size classes, realloc, free-list poison —
+    // all order-independent). Only the heap's *install* proof needs a
+    // fresh process, so it alone stays in `zig build tls-heap-proof`.
+    _ = tls.Engine;
+    _ = tls.Credentials;
+    _ = tls.libcrypto_heap;
+    _ = tls.Tickets;
+    _ = @import("tls/spike_test.zig");
 }

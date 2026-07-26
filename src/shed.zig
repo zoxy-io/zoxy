@@ -47,6 +47,7 @@ fn reasonPhrase(comptime status: u16) []const u8 {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        413 => "Content Too Large",
         414 => "URI Too Long",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
@@ -89,7 +90,7 @@ test "shed: every static response parses as a valid bodiless head" {
     // complete, correctly framed head whose persistence matches the
     // requested one — the same verdict a strict client would reach.
     const parser = @import("http/parser.zig");
-    inline for ([_]u16{ 400, 403, 404, 414, 429, 431, 501, 502, 503, 504 }) |status| {
+    inline for ([_]u16{ 400, 403, 404, 413, 414, 429, 431, 501, 502, 503, 504 }) |status| {
         inline for ([_]Persistence{ .keep, .close }) |persistence| {
             const bytes = staticResponse(status, persistence);
             var storage: parser.HeaderStorage = undefined;

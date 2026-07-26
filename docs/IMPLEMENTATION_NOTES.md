@@ -157,6 +157,92 @@ unshipped. No other production-credible pure-Zig TLS 1.3 server
 exists as of the scan; Geun-Oh/zigtls is aimed the right way but
 0.1.0-dev — watch-list only.
 
+## ztls spike — the Phase 3a engine settled (2026-07-25, PR #66)
+
+The scan above missed [ztls](https://github.com/mattrobenolt/ztls) —
+its hybrid shape (Zig protocol layer over libcrypto primitives) fell
+outside the pure-Zig framing. Once evaluated, it displaced tls.zig as
+the 3a engine: TLS 1.3 server with resumption, 0-RTT, HRR, KeyUpdate,
+and kTLS payloads already implemented, sans-I/O with caller-owned
+buffers, an allocation-free protocol layer, and 672/674 tests passing
+on the pinned 0.16 toolchain out of the box. The cost is the §4
+C-primitives exception (settled deliberately — see DESIGN §4) and its
+pre-alpha maturity (the wrapper + hash pin absorb the API churn; the
+correctness risk is bounded by zoxy's own gates). tls.zig remains the
+recorded pure-Zig fallback at `5452baf`; its gap is server-side
+resumption.
+
+Spike findings, so they are not re-learned (src/tls/ on the
+`phase-3a-ztls` branch, now under `zig build test`):
+
+- **Byte-exact flight replay holds — with two seeding requirements.**
+  libcrypto signs CertificateVerify with a random nonce, which varies
+  the signature bytes *and the encrypted-flight record length* (DER
+  integer trimming). Fixed with opt-in RFC 6979 deterministic nonces on
+  the zoxy-io/ztls fork (upstream mattrobenolt/ztls#82; OpenSSL 3.2+
+  "nonce-type" provider param; loud `DeterministicNonceUnsupported` on
+  BoringSSL-family/non-ECDSA/pre-3.2 — never a silent random-nonce
+  fallback; validated against the RFC 6979 §A.2.5 vector). Second:
+  *every peer keyshare* must be seeded — `KeyPairs.init` generates a
+  random P-256 share that rides in the ClientHello and so varies the
+  transcript the deterministic signature covers.
+- **Ownership rules the production engine inherits:** `setCredentials`
+  stores the chain *pointer* (the array must outlive the handshake);
+  `PrivateKey` wraps a libcrypto object with strict lifetime; every
+  `.write` event requires `completeWrite` before the next
+  `handleRecord`.
+- **Certificates:** ECDSA-only for CertificateVerify (no Ed25519 in
+  ztls's scheme list); modern validation requires a SAN (a CN-only
+  test cert was rejected); provisioning from embedded DER + raw scalar
+  needs no PEM machinery.
+- **Zero-alloc caveat:** ztls's own path allocates nothing, but
+  libcrypto mallocs internally — the zero-alloc gate's no-mmap/brk
+  counters will see it, hence the `CRYPTO_set_mem_functions`
+  fixed-arena slice as 3a's first code slice.
+
+## TLS engine footprint — pool, don't embed (2026-07-25, slice 2)
+
+`@sizeOf(tls.Engine)` measured **~180 KiB** on the pinned toolchain,
+dominated by ztls's caller-owned buffers: `ServerHandshake` ~19 KiB,
+`RecordBuffer.Storage` ~33 KiB (2× a max wire record), `OutBuffer` and
+`FlightBuffer` ~16.6 KiB each, and the ClientHello reassembly buffer
+~32 KiB (`ch_reassembly_buffer_size` = 2× max plaintext, added this
+slice for the #36 fragmented-ClientHello fix). The `PrivateKey` is
+16 bytes (a libcrypto handle). Slice 9 added a **32 KiB plaintext
+inbox**: ztls reassembles a record internally across reads, so one `feed`
+can deliver a full record's plaintext at once and the caller's
+destination must be sized by the record bound, not the read size.
+
+Decision: the serving path holds engines in a **shared `Pool(Engine)`
+sized for concurrent TLS activity**, never one embedded per conn slot —
+180 KiB × the 14074 conn ceiling would be ~2.4 GiB, absurd, whereas the
+c10k pool memory today is ~251 MiB total (§5). This is the same
+memory-follows-activity decoupling as relay buffers: an engine is
+checked out when a TLS handshake starts and returned when the
+connection ends — and, once kTLS lands (Phase 3b), returned *at
+handshake completion*, since the kernel then owns the record layer and
+the ~66 KiB of record/out/flight buffers is dead weight held only for
+userspace records. The pool's ceiling and default, its comptime budget
+assertions, and the checkout/return wiring land with the handshake
+phase (slice 4), which is where the pool gets its first consumer; this
+note is the sizing input so that slice does not re-derive it.
+
+## libcrypto's fixed heap — startup alone takes ~425 KiB (2026-07-25)
+
+Measured in the real binary with a TLS listener: after `install`, loading
+one listener's credentials (`Credentials.load` → `PrivateKey.fromPem`)
+leaves the heap frontier at **435152 bytes**. That is libcrypto's
+provider/EVP machinery initializing on first use, not the key itself —
+a one-time startup cost, and the reason the reservation
+(`libcrypto_heap_bytes`, 4 MiB) is sized well above what a handshake's
+transient working set alone would suggest.
+
+The frontier only grows (freed blocks return to their size-class list,
+not to the bump pointer), so this number is the floor for any TLS
+deployment. Handshakes reuse those freed blocks rather than extending
+it. Worth re-measuring under concurrent handshakes before tightening the
+reservation.
+
 ## TLS on the loop — the band that retired the worker pool (2026-07-25)
 
 Measured on the `phase-3a-ztls` branch (ztls engine, ECDSA P-256 fixture
@@ -398,3 +484,41 @@ to admit a newcomer.
 - **Zig 0.16 `Child`.** `kill()` reaps; a `wait()` after it is UB
   (SEGV'd the ReleaseFast bench harness and leaked nginx onto a bench
   port — d3000f5).
+
+## Profile share is not throughput headroom — the `fin_frag` wipe (2026-07-25)
+
+The first TLS handshake profile (§9, `zig build profile --protocol
+https`) put `compiler_rt.memset` at 11.2% of zoxy's CPU, and the folded
+stacks traced ~84% of that to ztls's `secureZero` on teardown —
+dominated by `fin_frag`, a 16 KiB buffer reserved against a client
+flight with a certificate chain and wiped in full on every handshake
+even when it held nothing. 16386 of the 18269 bytes `deinit` zeroed.
+
+Bounding that wipe to a high-water mark **did not change handshake
+throughput**. Measured on a saturated close-mode load, three runs each:
+
+- pinned before the fix: 710 / 712 / 712 req/s, memset 11.2%
+- pinned after the fix:  709 / 709 / 710 req/s, memset 10.1%
+
+The memset share moves exactly as predicted and the throughput does
+not, because the handshake is bounded by asymmetric crypto (~47% of the
+profile: X25519, P-256 ECDSA, ML-KEM), not by the zeroing. A symbol's
+share of samples is what it costs *while running*, not what removing it
+buys — those are the same number only when the symbol is the
+bottleneck.
+
+Two process notes, both paid for:
+
+- An intermediate measurement through a `.path` dependency override
+  read 733 / 733 req/s for the same code that measures 709 / 709 / 710
+  through the pinned `.url`. The build mechanism, not the code. Trust
+  numbers from the shipped configuration.
+- The first attempt put the high-water mark inside `ArrayBuffer`
+  itself, taxing every append in the library to benefit one buffer:
+  633 req/s, an 11% regression, caught only because the baseline had
+  been measured three times first and was stable to ±2 req/s. Measure
+  the baseline's variance before believing a delta.
+
+The change was kept — it is correct and does strictly less work — but
+it is not a throughput lever. The lever for handshake-bound load is
+session resumption, which skips the asymmetric work entirely.

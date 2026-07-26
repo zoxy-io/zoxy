@@ -38,12 +38,12 @@ pub fn Pool(comptime T: type) type {
         ///
         /// `count` may be zero: a *disabled* pool, reserving nothing and
         /// answering every `acquire` with null. That is how a feature the
-        /// config did not ask for costs no memory while its acquire site
-        /// stays one code path — exhaustion, which every caller already
-        /// sheds (§8). Whether a given pool is *allowed* to be empty is the
-        /// caller's policy, not this container's: a proxy cannot serve
-        /// without conn slots, and `Server.init` asserts that where the
-        /// requirement actually lives.
+        /// config did not ask for (a TLS engine pool with no TLS listener,
+        /// §4) costs no memory while its acquire site stays one code path —
+        /// exhaustion, which every caller already sheds (§8). Whether a
+        /// given pool is *allowed* to be empty is the caller's policy, not
+        /// this container's: a proxy cannot serve without conn slots, and
+        /// `Server.init` asserts that where the requirement actually lives.
         pub fn init(
             pool: *Self,
             arena: std.mem.Allocator,

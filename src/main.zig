@@ -28,6 +28,14 @@ comptime {
 /// the loop lives for the whole process (§3).
 var global_io: XevIo = undefined;
 
+/// The fixed heap libcrypto allocates from (§4), and its backing store.
+/// Both live for the process: the allocation hooks are process-global and
+/// permanent, so the heap they point at must outlive every handshake.
+/// Untouched — and its pages never faulted — unless a listener
+/// terminates TLS.
+var libcrypto_heap: zoxy.tls.libcrypto_heap.Heap = undefined;
+var libcrypto_heap_backing: [zoxy.constants.libcrypto_heap_bytes]u8 align(16) = undefined;
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
@@ -62,31 +70,18 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    // fds and the ring are sized to the *effective* config, not the
-    // compiled ceilings (§5, §8): a lean deployment neither demands the
-    // c10k RLIMIT_NOFILE nor asks the kernel for a 65536-deep ring.
-    const listeners_count: u32 = @intCast(config.listeners.len);
-    const fds_required = zoxy.constants.fdsRequired(
-        config.limits.conn_slots,
-        config.limits.upstream_slots,
-        listeners_count,
-    );
-    const cq_entries = zoxy.constants.completionQueueDepthFor(
-        config.limits.conn_slots,
-        config.limits.upstream_slots,
-        listeners_count,
-        config.limits.cq_fill_eighths,
-    );
-    // The effective config never exceeds the compiled ceilings (§8): the
-    // pools, the ring, and the fd demand all fit what the constants proved.
-    assert(fds_required <= zoxy.constants.fds_max);
-    assert(cq_entries <= zoxy.constants.completion_queue_entries);
-    try ensureFdBudget(fds_required);
-    try printBudgets(init.io, &config, fds_required, cq_entries);
+    const cq_entries = try settleBudgets(init.io, &config);
+
+    // TLS credentials come up before the loop so a bad certificate is a
+    // startup failure, never a runtime surprise on the first handshake.
+    // The libcrypto heap must be installed first: it has to precede
+    // libcrypto's *first* allocation, and loading a key is one (§4).
+    const tls_credentials = try loadTlsCredentials(init.io, arena, &config);
 
     try global_io.init(arena, cq_entries);
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
+    server.setTlsCredentials(tls_credentials);
     try server.start();
     installSignalHandlers();
 
@@ -207,6 +202,103 @@ fn ensureFdBudget(fds_required: u32) !void {
     try std.posix.setrlimit(.NOFILE, limits);
 }
 
+/// Size the fd and ring budgets to the *effective* config (§5, §8) — a
+/// lean deployment neither demands the c10k RLIMIT_NOFILE nor asks the
+/// kernel for a 65536-deep ring — assert both against RLIMIT_NOFILE and
+/// the compiled ceilings, and print them. Returns the completion-queue
+/// depth the loop should request.
+fn settleBudgets(io: std.Io, config: *const zoxy.config.Config) !u32 {
+    const listeners_count: u32 = @intCast(config.listeners.len);
+    const fds_required = zoxy.constants.fdsRequired(
+        config.limits.conn_slots,
+        config.limits.upstream_slots,
+        listeners_count,
+    );
+    const cq_entries = zoxy.constants.completionQueueDepthFor(
+        config.limits.conn_slots,
+        config.limits.upstream_slots,
+        listeners_count,
+        config.limits.cq_fill_eighths,
+    );
+    // The effective config never exceeds the compiled ceilings (§8): the
+    // pools, the ring, and the fd demand all fit what the constants proved.
+    assert(fds_required <= zoxy.constants.fds_max);
+    assert(cq_entries <= zoxy.constants.completion_queue_entries);
+    try ensureFdBudget(fds_required);
+    try printBudgets(io, config, fds_required, cq_entries);
+    return cq_entries;
+}
+
+/// Read and parse each TLS listener's certificate and key, in listener
+/// order (null where a listener is plain TCP), into the arena. Returns an
+/// empty slice when nothing terminates TLS — which is also the only case
+/// where the libcrypto heap stays uninstalled and its 4 MiB unfaulted.
+///
+/// Every failure here aborts startup with the offending path named: a
+/// proxy that cannot present its certificate must not come up serving
+/// plaintext, and must not discover the problem mid-handshake.
+fn loadTlsCredentials(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config: *const zoxy.config.Config,
+) ![]const ?zoxy.tls.Credentials {
+    assert(config.listeners.len >= 1);
+    var has_tls_listener = false;
+    for (config.listeners) |listener| {
+        if (listener.tls != null) has_tls_listener = true;
+    }
+    // No TLS: nothing to load, the heap stays uninstalled, and its
+    // reservation is never faulted in.
+    if (!has_tls_listener) {
+        assert(config.limits.tls_engines == 0);
+        return &.{};
+    }
+
+    // Before any libcrypto call, including the key parse below (§4).
+    libcrypto_heap.init(&libcrypto_heap_backing);
+    if (!zoxy.tls.libcrypto_heap.install(&libcrypto_heap)) {
+        std.debug.print(
+            "zoxy: cannot route libcrypto allocations to the fixed heap\n",
+            .{},
+        );
+        return error.LibcryptoHeapUnavailable;
+    }
+
+    const credentials = try arena.alloc(?zoxy.tls.Credentials, config.listeners.len);
+    for (config.listeners, credentials) |listener, *slot| {
+        const tls = listener.tls orelse {
+            slot.* = null;
+            continue;
+        };
+        const cert_bytes = try readPemFile(io, arena, tls.cert_path);
+        const key_bytes = try readPemFile(io, arena, tls.key_path);
+        slot.* = zoxy.tls.Credentials.load(arena, cert_bytes, key_bytes, .{}) catch |err| {
+            std.debug.print(
+                "zoxy: invalid TLS credentials (cert '{s}', key '{s}'): {t}\n",
+                .{ tls.cert_path, tls.key_path, err },
+            );
+            return err;
+        };
+    }
+    // One entry per listener, in listener order: `Server.start` indexes
+    // this by listener and expects a loaded entry wherever config asked
+    // for TLS.
+    assert(credentials.len == config.listeners.len);
+    return credentials;
+}
+
+fn readPemFile(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        arena,
+        .limited(zoxy.constants.tls_pem_bytes_max),
+    ) catch |err| {
+        std.debug.print("zoxy: cannot read TLS file '{s}': {t}\n", .{ path, err });
+        return err;
+    };
+}
+
 fn printBudgets(
     io: std.Io,
     config: *const zoxy.config.Config,
@@ -231,26 +323,37 @@ fn printBudgets(
         .relay_buffer_pair_bytes = @sizeOf(zoxy.RelayBuffer),
         .upstream_slots = limits.upstream_slots,
         .upstream_bytes = @sizeOf(UpstreamType),
+        .tls_engines = limits.tls_engines,
+        .tls_engine_bytes = @sizeOf(zoxy.tls.Engine),
     });
+    // The libcrypto heap is reserved only when something terminates TLS,
+    // and it is real process memory, so the printed total owns it rather
+    // than quietly sitting beside the pools (§5).
+    const libcrypto_bytes: u64 =
+        if (limits.tls_engines == 0) 0 else constants.libcrypto_heap_bytes;
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;
     try writer.print(
         \\zoxy budgets (closed-form, DESIGN.md §5/§8):
-        \\  memory  pools {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
-        \\          + upstream slots {d} x {d} B
+        \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
+        \\          + upstream slots {d} x {d} B + tls engines {d} x {d} B
+        \\          + libcrypto heap {d} KiB
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
         \\  config  {d} listener(s), {d} cluster(s)
         \\
     , .{
-        memory_total / 1024,
+        (memory_total + libcrypto_bytes) / 1024,
         limits.conn_slots,
         @sizeOf(ServerXev.ConnType),
         limits.relay_buffers,
         @sizeOf(zoxy.RelayBuffer),
         limits.upstream_slots,
         @sizeOf(UpstreamType),
+        limits.tls_engines,
+        @sizeOf(zoxy.tls.Engine),
+        libcrypto_bytes / 1024,
         fds_required,
         constants.ring_entries,
         cq_entries,
@@ -258,6 +361,35 @@ fn printBudgets(
         config.listeners.len,
         config.clusters.len,
     });
+
+    // The engine pool is the concurrent-HTTPS ceiling, not a throughput
+    // knob: a TLS connection with no engine is refused, because there is
+    // no session to answer through (§8). Stated outright because it is
+    // the one limit whose exhaustion looks like a broken proxy rather
+    // than a full one — the accept path advertises `conn_slots`, and a
+    // client past the engine count sees its connection closed with
+    // nothing on the wire to explain it.
+    if (limits.tls_engines != 0) {
+        try writer.print(
+            "  tls     {d} concurrent HTTPS connections (engine pool)\n",
+            .{limits.tls_engines},
+        );
+        if (limits.tls_engines < limits.conn_slots) {
+            try writer.print(
+                \\  WARNING tls engines {d} < conn slots {d}: HTTPS is capped at
+                \\          {d} concurrent connections, and connection {d} onward
+                \\          is refused (counter: shed_tls_engines). Raise
+                \\          limits.tls_engines to conn slots, or lower conn slots
+                \\          to match, so the advertised capacity is the real one.
+                \\
+            , .{
+                limits.tls_engines,
+                limits.conn_slots,
+                limits.tls_engines,
+                limits.tls_engines + 1,
+            });
+        }
+    }
     try writer.flush();
 }
 

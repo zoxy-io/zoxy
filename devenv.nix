@@ -1,5 +1,7 @@
-# Dev environment (https://devenv.sh): the pinned toolchain. Only two packages
-# are used by CI — zig (every job) and kcov (the Linux `zig build coverage`
+# Dev environment (https://devenv.sh): the pinned toolchain. Only three
+# packages are used by CI — zig (every job), openssl (libcrypto, which the
+# §4 TLS engine links into every build) and kcov (the Linux
+# `zig build coverage`
 # job) — so everything else is developer/bench/profile tooling gated out of the
 # CI closure: zls (editor LSP), nginx + haproxy (Tier-1 bench origins, §9), poop
 # (Tier-0 hardware-counter A/B) and perf + flamegraph (the pinned
@@ -19,6 +21,9 @@ in
   packages =
     [
       pkgs.zig_0_16
+      # libcrypto: ztls (the §4 TLS engine) links it, so every build —
+      # including CI's `zig build` and `zig build ci` — needs it.
+      pkgs.openssl
     ]
     # kcov drives the Linux `zig build coverage` job.
     ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [

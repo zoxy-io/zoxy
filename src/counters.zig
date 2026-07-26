@@ -19,6 +19,30 @@ pub const Counters = struct {
     shed_conn_slots: Value = Value.init(0),
     /// §8 rung: relay buffers exhausted at admission → close.
     shed_relay_buffers: Value = Value.init(0),
+    /// §8 rung (§4): no TLS engine available at admission → close. The
+    /// engine pool bounds concurrent TLS connections, so this is the wall
+    /// a TLS listener hits first under a handshake storm; engine setup
+    /// failing (key derivation) is folded in, because both mean the same
+    /// thing to the connection and both shed *before* admission — which
+    /// is what keeps this purely an admission counter for `reconcile`.
+    shed_tls_engines: Value = Value.init(0),
+    /// TLS sessions established. Not a shed — the handshake's success
+    /// side, so it stays out of `reconcile`.
+    tls_handshakes_completed: Value = Value.init(0),
+    /// A TLS session that failed mid-relay: a record the engine refused
+    /// to decrypt, or plaintext it could not encrypt. Post-admission, so
+    /// it completes like any other teardown.
+    tls_relay_failed: Value = Value.init(0),
+    /// A completed handshake that found no relay buffer free. Post-
+    /// admission, so it is *not* a shed rung: the connection was already
+    /// counted in `admitted` and goes on to `completed` via teardown.
+    /// Folding it into `shed_relay_buffers` would break reconcile (§9).
+    tls_relay_buffer_unavailable: Value = Value.init(0),
+    /// An *admitted* connection whose handshake never established: a
+    /// protocol error or a peer that left mid-flight. Post-admission, so
+    /// it ends in `completed` like any other teardown and stays out of
+    /// the shed sum.
+    tls_handshake_failed: Value = Value.init(0),
     /// §8 "watermarks before walls": pool pressure engaged (false→true
     /// crossings of a pool's high watermark), one counter per pool. Not
     /// sheds — biases that precede the walls — so they stay out of
@@ -37,6 +61,10 @@ pub const Counters = struct {
     /// of `reconcile`'s shed sum; these are pure observability.
     l7_bad_request: Value = Value.init(0),
     l7_uri_too_long: Value = Value.init(0),
+    /// A request whose head parsed but whose coalesced body overran the
+    /// head buffer in one TLS record (§4). Distinct from
+    /// `l7_headers_too_large`: the head was fine, the payload was not.
+    l7_body_too_large: Value = Value.init(0),
     l7_headers_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
     /// No route matched the request's canonical path (§7), answered 404.
@@ -291,6 +319,7 @@ test "counters: the gate identity sums exactly today's admission rungs" {
     const expected = [_][]const u8{
         "shed_conn_slots",
         "shed_relay_buffers",
+        "shed_tls_engines",
         "shed_draining",
     };
     comptime var actual_count: usize = 0;

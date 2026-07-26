@@ -198,16 +198,30 @@ submitted, completions are called back — the same shape as the previous
 iteration's hand-rolled TigerBeetle pattern, and the same shape as
 `io_uring` itself.
 
-**Dependency policy: Zig-first only.** The TIGER_STYLE zero-dependency rule
-takes its recorded exceptions here, and both are pure Zig, vendored by
-content hash in `build.zig.zon`: **libxev** (this section) and **hparse**
-(the HTTP/1.1 head parser — as a hardened fork, §7). No C-FFI dependency
-exists in the codebase; any future one (a TLS stack is the known
-Phase-3 candidate — [PLANS.md](PLANS.md)) is a
-separate deliberate decision, not a default. The pinned hash is an
-*audited commit*, never a branch tip — libxev's Zig 0.16 support is a
-self-described compatibility shim (PR #220) with real fixes still
-unmerged behind it, so the pin moves only after re-audit.
+**Dependency policy: Zig-first, with a scoped C exception for proven
+crypto primitives.** The TIGER_STYLE zero-dependency rule takes its
+recorded exceptions here, all vendored by content hash in
+`build.zig.zon` as zoxy-io forks: **libxev** (this section), **hparse**
+(the HTTP/1.1 head parser — as a hardened fork, §7), and **ztls** (the
+Phase-3a TLS 1.3 engine — [PLANS.md](PLANS.md)). libxev and hparse are
+pure Zig. ztls carries the codebase's one C surface, and settles the
+deliberate decision §4 reserved (2026-07-25): **battle-tested C crypto
+*primitive* libraries — the libcrypto family (OpenSSL / AWS-LC /
+BoringSSL) — are acceptable dependencies for the foreseeable future.**
+The trust split runs the right way: constant-time primitives want the
+most-watched assembly on earth, while the protocol state machine —
+where TLS CVEs actually live — stays auditable Zig behind our own
+wrapper. The scope is strict: primitives only, never a C *protocol*
+layer (libssl and picotls stay out); the C binding lives inside the
+dependency, so zoxy's own tree never names a C symbol and `@cImport`
+stays lint-forbidden (§9); and libcrypto's internal allocations are
+routed to a fixed startup arena (`CRYPTO_set_mem_functions`) so the
+zero-alloc gate keeps its teeth (a Phase-3a slice — PLANS.md). The
+pinned hash is an *audited commit*, never a branch tip — libxev's Zig
+0.16 support is a self-described compatibility shim (PR #220) with real
+fixes still unmerged behind it — so a pin moves only after re-audit;
+the ztls audit itself (Zig protocol layer read line-by-line, C
+primitives trusted institutionally) is a Phase-3a entry gate.
 
 - **Caller-owned completions.** Every `xev.Completion` is embedded inline
   in the connection slot; submitting an op writes it in place. Zero
@@ -321,7 +335,8 @@ previous iteration paid that cost, and shared pools sized for concurrent
 *activity* rather than worst-case-per-core are the fix and the reason this
 iteration exists.
 
-Three shared pools, all owned and touched only by the loop thread:
+Three shared pools, all owned and touched only by the loop thread (a
+fourth, TLS engines, joins them when a listener terminates TLS — below):
 
 1. **Connection slots — `Pool(Conn)`.** One contiguous object per
    connection: state machine, embedded completions (one per overlappable
@@ -366,7 +381,23 @@ a raised `RLIMIT_NOFILE`:
 | conn slots | 1386 | 14074 | ~1.7 KiB state + 8 KiB head |
 | relay buffers | 1386 | 14074 | 2 × 4 KiB |
 | upstream slots | 1024 | 1024 | ~40 B state + 8 KiB head |
+| tls engines | 0 / 256 | 1024 | ~180 KiB (ztls buffers + in/outbox) |
 | **pool memory** | **~32 MiB** | **~251 MiB** | |
+
+The fourth pool — **TLS engines** (§4, Phase 3a) — is the one sized by
+what the config asks for rather than by connection count: an engine is
+~180 KiB of ztls record/handshake buffers plus the plaintext inbox and
+ciphertext outbox, so one per conn slot would be ~2.4 GiB. It defaults to
+**zero** (a disabled pool reserving nothing) unless a listener carries a
+`tls` block, then 256; exhaustion is its own shed rung. Engines hold no
+socket and arm no ring op, so they enter neither the fd nor the CQ
+budget. The **pool memory** row above is the plain-TCP shape; a TLS
+deployment adds its engine pool on top — ~45 MiB at the default
+(~81 MiB total, the measured startup figure), ~180 MiB at the ceiling
+(~431 MiB) —
+plus one fixed 4 MiB heap for libcrypto's own allocations
+(`libcrypto_heap_bytes`), reserved only when TLS is configured and
+included in the startup total.
 
 Rules:
 
@@ -606,10 +637,22 @@ the loop thread.
 |---|---|---|
 | connection slots | accept completion | close immediately (SO_LINGER 0 → RST); accept stays armed |
 | relay buffers (L4) | accept admission | close immediately |
+| tls engines (§4) | accept admission on a TLS listener | close immediately — there is no session to answer through |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7) / close (L4) |
+| tls staging room (§4) | a step that would stage past the engine outbox or inbox | tear down that connection; counter |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
+
+The TLS staging rung sheds rather than backpressures because by the time
+it fires the bytes are already off the wire and decrypted inside a
+synchronous `feed`: there is no "ask the peer to pause" primitive at that
+granularity. The real backpressure happens one level up, by simply not
+arming the next read — a peer that outruns us stalls on its own send
+window, so only what fit in one read has to be resolved here. Forwarding
+it if it fits and shedding if it does not are the only two sound options;
+growing past a fixed bound and crashing are both ruled out by this
+section.
 
 - **Static error responses.** `400`/`404`/`414`/`431`/`501`/`503`/`504`
   are comptime byte arrays sent directly from static memory — never
@@ -793,6 +836,11 @@ src/
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
+  tls/
+    Engine.zig        // ztls wrapper: sans-I/O TLS 1.3 seam (§4, Phase 3a)
+    Credentials.zig   // per-listener cert chain + signing key (PEM load)
+    TestClient.zig    // scripted TLS client for the §9 gates
+    libcrypto_heap.zig // fixed heap for libcrypto's allocations (§4)
   balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads

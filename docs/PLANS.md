@@ -15,51 +15,192 @@ admin/metrics listener — are shipped on `main` (PRs #47, #50, #51, #54,
 is in git log, not here. Two sub-items they left open are tracked below
 under [Deferred, revisit on evidence](#deferred-revisit-on-evidence).
 
-- **Phase 3a — single-threaded TLS termination.** Settled 2026-07-24:
-  **no worker threads** — handshakes run on the loop under a per-tick
-  budget. Measured on the pinned toolchain (IMPLEMENTATION_NOTES.md), a
-  full TLS 1.3 server handshake in pure std.crypto costs ~95 µs
-  (Ed25519 cert) to ~380 µs (P256 on a slow core); resumption is
-  µs-class. The ~1–2 ms figure that motivated the worker pool was an
-  RSA number, so RSA certs are simply not supported — ECDSA/Ed25519
-  only, a documented constraint. The worst single uninterruptible step
-  (~275 µs P256 sign) bounds tick inflation; a handshake backlog past
-  the budget is a shed rung like any other (§8). One core absorbs
-  ~3.8k full P256 handshakes/s (~10k Ed25519), resumption effectively
-  unlimited.
-  The stack (surveyed 2026-07-24): a **hardened fork of
-  [tls.zig](https://github.com/ianic/tls.zig)**, pinned at `5452baf` —
-  the last Zig-0.16 commit; builds and tests clean on the pinned
-  toolchain — pure Zig under the §4 policy like libxev and hparse.
-  What makes it fit: sans-I/O `nonblock.Server` (caller buffers both
-  ways) behind our own wrapper; an allocation-free handshake path
-  (allocator appears only in startup cert loading — the config arena);
-  injectable `rng: std.Random` and `now: Io.Timestamp`, so SimIo
-  drives handshakes deterministically (§9); std.crypto primitives;
-  client-cert support; and a `Ktls.zig` that already emits the
-  `setsockopt(SOL_TLS)` key payloads (→ 3b). The fork's hardening
-  gate, hparse-style — cleared before 3a lands:
-  1. **Server-side session resumption** (NewSessionTicket issuance,
-     PSK-DHE acceptance, binder verification) — the one missing hard
-     requirement, and load-bearing: without tickets a full-population
-     reconnect storm is ~14k × ~260 µs ≈ seconds of handshake CPU;
-     with them, µs-class per connection.
-  2. **Fragmented ClientHello** (upstream #36) — a real robustness gap
-     the fuzz gate would find anyway.
-  3. Backport the three post-pin fixes (CBC-padding overflow
-     `106d10b`, dangling `alpn_protocol` `47c402a`, `d633a0f`).
-  4. The server handshake under zoxy's fuzz gate, fuzzed through our
-     wrapper like hparse (§9).
-  Fallback if hardening proves costlier than estimated: **picotls** —
-  functioning, but now two policy exceptions deep (C dependency plus
-  un-hookable malloc, plus OpenSSL libcrypto for acceptable sign
-  speed; verified unchanged 2026-07-24). std.crypto.tls stays
-  client-only (re-verified against the pinned toolchain and upstream
-  master; the stalled upstream server PR ziglang/zig#23005 *is*
-  tls.zig, so the fork adopts the same code with more control).
+- **Phase 3a — single-threaded TLS termination.** Two settlements:
+  2026-07-24, **no worker threads** — handshakes run on the loop under a
+  per-tick budget (measured ~100–400 µs per full handshake in pure
+  std.crypto, IMPLEMENTATION_NOTES.md; the ~1–2 ms figure that motivated
+  the worker pool was an RSA number, so RSA certs are simply not
+  supported); and 2026-07-25 (PR #66 spike), **the engine is ztls** —
+  sans-I/O TLS 1.3 server, Zig protocol layer over libcrypto primitives,
+  the §4 C-crypto exception — pinned by content hash to the zoxy-io/ztls
+  fork (branch `deterministic-ecdsa` = upstream `41c24d7` plus opt-in
+  RFC 6979 deterministic ECDSA nonces, mattrobenolt/ztls#82, offered
+  upstream). Server certs are **ECDSA-only** on this engine (P-256/
+  P-384; ztls's CertificateVerify schemes carry no Ed25519 — supersedes
+  the earlier "ECDSA/Ed25519" wording), and libcrypto's assembly P-256
+  sign is faster than the std.crypto numbers the budget was derived
+  from, so the arithmetic holds with margin. A handshake backlog past
+  the per-tick budget is a §8 shed rung like any other.
+  What the spike proved (src/tls/, now under `zig build test`): the sans-I/O
+  drive loop over static caller-owned buffers with zero wrapper
+  allocation; key material injected as plain data; byte-exact
+  server-flight replay under seeded inputs — the §9 property — with the
+  recorded rule that *every* peer keyshare must be seeded (a random
+  P-256 keyshare rides in the ClientHello and varies the signed
+  transcript). Fallback if ztls's pre-alpha state proves untenable:
+  ianic/tls.zig, pure Zig, pinned at `5452baf` for 0.16 — its gap is
+  server-side resumption (survey verdicts in IMPLEMENTATION_NOTES.md).
+  The remaining gate, in slice order — each behind all four §9 gates:
+  1. **libcrypto allocation interposition** — *landed:* the fork's
+     `mem_hooks` (`CRYPTO_set_mem_functions`) plus zoxy's fixed
+     segregated-fits heap (`src/tls/libcrypto_heap.zig`), proven by a
+     handshake-on-the-heap test (`tls-heap-proof`). The universal
+     no-mmap-after-init claim rides the zero-alloc syscall gate once TLS
+     joins the serving path (slices 5–6).
+  2. **Engine productionization** — *landed:* the ~180 KiB footprint
+     measured and the pool-not-embed decision recorded
+     (IMPLEMENTATION_NOTES.md); real backpressure (a zero-progress feed
+     is `error.RecordTooLarge`, never a ReleaseFast spin); the
+     ClientHello reassembly buffer (ztls #36, test-verified meaningful);
+     the ztls import boundary in the lint. *Deferred to slice 5* (where
+     they get a first consumer): the `Pool(Engine)` and its
+     `constants.zig` budget, and the drive-API settle (sink vs pull)
+     against `Conn`.
+  3. **Config + cert loading** — *landed:* a per-listener `tls: {cert,
+     key}` block (orthogonal to `protocol`), resolved to file paths with
+     schema metadata and pure path validation (the loader stays IO-free,
+     §1); and `tls.Credentials` — PEM chain + key → cert-chain DER +
+     libcrypto signing key + scheme, ECDSA-only (a non-ECDSA leaf is
+     rejected loudly), shared per listener. The engine now borrows a
+     `*const Credentials` instead of the spike's raw scalar. *Deferred to
+     slice 5:* the startup file read (path → bytes) and per-listener
+     Credentials construction, which happens where the engine pool
+     consumes them (SNI multi-cert stays deferred).
+  4. **Build wiring** — *landed:* ztls is a first-class dependency of the
+     `zoxy` module, so the shipped binary and every gate link libcrypto
+     (openssl moved into the CI closure). The TLS tests fold into
+     `zig build test`; only `tls-heap-proof` keeps its own step, since the
+     allocation hooks must precede libcrypto's first allocation and that
+     needs a fresh process.
+  5. **TLS engine pool + budget** — *landed:* `Pool(tls.Engine)` on the
+     Server, sized by `limits.tls_engines` (default 256 ≈ 30 MiB when a
+     listener terminates TLS, **zero** when none does — `Pool` now
+     accepts a zero-slot, permanently-exhausted pool, so linking the
+     engine costs a plain deployment nothing). The engine term joins the
+     closed-form memory total and the startup printout; engines hold no
+     socket and arm no ring op, so the fd and CQ budgets are untouched.
+     *Deferred to slice 6:* per-listener `Credentials` built at startup
+     from the config paths (the file read), and engine checkout.
+  6. **Startup credentials** — *landed:* main.zig installs the fixed
+     libcrypto heap (completing slice 1's wiring — nothing had called
+     `install` before), reads each TLS listener's cert/key, and builds a
+     per-listener `Credentials` the Server hands to its `ListenerState`.
+     A missing or malformed certificate aborts startup naming the path,
+     so a proxy never comes up unable to present it. Verified in the real
+     binary: boots with a live cert, exits 1 on both failure paths.
+  7. **Engine drive API** — *landed:* the sink-vs-pull question settles
+     as *both*, split by lifetime. Plaintext stays a synchronous `Sink`
+     callback (consumed inside the call). Ciphertext moves to an
+     engine-owned **outbox** (`outbound`/`outboundSent`, partial writes
+     credited), because it must outlive the call that produced it — an
+     async send completes long after `feed` returns, while ztls's buffers
+     are valid only until the next engine call. Costs ~33 KiB per engine
+     (two max wire records, the largest burst one step can produce),
+     charged only to TLS connections.
+  8. **The handshake phase in the data path** — *landed:* admission
+     forks on credentials before the l4/http fork (TLS is orthogonal),
+     checks an engine out of the pool, and drives the handshake one
+     strict step at a time on the client socket — recv ciphertext, feed,
+     send the outbox — under the idle deadline, so a peer that opens a
+     connection and never speaks meets the clock. The engine returns to
+     the pool at teardown. New §8 rung `shed_tls_engines` (pool
+     exhausted *or* engine setup failed — both shed before admission, so
+     `reconcile` stays exact), plus `tls_handshakes_completed` and
+     `tls_handshake_failed`. `fillRandom` joins the Io seam: seeded in
+     SimIo (replayable handshakes), `getrandom` in XevIo. Proven by a
+     real ztls client (`tls/TestClient.zig`, shared with the simulator)
+     completing a handshake over SimIo sockets. **The session then
+     closes** — close_notify, then teardown — because the plaintext
+     behind it has nowhere to go until the next slice.
+  9. **Data-path shim** — L4-over-TLS first (terminate, relay
+     plaintext), then L7 head-read over decrypted bytes; the strict
+     recv→send→recv discipline is unchanged either way — but the
+     *plumbing* is not, and that is this slice's real work. `pump.zig`
+     is shared by L4 and both L7 body legs, and its mechanics assume a
+     direction recvs and sends from **one** buffer (everything derives
+     from the direction tag). TLS breaks that symmetry in both
+     directions: client→upstream recvs ciphertext (the head buffer,
+     idle on L4), decrypts, and sends plaintext from the relay buffer;
+     upstream→client recvs plaintext into the relay buffer, encrypts,
+     and sends from the engine outbox. Two ways to take it, to be
+     settled with the code in front of you:
+     - Teach the pump a transform seam (recv buffer and send buffer
+       become separate policy-supplied slices). One mechanism, but it
+       touches the proven L4 and L7 paths.
+     - A parallel TLS relay beside `relay.zig`. Leaves the proven paths
+       alone at the cost of a second loop to keep honest.
+     *Settled:* the transform seam. The deferral condition ("worth doing
+     once TLS is proven") is met — TLS is proven on L4 — and the L7 body
+     legs run through `pump.zig`, so the alternative is a *third* copy of
+     the recv→send discipline. Duplication is what made the L4 bugs easy
+     to write; one mechanism with three users beats three mechanisms.
+
+     The seam itself **already exists on main** — the prefactoring
+     landed it as B1/B5 (`pump.zig`: `recvBuffer`, `transformIn`,
+     `transformOut`, `sendSlice`, `creditSend`, identity by default via
+     `@hasDecl`), so this slice hooks the TLS transforms onto a seam it
+     no longer has to build. Two things main's version settled that this
+     plan had left open:
+     - The write-side double-count ("the one place the refactor is not
+       mechanical, where a wrong move silently corrupts the byte stream
+       rather than failing loudly") is `creditSend`: ciphertext credits
+       the transform's own cursor, plaintext the framed debt, and the
+       pump asserts the debt is settled by the time `sendSlice` empties.
+     - A transform may yield **nothing** from a read — a fragment of a
+       record it can only decode whole. The pump re-arms the read and
+       asserts nothing is owed across it. TLS meets this on its first
+       split record; without the branch it is an assertion failure, not
+       a wrong answer.
+     *Landed:* the L4 relay, first as a parallel loop
+     (`net/tls_relay.zig`) and now **folded onto the seam** — one
+     `relay.zig` policy whose transform hooks branch on `conn.tls`, the
+     same runtime-branch shape the L7 body legs already use. The parallel
+     loop is deleted; the fold is net negative on lines and removes the
+     second copy of the recv→send discipline that motivated B1 in the
+     first place.
+
+     The fold needed one addition to the seam, `transformEnded`: a
+     transform yielding no bytes means either "mid-unit, read on" or "the
+     stream ended", and only the policy can tell. A TLS close_notify is
+     the second — an in-band EOF that **no socket EOF ever follows**,
+     because the connection stays open for the other direction. Without
+     it the direction waits for bytes that will never come until the idle
+     deadline reaps a connection that said a clean goodbye: no error, no
+     counter, just a slow silent leak of the half-close contract. The
+     test pins it by asserting `deadline_expired == 0`.
+
+     Two bugs the parallel shape made easy, both remotely triggerable,
+     both now gated:
+     plaintext is bounded by the *record*, not the read, so the
+     decrypt destination is an engine-owned inbox (a 16 KiB client
+     write overflowed a 4 KiB relay buffer); and both directions share
+     one outbox, so no step may assume it is empty — `hasStagingRoom`
+     sheds instead. A client may also write immediately after its
+     Finished, before the dial completes: that plaintext is staged on
+     the conn and forwarded as the relay's first send, not treated as
+     impossible early data.
+  10. **Sim + fuzz gates** — the spike client ported into the sim
+     harness (both keyshares seeded), the adversary at TLS record
+     granularity, golden byte-exact transcripts on clean seeds; fuzz
+     raw bytes through the wrapper — never panic, alert-or-progress.
+     Also fold the slice-3 PEM/base64 cert parser (`tls/Credentials.zig`)
+     into a fuzz target — new parsing over operator input, unit-tested
+     for now but owed §9 fuzz coverage (the ci `--fuzz` gate is
+     libcrypto-free, so this rides the TLS fuzz seam this slice builds).
+  11. **Resumption** — `psk_lookup` + ticket issuance over a static
+     key table in the memory budget. Last deliberately: full handshakes
+     already fit the budget; tickets are the reconnect-storm lever
+     (~14k × ~260 µs ≈ seconds of handshake CPU without them).
+  12. **Tier-1 TLS bench** — needs a TLS-capable load path: zrk TLS
+     support is the open dependency (h2load `--h1` is the interim).
+  Cross-cutting entry gate: the ztls audit per §4 (the Zig protocol
+  layer read line-by-line; the C primitives trusted institutionally),
+  and the pre-alpha posture — pin advances are deliberate, batched
+  migrations, with upstream engagement continuing on #82.
 - **Phase 3b — kTLS record offload.** Linux-only follow-up to 3a: hand
-  the negotiated keys to the kernel (`setsockopt(SOL_TLS)`, the fork's
-  `Ktls.zig` payloads) so the record layer costs zero userspace CPU
+  the negotiated keys to the kernel (`setsockopt(SOL_TLS)` — ztls ships
+  the struct payloads in its `ktls` module, and upstream's README
+  claims kTLS offload working) so the record layer costs zero userspace CPU
   and the post-handshake data path stays byte-identical to today's
   relay — which also keeps the `splice` c10k lever applicable to TLS
   traffic. The 3a userspace record path remains the portable fallback

@@ -565,6 +565,13 @@ pub fn closeNow(io: *SimIo, socket: Socket) void {
     io.closeEntry(socket);
 }
 
+/// Key material for the TLS engine (§4). Drawn from the scenario PRNG,
+/// so a seeded run replays a byte-exact handshake — the §9 property that
+/// makes TLS traffic assertable at all.
+pub fn fillRandom(io: *SimIo, buffer: []u8) void {
+    io.prng.random().bytes(buffer);
+}
+
 pub fn nowNs(io: *SimIo) u64 {
     assert(io.now_ns_value >= clock_start_ns);
     return io.now_ns_value;

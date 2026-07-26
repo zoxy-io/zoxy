@@ -31,6 +31,17 @@ pub fn build(b: *std.Build) void {
     });
     const hparse_module = hparse_dependency.module("hparse");
 
+    // ztls — the Phase 3a TLS engine, a Zig protocol layer over libcrypto
+    // primitives (the §4 crypto-primitives exception) — pinned by content
+    // hash to the zoxy-io fork; the pin moves only after re-audit. Only
+    // src/tls/ may import it (lint-enforced). It is the reason every build
+    // links libcrypto below.
+    const ztls_dependency = b.dependency("ztls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ztls_module = ztls_dependency.module("ztls");
+
     const zoxy_module = b.addModule("zoxy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -38,8 +49,12 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_module },
+            .{ .name = "ztls", .module = ztls_module },
         },
     });
+    // ztls's C surface: libcrypto supplies the crypto primitives (§4).
+    zoxy_module.link_libc = true;
+    zoxy_module.linkSystemLibrary("crypto", .{});
     // The shipped example config is embedded so tests and the fuzz corpus
     // stay in sync with the file users actually copy.
     zoxy_module.addAnonymousImport("example_config", .{
@@ -88,6 +103,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&lint_tests.step);
+
+    // Phase 3a slice 1: the fixed libcrypto heap. Its own step, and the
+    // one TLS test that cannot ride the main test binary: the allocation
+    // hooks must be installed before libcrypto's *first* allocation, which
+    // only a fresh process whose first libcrypto touch is the install can
+    // guarantee. Every other TLS test runs under `zig build test`.
+    const tls_heap_proof_module = b.createModule(.{
+        .root_source_file = b.path("src/tls_heap_proof.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ztls", .module = ztls_module },
+        },
+    });
+    tls_heap_proof_module.link_libc = true;
+    tls_heap_proof_module.linkSystemLibrary("crypto", .{});
+    const tls_heap_proof_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = tls_heap_proof_module,
+    }));
+    const tls_heap_proof_step = b.step(
+        "tls-heap-proof",
+        "Prove a TLS handshake runs on the fixed libcrypto heap (needs libcrypto)",
+    );
+    tls_heap_proof_step.dependOn(&tls_heap_proof_tests.step);
 
     const sim_exe = b.addExecutable(.{
         .name = "zoxy-sim",
@@ -153,6 +192,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseFast,
     });
+    const ztls_fast_dependency = b.dependency("ztls", .{
+        .target = target,
+        .optimize = std.builtin.OptimizeMode.ReleaseFast,
+    });
+    // Same source as `zoxy_module`, so it needs the same imports: root.zig
+    // exports `tls`, and the moment a bench or release path touches it an
+    // absent ztls import is a confusing build failure rather than dead code.
     const zoxy_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -160,8 +206,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
+            .{ .name = "ztls", .module = ztls_fast_dependency.module("ztls") },
         },
     });
+    zoxy_fast_module.link_libc = true;
+    zoxy_fast_module.linkSystemLibrary("crypto", .{});
     const release_zoxy = b.addExecutable(.{
         .name = "zoxy-release",
         .root_module = b.createModule(.{

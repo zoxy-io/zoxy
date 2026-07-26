@@ -123,6 +123,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "shutdown",
             "closeNow",
             "nowNs",
+            "fillRandom",
             "run",
             "stop",
         };

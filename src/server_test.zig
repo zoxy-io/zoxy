@@ -15,6 +15,13 @@ const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
 const origin_mod = @import("testing/origin.zig");
+const Credentials = @import("tls/Credentials.zig");
+const TlsTestClient = @import("tls/TestClient.zig").TestClient(SimIo);
+
+// Throwaway fixtures (src/tls/testdata/README.md), standing in for the
+// cert files main.zig reads at startup.
+const tls_cert_pem = @embedFile("tls/testdata/cert.pem");
+const tls_key_pem = @embedFile("tls/testdata/key.pem");
 
 const assert = std.debug.assert;
 
@@ -204,6 +211,9 @@ pub const TestBed = struct {
         max_lifetime_ms: u32 = 0,
         connect_timeout_ms: u32 = 50,
         drain_deadline_ms: u32 = 1000,
+        /// Give the listener a TLS block and real credentials, so `start`
+        /// exercises the §4 credential wiring.
+        tls: bool = false,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -223,7 +233,14 @@ pub const TestBed = struct {
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
-        bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .l4 }};
+        bed.listeners = .{.{
+            .bind_address = bindAddress(),
+            .routes = &bed.routes,
+            .protocol = .l4,
+            // Paths only; the credentials below are loaded from the
+            // embedded fixtures, standing in for main.zig's file read.
+            .tls = if (options.tls) .{ .cert_path = "cert.pem", .key_path = "key.pem" } else null,
+        }};
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
@@ -233,6 +250,13 @@ pub const TestBed = struct {
             .max_lifetime_ms = options.max_lifetime_ms,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, options.server);
+        // Credentials must reach the server before `start`, which copies
+        // each entry's address into its ListenerState (§4).
+        if (options.tls) {
+            const entries = try arena.alloc(?Credentials, bed.listeners.len);
+            entries[0] = try Credentials.load(arena, tls_cert_pem, tls_key_pem, .{});
+            bed.server.setTlsCredentials(entries);
+        }
         try bed.server.start();
 
         bed.scenario = .{
@@ -600,6 +624,383 @@ test "server: idle timeout shortens under pressure, is full otherwise" {
     try std.testing.expectEqual(@as(u32, 1000 / 16), bed.server.parkedTimeoutMs());
     bed.server.conn_pressure = false;
     bed.server.upstream_pressure = false;
+}
+
+/// Wind the scenario down once the TLS client is finished: stop
+/// accepting and let the server drain, which ends the sim run.
+fn drainOnClientEnd(ctx: ?*anyopaque) void {
+    const bed: *TestBed = @ptrCast(@alignCast(ctx.?));
+    bed.server.beginDrain();
+    bed.scenario.origin.stopListening();
+}
+
+// §4 handshake phase: a real TLS client completes a handshake against the
+// server's pooled engine over SimIo sockets. The engine is checked out at
+// admission and returned at teardown, so the pool drains — the property
+// that keeps a handshake storm bounded.
+test "tls: a client completes a handshake against a tls listener" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 9 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{ .host_name = "spike.zoxy.test" });
+    defer client.deinit();
+    // Wind the scenario down when the client is done with the socket.
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    // The engine went back to the pool: pools drained, counters reconcile.
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+// §4 + §6 end to end: a TLS client's plaintext reaches the origin and the
+// echo comes back, byte-exact, through a terminated session. The proxy
+// decrypts on the way in and encrypts on the way out; the origin only
+// ever sees plaintext.
+test "tls: a write landing before the dial completes still relays" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        // The delayed connect is what makes this deliberate rather than a
+        // property of some seed's ordering: the client's first write is
+        // guaranteed to arrive while the conn is still `.tls_handshaking`,
+        // which is legal — a TLS 1.3 client may write as soon as it has
+        // sent Finished. Those bytes must be staged and forwarded as the
+        // relay's first send, not dropped or treated as early data.
+        .sim = .{
+            .seed = 31,
+            .adversary = .{ .connect_delay_ns_max = 5_000_000 },
+        },
+        .tls = true,
+        .connect_timeout_ms = 60_000,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+test "tls: a post-handshake KeyUpdate interleaves with the relay" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 23 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    // This gates two distinct fixes at once.
+    //
+    // 1. The KeyUpdate response is staged into the engine outbox from the
+    //    client-to-upstream step while the other direction sits idle in a
+    //    recv — the interleaving that made an emptiness assert unsound.
+    // 2. Under this schedule the client's first write also beats the
+    //    upstream dial, so it lands while the conn is still
+    //    `.tls_handshaking` and must be staged and forwarded when the
+    //    relay starts, not treated as impossible early data. That is a
+    //    property of the seed's ordering, not something the client asks
+    //    for, so keep the seed pinned.
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .key_update = true,
+        .app_data = echo_token,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    // Both round-trips come back byte-exact: the KeyUpdate rekeys the
+    // session mid-relay without disturbing the bytes either way.
+    try std.testing.expectEqualStrings(
+        echo_token ++ echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("tls_relay_failed"),
+    );
+    // expectDrained does not cover the engine pool (Server.isIdle).
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+test "tls: a large write spanning records relays intact" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 17 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    // One write larger than a relay buffer: the client packs it into a
+    // TLS record the proxy reassembles across several recvs.
+    const big = "x" ** 9000;
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = big,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expectEqualStrings(big, client.app_received[0..client.app_received_len]);
+    try bed.expectDrained();
+}
+
+test "tls: plaintext relays end to end through a terminated session" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 13 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // The echo came back decrypted and intact.
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    // The origin saw exactly one connection, carrying plaintext.
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.origin.conns_count);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+// A client's close_notify is an EOF the proxy can only learn from a
+// *decrypt*: the TCP connection stays open for the other direction, so no
+// socket EOF ever arrives (§6 half-close, §4). The relay must recognize it
+// and shut the upstream's write side, which the origin then sees as its own
+// EOF — closing the loop back through `upstream → client`. Get this wrong
+// and nothing fails loudly: the direction simply waits for bytes that will
+// never come, until the idle deadline reaps a connection that had said a
+// clean goodbye. That is what the zero-deadline assertion pins.
+test "tls: a client's close_notify half-closes the upstream" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 17 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+        .close_after_echo = true,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // The exchange completed before the close: the goodbye is orderly, not
+    // an abort that happened to look like one.
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    // The proxy answered in protocol rather than with a bare FIN (§2).
+    try std.testing.expect(client.saw_close);
+    // The whole teardown ran on the peers' own signals: no clock involved.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+// The same goodbye, riding the same read as the data — write() then
+// shutdown(), which is what a real client does. One decrypt yields *both*
+// the last plaintext and the end of the session, so the chunk is non-empty
+// and the "empty decrypt means goodbye" rule never fires. Two ways to get
+// this wrong, and this pins both: forward the bytes and then wait forever
+// for a client that already left (the idle deadline covers it up), or spot
+// the close and drop the bytes that came with it (nothing covers that up —
+// the echo simply never comes back).
+test "tls: a close_notify coalesced with the last write loses neither" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 19 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .app_data = echo_token,
+        .close_with_data = true,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // Two payloads went out — one plain, one riding the alert — and both
+    // came back. The second is the one at issue: dropping the bytes that
+    // shared a read with the goodbye is exactly the other way to get this
+    // wrong, and it shows up here as a short echo.
+    try std.testing.expectEqual(
+        @as(u32, 2 * echo_token.len),
+        client.app_received_len,
+    );
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[echo_token.len..client.app_received_len],
+    );
+    try std.testing.expect(client.saw_close);
+    // And the direction ended on that alert, not on the clock.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+// A peer may say goodbye before the session it is establishing has ever
+// been used, and the handshake drive runs its sinks *synchronously inside*
+// `Engine.feed` — so the connection can be torn down underneath the step
+// that is still driving it. Continuing to pump one is not a matter of
+// tidiness: it drives a connection whose state has already moved on.
+// No relay is involved and no upstream is ever dialed; the whole exchange
+// ends inside the handshake.
+test "tls: a client that closes inside its handshake flight ends cleanly" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 23 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = "spike.zoxy.test",
+        .close_in_handshake = true,
+    });
+    defer client.deinit();
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.handshake_done);
+    // It never became a relay: no upstream was dialed on its behalf.
+    try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
+    // Admitted work still reaches `completed`, whichever state teardown
+    // began from (§9). `expectDrained` reconciles this too; pinning it
+    // here names the invariant the scenario is actually about.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    // And the engine came back, so a client that does this in a loop
+    // cannot drain the pool (§5, §8).
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+    try bed.expectDrained();
+}
+
+// §8 rung: the engine pool is the wall a TLS listener hits first. With no
+// engines, a TLS connection is refused at admission — never admitted, so
+// the accepted = admitted + shed identity still holds.
+test "tls: a listener with no engines sheds at admission" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 11 },
+        .tls = true,
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 0 },
+    });
+    defer bed.tearDown();
+
+    var client: TlsTestClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{ .host_name = "spike.zoxy.test" });
+    defer client.deinit();
+    // Wind the scenario down when the client is done with the socket.
+    client.on_end = drainOnClientEnd;
+    client.on_end_context = &bed;
+    try bed.sim_io.run();
+
+    try std.testing.expect(!client.handshake_done);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("shed_tls_engines"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("admitted"));
+    try bed.expectDrained();
+}
+
+// §4 startup wiring: a listener whose config carries a `tls` block comes
+// up holding the credentials main.zig loaded for it, so admission can ask
+// "does this connection start with a handshake?" without reaching back
+// through the config. A plain listener holds none.
+test "server: a tls listener's credentials reach its ListenerState" {
+    {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 5 }, .tls = true });
+        defer bed.tearDown();
+
+        const credentials = bed.server.listeners[0].credentials orelse
+            return error.TestExpectedCredentials;
+        // The listener points at the real loaded entry, not a copy: the
+        // chain and scheme are the fixture's.
+        try std.testing.expect(credentials.chain.len >= 1);
+        try std.testing.expectEqual(
+            &bed.server.tls_credentials[0].?,
+            credentials,
+        );
+    }
+    // Plain TCP: no credentials, and the engine pool stays disabled.
+    {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 5 } });
+        defer bed.tearDown();
+        try std.testing.expectEqual(
+            @as(?*const Credentials, null),
+            bed.server.listeners[0].credentials,
+        );
+    }
 }
 
 test "server: refused upstream tears the connection down and is counted" {
