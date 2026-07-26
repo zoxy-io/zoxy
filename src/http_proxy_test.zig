@@ -9,6 +9,7 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
+const constants = @import("constants.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const Io = @import("io/io.zig");
@@ -49,7 +50,10 @@ const HttpClient = struct {
     drain_on_finish: bool = true,
     sent_len: u32 = 0,
     send_in_flight: bool = false,
-    receive_buffer: [4096]u8 = undefined,
+    /// Twice the proxy's head buffer: a response that fills that buffer and
+    /// then grows in the render exceeds it, and the separate-excess scenario
+    /// needs the whole response in one place to compare against.
+    receive_buffer: [2 * constants.head_bytes_max]u8 = undefined,
     received_len: u32 = 0,
     outcome: Outcome = .pending,
 
@@ -1140,6 +1144,65 @@ test "l7: a body coalesced with the head, larger than a relay buffer, forwards i
     const forwarded_body = bed.origin.conns[0].request_buffer[forwarded.head_len..bed.origin.conns[0].request_len];
     try std.testing.expectEqualStrings(request[head.len..request_len], forwarded_body);
     try bed.expectDrained();
+}
+
+test "l7: a coalesced excess too large to ride the rendered head is written separately" {
+    // The origin's delivery fills upstream.head exactly, so the coalesced
+    // body sits flush against the 8 KiB bound; the `Connection: close`
+    // injection then grows the render past it and the excess cannot ride
+    // along — it leaves as a second write straight from upstream.head (§7).
+    // Sizes derive from the bound rather than being spelled out, so a change
+    // to `head_bytes_max` fails here loudly instead of quietly sliding the
+    // scenario off the branch it exists to cover (#77).
+    const injected_len = "Connection: close\r\n".len;
+    const body_len = 42;
+    const head_len: usize = constants.head_bytes_max - body_len;
+    const prefix = std.fmt.comptimePrint(
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nX-Pad: ",
+        .{body_len},
+    );
+    const suffix = "\r\n\r\n";
+
+    var response_bytes: [constants.head_bytes_max]u8 = undefined;
+    @memcpy(response_bytes[0..prefix.len], prefix);
+    @memset(response_bytes[prefix.len..][0 .. head_len - prefix.len - suffix.len], 'p');
+    @memcpy(response_bytes[head_len - suffix.len ..][0..suffix.len], suffix);
+    for (response_bytes[head_len..][0..body_len], 0..) |*byte, index| {
+        byte.* = @intCast('a' + (index % 26));
+    }
+
+    // Whole deliveries only: under 1-byte adversarial delivery the head
+    // parses long before the excess lands, and the excess rides the head
+    // write like every other response — a different path, covered elsewhere.
+    // The seeds still vary the clock jitter that orders the two head reads
+    // this response needs, so the branch must not depend on their timing.
+    var seed: u64 = 40;
+    while (seed < 44) : (seed += 1) {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = seed,
+            .origin_response = &response_bytes,
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /pad HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+        try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+        // The counter is the assertion that matters: the client receives the
+        // same bytes whichever way the excess left, so nothing below would
+        // fail if the branch stopped being taken.
+        try std.testing.expectEqual(
+            @as(u64, 1),
+            bed.server.counters.get("l7_response_excess_sent"),
+        );
+        const response = bed.client.response();
+        try std.testing.expectEqual(head_len + injected_len + body_len, response.len);
+        try std.testing.expectEqualStrings(
+            response_bytes[head_len..][0..body_len],
+            response[response.len - body_len ..],
+        );
+        try bed.expectDrained();
+    }
 }
 
 test "l7: a connection-close (until-close) response body relays to the client's EOF" {
