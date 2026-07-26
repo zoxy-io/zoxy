@@ -35,12 +35,20 @@ pub fn Pool(comptime T: type) type {
         /// In-place init via out-pointer for pointer stability. `arena`
         /// is the config arena — the only allocating region (§5) — and
         /// this is the pool's only allocation, ever.
+        ///
+        /// `count` may be zero: a *disabled* pool, reserving nothing and
+        /// answering every `acquire` with null. That is how a feature the
+        /// config did not ask for costs no memory while its acquire site
+        /// stays one code path — exhaustion, which every caller already
+        /// sheds (§8). Whether a given pool is *allowed* to be empty is the
+        /// caller's policy, not this container's: a proxy cannot serve
+        /// without conn slots, and `Server.init` asserts that where the
+        /// requirement actually lives.
         pub fn init(
             pool: *Self,
             arena: std.mem.Allocator,
             count: u32,
         ) error{OutOfMemory}!void {
-            assert(count >= 1);
             assert(count <= slots_count_max);
 
             const slots = try arena.alloc(T, count);
@@ -52,7 +60,9 @@ pub fn Pool(comptime T: type) type {
 
             pool.* = .{
                 .slots = slots,
-                .free_head = 0,
+                // An empty pool has no first free slot, and `acquire` reads
+                // that as exhausted — which for count == 0 it permanently is.
+                .free_head = if (count == 0) sentinel_none else 0,
                 .acquired_count = 0,
                 .acquired_count_peak = 0,
             };
@@ -211,4 +221,24 @@ test "pool: indexOf is stable across reuse" {
     const reused = pool.acquire().?;
     try std.testing.expectEqual(index, pool.indexOf(reused));
     pool.release(reused);
+}
+
+// A zero-slot pool is how a feature the config never asked for costs no
+// memory (§5): it reserves nothing and is permanently exhausted, so its
+// acquire site needs no special case — the caller's existing shed does.
+test "pool: a zero-slot pool reserves nothing and always sheds" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var pool: Pool(TestItem) = undefined;
+    try pool.init(arena_state.allocator(), 0);
+
+    try std.testing.expectEqual(@as(usize, 0), pool.slots.len);
+    try std.testing.expectEqual(@as(?*TestItem, null), pool.acquire());
+    // Still a well-formed pool: exhaustion is not a broken state, and every
+    // slot it has (none) is released.
+    try std.testing.expect(pool.isFullyReleased());
+    // Repeated acquires keep answering the same way rather than drifting.
+    try std.testing.expectEqual(@as(?*TestItem, null), pool.acquire());
+    try std.testing.expectEqual(@as(u32, 0), pool.acquired_count_peak);
 }

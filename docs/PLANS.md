@@ -132,11 +132,32 @@ Sizes are estimates, in diff lines, for sequencing only.
 
 | # | slice | ~ | what it buys |
 |---|---|---|---|
-| A1 | Zero-slot `Pool`: relax `count >= 1`, sentinel `free_head`, one test | 20 | a pool the config never asked for reserves nothing and is permanently exhausted, so its acquire site needs no special case |
-| A2 | `fillRandom` on the Io seam (`getrandom` in XevIo, scenario PRNG in SimIo), with the balancer's p2c seed routed through it | 60 | TLS needs key material through the seam; the side win is seed-replayable p2c in the simulator (§9) |
-| A3 | Lint boundaries as a data table `{import, allowed_prefix, message}` | 50 | the branch's 5th positional bool touched every test call; a new dependency boundary should be one row |
+| A1 | Zero-slot `Pool`: relax `count >= 1`, sentinel `free_head`, one test — *landed, with the requirement moved rather than dropped* | 20 | a pool the config never asked for reserves nothing and is permanently exhausted, so its acquire site needs no special case |
+| A2 | `fillRandom` on the Io seam (`getrandom` in XevIo, scenario PRNG in SimIo), with the balancer's p2c seed routed through it | 60 | ~~TLS needs key material through the seam~~ — **retired, see below** |
+| A3 | Lint boundaries as a data table `{needle, confined_to, message}` — *landed* | 50 | the branch's 5th positional bool touched every test call; a new dependency boundary should be one row |
 | A4 | `abortAdmission(server, conn, socket, rung)` — *landed*, with `releaseConn` as the pool pairing it was missing | 30 | collapses the release + pressure + counter + close quartet that `admitL4`/`admitHttp` already repeat and `admitTls` repeated twice more |
 | A5 | Split `prepare` from `startProtocol(server, conn)` — *landed* | 40 | one protocol fork, callable from accept *or* from a later phase — deletes the branch's duplicated switch and the `tls_protocol` field outright |
+
+**A2 is retired, not deferred.** Its two halves both fail the test this list
+sets. `fillRandom` on the Io seam has no caller here at all — TLS keys and
+session tickets are its only consumers, so it would be a seam method
+implemented in both backends and called by nothing. And routing the balancer's
+p2c seed through it contradicts a settled decision rather than improving on
+it: `balancer.zig` seeds xorshift64* from a fixed named constant *on purpose*
+("determinism is a feature" — the simulator replays every seed twice and
+demands byte-identical traces, §9), and the spread argument for per-process
+randomness does not hold either, since sibling processes behind SO_REUSEPORT
+already diverge through their own lease tables. TLS brings `fillRandom` when
+TLS brings a consumer for it.
+
+**A1 landed by moving the requirement, not removing it.** Relaxing `Pool`'s
+`count >= 1` on its own would have traded a live check for an absent caller's
+convenience. Instead the container now permits an empty pool — a generic
+container has no business insisting otherwise — and `Server.init` asserts that
+its three pools are non-empty, which is where the requirement is actually
+true: a proxy without conn slots, relay buffers or upstream slots cannot serve
+a request. Nothing is unchecked that was checked before, and the zero-slot case
+has a unit test rather than waiting for its first production user.
 
 **What A5 leaves to the phase that hands a connection over.**
 `startProtocol` stores the entry state and the entry deadline even at
