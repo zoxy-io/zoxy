@@ -163,6 +163,43 @@ const Staging = struct {
         staging.len += @intCast(bytes.len);
         assert(staging.len <= staging.buffer.len);
     }
+
+    /// Appends one `Name: value\r\n` line, reserving the whole line once.
+    ///
+    /// Byte-for-byte what four `append` calls emitted, and deliberately so:
+    /// a head has exactly one spelling here, and a second way to write one
+    /// is the kind of divergence §7 correctness is built to avoid. What
+    /// changes is only the bookkeeping around the bytes. Four calls reloaded
+    /// the cursor and re-checked the bound four times per header, twice of
+    /// that to move a two-byte constant — the `addl $0x2` and the cursor
+    /// reloads were the top instructions in this function's profile (§9).
+    fn appendHeaderLine(
+        staging: *Staging,
+        name: []const u8,
+        value: []const u8,
+    ) error{Oversize}!void {
+        assert(staging.len <= staging.buffer.len);
+        assert(name.len >= 1);
+        // `": "` and `"\r\n"`; both name and value are head-buffer bounded,
+        // so the sum cannot overflow.
+        const line_bytes = name.len + 2 + value.len + 2;
+        if (staging.buffer.len - staging.len < line_bytes) {
+            return error.Oversize;
+        }
+        var cursor: usize = staging.len;
+        @memcpy(staging.buffer[cursor..][0..name.len], name);
+        cursor += name.len;
+        staging.buffer[cursor] = ':';
+        staging.buffer[cursor + 1] = ' ';
+        cursor += 2;
+        @memcpy(staging.buffer[cursor..][0..value.len], value);
+        cursor += value.len;
+        staging.buffer[cursor] = '\r';
+        staging.buffer[cursor + 1] = '\n';
+        cursor += 2;
+        staging.len = @intCast(cursor);
+        assert(staging.len <= staging.buffer.len);
+    }
 };
 
 /// Appends every end-to-end header as `Name: value\r\n`, preserving the
@@ -220,21 +257,13 @@ fn appendEndToEndHeaders(
         if (has_suppressing_edit and suppressedByEdit(header.name, edits)) {
             continue;
         }
-        try staging.append(header.name);
-        try staging.append(": ");
-        try staging.append(header.value);
-        try staging.append("\r\n");
+        try staging.appendHeaderLine(header.name, header.value);
     }
     // Injected edits follow the surviving source headers; a `remove`
     // contributes no line (its whole effect is the suppression above).
     for (edits) |edit| {
         switch (edit.kind) {
-            .set, .add => {
-                try staging.append(edit.name);
-                try staging.append(": ");
-                try staging.append(edit.value);
-                try staging.append("\r\n");
-            },
+            .set, .add => try staging.appendHeaderLine(edit.name, edit.value),
             .remove => {},
         }
     }
