@@ -84,6 +84,16 @@ const Scratch = struct {
     /// whole — the fragment case that makes `transformIn` yield nothing.
     inbound: [payload_max + header_bytes]u8 = undefined,
     inbound_len: u32 = 0,
+    /// The peer's end marker has arrived: an EOF stated *inside* the
+    /// transform, which no socket EOF need follow — the read side is over
+    /// while the connection stays open for the other direction.
+    inbound_ended: bool = false,
+    /// Which terminal the marker reached. The two are not interchangeable —
+    /// one is reported by `transformEnded`, the other by `framingDone` —
+    /// so a test asserts it exercised the one it is named for rather than
+    /// passing on its sibling's path.
+    ended_via_drain: bool = false,
+    ended_via_complete: bool = false,
     /// The frame staged for the client, under the wire cursor the framed
     /// debt is not allowed to share.
     outbound: [payload_max + header_bytes]u8 = undefined,
@@ -91,7 +101,9 @@ const Scratch = struct {
     outbound_sent: u32 = 0,
 
     fn isClean(self: *const Scratch) bool {
-        return self.inbound_len == 0 and self.outbound_len == 0 and self.outbound_sent == 0;
+        return self.inbound_len == 0 and self.outbound_len == 0 and
+            self.outbound_sent == 0 and !self.inbound_ended and
+            !self.ended_via_drain and !self.ended_via_complete;
     }
 };
 
@@ -139,15 +151,28 @@ fn Base(comptime direction: Direction) type {
             return false;
         }
 
+        /// This direction is over: propagate the FIN and end the connection
+        /// once both directions have. Reached from a socket EOF and — on the
+        /// read side — from the transform's own end marker, which is the
+        /// point: an in-band EOF must land exactly where a real one does.
+        fn finish(server: *ServerSim, conn: *ConnSim) void {
+            assert(conn.state == .relaying);
+            // Negative space behind the comment above: a direction ends
+            // once. Reaching here twice would mean a socket EOF and an
+            // in-band one both claimed the same side.
+            assert(state(conn).phase != .finished);
+            state(conn).phase = .finished;
+            server.io.shutdown(targetSocket(conn), .write);
+            if (conn.directions[0].phase == .finished and
+                conn.directions[1].phase == .finished)
+            {
+                server.beginTeardown(conn);
+            }
+        }
+
         pub fn onRecvError(server: *ServerSim, conn: *ConnSim, err: Io.RecvError) void {
             if (err == error.EndOfStream) {
-                state(conn).phase = .finished;
-                server.io.shutdown(targetSocket(conn), .write);
-                if (conn.directions[0].phase == .finished and
-                    conn.directions[1].phase == .finished)
-                {
-                    server.beginTeardown(conn);
-                }
+                finish(server, conn);
                 return;
             }
             server.beginTeardown(conn);
@@ -181,11 +206,42 @@ const ToUpstreamPolicy = struct {
     pub const beforeRecv = base.beforeRecv;
     pub const beforeSend = base.beforeSend;
     pub const feed = base.feed;
-    pub const framingDone = base.framingDone;
     pub const onRecvError = base.onRecvError;
     pub const onSendError = base.onSendError;
-    pub const onDrained = base.onDrained;
-    pub const onComplete = base.onComplete;
+
+    /// The end marker arrived with no whole frame in front of it, so there
+    /// is nothing to forward first.
+    pub fn transformEnded(conn: *ConnSim) bool {
+        _ = conn;
+        return scratch.inbound_ended;
+    }
+
+    /// …and the same marker arriving *behind* a frame, in one read. The
+    /// chunk was non-empty, so `transformEnded` was never asked; this is
+    /// where the pump learns the stream ended, once the bytes that shared
+    /// the read with the marker are on their way.
+    pub fn framingDone(conn: *ConnSim) bool {
+        _ = conn;
+        return scratch.inbound_ended;
+    }
+
+    /// Both terminals mean the marker was seen; they differ only in whether
+    /// anything rode with it. Exactly one fires, exactly once — which is
+    /// what makes the coverage flags evidence rather than decoration, so it
+    /// is asserted rather than left to the tests to notice.
+    pub fn onDrained(server: *ServerSim, conn: *ConnSim) void {
+        assert(scratch.inbound_ended);
+        assert(!scratch.ended_via_drain and !scratch.ended_via_complete);
+        scratch.ended_via_drain = true;
+        base.finish(server, conn);
+    }
+
+    pub fn onComplete(server: *ServerSim, conn: *ConnSim) void {
+        assert(scratch.inbound_ended);
+        assert(!scratch.ended_via_drain and !scratch.ended_via_complete);
+        scratch.ended_via_complete = true;
+        base.finish(server, conn);
+    }
 
     /// After whatever fragment the last read left, never the relay buffer.
     pub fn recvBuffer(conn: *ConnSim) []u8 {
@@ -210,7 +266,24 @@ const ToUpstreamPolicy = struct {
         // breaks out.
         while (scratch.inbound_len >= header_bytes) {
             const need = std.mem.readInt(u16, scratch.inbound[0..2], .big);
-            if (need == 0 or need > payload_max) return null;
+            if (need > payload_max) return null;
+            if (need == 0) {
+                // The end marker. Frames already un-framed in this same call
+                // are returned and forwarded; anything *behind* the marker is
+                // dropped, because the stream ended there. Which side of it
+                // a byte falls on is the whole distinction the two hooks
+                // below exist to report.
+                //
+                // Dropped, not merely left unread: nothing re-arms this
+                // direction once the marker lands, so the leftovers would be
+                // inert here — but this scratch stands in for a buffer that
+                // lives on a pooled slot, where carrying a dead peer's bytes
+                // into the next connection is the bug the pattern must not
+                // teach (§5).
+                scratch.inbound_ended = true;
+                scratch.inbound_len = 0;
+                break;
+            }
             const frame_len = header_bytes + @as(u32, need);
             if (scratch.inbound_len < frame_len) break; // a fragment; read on
             if (out_len + need > out.len) return null;
@@ -286,6 +359,23 @@ const ToClientPolicy = struct {
 const PumpToUpstream = pump.Pump(SimIo, .client_to_upstream, ToUpstreamPolicy);
 const PumpToClient = pump.Pump(SimIo, .upstream_to_client, ToClientPolicy);
 
+/// Frame `payload` into `out` as `client_frames` dictates, returning the
+/// bytes written. Shared by the client's own wire and by the tests that
+/// append an end marker behind it.
+fn frameInto(out: []u8) u32 {
+    var offset: u32 = 0;
+    var written: u32 = 0;
+    for (client_frames) |chunk| {
+        assert(written + header_bytes + chunk <= out.len);
+        std.mem.writeInt(u16, out[written..][0..2], @intCast(chunk), .big);
+        @memcpy(out[written + header_bytes ..][0..chunk], payload[offset..][0..chunk]);
+        written += header_bytes + chunk;
+        offset += chunk;
+    }
+    assert(offset == payload.len);
+    return written;
+}
+
 /// The client peer: writes pre-framed bytes, expects framed bytes back, then
 /// FINs and waits for the proxied FIN.
 const Client = struct {
@@ -311,16 +401,7 @@ const Client = struct {
     reset: bool = false,
 
     fn frameUp(client: *Client) void {
-        var offset: u32 = 0;
-        var written: u32 = 0;
-        for (client_frames) |chunk| {
-            std.mem.writeInt(u16, client.wire[written..][0..2], @intCast(chunk), .big);
-            @memcpy(client.wire[written + header_bytes ..][0..chunk], payload[offset..][0..chunk]);
-            written += header_bytes + chunk;
-            offset += chunk;
-        }
-        assert(offset == payload.len);
-        client.wire_len = written;
+        client.wire_len = frameInto(&client.wire);
     }
 
     fn outgoing(client: *const Client) []const u8 {
@@ -641,6 +722,82 @@ test "transform: framed client bytes relay byte-exact in both directions" {
         // property an identity transform cannot exhibit.
         try std.testing.expect(bed.client.received_len > bed.client.unframed_len);
         try std.testing.expect(bed.client.eof);
+        try bed.expectSettled();
+    }
+}
+
+// A transform can end its stream *in band* — the peer says so inside the
+// framing, and no socket EOF need follow, because the connection stays open
+// for the other direction. The pump cannot tell that from a fragment on its
+// own (both yield no framed bytes), so the policy answers `transformEnded`.
+// Get it wrong and nothing fails: the direction re-arms a read and waits for
+// bytes that will never come, until a deadline reaps a peer that said a
+// clean goodbye. `deadline_expired == 0` is what pins that.
+test "transform: an end marker alone ends the direction, not the deadline" {
+    // The marker and nothing else, so the transform yields no framed bytes
+    // and `transformEnded` is the only thing that can distinguish this from
+    // a fragment — whatever the adversary does with a two-byte delivery.
+    const marker = [_]u8{ 0, 0 };
+    for (1..8) |seed| {
+        var bed: Harness = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = seed },
+            .client_raw = &marker,
+        });
+        defer bed.tearDown();
+
+        try bed.io.run();
+
+        // The marker reached the origin as a FIN, never as bytes.
+        try std.testing.expectEqual(@as(u32, 0), bed.origin.received_len);
+        try std.testing.expect(bed.origin.eof);
+        try std.testing.expect(scratch.ended_via_drain);
+        try std.testing.expect(!scratch.ended_via_complete);
+        try std.testing.expectEqual(
+            @as(u64, 0),
+            bed.server.counters.get("deadline_expired"),
+        );
+        try bed.expectSettled();
+    }
+}
+
+// The same marker riding the same read as the last frame — write() then
+// shutdown(), which is what a peer actually does. Now the chunk is *not*
+// empty, so `transformEnded` is never consulted and `framingDone` has to
+// report it instead, after the bytes that shared the read are forwarded.
+// Two ways to fail, and this pins both: forward the frame and then hang
+// waiting on a stream that ended, or notice the marker and drop the frame
+// that came with it — which shows up as a short payload at the origin.
+test "transform: an end marker coalesced with a frame loses neither" {
+    for (1..8) |seed| {
+        var wire: [payload.len + client_frames.len * header_bytes + header_bytes]u8 = undefined;
+        const framed = frameInto(&wire);
+        std.mem.writeInt(u16, wire[framed..][0..2], 0, .big);
+
+        var bed: Harness = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            // Whole deliveries, so the coalescing is arithmetic rather than
+            // luck of the seed. 72 bytes go out in one send (three frames,
+            // 70, plus the marker) against a 66-byte scratch, so the reads
+            // are a deterministic 66 then 6: the first ends mid-frame-3, and
+            // the second carries that frame's last bytes *and* the marker.
+            // So a completed frame and the marker share a read — which is
+            // the case at issue — on the second one, not the first.
+            .sim = .{ .seed = seed, .adversary = .{ .partial_io = false } },
+            .client_raw = wire[0 .. framed + header_bytes],
+        });
+        defer bed.tearDown();
+
+        try bed.io.run();
+
+        try std.testing.expectEqualStrings(payload, bed.origin.buffer[0..bed.origin.received_len]);
+        try std.testing.expect(bed.origin.eof);
+        try std.testing.expect(scratch.ended_via_complete);
+        try std.testing.expect(!scratch.ended_via_drain);
+        try std.testing.expectEqual(
+            @as(u64, 0),
+            bed.server.counters.get("deadline_expired"),
+        );
         try bed.expectSettled();
     }
 }

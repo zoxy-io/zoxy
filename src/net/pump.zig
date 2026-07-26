@@ -31,6 +31,7 @@
 //!   onSendEntry(server, conn) bool        divert a settled verdict; true = handled
 //!   recvBuffer(conn) []u8                 where a read lands
 //!   transformIn(conn, chunk) ?[]const u8  read bytes → framed bytes
+//!   transformEnded(conn) bool             an empty transform: ended, not partial
 //!   transformOut(conn, consumed) bool     framed bytes → wire bytes
 //!   sendSlice(conn) []const u8            what a send writes; empty = drained
 //!   creditSend(conn, sent)                credit whichever cursor tracks the wire
@@ -62,6 +63,21 @@
 //!    `beforeRecv` twice with no send between**, because that is how the pump
 //!    reads on for the rest of a fragment (see `onRecv`). Identity never can:
 //!    a recv delivers at least one byte and identity forwards all of them.
+//!    Such a policy must also answer `transformEnded`, because "no framed
+//!    bytes" has two meanings that could not differ more: the unit is
+//!    incomplete and the rest is coming, or the transformed stream is over.
+//!    The second is an *in-band* EOF — the peer said so inside the transform,
+//!    and no socket EOF need ever follow, so `onRecvError` will not fire for
+//!    it. Reading on for a stream that ended waits for bytes that will never
+//!    come, until a deadline reaps a connection that said a clean goodbye.
+//!    The default is "partial", the only answer an identity transform needs.
+//!
+//!    The same end can arrive *with* bytes rather than instead of them, when
+//!    the peer puts its last data and its end marker in one read. Then the
+//!    chunk is non-empty, `transformEnded` is never consulted, and it is
+//!    `framingDone` that has to report it — after the pump has forwarded
+//!    what came with it. A policy with an in-band EOF therefore answers
+//!    both, or it drops those last bytes or hangs holding them.
 //!
 //! The `on*Entry` hooks fire at completion time — after `delivered`, before
 //! the I/O result is unwrapped — so a Policy can re-assert the invariants
@@ -129,6 +145,14 @@ pub fn Pump(
         fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
             if (@hasDecl(Policy, "transformIn")) return Policy.transformIn(conn, chunk);
             return chunk;
+        }
+
+        /// Whether an empty `transformIn` means the transformed stream is
+        /// over rather than mid-unit. Only ever asked when the transform
+        /// yielded nothing, so identity — which never does — is never asked.
+        fn transformEnded(conn: *ConnType) bool {
+            if (@hasDecl(Policy, "transformEnded")) return Policy.transformEnded(conn);
+            return false;
         }
 
         /// Stage the framed chunk for the wire, exactly once per chunk:
@@ -222,6 +246,13 @@ pub fn Pump(
                 // Nothing was framed, so nothing is owed: a fragment must
                 // never leave a debt deferred across the next read.
                 assert(directionState(conn).owed() == 0);
+                // …but an empty transform is also how an in-band EOF
+                // arrives, and reading on for a stream that ended waits
+                // for bytes that will never come.
+                if (transformEnded(conn)) {
+                    Policy.onDrained(server, conn);
+                    return;
+                }
                 armRecv(server, conn);
                 return;
             }
