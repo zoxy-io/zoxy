@@ -437,26 +437,35 @@ comptime {
 /// §5). Slot sizes are runtime parameters because `Conn` is generic over
 /// the Io backend; the composition site passes `@sizeOf` of the concrete
 /// types and main.zig prints the result at startup.
-pub fn memoryBytesTotal(
+/// What the pools cost: a count and a slot size per pool. A struct rather
+/// than six positional arguments because three of them are `u64` byte sizes
+/// — transposing two of those compiles, runs, and silently prints the wrong
+/// total, which the sanity asserts below could only sometimes catch. Named
+/// fields make that particular mistake unrepresentable, and a fourth pool
+/// (§4's TLS engines) is a field and a term rather than two more positions
+/// at every call site.
+pub const PoolSizes = struct {
     conn_slots: u32,
     conn_bytes: u64,
     relay_buffers: u32,
     relay_buffer_pair_bytes: u64,
     upstream_slots: u32,
     upstream_bytes: u64,
-) u64 {
-    assert(conn_slots >= 1);
-    assert(conn_slots <= conn_slots_max);
-    assert(relay_buffers >= 1);
-    assert(relay_buffers <= relay_buffers_max);
-    assert(upstream_slots >= 1);
-    assert(upstream_slots <= upstream_slots_max);
-    assert(conn_bytes > 0);
-    assert(relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
-    assert(upstream_bytes >= head_bytes_max);
-    const total = @as(u64, conn_slots) * conn_bytes +
-        @as(u64, relay_buffers) * relay_buffer_pair_bytes +
-        @as(u64, upstream_slots) * upstream_bytes;
+};
+
+pub fn memoryBytesTotal(sizes: PoolSizes) u64 {
+    assert(sizes.conn_slots >= 1);
+    assert(sizes.conn_slots <= conn_slots_max);
+    assert(sizes.relay_buffers >= 1);
+    assert(sizes.relay_buffers <= relay_buffers_max);
+    assert(sizes.upstream_slots >= 1);
+    assert(sizes.upstream_slots <= upstream_slots_max);
+    assert(sizes.conn_bytes > 0);
+    assert(sizes.relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
+    assert(sizes.upstream_bytes >= head_bytes_max);
+    const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
+        @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
+        @as(u64, sizes.upstream_slots) * sizes.upstream_bytes;
     assert(total > 0);
     return total;
 }
@@ -490,19 +499,23 @@ test "budgets: memory total matches the closed form" {
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes;
-    try std.testing.expectEqual(expected_max, memoryBytesTotal(
-        conn_slots_max,
-        conn_bytes,
-        relay_buffers_max,
-        pair_bytes,
-        upstream_slots_max,
-        upstream_bytes,
-    ));
+    try std.testing.expectEqual(expected_max, memoryBytesTotal(.{
+        .conn_slots = conn_slots_max,
+        .conn_bytes = conn_bytes,
+        .relay_buffers = relay_buffers_max,
+        .relay_buffer_pair_bytes = pair_bytes,
+        .upstream_slots = upstream_slots_max,
+        .upstream_bytes = upstream_bytes,
+    }));
     const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
-    try std.testing.expectEqual(
-        expected_small,
-        memoryBytesTotal(64, conn_bytes, 8, pair_bytes, 8, upstream_bytes),
-    );
+    try std.testing.expectEqual(expected_small, memoryBytesTotal(.{
+        .conn_slots = 64,
+        .conn_bytes = conn_bytes,
+        .relay_buffers = 8,
+        .relay_buffer_pair_bytes = pair_bytes,
+        .upstream_slots = 8,
+        .upstream_bytes = upstream_bytes,
+    }));
 }
 
 test "budgets: c10k ceiling fd count needs a raised NOFILE" {

@@ -209,9 +209,39 @@ existing unverified.
 
 | # | slice | ~ | what it buys |
 |---|---|---|---|
-| C1 | Pool descriptors as one comptime table feeding `memoryBytesTotal`, `fdsRequired`, `inFlightOpsMax`, `completionQueueDepthFor` and the startup print | 150 | the branch added positional args to five call sites; a new pool should be one row, and §5's memory table would generate itself |
-| C2 | Counter groups — `admission_shed` vs `post_admission_failure` — with `reconcile` summing the first structurally | 60 | the branch had to reason that `shed_tls_engines` must precede admission while `tls_relay_buffer_unavailable` must not; make the wrong bucket unrepresentable |
-| C3 | Per-resource release with explicit lifetimes instead of a fixed teardown sequence | 60 | kTLS wants the engine back at *handshake completion*, not teardown — illegal in today's shape |
+| C1 | Pool descriptors as one comptime table feeding `memoryBytesTotal`, `fdsRequired`, `inFlightOpsMax`, `completionQueueDepthFor` and the startup print — *landed as a `PoolSizes` struct; see below* | 150 | the branch added positional args to five call sites; a new pool should be one row, and §5's memory table would generate itself |
+| C2 | Counter groups — `admission_shed` vs `post_admission_failure` — with `reconcile` summing the first structurally — *landed as a naming rule, not two groups* | 60 | the branch had to reason that `shed_tls_engines` must precede admission while `tls_relay_buffer_unavailable` must not; make the wrong bucket unrepresentable |
+| C3 | Per-resource release with explicit lifetimes instead of a fixed teardown sequence | 60 | ~~kTLS wants the engine back at handshake completion~~ — **already true, nothing to build; see below** |
+
+**What Tier C landed, and what it did not.** All three rows were written from
+the TLS branch's diff rather than from this tree, and two of them shrank when
+read against it.
+
+- **C2 landed as a naming rule instead of two counter groups.** `reconcile`
+  now sums the gate identity off the field set — every counter named `shed_*`
+  — rather than a hand-written list, which is what makes A4's comptime assert
+  in `abortAdmission` load-bearing: a rung joins the sum by being named, and
+  the two checks are one rule read from both ends. Two groups would have been
+  more machinery for the same guarantee. A test pins today's membership so a
+  new `shed_*` counter has to change the gate identity deliberately (verified
+  by adding one and watching it fail), and a second test pins that an
+  `l7_shed_*` reject lands on the *other* side of the identity.
+- **C1 landed as a `PoolSizes` struct, not a descriptor table.** The table was
+  budgeted against five call sites; there are four, all in `main.zig`, and two
+  of the four functions (`fdsRequired`, `inFlightOps`) take counts only — a
+  TLS engine holds no socket and arms no ring op, so it never enters them.
+  What is genuinely hazardous is `memoryBytesTotal`'s six positional
+  arguments, three of them `u64` byte sizes: transposing two compiles, runs,
+  and prints the wrong total. Named fields make that unrepresentable, and a
+  fourth pool is a field plus a term. Unifying the count-only functions with
+  the sizing one would have coupled things that share nothing.
+- **C3 needs nothing.** The row claims a resource can only be released at
+  teardown; the code already releases per-resource, early, in five places —
+  the relay buffer on a keep-alive turnaround and inside `respond`, the
+  upstream slot mid-exchange and at reject — each the `if (conn.x) |held| {
+  release; conn.x = null; }` shape the row asks for. A TLS engine adds one
+  more such block, and kTLS returning it at handshake completion is already
+  legal. Removed rather than left looking pending.
 
 ### Tier D — measurement readiness
 
