@@ -18,6 +18,37 @@ const file_bytes_max: u32 = 1024 * 1024;
 
 const syscall_needles = [_][]const u8{ "std.posix", "std.os", "os.linux" };
 
+/// One import boundary: a needle that may appear only under `confined_to`.
+/// Data rather than code, so adding a boundary — the TLS engine's own
+/// wrapper is the next one (§4) — is a row here instead of another
+/// parameter threaded through `lintLine` and every one of its tests.
+const Boundary = struct {
+    needle: []const u8,
+    /// A path prefix (`"io/"`) or an exact file (`"http/parser.zig"`),
+    /// always written with forward slashes; `pathIsUnder` normalizes. Empty
+    /// means the needle is allowed nowhere.
+    confined_to: []const u8,
+    message: []const u8,
+};
+
+const boundaries = [_]Boundary{
+    .{
+        .needle = "@cImport",
+        .confined_to = "",
+        .message = "@cImport is forbidden: no C-FFI dependency (DESIGN.md §4)",
+    },
+    .{
+        .needle = "@import(\"hparse\")",
+        .confined_to = "http/parser.zig",
+        .message = "hparse is imported only by src/http/parser.zig — the trust boundary (DESIGN.md §7)",
+    },
+    .{
+        .needle = "@import(\"xev\")",
+        .confined_to = "io/",
+        .message = "xev may only be imported under src/io/ (DESIGN.md §4)",
+    },
+};
+
 /// The only `std.posix.` members main.zig may name (rlimits + sigaction);
 /// everything else — sockets, files, pipes — stays behind the Io seam.
 /// These are matched as fully-qualified `std.posix.<name>` occurrences,
@@ -76,12 +107,6 @@ fn lintFile(
     path: []const u8,
 ) !u32 {
     assert(path.len > 0);
-    const in_io_directory = std.mem.startsWith(u8, path, "io/") or
-        std.mem.startsWith(u8, path, "io" ++ std.fs.path.sep_str);
-    const is_main = std.mem.eql(u8, path, "main.zig");
-    const is_http_parser = std.mem.eql(u8, path, "http/parser.zig") or
-        std.mem.eql(u8, path, "http" ++ std.fs.path.sep_str ++ "parser.zig");
-
     const contents = try root.readFileAlloc(io, path, arena, .limited(file_bytes_max));
     assert(contents.len < file_bytes_max);
 
@@ -90,7 +115,7 @@ fn lintFile(
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |line| {
         line_number += 1;
-        if (lintLine(line, in_io_directory, is_main, is_http_parser)) |message| {
+        if (lintLine(line, path)) |message| {
             std.debug.print("{s}:{d}: {s}\n", .{ path, line_number, message });
             violation_count += 1;
         }
@@ -99,25 +124,53 @@ fn lintFile(
     return violation_count;
 }
 
+comptime {
+    // Every path here — the walked one and the confinements below — is
+    // compared byte-for-byte with '/' as the separator. Rather than
+    // normalizing for a platform this project does not support (§1: Windows
+    // is a non-goal, and the macOS dev box uses '/' too), the assumption is
+    // stated and enforced: on a '\\' platform this lint would need real path
+    // handling, and failing to build says so.
+    assert(std.fs.path.sep == '/');
+}
+
+/// True when `path` is the file named by `confinement`, or lies under it as a
+/// directory prefix. A `confinement` ending in '/' is a directory, anything
+/// else an exact file; empty confines a needle to nowhere.
+fn pathIsUnder(path: []const u8, confinement: []const u8) bool {
+    assert(path.len > 0);
+    // The confinements are written in this file, so a stray separator is a
+    // typo in a table row, not untrusted input.
+    assert(std.mem.indexOfScalar(u8, confinement, '\\') == null);
+    if (confinement.len == 0) return false;
+    if (confinement[confinement.len - 1] != '/') {
+        return std.mem.eql(u8, path, confinement);
+    }
+    const directory = confinement[0 .. confinement.len - 1];
+    assert(directory.len >= 1);
+    if (!std.mem.startsWith(u8, path, directory)) return false;
+    // A sibling whose name merely starts the same is not under it: the byte
+    // after the directory must be the separator, never more name.
+    if (path.len == directory.len) return false;
+    return path[directory.len] == '/';
+}
+
 /// Returns a violation message for the line, or null if the line is clean.
-fn lintLine(
-    line: []const u8,
-    in_io_directory: bool,
-    is_main: bool,
-    is_http_parser: bool,
-) ?[]const u8 {
-    if (std.mem.indexOf(u8, line, "@cImport") != null) {
-        return "@cImport is forbidden: no C-FFI dependency (DESIGN.md §4)";
+fn lintLine(line: []const u8, path: []const u8) ?[]const u8 {
+    assert(path.len > 0);
+    const in_io_directory = pathIsUnder(path, "io/");
+    for (boundaries) |boundary| {
+        if (pathIsUnder(path, boundary.confined_to)) continue;
+        if (std.mem.indexOf(u8, line, boundary.needle) != null) {
+            return boundary.message;
+        }
     }
-    if (!is_http_parser and std.mem.indexOf(u8, line, "@import(\"hparse\")") != null) {
-        return "hparse is imported only by src/http/parser.zig — the trust boundary (DESIGN.md §7)";
-    }
+    // The syscall surfaces are not one needle with one home: they are a set,
+    // and main.zig carries a member-level allowlist rather than a path.
     if (in_io_directory) {
         return null;
     }
-    if (std.mem.indexOf(u8, line, "@import(\"xev\")") != null) {
-        return "xev may only be imported under src/io/ (DESIGN.md §4)";
-    }
+    const is_main = std.mem.eql(u8, path, "main.zig");
     for (syscall_needles) |needle| {
         if (std.mem.indexOf(u8, line, needle) == null) {
             continue;
@@ -164,33 +217,45 @@ fn startsWithAllowedMember(member: []const u8) bool {
 }
 
 test "lintLine: raw syscalls flagged outside io, allowed inside" {
-    try std.testing.expect(lintLine("const x = std.posix.socket();", false, false, false) != null);
-    try std.testing.expect(lintLine("const x = std.os.linux.close(fd);", false, false, false) != null);
-    try std.testing.expect(lintLine("const x = std.posix.socket();", true, false, false) == null);
-    try std.testing.expect(lintLine("const clean = a + b;", false, false, false) == null);
+    try std.testing.expect(lintLine("const x = std.posix.socket();", "net/relay.zig") != null);
+    try std.testing.expect(lintLine("const x = std.os.linux.close(fd);", "net/relay.zig") != null);
+    try std.testing.expect(lintLine("const x = std.posix.socket();", "io/XevIo.zig") == null);
+    try std.testing.expect(lintLine("const clean = a + b;", "net/relay.zig") == null);
 }
 
 test "lintLine: main.zig allowlist admits rlimit and sigaction only" {
-    try std.testing.expect(lintLine("try std.posix.setrlimit(.NOFILE, limits);", false, true, false) == null);
-    try std.testing.expect(lintLine("std.posix.sigaction(.TERM, &action, null);", false, true, false) == null);
-    try std.testing.expect(lintLine("_ = std.posix.setsockopt(fd, 0, 0, &opt);", false, true, false) != null);
+    try std.testing.expect(lintLine("try std.posix.setrlimit(.NOFILE, limits);", "main.zig") == null);
+    try std.testing.expect(lintLine("std.posix.sigaction(.TERM, &action, null);", "main.zig") == null);
+    try std.testing.expect(lintLine("_ = std.posix.setsockopt(fd, 0, 0, &opt);", "main.zig") != null);
     // A comment mentioning SIG must not exempt a real forbidden call.
-    try std.testing.expect(lintLine("const s = std.posix.socket(); // closed on SIGTERM", false, true, false) != null);
+    try std.testing.expect(lintLine("const s = std.posix.socket(); // closed on SIGTERM", "main.zig") != null);
     // A forbidden call sharing a line with an allowed one is still caught.
-    try std.testing.expect(lintLine("std.posix.sigaction(x); std.posix.socket();", false, true, false) != null);
+    try std.testing.expect(lintLine("std.posix.sigaction(x); std.posix.socket();", "main.zig") != null);
     // std.os.linux.* is never allowlisted in main.zig.
-    try std.testing.expect(lintLine("_ = std.os.linux.close(fd);", false, true, false) != null);
+    try std.testing.expect(lintLine("_ = std.os.linux.close(fd);", "main.zig") != null);
 }
 
 test "lintLine: xev import and cImport boundaries" {
-    try std.testing.expect(lintLine("const xev = @import(\"xev\");", false, false, false) != null);
-    try std.testing.expect(lintLine("const xev = @import(\"xev\");", true, false, false) == null);
-    try std.testing.expect(lintLine("const c = @cImport({});", true, false, false) != null);
+    try std.testing.expect(lintLine("const xev = @import(\"xev\");", "Server.zig") != null);
+    try std.testing.expect(lintLine("const xev = @import(\"xev\");", "io/XevIo.zig") == null);
+    try std.testing.expect(lintLine("const c = @cImport({});", "io/XevIo.zig") != null);
 }
 
 test "lintLine: hparse import is confined to the http parser wrapper" {
-    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", false, false, true) == null);
-    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", false, false, false) != null);
+    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "http/parser.zig") == null);
+    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "http/proxy.zig") != null);
     // Not even src/io/ may reach around the wrapper.
-    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", true, false, false) != null);
+    try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "io/XevIo.zig") != null);
+}
+
+test "pathIsUnder: exact files, directory prefixes, and near misses" {
+    try std.testing.expect(pathIsUnder("http/parser.zig", "http/parser.zig"));
+    try std.testing.expect(!pathIsUnder("http/parser_test.zig", "http/parser.zig"));
+    try std.testing.expect(pathIsUnder("io/XevIo.zig", "io/"));
+    try std.testing.expect(pathIsUnder("io/sub/deep.zig", "io/"));
+    // A sibling directory whose name merely starts the same is not under it.
+    try std.testing.expect(!pathIsUnder("iommu/thing.zig", "io/"));
+    try std.testing.expect(!pathIsUnder("io", "io/"));
+    // An empty spec confines a needle to nowhere.
+    try std.testing.expect(!pathIsUnder("anything.zig", ""));
 }
