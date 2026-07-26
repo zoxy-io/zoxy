@@ -186,7 +186,26 @@ pub fn Proxy(comptime IoType: type) type {
         /// the whole server. A target that will not canonicalize is
         /// BadPath (400). One canonical view, shared by both filter
         /// matching and routing, so they never disagree.
-        const RequestKeys = struct { host: ?[]const u8, path: []const u8 };
+        const RequestKeys = struct {
+            host: ?[]const u8,
+            /// The §7 *match* view: the canonical path, or "/" for OPTIONS
+            /// asterisk-form, which matches and routes as the origin root.
+            path: []const u8,
+            /// The §7 *forward* view: what the origin is sent. The same
+            /// bytes as `path` for origin-form; asterisk-form forwards "*"
+            /// verbatim rather than the "/" it matched as.
+            ///
+            /// Carried here so the canonicalization happens once. Rendering
+            /// needs this exact value and used to recompute it — decoding
+            /// and dot-segment-collapsing the whole path a second time on
+            /// every request (§9).
+            ///
+            /// For origin-form it aliases the caller's scratch and so lives
+            /// exactly as long as that frame; asterisk-form aliases the head
+            /// buffer instead, which outlives it. Treat the shorter of the
+            /// two as the lifetime.
+            target: parser.CanonicalTarget,
+        };
 
         fn requestKeys(
             request: *const parser.RequestHead,
@@ -198,15 +217,41 @@ pub fn Proxy(comptime IoType: type) type {
                 parser.canonicalHost(raw, host_scratch)
             else
                 null;
+            const views = try targetViews(request, scratch);
+            assert(views.match.len >= 1);
+            assert(views.forward.path.len >= 1);
+            return .{ .host = host, .path = views.match, .target = views.forward };
+        }
+
+        /// Both §7 views of a target, from one canonicalization.
+        ///
+        /// They differ in exactly one case, and this is the only place that
+        /// case is written: OPTIONS asterisk-form matches and routes as the
+        /// origin root but is forwarded as `*`. Origin-form canonicalizes,
+        /// and both views are then the same bytes.
+        ///
+        /// Canonicalizing decodes percent-escapes and collapses dot
+        /// segments over the whole path, so it is done once and both
+        /// consumers read the result (§9). The slices alias `scratch`.
+        const TargetViews = struct { match: []const u8, forward: parser.CanonicalTarget };
+
+        fn targetViews(
+            request: *const parser.RequestHead,
+            scratch: *[constants.head_bytes_max]u8,
+        ) error{BadPath}!TargetViews {
+            assert(request.target.len >= 1);
             if (request.target[0] != '/') {
                 // validateTarget admitted only asterisk-form here.
                 assert(request.method == .options);
-                return .{ .host = host, .path = "/" };
+                return .{
+                    .match = "/",
+                    .forward = .{ .path = request.target, .query = "" },
+                };
             }
             const canonical = parser.canonicalTarget(request.target, scratch) catch {
                 return error.BadPath;
             };
-            return .{ .host = host, .path = canonical.path };
+            return .{ .match = canonical.path, .forward = canonical };
         }
 
         /// Answer a §7 filter reject with its runtime policy status — each
@@ -225,19 +270,22 @@ pub fn Proxy(comptime IoType: type) type {
             unreachable;
         }
 
-        /// The canonical bytes to forward for `request` (§7): origin-form
-        /// canonicalizes, OPTIONS asterisk-form passes through. routeRequest
-        /// already proved canonicalization succeeds, so this cannot fail —
-        /// the same bytes are the single source of truth.
+        /// The bytes to forward for `request` (§7), rebuilt after an await.
+        /// routeRequest already proved canonicalization succeeds on these
+        /// same bytes — the single source of truth — so it cannot fail here.
+        ///
+        /// Only the fresh-dial path calls this, and only because the await
+        /// took routeRequest's scratch with it. The reuse path — almost all
+        /// traffic — carries `RequestKeys.target` over instead, since no
+        /// await separates the two and the scratch is still live. Both go
+        /// through `targetViews`, so the asterisk rule has one spelling.
         fn effectiveTarget(
             request: *const parser.RequestHead,
             scratch: *[constants.head_bytes_max]u8,
         ) parser.CanonicalTarget {
-            assert(request.target.len >= 1);
-            if (request.target[0] != '/') {
-                return .{ .path = request.target, .query = "" };
-            }
-            return parser.canonicalTarget(request.target, scratch) catch unreachable;
+            const views = targetViews(request, scratch) catch unreachable;
+            assert(views.forward.path.len >= 1);
+            return views.forward;
         }
 
         /// The forwarded target and header edits after applying the
@@ -358,8 +406,10 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.state = .l7_dialing;
                 // No await happened: this runs in the same callback as the
                 // parse whose result is still live, so the reuse path —
-                // the hot one — skips the re-parse the dial path needs.
-                renderRequestAndStartLegs(server, conn, request);
+                // the hot one — skips the re-parse the dial path needs,
+                // and hands over the canonical target it already built
+                // rather than having it decoded and collapsed again.
+                renderRequestAndStartLegs(server, conn, request, keys.target);
                 return;
             }
             dialUpstream(server, conn, pick);
@@ -451,7 +501,12 @@ pub fn Proxy(comptime IoType: type) type {
                 &storage,
             ) catch unreachable;
             assert(request.head_len == conn.l7.request_head_len);
-            renderRequestAndStartLegs(server, conn, &request);
+            // Only this path pays for canonicalization twice, and it has
+            // to: routeRequest's scratch died with its frame at the dial.
+            // The scratch lives here so the target outlives the call.
+            var scratch: [constants.head_bytes_max]u8 = undefined;
+            const base = effectiveTarget(&request, &scratch);
+            renderRequestAndStartLegs(server, conn, &request, base);
         }
 
         /// Render the request head into the upstream slot's staging
@@ -460,14 +515,18 @@ pub fn Proxy(comptime IoType: type) type {
             server: *ServerType,
             conn: *ConnType,
             request: *const parser.RequestHead,
+            /// The §7 canonical target the router matched on — the base the
+            /// origin sees, unless a filter rewrites the forwarded path.
+            /// Passed in rather than recomputed: canonicalizing decodes and
+            /// collapses the whole path, and the caller already did it
+            /// (§9). Origin-form aliases the caller's stack scratch, so it
+            /// is read out entirely before this returns.
+            base: parser.CanonicalTarget,
         ) void {
             assert(conn.state == .l7_dialing);
             assert(request.head_len == conn.l7.request_head_len);
+            assert(base.path.len >= 1);
             const upstream = conn.upstream.?;
-            // The §7 canonical target the router matched on is the base the
-            // origin sees, unless a filter rewrites the forwarded path.
-            var scratch: [constants.head_bytes_max]u8 = undefined;
-            const base = effectiveTarget(request, &scratch);
             // Apply the listener's filters (empty when none): a rewrite of
             // the forwarded path and any header edits, against the same
             // canonical view the reject/route phase used.
