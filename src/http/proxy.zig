@@ -59,15 +59,69 @@ pub fn Proxy(comptime IoType: type) type {
             armHeadRecv(server, conn);
         }
 
-        fn armHeadRecv(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_reading_head);
+        // -- the head-fill seam: the *request* head (§4, §7) --
+        //
+        // The head accumulates until it parses (§7 detect-and-retry), and
+        // three things make that loop work: where a read lands, how what
+        // arrived becomes head bytes, and what those bytes mean. Only the
+        // first two are a *source's* business, and they are named below, so a
+        // source that does not read plaintext off the socket — §4's TLS
+        // termination reads ciphertext and decrypts into the head — replaces
+        // exactly those two. Unlike `pump.zig`'s transform seam these are
+        // plain functions, not `@hasDecl` hooks on a policy: there is one
+        // source today, and the second one arrives inside `Proxy` rather than
+        // being handed in, so a policy parameter would buy nothing.
+        //
+        // Scoped to the request head deliberately. The origin's *response*
+        // head accumulates the same way in `onResponseHeadRecv`, into the
+        // upstream slot's buffer, and does not need a source: Phase 3a
+        // terminates TLS on the client side only, so the upstream leg stays
+        // plaintext (kTLS on the origin side, if it ever comes, would revisit
+        // this).
+        //
+        // The third stays `parseAndDispatch`, the single answer to "what do
+        // these bytes mean": read again, 400, 414, 431, or route. That matters
+        // most for a source that can overrun the buffer, which a plaintext
+        // read cannot: a transform decoding a whole record at once may yield
+        // more head bytes than the buffer holds, and whether that is a 431
+        // (the head itself is too large) or a 413 (the head fits and the
+        // payload behind it does not) is a question about the *parsed* head.
+        // Such a source records the overrun and lets the dispatch answer it,
+        // rather than deciding first and growing a second copy of the ladder.
+
+        /// Where a head read lands: the free space after what has already
+        /// accumulated.
+        fn headRecvBuffer(conn: *ConnType) []u8 {
             // Parsing turns a full buffer into an oversize verdict before
             // we ever get here, so there is always room to read into.
             assert(conn.head_len < constants.head_bytes_max);
+            return conn.head[conn.head_len..];
+        }
+
+        /// Account for bytes that became head bytes. Named because a
+        /// transforming source appends a different count than the socket
+        /// delivered, and this is where that difference belongs.
+        ///
+        /// The bound is a precondition, not a clamp: a source that can produce
+        /// more head bytes than there is room for — a decrypted record is up
+        /// to 16 KiB against an 8 KiB head — fills what fits, records the
+        /// surplus, and lets `parseAndDispatch` answer it. Handing an overrun
+        /// to this function is a bug, and asserts as one.
+        fn fillHead(conn: *ConnType, appended: u32) void {
+            assert(appended >= 1);
+            assert(conn.head_len + appended <= constants.head_bytes_max);
+            conn.head_len += appended;
+        }
+
+        fn armHeadRecv(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_reading_head);
+            // Resolved before the arm, so the source's own bound is checked
+            // before any state changes.
+            const into = headRecvBuffer(conn);
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
-                conn.head[conn.head_len..],
+                into,
                 &conn.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -95,8 +149,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(received >= 1);
-            conn.head_len += received;
-            assert(conn.head_len <= constants.head_bytes_max);
+            fillHead(conn, received);
             parseAndDispatch(server, conn);
         }
 

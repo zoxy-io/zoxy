@@ -161,7 +161,7 @@ reviews of A5 landed on it, and neither could guard it from here.
 | B1 | Pump transform seam — `recvBuffer`, `transformIn`, `transformOut`, `sendSlice`, `creditSend`, identity by default — and the loop condition becomes *"anything left to write?"* rather than *"cursor reached length"*. **Not done without B5** | 120 | TLS L4 becomes a policy; `tls_relay.zig` never gets written |
 | B5 | A toy transform in the simulator: deterministic and non-identity (XOR mask, or 4-byte length re-framing) on an L4 sim listener, verified byte-exact by the token oracle under the adversary. **Lands with B1, not after it** | 150 | proves the seam *without crypto*, so TLS adds only crypto, not new mechanism risk. The de-risking slice for all of Tier B |
 | B3 | One client-write channel over B2's cursor: `armClientWrite(conn, plaintext)` for all three client-directed sends | 150 | TLS changes one place, kTLS none; also settles what §8's "static responses straight from static memory" means once the bytes must be encrypted |
-| B4 | Head-fill source seam: read through a source (socket today), one "head complete? → parse / 431 / 413 / read again" decision | 100 | removes the parallel TLS completion path and the duplicated limit decision |
+| B4 | Head-fill source seam: read through a source (socket today), one "head complete? → parse / 431 / 413 / read again" decision — *landed at ~40 lines; see below* | 100 | removes the parallel TLS completion path and the duplicated limit decision |
 
 **What B2 landed, and what it left to B1.** The row above asked for a wire
 cursor *field* asserted equal to the framed one. Written out, that field
@@ -198,6 +198,25 @@ existing unverified.
 |---|---|---|---|
 | D1 | Tier-1 gate on achieved rate against offered | 40 | the §9 gates check socket and status errors only, so a run delivering 704 of 2000 req/s passed them |
 | D2 | A large-body band in the harness | 80 | the record layer's per-byte cost is unmeasured, and the kTLS decision (Phase 3b) depends on that number |
+
+**What B4 landed, and why it is small.** The row budgeted 100 lines for a
+source seam. Read against the code, the head loop already had the half that
+mattered: `parseAndDispatch` is the single answer to what accumulated bytes
+mean — read again, 400, 414, 431, or route. What the TLS branch actually
+duplicated came from the two things `armHeadRecv` hardcoded (the read target,
+and through it the completion callback) plus a 413-vs-431 decision it made
+*before* dispatch by re-parsing. So B4 names the read target and the fill
+accounting — the two a source replaces — and writes down the rule that an
+overrun discovered while filling is answered *through* the dispatch rather
+than beside it. Every other state the row implied (a fragment that yields
+nothing, an overrun, head bytes already staged at entry) is unreachable until
+a transforming source exists, so those variants land with TLS, where they will
+have a caller rather than being dormant (§1).
+**If that seam should be *proven* rather than documented**, the shape is B5's:
+a toy head source behind a test-only selection. It costs materially more than
+B5 did — the head path sits inside the L7 state machine (routing, dial,
+render) rather than at a pump's edge, so the selection has to reach into
+`Proxy` instead of being a policy handed to one `Pump`.
 
 **Order.** Critical path to a small TLS slice: **A5 → A4 → B2 →
 (B1 + B5) → B3 → B4**, with A1–A3 and Tier C as fill-in.
