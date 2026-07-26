@@ -626,6 +626,76 @@ test "l7: oversize request line is 414, oversize header section is 431" {
     }
 }
 
+/// The shared close of the two post-dial 431 arms. They answer the same
+/// bytes as the head-parse 431 above, so the assertion that tells them apart
+/// is the origin: it accepted a connection and never saw a request on it.
+fn expectRejectedAfterDial(bed: *const Http1Bed) !void {
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_headers_too_large"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+}
+
+test "l7: a head that fits on arrival but not after forwarding is 431" {
+    // Two arms the head-parse verdicts above cannot reach: a head the parser
+    // accepted, rejected only when the proxy renders what it will forward
+    // (#87).
+    {
+        // An added header pushes an exactly-`head_bytes_max` head over.
+        const rules = [_]filter.Rule{.{
+            .match = .{ .path_prefix = "/api" },
+            .actions = &.{.{ .header_add = .{ .name = "X-Trace", .value = "on" } }},
+        }};
+        const prefix = "GET /api HTTP/1.1\r\nHost: o\r\nX-Pad: ";
+        const suffix = "\r\n\r\n";
+        var request: [constants.head_bytes_max]u8 = undefined;
+        @memcpy(request[0..prefix.len], prefix);
+        @memset(request[prefix.len..][0 .. request.len - prefix.len - suffix.len], 'p');
+        @memcpy(request[request.len - suffix.len ..][0..suffix.len], suffix);
+
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 5,
+            .filters = &rules,
+            .route_prefix = "/api",
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange(&request);
+
+        try expectRejectedAfterDial(&bed);
+        try bed.expectDrained();
+    }
+    {
+        // A rewrite whose `to` dwarfs the prefix it replaces overruns the
+        // path scratch — on a head less than half full, so nothing about the
+        // arrival size is what rejects it.
+        const rules = [_]filter.Rule{.{
+            .match = .{},
+            .actions = &.{.{ .rewrite_prefix = .{ .from = "/r", .to = "/" ++ ("b" ** 5000) } }},
+        }};
+        const request = "GET /r/" ++ ("c" ** 4000) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
+
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 11,
+            .filters = &rules,
+            .route_prefix = "/r",
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange(request);
+
+        try expectRejectedAfterDial(&bed);
+        try bed.expectDrained();
+    }
+}
+
 test "l7: CONNECT and Upgrade are answered 501" {
     {
         var bed: Http1Bed = undefined;
@@ -1242,6 +1312,90 @@ test "l7: an unreachable origin is answered 502" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+test "l7: an origin response head the proxy cannot parse is 502" {
+    // Both verdicts on the origin's head — malformed, and oversize once the
+    // buffer is full — land on the same arm, and both are 502s the dial
+    // succeeded into: `accepted_count` is what separates them from the
+    // unreachable-origin 502 above (#87).
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 6,
+            // A status hparse rejects: three digits are the only shape.
+            .origin_response = "HTTP/1.1 2x0 OK\r\n\r\n",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+
+        try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+        try bed.expectDrained();
+    }
+    {
+        // A head that never terminates. It accumulates to `head_bytes_max`
+        // over several reads, and the parser turns the last Incomplete into
+        // the oversize verdict rather than asking for a read that has
+        // nowhere to land.
+        const unterminated = "HTTP/1.1 200 OK\r\nX-Pad: ";
+        const response = unterminated ++
+            ("p" ** (constants.head_bytes_max - unterminated.len));
+
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .seed = 8, .origin_response = response });
+        defer bed.tearDown();
+
+        try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+
+        try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+        try bed.expectDrained();
+    }
+}
+
+test "l7: an origin head that no longer fits once the close is injected is 502" {
+    // The origin's head is legal and exactly fills upstream.head; the render
+    // then has to add `Connection: close` and has nowhere to put it. The
+    // proxy cannot forward a head it cannot render, so the exchange fails
+    // like any other upstream failure — 502, not a truncated response (#87).
+    const prefix = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Pad: ";
+    const suffix = "\r\n\r\n";
+    var response_bytes: [constants.head_bytes_max]u8 = undefined;
+    @memcpy(response_bytes[0..prefix.len], prefix);
+    @memset(
+        response_bytes[prefix.len..][0 .. response_bytes.len - prefix.len - suffix.len],
+        'p',
+    );
+    @memcpy(response_bytes[response_bytes.len - suffix.len ..][0..suffix.len], suffix);
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 9, .origin_response = &response_bytes });
+    defer bed.tearDown();
+
+    // `Connection: close` is what forces the injection: the head is legal
+    // until the proxy has to announce a close the origin did not.
+    try bed.exchange("GET /pad HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
     try bed.expectDrained();
 }
 
