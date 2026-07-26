@@ -58,6 +58,25 @@ comptime {
     assert(overload_limits.relay_buffers >= 1);
 }
 
+/// The bulk response the large-body bands request. 256 KiB is 64 relay
+/// buffers' worth (§5's 4 KiB halves), so a request is dominated by the
+/// recv→send→recv loop rather than by its head — which is the point: these
+/// bands price a *byte*, where the keep-alive bands price a request. The
+/// path is served by the origin from a file of this size.
+const large_body_bytes: u32 = 256 * 1024;
+const large_body_target = "/large.bin";
+
+/// The §9 rate floor, as a percentage of the offered rate. A band that
+/// cannot keep up is a finding, not a pass: the error gates check *how*
+/// requests failed and never *whether* they happened, which is how a TLS
+/// band delivering 704 of 2000 req/s once went green
+/// (IMPLEMENTATION_NOTES.md). Every band this applies to has measured
+/// within a fraction of a percent of its offer, so the floor sits far
+/// enough below to leave loopback jitter alone while catching a collapse.
+/// The overload scenario is exempt by construction — it offers far past
+/// capacity on purpose.
+const rate_floor_percent: u64 = 90;
+
 const Flags = struct {
     rate: u64 = 20_000,
     // Connection: close is one TCP handshake per request, so on loopback
@@ -69,6 +88,12 @@ const Flags = struct {
     // port exhaustion, not a proxy fault. This is a latency band (the
     // per-request hop cost), never a throughput number.
     close_rate: u64 = 2_000,
+    /// Requests per second for the large-body bands. At
+    /// `large_body_bytes` each, 400/s offers ~100 MiB/s through the hop —
+    /// enough that per-byte cost dominates, and well inside what loopback
+    /// and a 4 KiB relay buffer sustain, so the band measures the proxy
+    /// rather than the generator.
+    large_rate: u64 = 400,
     connections: u32 = 32,
     duration_s: u64 = 10,
     origin: ?[]const u8 = null,
@@ -135,12 +160,14 @@ pub fn main(init: std.process.Init) !u8 {
     // zero-alloc witness covers reconnect-heavy close load too — not just
     // steady keep-alive. The haproxy references share the window; zoxy is
     // idle during them, so they cannot inflate its resident set.
-    const keep_alive = try runMode(arena, io, direct_port, &flags, false);
-    const close_mode = try runMode(arena, io, direct_port, &flags, true);
+    const keep_alive = try runMode(arena, io, direct_port, &flags, .keep_alive);
+    const close_mode = try runMode(arena, io, direct_port, &flags, .close);
+    const large_body = try runMode(arena, io, direct_port, &flags, .large_body);
     const rss_after_kb = try readRssKb(arena, io, zoxy_child.id);
 
-    printMode("keep-alive", &keep_alive);
-    printMode("Connection: close", &close_mode);
+    printMode("keep-alive", &keep_alive, .keep_alive);
+    printMode("Connection: close", &close_mode, .close);
+    printMode("large body", &large_body, .large_body);
     std.debug.print("zoxy RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
     // The §9 overload scenario runs against its own shrunken zoxy — the
@@ -148,8 +175,17 @@ pub fn main(init: std.process.Init) !u8 {
     const overload_ok = try runOverload(arena, io, &flags, origin_address, proxy_cpu);
 
     const drained_cleanly = try drainChild(io, &zoxy_child, &zoxy_running, "zoxy");
-    const passed = benchPassed(rss_before_kb, rss_after_kb, &keep_alive, &close_mode, drained_cleanly) and
-        overload_ok;
+    const passed = benchPassed(
+        rss_before_kb,
+        rss_after_kb,
+        &.{
+            .{ .label = "keep-alive", .scenario = .keep_alive, .runs = &keep_alive },
+            .{ .label = "close", .scenario = .close, .runs = &close_mode },
+            .{ .label = "large body", .scenario = .large_body, .runs = &large_body },
+        },
+        &flags,
+        drained_cleanly,
+    ) and overload_ok;
     return if (passed) 0 else 1;
 }
 
@@ -196,13 +232,13 @@ fn runOverload(
     _ = try awaitResponsive(arena, io, overload_http_port, "zoxy overload");
 
     const rss_before_kb = try readRssKb(arena, io, child.id);
-    var config = benchConfig(overload_http_port, overload_connections, flags.rate);
+    var config = benchConfig(overload_http_port, overload_connections, flags.rate, "/");
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
     const report = try zrk.runner.run(arena, io, &config, 0, null, null);
     const rss_after_kb = try readRssKb(arena, io, child.id);
 
     std.debug.print("-- overload (offered >> capacity) --\n", .{});
-    printReport("zoxy overload", &report);
+    printReport("zoxy overload", &report, .keep_alive);
     std.debug.print("zoxy overload RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
     // The counter dump (sheds, pressure engagements) lands in the run
@@ -319,11 +355,19 @@ fn warmUp(arena: std.mem.Allocator, io: Io, direct_port: u16) !void {
 /// The §9 pass/fail: flat RSS (the zero-alloc promise witnessed from
 /// outside), both baselines alive, both proxied modes healthy, and a
 /// clean drain. Prints each failure so a red run explains itself.
+/// One scenario's bands plus what they were asked to do, so the gates can
+/// name the failing band and compare its result against its own offer.
+const Band = struct {
+    label: []const u8,
+    scenario: Scenario,
+    runs: *const Runs,
+};
+
 fn benchPassed(
     rss_before_kb: u64,
     rss_after_kb: u64,
-    keep_alive: *const Runs,
-    close_mode: *const Runs,
+    bands: []const Band,
+    flags: *const Flags,
     drained_cleanly: bool,
 ) bool {
     // A live proxy always has resident pages; a zero reading means the
@@ -336,17 +380,28 @@ fn benchPassed(
     if (!rss_flat) {
         std.debug.print("FAIL: zoxy RSS grew under load\n", .{});
     }
-    const baselines_ok = keep_alive.direct.snapshot.counters.completed > 0 and
-        close_mode.direct.snapshot.counters.completed > 0;
-    if (!baselines_ok) {
-        std.debug.print("FAIL: a direct baseline completed zero requests\n", .{});
+    var bands_ok = true;
+    for (bands) |band| {
+        const offered = band.scenario.rate(flags);
+        // The direct baseline gates too, and not only on liveness: if the
+        // origin cannot keep up, every proxied band beside it is bounded by
+        // the origin and the comparison measures nothing.
+        if (band.runs.direct.snapshot.counters.completed == 0) {
+            std.debug.print("FAIL: {s} direct baseline completed zero requests\n", .{band.label});
+            bands_ok = false;
+        } else if (!rateHeld(band.label, "direct", offered, &band.runs.direct)) {
+            std.debug.print("       (the origin, not the proxy, is the limit here)\n", .{});
+            bands_ok = false;
+        }
+        // The proxied bands carry the hard §9 invariants: complete requests,
+        // a socket-error rate under 1% (a relay stall must not pass silently;
+        // faithfully relayed 4xx/5xx are excluded), and now an achieved rate
+        // that actually reaches what was offered.
+        if (!proxiesHealthy(band.label, band.runs)) bands_ok = false;
+        if (!rateHeld(band.label, "L4", offered, &band.runs.l4)) bands_ok = false;
+        if (!rateHeld(band.label, "L7", offered, &band.runs.l7)) bands_ok = false;
     }
-    // The proxied bands carry the hard §9 invariant: complete requests and
-    // a socket-error rate under 1% (a relay stall must not pass silently;
-    // faithfully relayed 4xx/5xx are excluded), in both persistence modes.
-    const proxies_ok = proxiesHealthy("keep-alive", keep_alive) and
-        proxiesHealthy("close", close_mode);
-    return rss_flat and baselines_ok and proxies_ok and drained_cleanly;
+    return rss_flat and bands_ok and drained_cleanly;
 }
 
 fn parseFlags(args: []const [:0]const u8) !Flags {
@@ -360,6 +415,9 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--close-rate")) {
             index += 1;
             flags.close_rate = try std.fmt.parseUnsigned(u64, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--large-rate")) {
+            index += 1;
+            flags.large_rate = try std.fmt.parseUnsigned(u64, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--connections")) {
             index += 1;
             flags.connections = try std.fmt.parseUnsigned(u32, args[index], 10);
@@ -410,6 +468,16 @@ fn originPortOf(origin_address: []const u8) u16 {
 fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !std.process.Child {
     const prefix = work_directory ++ "/nginx";
     try Io.Dir.cwd().createDirPath(io, prefix ++ "/logs");
+    // The bulk body the large-body bands request, written once. `alias`
+    // resolves relative to nginx's own prefix (`-p`), so the config needs no
+    // absolute path and the file lives beside the logs it never fills.
+    const body_name = "large.bin";
+    const body = try arena.alloc(u8, large_body_bytes);
+    // A fixed non-uniform fill: nothing here compresses or dedupes, but a
+    // constant byte would make an accidental short read look identical to a
+    // correct one in a hex dump.
+    for (body, 0..) |*byte, index| byte.* = @truncate(index);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = prefix ++ "/" ++ body_name, .data = body });
     const conf_path = prefix ++ "/bench.conf";
     const conf = try std.fmt.allocPrint(arena,
         \\daemon off;
@@ -422,10 +490,11 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
         \\    server {{
         \\        listen 127.0.0.1:{d};
         \\        location / {{ return 200 "zoxy-bench-origin\n"; }}
+        \\        location = {s} {{ default_type application/octet-stream; alias {s}; }}
         \\    }}
         \\}}
         \\
-    , .{origin_port});
+    , .{ origin_port, large_body_target, body_name });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = conf });
 
     const nginx_bin = try spawn_path.resolve(arena, io, environ, "nginx");
@@ -548,7 +617,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u
     const retry_sleep = Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms);
     var attempt: u8 = 0;
     while (attempt < probe_attempts_max) : (attempt += 1) {
-        var config = benchConfig(port, 4, 100);
+        var config = benchConfig(port, 4, 100, "/");
         config.duration_ns = std.time.ns_per_s / 2;
         const report = zrk.runner.run(arena, io, &config, 0, null, null) catch |err| {
             if (attempt == probe_attempts_max - 1) return err;
@@ -562,19 +631,59 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u
     return error.TargetUnresponsive;
 }
 
+/// What one band measures. `keep_alive` and `close` differ only in
+/// persistence and rate; `large_body` swaps the tiny origin reply for a
+/// bulk one, so the bands show per-*byte* cost rather than per-request cost
+/// — the number the record layer's price (and so the Phase-3b kTLS
+/// decision) has to be judged against (PLANS.md).
+const Scenario = enum {
+    keep_alive,
+    close,
+    large_body,
+
+    fn rate(scenario: Scenario, flags: *const Flags) u64 {
+        return switch (scenario) {
+            .keep_alive => flags.rate,
+            .close => flags.close_rate,
+            .large_body => flags.large_rate,
+        };
+    }
+
+    fn target(scenario: Scenario) []const u8 {
+        return switch (scenario) {
+            .keep_alive, .close => "/",
+            .large_body => large_body_target,
+        };
+    }
+
+    /// Bytes of response body each completed request carries, for the
+    /// throughput line. The small reply is not measured that way: at that
+    /// size the framing dominates and a MB/s figure would mislead.
+    fn bodyBytes(scenario: Scenario) ?u32 {
+        return switch (scenario) {
+            .keep_alive, .close => null,
+            .large_body => large_body_bytes,
+        };
+    }
+};
+
 fn loadTest(
     arena: std.mem.Allocator,
     io: Io,
     port: u16,
     flags: *const Flags,
-    close: bool,
+    scenario: Scenario,
 ) !zrk.runner.Report {
     assert(port != 0);
     assert(flags.duration_s >= 1);
-    const rate = if (close) flags.close_rate else flags.rate;
-    var config = benchConfig(port, flags.connections, rate);
+    var config = benchConfig(
+        port,
+        flags.connections,
+        scenario.rate(flags),
+        scenario.target(),
+    );
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
-    if (close) {
+    if (scenario == .close) {
         config.headers = &close_headers;
     }
     const report = try zrk.runner.run(arena, io, &config, 0, null, null);
@@ -592,32 +701,32 @@ const Runs = struct {
     http: zrk.runner.Report,
 };
 
-/// One full band matrix for a persistence mode. `close` sends
-/// `Connection: close` at the reduced close rate; the paths otherwise
-/// match the keep-alive run so the two modes are directly comparable.
+/// One full band matrix for a scenario. The paths are identical across
+/// scenarios so the bands are directly comparable.
 fn runMode(
     arena: std.mem.Allocator,
     io: Io,
     direct_port: u16,
     flags: *const Flags,
-    close: bool,
+    scenario: Scenario,
 ) !Runs {
     assert(direct_port != 0);
     return .{
-        .direct = try loadTest(arena, io, direct_port, flags, close),
-        .l4 = try loadTest(arena, io, zoxy_port, flags, close),
-        .l7 = try loadTest(arena, io, zoxy_http_port, flags, close),
-        .tcp = try loadTest(arena, io, haproxy_port, flags, close),
-        .http = try loadTest(arena, io, haproxy_http_port, flags, close),
+        .direct = try loadTest(arena, io, direct_port, flags, scenario),
+        .l4 = try loadTest(arena, io, zoxy_port, flags, scenario),
+        .l7 = try loadTest(arena, io, zoxy_http_port, flags, scenario),
+        .tcp = try loadTest(arena, io, haproxy_port, flags, scenario),
+        .http = try loadTest(arena, io, haproxy_http_port, flags, scenario),
     };
 }
 
-fn benchConfig(port: u16, connections: u32, rate: u64) zrk.cli.Config {
+fn benchConfig(port: u16, connections: u32, rate: u64, target: []const u8) zrk.cli.Config {
     assert(port != 0);
     assert(connections >= 1);
     assert(rate >= 1);
+    assert(target.len >= 1 and target[0] == '/');
     return .{
-        .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" },
+        .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = target },
         .connections = connections,
         .rate = rate,
         .timeout_ns = 2 * std.time.ns_per_s,
@@ -626,11 +735,32 @@ fn benchConfig(port: u16, connections: u32, rate: u64) zrk.cli.Config {
     };
 }
 
-fn printReport(label: []const u8, report: *const zrk.runner.Report) void {
+fn printReport(label: []const u8, report: *const zrk.runner.Report, scenario: Scenario) void {
     const hist = &report.snapshot.hist;
     const counters = &report.snapshot.counters;
     const rate_achieved =
         @as(f64, @floatFromInt(counters.completed)) / report.elapsed_s;
+    // A bulk band's headline number is bytes per second, not requests: the
+    // whole point is what a byte costs through the hop (§9).
+    if (scenario.bodyBytes()) |body_bytes| {
+        const mib_per_s = rate_achieved * @as(f64, @floatFromInt(body_bytes)) /
+            (1024 * 1024);
+        std.debug.print(
+            "{s}  {d:.0} req/s  {d:.0} MiB/s  p50 {d} us  p99 {d} us  " ++
+                "({d} completed, {d} socket-errors, {d} status-errors)\n",
+            .{
+                label,
+                rate_achieved,
+                mib_per_s,
+                hist.valueAtPercentile(50.0),
+                hist.valueAtPercentile(99.0),
+                counters.completed,
+                counters.socketErrors(),
+                counters.status_errors,
+            },
+        );
+        return;
+    }
     // zrk histograms record microseconds (the wrk2 convention). Socket
     // errors (connect + read + write + timeouts, via zrk's socketErrors())
     // are the relay-stall modes and are shown separately from status
@@ -680,15 +810,43 @@ fn printOverhead(
 }
 
 /// One mode's bands under a labelled header, then its hop overheads.
-fn printMode(label: []const u8, runs: *const Runs) void {
+fn printMode(label: []const u8, runs: *const Runs, scenario: Scenario) void {
     assert(label.len > 0);
-    std.debug.print("-- {s} --\n", .{label});
-    printReport("direct      ", &runs.direct);
-    printReport("zoxy L4     ", &runs.l4);
-    printReport("zoxy L7     ", &runs.l7);
-    printReport("haproxy tcp ", &runs.tcp);
-    printReport("haproxy http", &runs.http);
+    if (scenario.bodyBytes()) |body_bytes| {
+        std.debug.print("-- {s} ({d} KiB per response) --\n", .{ label, body_bytes / 1024 });
+    } else {
+        std.debug.print("-- {s} --\n", .{label});
+    }
+    printReport("direct      ", &runs.direct, scenario);
+    printReport("zoxy L4     ", &runs.l4, scenario);
+    printReport("zoxy L7     ", &runs.l7, scenario);
+    printReport("haproxy tcp ", &runs.tcp, scenario);
+    printReport("haproxy http", &runs.http, scenario);
     printOverhead(&runs.direct, &runs.l4, &runs.l7, &runs.tcp, &runs.http);
+}
+
+/// Did the band deliver what was offered (§9)? Compares the achieved rate
+/// against `rate_floor_percent` of the offer and prints both numbers, since
+/// the useful part of a shortfall is its size.
+fn rateHeld(
+    mode: []const u8,
+    path: []const u8,
+    offered: u64,
+    report: *const zrk.runner.Report,
+) bool {
+    assert(mode.len > 0);
+    assert(path.len > 0);
+    assert(offered >= 1);
+    assert(report.elapsed_s > 0);
+    const achieved = @as(f64, @floatFromInt(report.snapshot.counters.completed)) /
+        report.elapsed_s;
+    const floor = @as(f64, @floatFromInt(offered * rate_floor_percent)) / 100;
+    if (achieved >= floor) return true;
+    std.debug.print(
+        "FAIL: {s} {s} delivered {d:.0} of {d} req/s offered ({d}% floor)\n",
+        .{ mode, path, achieved, offered, rate_floor_percent },
+    );
+    return false;
 }
 
 /// The §9 hard invariant on the proxied bands: both zoxy protocols

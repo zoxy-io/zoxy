@@ -249,8 +249,41 @@ read against it.
 
 | # | slice | ~ | what it buys |
 |---|---|---|---|
-| D1 | Tier-1 gate on achieved rate against offered | 40 | the §9 gates check socket and status errors only, so a run delivering 704 of 2000 req/s passed them |
-| D2 | A large-body band in the harness | 80 | the record layer's per-byte cost is unmeasured, and the kTLS decision (Phase 3b) depends on that number |
+| D1 | Tier-1 gate on achieved rate against offered — *landed* | 40 | the §9 gates check socket and status errors only, so a run delivering 704 of 2000 req/s passed them |
+| D2 | A large-body band in the harness — *landed* | 80 | the record layer's per-byte cost is unmeasured, and the kTLS decision (Phase 3b) depends on that number |
+
+**The first large-body numbers** (2026-07-26, defaults: 256 KiB per response,
+400/s, 32 connections, one core for the proxy). Every path delivered the full
+offer, so the band is a latency comparison at 100 MiB/s rather than a
+throughput ceiling:
+
+| path | p50 | p99 | hop cost (p50 over direct) |
+|---|---|---|---|
+| direct (nginx) | 632 µs | 1140 µs | — |
+| zoxy L4 | 1344 µs | 2805 µs | +712 µs |
+| zoxy L7 | 1430 µs | 2719 µs | +798 µs |
+| haproxy tcp | 1245 µs | 2019 µs | +613 µs |
+| haproxy http | 1268 µs | 2523 µs | +636 µs |
+
+So a 256 KiB relay costs ~100–160 µs more through zoxy than through haproxy,
+~15–25% on the hop — the first per-byte figure this project has, and the
+baseline the Phase-3b kTLS argument has to beat. 100 MiB/s is what the *offer*
+asked for, not a ceiling; raise `--large-rate` to find one.
+
+The rate gate is verified by making it fail, not only by watching it pass: at
+`--rate 200000` the bands read L4 105101 and L7 93430 against the 90% floor and
+the run goes red, naming both numbers, while the direct baseline (199811 of
+200000) passes — so the gate blames the proxy, not the origin.
+
+**Found while landing these, and not caused by them:** the overload scenario's
+stall gate (`read_errors + timeouts` under 1% of completed) fails on a
+developer box — 7.7% on clean `main`, 11.4% with these bands added, both
+reproducible. Deep queueing is the scenario's *point* (p50 36 ms, p99 484 ms,
+max 1.1 s at 20k/s offered into 64 conn slots), and zrk's 2 s wire timeout
+inevitably fires for a slice of that, so a 1% ceiling looks mis-specified for a
+band deliberately driven past capacity. Filed rather than adjusted here:
+weakening a gate as a side effect of adding one is how gates stop meaning
+anything.
 
 **What B4 landed, and why it is small.** The row budgeted 100 lines for a
 source seam. Read against the code, the head loop already had the half that
