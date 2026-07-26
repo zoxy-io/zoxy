@@ -423,6 +423,12 @@ const Http1Bed = struct {
     const Options = struct {
         seed: u64,
         partial_io: bool = false,
+        /// Socket-ring size, null for SimIo's own default (§9). The default
+        /// is narrower than a head buffer, so no delivery can fill one in a
+        /// single read; a scenario that needs the shape production takes
+        /// raises it. Independent of `partial_io`, which fragments what the
+        /// ring was willing to carry.
+        inbox_bytes: ?u32 = null,
         origin_response: []const u8 = "",
         origin_listens: bool = true,
         origin_closes: bool = false,
@@ -459,10 +465,11 @@ const Http1Bed = struct {
         errdefer bed.arena_state.deinit();
         const arena = bed.arena_state.allocator();
 
-        try bed.sim_io.init(arena, .{
-            .seed = options.seed,
-            .adversary = .{ .partial_io = options.partial_io },
-        });
+        var adversary: SimIo.Adversary = .{ .partial_io = options.partial_io };
+        if (options.inbox_bytes) |bytes| {
+            adversary.inbox_bytes = bytes;
+        }
+        try bed.sim_io.init(arena, .{ .seed = options.seed, .adversary = adversary });
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
@@ -1273,6 +1280,51 @@ test "l7: a coalesced excess too large to ride the rendered head is written sepa
         );
         try bed.expectDrained();
     }
+}
+
+test "l7: the coalesced excess in the shape production delivers it" {
+    // The same branch as the test above, reached the way production reaches
+    // it: a 41-byte head with a body large enough that one read fills
+    // upstream.head outright. The test above has to grow the *head* to 8 KiB
+    // instead, because the default socket ring is half a head buffer and can
+    // never hand over more than that at once — the branch is common in
+    // production and unrepresentable in the simulator until a scenario opens
+    // the ring (#90).
+    const body_len = 9000;
+    const head = std.fmt.comptimePrint(
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n",
+        .{body_len},
+    );
+    const injected_len = "Connection: close\r\n".len;
+    var response_bytes: [head.len + body_len]u8 = undefined;
+    @memcpy(response_bytes[0..head.len], head);
+    for (response_bytes[head.len..], 0..) |*byte, index| {
+        byte.* = @intCast('a' + (index % 26));
+    }
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 12,
+        .inbox_bytes = constants.head_bytes_max,
+        .origin_response = &response_bytes,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /big HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_response_excess_sent"),
+    );
+    // The body crosses the excess write and the pump behind it intact.
+    const response = bed.client.response();
+    try std.testing.expectEqual(head.len + injected_len + body_len, response.len);
+    try std.testing.expectEqualStrings(
+        response_bytes[head.len..],
+        response[response.len - body_len ..],
+    );
+    try bed.expectDrained();
 }
 
 test "l7: a connection-close (until-close) response body relays to the client's EOF" {

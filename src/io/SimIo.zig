@@ -24,7 +24,22 @@ const SimIo = @This();
 const sockets_max: u16 = 1024;
 const listeners_max: u16 = 32;
 const accept_queue_max: u16 = 64;
-const inbox_bytes: u32 = 4096;
+/// The widest a scenario may open a socket ring. Sized to the head buffer
+/// so a scenario can reproduce a production-shaped delivery — one read
+/// filling `conn.head`/`upstream.head` outright — which a narrower ring
+/// makes unrepresentable whatever the seed.
+const inbox_bytes_max: u32 = constants.head_bytes_max;
+/// What a scenario gets unless it asks for more. Half the head buffer, so
+/// a head larger than it still arrives in pieces by default and the §7
+/// detect-and-retry re-parse keeps being exercised.
+const inbox_bytes_default: u32 = 4096;
+comptime {
+    assert(inbox_bytes_default >= 1);
+    assert(inbox_bytes_default <= inbox_bytes_max);
+    // The default must stay narrower than a head buffer, or every scenario
+    // silently loses the piecewise head arrival it covers today.
+    assert(inbox_bytes_default < constants.head_bytes_max);
+}
 const pending_ops_max: u32 = constants.in_flight_ops_max;
 const pending_signals_max: u8 = 8;
 /// The clock starts at one virtual second, not zero, so code that would
@@ -60,6 +75,13 @@ const blackholed_addresses_max: u8 = 4;
 pub const Adversary = struct {
     /// Bias deliveries toward 1-byte and full-length reads/writes.
     partial_io: bool = true,
+    /// Usable socket-ring size: the ceiling on what one recv can deliver,
+    /// however much the peer wrote. Where `partial_io` fragments a delivery
+    /// that could have been whole, this bounds how whole "whole" ever gets —
+    /// the two are independent knobs on the same question. Raising it to
+    /// `inbox_bytes_max` is what lets a scenario fill a head buffer in one
+    /// read, the shape production takes and the default cannot express.
+    inbox_bytes: u32 = inbox_bytes_default,
     connect_delay_ns_max: u64 = 0,
     connect_refuse_percent: u8 = 0,
     connect_blackhole_percent: u8 = 0,
@@ -201,13 +223,19 @@ const ListenerEntry = struct {
 };
 
 const Ring = struct {
-    bytes: [inbox_bytes]u8,
+    bytes: [inbox_bytes_max]u8,
     head: u32,
     count: u32,
+    /// What this ring actually wraps at, set per scenario from the
+    /// adversary. The backing array is the widest any scenario may ask
+    /// for; this is what the scenario asked for.
+    capacity: u32,
 
     fn freeSpace(ring: *const Ring) u32 {
-        assert(ring.count <= inbox_bytes);
-        return inbox_bytes - ring.count;
+        assert(ring.capacity >= 1);
+        assert(ring.capacity <= inbox_bytes_max);
+        assert(ring.count <= ring.capacity);
+        return ring.capacity - ring.count;
     }
 
     fn push(ring: *Ring, source: []const u8) u32 {
@@ -215,21 +243,26 @@ const Ring = struct {
         assert(n <= source.len);
         var written: u32 = 0;
         while (written < n) : (written += 1) {
-            ring.bytes[(ring.head + ring.count + written) % inbox_bytes] = source[written];
+            ring.bytes[(ring.head + ring.count + written) % ring.capacity] = source[written];
         }
         ring.count += n;
-        assert(ring.count <= inbox_bytes);
+        assert(ring.count <= ring.capacity);
         return n;
     }
 
     fn pop(ring: *Ring, target: []u8) u32 {
         const n: u32 = @min(@as(u32, @intCast(target.len)), ring.count);
         assert(n <= target.len);
+        // The modulus below is this function's own precondition, not one
+        // borrowed from whoever pushed.
+        assert(ring.capacity >= 1);
+        assert(ring.capacity <= inbox_bytes_max);
+        assert(ring.count <= ring.capacity);
         var read: u32 = 0;
         while (read < n) : (read += 1) {
-            target[read] = ring.bytes[(ring.head + read) % inbox_bytes];
+            target[read] = ring.bytes[(ring.head + read) % ring.capacity];
         }
-        ring.head = (ring.head + n) % inbox_bytes;
+        ring.head = (ring.head + n) % ring.capacity;
         ring.count -= n;
         return n;
     }
@@ -246,6 +279,10 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     assert(options.adversary.reset_percent <= 100);
     assert(options.adversary.kernel_pressure_percent <= 100);
     assert(options.adversary.batch_max >= 1);
+    // A ring that cannot hold a byte can never make progress, and one
+    // wider than the backing array would index past it.
+    assert(options.adversary.inbox_bytes >= 1);
+    assert(options.adversary.inbox_bytes <= inbox_bytes_max);
 
     io.listeners = try arena.alloc(ListenerEntry, listeners_max);
     io.pending = try arena.alloc(*Completion, pending_ops_max);
@@ -822,8 +859,8 @@ fn finishConnect(
     }
     const client_entry = io.sockets.acquire() orelse unreachable;
     const server_entry = io.sockets.acquire() orelse unreachable;
-    initSocketEntry(client_entry);
-    initSocketEntry(server_entry);
+    initSocketEntry(client_entry, io.adversary.inbox_bytes);
+    initSocketEntry(server_entry, io.adversary.inbox_bytes);
     client_entry.peer = @intCast(io.sockets.indexOf(server_entry));
     server_entry.peer = @intCast(io.sockets.indexOf(client_entry));
     listener.accept_queue[listener.accept_queue_len] = io.socketHandle(server_entry);
@@ -1011,7 +1048,9 @@ fn findListener(io: *SimIo, address: std.Io.net.IpAddress) ?*ListenerEntry {
     return null;
 }
 
-fn initSocketEntry(entry: *SocketEntry) void {
+fn initSocketEntry(entry: *SocketEntry, inbox_capacity: u32) void {
+    assert(inbox_capacity >= 1);
+    assert(inbox_capacity <= inbox_bytes_max);
     entry.peer = peer_none;
     entry.fin_received = false;
     entry.read_shutdown = false;
@@ -1022,6 +1061,7 @@ fn initSocketEntry(entry: *SocketEntry) void {
     entry.nodelay = false;
     entry.inbox.head = 0;
     entry.inbox.count = 0;
+    entry.inbox.capacity = inbox_capacity;
 }
 
 fn closeEntry(io: *SimIo, socket: Socket) void {
