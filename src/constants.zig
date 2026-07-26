@@ -444,6 +444,11 @@ comptime {
 /// fields make that particular mistake unrepresentable, and a fourth pool
 /// (§4's TLS engines) is a field and a term rather than two more positions
 /// at every call site.
+///
+/// Not `Config.Limits` plus byte sizes, though the three counts appear in
+/// both: `config.zig` imports this file, so the dependency cannot run the
+/// other way. `Limits` is what an operator provisions; this is what the
+/// provisioning costs, and a new pool needs a field in each.
 pub const PoolSizes = struct {
     conn_slots: u32,
     conn_bytes: u64,
@@ -453,7 +458,9 @@ pub const PoolSizes = struct {
     upstream_bytes: u64,
 };
 
-pub fn memoryBytesTotal(sizes: PoolSizes) u64 {
+/// By pointer: `PoolSizes` is past the 16-byte threshold TIGER_STYLE sets
+/// for by-value arguments, and a stack copy of the budget buys nothing.
+pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     assert(sizes.conn_slots >= 1);
     assert(sizes.conn_slots <= conn_slots_max);
     assert(sizes.relay_buffers >= 1);
@@ -499,7 +506,7 @@ test "budgets: memory total matches the closed form" {
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes;
-    try std.testing.expectEqual(expected_max, memoryBytesTotal(.{
+    try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
         .relay_buffers = relay_buffers_max,
@@ -508,7 +515,7 @@ test "budgets: memory total matches the closed form" {
         .upstream_bytes = upstream_bytes,
     }));
     const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
-    try std.testing.expectEqual(expected_small, memoryBytesTotal(.{
+    try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
         .conn_slots = 64,
         .conn_bytes = conn_bytes,
         .relay_buffers = 8,
