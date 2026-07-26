@@ -82,6 +82,11 @@ pub fn main(init: std.process.Init) !u8 {
     // `dedicate` yields null.
     const zoxy_cpu = affinity.dedicate(io, flags.zoxy_cpu).?;
 
+    // Both ways this run can record nothing, settled before the load
+    // window rather than after it (see the two helpers).
+    if (!ptraceScopeAllowsAttach(io)) return refuseNoPtraceAttach();
+    const cycles_event = cyclesEventFor(io, zoxy_cpu);
+
     var origin_child = try spawnNginx(arena, io, environ);
     defer origin_child.kill(io);
 
@@ -94,12 +99,12 @@ pub fn main(init: std.process.Init) !u8 {
     // Warm up and prove the path serves before spending a measured run on it.
     try awaitResponsive(arena, io, &flags);
     std.debug.print(
-        "profile: zoxy pid {d} pinned to cpu {d}; driving {s} listener; origin + load pinned off it\n",
-        .{ zoxy_pid, zoxy_cpu, @tagName(flags.protocol) },
+        "profile: zoxy pid {d} pinned to cpu {d} ({s}); driving {s} listener; origin + load pinned off it\n",
+        .{ zoxy_pid, zoxy_cpu, cycles_event, @tagName(flags.protocol) },
     );
 
     // Record only the zoxy pid for the load's duration while zrk saturates it.
-    var perf_child = try spawnPerf(arena, io, environ, zoxy_pid, &flags);
+    var perf_child = try spawnPerf(arena, io, environ, zoxy_pid, cycles_event, &flags);
     std.debug.print(
         "profile: measuring {d}s at {d} req/s over {d} connections\n",
         .{ flags.duration_s, flags.rate, flags.connections },
@@ -237,23 +242,127 @@ fn spawnZoxy(
     };
 }
 
+/// Reads a small sysfs/procfs file into `buffer`. Null when the file is
+/// absent or unreadable — every caller documents its own fallback.
+fn readSmallFile(io: Io, path: []const u8, buffer: []u8) ?[]const u8 {
+    assert(buffer.len > 0);
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var read_buffer: [256]u8 = undefined;
+    var file_reader = file.reader(io, &read_buffer);
+    const len = file_reader.interface.readSliceShort(buffer) catch return null;
+    assert(len <= buffer.len);
+    return buffer[0..len];
+}
+
+/// Whether a sysfs cpu mask (`"0-3"`, `"0,2-3"`) names `cpu`.
+///
+/// The content is a kernel-owned sysfs file, but it is still parsed as
+/// untrusted: a segment that does not parse, or whose bounds are
+/// reversed, is skipped rather than trusted or fatal. Skipping can only
+/// ever *narrow* the answer to "not this PMU", and every caller's
+/// fallback for that is a correct-but-less-specific event.
+fn cpuListContains(list: []const u8, cpu: u16) bool {
+    var ranges = std.mem.splitScalar(u8, list, ',');
+    while (ranges.next()) |range_raw| {
+        const range = std.mem.trim(u8, range_raw, " \n\t");
+        if (range.len == 0) continue;
+        const dash = std.mem.indexOfScalar(u8, range, '-');
+        if (dash) |at| assert(at < range.len);
+        const low_text = if (dash) |at| range[0..at] else range;
+        const high_text = if (dash) |at| range[at + 1 ..] else range;
+        // Malformed segment: not a cpu id, so it names no cpu (see above).
+        const low = std.fmt.parseUnsigned(u16, low_text, 10) catch continue;
+        const high = std.fmt.parseUnsigned(u16, high_text, 10) catch continue;
+        if (low > high) continue;
+        assert(low <= high);
+        if (cpu >= low and cpu <= high) return true;
+    }
+    return false;
+}
+
+/// The cycles event to sample zoxy with, qualified by the PMU that owns
+/// the dedicated core.
+///
+/// This matters on a hybrid part. An unqualified `cycles:u` binds to a
+/// single PMU — cpu_atom, as perf resolves it here — while `dedicate`
+/// deliberately pins zoxy to a *P*-core. The two never meet, so the run
+/// records zero samples and still renders a flamegraph, which reads like
+/// a measurement instead of the failure it is. Naming the PMU that owns
+/// the chosen cpu keeps the pairing correct whichever core is picked,
+/// including a `--cpu` override onto an E-core.
+fn cyclesEventFor(io: Io, cpu: u16) []const u8 {
+    var buffer: [256]u8 = undefined;
+    const event = event: {
+        if (readSmallFile(io, "/sys/devices/cpu_core/cpus", &buffer)) |list| {
+            if (cpuListContains(list, cpu)) break :event "cpu_core/cycles/u";
+        }
+        if (readSmallFile(io, "/sys/devices/cpu_atom/cpus", &buffer)) |list| {
+            if (cpuListContains(list, cpu)) break :event "cpu_atom/cycles/u";
+        }
+        break :event "cycles:u";
+    };
+    // Every arm names a cycles event, PMU-qualified or plain. An empty or
+    // unrelated event is what silently records nothing, which is the bug
+    // this function exists to prevent.
+    assert(event.len > 0);
+    assert(std.mem.indexOf(u8, event, "cycles") != null);
+    return event;
+}
+
+/// The remedy for a box whose `ptrace_scope` forbids the attach. Split
+/// out of `main` so the preflight costs it one line, not twelve.
+fn refuseNoPtraceAttach() u8 {
+    std.debug.print(
+        \\profile: kernel.yama.ptrace_scope is not 0, so `perf record -p` cannot
+        \\  attach to zoxy and the recording would come back empty. Either:
+        \\    sudo sysctl -w kernel.yama.ptrace_scope=0
+        \\  or run this profile as root.
+        \\
+    , .{});
+    return 1;
+}
+
+/// Whether `perf record -p` can attach to zoxy at all.
+///
+/// zoxy is spawned as *our* child so it can be pinned, warmed up and
+/// drained on SIGTERM; perf is its sibling, not its ancestor. Under
+/// `yama/ptrace_scope > 0` the kernel refuses that attach — and perf
+/// reports success anyway, writing a header-only perf.data. Checked up
+/// front so a misconfigured box costs a message rather than a full load
+/// window and an empty flamegraph.
+fn ptraceScopeAllowsAttach(io: Io) bool {
+    var buffer: [16]u8 = undefined;
+    const content = readSmallFile(io, "/proc/sys/kernel/yama/ptrace_scope", &buffer) orelse
+        return true;
+    assert(content.len <= buffer.len);
+    const text = std.mem.trim(u8, content, " \n\t");
+    assert(text.len <= content.len);
+    // Absent, empty or unreadable all mean "no yama restriction to prove",
+    // which is the permissive answer every non-yama kernel gives.
+    if (text.len == 0) return true;
+    return std.mem.eql(u8, text, "0");
+}
+
 fn spawnPerf(
     arena: std.mem.Allocator,
     io: Io,
     environ: std.process.Environ,
     zoxy_pid: std.process.Child.Id,
+    event: []const u8,
     flags: *const Flags,
 ) !std.process.Child {
-    // cycles:u + LBR: hardware call-graph from the branch-record MSRs, no frame
+    // LBR: hardware call-graph from the branch-record MSRs, no frame
     // pointers or DWARF CFI needed. `-- sleep N` bounds the recording to the
     // load window; perf self-terminates when sleep exits and writes the data.
+    assert(event.len > 0);
     const pid = try std.fmt.allocPrint(arena, "{d}", .{zoxy_pid});
     const freq = try std.fmt.allocPrint(arena, "{d}", .{flags.freq});
     const seconds = try std.fmt.allocPrint(arena, "{d}", .{flags.duration_s});
     const perf_bin = try spawn_path.resolve(arena, io, environ, "perf");
     return std.process.spawn(io, .{
         .argv = &.{
-            perf_bin, "record", "-p",           pid,   "-e", "cycles:u",
+            perf_bin, "record", "-p",           pid,   "-e", event,
             "-F",     freq,     "--call-graph", "lbr", "-o", perf_data_path,
             "--",     "sleep",  seconds,
         },
@@ -322,13 +431,34 @@ fn printReport(report: *const zrk.runner.Report) void {
 
 fn generateFlamegraph(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !void {
     try runToFile(arena, io, environ, &.{ "perf", "script", "-i", perf_data_path }, script_path);
+    try requireSamples(io);
     try runToFile(arena, io, environ, &.{ "stackcollapse-perf.pl", script_path }, folded_path);
     try runToFile(arena, io, environ, &.{
         "flamegraph.pl", "--title",
-        "zoxy under load (cycles:u, LBR call-graph) — see run for path",
+        "zoxy under load (user cycles, LBR call-graph) — see run for path",
         folded_path,
     }, svg_path);
     std.debug.print("profile: flamegraph -> {s}\n", .{svg_path});
+}
+
+/// A sample-free recording folds and renders exactly like a real one —
+/// into an empty flamegraph that reads as a measurement. The preflight
+/// checks cover the two causes seen so far; this catches every other one,
+/// so a profile is never quietly nothing.
+fn requireSamples(io: Io) !void {
+    var buffer: [1]u8 = undefined;
+    const head = readSmallFile(io, script_path, &buffer) orelse "";
+    assert(head.len <= buffer.len);
+    // One byte of `perf script` output is one sample folded; zero bytes is
+    // a recording that captured nothing at all.
+    if (head.len > 0) return;
+    std.debug.print(
+        \\profile: perf recorded zero samples — no flamegraph written.
+        \\  Check that the event bound to the PMU owning zoxy's core, and that
+        \\  perf could attach (kernel.yama.ptrace_scope, perf_event_paranoid).
+        \\
+    , .{});
+    return error.NoSamplesRecorded;
 }
 
 /// Spawn `argv` with stdout redirected to `out_path` — the Zig stand-in for a
