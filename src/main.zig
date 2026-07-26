@@ -224,14 +224,14 @@ fn printBudgets(
         limits.upstream_slots,
         @intCast(config.listeners.len),
     );
-    const memory_total = constants.memoryBytesTotal(
-        limits.conn_slots,
-        @sizeOf(ServerXev.ConnType),
-        limits.relay_buffers,
-        @sizeOf(zoxy.RelayBuffer),
-        limits.upstream_slots,
-        @sizeOf(UpstreamType),
-    );
+    const memory_total = constants.memoryBytesTotal(.{
+        .conn_slots = limits.conn_slots,
+        .conn_bytes = @sizeOf(ServerXev.ConnType),
+        .relay_buffers = limits.relay_buffers,
+        .relay_buffer_pair_bytes = @sizeOf(zoxy.RelayBuffer),
+        .upstream_slots = limits.upstream_slots,
+        .upstream_bytes = @sizeOf(UpstreamType),
+    });
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;

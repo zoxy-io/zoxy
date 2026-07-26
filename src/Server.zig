@@ -361,7 +361,7 @@ pub fn Server(comptime IoType: type) type {
             if (server.draining) {
                 // An accept completion can already be in flight when the
                 // drain begins; it is shed, not served.
-                server.counters.increment("shed_draining");
+                server.witnessShed("shed_draining");
                 shed.closeQuietly(IoType, server.io, client_socket);
                 return;
             }
@@ -478,12 +478,22 @@ pub fn Server(comptime IoType: type) type {
         fn admitConn(server: *Self, client_socket: IoType.Socket) ?*ConnType {
             assert(!server.draining);
             const conn = server.conns.acquire() orelse {
-                server.counters.increment("shed_conn_slots");
+                server.witnessShed("shed_conn_slots");
                 shed.closeWithRst(IoType, server.io, client_socket);
                 return null;
             };
             server.updateConnPressure();
             return conn;
+        }
+
+        /// Witness one admission-gate shed: a connection the kernel handed us
+        /// that never became `admitted`. The name is checked here because
+        /// `reconcile` sums the gate identity by exactly this prefix (§9), so
+        /// naming a rung is what puts it in the sum — one door for every rung,
+        /// rather than the rule holding only where someone remembered it.
+        fn witnessShed(server: *Self, comptime rung: []const u8) void {
+            comptime assert(std.mem.startsWith(u8, rung, "shed_"));
+            server.counters.increment(rung);
         }
 
         /// Undo an admission that cannot proceed: a connection already
@@ -508,14 +518,11 @@ pub fn Server(comptime IoType: type) type {
             client_socket: IoType.Socket,
             comptime rung: []const u8,
         ) void {
-            // Naming, and only naming: what this witnesses is always a shed.
-            // `reconcile` sums an explicit list (§9), so a new rung has to be
-            // added there too — the simulator's reconcile invariant is what
-            // actually catches a miss, not this assert.
-            comptime assert(std.mem.startsWith(u8, rung, "shed_"));
             assert(!server.draining);
             server.releaseConn(conn);
-            server.counters.increment(rung);
+            // Through the one door, so the gate identity's naming rule holds
+            // here exactly as it does at the other rungs (§9).
+            server.witnessShed(rung);
             shed.closeQuietly(IoType, server.io, client_socket);
         }
 

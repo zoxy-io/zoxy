@@ -160,13 +160,47 @@ pub const Counters = struct {
 
     /// The §9 invariant: admitted work is completed or still active, and
     /// every accepted connection was admitted or shed — no third outcome.
+    /// The prefix that makes a counter part of the gate identity below.
+    /// Naming is the membership rule on purpose: every rung is witnessed
+    /// through `Server.witnessShed`, which comptime-asserts the name (§8), so
+    /// a new admission shed joins `shedTotal` by being named rather than by
+    /// being remembered — which is what the previous hand-written sum could
+    /// not promise.
+    ///
+    /// The `l7_shed_*` counters sit outside it deliberately: those
+    /// connections were admitted and answered a 503, so they complete
+    /// normally and belong to the flow identity, not the gate one.
+    const shed_prefix = "shed_";
+
+    /// How many counters the prefix selects. Comptime, so a rename that
+    /// emptied the sum would fail the build instead of making the gate
+    /// identity vacuously true.
+    const shed_rung_count: usize = blk: {
+        var count: usize = 0;
+        for (@typeInfo(Counters).@"struct".fields) |field| {
+            if (field.type != Value) continue;
+            if (std.mem.startsWith(u8, field.name, shed_prefix)) count += 1;
+        }
+        break :blk count;
+    };
+
+    /// Every admission shed, summed off the field set rather than a list.
+    fn shedTotal(counters: *const Counters) u64 {
+        comptime assert(shed_rung_count >= 1);
+        var total: u64 = 0;
+        inline for (@typeInfo(Counters).@"struct".fields) |field| {
+            if (field.type != Value) continue;
+            if (comptime !std.mem.startsWith(u8, field.name, shed_prefix)) continue;
+            total += counters.get(field.name);
+        }
+        return total;
+    }
+
     pub fn reconcile(counters: *const Counters, active_count: u32) bool {
         const admitted = counters.get("admitted");
         const completed = counters.get("completed");
         const accepted = counters.get("accepted");
-        const shed = counters.get("shed_conn_slots") +
-            counters.get("shed_relay_buffers") +
-            counters.get("shed_draining");
+        const shed = counters.shedTotal();
         assert(completed <= admitted);
         assert(admitted <= accepted);
         // Every 504 verdict rides a deadline expiry (§8) — the verdict
@@ -247,4 +281,48 @@ test "counters: render bound holds at the maximum value" {
     // one (the "exact" claim in its doc comment).
     try std.testing.expectEqual(Counters.render_bytes_max, text.len);
     try std.testing.expect(std.mem.indexOf(u8, text, "18446744073709551615\n") != null);
+}
+
+test "counters: the gate identity sums exactly today's admission rungs" {
+    // Membership is by name (`shed_prefix`), so this pins what that rule
+    // currently selects: a new `shed_*` counter changes the gate identity,
+    // and should change this list in the same commit that adds it. The
+    // `l7_shed_*` rejects must stay out — those connections were admitted.
+    const expected = [_][]const u8{
+        "shed_conn_slots",
+        "shed_relay_buffers",
+        "shed_draining",
+    };
+    comptime var actual_count: usize = 0;
+    inline for (@typeInfo(Counters).@"struct".fields) |field| {
+        if (field.type != Counters.Value) continue;
+        if (!comptime std.mem.startsWith(u8, field.name, Counters.shed_prefix)) continue;
+        actual_count += 1;
+        comptime var listed = false;
+        inline for (expected) |name| {
+            if (comptime std.mem.eql(u8, name, field.name)) listed = true;
+        }
+        if (!listed) {
+            std.debug.print("unlisted shed counter: {s}\n", .{field.name});
+            return error.UnlistedShedCounter;
+        }
+    }
+    try std.testing.expectEqual(expected.len, actual_count);
+}
+
+test "counters: an admission shed and an L7 reject land on opposite sides" {
+    var counters: Counters = .{};
+    // A rung that fires before admission keeps the gate balanced on its own.
+    counters.increment("accepted");
+    counters.increment("shed_relay_buffers");
+    try std.testing.expect(counters.reconcile(0));
+
+    // The L7 503 is not a gate shed: its connection was admitted, so it has
+    // to complete for the books to balance.
+    counters.increment("accepted");
+    counters.increment("admitted");
+    counters.increment("l7_shed_relay_buffers");
+    try std.testing.expect(!counters.reconcile(0));
+    counters.increment("completed");
+    try std.testing.expect(counters.reconcile(0));
 }
