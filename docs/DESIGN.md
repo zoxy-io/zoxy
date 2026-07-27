@@ -625,7 +625,7 @@ the loop thread.
 | connection slots | accept completion | close immediately (SO_LINGER 0 → RST); accept stays armed |
 | relay buffers (L4) | accept admission | close immediately |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
-| upstream slots / dial concurrency | upstream checkout | static `503` (L7) / close (L4) |
+| upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
@@ -635,6 +635,20 @@ the loop thread.
   the connection's head buffer, whose bytes the parsed head's zero-copy
   slices may still reference (§7). Shedding costs one send, no
   allocation, no copy.
+- **A shed keeps the connection when it can.** Closing is not free: it
+  costs the client a handshake and this proxy an accept, a conn slot and
+  an admission — so an always-closing shed is *more* expensive per
+  request than the work it sheds, and a transient overshoot locks itself
+  in as a reconnect loop rather than settling into a plateau. A static
+  response therefore keeps the connection whenever all four hold: the
+  client's byte stream is still on a message boundary (a valid head
+  parsed, no declared body left to read, nothing pipelined past it), the
+  client asked for keep-alive, the proxy is not draining, and relay
+  pressure has not suppressed keep-alive (#57). Otherwise the lingering
+  close (§2) drains the client's inbound and closes. The
+  head-framing rejects — `400` malformed, `414`, `431` — can never keep:
+  where the next request begins is exactly what the parser could not
+  determine, so keeping would hand a smuggler a desynchronized stream.
 - **Accept never pauses.** Accept-and-RST is preferred over un-arming the
   accept: the kernel backlog stays drained, clients get an immediate
   signal instead of a timeout, and there is no re-arm state machine.

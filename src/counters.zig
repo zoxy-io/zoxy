@@ -33,22 +33,39 @@ pub const Counters = struct {
     /// L7 reject responses (§7): a malformed head (400), an oversize
     /// request line (414) or header section (431), or an unsupported
     /// method/upgrade (501). Not sheds — the connection was admitted and
-    /// answered a static response, so it completes normally and stays out
-    /// of `reconcile`'s shed sum; these are pure observability.
+    /// answered a static response, so they stay out of `reconcile`'s shed
+    /// sum; these are pure observability.
+    ///
+    /// They do not share one persistence rule, because they do not share
+    /// one cause. `l7_uri_too_long` and `l7_headers_too_large` always
+    /// close: the parser could not find the message boundary, so neither
+    /// can the turnaround. `l7_not_implemented` answers a head that parsed
+    /// cleanly and follows the general keep rule (§8). `l7_bad_request`
+    /// covers both — a parser-rejected head, which closes, and a head that
+    /// parsed but whose target would not canonicalize, which keeps. The
+    /// counter deliberately does not split: the client sees one status,
+    /// and `staticResponseResyncable` decides from the stream rather than
+    /// from the status.
     l7_bad_request: Value = Value.init(0),
     l7_uri_too_long: Value = Value.init(0),
     l7_headers_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
     /// No route matched the request's canonical path (§7), answered 404.
-    /// Like the other reject counters the connection completes normally.
+    /// A valid head, so the connection keeps serving when its stream is
+    /// still on a message boundary — see `l7_shed_*` below.
     l7_no_route: Value = Value.init(0),
     /// A §7 filter rule rejected the request with its policy status
-    /// (403/404/429/400). A reject, not a shed — the connection completes.
+    /// (403/404/429/400). A reject, not a shed; same persistence rule as
+    /// `l7_no_route`.
     l7_filtered: Value = Value.init(0),
     /// §8 rungs at the L7 request level, answered 503: relay buffers or
-    /// upstream slots exhausted when a valid request needed them. Like
-    /// the reject counters these connections complete normally, so they
-    /// stay out of `reconcile`'s shed sum.
+    /// upstream slots exhausted when a valid request needed them. Like the
+    /// reject counters, the connection was admitted, so these stay out of
+    /// `reconcile`'s shed sum — but it does not necessarily *end* here: a
+    /// shed whose client stream is still on a message boundary keeps
+    /// serving (§8 "then keep or close per pressure"), so one connection
+    /// can carry many of these. Counting them is not counting connections,
+    /// and the ratio to `accepted` is the churn signal.
     l7_shed_relay_buffers: Value = Value.init(0),
     l7_shed_upstream_slots: Value = Value.init(0),
     /// Upstream leg failed before any response byte reached the client:

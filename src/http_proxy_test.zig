@@ -703,6 +703,8 @@ test "l7: a head that fits on arrival but not after forwarding is 431" {
     }
 }
 
+// Both heads parse cleanly and carry no body, so the 501 keeps the
+// connection (§8) — the method is refused, not the framing.
 test "l7: CONNECT and Upgrade are answered 501" {
     {
         var bed: Http1Bed = undefined;
@@ -710,7 +712,7 @@ test "l7: CONNECT and Upgrade are answered 501" {
         defer bed.tearDown();
         try bed.exchange("CONNECT origin:443 HTTP/1.1\r\nHost: origin\r\n\r\n");
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
@@ -722,7 +724,7 @@ test "l7: CONNECT and Upgrade are answered 501" {
         defer bed.tearDown();
         try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
@@ -825,12 +827,14 @@ test "l7: an unroutable path is answered 404" {
     defer bed.tearDown();
 
     // The only route is /api; /elsewhere matches nothing, so the origin is
-    // never dialed and the client gets a 404 (§7, §8).
+    // never dialed and the client gets a 404 (§7, §8). The head parsed and
+    // the request has no body, so the reject keeps the connection (§8) —
+    // no `Connection: close`.
     try bed.exchange("GET /elsewhere HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
@@ -844,12 +848,15 @@ test "l7: a structure-changing escape in the path is answered 400" {
     defer bed.tearDown();
 
     // %2F is an encoded slash: it would change the path's structure, so
-    // the canonicalizer rejects it before routing (§7).
+    // the canonicalizer rejects it before routing (§7). Unlike the
+    // malformed-head 400 above, the *head* parsed cleanly here — only the
+    // target would not canonicalize — so the byte stream is still on a
+    // message boundary and the connection keeps serving (§8).
     try bed.exchange("GET /a%2Fb HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
@@ -900,7 +907,7 @@ test "l7: a request to a host with no route is answered 404" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
@@ -935,7 +942,7 @@ test "l7: a filter reject answers its policy status before the origin is dialed"
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
@@ -993,12 +1000,257 @@ test "l7: a filter reject survives 1-byte adversarial delivery across seeds" {
         try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nX-Env: prod\r\n\r\n");
 
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
         try bed.expectDrained();
     }
+}
+
+test "l7: an upstream-slot shed keeps the connection, and the client's ask decides" {
+    // The rung that collapsed the c10k benchmark. An empty upstream pool
+    // sheds every request with 503, so this drives the wall directly.
+    //
+    // Both requests are answered on ONE connection: the shed is a static
+    // response, not a teardown (§8 "then keep or close per pressure").
+    // That is the whole point — a close costs the client a handshake and
+    // the proxy an accept plus a conn slot, which is how a shed storm ends
+    // up more expensive per request than the work it sheds.
+    //
+    // The two responses differ in exactly one header, and the difference is
+    // the *client's* ask, not the status: keep-alive is kept, `Connection:
+    // close` is honored (§2). One test, both spellings, so neither branch
+    // can rot into the other.
+    // The single upstream slot goes to a client the origin never answers,
+    // so it stays leased and every other request meets the wall.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 60,
+        .upstream_slots = 1,
+        .origin_mute = true,
+    });
+    defer bed.tearDown();
+
+    // client holds the slot and must not end the run; client2 arrives once
+    // it is held, sheds twice, and winds the scenario down.
+    bed.client.drain_on_finish = false;
+    bed.client2.send_delay_ms = 100;
+    bed.client2.request = "GET /one HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /held HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n" ++
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client2.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_shed_upstream_slots"));
+    // Two sheds, and client2 was accepted once. This is the ratio that
+    // would have caught the collapse: on the old always-close path every
+    // shed cost an accept, and accept/s tracking shed/s one-for-one *was*
+    // the churn loop.
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("accepted"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("admitted"));
+    try bed.expectDrained();
+}
+
+test "l7: a 501 keeps the connection, and the next request is served" {
+    // CONNECT and Upgrade are non-goals (§1, §7), but they are *method*
+    // rejects, not framing ones: the head parsed cleanly and sits on a
+    // message boundary, so the connection keeps serving like any other
+    // valid-head reject. Nothing was forwarded, so there is no second
+    // parser to disagree with about where the message ended.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 70,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /after HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("CONNECT o:443 HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // The 501 keeps, and the request after it is proxied normally — the
+    // connection was never lost to a method it happened not to support.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("accepted"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: a reject closes when the client pipelined the next request" {
+    // Bytes past the head are a pipelined next request, which §2 does not
+    // serve. Keeping the connection here would leave those bytes sitting in
+    // the head buffer to be read as the *start* of the next request — the
+    // desynchronization a request-smuggler wants (§7). A wide inbox carries
+    // both heads in one delivery, so the trailing bytes are provably
+    // present when the reject is decided.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin" },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 62,
+        .filters = &rules,
+        .inbox_bytes = 4096,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET /admin HTTP/1.1\r\nHost: o\r\n\r\n" ++
+            "GET /admin/two HTTP/1.1\r\nHost: o\r\n\r\n",
+    );
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // One response, and it announces the close: the second head is never
+    // answered on this connection.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try bed.expectDrained();
+}
+
+test "l7: a reject closes when the body has not arrived with the head" {
+    // The framing-done condition on its own. Under 1-byte delivery the head
+    // completes on the read that carries its final byte, so at reject time
+    // nothing is past the head — `head_len == request_head_len` — and the
+    // *only* thing standing between this and a kept connection is the
+    // request's own declared body, still unread on the socket.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin" },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var seed: u64 = 63;
+    while (seed < 67) : (seed += 1) {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = seed,
+            .partial_io = true,
+            .filters = &rules,
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("POST /admin HTTP/1.1\r\nHost: o\r\nContent-Length: 4\r\n\r\nbody");
+
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            bed.client.response(),
+        );
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a drain closes a reject that would otherwise be kept" {
+    // `beginDrain` stops accepting but leaves admitted connections serving,
+    // so a reject arriving mid-drain is a connection the drain is waiting
+    // on. Keeping it would park an idle connection until `drain_deadline_ms`
+    // and turn a clean shutdown into a deadline-forced one — so the drain
+    // is a brake on keeping, exactly as it is on the render path (§2, §8).
+    //
+    // The client connects at once and is admitted, then holds its head back
+    // until after the drain has begun.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin" },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 69,
+        .filters = &rules,
+        .send_delay_ms = 100,
+    });
+    defer bed.tearDown();
+
+    bed.armDrainTimer(50);
+    try bed.exchange("GET /admin HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    // The drain finished because the connection left, not because the
+    // deadline shot it — the difference a kept connection would erase.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("drained_at_deadline"));
+    try bed.expectDrained();
+}
+
+test "l7: relay pressure closes a reject that would otherwise be kept" {
+    // §8: relay pressure is what suppresses keep-alive on the render path
+    // (#57), and a reject must honor the same brake — a proxy short of
+    // buffers should not be holding connections open for their next
+    // request. `relay_buffers = 1` puts the watermark at one held buffer,
+    // so the muted client alone engages pressure.
+    //
+    // Identical to the kept 403 above in every respect except the pool
+    // size, so the `Connection: close` here is attributable to pressure
+    // and nothing else.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin" },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 68,
+        .relay_buffers = 1,
+        .origin_mute = true,
+        .filters = &rules,
+    });
+    defer bed.tearDown();
+
+    bed.client.drain_on_finish = false;
+    bed.client2.send_delay_ms = 100;
+    bed.client2.request = "GET /admin HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /held HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expect(bed.server.counters.get("relay_pressure_engaged") >= 1);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client2.response(),
+    );
+    try bed.expectDrained();
+}
+
+test "l7: a reject closes when the request carries a body" {
+    // A declared body is unread bytes still to come, so the stream is not
+    // on a message boundary and the connection cannot resynchronize — the
+    // lingering close is what drains it (§2). Robust to delivery timing:
+    // if the body arrives coalesced with the head it fails the
+    // nothing-past-the-head condition, and if it arrives later it fails the
+    // framing-done one. Either way, close.
+    //
+    // Driven through the filter rung because `respond` is the single exit
+    // every reject and shed leaves by, so the persistence decision cannot
+    // differ between rungs — only the status does.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin" },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 61, .filters = &rules });
+    defer bed.tearDown();
+
+    try bed.exchange("POST /admin HTTP/1.1\r\nHost: o\r\nContent-Length: 4\r\n\r\nbody");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try bed.expectDrained();
 }
 
 test "l7: filter header edits reach the origin, applied once" {
