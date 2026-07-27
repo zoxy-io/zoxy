@@ -1056,6 +1056,38 @@ test "l7: an upstream-slot shed keeps the connection, and the client's ask decid
     try bed.expectDrained();
 }
 
+test "l7: kernel pressure on a socket option is witnessed per op, on both sockets" {
+    // A fresh L7 exchange sets TCP_NODELAY twice: once on the accepted
+    // client socket (`Server` admission) and once on the dialled upstream
+    // (`onUpstreamConnect`). The second site is the one the per-op split
+    // originally shipped without — it kept incrementing the aggregate
+    // counter alone — and nothing could reach it in simulation until
+    // SimIo learned to fail a socket option at all.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 71,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    bed.sim_io.injectSetOptionError();
+    bed.sim_io.injectSetOptionError();
+    try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("kernel_pressure_set_option"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("kernel_pressure_errors"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_recv"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_send"));
+    // TCP_NODELAY is best-effort (§6): failing it costs latency, never
+    // correctness, so the exchange is byte-for-byte unaffected.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
 test "l7: a 501 keeps the connection, and the next request is served" {
     // CONNECT and Upgrade are non-goals (§1, §7), but they are *method*
     // rejects, not framing ones: the head parsed cleanly and sits on a

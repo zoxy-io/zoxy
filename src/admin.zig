@@ -184,7 +184,7 @@ pub fn Admin(comptime IoType: type) type {
                 // spin starving the loop (§8). Witness it and back off through
                 // the shared retry delay, exactly as `Server.onAccept` does;
                 // Canceled cannot occur outside a drain, handled above.
-                admin.server.witnessKernelPressure(err);
+                admin.server.witnessKernelPressure(.accept, err);
                 admin.armAcceptRetry();
                 return;
             };
@@ -265,7 +265,7 @@ pub fn Admin(comptime IoType: type) type {
                 // A reset or unexpected error mid-response: nothing left to
                 // deliver, tear down. Witness kernel pressure (§8) like every
                 // other data-op site.
-                admin.server.witnessKernelPressure(err);
+                admin.server.witnessKernelPressure(.send, err);
                 admin.beginTeardown();
                 return;
             };
@@ -316,7 +316,7 @@ pub fn Admin(comptime IoType: type) type {
                 error.Canceled => admin.beginTeardown(),
                 // Kernel pressure on the drain read (§8): witness and tear down.
                 error.Unexpected => {
-                    admin.server.witnessKernelPressure(err);
+                    admin.server.witnessKernelPressure(.recv, err);
                     admin.beginTeardown();
                 },
             }

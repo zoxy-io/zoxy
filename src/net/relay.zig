@@ -113,12 +113,12 @@ pub fn Relay(comptime IoType: type) type {
                         maybeFinish(server, conn);
                         return;
                     }
-                    server.witnessKernelPressure(err);
+                    server.witnessKernelPressure(.recv, err);
                     server.beginTeardown(conn);
                 }
 
                 pub fn onSendError(server: *ServerType, conn: *ConnType, err: Io.SendError) void {
-                    server.witnessKernelPressure(err);
+                    server.witnessKernelPressure(.send, err);
                     server.beginTeardown(conn);
                 }
 

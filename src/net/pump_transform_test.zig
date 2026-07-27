@@ -179,7 +179,7 @@ fn Base(comptime direction: Direction) type {
         }
 
         pub fn onSendError(server: *ServerSim, conn: *ConnSim, err: Io.SendError) void {
-            server.witnessKernelPressure(err);
+            server.witnessKernelPressure(.send, err);
             server.beginTeardown(conn);
         }
 

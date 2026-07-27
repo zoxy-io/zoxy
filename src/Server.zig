@@ -348,7 +348,7 @@ pub fn Server(comptime IoType: type) type {
                 // the loop. Back off through a short timer instead; the
                 // shed ladder never engages here because there is no
                 // socket to shed (§8).
-                server.counters.increment("kernel_pressure_errors");
+                server.witnessKernelPressure(.accept, err);
                 if (!server.draining) {
                     server.io.timerStart(
                         &state.retry_completion,
@@ -550,8 +550,8 @@ pub fn Server(comptime IoType: type) type {
                 entryState(listener.protocol),
                 listener.cluster_index,
             );
-            server.io.setNodelay(client_socket) catch {
-                server.counters.increment("kernel_pressure_errors");
+            server.io.setNodelay(client_socket) catch |err| {
+                server.witnessKernelPressure(.set_option, err);
             };
             // The L7 path routes and filters once the head parses (§7);
             // every connection gets its listener's tables and the protocol
@@ -621,14 +621,20 @@ pub fn Server(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .connecting);
-            const socket = result catch {
+            const socket = result catch |err| {
                 server.counters.increment("upstream_connect_failed");
+                // Refused/timed-out/unreachable arrive typed and are the
+                // origin's verdict; anything else is resource pressure on
+                // our side — ephemeral ports and socket memory both land
+                // here — and wants the opposite response. The dial counter
+                // cannot tell them apart, so witness the pressure too (§8).
+                server.witnessKernelPressure(.connect, err);
                 server.beginTeardown(conn);
                 return;
             };
             conn.upstream_socket = socket;
-            server.io.setNodelay(socket) catch {
-                server.counters.increment("kernel_pressure_errors");
+            server.io.setNodelay(socket) catch |err| {
+                server.witnessKernelPressure(.set_option, err);
             };
             conn.state = .relaying;
             server.storeDeadline(conn, server.idleTimeoutMs());
@@ -730,17 +736,34 @@ pub fn Server(comptime IoType: type) type {
             server.maybeStopAfterDrain();
         }
 
-        /// §8 kernel-pressure rung on the data path: a non-orderly op
-        /// failure on a live socket is resource exhaustion (ENOBUFS/
-        /// ENOMEM), which the seam collapses to Unexpected. Orderly
-        /// failures (EndOfStream, Reset, Canceled) are peeled off by the
-        /// caller; only Unexpected is witnessed here, matching the
-        /// accept/connect/setNodelay sites. Shared by the L4 relay and the
-        /// L7 state machine.
-        pub fn witnessKernelPressure(server: *Self, err: anyerror) void {
-            if (err == error.Unexpected) {
-                server.counters.increment("kernel_pressure_errors");
-            }
+        /// §8 kernel-pressure rung: a non-orderly op failure on a live
+        /// socket is resource exhaustion (ENOBUFS/ENOMEM), which the seam
+        /// collapses to Unexpected. Orderly failures (EndOfStream, Reset,
+        /// Canceled) are peeled off by the caller; only Unexpected is
+        /// witnessed here. Shared by every site — the accept and
+        /// setNodelay ones included, so no path can reach the total
+        /// without naming the op it failed on.
+        ///
+        /// `op` is comptime and mandatory for that reason. The errno is
+        /// gone before this is called (libxev discards it), so the op is
+        /// the only thing left to distinguish a full NIC queue from an
+        /// exhausted fd table — and those want opposite responses.
+        pub fn witnessKernelPressure(
+            server: *Self,
+            comptime op: counters_module.Counters.KernelPressureOp,
+            err: anyerror,
+        ) void {
+            if (err != error.Unexpected) return;
+            server.counters.increment("kernel_pressure_errors");
+            server.counters.increment(comptime op.counter());
+            // The partition, checked where it is maintained rather than
+            // only where `reconcile` happens to run. A site that increments
+            // the total on its own leaves the two unequal, and the next
+            // witness call trips here — which is how the third `setNodelay`
+            // site was found still doing exactly that, on a path SimIo
+            // cannot fail and so 64 sim seeds could never reach.
+            assert(server.counters.kernelPressureTotal() ==
+                server.counters.get("kernel_pressure_errors"));
         }
 
         /// §8 watermarks before walls: recompute one pool's pressure flag

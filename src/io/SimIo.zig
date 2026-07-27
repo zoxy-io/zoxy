@@ -63,6 +63,14 @@ signal_userdata: ?*anyopaque,
 now_ns_value: u64,
 prng: std.Random.DefaultPrng,
 adversary: Adversary,
+/// Pending one-shot `setNodelay`/`setLingerRst` failures (§9). A virtual
+/// socket table has no reason to refuse a socket option, so without this
+/// the whole set-option path is unreachable in simulation — and a bug
+/// there is invisible under every seed. That is not hypothetical: the
+/// per-op kernel-pressure split shipped with one `setNodelay` site still
+/// bumping the aggregate counter alone, and 64 seeds stayed green because
+/// nothing could make the call fail.
+pending_set_option_errors: u8,
 stopped: bool,
 dump_on_deadlock: bool,
 /// FNV-1a over every delivery; two runs of one seed must end equal (§9).
@@ -296,6 +304,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.now_ns_value = clock_start_ns;
     io.prng = std.Random.DefaultPrng.init(options.seed);
     io.adversary = options.adversary;
+    io.pending_set_option_errors = 0;
     io.stopped = false;
     io.dump_on_deadlock = options.dump_on_deadlock;
     io.trace_hash = std.hash.Fnv1a_64.init().value;
@@ -576,11 +585,22 @@ pub fn signalWait(
 }
 
 pub fn setNodelay(io: *SimIo, socket: Socket) Io.SetOptionError!void {
+    if (io.takeSetOptionError()) |err| return err;
     io.socketEntry(socket).nodelay = true;
 }
 
 pub fn setLingerRst(io: *SimIo, socket: Socket) Io.SetOptionError!void {
+    if (io.takeSetOptionError()) |err| return err;
     io.socketEntry(socket).linger_rst = true;
+}
+
+/// Consume one injected set-option failure, if any. Returns the error to
+/// propagate rather than propagating it here, so both option setters read
+/// the same single line.
+fn takeSetOptionError(io: *SimIo) ?Io.SetOptionError {
+    if (io.pending_set_option_errors == 0) return null;
+    io.pending_set_option_errors -= 1;
+    return error.Unexpected;
 }
 
 pub fn shutdown(io: *SimIo, socket: Socket, how: Io.ShutdownHow) void {
@@ -625,6 +645,15 @@ pub fn injectAcceptError(io: *SimIo, listener: Listener) void {
     assert(entry.active);
     assert(entry.pending_accept_errors < std.math.maxInt(u8));
     entry.pending_accept_errors += 1;
+}
+
+/// Targeted scenario control: the next `setNodelay`/`setLingerRst` fails
+/// with error.Unexpected — the kernel-pressure path on a socket option,
+/// which production can hit (ENOBUFS-class, process-wide) and a virtual
+/// socket table never would (§9).
+pub fn injectSetOptionError(io: *SimIo) void {
+    assert(io.pending_set_option_errors < std.math.maxInt(u8));
+    io.pending_set_option_errors += 1;
 }
 
 pub fn scheduleSignal(io: *SimIo, signal: Io.Signal, at_ns: u64) void {
