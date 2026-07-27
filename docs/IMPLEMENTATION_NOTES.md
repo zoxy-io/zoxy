@@ -309,9 +309,10 @@ socket, and an L7 connection holds two, client and upstream. Against the
 1386-conn-slot default, whose printout reads **31.5 MiB of pools**, that
 is **~390 MiB of kernel socket memory** — twelve times the advertised
 figure, before receive autotuning, which may take `rmem` to 32 MiB per
-socket. At the conn-slot ceiling — 14074 when this was measured, 12282
-since the upstream pool took its share of the CQ line — the same
-arithmetic reaches ~3.9 GiB against ~251 MiB of pools.
+socket. At the conn-slot ceiling — 14074 when this was measured, and
+~3.9 GiB then — the same arithmetic reaches **~3.1 GiB** against ~284 MiB
+of pools at the 11464 the ceiling became once the upstream pool was
+pinned to it on the CQ line.
 
 These are caps rather than committed pages — the kernel allocates as data
 arrives, and `tcp_mem` bounds it globally (~3.09 GiB here). That is the
@@ -406,8 +407,8 @@ Median of four pinned runs, ns per arm/deliver pair:
 | 10000 | 91.1 MiB | 3.97 | 1.41× |
 | 14074 | 128.2 MiB | 7.18 | 2.55× |
 
-(The last row was the conn-slot ceiling when the sweep ran; it is 12282
-since the upstream pool took its share of the CQ line. The bench reads
+(The last row was the conn-slot ceiling when the sweep ran; it is 11464
+since the upstream pool was pinned to it on the CQ line. The bench reads
 the constant, so a rerun sweeps to whatever it is now.)
 
 The mechanism is confirmed — the knee is real and lands between 2000 and
@@ -490,22 +491,24 @@ CQ at 2 × SQ = 8192 and it capped `relay_buffers_max` at
 drain then cut `conn_ops_max` to 4 (the five-op teardown-vs-dial race
 became structurally unreachable, proven by a pinned-seed sim test), so
 `conn_slots_max` / `relay_buffers_max` ceiling at
-`(57344 − 23 − upstream_slots_max) / 4`, which was 14074 while
-`upstream_slots_max` was 1024 and is **12282** since it rose to 8192
-(2026-07-27, below). fds bind next, not memory (`fds_max = 32772` at the
-ceiling, so a c10k deployment raises `RLIMIT_NOFILE` at startup, §8).
-`constants.zig` owns the arithmetic and comptime-asserts it — the two
-ceilings are one line, so the assert is what keeps a change to either
-from silently overcommitting the ring. The remaining ceiling lever —
-`splice` — is fork work, in PLANS.md "c10k".
+`(57344 − 23 − upstream_slots_max) / 4` — 14074 while
+`upstream_slots_max` was 1024, 12282 once it rose to 8192 (2026-07-27,
+below). Pinning the upstream ceiling to the conn ceiling (2026-07-28,
+below) collapsed that to one divisor, `(57344 − 23) / (4 + 1) =
+**11464**`. fds bind next, not memory (`fds_max = 34408` at the ceiling,
+so a c10k deployment raises `RLIMIT_NOFILE` at startup, §8).
+`constants.zig` owns the arithmetic and comptime-asserts it — one line,
+one divisor, so the assert is what keeps a change from silently
+overcommitting the ring. The remaining ceiling lever — `splice` — is
+fork work, in PLANS.md "c10k".
 
 ## The upstream pool was a wall, not a range (2026-07-27)
 
 `upstream_slots_default` and `upstream_slots_max` were both 1024, so that
 pool was the one thing an operator could only shrink — while conn slots
 had the two-layer shape the design intends (1386 default, 14074 ceiling
-then — 12282 now,
-climb through `limits`). At 10k connections the missing range bites: the
+then — 11464 now, climb through `limits`). At 10k connections the
+missing range bites: the
 pool pins, and every request that cannot get a slot is answered 503.
 
 Measured on one 1-CPU box, 10k connections, same build and workload:
@@ -523,15 +526,70 @@ which is the §1 requirement; the out-of-box footprint is byte-identical
 (32,259 KiB, 3,805 fds) because only the *ceiling* moved and
 `upstream_slots_default` stayed at 1024 rather than tracking it.
 
-Provisional. PLANS.md carries the standing question of whether the
-operator should pick the pair instead of inheriting ours — the machinery
-(`cqFillFits`, `ensureFdBudget`, effective-size pools) already exists;
-what it would cost is a §5 amendment, spelled out there.
+"Both clear 10k" was true of the numbers and wrong about the shape: 8192
+still sat below the conn ceiling, and the next section is what that cost.
 
 Note for anyone reading older benchmark numbers: every c10k run before
 this date that behaved well used a **build-time `sed`** of these
 constants in the bench image. Runs at the shipped 1024 are the collapse
 case, not a baseline.
+
+## The upstream pool tracks connections, not requests (2026-07-28)
+
+The previous section sized the upstream pool against in-flight
+*exchanges* — rate × latency — and reasoned that it therefore sits below
+the conn-slot count. That model is wrong, and the gauges added with it
+are what showed it. Two runs of the same binary (4572b4a), same `/1k`
+workload, same 200→67000 ramp, one 1-CPU box:
+
+| | 500 connections | 10,000 connections |
+|---|---|---|
+| sustained (achieved ≥ 90% of offered) | **44,611 req/s** | **22,481 req/s** |
+| `conn_slots_in_use` peak | 500 | 10,095 of 12282 |
+| `upstream_slots_leased` peak | **492** | 8,017 |
+| leased + parked | ≤ ~500 | **pinned at 8192**, six scrapes |
+| `l7_shed_upstream_slots` | 0 | 22,568 (0.44%) |
+| `accepted` | 501 | 67,517 |
+| `kernel_pressure_errors` | 0 | 0 |
+
+Leased peak tracks the connection count, not the request rate: 492 of
+500. An upstream is leased for a whole exchange and parked between
+requests, so at saturation — every admitted connection mid-request —
+demand is one upstream slot per conn slot. A pool below the conn ceiling
+is admission capacity that cannot be served, which is exactly what the
+c10k column shows: ~2200 conn slots idle while the pool they depend on
+sat at its own ceiling. Hence the pinned pair, 11464/11464.
+
+What it is *not*: the cost of concurrency. Per-request CPU at matched
+offered rate is the same at both connection counts —
+
+| offered | 500 conns | 10,000 conns |
+|---|---|---|
+| 9,107 | 20.4 µs | 19.6 µs |
+| 12,447 | 23.6 µs | 24.2 µs |
+| 15,787 | 24.9 µs | 25.7 µs |
+
+— which is the end-to-end confirmation of the `delivered()`/SoA finding
+above (0.04%). 10k connections cost nothing per request.
+
+Nor was it the environment. At the c10k plateau the NIC carried 502
+Mbit/s where the 500-connection run had carried 914 Mbit/s through the
+same interface; zoxy held 78% of its 1-CPU quota with 0.17% of periods
+throttled; the origin idled 3.2 of 4 cores. Worth recording for anyone
+reading cloud numbers: the 2-core proxy VM showed **32% steal**, charged
+straight against that quota.
+
+Open, and deliberately not designed for yet: past ~16k req/s the c10k
+run's per-request CPU climbs 25.7 → 34.7 µs while the 500-connection
+run's *falls* to 18.6 µs at 44.6k. Named hypothesis — partial writes to
+backed-up client sockets costing several sends per response — but it is
+a hypothesis, and this file's rule is that it stays one until measured.
+
+PLANS.md carries the standing question of whether the operator should
+pick the ceiling instead of inheriting ours — the machinery (`cqFillFits`,
+`ensureFdBudget`, effective-size pools) already exists; what it would
+cost is a §5 amendment, spelled out there. Pinning narrows that question
+to one number rather than settling it.
 
 ## libxev error surfacing is lossy — resolved by the fork (2026-07-27)
 

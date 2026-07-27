@@ -381,19 +381,36 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 12282 | ~1.7 KiB state + 8 KiB head |
-| relay buffers | 1386 | 12282 | 2 × 4 KiB |
-| upstream slots | 1024 | 8192 | ~40 B state + 8 KiB head |
-| **pool memory** | **~32 MiB** | **~272 MiB** | |
+| conn slots | 1386 | 11464 | ~1.7 KiB state + 8 KiB head |
+| relay buffers | 1386 | 11464 | 2 × 4 KiB |
+| upstream slots | 1024 | 11464 | ~40 B state + 8 KiB head |
+| **pool memory** | **~32 MiB** | **~284 MiB** | |
 
-The two ceilings sit on one completion-queue line — a conn slot costs
-`conn_ops_max` ring ops, an upstream slot one — so raising either lowers
-the other. Both clear 10k at this pair, which is what §1 asks for: c10k
-*reachable*, not a shape tuned for it. Upstream slots were 1024 at both
-default and ceiling until 2026-07-27, which made that pool the one thing
-an operator could only shrink; the measurements that moved it are in
-IMPLEMENTATION_NOTES.md. Whether the pair should be ours to choose at all
-is an open question in PLANS.md.
+The ceilings sit on one completion-queue line — a conn slot costs
+`conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
+is **pinned to the conn ceiling**, so that line has a single divisor:
+`conn_ops_max + 1` ring ops per admitted connection, 11464 of them. On
+the L7 path a connection that is mid-exchange holds an upstream slot as
+well as its conn slot, and at saturation every admitted connection can be
+mid-exchange at once — so an upstream ceiling below the conn ceiling is
+admission capacity that cannot be served, and one above it is a pool that
+can never be drawn down. Both clear 10k, which is what §1 asks for: c10k
+*reachable*, not a shape tuned for it.
+
+The two moved apart twice before they were pinned: upstream slots were
+1024 at both default and ceiling until 2026-07-27, which made that pool
+the one thing an operator could only shrink, and then 8192 against a conn
+ceiling of 12282, which left ~2200 conn slots idle while the pool they
+depend on pinned. Both measurements are in IMPLEMENTATION_NOTES.md.
+Whether the ceiling should be ours to choose at all is an open question
+in PLANS.md.
+
+The *defaults* are not pinned to each other, and deliberately: the
+out-of-box shape is bounded by the stock 4096 `RLIMIT_NOFILE` rather than
+by admission (matching 1386 would cost 4167 fds), and an L4 deployment
+never touches the upstream pool at all — an L4 dial holds no upstream
+slot. A deployment that means to fill its conn pool raises both together
+through `limits`.
 
 Rules:
 

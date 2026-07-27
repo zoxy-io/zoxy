@@ -1554,15 +1554,24 @@ test "config: limits shrink pools below the ceilings, never past them" {
     try expectParseError(error.LimitCqFillOutOfRange, head ++ tail ++ "\"limits\":{\"cq_fill_eighths\":0}}");
     try expectParseError(error.LimitCqFillOutOfRange, head ++ tail ++ "\"limits\":{\"cq_fill_eighths\":8}}");
     // A fill tighter than the ceiling was derived at cannot serve the full
-    // conn-slot ceiling — the completion queue it would need exceeds the
-    // compiled ring, so the combination is rejected (§8).
+    // ceiling shape — the completion queue it would need exceeds the
+    // compiled ring, so the combination is rejected (§8). Both pools are
+    // named at their ceiling because that is the shape the derivation
+    // budgets for: the pair is pinned, so a conn slot's worst case
+    // includes the upstream slot it may hold (see `conn_slots_max`).
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
         const json = try std.fmt.allocPrint(
             arena_state.allocator(),
-            "{s}{s}\"limits\":{{\"conn_slots\":{d},\"cq_fill_eighths\":{d}}}}}",
-            .{ head, tail, constants.conn_slots_max, constants.cq_fill_eighths_max - 1 },
+            "{s}{s}\"limits\":{{\"conn_slots\":{d},\"upstream_slots\":{d},\"cq_fill_eighths\":{d}}}}}",
+            .{
+                head,
+                tail,
+                constants.conn_slots_max,
+                constants.upstream_slots_max,
+                constants.cq_fill_eighths_max - 1,
+            },
         );
         try std.testing.expectError(error.LimitConnSlotsOverCqFill, parse(arena_state.allocator(), json));
     }
