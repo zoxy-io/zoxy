@@ -1492,7 +1492,11 @@ test "config: limits shrink pools below the ceilings, never past them" {
         );
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.relay_buffers);
-        try std.testing.expectEqual(constants.upstream_slots_max, parsed.limits.upstream_slots);
+        // The *default*, which is deliberately below the ceiling: an
+        // omitted `upstream_slots` must not silently reserve the c10k
+        // maximum. These were the same number until the ceiling rose.
+        try std.testing.expectEqual(constants.upstream_slots_default, parsed.limits.upstream_slots);
+        try std.testing.expect(constants.upstream_slots_default < constants.upstream_slots_max);
         // The CQ fill defaults to ⅞ when the block omits it.
         try std.testing.expectEqual(constants.cq_fill_eighths_default, parsed.limits.cq_fill_eighths);
     }

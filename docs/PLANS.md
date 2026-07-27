@@ -371,7 +371,9 @@ current ceiling — the CQSIZE lever (#61, `IORING_SETUP_CQSIZE` off the
 fixed 2 × SQ, in-flight fill tunable via `limits.cq_fill_eighths`, ⅞
 default) and the `conn_ops_max` 5 → 4 cut (teardown closes serialized
 behind the full armed-set drain, #64) — putting `conn_slots_max` /
-`relay_buffers_max` at 14074 at ⅞ fill, with `fds_max` 29188 (a c10k
+`relay_buffers_max` at `(57344 − 23 − upstream_slots_max) / 4` at ⅞ fill;
+that read 14074 while `upstream_slots_max` was 1024 and is **12282**
+since it rose to 8192 (below), with `fds_max` **32772** (a c10k
 deployment raises the documented `RLIMIT_NOFILE` at startup, §8). The
 arithmetic and its history live in IMPLEMENTATION_NOTES.md.
 
@@ -380,34 +382,64 @@ saturation, still libxev-fork work (a re-audit); TLS and chunked L7
 bodies fall back to copy regardless.
 
 Entry gate for further ceiling work: demonstrate a workload that actually
-saturates the 14074 ceiling first — the splice lever costs a re-audit,
-not worth spending blind.
+saturates the *current* conn-slot ceiling first — the splice lever costs
+a re-audit, not worth spending blind. Note what the c10k runs of
+2026-07-27 did and did not show: they saturated the **upstream** pool
+comprehensively (which is why its ceiling moved), and never came close to
+the conn-slot one, sitting at ~10k held connections against 12282.
 
 ## Pool ceilings: policy we chose, or a range the operator picks?
 
-**Open decision (2026-07-27), evidence gathered, not yet taken.**
+**Interim taken 2026-07-27; the question below stays open.**
+
+The ceiling pair moved to `upstream_slots_max = 8192` /
+`conn_slots_max = 12282`, with `upstream_slots_default` held at 1024 so
+the out-of-box footprint is unchanged (byte-identical: 32,259 KiB, 3,805
+fds). That fixes the immediate defect — the upstream pool had *no range*,
+default and ceiling being the same number — and both ceilings clear 10k,
+so §1's "able to operate at c10k" holds on either axis. Measurements in
+IMPLEMENTATION_NOTES.md.
+
+It does **not** answer the question below. A pair chosen at compile time
+is still a policy decision made on the operator's behalf; this one is
+merely a better-evidenced choice than the last. What follows is why that
+may be worth changing, and what it would cost.
+
+One correction to the cost stated here originally: raising the ceilings
+does **not** balloon `SimIo`'s `ready_buffer`. That array is sized by
+`in_flight_ops_max`, which is already 57,343 against a 57,344 budget — it
+is the budget, near enough. Define it *as* the budget rather than as the
+ceilings' product and it does not move, and
+`assert(in_flight_ops_max <= completion_queue_entries)` survives as a
+stronger claim: the budget we enforce fits the ring, rather than one
+chosen point does.
 
 §1 says zoxy must be *able* to operate at c10k — not that it is tuned for
 it. The two-layer shape that serves that goal already exists for conn
 slots: a lean default the out-of-box deployment runs at, and a higher
 ceiling the operator climbs to through `limits`.
 
+As it stood before the interim fix:
+
     conn_slots_default      1386     ~32 MiB out of the box
     conn_slots_max         14074     operator opts up
     upstream_slots_default  1024
     upstream_slots_max      1024     <- same number: no range at all
 
-Upstream slots have no such range. An operator can only go *down*, and at
-c10k the upstream pool is precisely the one that needs to go up. Every
-c10k run that behaved did so on a build-time `sed` of the constant.
+Upstream slots had no such range. An operator could only go *down*, and
+at c10k the upstream pool is precisely the one that needs to go up. Every
+c10k run that behaved did so on a build-time `sed` of the constant. The
+interim fix gave that pool a range (default 1024, ceiling 8192, and
+`conn_slots_max` down to 12282 to pay for it on the shared CQ line).
 
 The measurements, on one 1-CPU box at 10k connections (2026-07-27):
 
-| | 1024 (shipped) | 8192 (sed) |
-|---|---|---|
-| pool state | pinned at 1024 leased | 5771/8192, never pinned |
-| `l7_shed_upstream_slots` | 5,852,702 (35% of responses) | 10,576 (0.35%) |
-| real req/s at high offered | decayed to 5,315 | flat ~20,000 |
+Summarised: at 1024 the pool pinned, a third of all responses became 503,
+and real throughput decayed to a quarter of its peak; at 8192 the pool
+never pinned, sheds fell by three orders of magnitude, and throughput
+held flat. The figures live in IMPLEMENTATION_NOTES.md ("The upstream
+pool was a wall, not a range") — restating them here is what let this
+section drift out of date once already.
 
 ### Why a better default does not fix it, and neither does a build option
 
@@ -460,13 +492,13 @@ kernel maximum, the u16 index widths, the watermark relationships, and
 
 ### Known cost beyond the amendment
 
-`SimIo` sizes a **stack** array from the ceiling —
-`var ready_buffer: [pending_ops_max]*Completion` where `pending_ops_max
-= constants.in_flight_ops_max`, ~458 KB today. Raising the ceilings
-inflates it past anything sane; it moves to the arena or gets a bound of
-its own. Production pools are unaffected: they already allocate from the
-*effective* config (`conns.init(arena, options.conn_slots)`), so the
-ceiling drives no allocation there.
+Nothing further, once `in_flight_ops_max` is defined as the budget (see
+the correction above). `SimIo` sizes a **stack** array from it —
+`var ready_buffer: [pending_ops_max]*Completion`, ~448 KB — and that is
+already the budget's size, so it neither grows nor needs moving to the
+arena. Production pools were never affected either: they allocate from
+the *effective* config (`conns.init(arena, options.conn_slots)`), so a
+ceiling drives no allocation at all.
 
 ### Entry gate
 

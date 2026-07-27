@@ -48,9 +48,10 @@ fn monotonicNs() u64 {
 const ops_per_point: u64 = 4_000_000;
 
 /// Live connection counts to sweep — the bench's 500-connection operating
-/// point, the c10k one, and the compiled ceiling, with steps between so the
+/// point, the c10k one, and the compiled ceiling (read from `constants`, so
+/// a ceiling change moves the sweep with it), with steps between so the
 /// knee is visible rather than inferred from the endpoints.
-const points = [_]u32{ 64, 256, 500, 1000, 2000, 5000, 10000, 14074 };
+const points = [_]u32{ 64, 256, 500, 1000, 2000, 5000, 10000, zoxy.constants.conn_slots_max };
 
 /// The point every ratio is quoted against: the connection count the
 /// Tier-1 bench actually runs at, so the column reads as "what c10k costs

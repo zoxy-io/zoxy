@@ -309,8 +309,9 @@ socket, and an L7 connection holds two, client and upstream. Against the
 1386-conn-slot default, whose printout reads **31.5 MiB of pools**, that
 is **~390 MiB of kernel socket memory** — twelve times the advertised
 figure, before receive autotuning, which may take `rmem` to 32 MiB per
-socket. At the 14074-connection ceiling the same arithmetic reaches
-~3.9 GiB against ~251 MiB of pools.
+socket. At the conn-slot ceiling — 14074 when this was measured, 12282
+since the upstream pool took its share of the CQ line — the same
+arithmetic reaches ~3.9 GiB against ~251 MiB of pools.
 
 These are caps rather than committed pages — the kernel allocates as data
 arrives, and `tcp_mem` bounds it globally (~3.09 GiB here). That is the
@@ -405,6 +406,10 @@ Median of four pinned runs, ns per arm/deliver pair:
 | 10000 | 91.1 MiB | 3.97 | 1.41× |
 | 14074 | 128.2 MiB | 7.18 | 2.55× |
 
+(The last row was the conn-slot ceiling when the sweep ran; it is 12282
+since the upstream pool took its share of the CQ line. The bench reads
+the constant, so a rerun sweeps to whatever it is now.)
+
 The mechanism is confirmed — the knee is real and lands between 2000 and
 5000 connections, where the touched set stops fitting L3. The magnitude
 is what kills it. The 500 → 10,000 delta is **1.2 ns per pair**; a
@@ -484,12 +489,49 @@ CQ at 2 × SQ = 8192 and it capped `relay_buffers_max` at
 11259` at ⅞. Serializing teardown closes behind the full armed-set
 drain then cut `conn_ops_max` to 4 (the five-op teardown-vs-dial race
 became structurally unreachable, proven by a pinned-seed sim test), so
-`conn_slots_max` / `relay_buffers_max` now ceiling at
-`(57344 − 23 − upstream_slots_max) / 4 = 14074`. fds bind next, not
-memory (`fds_max = 29188` at the ceiling, so a c10k deployment raises
-`RLIMIT_NOFILE` at startup, §8). `constants.zig` owns the arithmetic and
-comptime-asserts it. The remaining ceiling lever — `splice` — is fork
-work, in PLANS.md "c10k".
+`conn_slots_max` / `relay_buffers_max` ceiling at
+`(57344 − 23 − upstream_slots_max) / 4`, which was 14074 while
+`upstream_slots_max` was 1024 and is **12282** since it rose to 8192
+(2026-07-27, below). fds bind next, not memory (`fds_max = 32772` at the
+ceiling, so a c10k deployment raises `RLIMIT_NOFILE` at startup, §8).
+`constants.zig` owns the arithmetic and comptime-asserts it — the two
+ceilings are one line, so the assert is what keeps a change to either
+from silently overcommitting the ring. The remaining ceiling lever —
+`splice` — is fork work, in PLANS.md "c10k".
+
+## The upstream pool was a wall, not a range (2026-07-27)
+
+`upstream_slots_default` and `upstream_slots_max` were both 1024, so that
+pool was the one thing an operator could only shrink — while conn slots
+had the two-layer shape the design intends (1386 default, 14074 ceiling
+then — 12282 now,
+climb through `limits`). At 10k connections the missing range bites: the
+pool pins, and every request that cannot get a slot is answered 503.
+
+Measured on one 1-CPU box, 10k connections, same build and workload:
+
+| | upstream 1024 | upstream 8192 |
+|---|---|---|
+| pool | pinned at 1024 leased | 5771/8192, never pinned |
+| `l7_shed_upstream_slots` | 5,852,702 (35% of responses) | 10,576 (0.35%) |
+| real req/s at high offered | decayed to 5,315 | flat ~20,000 |
+
+Raised to 8192, which drops `conn_slots_max` to 12282 — the two are one
+CQ line (`conn × 4 + upstream + 23 ≤ 57344`), so the ceiling pair is a
+policy choice, not two independent numbers. Both clear 10k at this point,
+which is the §1 requirement; the out-of-box footprint is byte-identical
+(32,259 KiB, 3,805 fds) because only the *ceiling* moved and
+`upstream_slots_default` stayed at 1024 rather than tracking it.
+
+Provisional. PLANS.md carries the standing question of whether the
+operator should pick the pair instead of inheriting ours — the machinery
+(`cqFillFits`, `ensureFdBudget`, effective-size pools) already exists;
+what it would cost is a §5 amendment, spelled out there.
+
+Note for anyone reading older benchmark numbers: every c10k run before
+this date that behaved well used a **build-time `sed`** of these
+constants in the bench image. Runs at the shipped 1024 are the collapse
+case, not a baseline.
 
 ## libxev error surfacing is lossy — resolved by the fork (2026-07-27)
 
