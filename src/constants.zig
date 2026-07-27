@@ -58,13 +58,20 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// IORING_SETUP_CQSIZE) against the 4096 SQ, so at the largest fill a
 /// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
 /// parked-upstream and admin reservations carved out first, this caps at
-/// `(57344 - 23 - upstream_slots_max) / conn_ops_max = 14074` —
+/// `(57344 - 23 - upstream_slots_max) / conn_ops_max = 12282` —
 /// comptime-derived below (the 23 is the fixed ops: two per config and
 /// admin listener [18], the admin client's op budget [3], the signal
 /// wake [1], and the drain timer [1]). That clears a round 10k on a
 /// single ring; a deployment trades the ceiling back down for more burst
 /// headroom via `limits.cq_fill_eighths` (§8).
-pub const conn_slots_max: u32 = 14074;
+///
+/// This and `upstream_slots_max` sit on one line — a conn slot costs
+/// `conn_ops_max` ring ops, an upstream slot one — so raising either
+/// lowers the other. **Both clear 10k at this point**, which is what §1
+/// asks for: c10k reachable on either axis, not a shape tuned for it.
+/// The pair is provisional; PLANS.md holds the standing question of
+/// whether an operator should pick it rather than inherit ours.
+pub const conn_slots_max: u32 = 12282;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -141,10 +148,20 @@ pub const chunked_trailer_bytes_max: u32 = 1024;
 /// on keep-alive (§3, §5). Counted in the §8 budgets below: a parked
 /// upstream holds a socket (fd budget) and, once keep-alive lands, one
 /// armed idle-timer op (ring budget) — both reserved now so composing
-/// keep-alive does not re-cut the budgets. Sized as the largest power of
-/// two the fd and CQ budgets accommodate alongside the conn-slot
-/// ceiling.
-pub const upstream_slots_max: u32 = 1024;
+/// keep-alive does not re-cut the budgets.
+///
+/// This is the *ceiling*, not the out-of-box size — `upstream_slots_default`
+/// stays lean below it, the same two-layer shape conn slots have. It was
+/// 1024, where ceiling and default were the same number and an operator
+/// could only go *down*; at 10k connections that pool pinned and shed a
+/// third of all responses. 8192 is measured, not guessed — the numbers
+/// live in IMPLEMENTATION_NOTES.md ("The upstream pool was a wall, not a
+/// range"), which is their one home.
+///
+/// Provisional. It trades against `conn_slots_max` on one CQ line, so
+/// this pair is still a policy choice made on the operator's behalf —
+/// PLANS.md carries the open question of handing it to them instead.
+pub const upstream_slots_max: u32 = 8192;
 
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
@@ -357,7 +374,17 @@ pub const fds_max: u32 =
 /// the resulting footprint at startup.
 pub const conn_slots_default: u32 = 1386;
 pub const relay_buffers_default: u32 = conn_slots_default;
-pub const upstream_slots_default: u32 = upstream_slots_max;
+/// Deliberately *not* `upstream_slots_max`. It used to be, which left the
+/// two identical and the pool the one thing an operator could only shrink
+/// — the defect the raised ceiling exists to fix. The default answers a
+/// different question than the ceiling does: the ceiling is how far a
+/// c10k deployment may climb, this is what an unconfigured one costs, and
+/// 8192 slots would put 66 MiB of upstream pool in a footprint budgeted
+/// at ~32 MiB total. What it has to cover is in-flight *exchanges*
+/// (rate × latency) plus parked keep-alive connections — not one per
+/// conn slot — which is why it sits below `conn_slots_default` rather
+/// than tracking it.
+pub const upstream_slots_default: u32 = 1024;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
@@ -526,13 +553,15 @@ test "budgets: memory total matches the closed form" {
 }
 
 test "budgets: c10k ceiling fd count needs a raised NOFILE" {
-    // At the c10k ceiling the fd budget is ~29k — well past the common
+    // At the c10k ceiling the fd budget is ~33k — well past the common
     // 4096 unprivileged hard limit, so a deployment that configures up to
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
-    try std.testing.expectEqual(@as(u32, 29188), fds_max);
+    try std.testing.expectEqual(@as(u32, 32772), fds_max);
     try std.testing.expect(fds_max <= 65536);
+    // The out-of-box side of this is pinned by "the default deployment is
+    // lean" below, not restated here.
 }
 
 test "budgets: the default deployment is lean" {
