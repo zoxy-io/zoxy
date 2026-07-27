@@ -90,6 +90,42 @@ pub const SetOptionError = error{
     Unexpected,
 };
 
+/// Why the most recent op failed with `error.Unexpected`, as much as the
+/// backend can tell (§8). `Unexpected` is the right shape for *control
+/// flow* — no caller should switch on twenty errnos — but it is the wrong
+/// shape for an operator, who needs to know whether to shed load or widen
+/// a limit. This carries that answer alongside the error rather than
+/// widening every error set with cases nobody branches on.
+///
+/// A backend-neutral cause rather than a raw errno because the numbers are
+/// platform-specific and the *response* is not: "out of buffers" means the
+/// same thing wherever it comes from. The raw errno rides along anyway, so
+/// a cause of `.other` is still diagnosable.
+pub const Pressure = struct {
+    cause: Cause,
+    /// The platform errno, or 0 when the backend could not supply one.
+    /// Reported as a gauge so an `.other` is never a dead end.
+    errno: u16,
+
+    pub const Cause = enum {
+        /// ENOBUFS — socket buffer memory. Shed load.
+        out_of_buffers,
+        /// ENOMEM — kernel allocation. Shed load.
+        out_of_memory,
+        /// EMFILE/ENFILE — the fd table, per-process or system-wide.
+        /// Raise the limit; shedding does not help if the fds are leaked.
+        fd_limit,
+        /// EADDRNOTAVAIL — the ephemeral port range is exhausted. Widen
+        /// the range or reuse connections; unrelated to memory.
+        address_unavailable,
+        /// Outside the set worth acting on differently. Not a failure to
+        /// classify — read `errno` to see which one.
+        other,
+    };
+
+    pub const none: Pressure = .{ .cause = .other, .errno = 0 };
+};
+
 pub const RunError = error{
     /// SimIo only: pending work exists but nothing can ever become ready —
     /// a liveness bug in the scenario or the data path (§9 invariant).
@@ -122,6 +158,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "setLingerRst",
             "shutdown",
             "closeNow",
+            "lastPressure",
             "nowNs",
             "run",
             "stop",

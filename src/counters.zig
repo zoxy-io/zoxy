@@ -6,6 +6,8 @@
 
 const std = @import("std");
 
+const io_module = @import("io/io.zig");
+
 const assert = std.debug.assert;
 
 pub const Counters = struct {
@@ -104,18 +106,11 @@ pub const Counters = struct {
     kernel_pressure_errors: Value = Value.init(0),
     /// The same failures split by the syscall that produced them.
     ///
-    /// Why the split exists: the seam collapses every unmapped errno to
-    /// `error.Unexpected` (libxev discards it — see IMPLEMENTATION_NOTES),
-    /// so the total alone says only that *something* failed. A c10k run
-    /// recorded 227,628 of them against 736,843 churned connections, and
-    /// the total could not distinguish "the NIC queue is full on send"
-    /// from "we are out of fds on accept" — opposite problems with
-    /// opposite fixes. The op is the one bit of information that costs no
-    /// dependency change to keep, and it is usually the one that matters:
-    /// a send failure at 90% of link capacity needs no errno to read.
-    ///
-    /// Recovering the errno itself needs the libxev fork to stop throwing
-    /// it away; that is the follow-up this split does not block on.
+    /// Why the split exists: a c10k run recorded 227,628 of these against
+    /// 736,843 churned connections, and one number could not distinguish
+    /// "the NIC queue is full on send" from "we are out of fds on accept"
+    /// — opposite problems with opposite fixes. The op says which syscall
+    /// to look at; the cause counters below say what to do about it.
     ///
     /// `kernelPressureTotal` must equal `kernel_pressure_errors` — every
     /// witness increments exactly one of these alongside the total, which
@@ -125,6 +120,23 @@ pub const Counters = struct {
     kernel_pressure_recv: Value = Value.init(0),
     kernel_pressure_send: Value = Value.init(0),
     kernel_pressure_set_option: Value = Value.init(0),
+    /// The same failures split a second way — by *why* the kernel refused,
+    /// recovered from the errno the audited libxev fork now keeps on the
+    /// completion (zoxy-io/libxev#2). Two partitions of one total, because
+    /// the op and the cause answer different questions: the op says which
+    /// syscall to look at, the cause says what to do about it.
+    ///
+    /// Shed load for `out_of_buffers`/`out_of_memory`; raise a limit for
+    /// `fd_limit`; widen the port range or reuse connections for
+    /// `address_unavailable`. Reading them off one number was the original
+    /// problem — `.other` keeps that honest by never pretending to be a
+    /// classification, and `kernel_pressure_last_errno` (a gauge) carries
+    /// the raw value so an unlisted errno is still a lead.
+    kernel_pressure_out_of_buffers: Value = Value.init(0),
+    kernel_pressure_out_of_memory: Value = Value.init(0),
+    kernel_pressure_fd_limit: Value = Value.init(0),
+    kernel_pressure_address_unavailable: Value = Value.init(0),
+    kernel_pressure_other_cause: Value = Value.init(0),
     /// Admin/metrics scrapes whose full response was written (§8, PLANS.md
     /// §243). Pure observability: the admin plane sits entirely outside
     /// `reconcile`'s accepted/admitted/shed accounting, so these never enter
@@ -169,6 +181,12 @@ pub const Counters = struct {
         /// in-use figure.
         upstream_slots_parked: u32,
         upstream_slots_capacity: u32,
+        /// The raw errno of the most recent kernel-pressure failure, or 0
+        /// for "none since start". A gauge, not a counter: the question is
+        /// which errno is failing *now*, and the `kernel_pressure_*` cause
+        /// counters already carry the history. This is what keeps an
+        /// `other_cause` diagnosable instead of merely counted.
+        kernel_pressure_last_errno: u32,
 
         /// The invariant every producer owes: a level never exceeds its
         /// own capacity, and the two upstream levels share one.
@@ -340,12 +358,35 @@ pub const Counters = struct {
         }
     };
 
+    /// The counter for an `Io.Pressure.Cause`. Lives here rather than on
+    /// the seam's enum so `io.zig` stays free of counter names.
+    pub fn causeCounter(cause: io_module.Pressure.Cause) []const u8 {
+        return switch (cause) {
+            .out_of_buffers => "kernel_pressure_out_of_buffers",
+            .out_of_memory => "kernel_pressure_out_of_memory",
+            .fd_limit => "kernel_pressure_fd_limit",
+            .address_unavailable => "kernel_pressure_address_unavailable",
+            .other => "kernel_pressure_other_cause",
+        };
+    }
+
     /// The per-op split summed — equal to `kernel_pressure_errors` by
     /// construction, and asserted so in `reconcile`.
     pub fn kernelPressureTotal(counters: *const Counters) u64 {
         var total: u64 = 0;
         inline for (comptime std.enums.values(KernelPressureOp)) |op| {
             total += counters.get(comptime op.counter());
+        }
+        return total;
+    }
+
+    /// The per-cause split summed. The second partition of the same total,
+    /// so it must agree with `kernelPressureTotal` as well as with the
+    /// total itself — both asserted in `reconcile`.
+    pub fn kernelPressureCauseTotal(counters: *const Counters) u64 {
+        var total: u64 = 0;
+        inline for (comptime std.enums.values(io_module.Pressure.Cause)) |cause| {
+            total += counters.get(comptime causeCounter(cause));
         }
         return total;
     }
@@ -367,6 +408,7 @@ pub const Counters = struct {
         // incremented one without the other would make the split lie about
         // where the pressure is, which is the only thing it exists to say.
         assert(counters.kernelPressureTotal() == counters.get("kernel_pressure_errors"));
+        assert(counters.kernelPressureCauseTotal() == counters.get("kernel_pressure_errors"));
         const flow_holds = admitted == completed + active_count;
         const gate_holds = accepted == admitted + shed;
         return flow_holds and gate_holds;
@@ -400,6 +442,7 @@ const test_gauges: Counters.Gauges = .{
     .upstream_slots_leased = 5,
     .upstream_slots_parked = 11,
     .upstream_slots_capacity = 16,
+    .kernel_pressure_last_errno = 105, // ENOBUFS on Linux
 };
 
 test "counters: render emits Prometheus exposition for every field" {
@@ -541,11 +584,16 @@ test "counters: every kernel-pressure op has its own counter, and they partition
     }
     try std.testing.expectEqual(std.enums.values(Counters.KernelPressureOp).len, index);
 
-    // Each op moves its own counter and the total together, never one
-    // alone — the invariant `reconcile` asserts.
+    // The cause split is a second partition of the same total, so every
+    // witness moves three counters together: the total, one op, one cause.
+    inline for (comptime std.enums.values(io_module.Pressure.Cause)) |cause| {
+        try std.testing.expectEqual(@as(u64, 0), counters.get(comptime Counters.causeCounter(cause)));
+    }
     counters.increment("kernel_pressure_errors");
     counters.increment("kernel_pressure_send");
+    counters.increment("kernel_pressure_out_of_buffers");
     try std.testing.expectEqual(@as(u64, 1), counters.kernelPressureTotal());
+    try std.testing.expectEqual(@as(u64, 1), counters.kernelPressureCauseTotal());
     try std.testing.expect(counters.reconcile(0));
 
     // A total that moved without an op is exactly the old behaviour: the

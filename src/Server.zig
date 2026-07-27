@@ -68,6 +68,11 @@ pub fn Server(comptime IoType: type) type {
         /// co-armed exactly the budgeted worst case, not merely stayed
         /// under it.
         armed_ops_peak: u8,
+        /// The raw errno of the most recent kernel-pressure failure, or 0
+        /// (§8). Reported as a gauge rather than a counter because it is a
+        /// level — "what is failing now" — and because an errno space is
+        /// far too wide for a counter each.
+        last_pressure_errno: u16,
         drain_deadline_completion: IoType.Completion,
         /// The one timer covering every parked upstream (§5): a parked
         /// connection holds no armed op, so this sweep compares stored
@@ -147,6 +152,7 @@ pub fn Server(comptime IoType: type) type {
             server.conn_pressure = false;
             server.upstream_pressure = false;
             server.armed_ops_peak = 0;
+            server.last_pressure_errno = 0;
             server.drain_deadline_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
@@ -756,6 +762,19 @@ pub fn Server(comptime IoType: type) type {
             if (err != error.Unexpected) return;
             server.counters.increment("kernel_pressure_errors");
             server.counters.increment(comptime op.counter());
+            // The seam classified this while the completion was still in
+            // hand; reading it here is why the op and the cause always
+            // describe the same failure. Both partition the same total.
+            const pressure = server.io.lastPressure();
+            switch (pressure.cause) {
+                inline else => |cause| server.counters.increment(
+                    comptime counters_module.Counters.causeCounter(cause),
+                ),
+            }
+            // Kept raw so an `.other` is a lead rather than a dead end: the
+            // classification names only the errnos worth acting on
+            // differently, and this is how the rest stay visible.
+            server.last_pressure_errno = pressure.errno;
             // The partition, checked where it is maintained rather than
             // only where `reconcile` happens to run. A site that increments
             // the total on its own leaves the two unequal, and the next
@@ -763,6 +782,8 @@ pub fn Server(comptime IoType: type) type {
             // site was found still doing exactly that, on a path SimIo
             // cannot fail and so 64 sim seeds could never reach.
             assert(server.counters.kernelPressureTotal() ==
+                server.counters.get("kernel_pressure_errors"));
+            assert(server.counters.kernelPressureCauseTotal() ==
                 server.counters.get("kernel_pressure_errors"));
         }
 
@@ -858,6 +879,7 @@ pub fn Server(comptime IoType: type) type {
                 .upstream_slots_leased = server.upstreams.leasedCount(),
                 .upstream_slots_parked = server.upstreams.parkedCount(),
                 .upstream_slots_capacity = server.upstreams.capacity(),
+                .kernel_pressure_last_errno = server.last_pressure_errno,
             };
             // Asserted at the producer, not in the renderer: a level past
             // its capacity would mean a pool miscounted, and that is a bug

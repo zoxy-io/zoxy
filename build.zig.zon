@@ -32,15 +32,30 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // Audited fork: zoxy-io/libxev branch zoxy-cqsize = upstream
+        // Audited fork: zoxy-io/libxev branch zoxy-op-errno = upstream
         // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
-        // plus two commits: one exposing io_uring setup flags through
-        // Options, one exposing the CQ depth (IORING_SETUP_CQSIZE) — the
-        // c10k lever. Diff against that upstream commit to audit; the pin
-        // moves only after re-audit.
+        // plus three commits, each its own stacked PR:
+        //   c369817 expose io_uring setup flags through Options
+        //   6bd950d expose the CQ depth (IORING_SETUP_CQSIZE) — the c10k
+        //           lever
+        //   b3d6b55 keep the raw errno on the Completion (zoxy-io/libxev#2)
+        // Diff against that upstream commit to audit; the pin moves only
+        // after re-audit.
+        //
+        // Re-audit for b3d6b55: one `posix.E` field on `Completion`
+        // defaulting to `.SUCCESS`, one assignment at the top of `invoke`
+        // from the same `-errno` encoding every arm already decodes, and a
+        // test. No error set, result, or control-flow change — the whole
+        // diff is additive, so every existing call path behaves as before.
+        // Scope: **io_uring only**. `kqueue.Completion` has no such field,
+        // so `XevIo.recordPressure` reports unclassified there rather than
+        // failing to compile on the macOS dev box (§4).
+        // It exists because the mapping's `else => posix.unexpectedErrno`
+        // arms discard which errno failed, which is what left a c10k run
+        // reporting 227,628 indistinguishable failures.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#6bd950d789629d62c985eb7c625f6439e693ec87",
-            .hash = "libxev-0.0.0-86vtcxUcFAAKN43dhrvWh-caogydO84cmzT2QuHxyc-P",
+            .url = "git+https://github.com/zoxy-io/libxev#b3d6b55bfbea1de0401d11f69ad9755fed9a6144",
+            .hash = "libxev-0.0.0-86vtc6cnFACJYqPSG_os9Ea-nUgWmjAqi3CwCQGiFj2z",
         },
         .zrk = .{
             .url = "git+https://github.com/zoxy-io/zrk#f05cc6a2e7657409767c3cf63c68fcd54d2621e3",

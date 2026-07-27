@@ -71,6 +71,12 @@ adversary: Adversary,
 /// bumping the aggregate counter alone, and 64 seeds stayed green because
 /// nothing could make the call fail.
 pending_set_option_errors: u8,
+/// The cause `lastPressure` reports for the next injected failure (§8).
+/// Scenario-controlled so a test can drive each classification arm: the
+/// real errno comes from the kernel, which a virtual socket table has
+/// none of.
+pressure_cause: Io.Pressure.Cause,
+last_pressure: Io.Pressure,
 stopped: bool,
 dump_on_deadlock: bool,
 /// FNV-1a over every delivery; two runs of one seed must end equal (§9).
@@ -305,6 +311,8 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.prng = std.Random.DefaultPrng.init(options.seed);
     io.adversary = options.adversary;
     io.pending_set_option_errors = 0;
+    io.pressure_cause = .out_of_buffers;
+    io.last_pressure = Io.Pressure.none;
     io.stopped = false;
     io.dump_on_deadlock = options.dump_on_deadlock;
     io.trace_hash = std.hash.Fnv1a_64.init().value;
@@ -600,6 +608,7 @@ pub fn setLingerRst(io: *SimIo, socket: Socket) Io.SetOptionError!void {
 fn takeSetOptionError(io: *SimIo) ?Io.SetOptionError {
     if (io.pending_set_option_errors == 0) return null;
     io.pending_set_option_errors -= 1;
+    io.recordPressure();
     return error.Unexpected;
 }
 
@@ -645,6 +654,34 @@ pub fn injectAcceptError(io: *SimIo, listener: Listener) void {
     assert(entry.active);
     assert(entry.pending_accept_errors < std.math.maxInt(u8));
     entry.pending_accept_errors += 1;
+}
+
+/// The classified cause of the op currently being delivered (§8) — the
+/// seam contract `Server.witnessKernelPressure` reads. Production learns
+/// this from the kernel's errno; a virtual socket table has none, so the
+/// scenario states the cause it is simulating and this reports it back.
+///
+/// Valid only inside the callback for the failure it describes, exactly as
+/// on XevIo: every fault site records immediately before returning its
+/// error, and anything reading it later sees the previous failure's answer
+/// rather than an absent one. A fault site that forgets to record is the
+/// specific bug this warning is about — the accept path shipped that way
+/// once, reporting whatever the last unrelated op had left behind.
+pub fn lastPressure(io: *const SimIo) Io.Pressure {
+    return io.last_pressure;
+}
+
+/// Stamp the scenario's chosen cause onto the failure being delivered.
+/// The errno is 0 because there is no kernel here to have produced one —
+/// which is exactly what a `.errno` of 0 is defined to mean, so the sim
+/// does not have to invent a plausible number.
+fn recordPressure(io: *SimIo) void {
+    io.last_pressure = .{ .cause = io.pressure_cause, .errno = 0 };
+}
+
+/// Scenario control: which cause the next injected failures report.
+pub fn setPressureCause(io: *SimIo, cause: Io.Pressure.Cause) void {
+    io.pressure_cause = cause;
 }
 
 /// Targeted scenario control: the next `setNodelay`/`setLingerRst` fails
@@ -860,6 +897,7 @@ fn finishAccept(io: *SimIo, listener_index: u16) Io.AcceptError!Socket {
     }
     if (entry.pending_accept_errors > 0) {
         entry.pending_accept_errors -= 1;
+        io.recordPressure();
         return error.Unexpected;
     }
     assert(entry.accept_queue_len >= 1);
@@ -902,6 +940,7 @@ fn finishRecv(io: *SimIo, socket: Socket, buffer: []u8) Io.RecvError!u32 {
     if (entry.kernel_pressure) {
         // Transient op failure: consume the flag, leave the socket usable.
         entry.kernel_pressure = false;
+        io.recordPressure();
         return error.Unexpected;
     }
     if (entry.reset) {
@@ -924,6 +963,7 @@ fn finishSend(io: *SimIo, socket: Socket, bytes: []const u8) Io.SendError!u32 {
     if (entry.kernel_pressure) {
         // Transient op failure: consume the flag, leave the socket usable.
         entry.kernel_pressure = false;
+        io.recordPressure();
         return error.Unexpected;
     }
     if (entry.reset) {
