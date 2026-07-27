@@ -385,6 +385,46 @@ test "relay: a kernel-pressure data-op failure is witnessed and tears down" {
     try std.testing.expect(bed.server.counters.get("kernel_pressure_errors") >= 1);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("shed_relay_buffers"));
+    // The split must attribute this to the data path and nowhere else.
+    // Paired with the accept test below, this is the discrimination the
+    // single counter could not make: both scenarios used to land on one
+    // number, so a run reporting 227,628 of them said nothing about
+    // whether the NIC queue or the fd table was the problem.
+    const data_ops = bed.server.counters.get("kernel_pressure_recv") +
+        bed.server.counters.get("kernel_pressure_send");
+    try std.testing.expect(data_ops >= 1);
+    try std.testing.expectEqual(data_ops, bed.server.counters.get("kernel_pressure_errors"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_accept"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_connect"));
+    try bed.expectDrained();
+}
+
+test "server: kernel-pressure on a socket option is witnessed and the connection serves on" {
+    // The set-option path had no simulation coverage at all before this:
+    // a virtual socket table never refuses an option, so every bug on it
+    // was invisible under every seed — which is how a `setNodelay` site
+    // shipped still bumping the aggregate counter without naming its op.
+    //
+    // Setting TCP_NODELAY is best-effort (§6): failing it costs latency,
+    // not correctness, so the connection must still serve.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 52 } });
+    defer bed.tearDown();
+
+    bed.sim_io.injectSetOptionError();
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_errors"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_set_option"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_accept"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_recv"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_send"));
+    // Best-effort means the exchange completed regardless.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    const client = &bed.scenario.clients[0];
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    try std.testing.expectEqualStrings(echo_token, client.receive_buffer[0..client.received_len]);
     try bed.expectDrained();
 }
 
@@ -401,6 +441,11 @@ test "server: kernel-pressure accept failure backs off and recovers" {
     try bed.sim_io.run();
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_errors"));
+    // Attributed to the accept, and to nothing on the data path — the
+    // other half of the discrimination (see the relay test above).
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_accept"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_recv"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_send"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("accepted"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     const client = &bed.scenario.clients[0];

@@ -146,7 +146,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // instead of closing. The witness filters internally: only
                 // Unexpected (kernel pressure) is counted, so orderly
                 // EndOfStream/Reset pass through it uncounted.
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.recv, err);
                 server.beginTeardown(conn);
                 return;
             };
@@ -484,15 +484,18 @@ pub fn Proxy(comptime IoType: type) type {
                 respond(server, conn, 504, "l7_gateway_timeout");
                 return;
             }
-            const socket = result catch {
+            const socket = result catch |err| {
                 server.counters.increment("upstream_connect_failed");
+                // Same split as the L4 dial: the origin's verdict arrives
+                // typed, our own resource exhaustion does not (§8).
+                server.witnessKernelPressure(.connect, err);
                 respond(server, conn, 502, "l7_bad_gateway");
                 return;
             };
             conn.upstream.?.socket = socket;
             conn.upstream_socket = socket;
-            server.io.setNodelay(socket) catch {
-                server.counters.increment("kernel_pressure_errors");
+            server.io.setNodelay(socket) catch |err| {
+                server.witnessKernelPressure(.set_option, err);
             };
             renderAndStartLegs(server, conn);
         }
@@ -612,7 +615,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             const sent = result catch |err| {
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.send, err);
                 upstreamFailed(server, conn);
                 return;
             };
@@ -698,7 +701,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             const sent = result catch |err| {
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.send, err);
                 upstreamFailed(server, conn);
                 return;
             };
@@ -792,12 +795,12 @@ pub fn Proxy(comptime IoType: type) type {
             pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
                 // EOF mid-body is a truncated request; any failure here
                 // dooms the exchange in the client's own direction.
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.recv, err);
                 server.beginTeardown(conn);
             }
 
             pub fn onSendError(server: *ServerType, conn: *ConnType, err: Io.SendError) void {
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.send, err);
                 upstreamFailed(server, conn);
             }
 
@@ -866,7 +869,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             const received = result catch |err| {
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.recv, err);
                 upstreamFailed(server, conn);
                 return;
             };
@@ -1064,7 +1067,7 @@ pub fn Proxy(comptime IoType: type) type {
             const write = &conn.client_write;
             const sent = result catch |err| {
                 // The client is gone; there is no one left to answer.
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.send, err);
                 server.beginTeardown(conn);
                 return;
             };
@@ -1175,12 +1178,12 @@ pub fn Proxy(comptime IoType: type) type {
                     // Truncated inside a length-delimited body: the client
                     // must see the truncation too, so tear down.
                 }
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.recv, err);
                 server.beginTeardown(conn);
             }
 
             pub fn onSendError(server: *ServerType, conn: *ConnType, err: Io.SendError) void {
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.send, err);
                 server.beginTeardown(conn);
             }
 
@@ -1660,7 +1663,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // close is a clean FIN, not a data-discarding RST. Kernel
                 // pressure on the drain recv is still witnessed (§8) —
                 // this op fires most during a reject storm under load.
-                server.witnessKernelPressure(err);
+                server.witnessKernelPressure(.recv, err);
                 server.beginTeardown(conn);
                 return;
             };

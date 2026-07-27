@@ -99,8 +99,32 @@ pub const Counters = struct {
     upstream_idle_reaped: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
     /// across every completion (accept, connect, setNodelay, and the relay
-    /// recv/send data path).
+    /// recv/send data path). The total; `kernel_pressure_by_op` below
+    /// partitions it.
     kernel_pressure_errors: Value = Value.init(0),
+    /// The same failures split by the syscall that produced them.
+    ///
+    /// Why the split exists: the seam collapses every unmapped errno to
+    /// `error.Unexpected` (libxev discards it — see IMPLEMENTATION_NOTES),
+    /// so the total alone says only that *something* failed. A c10k run
+    /// recorded 227,628 of them against 736,843 churned connections, and
+    /// the total could not distinguish "the NIC queue is full on send"
+    /// from "we are out of fds on accept" — opposite problems with
+    /// opposite fixes. The op is the one bit of information that costs no
+    /// dependency change to keep, and it is usually the one that matters:
+    /// a send failure at 90% of link capacity needs no errno to read.
+    ///
+    /// Recovering the errno itself needs the libxev fork to stop throwing
+    /// it away; that is the follow-up this split does not block on.
+    ///
+    /// `kernelPressureTotal` must equal `kernel_pressure_errors` — every
+    /// witness increments exactly one of these alongside the total, which
+    /// `reconcile` asserts.
+    kernel_pressure_accept: Value = Value.init(0),
+    kernel_pressure_connect: Value = Value.init(0),
+    kernel_pressure_recv: Value = Value.init(0),
+    kernel_pressure_send: Value = Value.init(0),
+    kernel_pressure_set_option: Value = Value.init(0),
     /// Admin/metrics scrapes whose full response was written (§8, PLANS.md
     /// §243). Pure observability: the admin plane sits entirely outside
     /// `reconcile`'s accepted/admitted/shed accounting, so these never enter
@@ -292,6 +316,40 @@ pub const Counters = struct {
         return total;
     }
 
+    /// Which syscall a kernel-pressure failure came from (§8). Closed set:
+    /// a new op has to name itself here and grow a counter, rather than
+    /// disappearing into the total.
+    pub const KernelPressureOp = enum {
+        accept,
+        connect,
+        recv,
+        send,
+        set_option,
+
+        /// The counter this op increments. A `switch` rather than a name
+        /// built by concatenation, so a typo is a compile error and the
+        /// mapping reads in one place.
+        pub fn counter(op: KernelPressureOp) []const u8 {
+            return switch (op) {
+                .accept => "kernel_pressure_accept",
+                .connect => "kernel_pressure_connect",
+                .recv => "kernel_pressure_recv",
+                .send => "kernel_pressure_send",
+                .set_option => "kernel_pressure_set_option",
+            };
+        }
+    };
+
+    /// The per-op split summed — equal to `kernel_pressure_errors` by
+    /// construction, and asserted so in `reconcile`.
+    pub fn kernelPressureTotal(counters: *const Counters) u64 {
+        var total: u64 = 0;
+        inline for (comptime std.enums.values(KernelPressureOp)) |op| {
+            total += counters.get(comptime op.counter());
+        }
+        return total;
+    }
+
     pub fn reconcile(counters: *const Counters, active_count: u32) bool {
         const admitted = counters.get("admitted");
         const completed = counters.get("completed");
@@ -305,6 +363,10 @@ pub const Counters = struct {
         // Every §7 replay rides a checkout: only a reused connection's
         // early failure is blamed on staleness.
         assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));
+        // The op split partitions the total exactly: a witness that
+        // incremented one without the other would make the split lie about
+        // where the pressure is, which is the only thing it exists to say.
+        assert(counters.kernelPressureTotal() == counters.get("kernel_pressure_errors"));
         const flow_holds = admitted == completed + active_count;
         const gate_holds = accepted == admitted + shed;
         return flow_holds and gate_holds;
@@ -457,6 +519,43 @@ test "counters: the gate identity sums exactly today's admission rungs" {
         }
     }
     try std.testing.expectEqual(expected.len, actual_count);
+}
+
+test "counters: every kernel-pressure op has its own counter, and they partition the total" {
+    // The mapping must be total and injective: an op sharing a counter
+    // with another would silently re-create the bucket this split exists
+    // to break up.
+    var counters: Counters = .{};
+    var seen: [std.enums.values(Counters.KernelPressureOp).len][]const u8 = undefined;
+    var index: usize = 0;
+    inline for (comptime std.enums.values(Counters.KernelPressureOp)) |op| {
+        const name = comptime op.counter();
+        // Names an existing field: `get` would not compile otherwise, and
+        // the zero read here pins that it starts clean.
+        try std.testing.expectEqual(@as(u64, 0), counters.get(name));
+        for (seen[0..index]) |previous| {
+            try std.testing.expect(!std.mem.eql(u8, previous, name));
+        }
+        seen[index] = name;
+        index += 1;
+    }
+    try std.testing.expectEqual(std.enums.values(Counters.KernelPressureOp).len, index);
+
+    // Each op moves its own counter and the total together, never one
+    // alone — the invariant `reconcile` asserts.
+    counters.increment("kernel_pressure_errors");
+    counters.increment("kernel_pressure_send");
+    try std.testing.expectEqual(@as(u64, 1), counters.kernelPressureTotal());
+    try std.testing.expect(counters.reconcile(0));
+
+    // A total that moved without an op is exactly the old behaviour: the
+    // two diverge, and `reconcile` would trip its assertion rather than
+    // return false — which is why it is not called here. The sim runs
+    // `reconcile` under every seed, so that assertion is the enforcement;
+    // this pins the divergence it fires on.
+    counters.increment("kernel_pressure_errors");
+    try std.testing.expectEqual(@as(u64, 1), counters.kernelPressureTotal());
+    try std.testing.expectEqual(@as(u64, 2), counters.get("kernel_pressure_errors"));
 }
 
 test "counters: an admission shed and an L7 reject land on opposite sides" {
