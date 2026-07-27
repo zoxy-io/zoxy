@@ -375,6 +375,12 @@ test "admin: a drain racing an in-flight scrape tears down cleanly" {
         // The scrape may complete or be torn down by the drain; either way no
         // op or socket leaks, and counters reconcile.
         try testing.expect(harness.holder.settled);
+        // A teardown race must leave the §8 pressure rung untouched. This
+        // does not prove the EPIPE mapping — the teardown check fires
+        // before anything reads the error — which `io/contract_test.zig`
+        // covers on a real socket instead.
+        try testing.expectEqual(@as(u64, 0), harness.server.counters.get("kernel_pressure_send"));
+        try testing.expectEqual(@as(u64, 0), harness.server.counters.get("kernel_pressure_errors"));
         try harness.expectDrained();
     }
 }

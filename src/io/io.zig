@@ -76,6 +76,12 @@ pub const RecvError = error{
 };
 
 pub const SendError = error{
+    /// The connection is gone and this write can never land: the peer's
+    /// RST (ECONNRESET) *and* our own half-close (EPIPE) both arrive here.
+    /// One case because they want one response — stop writing, tear down —
+    /// and because keeping them apart tempted the send adapter into
+    /// leaving EPIPE unnamed, where it fell through to `Unexpected` and
+    /// spent months being counted as §8 kernel pressure.
     Reset,
     Canceled,
     Unexpected,

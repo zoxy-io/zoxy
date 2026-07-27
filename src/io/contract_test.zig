@@ -273,6 +273,97 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     try std.testing.expect(second >= first);
 }
 
+/// A connected loopback pair and nothing else: the EPIPE test needs two
+/// live ends, and `EchoScenario` closes its own when it finishes.
+const Pair = struct {
+    io: *XevIo,
+    accept_completion: XevIo.Completion = .{},
+    connect_completion: XevIo.Completion = .{},
+    client: ?XevIo.Socket = null,
+    server: ?XevIo.Socket = null,
+
+    fn onAccept(pair: *Pair, result: Io.AcceptError!XevIo.Socket) void {
+        pair.server = result catch null;
+    }
+
+    fn onConnect(pair: *Pair, result: Io.ConnectError!XevIo.Socket) void {
+        pair.client = result catch null;
+    }
+};
+
+test "xevio: a send after our own write shutdown is Reset, not kernel pressure" {
+    // Regression for the EPIPE collapse. libxev maps the errno for us
+    // (`.PIPE => error.BrokenPipe`), but the send adapter named only
+    // ConnectionResetByPeer and Canceled, so BrokenPipe fell into
+    // `else => error.Unexpected` — and `witnessKernelPressure` counts
+    // Unexpected as the §8 resource rung. A c10k run reported 227,628
+    // "kernel pressure" events that were, every one of them, a peer that
+    // had left mid-write.
+    //
+    // This lives here rather than in the simulator because the simulator
+    // cannot reach it: SimIo models a gone peer as `error.Reset` directly
+    // and never exercises XevIo's mapping at all, so only a real socket
+    // proves the arm. EPIPE is made deterministic by shutting down our own
+    // write side first — no race with a peer's close.
+    //
+    // io_uring only. `IORING_OP_WRITE` reports EPIPE through the
+    // completion; the kqueue backend writes with a synchronous `write(2)`,
+    // which raises SIGPIPE first — and nothing installs a handler for it,
+    // so on a macOS dev box this scenario would terminate the test binary
+    // rather than fail it. Skipping is honest: the arm under test is the
+    // io_uring adapter's, and the kqueue path never reaches it.
+    if (comptime xev.backend != .io_uring) return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try xev_io.init(arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    // A connected loopback pair through the seam's own API — the echo
+    // scenario closes both ends when it finishes, so this needs its own.
+    var pair: Pair = .{ .io = &xev_io };
+    const listener = try xev_io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+    xev_io.accept(listener, &pair.accept_completion, Pair, &pair, Pair.onAccept);
+    xev_io.connect(
+        xev_io.listenerAddress(listener),
+        &pair.connect_completion,
+        Pair,
+        &pair,
+        Pair.onConnect,
+    );
+    try xev_io.run();
+    const client = pair.client orelse return error.ConnectNeverCompleted;
+    // Stated positively like its sibling: defaulting this to `client` would
+    // defer a double close, which trips `closeFd`'s errno assertion instead
+    // of reporting that the accept never landed.
+    const server = pair.server orelse return error.AcceptNeverCompleted;
+    defer xev_io.closeNow(client);
+    defer xev_io.closeNow(server);
+    xev_io.listenClose(listener);
+
+    // Half-close our own write side, then write: the kernel answers EPIPE,
+    // deterministically — no race with the peer's close.
+    const socket = client;
+    xev_io.shutdown(socket, .write);
+
+    var outcome: ?Io.SendError!u32 = null;
+    var completion: XevIo.Completion = .{};
+    xev_io.send(socket, "after-shutdown", &completion, @TypeOf(outcome), &outcome, (struct {
+        fn onSend(state: *?Io.SendError!u32, result: Io.SendError!u32) void {
+            state.* = result;
+        }
+    }).onSend);
+    try xev_io.run();
+
+    const result = outcome orelse return error.SendNeverCompleted;
+    // The verdict that matters: a peer that is gone, not a kernel short of
+    // resources. `Unexpected` here is what put ordinary disconnects on the
+    // pressure rung.
+    try std.testing.expectError(error.Reset, result);
+}
+
 test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
     // Regression for the bind-error collapse (review finding 5): an
     // address that is not assigned to this host (TEST-NET-3, RFC 5737)
