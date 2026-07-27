@@ -58,20 +58,31 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// IORING_SETUP_CQSIZE) against the 4096 SQ, so at the largest fill a
 /// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
 /// parked-upstream and admin reservations carved out first, this caps at
-/// `(57344 - 23 - upstream_slots_max) / conn_ops_max = 12282` —
+/// `(57344 - 23) / (conn_ops_max + 1) = 11464` —
 /// comptime-derived below (the 23 is the fixed ops: two per config and
 /// admin listener [18], the admin client's op budget [3], the signal
 /// wake [1], and the drain timer [1]). That clears a round 10k on a
 /// single ring; a deployment trades the ceiling back down for more burst
 /// headroom via `limits.cq_fill_eighths` (§8).
 ///
-/// This and `upstream_slots_max` sit on one line — a conn slot costs
-/// `conn_ops_max` ring ops, an upstream slot one — so raising either
-/// lowers the other. **Both clear 10k at this point**, which is what §1
-/// asks for: c10k reachable on either axis, not a shape tuned for it.
-/// The pair is provisional; PLANS.md holds the standing question of
-/// whether an operator should pick it rather than inherit ours.
-pub const conn_slots_max: u32 = 12282;
+/// `upstream_slots_max` is pinned to this, and the `+ 1` in the divisor
+/// is that pin: on the L7 path an admitted connection that is mid-exchange
+/// holds one upstream slot as well as its conn slot, and at saturation
+/// every admitted connection can be mid-exchange at once. A conn ceiling
+/// above the upstream ceiling is therefore capacity that cannot be served
+/// — slots that admit connections the pool has no upstream for — and one
+/// below it is a pool that can never be drawn down. `11464` is the
+/// largest N with `N * (conn_ops_max + 1) <= 57321`, which keeps both
+/// ceilings clear of a round 10k: what §1 asks for, c10k reachable on
+/// either axis rather than a shape tuned for it.
+///
+/// It was 12282 against an upstream ceiling of 8192, which measured out
+/// as ~2200 conn slots that stayed idle while the pool they depend on
+/// pinned at its own ceiling; IMPLEMENTATION_NOTES.md ("The upstream pool
+/// tracks connections, not requests") is the one home for those numbers.
+/// The pair is still a policy choice made on the operator's behalf;
+/// PLANS.md holds the standing question of handing it to them instead.
+pub const conn_slots_max: u32 = 11464;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -154,14 +165,21 @@ pub const chunked_trailer_bytes_max: u32 = 1024;
 /// stays lean below it, the same two-layer shape conn slots have. It was
 /// 1024, where ceiling and default were the same number and an operator
 /// could only go *down*; at 10k connections that pool pinned and shed a
-/// third of all responses. 8192 is measured, not guessed — the numbers
-/// live in IMPLEMENTATION_NOTES.md ("The upstream pool was a wall, not a
-/// range"), which is their one home.
+/// third of all responses. Then 8192, which still sat below
+/// `conn_slots_max` — and since the pool holds one live upstream per live
+/// client connection, a conn ceiling the pool cannot cover is unreachable
+/// capacity. Both are measured, not guessed; IMPLEMENTATION_NOTES.md
+/// ("The upstream pool was a wall, not a range" and "The upstream pool
+/// tracks connections, not requests") is their one home.
 ///
-/// Provisional. It trades against `conn_slots_max` on one CQ line, so
-/// this pair is still a policy choice made on the operator's behalf —
-/// PLANS.md carries the open question of handing it to them instead.
-pub const upstream_slots_max: u32 = 8192;
+/// Pinned to `conn_slots_max`, the same way `relay_buffers_max` is and
+/// for the same reason: a slot past the conn-slot count could never be
+/// acquired, and a slot short of it admits a connection nothing can
+/// serve. The two trade against each other on one CQ line, so pinning
+/// them collapses that line to a single divisor — `conn_ops_max + 1` ring
+/// ops per admitted connection — instead of two numbers that must be
+/// edited together and can silently drift apart.
+pub const upstream_slots_max: u32 = conn_slots_max;
 
 /// Listen backlog for every listener.
 pub const accept_backlog: u31 = 1024;
@@ -377,13 +395,19 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 /// Deliberately *not* `upstream_slots_max`. It used to be, which left the
 /// two identical and the pool the one thing an operator could only shrink
 /// — the defect the raised ceiling exists to fix. The default answers a
-/// different question than the ceiling does: the ceiling is how far a
-/// c10k deployment may climb, this is what an unconfigured one costs, and
-/// 8192 slots would put 66 MiB of upstream pool in a footprint budgeted
-/// at ~32 MiB total. What it has to cover is in-flight *exchanges*
-/// (rate × latency) plus parked keep-alive connections — not one per
-/// conn slot — which is why it sits below `conn_slots_default` rather
-/// than tracking it.
+/// different question than the ceiling does: the ceiling is how far an
+/// L7 deployment may climb, this is what an unconfigured one costs.
+///
+/// It sits *below* `conn_slots_default` even though a saturated L7
+/// deployment needs one upstream slot per busy conn slot (see
+/// `conn_slots_max`), because the out-of-box shape is bounded by the
+/// stock 4096 `RLIMIT_NOFILE` rather than by admission: matching 1386
+/// would put the default at 4167 fds, over that line, for capacity an
+/// unconfigured proxy is not there to serve. An L4 deployment never
+/// leases from this pool at all — an L4 dial reads its `leased_counts`
+/// for the P2C draw and holds no slot. A deployment that means to fill its conn
+/// pool raises both together in `limits` — which is what the ceilings
+/// exist to permit and what the c10k benchmark configuration does.
 pub const upstream_slots_default: u32 = 1024;
 
 comptime {
@@ -446,11 +470,16 @@ comptime {
     // count whose worst-case ops fit the ⅞-CQ budget (at the default =
     // loosest fill) after the fixed ops — the parked-upstream reservation
     // and the admin listener plus its one client op — are carved out (§8).
+    // The pair is pinned (`upstream_slots_max = conn_slots_max`), so the
+    // shared CQ line has one divisor — an admitted connection costs
+    // `conn_ops_max` conn ops plus the one op of the upstream slot it may
+    // need — rather than one ceiling subtracting from the other.
+    assert(upstream_slots_max == conn_slots_max);
     assert(conn_slots_max == @divFloor(
         @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
             2 * (@as(u32, listeners_max) + admin_listeners) -
-            admin_conns * admin_conn_ops_max - 1 - 1 - upstream_slots_max,
-        conn_ops_max,
+            admin_conns * admin_conn_ops_max - 1 - 1,
+        conn_ops_max + 1,
     ));
     assert(admin_listeners >= 1);
     assert(admin_conns >= 1);
@@ -558,7 +587,7 @@ test "budgets: c10k ceiling fd count needs a raised NOFILE" {
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
-    try std.testing.expectEqual(@as(u32, 32772), fds_max);
+    try std.testing.expectEqual(@as(u32, 34408), fds_max);
     try std.testing.expect(fds_max <= 65536);
     // The out-of-box side of this is pinned by "the default deployment is
     // lean" below, not restated here.

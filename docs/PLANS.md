@@ -372,10 +372,12 @@ fixed 2 × SQ, in-flight fill tunable via `limits.cq_fill_eighths`, ⅞
 default) and the `conn_ops_max` 5 → 4 cut (teardown closes serialized
 behind the full armed-set drain, #64) — putting `conn_slots_max` /
 `relay_buffers_max` at `(57344 − 23 − upstream_slots_max) / 4` at ⅞ fill;
-that read 14074 while `upstream_slots_max` was 1024 and is **12282**
-since it rose to 8192 (below), with `fds_max` **32772** (a c10k
-deployment raises the documented `RLIMIT_NOFILE` at startup, §8). The
-arithmetic and its history live in IMPLEMENTATION_NOTES.md.
+that read 14074 while `upstream_slots_max` was 1024 and 12282 once it
+rose to 8192 (below). Pinning the upstream ceiling to the conn ceiling
+(2026-07-28) made it one divisor — `(57344 − 23) / (4 + 1)` = **11464**,
+with `fds_max` **34408** (a c10k deployment raises the documented
+`RLIMIT_NOFILE` at startup, §8). The arithmetic and its history live in
+IMPLEMENTATION_NOTES.md.
 
 The one remaining lever is **`splice`** (above) — an independent win at
 saturation, still libxev-fork work (a re-audit); TLS and chunked L7
@@ -385,25 +387,33 @@ Entry gate for further ceiling work: demonstrate a workload that actually
 saturates the *current* conn-slot ceiling first — the splice lever costs
 a re-audit, not worth spending blind. Note what the c10k runs of
 2026-07-27 did and did not show: they saturated the **upstream** pool
-comprehensively (which is why its ceiling moved), and never came close to
-the conn-slot one, sitting at ~10k held connections against 12282.
+comprehensively (which is why its ceiling moved, and then why it was
+pinned to the conn ceiling), and never came close to the conn-slot one,
+sitting at ~10k held connections against 12282 — which was the point:
+those 2200 spare slots were unservable, not spare.
 
 ## Pool ceilings: policy we chose, or a range the operator picks?
 
-**Interim taken 2026-07-27; the question below stays open.**
+**Interim taken 2026-07-27, narrowed 2026-07-28; the question below
+stays open.**
 
-The ceiling pair moved to `upstream_slots_max = 8192` /
-`conn_slots_max = 12282`, with `upstream_slots_default` held at 1024 so
-the out-of-box footprint is unchanged (byte-identical: 32,259 KiB, 3,805
-fds). That fixes the immediate defect — the upstream pool had *no range*,
-default and ceiling being the same number — and both ceilings clear 10k,
-so §1's "able to operate at c10k" holds on either axis. Measurements in
-IMPLEMENTATION_NOTES.md.
+The ceiling pair first moved to `upstream_slots_max = 8192` /
+`conn_slots_max = 12282`, which fixed the immediate defect — the upstream
+pool had *no range*, default and ceiling being the same number. The next
+c10k run showed that pair was still the wrong shape: leased upstreams
+track the *connection* count, so a pool below the conn ceiling makes the
+top of that ceiling unservable. The upstream ceiling is now **pinned** to
+the conn ceiling, and the shared CQ line has one divisor rather than two
+numbers that must be edited together: `conn_slots_max =
+upstream_slots_max = 11464`. `upstream_slots_default` stays at 1024, so
+the out-of-box footprint is still byte-identical (32,259 KiB, 3,805 fds).
+Measurements in IMPLEMENTATION_NOTES.md.
 
-It does **not** answer the question below. A pair chosen at compile time
-is still a policy decision made on the operator's behalf; this one is
-merely a better-evidenced choice than the last. What follows is why that
-may be worth changing, and what it would cost.
+It does **not** answer the question below — it narrows it. There is now
+one number, not a pair, and §1's "able to operate at c10k" holds on both
+axes at once. But a ceiling chosen at compile time is still a policy
+decision made on the operator's behalf. What follows is why that may be
+worth changing, and what it would cost.
 
 One correction to the cost stated here originally: raising the ceilings
 does **not** balloon `SimIo`'s `ready_buffer`. That array is sized by
@@ -430,29 +440,35 @@ Upstream slots had no such range. An operator could only go *down*, and
 at c10k the upstream pool is precisely the one that needs to go up. Every
 c10k run that behaved did so on a build-time `sed` of the constant. The
 interim fix gave that pool a range (default 1024, ceiling 8192, and
-`conn_slots_max` down to 12282 to pay for it on the shared CQ line).
-
-The measurements, on one 1-CPU box at 10k connections (2026-07-27):
+`conn_slots_max` down to 12282 to pay for it on the shared CQ line); the
+follow-up pinned the ceiling to `conn_slots_max` outright, which is the
+shape it should have had from the start.
 
 Summarised: at 1024 the pool pinned, a third of all responses became 503,
-and real throughput decayed to a quarter of its peak; at 8192 the pool
-never pinned, sheds fell by three orders of magnitude, and throughput
-held flat. The figures live in IMPLEMENTATION_NOTES.md ("The upstream
-pool was a wall, not a range") — restating them here is what let this
+and real throughput decayed to a quarter of its peak; at 8192 sheds fell
+by three orders of magnitude and throughput held flat, but a full c10k
+run still drove the pool to its ceiling — 0.44% of responses shed with
+~2200 conn slots idle. The figures live in IMPLEMENTATION_NOTES.md ("The
+upstream pool was a wall, not a range" and "The upstream pool tracks
+connections, not requests") — restating them here is what let this
 section drift out of date once already.
 
 ### Why a better default does not fix it, and neither does a build option
 
-The two ceilings share one completion-queue budget at 4:1 — a conn slot
-costs `conn_ops_max` ring ops, an upstream slot one:
+The two ceilings share one completion-queue budget — a conn slot costs
+`conn_ops_max` ring ops, an upstream slot one:
 
     conn_slots × 4 + upstream_slots + fixed <= 57344   (⅞ of a 65536 CQ)
 
-They are points on a line. **Choosing one at compile time is tuning for a
-deployment shape**, which is the thing §1 says not to do; a build option
-only moves who does the tuning. And zoxy ships prebuilt release binaries,
-so a build-time knob is invisible to anyone who installs rather than
-compiles.
+They are points on a line, and pinning the pair picks the diagonal of
+that line rather than getting off it. The diagonal is the right point for
+an L7 deployment — that is what the measurement says — but **choosing any
+point at compile time is tuning for a deployment shape**, which is the
+thing §1 says not to do. An L4-only deployment, for one, wants no
+upstream slots at all and would rather spend the whole budget on conn
+slots. A build option only moves who does the tuning; and zoxy ships
+prebuilt release binaries, so a build-time knob is invisible to anyone
+who installs rather than compiles.
 
 ### The shape that follows
 
