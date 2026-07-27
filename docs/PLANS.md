@@ -383,6 +383,101 @@ Entry gate for further ceiling work: demonstrate a workload that actually
 saturates the 14074 ceiling first — the splice lever costs a re-audit,
 not worth spending blind.
 
+## Pool ceilings: policy we chose, or a range the operator picks?
+
+**Open decision (2026-07-27), evidence gathered, not yet taken.**
+
+§1 says zoxy must be *able* to operate at c10k — not that it is tuned for
+it. The two-layer shape that serves that goal already exists for conn
+slots: a lean default the out-of-box deployment runs at, and a higher
+ceiling the operator climbs to through `limits`.
+
+    conn_slots_default      1386     ~32 MiB out of the box
+    conn_slots_max         14074     operator opts up
+    upstream_slots_default  1024
+    upstream_slots_max      1024     <- same number: no range at all
+
+Upstream slots have no such range. An operator can only go *down*, and at
+c10k the upstream pool is precisely the one that needs to go up. Every
+c10k run that behaved did so on a build-time `sed` of the constant.
+
+The measurements, on one 1-CPU box at 10k connections (2026-07-27):
+
+| | 1024 (shipped) | 8192 (sed) |
+|---|---|---|
+| pool state | pinned at 1024 leased | 5771/8192, never pinned |
+| `l7_shed_upstream_slots` | 5,852,702 (35% of responses) | 10,576 (0.35%) |
+| real req/s at high offered | decayed to 5,315 | flat ~20,000 |
+
+### Why a better default does not fix it, and neither does a build option
+
+The two ceilings share one completion-queue budget at 4:1 — a conn slot
+costs `conn_ops_max` ring ops, an upstream slot one:
+
+    conn_slots × 4 + upstream_slots + fixed <= 57344   (⅞ of a 65536 CQ)
+
+They are points on a line. **Choosing one at compile time is tuning for a
+deployment shape**, which is the thing §1 says not to do; a build option
+only moves who does the tuning. And zoxy ships prebuilt release binaries,
+so a build-time knob is invisible to anyone who installs rather than
+compiles.
+
+### The shape that follows
+
+Let the ceilings be what the *types and the kernel* allow rather than a
+policy point, and let the operator pick a feasible pair:
+
+- `upstream_slots_max` -> `maxInt(u16)` (the per-endpoint `leased_counts`
+  width, already asserted), `conn_slots_max` likewise bounded by its own
+  u16 slot index — independently, not against each other.
+- The operator names both in `limits`; `cqFillFits` rejects an infeasible
+  pair at config load. That guard already exists and already runs
+  unconditionally (`LimitConnSlotsOverCqFill`), so nothing new enforces
+  anything — it stops being shadowed by a comptime pre-decision.
+
+### The §5 amendment this requires — the actual decision
+
+`assert(in_flight_ops_max <= completion_queue_entries)` states a property
+of *the chosen point*. With independent ceilings there is no chosen point
+and the assertion is simply false, so it goes. §5's "the memory, fd and
+ring budgets are closed-form functions of those constants,
+comptime-asserted" becomes:
+
+> comptime-asserted where a budget is a property of one constant;
+> **rejected at startup** where it is a property of a *combination*.
+
+That is the whole cost, and it is a real narrowing of a stated invariant.
+What argues for paying it: the surviving check is about the configuration
+actually running rather than one nobody deploys, it cannot be skipped
+(the loader calls it on every start), and zoxy already refuses to start
+on an inadequate `RLIMIT_NOFILE` — the same failure mode, applied to the
+ring. What argues against: a compile error is unmissable, a startup
+refusal is merely loud.
+
+Everything else in §5 stays comptime: ring power-of-two, CQ within the
+kernel maximum, the u16 index widths, the watermark relationships, and
+`memoryBytesTotal`'s closed form.
+
+### Known cost beyond the amendment
+
+`SimIo` sizes a **stack** array from the ceiling —
+`var ready_buffer: [pending_ops_max]*Completion` where `pending_ops_max
+= constants.in_flight_ops_max`, ~458 KB today. Raising the ceilings
+inflates it past anything sane; it moves to the arena or gets a bound of
+its own. Production pools are unaffected: they already allocate from the
+*effective* config (`conns.init(arena, options.conn_slots)`), so the
+ceiling drives no allocation there.
+
+### Entry gate
+
+Take the decision before the code. If the answer is "ship a c10k-shaped
+default instead", that is one constant and no amendment — but it makes
+the lean out-of-box footprint worse for the deployments that are not
+c10k, which is most of them. The question to settle is whether one binary
+should span a few hundred connections through ten thousand *by
+configuration*; if yes, the amendment is the price and the machinery is
+already built.
+
 ## libxev fork queue
 
 The §4 pin policy (audited commit, moves only after re-audit) makes fork
@@ -390,15 +485,27 @@ changes deliberate, batched work — `Options.io_uring_flags` (the §4 ring
 setup flags) and `Options.cq_entries` (the c10k CQSIZE lever, #61) landed
 this way. Known queue, in rough value order:
 
-1. Per-errno surfacing on data ops: the backend collapses ENOBUFS/ENOMEM
-   — and every uncommon errno — into `error.Unexpected`
-   (IMPLEMENTATION_NOTES.md), so zoxy ships a categorical
-   kernel-pressure witness instead. Fork change: map
-   `.NOBUFS`/`.NOMEM => error.SystemResources` and widen
-   ReadError/WriteError.
+1. ~~Per-errno surfacing on data ops.~~ **Landed 2026-07-27**
+   (zoxy-io/libxev#2, pin b3d6b55). Solved by *keeping* the errno rather
+   than widening the error sets: `Completion.result_errno`, recorded at
+   the top of `invoke` before the per-operation mapping discards it. No
+   error set, result or control-flow change, so nothing downstream had to
+   adapt. zoxy consumes it as the per-cause half of the kernel-pressure
+   split (§8); the categorical witness is now two partitions of one total
+   plus a raw-errno gauge. It paid for itself on its first run: 172
+   "kernel pressure" events turned out to be EPIPE — clients leaving
+   mid-write, miscounted because zoxy's own send adapter left
+   `BrokenPipe` unnamed.
 2. `IORING_OP_SPLICE` (the op union is closed today).
 3. Multishot accept/recv ops — only behind the workloads in the verdict
-   table above.
+   table above. **The recv precondition is now met**: a 10k-connection
+   run holds ~20k req/s at 0.8–0.9 of a 1-CPU quota with ~87% of it
+   kernel time and the first non-zero CFS throttling, which is the
+   "recv-submission-bound workload (many mostly-idle connections)" the
+   parked verdict names. The 2–4% figure that parked it was measured on
+   a best-case echo microbench, never against this. Measure before
+   designing — two optimization priors were refuted by measurement the
+   same day (see IMPLEMENTATION_NOTES.md).
 
 ## Deferred, revisit on evidence
 
