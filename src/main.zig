@@ -94,7 +94,8 @@ pub fn main(init: std.process.Init) !void {
 
     // The loop only stops after a completed drain (§8).
     assert(server.isIdle());
-    server.counters.dump();
+    const gauges = server.gauges();
+    server.counters.dump(&gauges);
 }
 
 /// What the command line asked for: run against a config, or one of the

@@ -99,6 +99,47 @@ pub const Counters = struct {
 
     const Value = std.atomic.Value(u64);
 
+    /// Live pool occupancy against capacity (§8 "watermarks before
+    /// walls"). Gauges, not counters: they go both ways, and a scrape
+    /// wants the level, not the history.
+    ///
+    /// Read from the pools at render time rather than mirrored on every
+    /// acquire/release — a mirror is one missed release away from
+    /// disagreeing with the pool it describes, and the pools already
+    /// count what this reports. `Server.gauges` is the only producer.
+    ///
+    /// Why they exist: without them a scrape sees a wall only *after* it
+    /// is hit. The `shed_*` and `l7_shed_*` counters fire at exhaustion
+    /// and the `*_pressure_engaged` counters at the 3/4 watermark, so a
+    /// pool can run at 74% forever and look identical to an idle one.
+    /// The occupancy is what shows the approach.
+    pub const Gauges = struct {
+        conn_slots_in_use: u32,
+        conn_slots_capacity: u32,
+        relay_buffers_in_use: u32,
+        relay_buffers_capacity: u32,
+        /// Upstream slots serving a request right now. This is the level
+        /// that reaches `upstream_slots_capacity` and turns a request
+        /// into `l7_shed_upstream_slots` (§8).
+        upstream_slots_leased: u32,
+        /// Upstream slots held open for reuse (§5). Parked slots are
+        /// *occupied*: leased + parked is what the wall is measured
+        /// against, which is why both are reported rather than a single
+        /// in-use figure.
+        upstream_slots_parked: u32,
+        upstream_slots_capacity: u32,
+
+        /// The invariant every producer owes: a level never exceeds its
+        /// own capacity, and the two upstream levels share one.
+        pub fn valid(gauges: *const Gauges) bool {
+            if (gauges.conn_slots_in_use > gauges.conn_slots_capacity) return false;
+            if (gauges.relay_buffers_in_use > gauges.relay_buffers_capacity) return false;
+            const upstream_in_use = @as(u64, gauges.upstream_slots_leased) +
+                gauges.upstream_slots_parked;
+            return upstream_in_use <= gauges.upstream_slots_capacity;
+        }
+    };
+
     /// Loop thread only — the single writer (§8).
     pub fn increment(counters: *Counters, comptime name: []const u8) void {
         const previous = @field(counters, name).fetchAdd(1, .monotonic);
@@ -115,11 +156,13 @@ pub const Counters = struct {
 
     /// Exact byte bound on a full `render` (§5: the caller sizes a fixed
     /// buffer to it, so rendering never allocates and never truncates).
-    /// Per counter: a `# TYPE …` line plus a sample line whose value is at
-    /// most `maxInt(u64)` — 20 digits. Comptime-summed over the real field
-    /// set, so it tracks the counters as they are added or removed.
+    /// Per metric: a `# TYPE …` line plus a sample line whose value is at
+    /// most its type's maximum — 20 digits for a `u64` counter, 10 for a
+    /// `u32` gauge. Comptime-summed over the real field sets, so it tracks
+    /// both as they are added or removed.
     pub const render_bytes_max: usize = blk: {
         const u64_digits_max = 20; // len("18446744073709551615")
+        const u32_digits_max = 10; // len("4294967295")
         var total: usize = 0;
         for (@typeInfo(Counters).@"struct".fields) |field| {
             if (field.type != Value) continue;
@@ -127,15 +170,30 @@ pub const Counters = struct {
             total += "# TYPE ".len + name_len + " counter\n".len;
             total += name_len + " ".len + u64_digits_max + "\n".len;
         }
+        for (@typeInfo(Gauges).@"struct".fields) |field| {
+            assert(field.type == u32);
+            const name_len = metric_prefix.len + field.name.len;
+            total += "# TYPE ".len + name_len + " gauge\n".len;
+            total += name_len + " ".len + u32_digits_max + "\n".len;
+        }
         break :blk total;
     };
 
-    /// Render every counter as Prometheus exposition text into a
+    /// Render every counter and gauge as Prometheus exposition text into a
     /// caller-owned buffer (zero-alloc, §5) — the single renderer shared by
-    /// the SIGUSR1 `dump` and any future admin endpoint. The buffer must be
+    /// the SIGUSR1 `dump` and the admin endpoint. The buffer must be
     /// at least `render_bytes_max`; that bound is exact, so a correctly
     /// sized caller can never truncate. Returns the filled prefix.
-    pub fn render(counters: *const Counters, buffer: []u8) []const u8 {
+    ///
+    /// `gauges` is a snapshot the caller reads off the live pools, not
+    /// state this module owns: `counters.zig` is imported by `Server.zig`,
+    /// so the dependency cannot run the other way.
+    pub fn render(counters: *const Counters, gauges: *const Gauges, buffer: []u8) []const u8 {
+        // `gauges.valid()` is asserted where the snapshot is produced
+        // (`Server.gauges`), not here: the renderer must stay able to emit
+        // every field at its type's maximum, which is what makes
+        // `render_bytes_max` an exactly reachable bound rather than a
+        // merely sufficient one.
         assert(buffer.len >= render_bytes_max);
         var cursor: usize = 0;
         inline for (@typeInfo(Counters).@"struct".fields) |field| {
@@ -151,18 +209,30 @@ pub const Counters = struct {
             ) catch unreachable;
             cursor += written.len;
         }
+        inline for (@typeInfo(Gauges).@"struct".fields) |field| {
+            // Same argument as the counter loop above, against the gauge
+            // half of the bound: the format string is comptime and every
+            // gauge is a u32, whose widest rendering `render_bytes_max`
+            // reserves 10 digits for.
+            const written = std.fmt.bufPrint(
+                buffer[cursor..],
+                "# TYPE " ++ metric_prefix ++ field.name ++ " gauge\n" ++
+                    metric_prefix ++ field.name ++ " {d}\n",
+                .{@field(gauges, field.name)},
+            ) catch unreachable;
+            cursor += written.len;
+        }
         assert(cursor >= 1);
         assert(cursor <= render_bytes_max);
         return buffer[0..cursor];
     }
 
     /// Phase 0 exposure (§8): SIGUSR1 dumps the Prometheus rendering to
-    /// stderr through the signal seam; the admin plane stays deferred
-    /// (docs/PLANS.md). Shares `render` so the dump and a future scrape
-    /// endpoint never disagree on the wire format.
-    pub fn dump(counters: *const Counters) void {
+    /// stderr through the signal seam. Shares `render` so the dump and the
+    /// scrape endpoint never disagree on the wire format.
+    pub fn dump(counters: *const Counters, gauges: *const Gauges) void {
         var buffer: [render_bytes_max]u8 = undefined;
-        const text = counters.render(&buffer);
+        const text = counters.render(gauges, &buffer);
         assert(text.len <= buffer.len);
         std.debug.print("{s}", .{text});
     }
@@ -242,6 +312,17 @@ test "counters: reconcile holds across a lifecycle" {
     try std.testing.expectEqual(@as(u64, 1), counters.get("shed_conn_slots"));
 }
 
+/// A valid, distinguishable snapshot for the render tests.
+const test_gauges: Counters.Gauges = .{
+    .conn_slots_in_use = 7,
+    .conn_slots_capacity = 64,
+    .relay_buffers_in_use = 3,
+    .relay_buffers_capacity = 32,
+    .upstream_slots_leased = 5,
+    .upstream_slots_parked = 11,
+    .upstream_slots_capacity = 16,
+};
+
 test "counters: render emits Prometheus exposition for every field" {
     var counters: Counters = .{};
     counters.increment("accepted");
@@ -249,7 +330,7 @@ test "counters: render emits Prometheus exposition for every field" {
     counters.increment("l7_responses");
 
     var buffer: [Counters.render_bytes_max]u8 = undefined;
-    const text = counters.render(&buffer);
+    const text = counters.render(&test_gauges, &buffer);
 
     // Every counter appears exactly once as a TYPE line and a sample line,
     // and the sample carries the live value.
@@ -259,7 +340,18 @@ test "counters: render emits Prometheus exposition for every field" {
     // Untouched counters still render at zero — a scrape sees the whole set.
     try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_completed 0\n") != null);
 
-    // One TYPE line per counter field: the rendering is complete.
+    // Gauges ride the same rendering, typed `gauge` — a scrape that read
+    // an occupancy as a counter would chart nonsense through `rate()`.
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_upstream_slots_leased gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_leased 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_parked 11\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_capacity 16\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_conn_slots_in_use 7\n") != null);
+    // No gauge is rendered as a counter, and no counter as a gauge.
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_upstream_slots_leased counter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_accepted gauge") == null);
+
+    // One TYPE line per counter *and* gauge field: the rendering is complete.
     var type_lines: usize = 0;
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, text, search, "# TYPE ")) |at| {
@@ -270,26 +362,57 @@ test "counters: render emits Prometheus exposition for every field" {
     inline for (@typeInfo(Counters).@"struct".fields) |field| {
         if (field.type == Counters.Value) field_count += 1;
     }
+    field_count += @typeInfo(Counters.Gauges).@"struct".fields.len;
     try std.testing.expectEqual(field_count, type_lines);
+}
+
+test "counters: gauge validity is a level-against-capacity rule" {
+    try std.testing.expect(test_gauges.valid());
+    // Parked slots occupy the pool too: leased + parked is what the wall
+    // is measured against, so a pair that fits individually but not
+    // together is invalid — the case a single in-use figure would hide.
+    var over = test_gauges;
+    over.upstream_slots_parked = 12;
+    try std.testing.expect(!over.valid());
+    var conn_over = test_gauges;
+    conn_over.conn_slots_in_use = conn_over.conn_slots_capacity + 1;
+    try std.testing.expect(!conn_over.valid());
+    var relay_over = test_gauges;
+    relay_over.relay_buffers_in_use = relay_over.relay_buffers_capacity + 1;
+    try std.testing.expect(!relay_over.valid());
+    // A pool sitting exactly at its wall is valid — that is the state the
+    // gauges exist to show.
+    var full = test_gauges;
+    full.upstream_slots_leased = full.upstream_slots_capacity;
+    full.upstream_slots_parked = 0;
+    try std.testing.expect(full.valid());
 }
 
 test "counters: render bound holds at the maximum value" {
     // The render_bytes_max bound must survive every counter at maxInt(u64)
-    // — the widest possible sample line — so a saturated proxy never
-    // truncates or overruns the buffer.
+    // and every gauge at maxInt(u32) — the widest possible sample lines —
+    // so a saturated proxy never truncates or overruns the buffer.
     var counters: Counters = .{};
     inline for (@typeInfo(Counters).@"struct".fields) |field| {
         if (field.type == Counters.Value) {
             @field(counters, field.name).store(std.math.maxInt(u64), .monotonic);
         }
     }
+    var gauges: Counters.Gauges = undefined;
+    inline for (@typeInfo(Counters.Gauges).@"struct".fields) |field| {
+        @field(gauges, field.name) = std.math.maxInt(u32);
+    }
     var buffer: [Counters.render_bytes_max]u8 = undefined;
-    const text = counters.render(&buffer);
-    // With every value at its 20-digit maximum, the render fills the buffer
+    const text = counters.render(&gauges, &buffer);
+    // With every value at its type's maximum, the render fills the buffer
     // exactly — proving render_bytes_max is a tight bound, not just an upper
-    // one (the "exact" claim in its doc comment).
+    // one (the "exact" claim in its doc comment). This is also why `render`
+    // does not assert `gauges.valid()`: an all-maximum snapshot is not a
+    // producible pool state, but it *is* the widest rendering.
     try std.testing.expectEqual(Counters.render_bytes_max, text.len);
     try std.testing.expect(std.mem.indexOf(u8, text, "18446744073709551615\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "4294967295\n") != null);
+    try std.testing.expect(!gauges.valid());
 }
 
 test "counters: the gate identity sums exactly today's admission rungs" {

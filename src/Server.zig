@@ -230,7 +230,10 @@ pub fn Server(comptime IoType: type) type {
         fn onSignal(server: *Self, signal: Io.Signal) void {
             switch (signal) {
                 .terminate => server.beginDrain(),
-                .dump_counters => server.counters.dump(),
+                .dump_counters => {
+                    const snapshot = server.gauges();
+                    server.counters.dump(&snapshot);
+                },
             }
         }
 
@@ -812,6 +815,32 @@ pub fn Server(comptime IoType: type) type {
         /// never by closing connections that are doing work.
         pub fn keepAliveSuppressed(server: *const Self) bool {
             return server.relay_pressure;
+        }
+
+        /// The live occupancy of all three pools, read straight off them
+        /// for a scrape or a SIGUSR1 dump (§8). The only producer of
+        /// `Counters.Gauges` — nothing mirrors these levels, so nothing
+        /// can disagree with the pool it reports.
+        ///
+        /// This is what the `*_shed_*` counters cannot show: a shed says
+        /// the wall was *hit*, and by then the connection is already being
+        /// answered 503. The levels show the approach, which is the only
+        /// way to size `limits` before a run rather than after it.
+        pub fn gauges(server: *const Self) counters_module.Counters.Gauges {
+            const snapshot: counters_module.Counters.Gauges = .{
+                .conn_slots_in_use = server.conns.acquired_count,
+                .conn_slots_capacity = server.conns.capacity(),
+                .relay_buffers_in_use = server.relay_buffers.acquired_count,
+                .relay_buffers_capacity = server.relay_buffers.capacity(),
+                .upstream_slots_leased = server.upstreams.leasedCount(),
+                .upstream_slots_parked = server.upstreams.parkedCount(),
+                .upstream_slots_capacity = server.upstreams.capacity(),
+            };
+            // Asserted at the producer, not in the renderer: a level past
+            // its capacity would mean a pool miscounted, and that is a bug
+            // here, not a formatting problem there.
+            assert(snapshot.valid());
+            return snapshot;
         }
 
         /// The §8 upstream-pool acquire/release pair: the pressure flag
