@@ -97,11 +97,18 @@ const Harness = struct {
 /// time, before `admin_served` (or any counter this scenario touches) moves,
 /// so the on-the-wire snapshot is always the zero state — checkable
 /// byte-for-byte regardless of what the counters read after the run.
-fn expectedResponse(buffer: []u8) []const u8 {
+///
+/// The gauges are not zero and are not assumed: the admin plane lives
+/// outside the three data-path pools (§8), so an idle scrape reports their
+/// real capacities and an occupancy of zero. Passing the server's own
+/// snapshot keeps this expectation honest — a scrape that rendered stale or
+/// invented levels would fail here rather than quietly matching a
+/// hand-written constant.
+fn expectedResponse(gauges: *const counters_module.Counters.Gauges, buffer: []u8) []const u8 {
     assert(buffer.len >= admin.response_bytes_max);
     var zero: counters_module.Counters = .{};
     @memcpy(buffer[0..admin.response_head.len], admin.response_head);
-    const body = zero.render(buffer[admin.response_head.len..]);
+    const body = zero.render(gauges, buffer[admin.response_head.len..]);
     return buffer[0 .. admin.response_head.len + body.len];
 }
 
@@ -302,12 +309,21 @@ test "admin: a scrape returns the counters as byte-exact Prometheus text" {
 
         try testing.expectEqual(Scrape.Outcome.eof, harness.scrape.outcome);
         var expected_buffer: [admin.response_bytes_max]u8 = undefined;
-        const expected = expectedResponse(&expected_buffer);
+        // The data path is idle at scrape time, so the levels the scrape
+        // rendered are the ones still live here.
+        const gauges = harness.server.gauges();
+        const expected = expectedResponse(&gauges, &expected_buffer);
         try testing.expectEqualStrings(
             expected,
             harness.scrape.recv_buffer[0..harness.scrape.received_len],
         );
         try testing.expectEqual(@as(u64, 1), harness.server.counters.get("admin_served"));
+        // An idle data path renders zero occupancy against real capacities:
+        // the scrape reports the pools, not the admin plane's own slot.
+        try testing.expectEqual(@as(u32, 0), gauges.conn_slots_in_use);
+        try testing.expectEqual(@as(u32, 0), gauges.upstream_slots_leased);
+        try testing.expect(gauges.conn_slots_capacity >= 1);
+        try testing.expect(gauges.upstream_slots_capacity >= 1);
         try harness.expectDrained();
     }
 }
@@ -329,7 +345,8 @@ test "admin: a scrape stays intact and drains under resets" {
         try harness.sim_io.run();
 
         var expected_buffer: [admin.response_bytes_max]u8 = undefined;
-        const expected = expectedResponse(&expected_buffer);
+        const gauges = harness.server.gauges();
+        const expected = expectedResponse(&gauges, &expected_buffer);
         const got = harness.scrape.recv_buffer[0..harness.scrape.received_len];
         try testing.expect(std.mem.startsWith(u8, expected, got));
         try harness.expectDrained();

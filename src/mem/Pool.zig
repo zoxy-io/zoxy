@@ -114,6 +114,14 @@ pub fn Pool(comptime T: type) type {
             return @intCast(index);
         }
 
+        /// Slots the pool was sized to at init — the wall `acquire`
+        /// returns null at. `u32` because `init` bounds `count` by
+        /// `slots_count_max`, so the narrowing can never truncate.
+        pub fn capacity(pool: *const Self) u32 {
+            assert(pool.slots.len <= slots_count_max);
+            return @intCast(pool.slots.len);
+        }
+
         /// The simulator's leak invariant: every scenario ends here (§9).
         pub fn isFullyReleased(pool: *const Self) bool {
             assert(pool.acquired_count <= pool.slots.len);

@@ -227,10 +227,13 @@ pub fn Admin(comptime IoType: type) type {
         }
 
         /// Build the full response once, into the fixed buffer: the static
-        /// head then the counters rendering (zero-alloc, §5).
+        /// head then the counters-and-gauges rendering (zero-alloc, §5).
+        /// The gauges are sampled here, at render time, so a scrape reports
+        /// the pool levels as of the response it is answering.
         fn renderResponse(admin: *Self) void {
             @memcpy(admin.response[0..response_head.len], response_head);
-            const body = admin.server.counters.render(admin.response[response_head.len..]);
+            const gauges = admin.server.gauges();
+            const body = admin.server.counters.render(&gauges, admin.response[response_head.len..]);
             admin.response_len = @intCast(response_head.len + body.len);
             admin.sent = 0;
             assert(admin.response_len >= response_head.len);

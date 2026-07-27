@@ -195,6 +195,19 @@ pub fn UpstreamPool(comptime IoType: type) type {
             return pool.slot_pool.acquired_count - pool.idle_count;
         }
 
+        /// Slots held open on an idle list for reuse (§5). Occupied, not
+        /// free: `leasedCount` plus this is what the wall is measured
+        /// against, which is why the two are reported separately.
+        pub fn parkedCount(pool: *const Self) u32 {
+            assert(pool.idle_count <= pool.slot_pool.acquired_count);
+            return pool.idle_count;
+        }
+
+        /// Slots the pool was sized to — the wall `acquire` sheds at (§8).
+        pub fn capacity(pool: *const Self) u32 {
+            return pool.slot_pool.capacity();
+        }
+
         /// The simulator's leak invariant (§9): every scenario drains
         /// every pool to zero.
         pub fn isFullyReleased(pool: *const Self) bool {
