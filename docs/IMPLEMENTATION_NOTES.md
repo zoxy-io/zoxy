@@ -491,6 +491,29 @@ memory (`fds_max = 29188` at the ceiling, so a c10k deployment raises
 comptime-asserts it. The remaining ceiling lever — `splice` — is fork
 work, in PLANS.md "c10k".
 
+## libxev error surfacing is lossy — resolved by the fork (2026-07-27)
+
+The section below stood for months and is kept for the reasoning; the
+wall it describes is gone. zoxy-io/libxev#2 adds
+`Completion.result_errno`, recorded at the top of `invoke` *before* the
+per-operation mapping runs — which is the only place the errno still
+exists, since every arm's `else` hands it to `posix.unexpectedErrno` and
+keeps nothing. The pin moved to b3d6b55 after re-audit: one field, one
+assignment, one test, no error-set or control-flow change.
+
+What forced it: a c10k run reported 227,628 `kernel_pressure_errors`
+against 736,843 churned connections, and three runs in a row were
+undiagnosable because "something failed" is not a diagnosis. The counter
+is now partitioned twice over — by op (which syscall) and by cause (what
+to do about it: shed load, raise a limit, widen the port range) — with
+`kernel_pressure_last_errno` as a gauge so an unclassified errno stays a
+lead rather than a dead end. Both partitions are asserted equal to the
+total in `reconcile` and again in the witness that maintains them.
+
+The generalization in the note below still holds and is worth keeping:
+any *other* feature needing a particular errno on a data op now has the
+field to read, rather than a fork to negotiate first.
+
 ## libxev error surfacing is lossy
 
 The io_uring backend keeps only a few named errnos on data ops:

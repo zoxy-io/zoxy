@@ -37,6 +37,12 @@ signal_callback: ?*const fn (?*anyopaque, Io.Signal) void,
 signal_userdata: ?*anyopaque,
 listeners: []ListenerEntry,
 listeners_count: u16,
+/// The classified cause of the most recent op failure (§8). Written by the
+/// callback adapters from the forked `Completion.result_errno` just before
+/// they hand `error.Unexpected` to the caller, and read by the witness in
+/// the same callback — the loop is single-threaded and callbacks do not
+/// nest, so "most recent" is "the one being delivered".
+last_pressure: Io.Pressure,
 
 pub const Socket = enum(i32) { _ };
 
@@ -76,6 +82,7 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
     errdefer io.timer.deinit();
     io.listeners = try arena.alloc(ListenerEntry, constants.listeners_max);
     io.listeners_count = 0;
+    io.last_pressure = Io.Pressure.none;
     io.notifier_completion = .{};
     io.signal_mask = std.atomic.Value(u8).init(0);
     io.signal_callback = null;
@@ -271,6 +278,7 @@ pub fn accept(
         ) xev.CallbackAction {
             const io_inner: *XevIo = @fieldParentPtr("loop", loop);
             io_inner.clearArmedAccept(accept_completion);
+            io_inner.recordPressure(accept_completion);
             callback(context.?, if (result) |conn|
                 @as(Socket, @enumFromInt(conn.fd))
             else |err| switch (err) {
@@ -318,8 +326,8 @@ pub fn connect(
             socket: xev.TCP,
             result: xev.ConnectError!void,
         ) xev.CallbackAction {
-            _ = loop;
-            _ = connect_completion;
+            const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+            io_inner.recordPressure(connect_completion);
             if (result) |_| {
                 callback(context.?, @as(Socket, @enumFromInt(socket.fd)));
             } else |err| {
@@ -393,8 +401,8 @@ pub fn recv(
             read_buffer: xev.ReadBuffer,
             result: xev.ReadError!usize,
         ) xev.CallbackAction {
-            _ = loop;
-            _ = read_completion;
+            const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+            io_inner.recordPressure(read_completion);
             _ = tcp_inner;
             _ = read_buffer;
             // anyerror: kqueue's ReadError has no ConnectionResetByPeer.
@@ -431,8 +439,8 @@ pub fn send(
             write_buffer: xev.WriteBuffer,
             result: xev.WriteError!usize,
         ) xev.CallbackAction {
-            _ = loop;
-            _ = write_completion;
+            const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+            io_inner.recordPressure(write_completion);
             _ = tcp_inner;
             _ = write_buffer;
             // anyerror: kqueue's WriteError has no ConnectionResetByPeer.
@@ -554,26 +562,89 @@ pub fn notifySignalFromHandler(io: *XevIo, signal: Io.Signal) void {
     io.notifier.notify() catch {};
 }
 
+/// The classified cause of the op currently being delivered (§8). Valid
+/// only inside a completion callback: the adapters set it immediately
+/// before invoking the caller, so anything reading it later sees a stale
+/// answer. `Server.witnessKernelPressure` reads it in the callback, which
+/// is the only place it means anything.
+pub fn lastPressure(io: *const XevIo) Io.Pressure {
+    return io.last_pressure;
+}
+
+/// Classify the completion's recorded errno into a cause the operator can
+/// act on. The errno itself rides along, so a `.other` is still a lead
+/// rather than a dead end.
+///
+/// `result_errno` comes from the audited fork (zoxy-io/libxev#2): libxev's
+/// own mapping funnels every unnamed errno through `posix.unexpectedErrno`
+/// and keeps nothing, so without that field this classification would have
+/// no input at all.
+fn recordPressure(io: *XevIo, completion: *const Completion) void {
+    // io_uring only: `result_errno` is the audited fork's field, and the
+    // fork touched only that backend. kqueue keeps macOS usable as a dev
+    // box (§4) and must build, so it reports unclassified rather than
+    // guessing — the same honest fallback `setNodelay` uses when it has no
+    // completion to read. If macOS ever needs the classification, the
+    // kqueue backend needs the field first.
+    if (comptime xev.backend != .io_uring) {
+        io.last_pressure = Io.Pressure.none;
+        return;
+    }
+    const errno = completion.result_errno;
+    io.last_pressure = .{
+        .cause = switch (errno) {
+            .NOBUFS => .out_of_buffers,
+            .NOMEM => .out_of_memory,
+            .MFILE, .NFILE => .fd_limit,
+            .ADDRNOTAVAIL => .address_unavailable,
+            else => .other,
+        },
+        .errno = @intFromEnum(errno),
+    };
+}
+
 pub fn setNodelay(io: *XevIo, socket: Socket) Io.SetOptionError!void {
-    _ = io;
     const enable: i32 = 1;
     posix.setsockopt(
         @intFromEnum(socket),
         posix.IPPROTO.TCP,
         posix.TCP.NODELAY,
         std.mem.asBytes(&enable),
-    ) catch return error.Unexpected;
+    ) catch {
+        // Synchronous, so there is no completion to read: `setsockopt`
+        // already mapped the errno to a Zig error and kept nothing either.
+        // Reported as unclassified rather than guessed at.
+        io.last_pressure = Io.Pressure.none;
+        return error.Unexpected;
+    };
+}
+
+comptime {
+    // `recordPressure` reaches for a field only the io_uring backend has.
+    // Pinning that here means a kqueue build fails at this assertion with
+    // a reason, rather than at the field access with a bare "no field
+    // named result_errno" three call layers away.
+    if (xev.backend == .io_uring) {
+        assert(@hasField(Completion, "result_errno"));
+    }
 }
 
 pub fn setLingerRst(io: *XevIo, socket: Socket) Io.SetOptionError!void {
-    _ = io;
     const value: posix.linger = .{ .onoff = 1, .linger = 0 };
     posix.setsockopt(
         @intFromEnum(socket),
         posix.SOL.SOCKET,
         posix.SO.LINGER,
         std.mem.asBytes(&value),
-    ) catch return error.Unexpected;
+    ) catch {
+        // Same reasoning as `setNodelay`: synchronous, no completion, so
+        // unclassified rather than guessed. Symmetric on purpose — today
+        // the only caller swallows this error (§8 shedding never blocks),
+        // but a future one that witnesses it must not read the *previous*
+        // failure's cause.
+        io.last_pressure = Io.Pressure.none;
+        return error.Unexpected;
+    };
 }
 
 pub fn shutdown(io: *XevIo, socket: Socket, how: Io.ShutdownHow) void {

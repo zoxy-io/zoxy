@@ -399,6 +399,43 @@ test "relay: a kernel-pressure data-op failure is witnessed and tears down" {
     try bed.expectDrained();
 }
 
+test "server: the pressure cause travels from the seam to its own counter" {
+    // The other half of the diagnosis. The op says which syscall failed;
+    // the cause says what to do about it — shed load for out-of-buffers,
+    // raise a limit for fd_limit, widen the port range for
+    // address_unavailable. Production recovers it from the errno the
+    // audited libxev fork keeps on the completion; the sim states it.
+    //
+    // Driven per cause so no arm of the classification is plumbing nobody
+    // exercised: all five landed on one counter before this.
+    const cases = [_]struct { cause: Io.Pressure.Cause, counter: []const u8 }{
+        .{ .cause = .out_of_buffers, .counter = "kernel_pressure_out_of_buffers" },
+        .{ .cause = .out_of_memory, .counter = "kernel_pressure_out_of_memory" },
+        .{ .cause = .fd_limit, .counter = "kernel_pressure_fd_limit" },
+        .{ .cause = .address_unavailable, .counter = "kernel_pressure_address_unavailable" },
+        .{ .cause = .other, .counter = "kernel_pressure_other_cause" },
+    };
+    // `inline`: `counters.get` names its field at comptime, so the case
+    // table has to be unrolled rather than iterated.
+    inline for (cases, 0..) |case, index| {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 60 + index } });
+        defer bed.tearDown();
+
+        bed.sim_io.setPressureCause(case.cause);
+        bed.sim_io.injectSetOptionError();
+        bed.startClients(1, true);
+        try bed.sim_io.run();
+
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_errors"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get(case.counter));
+        // The op partition is unaffected by which cause it was: both
+        // describe the same single failure.
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_set_option"));
+        try bed.expectDrained();
+    }
+}
+
 test "server: kernel-pressure on a socket option is witnessed and the connection serves on" {
     // The set-option path had no simulation coverage at all before this:
     // a virtual socket table never refuses an option, so every bug on it
@@ -436,9 +473,17 @@ test "server: kernel-pressure accept failure backs off and recovers" {
     // The next accept completes with an ENFILE-class error. The gate must
     // not spin: it backs off through the retry timer, re-arms, and then
     // serves the client that was waiting in the backlog all along.
+    // ENFILE-class is what an accept actually runs out of, so the cause is
+    // stated and asserted here rather than left to whatever the previous
+    // completion happened to leave behind — the accept fault site shipped
+    // without recording one, and nothing downstream could have noticed.
+    bed.sim_io.setPressureCause(.fd_limit);
     bed.sim_io.injectAcceptError(bed.server.listeners[0].listener);
     bed.startClients(1, true);
     try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_fd_limit"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_out_of_buffers"));
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_errors"));
     // Attributed to the accept, and to nothing on the data path — the
