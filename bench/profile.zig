@@ -21,6 +21,7 @@ const affinity = @import("affinity.zig");
 const zrk = @import("zrk");
 const zio = @import("zio");
 const spawn_path = @import("spawn_path.zig");
+const constants = @import("zoxy").constants;
 
 const assert = std.debug.assert;
 
@@ -36,9 +37,14 @@ const report_path = work_directory ++ "/zoxy.report";
 
 const Flags = struct {
     rate: u64 = 100_000,
-    // zrk serves one thread per connection, so this is both the
-    // connection count and the load-thread count.
+    /// Open connections zrk holds. Since zrk 1.x these are coroutines over
+    /// a small thread pool, not a thread each, so this scales to the
+    /// conn-slot ceiling without the load generator taking over the box —
+    /// which is what makes a per-connection-cost sweep possible here.
     connections: u32 = 64,
+    /// zrk's load threads, independent of `connections`. Kept small: they
+    /// share every core except zoxy's.
+    threads: u8 = 2,
     duration_s: u64 = 30,
     freq: u32 = 4000,
     /// Core to dedicate to zoxy; null auto-picks the last P-core (or last cpu).
@@ -90,7 +96,7 @@ pub fn main(init: std.process.Init) !u8 {
     var origin_child = try spawnNginx(arena, io, environ);
     defer origin_child.kill(io);
 
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path);
+    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, flags.connections);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
     const zoxy_pid = zoxy_child.id orelse return error.NoZoxyPid;
@@ -139,6 +145,9 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--connections")) {
             index += 1;
             flags.connections = try std.fmt.parseUnsigned(u32, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            index += 1;
+            flags.threads = try std.fmt.parseUnsigned(u8, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--seconds")) {
             index += 1;
             flags.duration_s = try std.fmt.parseUnsigned(u64, args[index], 10);
@@ -164,7 +173,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             zoxy_path_set = true;
         } else {
             std.debug.print(
-                "usage: profile [zoxy-path] [--rate N] [--connections N] " ++
+                "usage: profile [zoxy-path] [--rate N] [--connections N] [--threads N] " ++
                     "[--seconds N] [--freq N] [--cpu N]\n",
                 .{},
             );
@@ -188,7 +197,7 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
         \\worker_processes 1;
         \\pid nginx.pid;
         \\error_log logs/error.log crit;
-        \\events {{ worker_connections 1024; }}
+        \\events {{ worker_connections 32768; }}
         \\http {{
         \\    access_log off;
         \\    server {{
@@ -211,10 +220,30 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
     };
 }
 
+/// Conn slots for a run of `connections` connections, with headroom for the
+/// churn a reject or a reconnect leaves behind. Without this the config
+/// carried no `limits` block at all, so every run above the default
+/// silently spent its window shedding at the admission wall (§8) — the
+/// profile would have been of the shed path, not the serving path, and
+/// nothing in the output would have said so.
+///
+/// Both bounds come from `constants`, not from literals here: a ceiling
+/// that later moves has to move this with it, and a raised one would
+/// otherwise cap a run below the maximum it was aimed at without saying so.
+fn connSlotsFor(connections: u32) u32 {
+    assert(connections >= 1);
+    const wanted = @as(u64, connections) + connections / 8 + 64;
+    const slots: u32 = @intCast(@min(wanted, constants.conn_slots_max));
+    assert(slots >= 1);
+    assert(slots <= constants.conn_slots_max);
+    return @max(slots, constants.conn_slots_default);
+}
+
 fn spawnZoxy(
     arena: std.mem.Allocator,
     io: Io,
     zoxy_path: []const u8,
+    connections: u32,
 ) !std.process.Child {
     // Both listeners always exist so the flag only picks which one zrk
     // drives; the idle one adds no load.
@@ -226,10 +255,11 @@ fn spawnZoxy(
         \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
         \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
-        \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000 }}
+        \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000 }},
+        \\    "limits": {{ "conn_slots": {d} }}
         \\}}
         \\
-    , .{ zoxy_l4_port, zoxy_http_port, origin_port });
+    , .{ zoxy_l4_port, zoxy_http_port, origin_port, connSlotsFor(connections) });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
@@ -360,11 +390,19 @@ fn spawnPerf(
     const freq = try std.fmt.allocPrint(arena, "{d}", .{flags.freq});
     const seconds = try std.fmt.allocPrint(arena, "{d}", .{flags.duration_s});
     const perf_bin = try spawn_path.resolve(arena, io, environ, "perf");
+    // `sleep` is resolved for the same reason every argv[0] here is: a
+    // spawned child inherits no PATH, and perf must exec this itself. A
+    // bare "sleep" fails, and perf reports the failure as
+    //   Failed to collect '<event>' for the 'sleep' workload: No such file
+    //   or directory
+    // which reads as a PMU problem and sends you hunting the wrong bug —
+    // it cost an afternoon before the empty-environment repro pinned it.
+    const sleep_bin = try spawn_path.resolve(arena, io, environ, "sleep");
     return std.process.spawn(io, .{
         .argv = &.{
-            perf_bin, "record", "-p",           pid,   "-e", event,
-            "-F",     freq,     "--call-graph", "lbr", "-o", perf_data_path,
-            "--",     "sleep",  seconds,
+            perf_bin, "record",  "-p",           pid,   "-e", event,
+            "-F",     freq,      "--call-graph", "lbr", "-o", perf_data_path,
+            "--",     sleep_bin, seconds,
         },
         .stdout = .ignore,
         .stderr = .inherit,
@@ -376,10 +414,11 @@ fn spawnPerf(
 
 // --- load (zrk, in-process, like bench/run.zig) -----------------------------
 
-fn benchConfig(port: u16, rate: u64, connections: u32) zrk.cli.Config {
+fn benchConfig(port: u16, rate: u64, connections: u32, threads: u8) zrk.cli.Config {
     return .{
         .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" },
         .connections = connections,
+        .threads = threads,
         .rate = rate,
         .timeout_ns = 2 * std.time.ns_per_s,
         .interval_ns = std.time.ns_per_s,
@@ -392,7 +431,10 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
     const retry_sleep = Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms);
     var attempt: u8 = 0;
     while (attempt < attempts_max) : (attempt += 1) {
-        var config = benchConfig(flags.zoxyPort(), 20_000, 16);
+        // A 16-connection probe over one thread: this only has to prove the
+        // path serves before the measured window, so it deliberately does
+        // not inherit the run's connection count or thread pool.
+        var config = benchConfig(flags.zoxyPort(), 20_000, 16, 1);
         config.duration_ns = std.time.ns_per_s / 2;
         const report = zrk.runner.run(arena, io, &config, 0, null, null) catch {
             if (attempt == attempts_max - 1) return error.TargetUnresponsive;
@@ -406,7 +448,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
 }
 
 fn loadTest(arena: std.mem.Allocator, io: Io, flags: *const Flags) !zrk.runner.Report {
-    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections);
+    var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections, flags.threads);
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
     return zrk.runner.run(arena, io, &config, 0, null, null);
 }

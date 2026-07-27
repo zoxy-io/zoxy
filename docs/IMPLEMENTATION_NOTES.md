@@ -376,6 +376,69 @@ which three pools share. If c10k pressure ever makes this worth
 revisiting, the relay-buffer pool's free list is already 10.9% of misses
 on its own and is the cheaper target.
 
+That revisit happened — see the next section. The answer was no, by three
+orders of magnitude. Do not open it a third time.
+
+## `delivered()` at c10k — the revisit, and why it closed (2026-07-27)
+
+The paragraph above bounded structure-of-arrays at "~6% at 2000
+connections and nothing below ~500" and invited a revisit under c10k
+pressure. A cloud c10k run supplied the pressure: at 10,000 connections
+zoxy served 21,396 req/s at 0.758 CPU, against 44,000 req/s at 0.859 CPU
+with 500 connections on the same build. **19.5 µs → 35.4 µs of CPU per
+request, a 1.8× per-request penalty**, with nothing saturated anywhere —
+no CFS throttling, upstream pool at 74%, origin at 24%, zero packet
+drops. The working-set hypothesis fit: 500 slots touch 4.6 MiB and live
+in L3, 10,000 touch 91 MiB and do not.
+
+`bench/micro/conn_touch_scaling.zig` measures exactly that, on the real
+`Conn` and the real `arm`/`delivered` pair, walked in a random
+permutation (a sequential walk measures the prefetcher, not the proxy).
+Median of four pinned runs, ns per arm/deliver pair:
+
+| conns | touched | ns/op | vs 500 |
+|---|---|---|---|
+| 500 | 4.6 MiB | 2.81 | 1.00× |
+| 1000 | 9.1 MiB | 2.76 | 0.98× |
+| 2000 | 18.2 MiB | 2.87 | 1.02× |
+| 5000 | 45.5 MiB | 3.34 | 1.19× |
+| 10000 | 91.1 MiB | 3.97 | 1.41× |
+| 14074 | 128.2 MiB | 7.18 | 2.55× |
+
+The mechanism is confirmed — the knee is real and lands between 2000 and
+5000 connections, where the touched set stops fitting L3. The magnitude
+is what kills it. The 500 → 10,000 delta is **1.2 ns per pair**; a
+keep-alive L7 request does four or five pairs (head recv, request-head
+send, response-head recv, client write, body pump), so the effect is
+**~5.8 ns/request against a measured 15,900 ns/request penalty —
+0.04%**. Doubling it for the kernel round trip that separates a real arm
+from its deliver still leaves under 0.1%.
+
+Two methodology notes, both learned by getting them wrong first. The
+bench discards a warm-up measurement: reading the first point of a run as
+data absorbed the core's frequency ramp and inflated the whole curve —
+before the warm-up the 10,000-connection ratio read 2.08× rather than
+1.41×, which would have overstated the case for acting by 50%. And the
+smallest swept point (64 connections) still reads slow despite being the
+most cache-friendly; it is left in the sweep and out of the conclusions,
+because a number nobody can explain is not a number to reason from.
+
+**So the c10k penalty is essentially all outside zoxy's data
+structures**, consistent with the 2026-07-12 finding that zoxy user code
+is a single-digit share of cycles. At 10,000 connections it is kernel
+work: TCP state for ~20,000 sockets, softirq, io_uring bookkeeping. No
+`Conn` layout change reaches it.
+
+Two harness defects surfaced doing this, both fixed in the same slice.
+`bench/profile.zig` emitted no `limits` block, so every profile run above
+the 1386 default spent its window at the admission wall — it was
+profiling the *shed* path, and nothing in the output said so. And
+`bench/micro/l7_head_pipeline.zig` had not compiled since
+`renderRequestHead` grew two parameters, staying broken across four
+merged slices because `bench-micro` was not in any gate. It is now a
+`ci` dependency: compiled, never run, which is the cheapest thing that
+would have caught it.
+
 ## Profile share is not throughput headroom — bounding a wipe (2026-07-25)
 
 Same profile: `compiler_rt.memset` at 11.2% of zoxy's CPU, ~84% of it
