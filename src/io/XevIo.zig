@@ -448,6 +448,13 @@ pub fn send(
                 @as(u32, @intCast(n))
             else |err| switch (@as(anyerror, err)) {
                 error.ConnectionResetByPeer => error.Reset,
+                // EPIPE. The peer is gone and this write can never land —
+                // the same verdict as a reset, and emphatically not the §8
+                // kernel-pressure rung it used to fall into. libxev maps
+                // the errno for us (`.PIPE => error.BrokenPipe`); naming it
+                // here is what was missing, and it made ordinary client
+                // disconnects read as resource exhaustion.
+                error.BrokenPipe => error.Reset,
                 error.Canceled => error.Canceled,
                 else => error.Unexpected,
             });
