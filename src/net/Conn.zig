@@ -113,6 +113,12 @@ pub const ClientWrite = struct {
         response_body,
         /// A static response is out: the lingering close (§2, §8).
         lingering_close,
+        /// A static response is out and the client's byte stream is still
+        /// synchronized: serve the next request on this connection (§2,
+        /// §8). The keep half of the ladder's "then keep or close per
+        /// pressure" — see `proxy.staticResponseResyncable` for what
+        /// earns it.
+        next_request,
     };
 };
 

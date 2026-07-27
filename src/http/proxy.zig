@@ -333,6 +333,34 @@ pub fn Proxy(comptime IoType: type) type {
             return .{ .target = target, .edits = forward.edits };
         }
 
+        /// What the parsed head says about the request itself, recorded on
+        /// the conn before any rung can reject it. `respond` reads these to
+        /// decide whether the client's byte stream is still synchronized
+        /// enough to keep the connection (§8 "then keep or close"), so they
+        /// must land ahead of *every* reject that answers a valid head —
+        /// the 501s included. Those reject the method, not the framing: a
+        /// CONNECT or Upgrade head parsed cleanly and sits on a message
+        /// boundary like any other, and since a 501 forwards nothing there
+        /// is no second parser to disagree with about where it ends. What
+        /// the client does next is either another request (served) or
+        /// tunnel bytes (400, closed) — never a smuggled one.
+        ///
+        /// A malformed or oversize head never reaches here, so it never
+        /// sets these: `request_head_len` staying 0 is exactly what marks a
+        /// stream whose message boundary the parser could not find.
+        fn recordRequestFacts(conn: *ConnType, request: *const parser.RequestHead) void {
+            assert(conn.state == .l7_reading_head);
+            assert(request.head_len >= 1);
+            // Once per request: `resetForNextRequest` and
+            // `resumeAfterStaticResponse` both clear `l7` on the turnaround,
+            // so a second recording would mean a head was routed twice.
+            assert(conn.l7.request_head_len == 0);
+            conn.l7.request_method = request.method;
+            conn.l7.request_framing = framingFromParsed(request.framing);
+            conn.l7.request_head_len = request.head_len;
+            conn.l7.client_keep_alive = request.keep_alive;
+        }
+
         /// Policy gate, then the exchange's admission: tunnels and
         /// upgrades are non-goals (§1, §7) — 501; the canonical path
         /// selects a cluster (400 if it will not canonicalize, 404 if no
@@ -341,6 +369,7 @@ pub fn Proxy(comptime IoType: type) type {
         fn routeRequest(server: *ServerType, conn: *ConnType, request: *const parser.RequestHead) void {
             assert(conn.state == .l7_reading_head);
             assert(request.head_len <= conn.head_len);
+            recordRequestFacts(conn, request);
             if (request.method == .connect) {
                 return respond(server, conn, 501, "l7_not_implemented");
             }
@@ -374,10 +403,6 @@ pub fn Proxy(comptime IoType: type) type {
             conn.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, conn, 503, "l7_shed_relay_buffers");
             };
-            conn.l7.request_method = request.method;
-            conn.l7.request_framing = framingFromParsed(request.framing);
-            conn.l7.request_head_len = request.head_len;
-            conn.l7.client_keep_alive = request.keep_alive;
 
             // The §3 reuse win: a parked connection to the picked endpoint
             // beats a fresh dial. A close that slipped through while it
@@ -1050,11 +1075,17 @@ pub fn Proxy(comptime IoType: type) type {
                 resumeClientWrite(server, conn); // Short send resumes (§6).
                 return;
             }
-            if (write.then != .lingering_close) {
-                // `response_started` blocks a verdict, so none can be pending
-                // once response bytes are flowing (negative space).
-                assert(conn.state == .l7_exchanging);
-                assert(conn.l7.pending_verdict == .none);
+            switch (write.then) {
+                .response_excess, .response_body => {
+                    // `response_started` blocks a verdict, so none can be
+                    // pending once response bytes are flowing (negative
+                    // space).
+                    assert(conn.state == .l7_exchanging);
+                    assert(conn.l7.pending_verdict == .none);
+                },
+                // The two static-response endings share one state: `respond`
+                // is the only writer of either, and it always sets it.
+                .lingering_close, .next_request => assert(conn.state == .l7_responding),
             }
             switch (write.then) {
                 .response_excess => sendResponseExcess(server, conn),
@@ -1063,6 +1094,7 @@ pub fn Proxy(comptime IoType: type) type {
                     afterResponseExcess(server, conn);
                 },
                 .lingering_close => beginLingeringClose(server, conn),
+                .next_request => resumeAfterStaticResponse(server, conn),
             }
         }
 
@@ -1255,6 +1287,23 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.client_write.pending.len == 0);
             server.releaseRelayBuffer(conn.relay_buffer.?);
             conn.relay_buffer = null;
+            beginNextRequest(server, conn);
+        }
+
+        /// The turnaround itself, shared by the two paths that reach it: an
+        /// exchange that completed (`resetForNextRequest`) and a static
+        /// response that kept its connection (`resumeAfterStaticResponse`).
+        /// One home so a new per-request field cannot be cleared on one path
+        /// and left stale on the other — which on the resync rule's inputs
+        /// would be a §7 bug, not a cosmetic one.
+        ///
+        /// The preconditions stay with the callers: they differ (one has an
+        /// exchange to have settled, the other never had one), and only they
+        /// can state why they hold.
+        fn beginNextRequest(server: *ServerType, conn: *ConnType) void {
+            assert(conn.relay_buffer == null);
+            assert(conn.upstream == null);
+            assert(conn.client_write.pending.len == 0);
             conn.head_len = 0;
             conn.l7 = .{};
             conn.directions = .{ .{}, .{} };
@@ -1433,10 +1482,53 @@ pub fn Proxy(comptime IoType: type) type {
             respond(server, conn, 502, "l7_bad_gateway");
         }
 
-        /// Answer a comptime static error response, then close (§8). Legal
-        /// from head reading (rejects), dialing (502), and the exchange
-        /// (upstream failures) — every caller guarantees both data ops are
-        /// free, because the send and the lingering drain need them.
+        /// Whether a static response can be followed by the *next* request
+        /// on this connection instead of the lingering close — the keep
+        /// half of §8's "static 503 … then keep or close per pressure".
+        ///
+        /// It is a question about the client's byte stream, not about the
+        /// status: the connection may keep serving only when the stream
+        /// sits exactly on a message boundary. Three conditions, each
+        /// ruling out a way it might not:
+        ///
+        ///   - the request declares no body left to read. A declared body
+        ///     is unread bytes still to come; draining it is what the
+        ///     lingering close is for.
+        ///   - the client sent nothing past the head. Trailing bytes are a
+        ///     pipelined next request, which §2 does not serve — and
+        ///     leaving them buffered to be read as the *start* of the next
+        ///     request is the desynchronization §7 exists to prevent.
+        ///
+        /// Reading `.l7_reading_head` keeps every mid-exchange caller
+        /// (502, 504, the post-edit 431, the malformed-body 400) on the
+        /// close path: by then a request head has gone to the origin and
+        /// the two streams are no longer alignable.
+        ///
+        /// A head that never parsed — the 400/414/431 rejects, which answer
+        /// bytes the parser could not frame — needs no test of its own:
+        /// `request_head_len` is still 0 there while `head_len` is at least
+        /// the byte that triggered the parse, so the boundary check below
+        /// already refuses it. That is asserted rather than re-tested,
+        /// because a second guard for it would be a branch no input can
+        /// reach and no test can pin. `recordRequestFacts` is what makes
+        /// that marker trustworthy: it runs for every valid head and only
+        /// for a valid head.
+        fn staticResponseResyncable(conn: *const ConnType) bool {
+            if (conn.state != .l7_reading_head) return false;
+            // `fillHead` never appends zero bytes and every reject from
+            // this state follows a fill, so an unparsed head cannot tie
+            // with `request_head_len`'s zero.
+            assert(conn.head_len >= 1);
+            assert(conn.l7.request_head_len <= conn.head_len);
+            if (!framingDoneOf(&conn.l7.request_framing)) return false;
+            return conn.head_len == conn.l7.request_head_len;
+        }
+
+        /// Answer a comptime static error response, then keep the
+        /// connection or close it (§8). Legal from head reading (rejects),
+        /// dialing (502), and the exchange (upstream failures) — every
+        /// caller guarantees both data ops are free, because the send and
+        /// the lingering drain need them.
         fn respond(
             server: *ServerType,
             conn: *ConnType,
@@ -1470,10 +1562,61 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.upstream_socket = null;
             }
             server.counters.increment(counter);
+            // §8's "then keep or close per pressure". Closing is not free:
+            // it costs the client a fresh handshake and this proxy a fresh
+            // accept, conn slot and admission — which is how a shed storm
+            // becomes *more* expensive per request than the work it is
+            // shedding, and how a transient overshoot locks itself in as a
+            // reconnect loop. Keeping is one send.
+            //
+            // The same three brakes the render-time persistence decision
+            // honors apply here (§2, §8): the client's own ask, the drain,
+            // and relay pressure — a proxy shedding buffers should not also
+            // be holding connections open for their next request.
+            const keep = staticResponseResyncable(conn) and
+                conn.l7.client_keep_alive and
+                !server.draining and
+                !server.keepAliveSuppressed();
             conn.state = .l7_responding;
             // Straight from static memory (§8): the channel carries the slice
-            // and never copies it, so a shed still costs one send.
-            armClientWrite(server, conn, shed.staticResponse(status, .close), .lingering_close);
+            // and never copies it, so a shed still costs one send. Both
+            // spellings are comptime byte arrays; only the choice is runtime,
+            // and it must match what happens after the send — an announced
+            // close that kept serving, or a kept connection the client was
+            // told to stop using, are both §2 violations.
+            if (keep) {
+                armClientWrite(server, conn, shed.staticResponse(status, .keep), .next_request);
+            } else {
+                armClientWrite(server, conn, shed.staticResponse(status, .close), .lingering_close);
+            }
+        }
+
+        /// The static response is out and the stream is still synchronized:
+        /// serve the next request on this connection (§2, §8). `respond`
+        /// already released the relay buffer and any attached upstream, so
+        /// this is `resetForNextRequest` minus the exchange it never had.
+        fn resumeAfterStaticResponse(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_responding);
+            assert(conn.client_write.pending.len == 0);
+            // `respond` frees both before the send, so a kept connection
+            // carries nothing into its next request (§5).
+            assert(conn.relay_buffer == null);
+            assert(conn.upstream == null);
+            assert(conn.upstream_socket == null);
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            // The same OR `resetForNextRequest` needs, for the same reason,
+            // and it is not this request's doing: a *previous* request on
+            // this connection may have dialed, re-based its deadline (§8),
+            // and completed before the rebase's cancel drained. That
+            // straggler survives `beginNextRequest` — which touches `l7` and
+            // the state, never the armed bits — so the next request can be
+            // rejected while `deadline` has already cleared and only
+            // `deadline_cancel` is still outstanding. Either one
+            // re-establishes the idle deadline (§4); requiring `deadline`
+            // specifically would fire on ordinary keep-alive traffic.
+            assert(conn.armed.deadline or conn.armed.deadline_cancel);
+            beginNextRequest(server, conn);
         }
 
         /// A client can still be sending its request — a body, or the rest
