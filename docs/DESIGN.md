@@ -655,6 +655,26 @@ the loop thread.
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
+Every rung but one sheds on a *resource* running out. That is a real gap
+and it was measured, not theorised: at c10k the upstream pool's ceiling
+was the only thing saying no, and once it was given enough headroom to
+stop firing (§5), nothing bounded an overloaded exchange at all —
+latency grew until the *client* gave up, and this proxy went on spending
+CPU answering requests whose callers had left. The numbers are in
+IMPLEMENTATION_NOTES.md.
+
+The rung that answers on **time** rather than on exhaustion is the
+request deadline, and `timeouts.request_ms` is what arms it: an absolute
+cap on one exchange, from the moment a request head is routed to the
+last response byte. It is deliberately **not** refreshed by activity —
+that is the whole difference from `idle_ms`, which bounds a stalled
+exchange but never a merely slow one. It rides the same per-connection
+deadline timer, clamping it the way `max_lifetime_ms` does, and is
+retired the moment any rung commits to an answer, so a deadline can
+never cut short the delivery of the verdict it caused. `0` (the default)
+disables it: what counts as too slow is a property of the operator's
+origin, not one this proxy can pick for them.
+
 - **Static error responses.** `400`/`404`/`414`/`431`/`501`/`503`/`504`
   are comptime byte arrays sent directly from static memory — never
   staged through

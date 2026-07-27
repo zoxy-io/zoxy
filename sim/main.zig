@@ -258,6 +258,15 @@ const Harness = struct {
                 10 + random.uintAtMost(u32, 90)
             else
                 0,
+            // Same shape for the §8 request deadline: a third of seeds arm
+            // it, over a range that straddles both the connect and idle
+            // timeouts drawn above — so it sometimes fires inside a dial,
+            // sometimes mid-exchange, and sometimes never, all under the
+            // adversary. 0 leaves it disabled.
+            .request_timeout_ms = if (random.uintLessThan(u8, 3) == 0)
+                10 + random.uintAtMost(u32, 90)
+            else
+                0,
         };
     }
 

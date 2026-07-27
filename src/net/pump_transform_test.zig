@@ -619,6 +619,7 @@ const Harness = struct {
             .idle_timeout_ms = 5000,
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = 0,
+            .request_timeout_ms = 0,
         };
         // The Server owns the pools, the clock and teardown. Its own
         // listeners stay unbound: this scenario drives the pump directly, so

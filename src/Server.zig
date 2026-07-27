@@ -965,7 +965,37 @@ pub fn Server(comptime IoType: type) type {
                     @as(u64, server.config.max_lifetime_ms) * std.time.ns_per_ms;
                 deadline_ns = @min(deadline_ns, cap_ns);
             }
+            // The §8 request deadline rides the same timer for the same
+            // reason, one exchange rather than one connection: zero while
+            // no request is in flight (L4 never sets it, and a keep-alive
+            // turnaround clears `l7`), so the clamp is inert outside an
+            // exchange. Its arming side re-bases the armed timer, which is
+            // what makes it fire *on* time rather than at the next tick.
+            if (conn.l7.request_deadline_ns != 0) {
+                deadline_ns = @min(deadline_ns, conn.l7.request_deadline_ns);
+            }
             conn.deadline_ns = deadline_ns;
+        }
+
+        /// Retire this exchange's §8 request deadline. One rule, two
+        /// moments that satisfy it: the deadline fires, or some other rung
+        /// commits to an answer first. After either, the cap is in the past
+        /// or irrelevant, and leaving it in place would clamp the very
+        /// writes that deliver the answer — expiring the connection a
+        /// second time before a byte of the verdict reached the client. A
+        /// deadline must never cut short the delivery of the answer it
+        /// caused. What is left to bound is a client that will not read:
+        /// the idle timeout's job, and the keep-alive turnaround installs a
+        /// fresh cap for the next request.
+        ///
+        /// Caller obligation, because this only retires the *cap*:
+        /// `conn.deadline_ns` still stands wherever the cap clamped it, so
+        /// every caller must store a fresh deadline afterwards or the
+        /// retirement changes nothing that is already armed. `respond`
+        /// widens to the idle budget; `expireDeadline`'s two verdict
+        /// branches store their fixed grace window.
+        pub fn clearRequestDeadline(conn: *ConnType) void {
+            conn.l7.request_deadline_ns = 0;
         }
 
         fn armDeadline(server: *Self, conn: *ConnType) void {
@@ -989,7 +1019,12 @@ pub fn Server(comptime IoType: type) type {
         /// (so the cancel cannot match the fresh timer). A path that already
         /// delivered the timer has no armed op to re-base, so it arms fresh.
         pub fn rebaseDeadline(server: *Self, conn: *ConnType) void {
-            assert(conn.state == .l7_dialing);
+            // Two callers, both storing a target earlier than the armed
+            // timer: the dial's per-try connect budget (`.l7_dialing`) and
+            // the request deadline installed at routing (`.l7_reading_head`,
+            // §8) — which must re-base here because the reuse path never
+            // reaches the dial.
+            assert(conn.state == .l7_dialing or conn.state == .l7_reading_head);
             // A prior dial's rebase cancel can still be draining if the
             // exchange outran it across a keep-alive turnaround. It re-arms
             // the timer at the target this dial just stored (deadline_ns is
@@ -1090,6 +1125,10 @@ pub fn Server(comptime IoType: type) type {
             // rebase cancel first, or it could match the fresh timer (§8).
             assert(!conn.armed.deadline_cancel);
             server.counters.increment("deadline_expired");
+            // Before either verdict branch stores its grace window: both
+            // grace deadlines run through `storeDeadline`, which would
+            // clamp them straight back to this already-expired cap.
+            clearRequestDeadline(conn);
             if (conn.state == .l7_exchanging and
                 conn.l7.pending_verdict == .none and
                 Proxy.expiryAnswerable(conn))

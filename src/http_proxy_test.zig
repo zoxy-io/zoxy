@@ -213,6 +213,11 @@ const HttpOrigin = struct {
     /// Read the whole request, then never answer — the stalled origin
     /// that drives the §8 request-deadline 504 verdict.
     mute: bool = false,
+    /// Stall from the Nth request onward instead of from the first:
+    /// `maxInt` (the default) never stalls, `1` stalls the second and
+    /// later. The only way to reach the *reuse* path with a stalled
+    /// exchange — a parked upstream exists only after one was served.
+    mute_after_served: u32 = std.math.maxInt(u32),
     /// Close the second accepted connection immediately: the replayed
     /// try fails too, pinning the one-replay budget (§7).
     close_second_at_accept: bool = false,
@@ -292,9 +297,14 @@ const HttpOrigin = struct {
                 return;
             }
             oconn.request_complete = true;
-            if (oconn.origin.mute) {
+            if (oconn.origin.mute or
+                oconn.origin.requests_served >= oconn.origin.mute_after_served)
+            {
                 // The stalled origin: request read in full, no answer, no
                 // armed op — the proxy's deadline is the only way out.
+                // `mute_after_served` stalls only from the Nth request on,
+                // so a test can park an upstream on a served exchange and
+                // then stall the *reused* one.
                 return;
             }
             oconn.armSend();
@@ -434,6 +444,10 @@ const Http1Bed = struct {
         origin_closes: bool = false,
         /// The origin reads the whole request and never answers (§8 504).
         origin_mute: bool = false,
+        /// The origin answers this many requests and stalls from then on,
+        /// so a test can stall a *reused* upstream rather than a fresh
+        /// dial. Default never stalls.
+        origin_mute_after_served: u32 = std.math.maxInt(u32),
         /// The origin closes the second accepted connection at accept —
         /// the replayed try fails too, pinning the one-replay budget.
         close_second_at_accept: bool = false,
@@ -445,6 +459,10 @@ const Http1Bed = struct {
         /// exchange outlives clamps every stored deadline to it, so a
         /// re-based target can already be in the past.
         max_lifetime_ms: u32 = 0,
+        /// The §8 per-exchange cap; 0 (the default) disables it. Unlike the
+        /// age cap it starts at routing, so a test sets it against the
+        /// origin's response delay rather than the connection's birth.
+        request_timeout_ms: u32 = 0,
         /// Hold the client's head back this long after it connects, so it
         /// lands at a chosen instant rather than at once.
         send_delay_ms: u32 = 0,
@@ -486,6 +504,7 @@ const Http1Bed = struct {
             .idle_timeout_ms = idle_timeout_ms,
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = options.max_lifetime_ms,
+            .request_timeout_ms = options.request_timeout_ms,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
@@ -497,6 +516,7 @@ const Http1Bed = struct {
             .response = options.origin_response,
             .close_after_response = options.origin_closes,
             .mute = options.origin_mute,
+            .mute_after_served = options.origin_mute_after_served,
             .close_second_at_accept = options.close_second_at_accept,
         };
         if (options.origin_listens) {
@@ -1939,6 +1959,159 @@ test "l7: a dial re-basing an already-expired deadline defers past the cancel" {
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
         try bed.expectDrained();
     }
+}
+
+test "l7: the request deadline fires 504 ahead of the connect and idle budgets" {
+    // §8's request deadline is the rung that answers on *time* rather than
+    // on a resource running out. The origin here accepts and then says
+    // nothing, so the dial succeeds and only a deadline can end the
+    // exchange — and the one that ends it must be this one, which is set
+    // tighter than either budget the connection already carries.
+    const request_ms: u32 = 20;
+    comptime {
+        assert(request_ms < Http1Bed.connect_timeout_ms);
+        assert(Http1Bed.connect_timeout_ms < Http1Bed.idle_timeout_ms);
+    }
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 61,
+        .origin_mute = true,
+        .request_timeout_ms = request_ms,
+    });
+    defer bed.tearDown();
+
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("GET /slow HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    // The dial *worked*: this is a slow exchange, not a hung or refused
+    // one, which is exactly the case no other rung covers.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_gateway"));
+    // The verdict lands at the request budget, well inside the connect
+    // budget the dial re-bases to and nowhere near the idle timeout the
+    // head read was armed under.
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms >= request_ms);
+    try std.testing.expect(elapsed_ms < Http1Bed.connect_timeout_ms);
+    try bed.expectDrained();
+}
+
+test "l7: the request deadline binds a reused upstream, which no dial re-bases" {
+    // The test above cannot pin `armRequestDeadline`'s re-base: a fresh
+    // dial re-bases the timer itself, so the cap would be honoured either
+    // way. The reuse path is where the re-base is load-bearing — it skips
+    // `dialUpstream` entirely, so the only armed timer is the idle one
+    // from the keep-alive turnaround, 50× looser than the cap. Serve the
+    // first request, stall the second: the second rides the parked
+    // upstream and only this exchange's own deadline can end it.
+    const request_ms: u32 = 20;
+    comptime assert(request_ms < Http1Bed.idle_timeout_ms);
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 62,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .origin_mute_after_served = 1,
+        .request_timeout_ms = request_ms,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\n\r\n";
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    // One upstream connection served both tries, so the second never
+    // dialed — `accepted_count` is the oracle for that.
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    // Honest limit of this bed, measured rather than assumed: deleting the
+    // re-base in `armRequestDeadline` does not move this number. Both
+    // exchanges start at ~t=0 here, so the timer request one re-based is
+    // already sitting on the exact instant request two's cap wants, and
+    // the lazy re-arm covers for the missing call. The case that needs it
+    // — a connection idle for minutes, its timer armed a whole idle
+    // timeout out, taking a request with a 200 ms cap — needs a gap
+    // between the two requests that this bed cannot express (issue #106).
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms >= request_ms);
+    try std.testing.expect(elapsed_ms < Http1Bed.idle_timeout_ms);
+    try bed.expectDrained();
+}
+
+test "l7: an exchange inside the request deadline is untouched by it" {
+    // Negative space for the rung above: a deadline that binds a slow
+    // exchange must not touch a prompt one, and must not survive its own
+    // exchange — the second request on the same connection gets a fresh
+    // budget, not the remainder of the first one's.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 50,
+        .origin_response = response,
+        .request_timeout_ms = 500,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+    try bed.expectDrained();
+
+    // Both exchanges completed, the second off the parked upstream — the
+    // reuse path, which never reaches the dial and so is the one that
+    // depends on `armRequestDeadline` arming the budget itself.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
+}
+
+test "l7: the §7 replay inherits the request deadline, it does not restart it" {
+    // A replay is the same client request taking its one free retry, so
+    // the §8 cap must ride across it. `beginReplay` rebuilds `l7` field by
+    // field, which is exactly where a cap can be dropped silently — and a
+    // dropped cap does not fail loudly, it just stops clamping.
+    //
+    // Serve request one and close behind it, so the parked upstream is
+    // stale; request two checks it out, fails on first use, and replays
+    // onto a fresh dial that then stalls. The only budget left is the one
+    // installed when request two was routed.
+    const request_ms: u32 = 20;
+    comptime assert(request_ms < Http1Bed.idle_timeout_ms);
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 63,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .origin_closes = true,
+        .origin_mute_after_served = 1,
+        .request_timeout_ms = request_ms,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\n\r\n";
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_replayed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    // The discriminator: drop `request_deadline_ns` from `beginReplay`'s
+    // literal and `storeDeadline` stops clamping, so the stalled replay
+    // waits out the whole idle timeout instead of this budget.
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms >= request_ms);
+    try std.testing.expect(elapsed_ms < Http1Bed.idle_timeout_ms);
+    try bed.expectDrained();
 }
 
 test "l7: the 504 verdict path allocates nothing after init" {

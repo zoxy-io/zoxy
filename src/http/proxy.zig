@@ -361,6 +361,26 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.client_keep_alive = request.keep_alive;
         }
 
+        /// Start this exchange's §8 deadline, if the deployment set one.
+        /// Storing the cap is not enough on its own: the armed timer is the
+        /// idle one this connection has carried since its last turnaround,
+        /// due far later, and the lazy re-arm only ever fires *at* the armed
+        /// target (§4) — so a cap stored under it would be noticed one idle
+        /// timeout late, which is the whole failure it exists to prevent.
+        /// Re-base once, here, and every later `storeDeadline` on this
+        /// exchange clamps under a timer already due on time.
+        fn armRequestDeadline(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_reading_head);
+            assert(conn.l7.request_deadline_ns == 0);
+            if (server.config.request_timeout_ms == 0) return;
+            const now_ns = server.io.nowNs();
+            conn.l7.request_deadline_ns = now_ns +
+                @as(u64, server.config.request_timeout_ms) * std.time.ns_per_ms;
+            assert(conn.l7.request_deadline_ns > now_ns);
+            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.rebaseDeadline(conn);
+        }
+
         /// Policy gate, then the exchange's admission: tunnels and
         /// upgrades are non-goals (§1, §7) — 501; the canonical path
         /// selects a cluster (400 if it will not canonicalize, 404 if no
@@ -370,6 +390,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_reading_head);
             assert(request.head_len <= conn.head_len);
             recordRequestFacts(conn, request);
+            armRequestDeadline(server, conn);
             if (request.method == .connect) {
                 return respond(server, conn, 501, "l7_not_implemented");
             }
@@ -1446,6 +1467,12 @@ pub fn Proxy(comptime IoType: type) type {
                 .request_head_len = conn.l7.request_head_len,
                 .client_keep_alive = conn.l7.client_keep_alive,
                 .replay_used = true,
+                // The §8 cap rides across too: a replay is the *same*
+                // client-visible request taking its one free retry, not a
+                // new exchange, so it must not win itself a fresh budget.
+                // Dropping it here would silently uncap the rest of the
+                // exchange, since `storeDeadline` stops clamping at zero.
+                .request_deadline_ns = conn.l7.request_deadline_ns,
                 // upstream_was_reused stays default-false: the replay try
                 // is a fresh dial, and a second early failure answers 502.
             };
@@ -1564,6 +1591,17 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.upstream = null;
                 conn.upstream_socket = null;
             }
+            // A rung committed to an answer: retire the §8 request deadline
+            // so it cannot expire the connection out from under the write
+            // that delivers it (`clearRequestDeadline` owns the rule).
+            // Retiring the *cap* is only half of it — `conn.deadline_ns` is
+            // still standing wherever the cap clamped it, and the armed
+            // timer is still aimed there, so widen it back to the idle
+            // budget that owns a slow-reading client. No arm: whatever
+            // timer is already out re-arms itself for the remainder once it
+            // sees the later target (§4's lazy tick-and-compare).
+            ServerType.clearRequestDeadline(conn);
+            server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment(counter);
             // §8's "then keep or close per pressure". Closing is not free:
             // it costs the client a fresh handshake and this proxy a fresh

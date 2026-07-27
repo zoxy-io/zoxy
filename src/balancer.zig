@@ -147,6 +147,7 @@ fn testConfig(clusters: []const config_module.Config.Cluster) config_module.Conf
         .idle_timeout_ms = 1,
         .drain_deadline_ms = 1,
         .max_lifetime_ms = 0,
+        .request_timeout_ms = 0,
     };
 }
 

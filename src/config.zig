@@ -31,6 +31,17 @@ pub const Config = struct {
     /// where zero is legal (an unbounded connection age), so it is optional
     /// in the JSON and defaults off.
     max_lifetime_ms: u32,
+    /// Cap on one L7 exchange, from the moment a request head is routed to
+    /// the last response byte (§8). Unlike the idle timeout it is *not*
+    /// refreshed by activity, so it bounds a request that is progressing
+    /// too slowly, not merely one that has stalled — the difference
+    /// between shedding on time and shedding only when a resource runs
+    /// out. It rides the same per-connection deadline timer, clamping it
+    /// the way `max_lifetime_ms` does, and expires into the §8 request-
+    /// deadline rung: `504` if no response byte has been sent, teardown
+    /// otherwise. `0` disables it, so it is optional in the JSON and
+    /// defaults off. L4 connections never set it.
+    request_timeout_ms: u32,
     /// Effective pool sizes (§5, §8). The comptime constants stay the
     /// hard, budget-asserted ceilings; config may only shrink below them
     /// — for capacity planning, and so the overload benchmark can hit
@@ -172,6 +183,7 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
         .idle_timeout_ms = parsed.timeouts.idle_ms,
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
+        .request_timeout_ms = parsed.timeouts.request_ms,
         .limits = limits,
         .admin_bind = admin_bind,
     };
@@ -501,6 +513,10 @@ pub const TimeoutsJson = struct {
     /// Optional: absent or `0` means "no cap" (§6). The default keeps every
     /// pre-existing config valid and leaves max-lifetime opt-in.
     max_lifetime_ms: u32 = 0,
+    /// Optional, same shape: absent or `0` means "no cap" (§8). Opt-in
+    /// because a request deadline is a policy an operator sets against
+    /// their own origin's latency, not a value zoxy can pick for them.
+    request_ms: u32 = 0,
 
     pub const schema_doc = "Connection lifecycle deadlines, in milliseconds.";
     pub const schema_fields = .{
@@ -521,6 +537,11 @@ pub const TimeoutsJson = struct {
         },
         .max_lifetime_ms = .{
             .desc = "Absolute connection-age cap; 0 disables it.",
+            .minimum = 0,
+            .maximum = constants.timeout_ms_max,
+        },
+        .request_ms = .{
+            .desc = "Cap on one L7 exchange, not refreshed by activity; 0 disables it.",
             .minimum = 0,
             .maximum = constants.timeout_ms_max,
         },
@@ -1158,10 +1179,13 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
             return error.TimeoutOverLimit;
         }
     }
-    // max_lifetime_ms is the one optional bound (§6): 0 means "no cap", so
-    // only the shared ceiling is enforced — zero stays legal.
-    if (timeouts.max_lifetime_ms > constants.timeout_ms_max) {
-        return error.TimeoutOverLimit;
+    // The two optional bounds (§6, §8): 0 means "no cap" on either, so only
+    // the shared ceiling is enforced — zero stays legal.
+    const optional = [_]u32{ timeouts.max_lifetime_ms, timeouts.request_ms };
+    for (optional) |value| {
+        if (value > constants.timeout_ms_max) {
+            return error.TimeoutOverLimit;
+        }
     }
 }
 
@@ -1199,6 +1223,58 @@ test "config: max_lifetime_ms is optional and defaults to disabled" {
         \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
     );
     try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
+    // The shipped example names neither optional bound, so both must land
+    // disabled — the §8 request deadline is opt-in like the age cap.
+    try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
+}
+
+test "config: request_ms is optional, defaults off, and shares the timeout ceiling" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+    ;
+    // Absent: pre-existing configs stay valid and the §8 request deadline
+    // defaults off, the same shape as max_lifetime_ms.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
+    }
+    // Explicit 0 is legal — "no cap", not a TimeoutZero.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1,\"request_ms\":0}}",
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
+    }
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1,\"request_ms\":250}}",
+        );
+        try std.testing.expectEqual(@as(u32, 250), parsed.request_timeout_ms);
+    }
+    // The shared ceiling still binds — an optional cap is not an unbounded
+    // one.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const json = try std.fmt.allocPrint(
+            arena_state.allocator(),
+            "{s}\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1,\"request_ms\":{d}}}}}",
+            .{ head, @as(u64, constants.timeout_ms_max) + 1 },
+        );
+        try std.testing.expectError(error.TimeoutOverLimit, parse(arena_state.allocator(), json));
+    }
 }
 
 test "config: max_lifetime_ms accepts zero (the one legal zero timeout) and real values" {
