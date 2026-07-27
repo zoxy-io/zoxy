@@ -206,7 +206,7 @@ pub fn build(b: *std.Build) void {
     // ReleaseFast `zoxy_fast_module` defined above so the SIMD parser is
     // what gets measured.
     const micro_step = b.step("bench-micro", "Build Tier-0 micro binaries for poop A/B");
-    for ([_][]const u8{ "pool_acquire_release", "relay_chunking", "l7_head_pipeline" }) |micro_name| {
+    for ([_][]const u8{ "pool_acquire_release", "relay_chunking", "l7_head_pipeline", "conn_touch_scaling" }) |micro_name| {
         const micro_exe = b.addExecutable(.{
             .name = b.fmt("zoxy-bench-{s}", .{micro_name}),
             .root_module = b.createModule(.{
@@ -236,6 +236,13 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
                 .{ .name = "zio", .module = zio_dependency.module("zio") },
+                // For `constants` alone: the harness sizes the conn-slot
+                // limit it writes into zoxy's config against the compiled
+                // ceiling. Duplicating that number here would track a
+                // *lowered* ceiling loudly (the config is rejected at
+                // startup) but a *raised* one silently — a profile aimed at
+                // the new maximum would cap below it and say nothing.
+                .{ .name = "zoxy", .module = zoxy_fast_module },
             },
         }),
     });
@@ -261,6 +268,18 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
     ci_step.dependOn(sim_step);
+    // Compile — never run — every measurement binary. Their verdicts are
+    // human-read A/Bs and profiles, so running them here would buy nothing
+    // and cost minutes; but they call the same internal APIs the proxy
+    // does, and nothing else in the gate does. Left ungated,
+    // `l7_head_pipeline` silently stopped compiling when
+    // `renderRequestHead` grew two parameters and stayed broken across four
+    // merged slices — discovered only when someone next reached for it,
+    // which is the worst time to find out a measurement tool is dead. A
+    // build is enough to catch that, and it is the cheapest thing that is.
+    ci_step.dependOn(micro_step);
+    ci_step.dependOn(&bench_exe.step);
+    ci_step.dependOn(&profile_harness.step);
 
     // Line coverage via kcov (Linux-only, in the dev shell): the unit-test
     // binary plus a simulator sweep, merged — the simulator reaches error
