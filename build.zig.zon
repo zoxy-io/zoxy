@@ -73,12 +73,12 @@
         // bench harness constructs its own zio.Runtime to match (see
         // bench/run.zig), so this pin must stay *exactly* the one zrk's own
         // build.zig.zon carries: two zio copies would be two runtimes, and
-        // zrk's runner would be handed an `Io` from the wrong one.
-        // zoxy-io/zio is our fork of lalinsky/zio; its main is at the same
-        // commit zrk 1.3.1 pins upstream, which is what makes this
-        // substitution a no-op today rather than a divergence to audit.
+        // zrk's runner would be handed an `Io` from the wrong one. Upstream
+        // rather than a fork, deliberately — a fork of a dependency we do
+        // not patch is a second thing to keep in sync with zrk's pin, and
+        // the only way it can differ from upstream is by being wrong.
         .zio = .{
-            .url = "git+https://github.com/zoxy-io/zio#3566a3a8ca706e90de0ef1e1c46226ec4464f659",
+            .url = "git+https://github.com/lalinsky/zio#3566a3a8ca706e90de0ef1e1c46226ec4464f659",
             .hash = "zio-0.16.0-xHbVVDxFJADhW5CgWRdQmPa8bg_YrOAiPFHTKGFq8jwk",
         },
         // Audited fork: zoxy-io/hparse main at the DESIGN.md §7
