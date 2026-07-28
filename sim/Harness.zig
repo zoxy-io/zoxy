@@ -118,6 +118,10 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
         .connect_blackhole_percent = random.uintAtMost(u8, 10),
         .reset_percent = random.uintAtMost(u8, 10),
         .kernel_pressure_percent = random.uintAtMost(u8, 8),
+        // Dial-time kernel pressure (§8): the witnessKernelPressure
+        // sites on both dial paths were unreachable under every seed
+        // until this fate existed (issue #106, kind B).
+        .connect_pressure_percent = random.uintAtMost(u8, 5),
     };
 }
 

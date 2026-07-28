@@ -5,8 +5,8 @@
 //! schedule byte for byte. The adversary delivers completions in
 //! PRNG-permuted bounded batches without refreshing the clock mid-batch
 //! (making §4's one-tick staleness adversarial by construction), splits
-//! reads and writes down to one byte, delays/refuses/black-holes
-//! connects, and injects resets between batches.
+//! reads and writes down to one byte, delays/refuses/black-holes/
+//! pressure-fails connects, and injects resets between batches.
 //!
 //! Socket handles carry a generation; any use of a stale handle after
 //! close trips an assertion — the §5 release rule enforced in the sim.
@@ -83,8 +83,13 @@ dump_on_deadlock: bool,
 trace_hash: u64,
 blackholed_addresses: [blackholed_addresses_max]std.Io.net.IpAddress,
 blackholed_count: u8,
+/// One-shot dial faults by address (`injectConnectError`): the next
+/// connect to a matching address fails with `error.Unexpected`.
+connect_error_addresses: [connect_error_addresses_max]std.Io.net.IpAddress,
+connect_error_count: u8,
 
 const blackholed_addresses_max: u8 = 4;
+const connect_error_addresses_max: u8 = 4;
 
 pub const Adversary = struct {
     /// Bias deliveries toward 1-byte and full-length reads/writes.
@@ -105,6 +110,12 @@ pub const Adversary = struct {
     /// `error.Unexpected` (ENOBUFS/ENOMEM-class, §8) — local to that
     /// socket, so the relay witnesses it and tears the connection down.
     kernel_pressure_percent: u8 = 0,
+    /// Chance per connect to fail the dial with `error.Unexpected` —
+    /// the socket()-time kernel-pressure fate (ENFILE/EADDRNOTAVAIL-
+    /// class, §8). Distinct from `connect_refuse_percent`: Refused is
+    /// the origin's verdict, this is our own exhaustion, and the two
+    /// want opposite responses upstream.
+    connect_pressure_percent: u8 = 0,
     batch_max: u32 = constants.loop_completions_per_tick_max,
 };
 
@@ -148,7 +159,7 @@ const Op = union(enum) {
     connect_cancel: struct { target: *Completion },
 };
 
-const ConnectFate = enum(u8) { succeed, refuse, blackhole };
+const ConnectFate = enum(u8) { succeed, refuse, blackhole, pressure };
 
 const Result = union(enum) {
     accept: Io.AcceptError!Socket,
@@ -289,7 +300,8 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     // otherwise surface as an opaque arithmetic/uintLessThan panic deep in
     // a delivery, seeds away from the caller that set it.
     assert(@as(u16, options.adversary.connect_refuse_percent) +
-        options.adversary.connect_blackhole_percent <= 100);
+        options.adversary.connect_blackhole_percent +
+        options.adversary.connect_pressure_percent <= 100);
     assert(options.adversary.reset_percent <= 100);
     assert(options.adversary.kernel_pressure_percent <= 100);
     assert(options.adversary.batch_max >= 1);
@@ -318,6 +330,8 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.trace_hash = std.hash.Fnv1a_64.init().value;
     io.blackholed_addresses = undefined;
     io.blackholed_count = 0;
+    io.connect_error_addresses = undefined;
+    io.connect_error_count = 0;
     assert(io.sockets.isFullyReleased());
 }
 
@@ -429,12 +443,18 @@ pub fn connect(
     const random = io.prng.random();
     const roll = random.uintLessThan(u8, 100);
     var fate: ConnectFate = .succeed;
-    if (io.isBlackholed(address)) {
+    if (io.takeConnectError(address)) {
+        fate = .pressure;
+    } else if (io.isBlackholed(address)) {
         fate = .blackhole;
     } else if (roll < io.adversary.connect_blackhole_percent) {
         fate = .blackhole;
     } else if (roll < io.adversary.connect_blackhole_percent + io.adversary.connect_refuse_percent) {
         fate = .refuse;
+    } else if (roll < io.adversary.connect_blackhole_percent + io.adversary.connect_refuse_percent +
+        io.adversary.connect_pressure_percent)
+    {
+        fate = .pressure;
     }
     const delay_ns = if (io.adversary.connect_delay_ns_max == 0)
         0
@@ -645,6 +665,27 @@ pub fn injectSignal(io: *SimIo, signal: Io.Signal) void {
     io.scheduleSignal(signal, io.now_ns_value);
 }
 
+// Fault injection (§9). A virtual socket table cannot organically fail
+// where a kernel can, so every seam operation that CAN fail has an
+// injector: accept (`injectAcceptError`), connect (`injectConnectError`
+// and the `connect_pressure_percent` knob), the data ops (the
+// `kernel_pressure_percent` knob), and the option setters
+// (`injectSetOptionError`). The audit behind that inventory (the ops
+// deliberately left without one, because the seam contract makes their
+// failure unobservable):
+// - close/closeNow: XevIo swallows close errors — the fd is gone either
+//   way and the callback carries no error — so there is nothing a
+//   scenario could observe.
+// - shutdown: returns void; XevIo asserts SUCCESS or the legal NOTCONN
+//   race. A failing shutdown is an invariant violation, not an error
+//   path.
+// - listenerAddress: a pure table lookup on both backends.
+// - timerStart: XevIo panics on a kernel timer failure (an unarmed
+//   deadline is not a recoverable condition, §4); the only deliverable
+//   error is Canceled, which timerCancel produces naturally.
+// - listen: fails typed on both backends and is exercised directly
+//   (AddressInUse/AddressUnavailable here, the rest in contract_test.zig).
+
 /// Targeted scenario control: the next accept delivery on this listener
 /// fails with error.Unexpected — the kernel-pressure (ENFILE-class) path
 /// production can hit but a virtual socket table never would (§9).
@@ -654,6 +695,17 @@ pub fn injectAcceptError(io: *SimIo, listener: Listener) void {
     assert(entry.active);
     assert(entry.pending_accept_errors < std.math.maxInt(u8));
     entry.pending_accept_errors += 1;
+}
+
+/// Targeted scenario control: the next connect to this address fails
+/// with error.Unexpected — the dial-time kernel-pressure path
+/// (ENFILE/EADDRNOTAVAIL-class, §8) production can hit but a virtual
+/// socket table never would (§9). One-shot, unlike `blackholeAddress`,
+/// so a scenario can fail one dial and let the retry through.
+pub fn injectConnectError(io: *SimIo, address: std.Io.net.IpAddress) void {
+    assert(io.connect_error_count < connect_error_addresses_max);
+    io.connect_error_addresses[io.connect_error_count] = address;
+    io.connect_error_count += 1;
 }
 
 /// The classified cause of the op currently being delivered (§8) — the
@@ -917,6 +969,12 @@ fn finishConnect(
     fate: ConnectFate,
 ) Io.ConnectError!Socket {
     assert(fate != .blackhole);
+    if (fate == .pressure) {
+        // Kernel pressure at dial time (§8): no virtual pair is created,
+        // exactly as a failed socket()/connect submission creates no fd.
+        io.recordPressure();
+        return error.Unexpected;
+    }
     if (fate == .refuse) {
         return error.Refused;
     }
@@ -1101,6 +1159,21 @@ fn socketHandle(io: *SimIo, entry: *SocketEntry) Socket {
         .index = @intCast(io.sockets.indexOf(entry)),
         .generation = @truncate(entry.generation),
     };
+}
+
+/// Consume a pending one-shot dial fault for this address, if any.
+fn takeConnectError(io: *SimIo, address: std.Io.net.IpAddress) bool {
+    assert(io.connect_error_count <= connect_error_addresses_max);
+    for (io.connect_error_addresses[0..io.connect_error_count], 0..) |pending, index| {
+        if (std.meta.eql(pending, address)) {
+            assert(io.connect_error_count >= 1);
+            io.connect_error_addresses[index] =
+                io.connect_error_addresses[io.connect_error_count - 1];
+            io.connect_error_count -= 1;
+            return true;
+        }
+    }
+    return false;
 }
 
 fn isBlackholed(io: *const SimIo, address: std.Io.net.IpAddress) bool {

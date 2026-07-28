@@ -773,8 +773,9 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
 1. **Deterministic simulation — `zig build sim -- [seed] [iterations]`.**
    The `SimIo` backend (§4) runs the real data path against virtual
    sockets and a virtual clock under a seeded adversarial scheduler:
-   partial reads/writes down to 1 byte, delayed/refused/black-holed
-   connects, resets at every point in every exchange, misbehaving origins.
+   partial reads/writes down to 1 byte, delayed/refused/black-holed/
+   pressure-failed connects, resets at every point in every exchange,
+   misbehaving origins.
    Mixed L4 and L7 clients share one server. L4 clients carry a token
    echoed into the body and verified byte-exact. L7 clients run HTTP
    request scripts — the valid shapes, the §7 reject shapes, and the

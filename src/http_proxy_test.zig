@@ -1699,6 +1699,38 @@ test "l7: an unreachable origin is answered 502" {
     try bed.expectDrained();
 }
 
+test "l7: kernel pressure on the upstream dial is witnessed and answered 502" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 31 });
+    defer bed.tearDown();
+
+    // The origin listens and is healthy; the dial itself fails the way a
+    // kernel out of ephemeral ports fails it (§8). Refused is the
+    // origin's verdict and had coverage above — this is our own
+    // exhaustion, and no seed could reach its witness before the
+    // connect-error injector existed (issue #106, kind B).
+    bed.sim_io.setPressureCause(.address_unavailable);
+    bed.sim_io.injectConnectError(Http1Bed.originAddress());
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_errors"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_connect"));
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("kernel_pressure_address_unavailable"),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 test "l7: an origin response head the proxy cannot parse is 502" {
     // Both verdicts on the origin's head — malformed, and oversize once the
     // buffer is full — land on the same arm, and both are 502s the dial
