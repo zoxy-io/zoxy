@@ -11,7 +11,15 @@ const Harness = @import("Harness.zig");
 const assert = std.debug.assert;
 
 const default_seed: u64 = 1;
-const default_iterations: u64 = 64;
+/// What `zig build sim` (and so `ci`) sweeps. Sized by census, not by
+/// feel: at 64 the gate left three scripts — `post_chunked_malformed`,
+/// `oversize_uri`, `filter_edit` — with no *clean* seed at all, so
+/// their golden-outcome oracles never ran, and the §7 "silent teardown
+/// instead of 400" shape had no seed demanding its 400. Every script
+/// draws a clean seed by ~1024; 4096 keeps that true with margin as
+/// the script table grows, and costs ~5 s (each seed runs twice for the
+/// determinism check).
+const default_iterations: u64 = 4096;
 const progress_interval: u64 = 500;
 
 pub fn main(init: std.process.Init) !u8 {
