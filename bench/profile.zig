@@ -56,14 +56,17 @@ const Flags = struct {
     /// deadline's arming path on every request, so this is the flag that
     /// makes its cost measurable rather than argued about.
     request_ms: u32 = 0,
-    /// Highest 1-minute load average the box may already carry when the
-    /// measured window opens; 0 disables the gate. Half a core of ambient
-    /// work is the most that leaves the pinned core and the six load
-    /// threads to themselves on a machine this harness assumes it owns.
-    quiesce_load: f64 = 0.5,
-    /// How long to wait for the box to reach `quiesce_load` before giving
-    /// up and refusing the run.
-    quiesce_timeout_s: u64 = 180,
+    /// Optional hard ceiling on the settled load: refuse the run if the
+    /// box flattens above it. 0 (the default) asks only that the load has
+    /// stopped falling, and reports where — see `awaitQuietBox` for why
+    /// no absolute default is defensible.
+    quiesce_load: f64 = 0,
+    /// How long to wait for the load to flatten before measuring anyway
+    /// and saying so. Sized against the decay it exists to wait out: a
+    /// row drives ~7 cores, and a ~60s EWMA needs ~160s to fall from
+    /// there to a low floor, so this leaves real margin rather than the
+    /// 22 seconds the first version left.
+    quiesce_timeout_s: u64 = 300,
     zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
 
     const Protocol = enum { l4, http };
@@ -126,7 +129,10 @@ pub fn main(init: std.process.Init) !u8 {
         "profile: measuring {d}s at {d} req/s over {d} connections\n",
         .{ flags.duration_s, flags.rate, flags.connections },
     );
+    const ring_scratch = try arena.alloc(u8, proc_scratch_bytes);
+    const ring_before = readRingSample(io, zoxy_pid, ring_scratch);
     const report = try loadTest(arena, io, &flags);
+    printRingDelta(io, zoxy_pid, &ring_before, report.snapshot.counters.completed, ring_scratch);
     const perf_term = try perf_child.wait(io);
     if (perf_term != .exited or perf_term.exited != 0) {
         std.debug.print("profile: perf record exited abnormally ({any})\n", .{perf_term});
@@ -490,6 +496,247 @@ fn preflight(io: Io, flags: *const Flags, zoxy_cpu: u16) !?[]const u8 {
     return cycles_event;
 }
 
+/// One sample of the loop's io_uring and scheduling counters, every field
+/// cumulative since process start (§9) — deltas across the measured window
+/// are what mean anything, the absolutes include startup.
+///
+/// All of it comes from `/proc`, so the proxy needs no instrumentation and
+/// the numbers are the kernel's own rather than something zoxy reports
+/// about itself.
+const RingSample = struct {
+    /// SQEs the loop has written: every op it has submitted.
+    sqes: u64,
+    /// CQEs the kernel has produced: every completion delivered.
+    cqes: u64,
+    /// Times this process blocked and was woken. The loop blocks in
+    /// `io_uring_enter`, so this is the nearest thing to an enter count
+    /// obtainable here — the syscall tracepoint needs a
+    /// `perf_event_paranoid` this box does not grant, and counting inside
+    /// libxev would be a fork change. It counts the enters that *slept*,
+    /// which is the half that matters: completions per wake is the loop's
+    /// batch depth, and batch depth is what separates "submission-bound"
+    /// from "already coalescing".
+    ///
+    /// Undercounts by every non-blocking enter, and overcounts by every
+    /// other voluntary block on this thread — the second only matters if
+    /// there ever is one, which §3's one-thread-one-loop says there is
+    /// not. Reported batch depth is therefore a lower bound on the truth
+    /// in the first case and an upper bound in the second.
+    wakes: u64,
+    /// Whether the CQ has overflowed, or null when that cannot be told.
+    /// Overflowed completions are parked in a kernel list and delivered
+    /// late, or dropped outright once that fills — either way the §8
+    /// budget that sized the ring was wrong, and nothing else in this
+    /// harness would notice.
+    ///
+    /// Nullable because the one case that must never be reported as a
+    /// confident "no" is the one this exists to catch: fdinfo lists every
+    /// pending SQE and CQE, one line each, *before* `CqOverflowList:`, so
+    /// a ring deep enough to overflow is also a ring whose fdinfo can run
+    /// past any fixed read. A missing header then means "did not read far
+    /// enough", never "no overflow".
+    overflowed: ?bool,
+};
+
+/// Highest fd number scanned when looking for the ring. The fd is not
+/// assumed because it depends on how many files the process opened first,
+/// which is not this harness's business to know; the bound is what keeps
+/// the search finite.
+const ring_fd_scan_max: u8 = 64;
+
+/// The load average counts as "still falling" while each poll is below
+/// the previous one by more than this factor. A ~60s EWMA sampled every
+/// 2s decays by `exp(-2/60)` = 0.967 per poll while it is genuinely
+/// decaying, so anything above 0.99 is flat rather than falling — the gap
+/// between the two is what keeps noise from reading as decay.
+const settle_decay_ratio: f64 = 0.99;
+/// Consecutive flat polls before the box counts as settled. Two, so a
+/// single noisy sample cannot end the wait on its own.
+const settle_polls: u32 = 2;
+
+/// The `u64` after `key:` in a `/proc` `key:<whitespace>value` table, or
+/// null when the key is absent or its value will not parse. Kernel-owned
+/// text, still parsed as untrusted: every caller's fallback for null is to
+/// report nothing rather than to report a zero.
+fn procField(content: []const u8, key: []const u8) ?u64 {
+    assert(key.len >= 1);
+    assert(content.len >= 1);
+    var lines = std.mem.tokenizeScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        if (line.len <= key.len or line[key.len] != ':') continue;
+        const value = std.mem.trim(u8, line[key.len + 1 ..], " \t");
+        return std.fmt.parseUnsigned(u64, value, 10) catch null;
+    }
+    return null;
+}
+
+/// Read the head of a `/proc` file that may be large, into `out`.
+///
+/// `readSmallFile`'s 256-byte internal buffer is fine for the fixed-size
+/// files this harness otherwise reads, and wrong for io_uring's fdinfo:
+/// procfs regenerates that text on every read, and once the ring carries
+/// thousands of in-flight ops — one printed line each — the read through a
+/// small internal buffer fails outright rather than returning a prefix.
+/// That failure is what made `readRingSample` skip the ring's own fd and
+/// then report no ring at all, on exactly the busy c10k rows the counters
+/// were added for.
+///
+/// A large internal buffer and a small destination: take one big bite,
+/// keep the head, which is where every counter this harness wants lives.
+fn readProcHead(io: Io, path: []const u8, out: []u8, scratch: []u8) ?[]const u8 {
+    assert(out.len > 0);
+    assert(scratch.len >= out.len);
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var file_reader = file.reader(io, scratch);
+    const len = file_reader.interface.readSliceShort(out) catch return null;
+    assert(len <= out.len);
+    return out[0..len];
+}
+
+/// Scratch for `readProcHead`, sized from the worst case rather than
+/// guessed at — the previous two sizes were both round numbers and both
+/// too small.
+///
+/// io_uring's fdinfo renders a line per pending SQE and CQE, ~89 and ~34
+/// bytes, and `constants.in_flight_ops_max` is what bounds how many there
+/// can be: ~57k ops at the compiled ceiling, so ~5 MB of text at the
+/// worst moment. The kernel appears to want the whole record to fit
+/// rather than handing back a prefix, which is why a 64 KiB buffer still
+/// failed the busiest c10k rows while working on quieter ones.
+const proc_scratch_bytes: usize = 8 << 20;
+
+/// Whether a `/proc` list section named by `header` has any entry under
+/// it, or null when the text does not settle it. fdinfo prints list
+/// headers unconditionally and indents their entries, while the next
+/// section's key starts at column zero — so the first line after the
+/// header is the whole answer.
+///
+/// Null rather than false when the header is absent or ends the text,
+/// because for this caller those mean "the read stopped short", and the
+/// read stops short precisely when the ring is busiest. Every other parser
+/// in this file answers "cannot tell" with null; a bare `bool` here would
+/// be the one place that turns an unread file into a confident negative.
+fn procListHasEntry(content: []const u8, header: []const u8) ?bool {
+    assert(header.len >= 1);
+    assert(content.len >= 1);
+    const at = std.mem.indexOf(u8, content, header) orelse return null;
+    const rest = content[at + header.len ..];
+    const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse return null;
+    const next_line = rest[newline + 1 ..];
+    if (next_line.len == 0) return null;
+    return next_line[0] == ' ' or next_line[0] == '\t';
+}
+
+/// Sample the ring and scheduling counters for `pid`, or null if the ring
+/// fdinfo cannot be found or read — a harness that cannot measure must say
+/// so, not print zeroes that read as "no work happened".
+fn readRingSample(io: Io, pid: i32, scratch: []u8) ?RingSample {
+    assert(pid > 0);
+    // A bounded *head* read, deliberately. The counters this exists for
+    // sit in the first few hundred bytes; what follows them is a line per
+    // pending SQE and CQE, so the file's length scales with in-flight ops
+    // and is unbounded in practice. Asking for more of it is not free:
+    // procfs regenerates the text per read, so a large destination means
+    // many reads of a file that is changing underneath them, and the read
+    // fails outright. Sizing this at 64 KiB to "be safe" is exactly what
+    // broke four of five c10k rows with `no sample at end of window` —
+    // the counters were unreadable precisely when the ring was busy.
+    //
+    // A full buffer is therefore evidence of a truncated read rather than
+    // of a large complete one; the two are indistinguishable from content
+    // alone, so the length is what `overflowed` keys its "cannot tell"
+    // off, and on a busy ring it will indeed say so.
+    var buffer: [4096]u8 = undefined;
+    var path_buffer: [64]u8 = undefined;
+    var fd: u32 = 0;
+    var readable: u32 = 0;
+    while (fd < ring_fd_scan_max) : (fd += 1) {
+        assert(fd < ring_fd_scan_max);
+        const path = std.fmt.bufPrint(
+            &path_buffer,
+            "/proc/{d}/fdinfo/{d}",
+            .{ pid, fd },
+        ) catch continue;
+        const content = readProcHead(io, path, &buffer, scratch) orelse continue;
+        readable += 1;
+        // `SqMask` is io_uring's own marker: no other fd type prints it.
+        if (std.mem.indexOf(u8, content, "SqMask:") == null) continue;
+        // Both counters print near the top, ahead of any per-entry list,
+        // so they survive a truncated read; the overflow flag does not.
+        const sqes = procField(content, "SqTail") orelse return null;
+        const cqes = procField(content, "CqTail") orelse return null;
+        // The list header is always printed, so its presence proves
+        // nothing; what distinguishes an overflow is an *entry* under it.
+        // Entries are indented (`PollList` prints its own the same way)
+        // and the next section key is not, so the first following line
+        // decides it. Getting this backwards reads `NAPI:` as an overflow
+        // and cries wolf on every run. A filled buffer means the header
+        // may simply lie past what was read, which is "cannot tell".
+        const truncated = content.len == buffer.len;
+        const overflowed = if (truncated) null else procListHasEntry(content, "CqOverflowList:");
+        var status_buffer: [4096]u8 = undefined;
+        const status_path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/status", .{pid}) catch return null;
+        const status = readProcHead(io, status_path, &status_buffer, scratch) orelse return null;
+        const wakes = procField(status, "voluntary_ctxt_switches") orelse return null;
+        assert(cqes <= sqes); // A completion the loop never submitted is impossible.
+        return .{ .sqes = sqes, .cqes = cqes, .wakes = wakes, .overflowed = overflowed };
+    }
+    // Say which way it failed. "No ring under fd 64" and "no fdinfo at all"
+    // are different bugs — the first means the scan bound is too low for a
+    // process whose low fds are taken, the second means the pid is wrong or
+    // gone — and a bare null made a whole c10k sweep unattributable.
+    std.debug.print(
+        "profile: ring  no io_uring fd under {d} for pid {d} ({d} fdinfo entries readable)\n",
+        .{ ring_fd_scan_max, pid, readable },
+    );
+    return null;
+}
+
+/// Report what the ring did across the measured window: ops and
+/// completions per request, and the batch depth that says whether the loop
+/// is submission-bound. Silent when either sample is missing — see
+/// `readRingSample`.
+fn printRingDelta(io: Io, pid: i32, before: *const ?RingSample, completed: u64, scratch: []u8) void {
+    assert(pid > 0);
+    const start = before.* orelse return;
+    const end = readRingSample(io, pid, scratch) orelse {
+        std.debug.print("profile: ring  unavailable (no sample at end of window)\n", .{});
+        return;
+    };
+    // Every counter is cumulative and this process never restarted, so a
+    // counter that went backwards means the sample is not of the same ring
+    // — say so rather than print a saturated zero that reads as "idle".
+    if (end.sqes < start.sqes or end.cqes < start.cqes or end.wakes < start.wakes) {
+        std.debug.print("profile: ring  discarded (counters went backwards)\n", .{});
+        return;
+    }
+    if (completed == 0) return;
+    const sqes = end.sqes - start.sqes;
+    const cqes = end.cqes - start.cqes;
+    const wakes = end.wakes - start.wakes;
+    assert(completed >= 1);
+    const per_request = @as(f64, @floatFromInt(cqes)) / @as(f64, @floatFromInt(completed));
+    const batch = if (wakes >= 1)
+        @as(f64, @floatFromInt(cqes)) / @as(f64, @floatFromInt(wakes))
+    else
+        0;
+    std.debug.print(
+        "profile: ring  sqes {d} ({d:.2}/req)  cqes {d} ({d:.2}/req)  " ++
+            "wakes {d} ({d:.1} cqes/wake)  cq-overflow {s}\n",
+        .{
+            sqes,
+            @as(f64, @floatFromInt(sqes)) / @as(f64, @floatFromInt(completed)),
+            cqes,
+            per_request,
+            wakes,
+            batch,
+            if (end.overflowed) |o| (if (o) "YES" else "no") else "unknown",
+        },
+    );
+}
+
 /// The 1-minute load average, or null when `/proc/loadavg` is absent, will
 /// not parse, or parses to something a load average cannot be — callers
 /// treat all three as "cannot tell", never as zero. Negative and NaN are
@@ -517,51 +764,69 @@ fn readLoadAverage(io: Io) ?f64 {
 /// result. So gate on it rather than trusting the operator to notice, and
 /// print the load either way so the report carries the evidence.
 ///
-/// Waiting rather than refusing outright, because both causes are things
-/// that end on their own: a concurrent benchmark or a parallel agent
-/// session that will finish, and this harness's own previous row, whose
-/// load the 1-minute average keeps decaying for two to three minutes after
-/// it exits. Refusing immediately would fail a back-to-back sweep on every
-/// row and pass it on none; the 180s default is sized to that decay, not
-/// to the nominal one-minute window.
+/// There is deliberately **no absolute threshold**. A fixed number cannot
+/// tell a busy neighbour from an ordinary desktop: 0.5 is unreachable on
+/// a box whose idle floor is 1.5, and trivially passed on one idle at 0.1
+/// while a neighbour is spinning up. What is universal is the *shape* —
+/// the 1-minute average is a ~60s EWMA, so after this harness's own
+/// previous row (which drives about seven cores) it falls steeply and
+/// then flattens at whatever this box's floor happens to be. Wait for the
+/// flattening, report the floor it settled at, and let a row taken beside
+/// a neighbour carry that evidence rather than hide it.
+///
+/// The first version got this wrong in a way worth recording. It waited
+/// for load <= 0.5 with a 180s timeout, and decaying from ~7 to 0.5 takes
+/// `60 * ln(14)` = 158s on a *perfectly* idle box. Twenty-two seconds of
+/// margin, so back-to-back rows failed on any ambient load at all — which
+/// read as neighbour contention and was mostly self-inflicted.
+///
+/// `--quiesce-load` still imposes a hard ceiling for anyone who wants
+/// one, but defaults off: the settled value is reported either way, and a
+/// number in the report beats a refusal whose cause has to be guessed.
 fn awaitQuietBox(io: Io, flags: *const Flags) !void {
-    if (flags.quiesce_load == 0) return;
-    assert(flags.quiesce_load > 0);
     assert(flags.quiesce_timeout_s >= 1);
+    assert(flags.quiesce_load >= 0);
     const poll_s: u64 = 2;
     const poll = Io.Duration.fromNanoseconds(poll_s * std.time.ns_per_s);
     const attempts_max: u64 = @max(@divFloor(flags.quiesce_timeout_s, poll_s), 1);
     var attempt: u64 = 0;
-    var observed: f64 = 0;
+    var previous: f64 = 0;
+    var flat_polls: u32 = 0;
     while (attempt < attempts_max) : (attempt += 1) {
         // No procfs is not evidence of a busy box; a gate that cannot read
         // its input must not invent a verdict. It prints nothing either,
         // so a report from such a box is silent about load rather than
         // claiming a clean one.
-        observed = readLoadAverage(io) orelse return;
-        if (observed <= flags.quiesce_load) {
-            assert(observed >= 0);
-            std.debug.print("profile: box quiet, load {d:.2}\n", .{observed});
-            return;
-        }
-        if (attempt == 0) {
+        const observed = readLoadAverage(io) orelse return;
+        assert(observed >= 0);
+        // Falling by less than the decay would predict — or rising, which
+        // means a neighbour just started and waiting only wastes time.
+        const flattened = attempt >= 1 and observed > previous * settle_decay_ratio;
+        flat_polls = if (flattened) flat_polls + 1 else 0;
+        previous = observed;
+        if (flat_polls >= settle_polls) {
+            if (flags.quiesce_load > 0 and observed > flags.quiesce_load) {
+                std.debug.print(
+                    "profile: box settled at load {d:.2}, over the {d:.2} ceiling asked for\n",
+                    .{ observed, flags.quiesce_load },
+                );
+                return error.BoxBusy;
+            }
             std.debug.print(
-                "profile: waiting up to {d}s for the box to go quiet (load {d:.2} > {d:.2})\n",
-                .{ flags.quiesce_timeout_s, observed, flags.quiesce_load },
+                "profile: box settled at load {d:.2} after {d}s\n",
+                .{ observed, attempt * poll_s },
             );
+            return;
         }
         // The only error is cancellation; a cut-short sleep just means the
         // next poll happens sooner, which the loop bound already covers.
         io.sleep(poll, .awake) catch {};
     }
-    assert(observed > flags.quiesce_load);
     std.debug.print(
-        "profile: box still busy after {d}s (load {d:.2} > {d:.2}). A measurement " ++
-            "here records contention, not the proxy — wait, or pass --quiesce-load 0 " ++
-            "to measure anyway.\n",
-        .{ flags.quiesce_timeout_s, observed, flags.quiesce_load },
+        "profile: load never settled in {d}s (last {d:.2}); measuring anyway, " ++
+            "treat this row as suspect\n",
+        .{ flags.quiesce_timeout_s, previous },
     );
-    return error.BoxBusy;
 }
 
 fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void {
