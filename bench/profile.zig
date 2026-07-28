@@ -126,7 +126,9 @@ pub fn main(init: std.process.Init) !u8 {
         "profile: measuring {d}s at {d} req/s over {d} connections\n",
         .{ flags.duration_s, flags.rate, flags.connections },
     );
+    const ring_before = readRingSample(io, zoxy_pid);
     const report = try loadTest(arena, io, &flags);
+    printRingDelta(io, zoxy_pid, ring_before, report.snapshot.counters.completed);
     const perf_term = try perf_child.wait(io);
     if (perf_term != .exited or perf_term.exited != 0) {
         std.debug.print("profile: perf record exited abnormally ({any})\n", .{perf_term});
@@ -488,6 +490,139 @@ fn preflight(io: Io, flags: *const Flags, zoxy_cpu: u16) !?[]const u8 {
     // Before anything is spawned, so the wait is not itself adding load.
     try awaitQuietBox(io, flags);
     return cycles_event;
+}
+
+/// One sample of the loop's io_uring and scheduling counters, every field
+/// cumulative since process start (§9) — deltas across the measured window
+/// are what mean anything, the absolutes include startup.
+///
+/// All of it comes from `/proc`, so the proxy needs no instrumentation and
+/// the numbers are the kernel's own rather than something zoxy reports
+/// about itself.
+const RingSample = struct {
+    /// SQEs the loop has written: every op it has submitted.
+    sqes: u64,
+    /// CQEs the kernel has produced: every completion delivered.
+    cqes: u64,
+    /// Times this process blocked and was woken. The loop blocks in
+    /// `io_uring_enter`, so this is the nearest thing to an enter count
+    /// obtainable here — the syscall tracepoint needs a
+    /// `perf_event_paranoid` this box does not grant, and counting inside
+    /// libxev would be a fork change. It counts the enters that *slept*,
+    /// which is the half that matters: completions per wake is the loop's
+    /// batch depth, and batch depth is what separates "submission-bound"
+    /// from "already coalescing".
+    wakes: u64,
+    /// Whether the CQ has overflowed. Overflowed completions are parked in
+    /// a kernel list and delivered late, or dropped outright once that
+    /// fills — either way the §8 budget that sized the ring was wrong, and
+    /// nothing else in this harness would notice.
+    overflowed: bool,
+};
+
+/// Highest fd number scanned when looking for the ring. The fd is not
+/// assumed because it depends on how many files the process opened first,
+/// which is not this harness's business to know; the bound is what keeps
+/// the search finite.
+const ring_fd_scan_max: u8 = 64;
+
+/// The `u64` after `key:` in a `/proc` `key:<whitespace>value` table, or
+/// null when the key is absent or its value will not parse. Kernel-owned
+/// text, still parsed as untrusted: every caller's fallback for null is to
+/// report nothing rather than to report a zero.
+fn procField(content: []const u8, key: []const u8) ?u64 {
+    assert(key.len >= 1);
+    assert(content.len >= 1);
+    var lines = std.mem.tokenizeScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        if (line.len <= key.len or line[key.len] != ':') continue;
+        const value = std.mem.trim(u8, line[key.len + 1 ..], " \t");
+        return std.fmt.parseUnsigned(u64, value, 10) catch null;
+    }
+    return null;
+}
+
+/// Whether a `/proc` list section named by `header` has any entry under
+/// it. fdinfo prints list headers unconditionally and indents their
+/// entries, while the next section's key starts at column zero — so the
+/// first line after the header is the whole answer. Absent header, or a
+/// header at end of file, is "no entries": a list that is not there cannot
+/// be non-empty.
+fn procListHasEntry(content: []const u8, header: []const u8) bool {
+    assert(header.len >= 1);
+    const at = std.mem.indexOf(u8, content, header) orelse return false;
+    const rest = content[at + header.len ..];
+    const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse return false;
+    const next_line = rest[newline + 1 ..];
+    if (next_line.len == 0) return false;
+    return next_line[0] == ' ' or next_line[0] == '\t';
+}
+
+/// Sample the ring and scheduling counters for `pid`, or null if the ring
+/// fdinfo cannot be found or read — a harness that cannot measure must say
+/// so, not print zeroes that read as "no work happened".
+fn readRingSample(io: Io, pid: i32) ?RingSample {
+    var buffer: [4096]u8 = undefined;
+    var path_buffer: [64]u8 = undefined;
+    var fd: u8 = 0;
+    while (fd < ring_fd_scan_max) : (fd += 1) {
+        const path = std.fmt.bufPrint(
+            &path_buffer,
+            "/proc/{d}/fdinfo/{d}",
+            .{ pid, fd },
+        ) catch continue;
+        const content = readSmallFile(io, path, &buffer) orelse continue;
+        // `SqMask` is io_uring's own marker: no other fd type prints it.
+        if (std.mem.indexOf(u8, content, "SqMask:") == null) continue;
+        const sqes = procField(content, "SqTail") orelse return null;
+        const cqes = procField(content, "CqTail") orelse return null;
+        // The list header is always printed, so its presence proves
+        // nothing; what distinguishes an overflow is an *entry* under it.
+        // Entries are indented (`PollList` prints its own the same way)
+        // and the next section key is not, so the first following line
+        // decides it. Getting this backwards reads `NAPI:` as an overflow
+        // and cries wolf on every run.
+        const overflowed = procListHasEntry(content, "CqOverflowList:");
+        var status_buffer: [4096]u8 = undefined;
+        const status_path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/status", .{pid}) catch return null;
+        const status = readSmallFile(io, status_path, &status_buffer) orelse return null;
+        const wakes = procField(status, "voluntary_ctxt_switches") orelse return null;
+        return .{ .sqes = sqes, .cqes = cqes, .wakes = wakes, .overflowed = overflowed };
+    }
+    return null;
+}
+
+/// Report what the ring did across the measured window: ops and
+/// completions per request, and the batch depth that says whether the loop
+/// is submission-bound. Silent when either sample is missing — see
+/// `readRingSample`.
+fn printRingDelta(io: Io, pid: i32, before: ?RingSample, completed: u64) void {
+    const start = before orelse return;
+    const end = readRingSample(io, pid) orelse return;
+    if (completed == 0 or end.cqes < start.cqes or end.wakes < start.wakes) return;
+    const sqes = end.sqes -| start.sqes;
+    const cqes = end.cqes -| start.cqes;
+    const wakes = end.wakes -| start.wakes;
+    assert(completed >= 1);
+    const per_request = @as(f64, @floatFromInt(cqes)) / @as(f64, @floatFromInt(completed));
+    const batch = if (wakes >= 1)
+        @as(f64, @floatFromInt(cqes)) / @as(f64, @floatFromInt(wakes))
+    else
+        0;
+    std.debug.print(
+        "profile: ring  sqes {d} ({d:.2}/req)  cqes {d} ({d:.2}/req)  " ++
+            "wakes {d} ({d:.1} cqes/wake)  cq-overflow {s}\n",
+        .{
+            sqes,
+            @as(f64, @floatFromInt(sqes)) / @as(f64, @floatFromInt(completed)),
+            cqes,
+            per_request,
+            wakes,
+            batch,
+            if (end.overflowed) "YES" else "no",
+        },
+    );
 }
 
 /// The 1-minute load average, or null when `/proc/loadavg` is absent, will
