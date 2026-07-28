@@ -129,9 +129,10 @@ pub fn main(init: std.process.Init) !u8 {
         "profile: measuring {d}s at {d} req/s over {d} connections\n",
         .{ flags.duration_s, flags.rate, flags.connections },
     );
-    const ring_before = readRingSample(io, zoxy_pid);
+    const ring_scratch = try arena.alloc(u8, proc_scratch_bytes);
+    const ring_before = readRingSample(io, zoxy_pid, ring_scratch);
     const report = try loadTest(arena, io, &flags);
-    printRingDelta(io, zoxy_pid, &ring_before, report.snapshot.counters.completed);
+    printRingDelta(io, zoxy_pid, &ring_before, report.snapshot.counters.completed, ring_scratch);
     const perf_term = try perf_child.wait(io);
     if (perf_term != .exited or perf_term.exited != 0) {
         std.debug.print("profile: perf record exited abnormally ({any})\n", .{perf_term});
@@ -583,16 +584,28 @@ fn procField(content: []const u8, key: []const u8) ?u64 {
 ///
 /// A large internal buffer and a small destination: take one big bite,
 /// keep the head, which is where every counter this harness wants lives.
-fn readProcHead(io: Io, path: []const u8, out: []u8) ?[]const u8 {
+fn readProcHead(io: Io, path: []const u8, out: []u8, scratch: []u8) ?[]const u8 {
     assert(out.len > 0);
+    assert(scratch.len >= out.len);
     const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
-    var read_buffer: [64 * 1024]u8 = undefined;
-    var file_reader = file.reader(io, &read_buffer);
+    var file_reader = file.reader(io, scratch);
     const len = file_reader.interface.readSliceShort(out) catch return null;
     assert(len <= out.len);
     return out[0..len];
 }
+
+/// Scratch for `readProcHead`, sized from the worst case rather than
+/// guessed at — the previous two sizes were both round numbers and both
+/// too small.
+///
+/// io_uring's fdinfo renders a line per pending SQE and CQE, ~89 and ~34
+/// bytes, and `constants.in_flight_ops_max` is what bounds how many there
+/// can be: ~57k ops at the compiled ceiling, so ~5 MB of text at the
+/// worst moment. The kernel appears to want the whole record to fit
+/// rather than handing back a prefix, which is why a 64 KiB buffer still
+/// failed the busiest c10k rows while working on quieter ones.
+const proc_scratch_bytes: usize = 8 << 20;
 
 /// Whether a `/proc` list section named by `header` has any entry under
 /// it, or null when the text does not settle it. fdinfo prints list
@@ -619,7 +632,7 @@ fn procListHasEntry(content: []const u8, header: []const u8) ?bool {
 /// Sample the ring and scheduling counters for `pid`, or null if the ring
 /// fdinfo cannot be found or read — a harness that cannot measure must say
 /// so, not print zeroes that read as "no work happened".
-fn readRingSample(io: Io, pid: i32) ?RingSample {
+fn readRingSample(io: Io, pid: i32, scratch: []u8) ?RingSample {
     assert(pid > 0);
     // A bounded *head* read, deliberately. The counters this exists for
     // sit in the first few hundred bytes; what follows them is a line per
@@ -646,7 +659,7 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
             "/proc/{d}/fdinfo/{d}",
             .{ pid, fd },
         ) catch continue;
-        const content = readProcHead(io, path, &buffer) orelse continue;
+        const content = readProcHead(io, path, &buffer, scratch) orelse continue;
         readable += 1;
         // `SqMask` is io_uring's own marker: no other fd type prints it.
         if (std.mem.indexOf(u8, content, "SqMask:") == null) continue;
@@ -665,7 +678,7 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
         const overflowed = if (truncated) null else procListHasEntry(content, "CqOverflowList:");
         var status_buffer: [4096]u8 = undefined;
         const status_path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/status", .{pid}) catch return null;
-        const status = readProcHead(io, status_path, &status_buffer) orelse return null;
+        const status = readProcHead(io, status_path, &status_buffer, scratch) orelse return null;
         const wakes = procField(status, "voluntary_ctxt_switches") orelse return null;
         assert(cqes <= sqes); // A completion the loop never submitted is impossible.
         return .{ .sqes = sqes, .cqes = cqes, .wakes = wakes, .overflowed = overflowed };
@@ -685,10 +698,10 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
 /// completions per request, and the batch depth that says whether the loop
 /// is submission-bound. Silent when either sample is missing — see
 /// `readRingSample`.
-fn printRingDelta(io: Io, pid: i32, before: *const ?RingSample, completed: u64) void {
+fn printRingDelta(io: Io, pid: i32, before: *const ?RingSample, completed: u64, scratch: []u8) void {
     assert(pid > 0);
     const start = before.* orelse return;
-    const end = readRingSample(io, pid) orelse {
+    const end = readRingSample(io, pid, scratch) orelse {
         std.debug.print("profile: ring  unavailable (no sample at end of window)\n", .{});
         return;
     };
