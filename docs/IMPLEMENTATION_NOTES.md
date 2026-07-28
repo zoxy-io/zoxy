@@ -88,6 +88,49 @@ loop only blocks when its pipeline is empty and the next arrival is
 ~50 µs out, so the spin budget expires empty every time. Reverted; do
 not re-propose.
 
+## Hand-rolled short copy in the head render — rejected (2026-07-28)
+
+A pinned `zig build profile` at c10k (`--protocol http --connections
+10000 --rate 40000`) put 9.2% of on-CPU in `memcpy`. It splits two ways:
+~6.3% is libxev's `copy_cqes` (the shelved #40 verdict above — `cq_ready`,
+a single atomic load of `cq.tail`, moves in lockstep with it from 0.9% to
+4.3% across runs, which is the tell that both are paying for CQ-ring
+coherence traffic and not for copy work), and ~2.6% is
+`render.Staging.appendHeaderLine`/`append` re-serializing the head.
+
+The render half looked addressable: `@memcpy` lowers to a `callconv(.c)`
+call into compiler_rt `memcpyFast`, and most header *names* are under 16
+bytes, so the call barrier costs more than the handful of moves it
+performs. Replacing it with an inline length dispatch (overlapping
+fixed-width end copies below a limit, `@memcpy` above it) does exactly
+what it promises — the `memcpy` calls leave `appendEndToEndHeaders`, and
+`poop` on `bench/micro/l7_head_pipeline` measures **8.3–8.8% ± 0.5%
+faster**.
+
+It is still a regression, and the micro-bench is why it looked otherwise:
+its heads carry 3 request and 3 response headers whose values are all
+under 32 bytes, so every copy takes the inline arm. Re-run against a
+realistic head (11 request headers, 8 response: User-Agent 97 B, Cookie
+79 B, Authorization 64 B, X-Request-Id 36 B — 7 of 19 values over 32 B)
+and the same change is **3.4% ± 0.4% slower**, bands non-overlapping. A
+value past the limit pays the new dispatch *and* the call it was meant to
+avoid, and the long values cost more than the short names save. Widening
+the limit to 128 B (adding 32- and 64-byte arms) recovers only part of
+it — still **2.1% ± 0.5% slower**.
+
+At the proxy level it measures as nothing either way: an ABBA A/B, 6
+candidate and 5 baseline 20 s runs at 10k connections, gives 3149 ± 194
+cycles/request against 3193 ± 68 — overlapping bands. (One baseline run
+that never reached the offered rate, 29.5k vs 39.5k req/s, was dropped.)
+
+Two things to carry forward. First, `l7_head_pipeline`'s heads are
+small enough to flatter any change that keys off header length; size the
+heads to the question before trusting it. Second, this is #40's shape a
+second time — a `memcpy` symbol that can be made to disappear without the
+work disappearing. compiler_rt's own dispatch is already good; the call
+around it is not worth beating by hand. Do not re-propose without a
+workload whose header values are genuinely short.
+
 ## io_uring op upgrades — evaluated, deferred (2026-07-16)
 
 §4's "plain ops only" holds: on the loop profile above (latency-bound,
