@@ -51,6 +51,11 @@ const Flags = struct {
     zoxy_cpu: ?u16 = null,
     /// Which listener to drive: the L4 relay or the L7 reverse proxy.
     protocol: Protocol = .l4,
+    /// zoxy's §8 per-exchange deadline, in ms; 0 (the default) leaves it
+    /// disabled, which is also the shipped default. Non-zero puts the
+    /// deadline's arming path on every request, so this is the flag that
+    /// makes its cost measurable rather than argued about.
+    request_ms: u32 = 0,
     zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
 
     const Protocol = enum { l4, http };
@@ -96,7 +101,7 @@ pub fn main(init: std.process.Init) !u8 {
     var origin_child = try spawnNginx(arena, io, environ);
     defer origin_child.kill(io);
 
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, flags.connections);
+    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, flags.connections, flags.request_ms);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
     const zoxy_pid = zoxy_child.id orelse return error.NoZoxyPid;
@@ -157,6 +162,9 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--cpu")) {
             index += 1;
             flags.zoxy_cpu = try std.fmt.parseUnsigned(u16, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--request-ms")) {
+            index += 1;
+            flags.request_ms = try std.fmt.parseUnsigned(u32, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--protocol")) {
             index += 1;
             if (std.mem.eql(u8, args[index], "l4")) {
@@ -174,7 +182,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else {
             std.debug.print(
                 "usage: profile [zoxy-path] [--rate N] [--connections N] [--threads N] " ++
-                    "[--seconds N] [--freq N] [--cpu N] [--protocol l4|http]\n",
+                    "[--seconds N] [--freq N] [--cpu N] [--request-ms N] [--protocol l4|http]\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -251,7 +259,13 @@ fn spawnZoxy(
     io: Io,
     zoxy_path: []const u8,
     connections: u32,
+    request_ms: u32,
 ) !std.process.Child {
+    assert(connections >= 1);
+    // Rejected by the spawned zoxy's own config validation, but only after
+    // a spawn and ~2s of `awaitResponsive` retries that report the generic
+    // TargetUnresponsive — so catch it here, where the flag was set.
+    assert(request_ms <= constants.timeout_ms_max);
     // Both listeners always exist so the flag only picks which one zrk
     // drives; the idle one adds no load.
     const config_path = work_directory ++ "/zoxy.json";
@@ -262,7 +276,8 @@ fn spawnZoxy(
         \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
         \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
-        \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000 }},
+        \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000,
+        \\                   "request_ms": {d} }},
         \\    "limits": {{ "conn_slots": {d}, "upstream_slots": {d} }}
         \\}}
         \\
@@ -270,6 +285,7 @@ fn spawnZoxy(
         zoxy_l4_port,
         zoxy_http_port,
         origin_port,
+        request_ms,
         connSlotsFor(connections),
         connSlotsFor(connections),
     });
