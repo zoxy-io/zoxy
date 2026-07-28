@@ -27,9 +27,11 @@ the durable conclusions.
   would clean the bench bands — environmental work, not zoxy work.
 
 All three candidates this profile ranked have since been measured (ring
-flags: landed; multishot recv: parked; pre-block spin: rejected — all
-below). Remaining wins are environmental (nft bypass) or workload-level
-(`splice`/`send_zc` for large bodies — PLANS.md).
+flags: landed; multishot recv: parked 2026-07-12 and **closed**
+2026-07-28 once its named workload was measured and turned out not to be
+submission-bound; pre-block spin: rejected — all below). Remaining wins
+are environmental (nft bypass) or workload-level (`splice`/`send_zc` for
+large bodies — PLANS.md).
 
 ## Ring setup flags — landed 2026-07-12 (196ffbf)
 
@@ -68,7 +70,7 @@ re-audit is not spent on a non-win. Revisit only under genuine CPU
 saturation with large CQE batches, never loopback. Recorded so the
 profiler's headline symbol is not re-chased.
 
-## Multishot recv — measured and parked (2026-07-12)
+## Multishot recv — measured and parked (2026-07-12), closed (2026-07-28)
 
 Best-case echo microbench (pinned cores, ABBA, single-shot vs multishot
 recv): only ~2–4% CPU and 15–20% fewer enters — does not pay for the
@@ -77,9 +79,14 @@ SimIo emulation). The libxev `recv_ms` patch and the echo harness were
 erased with the perf write-ups; re-derive if ever needed: `recv_ms` op
 = `RECV_MULTISHOT` + `IOSQE_BUFFER_SELECT` over a std `BufferGroup`,
 `F_MORE` keeps the completion armed, `cqe_flags` carries the buffer id;
-harness = pinned-core echo, single-shot vs multishot, ABBA. Do not
-re-propose without a recv-submission-bound workload (many mostly-idle
-connections) — PLANS.md holds the standing verdict.
+harness = pinned-core echo, single-shot vs multishot, ABBA.
+
+That reopening condition — a recv-submission-bound workload, many
+mostly-idle connections — has since been met and answered: c10k is the
+workload, and it is not submission-bound ("The loop is not
+submission-bound", below, 2026-07-28). Do not re-propose without a
+workload whose *measured* `cqes/wake` approaches 1; the shape of the
+workload is not the evidence, the batch depth is.
 
 ## Pre-block spin — rejected (2026-07-12)
 
@@ -143,8 +150,9 @@ carries only the one-line revisit condition per op.
   costs a fork op plus a documented exception to XevIo's
   every-callback-disarms discipline. A Tier-0 churn A/B decides it, but
   only under a churn-heavy workload (`Connection: close` storms).
-- **Multishot recv / buffer rings** — its own verdict above ("measured
-  and parked"). The syscall win does not pay for the relay redesign it
+- **Multishot recv / buffer rings** — its own verdict above, parked here
+  and **closed 2026-07-28** once the workload it was waiting for was
+  measured. The syscall win does not pay for the relay redesign it
   demands; single-shot buffer-select would keep the strict §6 discipline
   but forfeits most of that win.
 - **`send_zc`** — rejected at the deliberate 4 KiB relay buffer. Below
@@ -622,11 +630,17 @@ throttled; the origin idled 3.2 of 4 cores. Worth recording for anyone
 reading cloud numbers: the 2-core proxy VM showed **32% steal**, charged
 straight against that quota.
 
-Open, and deliberately not designed for yet: past ~16k req/s the c10k
-run's per-request CPU climbs 25.7 → 34.7 µs while the 500-connection
-run's *falls* to 18.6 µs at 44.6k. Named hypothesis — partial writes to
-backed-up client sockets costing several sends per response — but it is
-a hypothesis, and this file's rule is that it stays one until measured.
+One line here read, until 2026-07-28: *"past ~16k req/s the c10k run's
+per-request CPU climbs 25.7 → 34.7 µs … named hypothesis, partial writes
+to backed-up client sockets."* Withdrawn. The hypothesis was that a request costs
+more *work* when the client backs up; on a quiet box a request costs a
+flat 4.0 ring ops from 64 connections to 10,000, with no send-side term
+that grows ("The loop is not submission-bound", below). The table above
+still stands as measured — per-request CPU does rise with offered rate at
+both connection counts — but it rises identically at 500 and at 10,000,
+which is the shape of a shared environmental cost, not of a
+concurrency-driven one. Partial writes were a guess at a layer the ring
+counters say is not moving.
 
 PLANS.md carries the standing question of whether the operator should
 pick the ceiling instead of inheriting ours — the machinery (`cqFillFits`,
@@ -675,6 +689,91 @@ nothing at all bounds an exchange that is merely slow.
 already existed, it was simply never armed by anything but a stalled
 dial. Opt-in, because how slow is too slow is a property of the
 operator's origin.
+
+## The loop is not submission-bound — multishot recv closed (2026-07-28)
+
+The 2026-07-12 verdict parked multishot recv "until a recv-submission-
+bound workload: many mostly-idle conns". c10k is that workload by shape,
+so the profiler was taught to read the ring — sqes, cqes, and wakes
+(voluntary context switches, the enters that *slept*) straight out of
+`/proc`. Fixed 40k offered throughout, so the only variable is how idle
+each connection is:
+
+| conns | req/s each | ops/req | cqes/wake | p50 |
+|---|---|---|---|---|
+| 64 | 625 | 4.00 | 5.3 | 77 µs |
+| 1000 | 40 | 4.01 | 8.1 | 208 µs |
+| 10000 | 4 | 4.07 | 8.7 | 137 µs |
+| 64 (drift) | 625 | 4.00 | 5.9 | 88 µs |
+
+Batch depth **rises** as connections idle, 5.3 → 8.7. Submission-bound is
+the opposite: an op per read, a wake per op, depth collapsing toward 1.
+At c10k the loop wakes ~18,600 times a second and drains ~8 completions
+each, so the enter is already amortised eight ways and multishot's saving
+— the per-read re-arm — has little left to take. The verdict stands, now
+on the workload it named rather than on an echo microbench.
+
+Two corrections it forced. First, a c10k profile shows ~29% of self-time
+in libxev's `Readable.read` callback, and that was read here as "what
+multishot attacks". It is not: multishot removes the *submission*, not
+the completion or its callback. The addressable slice sits in
+`IoUring.enter` and `Loop.add`, which is the ~2–4% the 2026-07-12 bench
+measured. Second, `cqes/wake` is **two-sided** and must never be read
+without the latency beside it — see the next section, where 504 per wake
+means the loop never caught up, not that it batched well.
+
+Ops per request is 4.0 flat across a 156× change in connection count:
+recv client head, send upstream head, recv response, send client
+response. That it equals `conn_ops_max` is a coincidence of a different
+quantity — the constant bounds ops *armed per slot* — but the §5 CQ
+budget's arithmetic now has a measurement standing next to it.
+
+## A short timer takes over the loop's wake schedule (2026-07-28)
+
+`timeouts.request_ms` arms a deadline per exchange (§8). Setting it below
+the *per-connection inter-request gap* is what makes that expensive, and
+the cost is not the expiry — measured at 10k connections, 40k offered,
+where the gap is 250 ms:
+
+| | ops/req | wakes | cqes/wake | req/s | p50 | CPU samples | sock err | expiries |
+|---|---|---|---|---|---|---|---|---|
+| `request_ms=0` | 4.07 | 371,617 | 8.7 | 39,075 | 137 µs | 59,139 | 0 | 0 |
+| `request_ms=500` | 4.0 | — | — | 39,530 | 41 µs | 60,893 | 0 | 0 |
+| `request_ms=200` | **6.51** | **6,289** | **504** | 23,240 | **490 ms** | **24,080** | 28,568 | **0** |
+
+(CPU samples are perf samples at 4 kHz over a 20 s window, so they are
+CPU-seconds × 4000 — comparable across rows, and the 59% fall is theirs.)
+
+Zero expiries in every row, including the one that collapses, so whatever
+this costs it is not the expiry path.
+
+Measured: ops per request goes 4.07 → 6.51, **+2.44 ring ops**; sleeps go
+371,617 → 6,289; each remaining sleep drains 504 completions instead of
+8.7. Throughput falls 40% and CPU falls 59% — *less* CPU for *worse*
+service, which is the signature of a loop that stopped sleeping rather
+than one doing more work.
+
+Inferred, and consistent with all of it but not directly observed: the
+extra ops are a timer armed per request that fires *between* requests,
+finds the keep-alive turnaround has already stored the 60 s idle
+deadline, and re-arms — arm, cancel, pointless fire, which is about the
+2.44 seen. Nothing in these counters watches an individual timer, so this
+is the account that fits, not a sighting.
+
+Also inferred, from one measured (gap, threshold) pair: that the rule is
+about timers generally rather than this timeout — any deadline shorter
+than the loop's own wake cadence taking over its wake schedule, with
+`idle_ms` exempt only because 60 s is far longer than anything else in
+flight. What is measured is that 500 ms is free and 200 ms is not, at a
+250 ms gap. A deployment wanting `request_ms` should keep it above the
+per-connection inter-request gap it expects; the c10k benchmark's 200 ms
+was below it, which is why those runs degraded.
+
+Not measured, and the honest gap: *why* the extra ops tip the loop rather
+than merely costing more. That is a question about libxev's submit/wait
+policy, and answering it needs an enter count, which needs either a
+syscall tracepoint (a `perf_event_paranoid` the dev box does not grant)
+or a fork change.
 
 ## libxev error surfacing is lossy — resolved by the fork (2026-07-27)
 

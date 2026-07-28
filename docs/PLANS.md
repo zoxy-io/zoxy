@@ -358,7 +358,7 @@ standing revisit conditions, so the verdicts are not re-litigated:
 | op | verdict | revisit when |
 |---|---|---|
 | multishot accept | parked (unmeasured) | connection-churn workload (`Connection: close` storms) |
-| multishot recv + buffer rings | measured, parked (2026-07-12) | recv-submission-bound workload: many mostly-idle conns |
+| multishot recv + buffer rings | **closed** (2026-07-28) — the named workload arrived and is not submission-bound | a workload whose measured `cqes/wake` approaches 1 |
 | `send_zc` | rejected at 4 KiB buffers | large-body workload with ≥16 KiB sends |
 | `splice` | deferred (the last open c10k lever) | genuine CPU/memory-bandwidth saturation |
 
@@ -545,6 +545,7 @@ this way. Known queue, in rough value order:
    mid-write, miscounted because zoxy's own send adapter left
    `BrokenPipe` unnamed.
 2. `IORING_OP_SPLICE` (the op union is closed today).
+<<<<<<< HEAD
 3. Name the two peer-gone errnos still funneled to `error.Unexpected`
    (#106, the bug-5 shape): ENETUNREACH on connect (a routing failure,
    counted today as §8 dial pressure with only the errno gauge to say
@@ -561,15 +562,19 @@ this way. Known queue, in rough value order:
    Unexpected there (proven by the linger-RST contract test's first
    macos-latest run), so every dev-box data-op failure reads as §8
    pressure until the fork names them too.
-4. Multishot accept/recv ops — only behind the workloads in the verdict
-   table above. **The recv precondition is now met**: a 10k-connection
-   run holds ~20k req/s at 0.8–0.9 of a 1-CPU quota with ~87% of it
-   kernel time and the first non-zero CFS throttling, which is the
-   "recv-submission-bound workload (many mostly-idle connections)" the
-   parked verdict names. The 2–4% figure that parked it was measured on
-   a best-case echo microbench, never against this. Measure before
-   designing — two optimization priors were refuted by measurement the
-   same day (see IMPLEMENTATION_NOTES.md).
+4. Multishot **accept** — only behind the workload in the verdict table
+   above (a `Connection: close` storm), still unmeasured. Multishot
+   **recv is closed**, not pending: its precondition looked met on
+   2026-07-27 (a 10k-connection run at ~20k req/s, ~87% kernel time),
+   and measuring it on 2026-07-28 showed the workload is not
+   submission-bound — batch depth never approaches 1 anywhere measured,
+   the lowest of ~15 rows being 2.9 and most near 4. See
+   IMPLEMENTATION_NOTES.md, "The loop is not submission-bound", which
+   also records what did *not* hold up: a first reading claimed batch
+   depth rises with connection count, and a bracketed re-run showed the
+   number tracks box load instead. Reopen only on a measured
+   `cqes/wake` approaching 1; workload shape was what made this look
+   open twice, and it is not the evidence.
 
 ## Deferred, revisit on evidence
 
