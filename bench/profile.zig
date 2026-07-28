@@ -51,6 +51,19 @@ const Flags = struct {
     zoxy_cpu: ?u16 = null,
     /// Which listener to drive: the L4 relay or the L7 reverse proxy.
     protocol: Protocol = .l4,
+    /// zoxy's §8 per-exchange deadline, in ms; 0 (the default) leaves it
+    /// disabled, which is also the shipped default. Non-zero puts the
+    /// deadline's arming path on every request, so this is the flag that
+    /// makes its cost measurable rather than argued about.
+    request_ms: u32 = 0,
+    /// Highest 1-minute load average the box may already carry when the
+    /// measured window opens; 0 disables the gate. Half a core of ambient
+    /// work is the most that leaves the pinned core and the six load
+    /// threads to themselves on a machine this harness assumes it owns.
+    quiesce_load: f64 = 0.5,
+    /// How long to wait for the box to reach `quiesce_load` before giving
+    /// up and refusing the run.
+    quiesce_timeout_s: u64 = 180,
     zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
 
     const Protocol = enum { l4, http };
@@ -88,15 +101,13 @@ pub fn main(init: std.process.Init) !u8 {
     // `dedicate` yields null.
     const zoxy_cpu = affinity.dedicate(io, flags.zoxy_cpu).?;
 
-    // Both ways this run can record nothing, settled before the load
-    // window rather than after it (see the two helpers).
-    if (!ptraceScopeAllowsAttach(io)) return refuseNoPtraceAttach();
-    const cycles_event = cyclesEventFor(io, zoxy_cpu);
+    const cycles_event = try preflight(io, &flags, zoxy_cpu) orelse
+        return refuseNoPtraceAttach();
 
     var origin_child = try spawnNginx(arena, io, environ);
     defer origin_child.kill(io);
 
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, flags.connections);
+    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, flags.connections, flags.request_ms);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
     const zoxy_pid = zoxy_child.id orelse return error.NoZoxyPid;
@@ -157,6 +168,21 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--cpu")) {
             index += 1;
             flags.zoxy_cpu = try std.fmt.parseUnsigned(u16, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--quiesce-load")) {
+            index += 1;
+            flags.quiesce_load = try std.fmt.parseFloat(f64, args[index]);
+            // A gate is only worth having if a typo cannot switch it off
+            // while still looking switched on: negative and NaN would trip
+            // an assert deep in the wait, and `inf` is worse — it passes
+            // every check and prints "box quiet" for any load at all. 0 is
+            // the one documented way to disable it.
+            if (!(flags.quiesce_load >= 0) or !std.math.isFinite(flags.quiesce_load)) {
+                std.debug.print("profile: --quiesce-load must be finite and >= 0 (0 disables)\n", .{});
+                return error.InvalidArguments;
+            }
+        } else if (std.mem.eql(u8, arg, "--request-ms")) {
+            index += 1;
+            flags.request_ms = try std.fmt.parseUnsigned(u32, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--protocol")) {
             index += 1;
             if (std.mem.eql(u8, args[index], "l4")) {
@@ -174,7 +200,8 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else {
             std.debug.print(
                 "usage: profile [zoxy-path] [--rate N] [--connections N] [--threads N] " ++
-                    "[--seconds N] [--freq N] [--cpu N] [--protocol l4|http]\n",
+                    "[--seconds N] [--freq N] [--cpu N] [--quiesce-load F] [--request-ms N] " ++
+                    "[--protocol l4|http]\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -251,7 +278,13 @@ fn spawnZoxy(
     io: Io,
     zoxy_path: []const u8,
     connections: u32,
+    request_ms: u32,
 ) !std.process.Child {
+    assert(connections >= 1);
+    // Rejected by the spawned zoxy's own config validation, but only after
+    // a spawn and ~2s of `awaitResponsive` retries that report the generic
+    // TargetUnresponsive — so catch it here, where the flag was set.
+    assert(request_ms <= constants.timeout_ms_max);
     // Both listeners always exist so the flag only picks which one zrk
     // drives; the idle one adds no load.
     const config_path = work_directory ++ "/zoxy.json";
@@ -262,7 +295,8 @@ fn spawnZoxy(
         \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
         \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
-        \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000 }},
+        \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000,
+        \\                   "request_ms": {d} }},
         \\    "limits": {{ "conn_slots": {d}, "upstream_slots": {d} }}
         \\}}
         \\
@@ -270,6 +304,7 @@ fn spawnZoxy(
         zoxy_l4_port,
         zoxy_http_port,
         origin_port,
+        request_ms,
         connSlotsFor(connections),
         connSlotsFor(connections),
     });
@@ -437,6 +472,96 @@ fn benchConfig(port: u16, rate: u64, connections: u32, threads: u8) zrk.cli.Conf
         .interval_ns = std.time.ns_per_s,
         .plain = true,
     };
+}
+
+/// Everything that must hold before a measured window opens, settled here
+/// rather than discovered after: the two ways this harness can record
+/// nothing at all (perf cannot attach, no PMU cycles event) and the one way
+/// it can record the wrong thing (a busy box). Null means perf cannot
+/// attach and the caller prints the fix; `error.BoxBusy` means the box
+/// never went quiet.
+fn preflight(io: Io, flags: *const Flags, zoxy_cpu: u16) !?[]const u8 {
+    assert(flags.quiesce_load >= 0);
+    if (!ptraceScopeAllowsAttach(io)) return null;
+    const cycles_event = cyclesEventFor(io, zoxy_cpu);
+    assert(cycles_event.len >= 1);
+    // Before anything is spawned, so the wait is not itself adding load.
+    try awaitQuietBox(io, flags);
+    return cycles_event;
+}
+
+/// The 1-minute load average, or null when `/proc/loadavg` is absent, will
+/// not parse, or parses to something a load average cannot be — callers
+/// treat all three as "cannot tell", never as zero. Negative and NaN are
+/// rejected rather than asserted for the same reason `cpuListContains`
+/// skips a malformed range: this is kernel-owned text, but it is still
+/// parsed as untrusted, and refusing to answer can only narrow the gate,
+/// never widen it.
+fn readLoadAverage(io: Io) ?f64 {
+    var buffer: [64]u8 = undefined;
+    const content = readSmallFile(io, "/proc/loadavg", &buffer) orelse return null;
+    var fields = std.mem.tokenizeScalar(u8, content, ' ');
+    const first = fields.next() orelse return null;
+    assert(first.len >= 1);
+    const load = std.fmt.parseFloat(f64, first) catch return null;
+    if (!(load >= 0)) return null; // Also catches NaN, which no comparison holds for.
+    return load;
+}
+
+/// Hold the run until the box is quiet (§9).
+///
+/// A Tier-0 number means something only because perf samples are CPU time
+/// on a core this harness pinned — and a core it did not actually get is
+/// measuring contention, not the proxy. That failure is silent: the run
+/// completes, prints a smaller number, and looks exactly like a real
+/// result. So gate on it rather than trusting the operator to notice, and
+/// print the load either way so the report carries the evidence.
+///
+/// Waiting rather than refusing outright, because both causes are things
+/// that end on their own: a concurrent benchmark or a parallel agent
+/// session that will finish, and this harness's own previous row, whose
+/// load the 1-minute average keeps decaying for two to three minutes after
+/// it exits. Refusing immediately would fail a back-to-back sweep on every
+/// row and pass it on none; the 180s default is sized to that decay, not
+/// to the nominal one-minute window.
+fn awaitQuietBox(io: Io, flags: *const Flags) !void {
+    if (flags.quiesce_load == 0) return;
+    assert(flags.quiesce_load > 0);
+    assert(flags.quiesce_timeout_s >= 1);
+    const poll_s: u64 = 2;
+    const poll = Io.Duration.fromNanoseconds(poll_s * std.time.ns_per_s);
+    const attempts_max: u64 = @max(@divFloor(flags.quiesce_timeout_s, poll_s), 1);
+    var attempt: u64 = 0;
+    var observed: f64 = 0;
+    while (attempt < attempts_max) : (attempt += 1) {
+        // No procfs is not evidence of a busy box; a gate that cannot read
+        // its input must not invent a verdict. It prints nothing either,
+        // so a report from such a box is silent about load rather than
+        // claiming a clean one.
+        observed = readLoadAverage(io) orelse return;
+        if (observed <= flags.quiesce_load) {
+            assert(observed >= 0);
+            std.debug.print("profile: box quiet, load {d:.2}\n", .{observed});
+            return;
+        }
+        if (attempt == 0) {
+            std.debug.print(
+                "profile: waiting up to {d}s for the box to go quiet (load {d:.2} > {d:.2})\n",
+                .{ flags.quiesce_timeout_s, observed, flags.quiesce_load },
+            );
+        }
+        // The only error is cancellation; a cut-short sleep just means the
+        // next poll happens sooner, which the loop bound already covers.
+        io.sleep(poll, .awake) catch {};
+    }
+    assert(observed > flags.quiesce_load);
+    std.debug.print(
+        "profile: box still busy after {d}s (load {d:.2} > {d:.2}). A measurement " ++
+            "here records contention, not the proxy — wait, or pass --quiesce-load 0 " ++
+            "to measure anyway.\n",
+        .{ flags.quiesce_timeout_s, observed, flags.quiesce_load },
+    );
+    return error.BoxBusy;
 }
 
 fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void {
