@@ -57,18 +57,29 @@
             .url = "git+https://github.com/zoxy-io/libxev#b3d6b55bfbea1de0401d11f69ad9755fed9a6144",
             .hash = "libxev-0.0.0-86vtc6cnFACJYqPSG_os9Ea-nUgWmjAqi3CwCQGiFj2z",
         },
+        // Load generator, §9 Tier 0/1 only — never linked into the proxy
+        // (no `src/` file imports it), so a bump moves what the benchmark
+        // measures *with*, not what it measures. Held at the same version
+        // the cloud benchmark runs, so a local band and a fleet number
+        // come off the same generator; runs on mismatched versions are not
+        // comparable, which is a trap this pin exists to close.
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk#f05cc6a2e7657409767c3cf63c68fcd54d2621e3",
-            .hash = "zrk-1.1.1-WqdFOyINBACoGOEBa8pY7REiDy4i88WibHjSDDvnQezq",
+            .url = "git+https://github.com/zoxy-io/zrk#3940a4570c02ff70094c46d1507ecebadf3e6404",
+            .hash = "zrk-1.3.1-WqdFOzSEBABi11K0XkWd67ny1dp-nYFBXRtIOLqLBiB7",
         },
-        // zrk 1.1.1 embeds its load off a zio (io_uring) runtime, not the
-        // default std.Io.Threaded backend — plain Threaded is missing
-        // pieces zrk now calls (e.g. connect-with-timeout is still a TODO
-        // stub there). Same pin zrk's own build.zig.zon carries; the bench
-        // harness constructs its own zio.Runtime to match (see bench/run.zig).
+        // zrk embeds its load off a zio (io_uring) runtime, not the default
+        // std.Io.Threaded backend — plain Threaded is missing pieces zrk
+        // calls (e.g. connect-with-timeout is still a TODO stub there). The
+        // bench harness constructs its own zio.Runtime to match (see
+        // bench/run.zig), so this pin must stay *exactly* the one zrk's own
+        // build.zig.zon carries: two zio copies would be two runtimes, and
+        // zrk's runner would be handed an `Io` from the wrong one.
+        // zoxy-io/zio is our fork of lalinsky/zio; its main is at the same
+        // commit zrk 1.3.1 pins upstream, which is what makes this
+        // substitution a no-op today rather than a divergence to audit.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#a8a88c0e85ba87525ec9555aa409544873443142",
-            .hash = "zio-0.16.0-xHbVVGNDIwDYoZmY7GkL3RMCKuyc4JjK2hv_4TOBx8x2",
+            .url = "git+https://github.com/zoxy-io/zio#3566a3a8ca706e90de0ef1e1c46226ec4464f659",
+            .hash = "zio-0.16.0-xHbVVDxFJADhW5CgWRdQmPa8bg_YrOAiPFHTKGFq8jwk",
         },
         // Audited fork: zoxy-io/hparse main at the DESIGN.md §7
         // hardening-gate merge (PR #3: CRLF-only line terminators +

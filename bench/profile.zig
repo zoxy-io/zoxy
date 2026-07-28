@@ -174,7 +174,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else {
             std.debug.print(
                 "usage: profile [zoxy-path] [--rate N] [--connections N] [--threads N] " ++
-                    "[--seconds N] [--freq N] [--cpu N]\n",
+                    "[--seconds N] [--freq N] [--cpu N] [--protocol l4|http]\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -230,6 +230,13 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
 /// Both bounds come from `constants`, not from literals here: a ceiling
 /// that later moves has to move this with it, and a raised one would
 /// otherwise cap a run below the maximum it was aimed at without saying so.
+/// Effective pool size for a run of `connections` clients — used for both
+/// pools, because they are pinned to each other at the ceiling and for the
+/// same reason at the effective size: on the L7 path a busy client
+/// connection holds an upstream slot, so leaving `upstream_slots` at its
+/// lean default would profile the §8 shed path instead of the proxy. That
+/// is not hypothetical — it is what a cloud c10k run measured before the
+/// ceilings were pinned (IMPLEMENTATION_NOTES.md).
 fn connSlotsFor(connections: u32) u32 {
     assert(connections >= 1);
     const wanted = @as(u64, connections) + connections / 8 + 64;
@@ -256,10 +263,16 @@ fn spawnZoxy(
         \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
         \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000 }},
-        \\    "limits": {{ "conn_slots": {d} }}
+        \\    "limits": {{ "conn_slots": {d}, "upstream_slots": {d} }}
         \\}}
         \\
-    , .{ zoxy_l4_port, zoxy_http_port, origin_port, connSlotsFor(connections) });
+    , .{
+        zoxy_l4_port,
+        zoxy_http_port,
+        origin_port,
+        connSlotsFor(connections),
+        connSlotsFor(connections),
+    });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     return std.process.spawn(io, .{
@@ -436,7 +449,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
         // not inherit the run's connection count or thread pool.
         var config = benchConfig(flags.zoxyPort(), 20_000, 16, 1);
         config.duration_ns = std.time.ns_per_s / 2;
-        const report = zrk.runner.run(arena, io, &config, 0, null, null) catch {
+        const report = zrk.runner.run(arena, io, &config, 0, null, null, null) catch {
             if (attempt == attempts_max - 1) return error.TargetUnresponsive;
             io.sleep(retry_sleep, .awake) catch {};
             continue;
@@ -450,7 +463,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void 
 fn loadTest(arena: std.mem.Allocator, io: Io, flags: *const Flags) !zrk.runner.Report {
     var config = benchConfig(flags.zoxyPort(), flags.rate, flags.connections, flags.threads);
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
-    return zrk.runner.run(arena, io, &config, 0, null, null);
+    return zrk.runner.run(arena, io, &config, 0, null, null, null);
 }
 
 fn printReport(report: *const zrk.runner.Report) void {
