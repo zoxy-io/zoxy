@@ -198,12 +198,15 @@ pub const ring_entries: u16 = 4096;
 /// Two peaks tie: a teardown racing its own upstream dial holds
 /// {connect, deadline, connect_cancel, deadline_cancel}, and a relay
 /// teardown holds {both data ops, deadline, deadline_cancel}. Closes
-/// never join either set — `continueTeardown` submits them only once
-/// every other op has drained (serialize cancel-then-close), which is
-/// what cut this budget from five: before that, a dial completing
-/// against its own cancel co-armed the closes with the deadline and
-/// both cancels. `Conn.arm` asserts the budget on every arm, and the
-/// drain-vs-dial sim test pins seeds that reach exactly four (§8, §9).
+/// never join either set — they are not ring ops at all:
+/// `continueTeardown` closes synchronously once every armed op has
+/// drained, nothing referencing the fds by then. Serializing them
+/// behind the drain is what cut this budget from five (a dial
+/// completing against its own cancel used to co-arm the closes with
+/// the deadline and both cancels); making them synchronous then
+/// removed their two completions outright. `Conn.arm` asserts the
+/// budget on every arm, and the drain-vs-dial sim test pins seeds
+/// that reach exactly four (§8, §9).
 pub const conn_ops_max: u32 = 4;
 
 /// Completions drained per loop tick before control returns to the kernel;

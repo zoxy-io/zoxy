@@ -448,9 +448,10 @@ Rules:
   embedded in the slot, and the slot header tracks which are armed.
   Teardown is a *state*, not an event: shutdown both fds — a pending recv
   never completes otherwise — cancel the timer (§4 — teardown and the §8
-  dial re-base are the only cancels), then wait — the
-  last terminal completion (success, error, or cancellation) releases
-  the slot. An active completion is never resubmitted (libxev's
+  dial re-base are the only cancels), then wait — the last terminal
+  completion (success, error, or cancellation) empties the armed set,
+  closes both fds synchronously (no op references them any more, so the
+  closes need no ring completions of their own), and releases the slot. An active completion is never resubmitted (libxev's
   intrusive queues corrupt on re-enqueue) — overlapping ops on the same
   connection get their own completions instead of sharing one — and LIFO
   reuse turns a straggler completion landing in a recycled slot into
