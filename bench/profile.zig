@@ -56,14 +56,17 @@ const Flags = struct {
     /// deadline's arming path on every request, so this is the flag that
     /// makes its cost measurable rather than argued about.
     request_ms: u32 = 0,
-    /// Highest 1-minute load average the box may already carry when the
-    /// measured window opens; 0 disables the gate. Half a core of ambient
-    /// work is the most that leaves the pinned core and the six load
-    /// threads to themselves on a machine this harness assumes it owns.
-    quiesce_load: f64 = 0.5,
-    /// How long to wait for the box to reach `quiesce_load` before giving
-    /// up and refusing the run.
-    quiesce_timeout_s: u64 = 180,
+    /// Optional hard ceiling on the settled load: refuse the run if the
+    /// box flattens above it. 0 (the default) asks only that the load has
+    /// stopped falling, and reports where — see `awaitQuietBox` for why
+    /// no absolute default is defensible.
+    quiesce_load: f64 = 0,
+    /// How long to wait for the load to flatten before measuring anyway
+    /// and saying so. Sized against the decay it exists to wait out: a
+    /// row drives ~7 cores, and a ~60s EWMA needs ~160s to fall from
+    /// there to a low floor, so this leaves real margin rather than the
+    /// 22 seconds the first version left.
+    quiesce_timeout_s: u64 = 300,
     zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
 
     const Protocol = enum { l4, http };
@@ -540,6 +543,16 @@ const RingSample = struct {
 /// the search finite.
 const ring_fd_scan_max: u8 = 64;
 
+/// The load average counts as "still falling" while each poll is below
+/// the previous one by more than this factor. A ~60s EWMA sampled every
+/// 2s decays by `exp(-2/60)` = 0.967 per poll while it is genuinely
+/// decaying, so anything above 0.99 is flat rather than falling — the gap
+/// between the two is what keeps noise from reading as decay.
+const settle_decay_ratio: f64 = 0.99;
+/// Consecutive flat polls before the box counts as settled. Two, so a
+/// single noisy sample cannot end the wait on its own.
+const settle_polls: u32 = 2;
+
 /// The `u64` after `key:` in a `/proc` `key:<whitespace>value` table, or
 /// null when the key is absent or its value will not parse. Kernel-owned
 /// text, still parsed as untrusted: every caller's fallback for null is to
@@ -696,51 +709,69 @@ fn readLoadAverage(io: Io) ?f64 {
 /// result. So gate on it rather than trusting the operator to notice, and
 /// print the load either way so the report carries the evidence.
 ///
-/// Waiting rather than refusing outright, because both causes are things
-/// that end on their own: a concurrent benchmark or a parallel agent
-/// session that will finish, and this harness's own previous row, whose
-/// load the 1-minute average keeps decaying for two to three minutes after
-/// it exits. Refusing immediately would fail a back-to-back sweep on every
-/// row and pass it on none; the 180s default is sized to that decay, not
-/// to the nominal one-minute window.
+/// There is deliberately **no absolute threshold**. A fixed number cannot
+/// tell a busy neighbour from an ordinary desktop: 0.5 is unreachable on
+/// a box whose idle floor is 1.5, and trivially passed on one idle at 0.1
+/// while a neighbour is spinning up. What is universal is the *shape* —
+/// the 1-minute average is a ~60s EWMA, so after this harness's own
+/// previous row (which drives about seven cores) it falls steeply and
+/// then flattens at whatever this box's floor happens to be. Wait for the
+/// flattening, report the floor it settled at, and let a row taken beside
+/// a neighbour carry that evidence rather than hide it.
+///
+/// The first version got this wrong in a way worth recording. It waited
+/// for load <= 0.5 with a 180s timeout, and decaying from ~7 to 0.5 takes
+/// `60 * ln(14)` = 158s on a *perfectly* idle box. Twenty-two seconds of
+/// margin, so back-to-back rows failed on any ambient load at all — which
+/// read as neighbour contention and was mostly self-inflicted.
+///
+/// `--quiesce-load` still imposes a hard ceiling for anyone who wants
+/// one, but defaults off: the settled value is reported either way, and a
+/// number in the report beats a refusal whose cause has to be guessed.
 fn awaitQuietBox(io: Io, flags: *const Flags) !void {
-    if (flags.quiesce_load == 0) return;
-    assert(flags.quiesce_load > 0);
     assert(flags.quiesce_timeout_s >= 1);
+    assert(flags.quiesce_load >= 0);
     const poll_s: u64 = 2;
     const poll = Io.Duration.fromNanoseconds(poll_s * std.time.ns_per_s);
     const attempts_max: u64 = @max(@divFloor(flags.quiesce_timeout_s, poll_s), 1);
     var attempt: u64 = 0;
-    var observed: f64 = 0;
+    var previous: f64 = 0;
+    var flat_polls: u32 = 0;
     while (attempt < attempts_max) : (attempt += 1) {
         // No procfs is not evidence of a busy box; a gate that cannot read
         // its input must not invent a verdict. It prints nothing either,
         // so a report from such a box is silent about load rather than
         // claiming a clean one.
-        observed = readLoadAverage(io) orelse return;
-        if (observed <= flags.quiesce_load) {
-            assert(observed >= 0);
-            std.debug.print("profile: box quiet, load {d:.2}\n", .{observed});
-            return;
-        }
-        if (attempt == 0) {
+        const observed = readLoadAverage(io) orelse return;
+        assert(observed >= 0);
+        // Falling by less than the decay would predict — or rising, which
+        // means a neighbour just started and waiting only wastes time.
+        const flattened = attempt >= 1 and observed > previous * settle_decay_ratio;
+        flat_polls = if (flattened) flat_polls + 1 else 0;
+        previous = observed;
+        if (flat_polls >= settle_polls) {
+            if (flags.quiesce_load > 0 and observed > flags.quiesce_load) {
+                std.debug.print(
+                    "profile: box settled at load {d:.2}, over the {d:.2} ceiling asked for\n",
+                    .{ observed, flags.quiesce_load },
+                );
+                return error.BoxBusy;
+            }
             std.debug.print(
-                "profile: waiting up to {d}s for the box to go quiet (load {d:.2} > {d:.2})\n",
-                .{ flags.quiesce_timeout_s, observed, flags.quiesce_load },
+                "profile: box settled at load {d:.2} after {d}s\n",
+                .{ observed, attempt * poll_s },
             );
+            return;
         }
         // The only error is cancellation; a cut-short sleep just means the
         // next poll happens sooner, which the loop bound already covers.
         io.sleep(poll, .awake) catch {};
     }
-    assert(observed > flags.quiesce_load);
     std.debug.print(
-        "profile: box still busy after {d}s (load {d:.2} > {d:.2}). A measurement " ++
-            "here records contention, not the proxy — wait, or pass --quiesce-load 0 " ++
-            "to measure anyway.\n",
-        .{ flags.quiesce_timeout_s, observed, flags.quiesce_load },
+        "profile: load never settled in {d}s (last {d:.2}); measuring anyway, " ++
+            "treat this row as suspect\n",
+        .{ flags.quiesce_timeout_s, previous },
     );
-    return error.BoxBusy;
 }
 
 fn awaitResponsive(arena: std.mem.Allocator, io: Io, flags: *const Flags) !void {
