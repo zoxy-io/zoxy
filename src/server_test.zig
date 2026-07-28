@@ -505,6 +505,42 @@ test "server: kernel-pressure accept failure backs off and recovers" {
     try bed.expectDrained();
 }
 
+test "server: kernel-pressure on the upstream dial is witnessed and the conn torn down" {
+    // The dial-Unexpected path had no simulation coverage before this:
+    // the adversary could refuse or black-hole a dial but never fail it
+    // the way a kernel out of sockets or ephemeral ports does, so the §8
+    // witness on the connect op was unreachable under every seed
+    // (issue #106, kind B).
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 53 } });
+    defer bed.tearDown();
+
+    // EADDRNOTAVAIL is the dial's own exhaustion shape: ephemeral ports.
+    // Pins the proxy→origin dial only; the client's connect stays live.
+    bed.sim_io.setPressureCause(.address_unavailable);
+    bed.sim_io.injectConnectError(TestBed.originAddress());
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_errors"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_connect"));
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("kernel_pressure_address_unavailable"),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_accept"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    // At this seed the dial fate delivers before any token byte reaches
+    // the proxy-side inbox, so the teardown's close FINs; a schedule
+    // that lands a byte first would RST instead (unread inbox). Either
+    // way the client ends — the §8 witness above is the invariant here,
+    // the wire shape is the seed's.
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+    try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
+    try bed.expectDrained();
+}
+
 test "drain: terminate signal stops accepting and reaps stragglers at the drain deadline" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 41 }, .idle_timeout_ms = 60_000 });

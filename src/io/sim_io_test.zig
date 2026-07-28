@@ -175,6 +175,60 @@ const ConnectProbe = struct {
     }
 };
 
+test "sim: an injected connect error fails one dial with Unexpected and records its cause" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 17 });
+
+    // A live listener proves the fault wins over an otherwise-successful
+    // connect — and, below, that it is one-shot: the retry goes through.
+    const listener = try sim_io.listen(testAddress());
+    sim_io.setPressureCause(.address_unavailable);
+    sim_io.injectConnectError(testAddress());
+
+    var probe: ConnectPressureProbe = .{ .io = &sim_io };
+    sim_io.connect(
+        testAddress(),
+        &probe.completion,
+        ConnectPressureProbe,
+        &probe,
+        ConnectPressureProbe.onConnect,
+    );
+    try sim_io.run();
+    try std.testing.expectError(error.Unexpected, probe.result.?);
+    try std.testing.expectEqual(Io.Pressure.Cause.address_unavailable, probe.pressure.?.cause);
+
+    var retry: ConnectProbe = .{};
+    sim_io.connect(testAddress(), &retry.completion, ConnectProbe, &retry, ConnectProbe.onConnect);
+    try sim_io.run();
+    const socket = try retry.result.?;
+    sim_io.closeNow(socket);
+    // The accepted-side socket still sits in the backlog; closing the
+    // listener reaps it, so the leak check stays exact.
+    sim_io.listenClose(listener);
+    try std.testing.expect(sim_io.sockets.isFullyReleased());
+}
+
+const ConnectPressureProbe = struct {
+    io: *SimIo,
+    result: ?(Io.ConnectError!SimIo.Socket) = null,
+    /// Captured inside the callback — the only place `lastPressure`
+    /// describes the failure being delivered.
+    pressure: ?Io.Pressure = null,
+    completion: SimIo.Completion = .{},
+
+    fn onConnect(probe: *ConnectPressureProbe, result: Io.ConnectError!SimIo.Socket) void {
+        assert(probe.result == null);
+        probe.result = result;
+        if (result) |_| {} else |err| {
+            if (err == error.Unexpected) {
+                probe.pressure = probe.io.lastPressure();
+            }
+        }
+    }
+};
+
 test "sim: timers fire in virtual-time order; cancel completes both sides" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

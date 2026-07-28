@@ -715,6 +715,64 @@ the orderly failures (EOF, RST) are peeled off first. SimIo grew a
 one-shot `kernel_pressure` fault and a `kernel_pressure_percent`
 adversary knob to exercise the rung.
 
+## Reached is not covered — the `@panic` probe (2026-07-28, #106)
+
+Five defects cleared 64 green sim seeds in one day (#106). One of them
+sat on a path the seeds *executed*: the `write_shutdown` EPIPE branch
+ran under several tests and seed 0, but the caller returned on
+`isTearingDown()` before anything read the error — so its value was
+unobservable, and a wrong value was green. Seed counts measure
+scheduling coverage; they say nothing about whether an outcome is
+asserted. kcov (`zig build coverage`) has the same blind spot: it
+colors the line green because the line ran.
+
+The thirty-second answer, now standard practice: **replace the outcome
+with `@panic("probe")` and run the gate.** If `zig build ci` stays
+green, the path is reached-but-unobserved — every test that "covers" it
+would also pass with the behavior destroyed, and the fix is an oracle
+(assert the outcome somewhere), not another seed. If the gate trips,
+the panic's seed list is documentation of exactly which scenarios pin
+that path. Probe before trusting, especially: error-mapping arms, catch
+branches that only tear down, and any branch whose effect is a counter
+nobody asserts. The probe is a temporary edit by design — nothing to
+build, nothing to merge, no gate step to maintain; what lands is the
+missing assertion it finds.
+
+The related #106 question — should `else => error.Unexpected` in the
+XevIo mapping arms be a Debug-mode tripwire (`unreachable`) so a
+forgotten mapping announces itself? — is settled as **no**. The errno
+set on live-socket ops is open, not closed: ETIMEDOUT (retransmission
+timeout), EHOSTUNREACH/ENETUNREACH (ICMP feedback mid-connection) are
+legal kernel answers on a data op, and a tripwire would turn network
+weather into crashes. The honest fallback is what stands:
+`error.Unexpected`, witnessed as §8 pressure, with the raw errno kept
+by the fork (`result_errno`) and surfaced through the
+`kernel_pressure_last_errno` gauge — so a mislabeled arm is a visible
+lead (172 EPIPEs were how #106 bug 5 was caught), never a silent zero.
+The two known peer-gone errnos still landing in the fallback are queued
+fork work (PLANS.md, fork queue): the fix for a forgotten mapping is to
+name it, not to crash on it.
+
+## Build mode for the simulator — Debug, and ReleaseSafe is a trap (2026-07-28)
+
+Measured while sizing the nightly soak, 20k seeds on the dev box:
+**Debug 25 s, ReleaseSafe 88 s, ReleaseFast 3 s.** ReleaseSafe being
+3.5× *slower than unoptimized* is the surprise; it is unexplained and
+worth its own look if anything ever wants to ship ReleaseSafe. Nothing
+does today — release.yml builds `-Doptimize=ReleaseFast` — so this is a
+simulator-workload finding, not a production one, and the ~90 k req/s
+bench bands are unaffected.
+
+The actionable half is the build mode the sim gates run under. ReleaseFast
+is 8× faster than Debug and is exactly the wrong choice: it compiles
+`std.debug.assert` out, and the assertions *are* most of what the sim
+checks, so it would sweep eight times the seeds while verifying a
+fraction of the invariants — the reached-vs-covered trap above, wearing
+a performance argument as a disguise. ReleaseSafe keeps the assertions
+but loses to Debug on speed, so Debug is both the strictest and the
+fastest option available and there is no trade to make. Recorded so the
+soak's runtime is never "optimized" by changing its build mode.
+
 ## The deadline rebase cancel reaches the expiry path (#65)
 
 Every deadline re-arm guards on `!armed.deadline_cancel` so the in-flight

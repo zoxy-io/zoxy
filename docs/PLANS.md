@@ -545,7 +545,23 @@ this way. Known queue, in rough value order:
    mid-write, miscounted because zoxy's own send adapter left
    `BrokenPipe` unnamed.
 2. `IORING_OP_SPLICE` (the op union is closed today).
-3. Multishot accept/recv ops — only behind the workloads in the verdict
+3. Name the two peer-gone errnos still funneled to `error.Unexpected`
+   (#106, the bug-5 shape): ENETUNREACH on connect (a routing failure,
+   counted today as §8 dial pressure with only the errno gauge to say
+   otherwise) and ETIMEDOUT on the data ops (a retransmission-timeout
+   peer-gone verdict, same mislabel). One named error each in the fork's
+   connect/read/write maps lets XevIo map them portably — Unreachable
+   and Reset — the exact fix the EPIPE collapse got in-tree, blocked at
+   the fork boundary for these two because a switch may only name error
+   members that exist. Cheap, zero-behavior-change for every other arm;
+   batch with the next pin move. The contract-test decision table
+   (src/io/contract_test.zig) tracks which arms gain real-socket tests
+   once named. Same shape, worse on kqueue: the macOS backend's data-op
+   maps name only CANCELED — even ECONNRESET and EPIPE land as
+   Unexpected there (proven by the linger-RST contract test's first
+   macos-latest run), so every dev-box data-op failure reads as §8
+   pressure until the fork names them too.
+4. Multishot accept/recv ops — only behind the workloads in the verdict
    table above. **The recv precondition is now met**: a 10k-connection
    run holds ~20k req/s at 0.8–0.9 of a 1-CPU quota with ~87% of it
    kernel time and the first non-zero CFS throttling, which is the
