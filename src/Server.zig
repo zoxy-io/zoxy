@@ -649,8 +649,8 @@ pub fn Server(comptime IoType: type) type {
 
         /// Teardown is a state, not an event (§5): shutdown both fds,
         /// cancel pending connect/timer (the only legal cancels, §4),
-        /// then closes once every armed op drains; the last terminal
-        /// completion releases the slot.
+        /// then wait; the delivery that empties the armed set closes
+        /// both fds synchronously and releases the slot.
         pub fn beginTeardown(server: *Self, conn: *ConnType) void {
             if (conn.isTearingDown()) return;
             assert(conn.isLive());
@@ -681,48 +681,26 @@ pub fn Server(comptime IoType: type) type {
             server.continueTeardown(conn);
         }
 
-        /// Public for the relay: a non-close completion delivered during
-        /// teardown re-enters here (§5). Closes are serialized behind the
-        /// full drain — submitted only once every other op (data,
-        /// connect, deadline, both cancels) has delivered — so a dial
-        /// completing against its own teardown peaks at four armed ops,
-        /// never five: the `conn_ops_max` budget the CQ is sized by (§8).
+        /// Public for the relay: a completion delivered during teardown
+        /// re-enters here (§5). The delivery that empties the armed set
+        /// finishes the whole teardown synchronously: nothing references
+        /// either fd any more, so the closes are plain syscalls — the
+        /// same close-after-full-drain discipline `detachUpstream` and
+        /// the parked reap already use — and the slot releases in the
+        /// same call instead of waiting out two close completions. A
+        /// dial completing against its own teardown still peaks at four
+        /// armed ops: the `conn_ops_max` budget the CQ is sized by (§8).
         pub fn continueTeardown(server: *Self, conn: *ConnType) void {
-            // Only non-close deliveries route here, and a non-close op can
-            // be armed only before .closing; closes deliver into
-            // maybeRelease instead.
             assert(conn.state == .tearing_down);
             if (conn.armedCount() != 0) return;
-            conn.state = .closing;
-            conn.arm(&conn.op_close_client, "close_client");
-            server.io.close(
-                conn.client_socket,
-                &conn.op_close_client.completion,
-                ConnType,
-                conn,
-                onCloseClient,
-            );
+            // Nothing armed: no op references either fd, which is what
+            // makes the synchronous closes and the release safe.
+            assert(conn.armedCount() == 0);
+            server.io.closeNow(conn.client_socket);
             if (conn.upstream_socket) |socket| {
-                conn.arm(&conn.op_close_upstream, "close_upstream");
-                server.io.close(
-                    socket,
-                    &conn.op_close_upstream.completion,
-                    ConnType,
-                    conn,
-                    onCloseUpstream,
-                );
+                server.io.closeNow(socket);
+                conn.upstream_socket = null;
             }
-            // Postcondition: .closing holds the closes and nothing else.
-            assert(conn.armed.close_client);
-            assert(conn.armedCount() <= 2);
-        }
-
-        /// §5 release rule: closes submitted and the armed-op set empty —
-        /// only then does the slot go back to the pool.
-        fn maybeRelease(server: *Self, conn: *ConnType) void {
-            assert(conn.isTearingDown());
-            if (conn.state != .closing) return;
-            if (conn.armedCount() != 0) return;
             // An idle L7 connection holds no relay buffer (§5); only
             // release one that was actually acquired.
             if (conn.relay_buffer) |buffer| {
@@ -730,13 +708,14 @@ pub fn Server(comptime IoType: type) type {
                 conn.relay_buffer = null;
             }
             // The leased upstream slot rides the same release rule: its
-            // socket (if any) was closed by this teardown's
-            // close_upstream, so the slot is inert by the time the armed
-            // set empties (§5). Parking replaces this with reuse later.
+            // socket (if any) was closed just above, so the slot is
+            // inert (§5). Parking replaces this with reuse later.
             if (conn.upstream) |leased| {
                 server.releaseUpstream(leased);
                 conn.upstream = null;
             }
+            assert(conn.relay_buffer == null);
+            assert(conn.upstream == null);
             server.releaseConn(conn);
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
@@ -1072,9 +1051,9 @@ pub fn Server(comptime IoType: type) type {
             } else |err| {
                 assert(err == error.Canceled);
                 if (conn.isTearingDown()) {
-                    // Closes wait for this delivery (and every other
-                    // armed op) before they are submitted, so the state
-                    // here is always .tearing_down, never .closing.
+                    // The teardown waits for this delivery (and every
+                    // other armed op) before it closes and releases, so
+                    // the slot is still live here.
                     server.continueTeardown(conn);
                     return;
                 }
@@ -1199,16 +1178,6 @@ pub fn Server(comptime IoType: type) type {
         fn onDeadlineCancel(conn: *ConnType) void {
             conn.delivered(&conn.op_deadline_cancel, "deadline_cancel");
             conn.server.continueTeardown(conn);
-        }
-
-        fn onCloseClient(conn: *ConnType) void {
-            conn.delivered(&conn.op_close_client, "close_client");
-            conn.server.maybeRelease(conn);
-        }
-
-        fn onCloseUpstream(conn: *ConnType) void {
-            conn.delivered(&conn.op_close_upstream, "close_upstream");
-            conn.server.maybeRelease(conn);
         }
     };
 }

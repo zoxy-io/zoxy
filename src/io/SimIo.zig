@@ -737,10 +737,30 @@ pub fn run(io: *SimIo) Io.RunError!void {
         io.maybeInjectReset();
         io.maybeInjectKernelPressure();
     }
-    // The loop was stopped (a completed drain). A raced accept whose CQE
-    // beat the listener close but was never delivered before stop() is an
-    // accepted-but-unshed fd — reclaimed at process exit in production, so
-    // model that here rather than flagging it as an operational leak.
+    // The loop was stopped (a completed drain). What is already *ready*
+    // still delivers, with the virtual clock frozen so nothing new
+    // becomes due. In production these effects live kernel-side — the
+    // peer of a socket the drain closed observes its FIN/RST whether or
+    // not this process takes another tick — but the simulator's peers
+    // observe through delivery, so cutting them off at stop() would
+    // strand exactly the observations production guarantees. The server
+    // is quiescent by stop's precondition (§8: every pool released,
+    // every op delivered), so this settles harness actors only; the
+    // adversary stays out of a world that is no longer running.
+    var flush_passes: u32 = 0;
+    while (true) : (flush_passes += 1) {
+        // Each pass retires pending ops; a harness that keeps
+        // generating fresh ready work under a frozen clock is a
+        // liveness bug, not a schedule (§9).
+        assert(flush_passes <= pending_ops_max);
+        const ready = io.collectReady(&ready_buffer);
+        if (ready.len == 0) break;
+        io.deliverBatch(ready);
+    }
+    // A raced accept whose CQE beat the listener close but was never
+    // delivered before stop() is an accepted-but-unshed fd — reclaimed
+    // at process exit in production, so model that here rather than
+    // flagging it as an operational leak.
     io.reclaimRacedSockets();
 }
 

@@ -718,12 +718,13 @@ test "teardown: a drain racing its own upstream dial peaks at four armed ops" {
     // The §8 worst case the ring budget must cover: the drain deadline
     // reaps a connection whose upstream dial is still in flight, teardown
     // arms both cancels on top of {connect, deadline}, and the delayed
-    // dial then completes against its own cancel. Closes serialize
-    // behind the full drain (continueTeardown), so the peak stays at
-    // conn_ops_max = 4 — before the serialization these exact seeds
-    // co-armed five ops ({deadline, both cancels, both closes}), found
-    // by sweeping 1..400 against the old code and pinned here so the
-    // race, not just some teardown, is what every run witnesses.
+    // dial then completes against its own cancel. Closes are synchronous
+    // after the full drain (continueTeardown, not ring ops at all), so
+    // the peak stays at conn_ops_max = 4 — when closes were ring ops
+    // merely submitted eagerly, these exact seeds co-armed five ops
+    // ({deadline, both cancels, both closes}), found by sweeping 1..400
+    // against that code and pinned here so the race, not just some
+    // teardown, is what every run witnesses.
     const race_seeds = [_]u64{ 40, 109, 116, 163, 211, 334 };
     for (race_seeds) |seed| {
         var bed: TestBed = undefined;

@@ -188,8 +188,6 @@ pub fn Conn(comptime IoType: type) type {
         op_data_upstream_to_client: Op,
         op_connect: Op,
         op_connect_cancel: Op,
-        op_close_client: Op,
-        op_close_upstream: Op,
         op_deadline: Op,
         op_deadline_cancel: Op,
 
@@ -212,18 +210,17 @@ pub fn Conn(comptime IoType: type) type {
             l7_exchanging,
             l7_responding,
             l7_draining_request,
-            /// Teardown begun: sockets shut down, pending ops draining,
-            /// closes not yet submitted.
+            /// Teardown begun: sockets shut down, pending ops draining.
+            /// The delivery that empties the armed set closes both fds
+            /// synchronously and releases the slot (§5) — there is no
+            /// second phase, because with nothing armed nothing can
+            /// straggle into the closes.
             tearing_down,
-            /// Closes submitted; the slot releases when the armed set
-            /// empties (§5). Splitting this from `tearing_down` lets an
-            /// assertion tell "still draining ops" from "awaiting closes".
-            closing,
         };
 
-        /// True once teardown has begun, in either teardown phase.
+        /// True once teardown has begun.
         pub fn isTearingDown(conn: *const Self) bool {
-            return conn.state == .tearing_down or conn.state == .closing;
+            return conn.state == .tearing_down;
         }
 
         /// True in any pre-teardown serving state — the states from which
@@ -238,7 +235,7 @@ pub fn Conn(comptime IoType: type) type {
                 .l7_responding,
                 .l7_draining_request,
                 => true,
-                .tearing_down, .closing => false,
+                .tearing_down => false,
             };
         }
 
@@ -374,13 +371,13 @@ pub fn Conn(comptime IoType: type) type {
         };
 
         /// One bit per embedded op; release requires all clear (§5).
-        pub const Armed = packed struct(u8) {
+        /// Closes carry no bit: they are synchronous syscalls once this
+        /// set is empty, never ring ops (`Server.continueTeardown`).
+        pub const Armed = packed struct(u6) {
             data_client_to_upstream: bool = false,
             data_upstream_to_client: bool = false,
             connect: bool = false,
             connect_cancel: bool = false,
-            close_client: bool = false,
-            close_upstream: bool = false,
             deadline: bool = false,
             deadline_cancel: bool = false,
         };
@@ -426,8 +423,6 @@ pub fn Conn(comptime IoType: type) type {
             conn.op_data_upstream_to_client = .{};
             conn.op_connect = .{};
             conn.op_connect_cancel = .{};
-            conn.op_close_client = .{};
-            conn.op_close_upstream = .{};
             conn.op_deadline = .{};
             conn.op_deadline_cancel = .{};
             assert(conn.state == state);
@@ -468,7 +463,7 @@ pub fn Conn(comptime IoType: type) type {
         }
 
         pub fn armedCount(conn: *const Self) u8 {
-            return @popCount(@as(u8, @bitCast(conn.armed)));
+            return @popCount(@as(u6, @bitCast(conn.armed)));
         }
     };
 }
