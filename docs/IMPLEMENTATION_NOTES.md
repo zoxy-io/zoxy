@@ -710,6 +710,26 @@ The two known peer-gone errnos still landing in the fallback are queued
 fork work (PLANS.md, fork queue): the fix for a forgotten mapping is to
 name it, not to crash on it.
 
+## Build mode for the simulator — Debug, and ReleaseSafe is a trap (2026-07-28)
+
+Measured while sizing the nightly soak, 20k seeds on the dev box:
+**Debug 25 s, ReleaseSafe 88 s, ReleaseFast 3 s.** ReleaseSafe being
+3.5× *slower than unoptimized* is the surprise; it is unexplained and
+worth its own look if anything ever wants to ship ReleaseSafe. Nothing
+does today — release.yml builds `-Doptimize=ReleaseFast` — so this is a
+simulator-workload finding, not a production one, and the ~90 k req/s
+bench bands are unaffected.
+
+The actionable half is the build mode the sim gates run under. ReleaseFast
+is 8× faster than Debug and is exactly the wrong choice: it compiles
+`std.debug.assert` out, and the assertions *are* most of what the sim
+checks, so it would sweep eight times the seeds while verifying a
+fraction of the invariants — the reached-vs-covered trap above, wearing
+a performance argument as a disguise. ReleaseSafe keeps the assertions
+but loses to Debug on speed, so Debug is both the strictest and the
+fastest option available and there is no trade to make. Recorded so the
+soak's runtime is never "optimized" by changing its build mode.
+
 ## The deadline rebase cancel reaches the expiry path (#65)
 
 Every deadline re-arm guards on `!armed.deadline_cancel` so the in-flight

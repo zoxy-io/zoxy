@@ -84,10 +84,15 @@ jobs:
           echo "count=$SEEDS" >> "$GITHUB_OUTPUT"
           echo "last=$(( start + SEEDS - 1 ))" >> "$GITHUB_OUTPUT"
 
-      # Debug, deliberately: it is both the strictest build (every safety
-      # check on) and — measured 2026-07-28 — about 3.5x faster through
-      # the simulator than ReleaseSafe on this workload, so there is no
-      # trade to make here.
+      # Debug, deliberately, and do not "optimize" this. Measured
+      # 2026-07-28 on the dev box, 20k seeds: Debug 25 s, ReleaseSafe
+      # 88 s, ReleaseFast 3 s. ReleaseFast is the tempting one and is
+      # exactly wrong — it compiles `std.debug.assert` out, and the
+      # assertions are most of what this soak checks, so it would sweep
+      # eight times the seeds while verifying a fraction of the
+      # invariants: a green gate that stopped looking. ReleaseSafe keeps
+      # the assertions but is slower than Debug here, so Debug wins on
+      # both counts and there is no trade left to make.
       - name: Build
         run: devenv shell -- zig build
 
