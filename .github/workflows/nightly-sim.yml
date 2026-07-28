@@ -1,0 +1,206 @@
+name: Nightly simulation
+
+# The §9 soak. `ci` sweeps 4096 seeds per change, sized so every L7
+# script draws a clean seed; this sweeps a far larger, *disjoint* range
+# each night, where the value is concentrated in the always-on invariant
+# oracles — no deadlock, pools drain to zero, counters reconcile, every
+# virtual socket released. Those can only fail on a rare interleaving,
+# which is exactly what more schedules buy. (The golden-outcome oracles
+# saturate at ~1024 seeds and gain nothing here.)
+#
+# Ranges are deterministic and contiguous, keyed to the run number, so
+# the sweep is a cumulative claim — "seeds 1..N have been swept" — rather
+# than the random walk `zig build sim -- fuzz` would give. Any failure
+# replays exactly, locally, from the seed in the report.
+
+on:
+  schedule:
+    # 03:00 UTC daily. Scheduled runs use the default branch.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds to sweep this run"
+        required: false
+        default: "1000000"
+      start_seed:
+        description: "First seed (blank = continue the nightly range)"
+        required: false
+        default: ""
+
+# Never overlap two soaks; a running one is not worth cancelling.
+concurrency:
+  group: nightly-sim
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: sim soak
+    runs-on: ubuntu-latest
+    # Measured ~800 seeds/s in Debug on an 8-core dev box; a shared
+    # runner is slower, so 1M seeds is roughly an hour. The cap is
+    # headroom, not a target — a soak that hits it should shrink `seeds`
+    # rather than run longer.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+
+      - name: Set up devenv binary cache
+        uses: cachix/cachix-action@v17
+        with:
+          name: devenv
+          skipPush: true
+
+      - name: Install devenv
+        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+
+      # Contiguous, disjoint blocks: run N sweeps the N-th block, so the
+      # union over all runs is a solid range from seed 1 with no repeats.
+      # Two things put holes in that: changing `seeds` between runs
+      # re-tiles the blocks, and a manual run with `start_seed` still
+      # consumes a run number, leaving that block unswept. Both are
+      # harmless — seeds are independent — and both are why the report
+      # states the exact range swept rather than implying the union.
+      - name: Compute seed range
+        id: range
+        env:
+          SEEDS: ${{ inputs.seeds || '1000000' }}
+          START_OVERRIDE: ${{ inputs.start_seed }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          if [ -n "$START_OVERRIDE" ]; then
+            start="$START_OVERRIDE"
+          else
+            start=$(( 1 + (RUN_NUMBER - 1) * SEEDS ))
+          fi
+          echo "start=$start" >> "$GITHUB_OUTPUT"
+          echo "count=$SEEDS" >> "$GITHUB_OUTPUT"
+          echo "last=$(( start + SEEDS - 1 ))" >> "$GITHUB_OUTPUT"
+
+      # Debug, deliberately: it is both the strictest build (every safety
+      # check on) and — measured 2026-07-28 — about 3.5x faster through
+      # the simulator than ReleaseSafe on this workload, so there is no
+      # trade to make here.
+      - name: Build
+        run: devenv shell -- zig build
+
+      - name: Sweep
+        id: sweep
+        env:
+          START: ${{ steps.range.outputs.start }}
+          COUNT: ${{ steps.range.outputs.count }}
+        run: |
+          set -uo pipefail
+          began=$(date +%s)
+          set +e
+          devenv shell -- zig build sim -- "$START" "$COUNT" 2>&1 | tee sweep.log
+          status=${PIPESTATUS[0]}
+          set -e
+          elapsed=$(( $(date +%s) - began ))
+          echo "elapsed=$elapsed" >> "$GITHUB_OUTPUT"
+          echo "rate=$(( COUNT / (elapsed > 0 ? elapsed : 1) ))" >> "$GITHUB_OUTPUT"
+          # The simulator names the offending seed on every failure shape
+          # (a failed invariant, the same on replay, and a trace that did
+          # not reproduce), which is the whole handle for reproducing it:
+          # `zig build sim -- N 1`. Anchored to the simulator's own lines
+          # so a `seed=`-shaped string anywhere in the nix or build output
+          # cannot be mistaken for the verdict.
+          seed=$(grep -oE 'sim: (FAILURE|NONDETERMINISM).*' sweep.log \
+            | grep -oE 'seed=[0-9]+' | head -1 | cut -d= -f2 || true)
+          echo "seed=${seed:-}" >> "$GITHUB_OUTPUT"
+          if grep -q 'NONDETERMINISM' sweep.log; then
+            echo "kind=nondeterminism" >> "$GITHUB_OUTPUT"
+          else
+            echo "kind=invariant" >> "$GITHUB_OUTPUT"
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # Reports both outcomes: a soak nobody hears from is indistinguishable
+      # from a soak that silently stopped running.
+      - name: Report to Discord
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          OUTCOME: ${{ steps.sweep.outcome }}
+          START: ${{ steps.range.outputs.start }}
+          LAST: ${{ steps.range.outputs.last }}
+          COUNT: ${{ steps.range.outputs.count }}
+          ELAPSED: ${{ steps.sweep.outputs.elapsed }}
+          RATE: ${{ steps.sweep.outputs.rate }}
+          SEED: ${{ steps.sweep.outputs.seed }}
+          KIND: ${{ steps.sweep.outputs.kind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::warning::DISCORD_WEBHOOK is not set; skipping the report."
+            exit 0
+          fi
+          # printf, not a multi-line literal: the replay block carries
+          # newlines and backticks, and both stay inside one YAML line here.
+          if [ "$OUTCOME" = "success" ]; then
+            title="Nightly simulation passed"
+            color=3066993
+            detail=$(printf 'Swept seeds `%s..%s` with every §9 invariant holding.' "$START" "$LAST")
+          elif [ "$OUTCOME" = "cancelled" ]; then
+            # Distinct from a failure: nothing was proven, but nothing broke.
+            title="Nightly simulation cancelled"
+            color=9807270
+            detail="The soak was cancelled before it finished — no verdict."
+          else
+            title="Nightly simulation FAILED"
+            color=15158332
+            if [ -n "${SEED:-}" ]; then
+              detail=$(printf 'Seed `%s` failed (%s). Replay it exactly:\n```\nzig build sim -- %s 1\n```' "$SEED" "$KIND" "$SEED")
+            else
+              detail="The sweep failed before naming a seed — see the run log."
+            fi
+          fi
+          # jq builds the payload so a seed, a range, or a future message
+          # can never break out of the JSON.
+          jq -n \
+            --arg title "$title" \
+            --arg detail "$detail" \
+            --argjson color "$color" \
+            --arg range "${START:-?}..${LAST:-?} (${COUNT:-?} seeds)" \
+            --arg timing "${ELAPSED:-0}s (~${RATE:-0} seeds/s)" \
+            --arg sha "${SHA:0:7}" \
+            --arg url "$RUN_URL" \
+            '{
+              username: "zoxy sim",
+              embeds: [{
+                title: $title,
+                description: $detail,
+                color: $color,
+                url: $url,
+                fields: [
+                  {name: "Range", value: $range, inline: true},
+                  {name: "Duration", value: $timing, inline: true},
+                  {name: "Commit", value: $sha, inline: true}
+                ]
+              }]
+            }' > payload.json
+          curl -sS -f -X POST -H "Content-Type: application/json" \
+            -d @payload.json "$WEBHOOK" > /dev/null
+          echo "Reported: $title"
+
+      # The failing seed is the reproducer, but the log says which
+      # invariant broke — worth keeping past the Discord message.
+      - name: Upload sweep log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-log
+          path: sweep.log
+          # A failure before the sweep (build, devenv) leaves no log; that
+          # is not itself an error worth failing the job a second time for.
+          if-no-files-found: ignore
