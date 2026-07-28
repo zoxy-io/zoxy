@@ -699,35 +699,48 @@ so the profiler was taught to read the ring — sqes, cqes, and wakes
 `/proc`. Fixed 40k offered throughout, so the only variable is how idle
 each connection is:
 
-| conns | req/s each | ops/req | cqes/wake | p50 |
-|---|---|---|---|---|
-| 64 | 625 | 4.00 | 5.3 | 77 µs |
-| 1000 | 40 | 4.01 | 8.1 | 208 µs |
-| 10000 | 4 | 4.07 | 8.7 | 137 µs |
-| 64 (drift) | 625 | 4.00 | 5.9 | 88 µs |
+The verdict rests on a **bound**, not on a trend. Submission-bound means
+roughly one op submitted and one wake per read — batch depth near 1.
+Across ~15 measurements spanning 64 to 10,000 connections and settled
+loads from 0.4 to 3.1, the lowest `cqes/wake` ever observed is **2.9**,
+and most rows sit near 4. The enter is amortised several ways at every
+point measured, so multishot's saving — the per-read re-arm — has little
+left to take.
 
-Batch depth **rises** as connections idle, 5.3 → 8.7. Submission-bound is
-the opposite: an op per read, a wake per op, depth collapsing toward 1.
-At c10k the loop wakes ~18,600 times a second and drains ~8 completions
-each, so the enter is already amortised eight ways and multishot's saving
-— the per-read re-arm — has little left to take. The verdict stands, now
-on the workload it named rather than on an echo microbench.
+An earlier reading of this claimed more, and the retraction is the more
+useful record. One sweep showed batch depth *rising* with connection
+count (5.3 / 8.1 / 8.7 at 64 / 1000 / 10000) and that was written up as
+the finding. A bracketed re-run does not reproduce it: the two
+64-connection rows came out 3.3 and 4.2, and the 64-connection row
+*exceeded* the 1000-connection row. Sorting every row of that re-run by
+settled load instead:
 
-The four rows above were taken at settled loads of 0.41–0.50, which is
-what makes them comparable: batch depth is load-sensitive, and the same
-c10k row reads 3.7–3.8 on a box settled at 1.2–1.9. The direction of the
-trend is the finding, and reading it required rows measured under the
-same conditions — which is why the harness now reports the settled load
-per row rather than assuming one.
+| settled load | conns | cqes/wake |
+|---|---|---|
+| 1.19 | 64 | 3.3 |
+| 1.76 | 1000 | 3.9 |
+| 2.24 | 1000 | 4.1 |
+| 3.10 | 64 | 4.2 |
 
-Two corrections it forced. First, a c10k profile shows ~29% of self-time
-in libxev's `Readable.read` callback, and that was read here as "what
-multishot attacks". It is not: multishot removes the *submission*, not
-the completion or its callback. The addressable slice sits in
-`IoUring.enter` and `Loop.add`, which is the ~2–4% the 2026-07-12 bench
-measured. Second, `cqes/wake` is **two-sided** and must never be read
-without the latency beside it — see the next section, where 504 per wake
-means the loop never caught up, not that it batched well.
+Monotonic in load. Not ordered by connection count at all. The original
+series ran at 0.41–0.50, close enough that a load effect and a
+connection effect are indistinguishable in it — so the trend is
+withdrawn, and `cqes/wake` is not usable for cross-row comparison on a
+shared machine at all. What it can still support is the bound above,
+which no run has come close to violating.
+
+Two corrections this forced along the way. First, a c10k profile shows
+~29% of self-time in libxev's `Readable.read` callback, and that was read
+here as "what multishot attacks". It is not: multishot removes the
+*submission*, not the completion or its callback. The addressable slice
+sits in `IoUring.enter` and `Loop.add`, which is the ~2–4% the
+2026-07-12 bench measured. Second, `cqes/wake` is **two-sided** and must
+never be read without the latency beside it — see the next section, where
+504 per wake means the loop never caught up, not that it batched well.
+
+Measuring the connection-count trend properly needs a machine nobody
+else is using. On a box shared with other work the signal is smaller
+than the noise, and three sweeps spent proving that is enough.
 
 Ops per request is 4.0 flat across a 156× change in connection count:
 recv client head, send upstream head, recv response, send client
@@ -779,11 +792,12 @@ stored the 60 s idle deadline, and re-arms — arm, cancel, pointless fire,
 which is about the 2.44 seen. Nothing in these counters watches an
 individual timer, so this is the account that fits, not a sighting.
 
-Batch depth is also load-sensitive, which the bracketed sweep exposed and
-the single run could not: the same `request_ms=0` c10k row reads 8.7
-cqes/wake at a settled load of ~0.5 and 3.7–3.8 at 1.2–1.9. Rows are
-therefore only comparable at comparable settled load, which is why every
-row now reports it.
+Batch depth tracks *box load* more closely than it tracks anything this
+harness varies deliberately — see the section above, where sorting a
+bracketed sweep by settled load orders it perfectly and sorting by
+connection count does not. So the 504 figure says the loop stopped
+sleeping, which the 490 ms p50 corroborates independently, but its
+magnitude should not be compared against rows taken at another load.
 
 Also inferred, from one measured (gap, threshold) pair: that the rule is
 about timers generally rather than this timeout — any deadline shorter

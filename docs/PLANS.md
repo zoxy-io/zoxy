@@ -545,7 +545,6 @@ this way. Known queue, in rough value order:
    mid-write, miscounted because zoxy's own send adapter left
    `BrokenPipe` unnamed.
 2. `IORING_OP_SPLICE` (the op union is closed today).
-<<<<<<< HEAD
 3. Name the two peer-gone errnos still funneled to `error.Unexpected`
    (#106, the bug-5 shape): ENETUNREACH on connect (a routing failure,
    counted today as §8 dial pressure with only the errno gauge to say
