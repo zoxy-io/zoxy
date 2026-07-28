@@ -570,6 +570,30 @@ fn procField(content: []const u8, key: []const u8) ?u64 {
     return null;
 }
 
+/// Read the head of a `/proc` file that may be large, into `out`.
+///
+/// `readSmallFile`'s 256-byte internal buffer is fine for the fixed-size
+/// files this harness otherwise reads, and wrong for io_uring's fdinfo:
+/// procfs regenerates that text on every read, and once the ring carries
+/// thousands of in-flight ops — one printed line each — the read through a
+/// small internal buffer fails outright rather than returning a prefix.
+/// That failure is what made `readRingSample` skip the ring's own fd and
+/// then report no ring at all, on exactly the busy c10k rows the counters
+/// were added for.
+///
+/// A large internal buffer and a small destination: take one big bite,
+/// keep the head, which is where every counter this harness wants lives.
+fn readProcHead(io: Io, path: []const u8, out: []u8) ?[]const u8 {
+    assert(out.len > 0);
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var file_reader = file.reader(io, &read_buffer);
+    const len = file_reader.interface.readSliceShort(out) catch return null;
+    assert(len <= out.len);
+    return out[0..len];
+}
+
 /// Whether a `/proc` list section named by `header` has any entry under
 /// it, or null when the text does not settle it. fdinfo prints list
 /// headers unconditionally and indents their entries, while the next
@@ -597,15 +621,24 @@ fn procListHasEntry(content: []const u8, header: []const u8) ?bool {
 /// so, not print zeroes that read as "no work happened".
 fn readRingSample(io: Io, pid: i32) ?RingSample {
     assert(pid > 0);
-    // Sized well past a quiet ring's fdinfo, because a busy one is not
-    // quiet text: every pending SQE and CQE prints a line of its own
-    // before the overflow list. A full buffer is therefore evidence of a
-    // truncated read, not of a large-but-complete one — the two are
-    // indistinguishable from the content alone, so the length is what
-    // `overflowed` keys its "cannot tell" off.
-    var buffer: [64 * 1024]u8 = undefined;
+    // A bounded *head* read, deliberately. The counters this exists for
+    // sit in the first few hundred bytes; what follows them is a line per
+    // pending SQE and CQE, so the file's length scales with in-flight ops
+    // and is unbounded in practice. Asking for more of it is not free:
+    // procfs regenerates the text per read, so a large destination means
+    // many reads of a file that is changing underneath them, and the read
+    // fails outright. Sizing this at 64 KiB to "be safe" is exactly what
+    // broke four of five c10k rows with `no sample at end of window` —
+    // the counters were unreadable precisely when the ring was busy.
+    //
+    // A full buffer is therefore evidence of a truncated read rather than
+    // of a large complete one; the two are indistinguishable from content
+    // alone, so the length is what `overflowed` keys its "cannot tell"
+    // off, and on a busy ring it will indeed say so.
+    var buffer: [4096]u8 = undefined;
     var path_buffer: [64]u8 = undefined;
-    var fd: u8 = 0;
+    var fd: u32 = 0;
+    var readable: u32 = 0;
     while (fd < ring_fd_scan_max) : (fd += 1) {
         assert(fd < ring_fd_scan_max);
         const path = std.fmt.bufPrint(
@@ -613,7 +646,8 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
             "/proc/{d}/fdinfo/{d}",
             .{ pid, fd },
         ) catch continue;
-        const content = readSmallFile(io, path, &buffer) orelse continue;
+        const content = readProcHead(io, path, &buffer) orelse continue;
+        readable += 1;
         // `SqMask` is io_uring's own marker: no other fd type prints it.
         if (std.mem.indexOf(u8, content, "SqMask:") == null) continue;
         // Both counters print near the top, ahead of any per-entry list,
@@ -631,11 +665,19 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
         const overflowed = if (truncated) null else procListHasEntry(content, "CqOverflowList:");
         var status_buffer: [4096]u8 = undefined;
         const status_path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/status", .{pid}) catch return null;
-        const status = readSmallFile(io, status_path, &status_buffer) orelse return null;
+        const status = readProcHead(io, status_path, &status_buffer) orelse return null;
         const wakes = procField(status, "voluntary_ctxt_switches") orelse return null;
         assert(cqes <= sqes); // A completion the loop never submitted is impossible.
         return .{ .sqes = sqes, .cqes = cqes, .wakes = wakes, .overflowed = overflowed };
     }
+    // Say which way it failed. "No ring under fd 64" and "no fdinfo at all"
+    // are different bugs — the first means the scan bound is too low for a
+    // process whose low fds are taken, the second means the pid is wrong or
+    // gone — and a bare null made a whole c10k sweep unattributable.
+    std.debug.print(
+        "profile: ring  no io_uring fd under {d} for pid {d} ({d} fdinfo entries readable)\n",
+        .{ ring_fd_scan_max, pid, readable },
+    );
     return null;
 }
 
