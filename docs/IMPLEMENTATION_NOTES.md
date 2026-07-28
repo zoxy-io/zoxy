@@ -591,6 +591,48 @@ pick the ceiling instead of inheriting ours — the machinery (`cqFillFits`,
 cost is a §5 amendment, spelled out there. Pinning narrows that question
 to one number rather than settling it.
 
+## The 503 was the only backpressure, and it was accidental (2026-07-28)
+
+The run that verified the pinned pair did what it was built to do, and
+exposed something else. Same 10k-connection ramp, same binary except the
+ceilings:
+
+| | upstream 8192 | pinned 11464 |
+|---|---|---|
+| `l7_shed_upstream_slots` | 22,568 | **0** |
+| pool peak (leased + parked) | pinned at 8192, six scrapes | 8,749 of 11,464 |
+| **sustained** | **22,481 req/s** | **22,385 req/s** |
+| `accepted` | 67,517 | **220,144** |
+| loadgen connect errors | 32,891 | 186,265 |
+| loadgen timeouts | 58,999 | 142,478 |
+| loadgen error rate | 2.2% | **6.3%** |
+| errors before the knee (t<95s) | 29,299 | 16,488 |
+
+Throughput did not move, which was the prediction: sheds were 0.44%, so
+they were never the limiter. Pre-knee behaviour improved — half the
+errors, and the stall that used to sit at t≈85s is gone.
+
+Past the knee it got worse, and the mechanism is the finding. The 503
+was a *fast, bounded, connection-keeping* answer. With nothing shedding,
+the same request instead queues until the client's own 1 s timeout kills
+it and reconnects — 3.3× the connection churn. The receipt: zoxy served
+**5,001,502** responses while the loadgen counted **4,860,555**. The
+140,947 gap matches the 142,478 timeouts. That work was done for callers
+who had already left.
+
+So until this run, upstream-pool exhaustion was doing double duty as
+zoxy's capacity signal — and a second mechanism keyed off the same flag,
+`parkedTimeoutMs`'s pressure-shortened reap, went dormant with it
+(`upstream_pressure_engaged` = 2 across the whole run). Both were reading
+an accident. Removing the accident was right; what it left behind was a
+§8 ladder where every rung but one sheds on a resource running out, and
+nothing at all bounds an exchange that is merely slow.
+
+`timeouts.request_ms` is the answer to that: the request-deadline rung
+already existed, it was simply never armed by anything but a stalled
+dial. Opt-in, because how slow is too slow is a property of the
+operator's origin.
+
 ## libxev error surfacing is lossy — resolved by the fork (2026-07-27)
 
 The section below stood for months and is kept for the reasoning; the

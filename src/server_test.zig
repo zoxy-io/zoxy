@@ -231,6 +231,9 @@ pub const TestBed = struct {
             .idle_timeout_ms = options.idle_timeout_ms,
             .drain_deadline_ms = options.drain_deadline_ms,
             .max_lifetime_ms = options.max_lifetime_ms,
+            // L4 only: the §8 request deadline is an L7 exchange bound and
+            // this bed never routes one.
+            .request_timeout_ms = 0,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, options.server);
         try bed.server.start();

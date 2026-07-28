@@ -284,6 +284,20 @@ pub fn Conn(comptime IoType: type) type {
             /// as the channel's next write. Zero when the excess rode along
             /// with the head, or when there was none.
             response_excess_len: u32 = 0,
+            /// Absolute cap on this exchange, set at routing from
+            /// `request_timeout_ms` (§8); `storeDeadline` clamps every
+            /// deadline to it, so unlike the idle timeout no activity can
+            /// push it out. `0` when the timeout is disabled. It lives in
+            /// `l7` rather than beside `birth_ns` precisely so the
+            /// per-request lifetime is structural: every keep-alive
+            /// turnaround clears `l7` wholesale, so the cap cannot outlive
+            /// the exchange that set it even if a rung forgets to retire
+            /// it. Rungs that answer early *do* retire it explicitly, via
+            /// `Server.clearRequestDeadline`. The §7 replay is the one
+            /// place `l7` is rebuilt mid-exchange, so it carries this field
+            /// across by hand — a replay is the same request retrying, not
+            /// a new one earning a fresh budget.
+            request_deadline_ns: u64 = 0,
             /// True once the request head has been forwarded off conn.head
             /// (head sent and any coalesced body excess drained), so the
             /// response head may render into conn.head (§7 buffer rotation).
