@@ -380,7 +380,7 @@ pub const fds_max: u32 =
     fdsRequired(conn_slots_max, upstream_slots_max, listeners_max);
 
 /// Default effective pool sizes when the config omits a `limits` block: a
-/// lean out-of-box footprint (~32 MiB of pools, well under a routine 4096
+/// lean out-of-box footprint (~33 MiB of pools, well under a routine 4096
 /// RLIMIT_NOFILE, a shallow ring) rather than the c10k worst case. An
 /// operator opts into more concurrency — up to the compiled ceilings —
 /// through the config `limits` block, and the fd budget (`fdsRequired`,
@@ -406,12 +406,18 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 /// `conn_slots_max`), because the out-of-box shape is bounded by the
 /// stock 4096 `RLIMIT_NOFILE` rather than by admission: matching 1386
 /// would put the default at 4167 fds, over that line, for capacity an
-/// unconfigured proxy is not there to serve. An L4 deployment never
-/// leases from this pool at all — an L4 dial reads its `leased_counts`
-/// for the P2C draw and holds no slot. A deployment that means to fill its conn
-/// pool raises both together in `limits` — which is what the ceilings
-/// exist to permit and what the c10k benchmark configuration does.
-pub const upstream_slots_default: u32 = 1024;
+/// unconfigured proxy is not there to serve. 1314 is the largest value
+/// that still clears that line — `fdsRequired(conn_slots_default, x, 1)`
+/// is `2781 + x`, and that must stay strictly under 4096 (the out-of-box
+/// budget stays *under* the stock limit, not flush against it), so
+/// `4096 - 2781 - 1 = 1314` — the default leans as far toward
+/// `conn_slots_default` as the stock fd budget allows. An L4
+/// deployment never leases from this pool at all — an L4 dial reads its
+/// `leased_counts` for the P2C draw and holds no slot. A deployment that
+/// means to fill its conn pool raises both together in `limits` — which
+/// is what the ceilings exist to permit and what the c10k benchmark
+/// configuration does.
+pub const upstream_slots_default: u32 = 1314;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));

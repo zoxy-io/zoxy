@@ -405,9 +405,11 @@ track the *connection* count, so a pool below the conn ceiling makes the
 top of that ceiling unservable. The upstream ceiling is now **pinned** to
 the conn ceiling, and the shared CQ line has one divisor rather than two
 numbers that must be edited together: `conn_slots_max =
-upstream_slots_max = 11464`. `upstream_slots_default` stays at 1024, so
-the out-of-box footprint is still byte-identical (32,259 KiB, 3,805 fds).
-Measurements in IMPLEMENTATION_NOTES.md.
+upstream_slots_max = 11464`. `upstream_slots_default` moved again on
+2026-07-28, from 1024 to 1314 — the largest value that keeps the
+out-of-box fd budget strictly under the stock 4096 `RLIMIT_NOFILE`
+(34,233 KiB, 4095 fds; see `src/constants.zig`'s `upstream_slots_default`
+comment for the arithmetic). Measurements in IMPLEMENTATION_NOTES.md.
 
 It does **not** answer the question below — it narrows it. There is now
 one number, not a pair, and §1's "able to operate at c10k" holds on both

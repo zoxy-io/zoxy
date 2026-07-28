@@ -372,7 +372,7 @@ Three shared pools, all owned and touched only by the loop thread:
 Sizing shape. The comptime constants are the hard, budget-asserted
 *ceilings*; the config `limits` block sizes the *effective* pools anywhere
 from 1 up to them. An omitted block takes the lean **defaults**, so the
-out-of-box footprint is small (~32 MiB) and an operator opts into more
+out-of-box footprint is small (~33 MiB) and an operator opts into more
 concurrency — up to the c10k ceiling — through `limits`, never a rebuild.
 The fd budget and the requested CQ depth track the effective sizes too
 (§4/§8), so a small deployment neither reserves nor demands the ceiling's
@@ -383,8 +383,8 @@ a raised `RLIMIT_NOFILE`:
 |---|---|---|---|
 | conn slots | 1386 | 11464 | ~1.7 KiB state + 8 KiB head |
 | relay buffers | 1386 | 11464 | 2 × 4 KiB |
-| upstream slots | 1024 | 11464 | ~40 B state + 8 KiB head |
-| **pool memory** | **~32 MiB** | **~284 MiB** | |
+| upstream slots | 1314 | 11464 | ~40 B state + 8 KiB head |
+| **pool memory** | **~33 MiB** | **~284 MiB** | |
 
 The ceilings sit on one completion-queue line — a conn slot costs
 `conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
@@ -407,10 +407,12 @@ in PLANS.md.
 
 The *defaults* are not pinned to each other, and deliberately: the
 out-of-box shape is bounded by the stock 4096 `RLIMIT_NOFILE` rather than
-by admission (matching 1386 would cost 4167 fds), and an L4 deployment
-never touches the upstream pool at all — an L4 dial holds no upstream
-slot. A deployment that means to fill its conn pool raises both together
-through `limits`.
+by admission (matching 1386 would cost 4167 fds), so the upstream default
+sits at 1314 — the largest value that still stays strictly under that
+line — rather than at the conn default. An L4 deployment never touches
+the upstream pool at all — an L4 dial holds no upstream slot. A
+deployment that means to fill its conn pool raises both together through
+`limits`.
 
 Rules:
 
