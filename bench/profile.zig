@@ -128,7 +128,7 @@ pub fn main(init: std.process.Init) !u8 {
     );
     const ring_before = readRingSample(io, zoxy_pid);
     const report = try loadTest(arena, io, &flags);
-    printRingDelta(io, zoxy_pid, ring_before, report.snapshot.counters.completed);
+    printRingDelta(io, zoxy_pid, &ring_before, report.snapshot.counters.completed);
     const perf_term = try perf_child.wait(io);
     if (perf_term != .exited or perf_term.exited != 0) {
         std.debug.print("profile: perf record exited abnormally ({any})\n", .{perf_term});
@@ -512,12 +512,26 @@ const RingSample = struct {
     /// which is the half that matters: completions per wake is the loop's
     /// batch depth, and batch depth is what separates "submission-bound"
     /// from "already coalescing".
+    ///
+    /// Undercounts by every non-blocking enter, and overcounts by every
+    /// other voluntary block on this thread — the second only matters if
+    /// there ever is one, which §3's one-thread-one-loop says there is
+    /// not. Reported batch depth is therefore a lower bound on the truth
+    /// in the first case and an upper bound in the second.
     wakes: u64,
-    /// Whether the CQ has overflowed. Overflowed completions are parked in
-    /// a kernel list and delivered late, or dropped outright once that
-    /// fills — either way the §8 budget that sized the ring was wrong, and
-    /// nothing else in this harness would notice.
-    overflowed: bool,
+    /// Whether the CQ has overflowed, or null when that cannot be told.
+    /// Overflowed completions are parked in a kernel list and delivered
+    /// late, or dropped outright once that fills — either way the §8
+    /// budget that sized the ring was wrong, and nothing else in this
+    /// harness would notice.
+    ///
+    /// Nullable because the one case that must never be reported as a
+    /// confident "no" is the one this exists to catch: fdinfo lists every
+    /// pending SQE and CQE, one line each, *before* `CqOverflowList:`, so
+    /// a ring deep enough to overflow is also a ring whose fdinfo can run
+    /// past any fixed read. A missing header then means "did not read far
+    /// enough", never "no overflow".
+    overflowed: ?bool,
 };
 
 /// Highest fd number scanned when looking for the ring. The fd is not
@@ -544,18 +558,24 @@ fn procField(content: []const u8, key: []const u8) ?u64 {
 }
 
 /// Whether a `/proc` list section named by `header` has any entry under
-/// it. fdinfo prints list headers unconditionally and indents their
-/// entries, while the next section's key starts at column zero — so the
-/// first line after the header is the whole answer. Absent header, or a
-/// header at end of file, is "no entries": a list that is not there cannot
-/// be non-empty.
-fn procListHasEntry(content: []const u8, header: []const u8) bool {
+/// it, or null when the text does not settle it. fdinfo prints list
+/// headers unconditionally and indents their entries, while the next
+/// section's key starts at column zero — so the first line after the
+/// header is the whole answer.
+///
+/// Null rather than false when the header is absent or ends the text,
+/// because for this caller those mean "the read stopped short", and the
+/// read stops short precisely when the ring is busiest. Every other parser
+/// in this file answers "cannot tell" with null; a bare `bool` here would
+/// be the one place that turns an unread file into a confident negative.
+fn procListHasEntry(content: []const u8, header: []const u8) ?bool {
     assert(header.len >= 1);
-    const at = std.mem.indexOf(u8, content, header) orelse return false;
+    assert(content.len >= 1);
+    const at = std.mem.indexOf(u8, content, header) orelse return null;
     const rest = content[at + header.len ..];
-    const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse return false;
+    const newline = std.mem.indexOfScalar(u8, rest, '\n') orelse return null;
     const next_line = rest[newline + 1 ..];
-    if (next_line.len == 0) return false;
+    if (next_line.len == 0) return null;
     return next_line[0] == ' ' or next_line[0] == '\t';
 }
 
@@ -563,10 +583,18 @@ fn procListHasEntry(content: []const u8, header: []const u8) bool {
 /// fdinfo cannot be found or read — a harness that cannot measure must say
 /// so, not print zeroes that read as "no work happened".
 fn readRingSample(io: Io, pid: i32) ?RingSample {
-    var buffer: [4096]u8 = undefined;
+    assert(pid > 0);
+    // Sized well past a quiet ring's fdinfo, because a busy one is not
+    // quiet text: every pending SQE and CQE prints a line of its own
+    // before the overflow list. A full buffer is therefore evidence of a
+    // truncated read, not of a large-but-complete one — the two are
+    // indistinguishable from the content alone, so the length is what
+    // `overflowed` keys its "cannot tell" off.
+    var buffer: [64 * 1024]u8 = undefined;
     var path_buffer: [64]u8 = undefined;
     var fd: u8 = 0;
     while (fd < ring_fd_scan_max) : (fd += 1) {
+        assert(fd < ring_fd_scan_max);
         const path = std.fmt.bufPrint(
             &path_buffer,
             "/proc/{d}/fdinfo/{d}",
@@ -575,6 +603,8 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
         const content = readSmallFile(io, path, &buffer) orelse continue;
         // `SqMask` is io_uring's own marker: no other fd type prints it.
         if (std.mem.indexOf(u8, content, "SqMask:") == null) continue;
+        // Both counters print near the top, ahead of any per-entry list,
+        // so they survive a truncated read; the overflow flag does not.
         const sqes = procField(content, "SqTail") orelse return null;
         const cqes = procField(content, "CqTail") orelse return null;
         // The list header is always printed, so its presence proves
@@ -582,12 +612,15 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
         // Entries are indented (`PollList` prints its own the same way)
         // and the next section key is not, so the first following line
         // decides it. Getting this backwards reads `NAPI:` as an overflow
-        // and cries wolf on every run.
-        const overflowed = procListHasEntry(content, "CqOverflowList:");
+        // and cries wolf on every run. A filled buffer means the header
+        // may simply lie past what was read, which is "cannot tell".
+        const truncated = content.len == buffer.len;
+        const overflowed = if (truncated) null else procListHasEntry(content, "CqOverflowList:");
         var status_buffer: [4096]u8 = undefined;
         const status_path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/status", .{pid}) catch return null;
         const status = readSmallFile(io, status_path, &status_buffer) orelse return null;
         const wakes = procField(status, "voluntary_ctxt_switches") orelse return null;
+        assert(cqes <= sqes); // A completion the loop never submitted is impossible.
         return .{ .sqes = sqes, .cqes = cqes, .wakes = wakes, .overflowed = overflowed };
     }
     return null;
@@ -597,13 +630,24 @@ fn readRingSample(io: Io, pid: i32) ?RingSample {
 /// completions per request, and the batch depth that says whether the loop
 /// is submission-bound. Silent when either sample is missing — see
 /// `readRingSample`.
-fn printRingDelta(io: Io, pid: i32, before: ?RingSample, completed: u64) void {
-    const start = before orelse return;
-    const end = readRingSample(io, pid) orelse return;
-    if (completed == 0 or end.cqes < start.cqes or end.wakes < start.wakes) return;
-    const sqes = end.sqes -| start.sqes;
-    const cqes = end.cqes -| start.cqes;
-    const wakes = end.wakes -| start.wakes;
+fn printRingDelta(io: Io, pid: i32, before: *const ?RingSample, completed: u64) void {
+    assert(pid > 0);
+    const start = before.* orelse return;
+    const end = readRingSample(io, pid) orelse {
+        std.debug.print("profile: ring  unavailable (no sample at end of window)\n", .{});
+        return;
+    };
+    // Every counter is cumulative and this process never restarted, so a
+    // counter that went backwards means the sample is not of the same ring
+    // — say so rather than print a saturated zero that reads as "idle".
+    if (end.sqes < start.sqes or end.cqes < start.cqes or end.wakes < start.wakes) {
+        std.debug.print("profile: ring  discarded (counters went backwards)\n", .{});
+        return;
+    }
+    if (completed == 0) return;
+    const sqes = end.sqes - start.sqes;
+    const cqes = end.cqes - start.cqes;
+    const wakes = end.wakes - start.wakes;
     assert(completed >= 1);
     const per_request = @as(f64, @floatFromInt(cqes)) / @as(f64, @floatFromInt(completed));
     const batch = if (wakes >= 1)
@@ -620,7 +664,7 @@ fn printRingDelta(io: Io, pid: i32, before: ?RingSample, completed: u64) void {
             per_request,
             wakes,
             batch,
-            if (end.overflowed) "YES" else "no",
+            if (end.overflowed) |o| (if (o) "YES" else "no") else "unknown",
         },
     );
 }
