@@ -713,6 +713,13 @@ each, so the enter is already amortised eight ways and multishot's saving
 — the per-read re-arm — has little left to take. The verdict stands, now
 on the workload it named rather than on an echo microbench.
 
+The four rows above were taken at settled loads of 0.41–0.50, which is
+what makes them comparable: batch depth is load-sensitive, and the same
+c10k row reads 3.7–3.8 on a box settled at 1.2–1.9. The direction of the
+trend is the finding, and reading it required rows measured under the
+same conditions — which is why the harness now reports the settled load
+per row rather than assuming one.
+
 Two corrections it forced. First, a c10k profile shows ~29% of self-time
 in libxev's `Readable.read` callback, and that was read here as "what
 multishot attacks". It is not: multishot removes the *submission*, not
@@ -735,30 +742,48 @@ the *per-connection inter-request gap* is what makes that expensive, and
 the cost is not the expiry — measured at 10k connections, 40k offered,
 where the gap is 250 ms:
 
-| | ops/req | wakes | cqes/wake | req/s | p50 | CPU samples | sock err | expiries |
-|---|---|---|---|---|---|---|---|---|
-| `request_ms=0` | 4.07 | 371,617 | 8.7 | 39,075 | 137 µs | 59,139 | 0 | 0 |
-| `request_ms=500` | 4.0 | — | — | 39,530 | 41 µs | 60,893 | 0 | 0 |
-| `request_ms=200` | **6.51** | **6,289** | **504** | 23,240 | **490 ms** | **24,080** | 28,568 | **0** |
+Bracketed sweep at 10k connections — three `request_ms=0` rows around the
+two treatments, so drift is measured rather than assumed. CPU is perf
+samples at 4 kHz over 20 s:
 
-(CPU samples are perf samples at 4 kHz over a 20 s window, so they are
-CPU-seconds × 4000 — comparable across rows, and the 59% fall is theirs.)
+| row | settled load | CPU samples | req/s | p50 |
+|---|---|---|---|---|
+| `request_ms=0` (A) | 1.19 | 58,459 | 39,516 | 44 µs |
+| `request_ms=200` | 1.35 | **38,944** | 39,479 | **51,056 µs** |
+| `request_ms=0` (A′) | 1.33 | 59,895 | 39,502 | 43 µs |
+| `request_ms=500` | 1.30 | 60,174 | 39,528 | 43 µs |
+| `request_ms=0` (A″) | 2.25 | 59,162 | 39,577 | 45 µs |
 
-Zero expiries in every row, including the one that collapses, so whatever
-this costs it is not the expiry path.
+The three baselines agree to 2.5% on CPU and 44/43/45 µs on p50, which is
+what makes the rest of the table readable. `request_ms=500` is
+indistinguishable from them: above the gap, nothing spurious fires.
 
-Measured: ops per request goes 4.07 → 6.51, **+2.44 ring ops**; sleeps go
-371,617 → 6,289; each remaining sleep drains 504 completions instead of
-8.7. Throughput falls 40% and CPU falls 59% — *less* CPU for *worse*
-service, which is the signature of a loop that stopped sleeping rather
-than one doing more work.
+`request_ms=200` costs **p50 43 µs → 51 ms** and **34% of CPU**, at
+unchanged throughput and with zero expiries. Less CPU for worse service
+is the signature of a loop that stopped sleeping rather than one doing
+more work.
 
-Inferred, and consistent with all of it but not directly observed: the
-extra ops are a timer armed per request that fires *between* requests,
-finds the keep-alive turnaround has already stored the 60 s idle
-deadline, and re-arms — arm, cancel, pointless fire, which is about the
-2.44 seen. Nothing in these counters watches an individual timer, so this
-is the account that fits, not a sighting.
+An earlier single run of this pair also showed throughput falling 39,075
+→ 23,240, and that is **not reproduced here** — 39,479 against a 39,516
+baseline. One run each, no bracketing; treat the throughput claim as
+withdrawn and the latency and CPU costs as the findings. The same run
+supplied the ring counters below, and its instrument has since been found
+to fail on busy rows, so those carry the same single-run caveat.
+
+From that single run, the ring counters read ops/req 4.07 → **6.51**
+(+2.44) and sleeps 371,617 → 6,289, each draining 504 completions rather
+than 8.7. Inferred from those, and consistent with everything above but
+not directly observed: the extra ops are a timer armed per request that
+fires *between* requests, finds the keep-alive turnaround has already
+stored the 60 s idle deadline, and re-arms — arm, cancel, pointless fire,
+which is about the 2.44 seen. Nothing in these counters watches an
+individual timer, so this is the account that fits, not a sighting.
+
+Batch depth is also load-sensitive, which the bracketed sweep exposed and
+the single run could not: the same `request_ms=0` c10k row reads 8.7
+cqes/wake at a settled load of ~0.5 and 3.7–3.8 at 1.2–1.9. Rows are
+therefore only comparable at comparable settled load, which is why every
+row now reports it.
 
 Also inferred, from one measured (gap, threshold) pair: that the rule is
 about timers generally rather than this timeout — any deadline shorter
