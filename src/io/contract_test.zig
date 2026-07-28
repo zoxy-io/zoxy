@@ -3,6 +3,43 @@
 //! scheduling) and `XevIo` (real loopback through io_uring). A sim that
 //! is kinder than the kernel proves nothing — this file is what keeps
 //! the two backends semantically aligned.
+//!
+//! It is also the home of seam-translation coverage (issue #106, kind D):
+//! `SimIo` is a different backend and never runs XevIo's errno mapping,
+//! so every named arm there is either pinned here on a real socket or
+//! has a written verdict below — decided per arm, never by omission.
+//!
+//!   listen  AddressInUse       tested: the squatted-port test.
+//!   listen  AddressUnavailable tested: the TEST-NET-3 bind test.
+//!   listen  AccessDenied       tested, environment-guarded: the
+//!           privileged-port test skips where the port is grantable.
+//!   accept  Canceled           tested: the listener-close cancel test.
+//!   connect Refused            tested: the closed-port dial test.
+//!   connect Canceled           tested: the stuck-dial cancel test.
+//!   connect Unreachable        not tested: EHOSTUNREACH needs a
+//!           packet-dropping route (root-only netns setup) and the
+//!           TimedOut spelling needs seconds of dropped SYNs; the map is
+//!           a straight rename of the fork's named errors and the §8
+//!           dial-deadline behavior above it is sim-covered. Revisit if
+//!           a netns harness ever lands.
+//!   recv    EndOfStream        tested: the echo scenario's FIN path.
+//!   recv    Reset              tested: the linger-RST recv test.
+//!   send    Reset (EPIPE)      tested: the write-shutdown send test.
+//!   send    Reset (ECONNRESET) not tested directly: pinning the errno
+//!           needs a send already blocked when the RST lands — an
+//!           unread-data close races the submission otherwise. The arm
+//!           shares its map target with EPIPE and its errno with the
+//!           recv test's pin, so a regression cannot change what the
+//!           caller observes.
+//!   recv/send Canceled         unreachable through the seam today: no
+//!           caller cancels a data op (§5 cancels connects and timers
+//!           only); the arms stay mapped for a future drain that does.
+//!   *       else => Unexpected the honest fallback: witnessed as §8
+//!           pressure with the raw errno kept by the fork
+//!           (`result_errno`). Two known peer-gone errnos still land
+//!           there — ENETUNREACH on connect, ETIMEDOUT on the data ops —
+//!           because the fork leaves them unnamed; naming them is queued
+//!           in docs/PLANS.md (libxev fork queue).
 
 const std = @import("std");
 const xev = @import("xev");
@@ -12,6 +49,40 @@ const SimIo = @import("SimIo.zig");
 const XevIo = @import("XevIo.zig");
 
 const assert = std.debug.assert;
+const posix = std.posix;
+
+const init_attempts_max: u8 = 5;
+
+/// Every test builds its ring through this. io_uring ring teardown is
+/// deferred in the kernel, so on a saturated box (the parallel ci
+/// graph) freed rings outlive their test long enough that a fresh
+/// io_uring_setup transiently hits the per-user accounting ceiling —
+/// ENOMEM with gigabytes free. Measured 2026-07-28 on the 8 MiB-memlock
+/// dev box: twelve sequential rings never fail, the parallel gate
+/// failed about half its runs at around the tenth. A bounded retry
+/// with a short pause is the honest answer to a transient; production
+/// creates one ring at startup and must keep failing loudly.
+fn initTestIo(xev_io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
+    var attempt: u8 = 1;
+    while (true) : (attempt += 1) {
+        assert(attempt <= init_attempts_max);
+        if (XevIo.init(xev_io, arena, cq_entries)) |_| {
+            return;
+        } else |err| {
+            if (err != error.SystemResources) return err;
+            if (attempt == init_attempts_max) return err;
+        }
+        // The pause is what lets the kernel's deferred frees land; the
+        // phenomenon (and the branch) is io_uring-only.
+        if (comptime xev.backend == .io_uring) {
+            const pause: std.os.linux.timespec = .{
+                .sec = 0,
+                .nsec = 20 * std.time.ns_per_ms,
+            };
+            _ = std.os.linux.nanosleep(&pause, null);
+        }
+    }
+}
 
 pub const echo_token = "echo-contract-token-0123456789abcdef";
 
@@ -210,7 +281,7 @@ test "contract: echo on XevIo over real loopback" {
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator(), 0);
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     var scenario: EchoScenario(XevIo) = .{ .io = &xev_io };
@@ -228,7 +299,7 @@ test "contract: XevIo requests a nonzero IORING_SETUP_CQSIZE depth" {
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator(), 16384);
+    try initTestIo(&xev_io, arena_state.allocator(), 16384);
     defer xev_io.deinit();
 
     if (comptime xev.backend == .io_uring) {
@@ -254,7 +325,7 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator(), 0);
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     // Force a coarse refresh for the baseline too — init() seeds cached_now
@@ -291,6 +362,36 @@ const Pair = struct {
     }
 };
 
+const ConnectedPair = struct {
+    listener: XevIo.Listener,
+    client: XevIo.Socket,
+    server: XevIo.Socket,
+};
+
+/// Establish a connected loopback pair through the seam's own API. The
+/// `Pair` completions have both delivered when this returns, so the
+/// stack-local scaffolding can die here.
+fn connectPair(xev_io: *XevIo) !ConnectedPair {
+    var pair: Pair = .{ .io = xev_io };
+    const listener = try xev_io.listen(
+        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+    );
+    xev_io.accept(listener, &pair.accept_completion, Pair, &pair, Pair.onAccept);
+    xev_io.connect(
+        xev_io.listenerAddress(listener),
+        &pair.connect_completion,
+        Pair,
+        &pair,
+        Pair.onConnect,
+    );
+    try xev_io.run();
+    const client = pair.client orelse return error.ConnectNeverCompleted;
+    const server = pair.server orelse return error.AcceptNeverCompleted;
+    assert(client != server);
+    assert(xev_io.listenerAddress(listener).getPort() != 0);
+    return .{ .listener = listener, .client = client, .server = server };
+}
+
 test "xevio: a send after our own write shutdown is Reset, not kernel pressure" {
     // Regression for the EPIPE collapse. libxev maps the errno for us
     // (`.PIPE => error.BrokenPipe`), but the send adapter named only
@@ -318,7 +419,7 @@ test "xevio: a send after our own write shutdown is Reset, not kernel pressure" 
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator(), 0);
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     // A connected loopback pair through the seam's own API — the echo
@@ -373,7 +474,7 @@ test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator(), 0);
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     const unavailable = std.Io.net.IpAddress.parseLiteral("203.0.113.1:0") catch unreachable;
@@ -391,7 +492,7 @@ test "xevio: SO_REUSEPORT lets two listeners share one port" {
     defer arena_state.deinit();
 
     var xev_io: XevIo = undefined;
-    try xev_io.init(arena_state.allocator(), 0);
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
     defer xev_io.deinit();
 
     // First listener takes an ephemeral port; read the concrete port back.
@@ -406,4 +507,258 @@ test "xevio: SO_REUSEPORT lets two listeners share one port" {
     shared.setPort(port);
     const second = try xev_io.listen(shared);
     try std.testing.expectEqual(port, xev_io.listenerAddress(second).getPort());
+}
+
+/// Sync close for fds the tests create outside the seam (a squatter, a
+/// backlog filler). Mirrors XevIo's own closeFd discipline, INTR
+/// tolerance included.
+fn closeRawFd(fd: posix.socket_t) void {
+    const rc = posix.system.close(fd);
+    const errno = posix.errno(rc);
+    assert(errno == .SUCCESS or errno == .INTR);
+}
+
+/// A raw loopback sockaddr for the one test that must dial outside the
+/// seam (the backlog filler's blocking connect).
+fn loopbackSockaddr(port: u16) posix.sockaddr.in {
+    return .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+}
+
+test "xevio: a port squatted without SO_REUSEPORT is AddressInUse" {
+    // The AddressInUse arm of the listen map. zoxy's own listeners share
+    // ports via SO_REUSEPORT, so producing a genuine conflict needs a
+    // squatter that did NOT set it — then the REUSEPORT bind fails
+    // EADDRINUSE, and the diagnosis must say "in use", not "unavailable".
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    // xev.TCP.init sets no REUSEPORT (XevIo.listen adds it separately),
+    // which is exactly the squatter this conflict needs.
+    const squat_address = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
+    const squatter = try xev.TCP.init(squat_address);
+    defer closeRawFd(squatter.fd);
+    try squatter.bind(squat_address);
+    try squatter.listen(1);
+    const port = try XevIo.boundPort(squatter.fd);
+    assert(port != 0);
+
+    var shared = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
+    shared.setPort(port);
+    try std.testing.expectError(error.AddressInUse, xev_io.listen(shared));
+}
+
+test "xevio: binding a privileged port without the capability is AccessDenied" {
+    // The AccessDenied arm of the listen map: port 1 needs
+    // CAP_NET_BIND_SERVICE. Where the environment grants low ports anyway
+    // (root, or a container with ip_unprivileged_port_start=0) there is
+    // nothing to prove — skip rather than fail, but never accept a third
+    // diagnosis: a wrong arm here sends an operator hunting for a
+    // conflicting process that does not exist.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    const privileged = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    if (xev_io.listen(privileged)) |listener| {
+        xev_io.listenClose(listener);
+        return error.SkipZigTest;
+    } else |err| {
+        try std.testing.expectEqual(Io.ListenError.AccessDenied, err);
+    }
+}
+
+test "xevio: a dial to a closed loopback port is Refused" {
+    // The Refused arm of the connect map: bind an ephemeral port to learn
+    // a concrete number, close it, dial it. The kernel answers RST —
+    // ECONNREFUSED is the origin's verdict (§8), never the pressure rung.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    const listener = try xev_io.listen(
+        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+    );
+    const address = xev_io.listenerAddress(listener);
+    assert(address.getPort() != 0);
+    xev_io.listenClose(listener);
+
+    var outcome: ?(Io.ConnectError!XevIo.Socket) = null;
+    var completion: XevIo.Completion = .{};
+    xev_io.connect(address, &completion, @TypeOf(outcome), &outcome, (struct {
+        fn onConnect(
+            state: *?(Io.ConnectError!XevIo.Socket),
+            result: Io.ConnectError!XevIo.Socket,
+        ) void {
+            state.* = result;
+        }
+    }).onConnect);
+    try xev_io.run();
+
+    const result = outcome orelse return error.ConnectNeverCompleted;
+    try std.testing.expectError(error.Refused, result);
+}
+
+/// The drain-shaped closer for the accept-cancel test: production closes
+/// listeners from inside the running loop (a signal's callback), and the
+/// cancel contract only holds for an accept the ring has actually seen —
+/// a listenClose before run() would close the fd under an unsubmitted op.
+const DrainCloser = struct {
+    io: *XevIo,
+    listener: XevIo.Listener,
+    timer_completion: XevIo.Completion = .{},
+
+    fn onTimer(closer: *DrainCloser, result: Io.TimerError!void) void {
+        // The only TimerError is Canceled, and nothing cancels this timer.
+        result catch unreachable;
+        closer.io.listenClose(closer.listener);
+    }
+};
+
+test "xevio: closing a listener cancels its armed accept" {
+    // The Canceled arm of the accept map — the §8 drain contract on a
+    // real ring: an io_uring op holds its own file reference, so
+    // listenClose must reap the armed accept through an async cancel and
+    // the accept must terminate with error.Canceled — never hang, never
+    // invent a socket.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    const listener = try xev_io.listen(
+        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+    );
+    var outcome: ?(Io.AcceptError!XevIo.Socket) = null;
+    var completion: XevIo.Completion = .{};
+    xev_io.accept(listener, &completion, @TypeOf(outcome), &outcome, (struct {
+        fn onAccept(
+            state: *?(Io.AcceptError!XevIo.Socket),
+            result: Io.AcceptError!XevIo.Socket,
+        ) void {
+            state.* = result;
+        }
+    }).onAccept);
+    var closer: DrainCloser = .{ .io = &xev_io, .listener = listener };
+    xev_io.timerStart(&closer.timer_completion, 0, DrainCloser, &closer, DrainCloser.onTimer);
+    try xev_io.run();
+
+    const result = outcome orelse return error.AcceptNeverCompleted;
+    try std.testing.expectError(error.Canceled, result);
+}
+
+test "xevio: a recv against a linger-RST close is Reset, with the errno pinned" {
+    // The ConnectionResetByPeer arm of the read map, deterministic by
+    // construction: the close(2) below fires the RST before run() ever
+    // submits the recv, so the op completes with ECONNRESET — the peer's
+    // verdict (error.Reset), never EOF and never the §8 pressure rung.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    const pair = try connectPair(&xev_io);
+    defer xev_io.closeNow(pair.client);
+    xev_io.listenClose(pair.listener);
+
+    var outcome: ?(Io.RecvError!u32) = null;
+    var buffer: [16]u8 = undefined;
+    var completion: XevIo.Completion = .{};
+    xev_io.recv(pair.client, &buffer, &completion, @TypeOf(outcome), &outcome, (struct {
+        fn onRecv(state: *?(Io.RecvError!u32), result: Io.RecvError!u32) void {
+            state.* = result;
+        }
+    }).onRecv);
+    try xev_io.setLingerRst(pair.server);
+    xev_io.closeNow(pair.server);
+    try xev_io.run();
+
+    const result = outcome orelse return error.RecvNeverCompleted;
+    try std.testing.expectError(error.Reset, result);
+    // Pin WHICH arm fired: the errno the fork kept must be the reset,
+    // so this cannot silently start passing via a future EOF mapping.
+    if (comptime xev.backend == .io_uring) {
+        try std.testing.expectEqual(posix.E.CONNRESET, completion.result_errno);
+    }
+}
+
+test "xevio: canceling a stuck dial delivers Canceled and releases the op" {
+    // The Canceled arm of the connect map — the §5 reap for a black-holed
+    // dial, built from loopback parts: a raw listener with a zero backlog
+    // whose only queue slot a raw filler already holds. The victim's SYN
+    // is dropped by the full accept queue, so the dial pends in
+    // retransmission until the cancel terminates it.
+    //
+    // io_uring only: the arm under test is the io_uring adapter's, and
+    // BSD accept-queue overflow answers RST where Linux drops — the
+    // pending-dial premise does not hold on the kqueue dev box.
+    if (comptime xev.backend != .io_uring) return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    const stuck_address = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
+    const stuck_listener = try xev.TCP.init(stuck_address);
+    defer closeRawFd(stuck_listener.fd);
+    try stuck_listener.bind(stuck_address);
+    try stuck_listener.listen(0);
+    const port = try XevIo.boundPort(stuck_listener.fd);
+    assert(port != 0);
+
+    // Blocking connect: returns established, occupying the single slot.
+    const filler = try xev.TCP.init(stuck_address);
+    defer closeRawFd(filler.fd);
+    var filler_sockaddr = loopbackSockaddr(port);
+    const rc = std.os.linux.connect(
+        filler.fd,
+        @ptrCast(&filler_sockaddr),
+        @sizeOf(posix.sockaddr.in),
+    );
+    if (posix.errno(rc) != .SUCCESS) return error.FillerConnectFailed;
+
+    var address = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
+    address.setPort(port);
+    var outcome: ?(Io.ConnectError!XevIo.Socket) = null;
+    var connect_completion: XevIo.Completion = .{};
+    xev_io.connect(address, &connect_completion, @TypeOf(outcome), &outcome, (struct {
+        fn onConnect(
+            state: *?(Io.ConnectError!XevIo.Socket),
+            result: Io.ConnectError!XevIo.Socket,
+        ) void {
+            state.* = result;
+        }
+    }).onConnect);
+    var canceled = false;
+    var cancel_completion: XevIo.Completion = .{};
+    xev_io.connectCancel(&connect_completion, &cancel_completion, bool, &canceled, (struct {
+        fn onCanceled(state: *bool) void {
+            state.* = true;
+        }
+    }).onCanceled);
+    try xev_io.run();
+
+    try std.testing.expect(canceled);
+    const result = outcome orelse return error.ConnectNeverCompleted;
+    try std.testing.expectError(error.Canceled, result);
 }
