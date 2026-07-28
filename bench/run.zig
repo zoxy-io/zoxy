@@ -234,7 +234,7 @@ fn runOverload(
     const rss_before_kb = try readRssKb(arena, io, child.id);
     var config = benchConfig(overload_http_port, overload_connections, flags.rate, "/");
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
-    const report = try zrk.runner.run(arena, io, &config, 0, null, null);
+    const report = try zrk.runner.run(arena, io, &config, 0, null, null, null);
     const rss_after_kb = try readRssKb(arena, io, child.id);
 
     std.debug.print("-- overload (offered >> capacity) --\n", .{});
@@ -632,7 +632,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u
     while (attempt < probe_attempts_max) : (attempt += 1) {
         var config = benchConfig(port, 4, 100, "/");
         config.duration_ns = std.time.ns_per_s / 2;
-        const report = zrk.runner.run(arena, io, &config, 0, null, null) catch |err| {
+        const report = zrk.runner.run(arena, io, &config, 0, null, null, null) catch |err| {
             if (attempt == probe_attempts_max - 1) return err;
             io.sleep(retry_sleep, .awake) catch {};
             continue;
@@ -699,7 +699,7 @@ fn loadTest(
     if (scenario == .close) {
         config.headers = &close_headers;
     }
-    const report = try zrk.runner.run(arena, io, &config, 0, null, null);
+    const report = try zrk.runner.run(arena, io, &config, 0, null, null, null);
     assert(report.launched >= 1);
     return report;
 }
