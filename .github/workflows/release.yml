@@ -52,19 +52,27 @@ jobs:
           version="${{ steps.ver.outputs.version }}"
           mkdir -p dist
 
-          # zig-target : release-archive-label
+          # zig-target : release-archive-label : -Dcpu value (empty = default)
+          #
+          # x86_64 gets -Dcpu=x86_64_v3 (AVX2/BMI2/FMA, Haswell 2013+ / Zen
+          # 2017+): the default cross-compile baseline is plain SSE2, which
+          # caps hparse's vector width at 128 bits (std.simd.suggestVectorLength
+          # keys off target CPU features, DESIGN.md §7); v3 doubles it to 256.
+          # aarch64 is left at its default baseline — NEON is mandatory in
+          # ARMv8-A, so there is no wider portable win to take there.
           targets="
-            x86_64-linux-musl:x86_64-linux
-            aarch64-linux-musl:aarch64-linux
-            x86_64-macos:x86_64-macos
-            aarch64-macos:aarch64-macos
+            x86_64-linux-musl:x86_64-linux:x86_64_v3
+            aarch64-linux-musl:aarch64-linux:
+            x86_64-macos:x86_64-macos:x86_64_v3
+            aarch64-macos:aarch64-macos:
           "
           for pair in $targets; do
-            zig_t="${pair%%:*}"
-            label="${pair##*:}"
-            echo "::group::$label ($zig_t)"
+            zig_t="$(echo "$pair" | cut -d: -f1)"
+            label="$(echo "$pair" | cut -d: -f2)"
+            cpu="$(echo "$pair" | cut -d: -f3)"
+            echo "::group::$label ($zig_t${cpu:+, -Dcpu=$cpu})"
             devenv shell -- zig build \
-              -Dtarget="$zig_t" -Doptimize=ReleaseFast --prefix "out/$label"
+              -Dtarget="$zig_t" ${cpu:+-Dcpu="$cpu"} -Doptimize=ReleaseFast --prefix "out/$label"
             tar czf "dist/zoxy-$version-$label.tar.gz" -C "out/$label/bin" zoxy
             echo "::endgroup::"
           done
