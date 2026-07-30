@@ -773,7 +773,12 @@ so `zig build bench` is invoked deliberately against a real origin, and
 its hard invariants (flat RSS, clean drain, sub-1% socket-error rate)
 are the pass/fail part. `zig build ci` deliberately excludes it.
 
-1. **Deterministic simulation — `zig build sim -- [seed] [iterations]`.**
+1. **Deterministic simulation — `zig build sim -- [seed] [iterations]
+   [keep-going]`.** `keep-going` names every failing seed in the range
+   (up to a cap) instead of stopping at the first, and states the range
+   it actually reached: the nightly soak wants that census, because its
+   blocks are keyed to the run number and a block abandoned mid-sweep is
+   never revisited. `ci` omits it and keeps the first failure, fast.
    The `SimIo` backend (§4) runs the real data path against virtual
    sockets and a virtual clock under a seeded adversarial scheduler:
    partial reads/writes down to 1 byte, delayed/refused/black-holed/

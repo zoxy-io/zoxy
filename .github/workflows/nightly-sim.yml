@@ -12,6 +12,17 @@ name: Nightly simulation
 # the sweep is a cumulative claim — "seeds 1..N have been swept" — rather
 # than the random walk `zig build sim -- fuzz` would give. Any failure
 # replays exactly, locally, from the seed in the report.
+#
+# The night's block is split across parallel shards, and each shard
+# sweeps with `keep-going`. Both exist because a failure used to cost the
+# rest of the night: run #4 (2026-07-30) stopped at seed 3064744, 6.5%
+# into its million-seed block, so the night proved nothing about the
+# other 935k — and since ranges are keyed to the run number, that
+# remainder is never revisited. Now a shard censuses its own slice
+# instead of stopping, and `fail-fast: false` keeps the siblings running,
+# so a *failing* night still reports its whole block. Sharding also buys
+# the block size back in wall clock: 4M seeds finish in the time 1M used
+# to take.
 
 on:
   schedule:
@@ -20,9 +31,13 @@ on:
   workflow_dispatch:
     inputs:
       seeds:
-        description: "Seeds to sweep this run"
+        description: "Seeds per shard"
         required: false
         default: "1000000"
+      shards:
+        description: "Parallel shards (block = shards x seeds)"
+        required: false
+        default: "4"
       start_seed:
         description: "First seed (blank = continue the nightly range)"
         required: false
@@ -34,14 +49,88 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  soak:
-    name: sim soak
+  # Contiguous, disjoint blocks: run N sweeps the N-th block, so the union
+  # over all runs is a solid range from seed 1 with no repeats. Two things
+  # put holes in that: changing `seeds`/`shards` between runs re-tiles the
+  # blocks, and a manual run with `start_seed` still consumes a run
+  # number, leaving that block unswept. Both are harmless — seeds are
+  # independent — and both are why every report states the exact range
+  # swept rather than implying the union.
+  plan:
+    name: plan block
     runs-on: ubuntu-latest
-    # Measured ~800 seeds/s in Debug on an 8-core dev box; a shared
-    # runner is slower, so 1M seeds is roughly an hour. The cap is
-    # headroom, not a target — a soak that hits it should shrink `seeds`
-    # rather than run longer.
-    timeout-minutes: 180
+    outputs:
+      shards: ${{ steps.range.outputs.shards }}
+      shard_list: ${{ steps.range.outputs.shard_list }}
+      seeds: ${{ steps.range.outputs.seeds }}
+      start: ${{ steps.range.outputs.start }}
+      last: ${{ steps.range.outputs.last }}
+      block: ${{ steps.range.outputs.block }}
+    steps:
+      - name: Compute seed range
+        id: range
+        env:
+          SEEDS: ${{ inputs.seeds || '1000000' }}
+          SHARDS: ${{ inputs.shards || '4' }}
+          START_OVERRIDE: ${{ inputs.start_seed }}
+          RUN_NUMBER: ${{ github.run_number }}
+          # Runs 1..4 swept seeds 1..4,000,000 one job at a time, 1M per
+          # run. The sharded tiling resumes after them rather than
+          # re-deriving from run 1, because a block-size change would
+          # otherwise skip everything between the old tiling's end and the
+          # new block's start — 12M seeds, in this case. Changing
+          # `seeds`/`shards` again wants the same treatment: set the pair
+          # below to the last seed swept and the next run's number.
+          SWEPT_BEFORE: "4000000"
+          FIRST_SHARDED_RUN: "5"
+        run: |
+          set -euo pipefail
+          block=$(( SHARDS * SEEDS ))
+          if [ -n "$START_OVERRIDE" ]; then
+            start="$START_OVERRIDE"
+          elif [ "$RUN_NUMBER" -ge "$FIRST_SHARDED_RUN" ]; then
+            start=$(( SWEPT_BEFORE + 1 + (RUN_NUMBER - FIRST_SHARDED_RUN) * block ))
+          else
+            # Only reachable if the epoch above is edited without moving
+            # FIRST_SHARDED_RUN past the runs it describes.
+            start=$(( 1 + (RUN_NUMBER - 1) * block ))
+          fi
+          {
+            echo "shards=$SHARDS"
+            echo "shard_list=$(seq 0 $(( SHARDS - 1 )) | jq -cs .)"
+            echo "seeds=$SEEDS"
+            echo "start=$start"
+            echo "block=$block"
+            echo "last=$(( start + block - 1 ))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summarize the plan
+        env:
+          SHARDS: ${{ steps.range.outputs.shards }}
+          SEEDS: ${{ steps.range.outputs.seeds }}
+          START: ${{ steps.range.outputs.start }}
+          LAST: ${{ steps.range.outputs.last }}
+        run: |
+          set -euo pipefail
+          echo "Sweeping $START..$LAST across $SHARDS shards of $SEEDS seeds." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  soak:
+    name: sim soak ${{ matrix.shard }}
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      # The point of sharding: one shard's failure must not cancel the
+      # others, or a failing night still reports a single slice.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shard_list) }}
+    # Measured on this runner 2026-07-29 (run #3): 1M seeds in 717 s, so
+    # ~1400 seeds/s in Debug — a shared runner is not slower than the dev
+    # box here. A 1M shard is ~12 min; the cap is headroom, not a target,
+    # and a shard that hits it should shrink `seeds` rather than run
+    # longer. `keep-going` never runs past the end of its own slice.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -60,30 +149,6 @@ jobs:
       - name: Install devenv
         run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
 
-      # Contiguous, disjoint blocks: run N sweeps the N-th block, so the
-      # union over all runs is a solid range from seed 1 with no repeats.
-      # Two things put holes in that: changing `seeds` between runs
-      # re-tiles the blocks, and a manual run with `start_seed` still
-      # consumes a run number, leaving that block unswept. Both are
-      # harmless — seeds are independent — and both are why the report
-      # states the exact range swept rather than implying the union.
-      - name: Compute seed range
-        id: range
-        env:
-          SEEDS: ${{ inputs.seeds || '1000000' }}
-          START_OVERRIDE: ${{ inputs.start_seed }}
-          RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          set -euo pipefail
-          if [ -n "$START_OVERRIDE" ]; then
-            start="$START_OVERRIDE"
-          else
-            start=$(( 1 + (RUN_NUMBER - 1) * SEEDS ))
-          fi
-          echo "start=$start" >> "$GITHUB_OUTPUT"
-          echo "count=$SEEDS" >> "$GITHUB_OUTPUT"
-          echo "last=$(( start + SEEDS - 1 ))" >> "$GITHUB_OUTPUT"
-
       # Debug, deliberately, and do not "optimize" this. Measured
       # 2026-07-28 on the dev box, 20k seeds: Debug 25 s, ReleaseSafe
       # 88 s, ReleaseFast 3 s. ReleaseFast is the tempting one and is
@@ -99,63 +164,136 @@ jobs:
       - name: Sweep
         id: sweep
         env:
-          START: ${{ steps.range.outputs.start }}
-          COUNT: ${{ steps.range.outputs.count }}
+          START: ${{ needs.plan.outputs.start }}
+          SEEDS: ${{ needs.plan.outputs.seeds }}
+          SHARD: ${{ matrix.shard }}
         run: |
           set -uo pipefail
+          shard_start=$(( START + SHARD * SEEDS ))
+          shard_last=$(( shard_start + SEEDS - 1 ))
           began=$(date +%s)
           set +e
-          devenv shell -- zig build sim -- "$START" "$COUNT" 2>&1 | tee sweep.log
+          devenv shell -- zig build sim -- "$shard_start" "$SEEDS" keep-going 2>&1 \
+            | tee "sweep-${SHARD}.log"
           status=${PIPESTATUS[0]}
           set -e
           elapsed=$(( $(date +%s) - began ))
-          echo "elapsed=$elapsed" >> "$GITHUB_OUTPUT"
-          echo "rate=$(( COUNT / (elapsed > 0 ? elapsed : 1) ))" >> "$GITHUB_OUTPUT"
-          # The simulator names the offending seed on every failure shape
-          # (a failed invariant, the same on replay, and a trace that did
-          # not reproduce), which is the whole handle for reproducing it:
-          # `zig build sim -- N 1`. Anchored to the simulator's own lines
-          # so a `seed=`-shaped string anywhere in the nix or build output
-          # cannot be mistaken for the verdict.
-          seed=$(grep -oE 'sim: (FAILURE|NONDETERMINISM).*' sweep.log \
-            | grep -oE 'seed=[0-9]+' | head -1 | cut -d= -f2 || true)
-          echo "seed=${seed:-}" >> "$GITHUB_OUTPUT"
-          if grep -q 'NONDETERMINISM' sweep.log; then
-            echo "kind=nondeterminism" >> "$GITHUB_OUTPUT"
-          else
-            echo "kind=invariant" >> "$GITHUB_OUTPUT"
+          # The simulator names every failing seed on the summary line and
+          # states the range it actually reached, so a shard that stopped
+          # at the failure cap cannot read as having cleared the rest.
+          # Anchored to the simulator's own lines so a `seed=`-shaped
+          # string anywhere in the nix or build output cannot be mistaken
+          # for the verdict.
+          seeds_failed=$(grep -oE '^sim: [0-9]+ seed\(s\) failed: .*' "sweep-${SHARD}.log" \
+            | sed 's/^.*failed: //' | head -1 || true)
+          swept_last=$(grep -oE '^sim: swept [0-9]+\.\.[0-9]+' "sweep-${SHARD}.log" \
+            | grep -oE '[0-9]+$' | head -1 || true)
+          extent=exact
+          if [ -z "$swept_last" ]; then
+            if [ "$status" -eq 0 ]; then
+              # A clean pass prints no `swept` line; the whole slice is done.
+              swept_last="$shard_last"
+            else
+              # Neither summary line: the sim panicked rather than
+              # returning, so `keep-going` never ran and how far this
+              # shard got is unknown. Claim nothing — assuming the full
+              # slice here would report a crashed shard as near-fully
+              # verified, which is the false all-clear this whole change
+              # exists to remove.
+              swept_last=$(( shard_start - 1 ))
+              extent=unknown
+            fi
           fi
-          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if grep -q 'NONDETERMINISM' "sweep-${SHARD}.log"; then
+            kind=nondeterminism
+          else
+            kind=invariant
+          fi
+          capped=false
+          if grep -q 'failure cap reached' "sweep-${SHARD}.log"; then capped=true; fi
+          # jq builds the record so a seed list can never break the JSON.
+          jq -n \
+            --argjson shard "$SHARD" \
+            --argjson start "$shard_start" \
+            --argjson last "$shard_last" \
+            --argjson swept_last "$swept_last" \
+            --argjson status "$status" \
+            --argjson elapsed "$elapsed" \
+            --argjson capped "$capped" \
+            --arg kind "$kind" \
+            --arg extent "$extent" \
+            --arg seeds "$seeds_failed" \
+            '{shard: $shard, start: $start, last: $last, swept_last: $swept_last,
+              status: $status, elapsed: $elapsed, capped: $capped, kind: $kind,
+              extent: $extent,
+              failed: ($seeds | split(" ") | map(select(length > 0) | tonumber))}' \
+            > "result-${SHARD}.json"
+          cat "result-${SHARD}.json"
           exit "$status"
 
-      # Reports both outcomes: a soak nobody hears from is indistinguishable
-      # from a soak that silently stopped running.
-      - name: Report to Discord
+      # always(): the record and the log are what the report is built
+      # from, so they must survive the shard failing.
+      - name: Upload shard result
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: |
+            result-${{ matrix.shard }}.json
+            sweep-${{ matrix.shard }}.log
+          if-no-files-found: ignore
+
+  # Reports both outcomes, once for the whole block: a soak nobody hears
+  # from is indistinguishable from a soak that silently stopped running.
+  report:
+    name: report
+    needs: [plan, soak]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          merge-multiple: true
+          path: results
+
+      - name: Report to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          OUTCOME: ${{ steps.sweep.outcome }}
-          START: ${{ steps.range.outputs.start }}
-          LAST: ${{ steps.range.outputs.last }}
-          COUNT: ${{ steps.range.outputs.count }}
-          ELAPSED: ${{ steps.sweep.outputs.elapsed }}
-          RATE: ${{ steps.sweep.outputs.rate }}
-          SEED: ${{ steps.sweep.outputs.seed }}
-          KIND: ${{ steps.sweep.outputs.kind }}
+          OUTCOME: ${{ needs.soak.result }}
+          START: ${{ needs.plan.outputs.start }}
+          LAST: ${{ needs.plan.outputs.last }}
+          BLOCK: ${{ needs.plan.outputs.block }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+          SEEDS: ${{ needs.plan.outputs.seeds }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ -z "${WEBHOOK:-}" ]; then
-            echo "::warning::DISCORD_WEBHOOK is not set; skipping the report."
-            exit 0
-          fi
-          # printf, not a multi-line literal: the replay block carries
-          # newlines and backticks, and both stay inside one YAML line here.
-          if [ "$OUTCOME" = "success" ]; then
+          # One aggregate over every shard that produced a record. Shards
+          # that never got that far are counted as missing rather than
+          # passing, so a lost shard cannot inflate the claim.
+          records=$(cat results/result-*.json 2>/dev/null | jq -cs . || echo '[]')
+          reported=$(echo "$records" | jq 'length')
+          swept=$(echo "$records" | jq '[.[] | .swept_last - .start + 1] | add // 0')
+          failing=$(echo "$records" | jq '[.[] | select(.status != 0)] | length')
+          capped=$(echo "$records" | jq '[.[] | select(.capped)] | length')
+          seeds=$(echo "$records" | jq -r '[.[] | .failed[]] | sort | .[0:20] | join(" ")')
+          total_seeds=$(echo "$records" | jq '[.[] | .failed | length] | add // 0')
+          missing=$(( SHARDS - reported ))
+          unknown=$(echo "$records" | jq '[.[] | select(.extent == "unknown")] | length')
+          elapsed=$(echo "$records" | jq '[.[] | .elapsed] | max // 0')
+          # Say when the list is trimmed: "naming 40 seeds" beside 20 of
+          # them otherwise reads as the whole set.
+          shown=""
+          if [ "$total_seeds" -gt 20 ]; then shown=" (first 20)"; fi
+
+          if [ "$OUTCOME" = "success" ] && [ "$missing" -eq 0 ]; then
             title="Nightly simulation passed"
             color=3066993
-            detail=$(printf 'Swept seeds `%s..%s` with every §9 invariant holding.' "$START" "$LAST")
+            detail=$(printf 'Swept seeds `%s..%s` across %s shards with every §9 invariant holding.' \
+              "$START" "$LAST" "$SHARDS")
           elif [ "$OUTCOME" = "cancelled" ]; then
             # Distinct from a failure: nothing was proven, but nothing broke.
             title="Nightly simulation cancelled"
@@ -164,11 +302,33 @@ jobs:
           else
             title="Nightly simulation FAILED"
             color=15158332
-            if [ -n "${SEED:-}" ]; then
-              detail=$(printf 'Seed `%s` failed (%s). Replay it exactly:\n```\nzig build sim -- %s 1\n```' "$SEED" "$KIND" "$SEED")
+            if [ "$total_seeds" -gt 0 ]; then
+              detail=$(printf '%s of %s shards failed, naming %s seed(s)%s. Replay any of them exactly:\n```\nzig build sim -- <seed> 1\n```\nSeeds: `%s`' \
+                "$failing" "$SHARDS" "$total_seeds" "$shown" "$seeds")
             else
-              detail="The sweep failed before naming a seed — see the run log."
+              detail=$(printf '%s of %s shards failed without naming a seed — see the run log.' \
+                "$failing" "$SHARDS")
             fi
+            if [ "$capped" -gt 0 ]; then
+              detail="$detail"$(printf '\n%s shard(s) hit the failure cap, so seeds past their last swept point are unverified.' "$capped")
+            fi
+            # A shard that died before writing its record proved nothing,
+            # and its slice is not in the swept count — say so rather than
+            # letting the passing shards imply the block was covered.
+            if [ "$missing" -gt 0 ]; then
+              detail="$detail"$(printf '\n%s shard(s) produced no record at all; their slices are unswept.' "$missing")
+            fi
+            # A panic prints no summary line, so the sim never named the
+            # seed and the slice counts as zero verified.
+            if [ "$unknown" -gt 0 ]; then
+              detail="$detail"$(printf '\n%s shard(s) crashed rather than returning a verdict; their coverage is unknown and counted as zero. Check the sweep log for the panic.' "$unknown")
+            fi
+          fi
+
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::warning::DISCORD_WEBHOOK is not set; skipping the report."
+            printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           # jq builds the payload so a seed, a range, or a future message
           # can never break out of the JSON.
@@ -176,8 +336,9 @@ jobs:
             --arg title "$title" \
             --arg detail "$detail" \
             --argjson color "$color" \
-            --arg range "${START:-?}..${LAST:-?} (${COUNT:-?} seeds)" \
-            --arg timing "${ELAPSED:-0}s (~${RATE:-0} seeds/s)" \
+            --arg range "${START:-?}..${LAST:-?} (${BLOCK:-?} seeds)" \
+            --arg shards "${SHARDS:-?} x ${SEEDS:-?}, ${swept} verified" \
+            --arg timing "${elapsed:-0}s slowest shard" \
             --arg sha "${SHA:0:7}" \
             --arg url "$RUN_URL" \
             '{
@@ -189,6 +350,7 @@ jobs:
                 url: $url,
                 fields: [
                   {name: "Range", value: $range, inline: true},
+                  {name: "Shards", value: $shards, inline: true},
                   {name: "Duration", value: $timing, inline: true},
                   {name: "Commit", value: $sha, inline: true}
                 ]
@@ -197,15 +359,4 @@ jobs:
           curl -sS -f -X POST -H "Content-Type: application/json" \
             -d @payload.json "$WEBHOOK" > /dev/null
           echo "Reported: $title"
-
-      # The failing seed is the reproducer, but the log says which
-      # invariant broke — worth keeping past the Discord message.
-      - name: Upload sweep log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sweep-log
-          path: sweep.log
-          # A failure before the sweep (build, devenv) leaves no log; that
-          # is not itself an error worth failing the job a second time for.
-          if-no-files-found: ignore
+          printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"
