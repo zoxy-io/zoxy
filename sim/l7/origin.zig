@@ -11,6 +11,7 @@ const std = @import("std");
 const zoxy = @import("zoxy");
 
 const canon = @import("canon.zig");
+const scripts = @import("scripts.zig");
 
 const Io = zoxy.Io;
 const parser = zoxy.http.parser;
@@ -77,13 +78,36 @@ pub fn HttpOrigin(comptime IoType: type) type {
         const Phase = enum(u8) { head, body, respond };
         const FramingTag = enum(u8) { none, content_length, chunked };
 
+        comptime {
+            // What `compact` makes true, checked rather than trusted:
+            // the buffer measures one request, so every script's wire
+            // bytes must fit it. Add a script past this and the gate
+            // fails at compile time instead of surfacing as a
+            // one-in-200k `OriginSawMalformedBytes`.
+            //
+            // One request is the whole bound. A recv can coalesce this
+            // request's tail with the next one's opening bytes, which
+            // `compact` carries over — but only a later exchange can
+            // supply those, and §5 checkout is exclusive, so the proxy
+            // cannot forward the next request until this response has
+            // fully arrived, which is after `compact` ran. Hence the
+            // carry-over is empty in practice, and the largest
+            // forwarded script (`post_big`, 6055 bytes) leaves 10 KiB
+            // spare even if it were not.
+            for (std.enums.values(scripts.Script)) |script| {
+                assert(scripts.spec(script).request.len <= request_buffer_bytes);
+            }
+        }
+
         pub const Conn = struct {
             origin: *Self = undefined,
             socket: IoType.Socket = undefined,
             recv_completion: IoType.Completion = .{},
             send_completion: IoType.Completion = .{},
-            /// Every request stays captured; the current one starts at
-            /// `request_offset` and parses from there.
+            /// Received and not yet consumed; the current request starts
+            /// at `request_offset` and parses from there. Compacted at
+            /// each keep-alive boundary, so this bounds one request, not
+            /// a reused connection's lifetime.
             request_buffer: [request_buffer_bytes]u8 = undefined,
             request_len: u32 = 0,
             request_offset: u32 = 0,
@@ -291,6 +315,34 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 return true;
             }
 
+            /// Drop what the answered requests consumed, so the buffer
+            /// measures the request in flight rather than everything the
+            /// connection ever carried. §5 parking reuses one upstream
+            /// connection across exchanges, and the reuse count is
+            /// unbounded: without this, enough `post_big` forwards
+            /// (6055 bytes each) fill any buffer, and the oracle reads
+            /// that well-framed traffic as forwarded excess — failing
+            /// the seed on the proxy's own good behavior. Seed 3064744
+            /// was three of them on one connection.
+            fn compact(conn: *Conn) void {
+                assert(conn.phase == .head);
+                assert(conn.request_offset >= 1);
+                assert(conn.request_offset <= conn.request_len);
+                const remaining = conn.request_len - conn.request_offset;
+                // Shifting left, so forwards: every destination write
+                // lands before that offset is read as a source.
+                std.mem.copyForwards(
+                    u8,
+                    conn.request_buffer[0..remaining],
+                    conn.request_buffer[conn.request_offset..conn.request_len],
+                );
+                conn.request_len = remaining;
+                conn.request_offset = 0;
+                // A served request consumed at least its head, so the
+                // compacted buffer always has room for `armRecv`.
+                assert(conn.request_len < conn.request_buffer.len);
+            }
+
             /// A request still incomplete with the buffer full is
             /// forwarded excess the scripts never produce — a violation,
             /// not a capacity shortfall; otherwise read on.
@@ -346,9 +398,10 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     conn.armDrainRecv();
                     return;
                 }
-                // Keep-alive: the next request parses from the new offset
-                // (its bytes may already be buffered).
+                // Keep-alive: the next request parses from the front
+                // again (its bytes may already be buffered).
                 conn.phase = .head;
+                conn.compact();
                 conn.advance();
             }
 
