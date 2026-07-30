@@ -11,7 +11,11 @@ name: Nightly simulation
 # Ranges are deterministic and contiguous, keyed to the run number, so
 # the sweep is a cumulative claim — "seeds 1..N have been swept" — rather
 # than the random walk `zig build sim -- fuzz` would give. Any failure
-# replays exactly, locally, from the seed in the report.
+# replays exactly, locally, from the seed in the report. The claim is
+# per-epoch, not forever: the tiling starts wherever the epoch in `plan`
+# points, so moving it restarts the range deliberately (and each report
+# names its commit, because a seed swept by an older gate is a weaker
+# check than the same seed today).
 #
 # The night's block is split across parallel shards, and each shard
 # sweeps with `keep-going`. Both exist because a failure used to cost the
@@ -49,13 +53,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Contiguous, disjoint blocks: run N sweeps the N-th block, so the union
-  # over all runs is a solid range from seed 1 with no repeats. Two things
-  # put holes in that: changing `seeds`/`shards` between runs re-tiles the
-  # blocks, and a manual run with `start_seed` still consumes a run
-  # number, leaving that block unswept. Both are harmless — seeds are
-  # independent — and both are why every report states the exact range
-  # swept rather than implying the union.
+  # Contiguous, disjoint blocks: run N sweeps block N - EPOCH_RUN, so the
+  # union over an epoch's runs is a solid range from EPOCH_SEED. Three
+  # things break that, none of them silently:
+  #
+  #  - moving the epoch restarts the range on purpose, so the union across
+  #    epochs repeats whatever the previous one had reached (runs 1..4
+  #    swept 1..4,000,000, and the epoch below sweeps it again);
+  #  - changing `seeds`/`shards` between runs re-tiles the blocks;
+  #  - a manual run with `start_seed` still consumes a run number, leaving
+  #    that block unswept.
+  #
+  # All three are harmless — seeds are independent — and all three are why
+  # every report states the exact range swept rather than implying a
+  # cumulative union.
   plan:
     name: plan block
     runs-on: ubuntu-latest
@@ -74,26 +85,41 @@ jobs:
           SHARDS: ${{ inputs.shards || '4' }}
           START_OVERRIDE: ${{ inputs.start_seed }}
           RUN_NUMBER: ${{ github.run_number }}
-          # Runs 1..4 swept seeds 1..4,000,000 one job at a time, 1M per
-          # run. The sharded tiling resumes after them rather than
-          # re-deriving from run 1, because a block-size change would
-          # otherwise skip everything between the old tiling's end and the
-          # new block's start — 12M seeds, in this case. Changing
-          # `seeds`/`shards` again wants the same treatment: set the pair
-          # below to the last seed swept and the next run's number.
-          SWEPT_BEFORE: "4000000"
-          FIRST_SHARDED_RUN: "5"
+          # The tiling epoch: run EPOCH_RUN sweeps the block starting at
+          # EPOCH_SEED, and every later run takes the next block. Moving
+          # this pair is the only way to redirect the sweep — set
+          # EPOCH_SEED to the seed to resume from and EPOCH_RUN to the next
+          # run number. Changing `seeds`/`shards` needs the same move, or
+          # the new block size re-tiles from a different origin and skips
+          # everything between the old tiling's end and the new block's
+          # start.
+          #
+          # Set to 1 / 5 to restart the sweep. Runs 1..4 swept 1..4,000,000
+          # but as four separate builds, a million each; at 4M a night one
+          # run now re-covers that whole range against a single commit, so
+          # the claim becomes "this build swept 1..N" rather than "four
+          # builds each swept a different million". Worth repeating
+          # whenever the gate gains detection power — a new oracle or a
+          # closed coverage gap makes every earlier sweep a weaker check
+          # than today's, and re-treading them is then real evidence
+          # rather than a repeat.
+          EPOCH_SEED: "1"
+          EPOCH_RUN: "5"
         run: |
           set -euo pipefail
           block=$(( SHARDS * SEEDS ))
           if [ -n "$START_OVERRIDE" ]; then
             start="$START_OVERRIDE"
-          elif [ "$RUN_NUMBER" -ge "$FIRST_SHARDED_RUN" ]; then
-            start=$(( SWEPT_BEFORE + 1 + (RUN_NUMBER - FIRST_SHARDED_RUN) * block ))
+          elif [ "$RUN_NUMBER" -ge "$EPOCH_RUN" ]; then
+            start=$(( EPOCH_SEED + (RUN_NUMBER - EPOCH_RUN) * block ))
           else
-            # Only reachable if the epoch above is edited without moving
-            # FIRST_SHARDED_RUN past the runs it describes.
-            start=$(( 1 + (RUN_NUMBER - 1) * block ))
+            # Only reachable if EPOCH_RUN is set past the next run.
+            # Extrapolating backward would derive a seed below the epoch,
+            # so hold at its first block instead: every run until the epoch
+            # arrives re-sweeps that block rather than tiling forward.
+            # Repeating a block beats sweeping below EPOCH_SEED, and each
+            # report still names the exact range, so the repeat is visible.
+            start="$EPOCH_SEED"
           fi
           {
             echo "shards=$SHARDS"
