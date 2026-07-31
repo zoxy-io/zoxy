@@ -72,7 +72,11 @@ pub fn HttpOrigin(comptime IoType: type) type {
         violations: u32 = 0,
 
         const Self = @This();
-        pub const conns_max: u8 = 32;
+        /// Sized for the worst case: client-driven dials (fresh, replay,
+        /// post-ejection) plus a `check` scenario's passing probes, each
+        /// of which accepts and vanishes (§7) but still consumes a slot —
+        /// conns are tracked monotonically, never recycled.
+        pub const conns_max: u8 = 64;
         const request_buffer_bytes: u32 = 16384;
 
         const Phase = enum(u8) { head, body, respond };

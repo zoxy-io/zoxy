@@ -35,6 +35,26 @@ const Harness = @This();
 const clients_max: u8 = 6;
 /// Virtual time from scenario start after which stuck work is force-ended.
 const scenario_end_ns: u64 = 2_000_000_000;
+/// The slowest §7 probe pacing a non-outage seed may draw. Named so the
+/// origin-capacity bound below is derived from the same number the draw
+/// uses, not restated in prose.
+const health_interval_floor_ms: u32 = 100;
+/// Upper bound on probe sweeps one scenario can run against a listening
+/// origin: the interval floor paces them across the scenario, plus the
+/// immediate first sweep. Outage seeds pace far tighter but stop their
+/// origin within tens of milliseconds, so their passing probes stay
+/// under this bound too.
+const probe_sweeps_max: u64 =
+    scenario_end_ns / (health_interval_floor_ms * std.time.ns_per_ms) + 1;
+
+comptime {
+    // Passing probes consume origin conn slots (accept-and-vanish, never
+    // recycled), on top of each origin's client-driven worst case: one
+    // conn per L4 client, and the pre-probe capacity of 32 the 4096-seed
+    // sweeps validated for the HTTP origin's dial churn.
+    assert(Origin.conns_max >= @as(u64, clients_max) + probe_sweeps_max);
+    assert(HttpOrigin.conns_max >= 32 + probe_sweeps_max);
+}
 
 io: SimIo,
 server: ServerSim,
@@ -58,6 +78,17 @@ ended_count: u8,
 /// origin, so the L7 oracles demand exact golden outcomes.
 clean: bool,
 end_timer_completion: SimIo.Completion,
+/// Virtual instant at which the HTTP origin stops listening mid-run, or
+/// 0 for never. Drawn on a fraction of checked-http adversarial seeds:
+/// probes then start refusing while parked connections from earlier
+/// exchanges still exist, which is the only schedule that reaches the
+/// §5 parked-close on ejection under the fuzz — chance alone almost
+/// never lines an ejection up with a parked conn. Statistical, not
+/// guaranteed: a scenario that winds down before the drawn instant
+/// never sees its outage, which is fine — the sweep needs the schedule
+/// to land often, not on every draw.
+http_origin_stop_at_ns: u64,
+http_origin_stop_completion: SimIo.Completion,
 scenario_prng: std.Random.DefaultPrng,
 
 fn bindAddress() std.Io.net.IpAddress {
@@ -103,6 +134,26 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         harness,
         onScenarioEnd,
     );
+    harness.http_origin_stop_completion = .{};
+    if (harness.http_origin_stop_at_ns != 0) {
+        assert(harness.http_origin_stop_at_ns < scenario_end_ns);
+        harness.io.timerStart(
+            &harness.http_origin_stop_completion,
+            harness.http_origin_stop_at_ns,
+            Harness,
+            harness,
+            onHttpOriginStop,
+        );
+    }
+}
+
+/// The mid-run origin outage (§7): refused dials are a fate clients
+/// already meet under the adversary's own knobs, so the prefix oracles
+/// absorb it — what it adds is probes failing against a cluster that
+/// still holds parked connections.
+fn onHttpOriginStop(harness: *Harness, result: Io.TimerError!void) void {
+    result catch return;
+    harness.origin_http.stopListening();
 }
 
 fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
@@ -145,9 +196,18 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         if (random.boolean()) .p2c else .rr;
     const pick_http: zoxy.config.Config.Cluster.Pick =
         if (random.boolean()) .p2c else .rr;
+    // Each cluster draws §7 active health checks independently, so the
+    // prober runs its whole lifecycle — sweeps, fall/rise transitions
+    // under the adversary's connect fates, parked-close on ejection, and
+    // drain from every state — inside the schedule fuzz. Fail-open keeps
+    // a single-endpoint topology's routing unchanged whatever the
+    // verdicts, so the L7 golden oracles hold on clean seeds (where
+    // probes always pass) and prefix-legality holds under the adversary.
+    const health = deriveHealthChecks(harness.clean, random);
+    harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
     harness.clusters = .{
-        .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick_l4 },
-        .{ .name = "origin-http", .endpoints = &harness.endpoints_http, .pick = pick_http },
+        .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick_l4, .check = health.check_l4 },
+        .{ .name = "origin-http", .endpoints = &harness.endpoints_http, .pick = pick_http, .check = health.check_http },
     };
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
@@ -180,7 +240,49 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         // schedule fuzz; the fourth leaves it off, which is the shape
         // that must reserve nothing and read no clock (§5, §8).
         .access_log_sink = if (random.uintLessThan(u8, 4) == 0) null else .stdout,
+        .health_interval_ms = health.interval_ms,
     };
+}
+
+/// The §7 health-check shape of one scenario: which clusters probe, how
+/// fast, and whether the HTTP origin dies mid-run.
+const HealthDraw = struct {
+    check_l4: bool,
+    check_http: bool,
+    interval_ms: u32,
+    http_origin_stop_at_ns: u64,
+};
+
+/// An eighth of adversarial seeds are outage seeds: the HTTP origin
+/// stops listening while clients are still live and parked connections
+/// still exist — most scenarios wind down within tens of virtual
+/// milliseconds, so the outage lands inside that window, paced in
+/// milliseconds so fall's three misses do too. Outage seeds check only
+/// the http cluster: the tight pacing on a stuck 2 s scenario would
+/// otherwise stream hundreds of passing probes into the L4 origin's
+/// conn table, while the stopped HTTP origin refuses its probes and a
+/// refused probe consumes no origin conn. Everyone else paces from the
+/// `health_interval_floor_ms` the origin-capacity bound is derived at.
+fn deriveHealthChecks(clean: bool, random: std.Random) HealthDraw {
+    const outage = !clean and random.uintLessThan(u8, 8) == 0;
+    const draw: HealthDraw = .{
+        .check_l4 = !outage and random.boolean(),
+        .check_http = outage or random.boolean(),
+        .interval_ms = if (outage)
+            5 + random.uintAtMost(u32, 10)
+        else
+            health_interval_floor_ms + random.uintAtMost(u32, 400),
+        .http_origin_stop_at_ns = if (outage)
+            (10 + random.uintAtMost(u64, 30)) * std.time.ns_per_ms
+        else
+            0,
+    };
+    // An outage always probes the cluster it exists to eject, and the
+    // instant always precedes the scenario-end backstop.
+    assert(draw.http_origin_stop_at_ns == 0 or draw.check_http);
+    assert(draw.http_origin_stop_at_ns < scenario_end_ns);
+    assert(draw.interval_ms >= 1);
+    return draw;
 }
 
 /// The deterministic half of the topology: two listeners, and the §7
