@@ -246,9 +246,11 @@ const HttpOrigin = struct {
     /// Close the second accepted connection immediately: the replayed
     /// try fails too, pinning the one-replay budget (§7).
     close_second_at_accept: bool = false,
-    /// Two connections: the second accept serves the §7 replay's fresh
-    /// dial. Tests that must prove reuse assert `accepted_count == 1`.
-    conns: [2]OConn = .{ .{}, .{} },
+    /// The second accept serves the §7 replay's fresh dial, and a
+    /// `check` scenario's probes each accept-and-vanish too — hence four
+    /// slots, not two. Tests that must prove reuse assert
+    /// `accepted_count == 1`.
+    conns: [4]OConn = .{ .{}, .{}, .{}, .{} },
     accepted_count: u32 = 0,
     requests_served: u32 = 0,
 
@@ -440,6 +442,7 @@ const Http1Bed = struct {
     client: HttpClient,
     client2: HttpClient,
     drain_timer_completion: SimIo.Completion,
+    origin_stop_completion: SimIo.Completion,
 
     const idle_timeout_ms: u32 = 1000;
     /// Deliberately 20× tighter than the idle timeout so a test can witness
@@ -505,6 +508,12 @@ const Http1Bed = struct {
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
         access_log: bool = false,
+        /// §7 active health checks on the one cluster; off by default so
+        /// existing scenarios see no probe traffic.
+        check: bool = false,
+        /// Probe pacing for `check` scenarios — tight, so fall/rise fit
+        /// inside a short virtual run.
+        health_interval_ms: u32 = 40,
     };
 
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
@@ -518,7 +527,7 @@ const Http1Bed = struct {
         }
         try bed.sim_io.init(arena, .{ .seed = options.seed, .adversary = adversary });
         bed.endpoints = .{originAddress()};
-        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{
             .bind_address = bindAddress(),
@@ -535,6 +544,7 @@ const Http1Bed = struct {
             .max_lifetime_ms = options.max_lifetime_ms,
             .request_timeout_ms = options.request_timeout_ms,
             .access_log_sink = if (options.access_log) .stdout else null,
+            .health_interval_ms = options.health_interval_ms,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
@@ -559,6 +569,7 @@ const Http1Bed = struct {
         bed.client = .{ .send_delay_ms = options.send_delay_ms };
         bed.client2 = .{};
         bed.drain_timer_completion = .{};
+        bed.origin_stop_completion = .{};
     }
 
     /// A sweep-observation scenario cannot let the client drive the drain
@@ -577,6 +588,24 @@ const Http1Bed = struct {
     fn onDrainTimer(bed: *Http1Bed, result: Io.TimerError!void) void {
         result catch unreachable; // Nothing cancels the test drain timer.
         bed.server.beginDrain();
+    }
+
+    /// Stop the origin's listener mid-run at a chosen instant — how a
+    /// health scenario turns a serving origin into a refusing one while
+    /// probes are in flight (§7).
+    fn armOriginStopTimer(bed: *Http1Bed, delay_ms: u32) void {
+        bed.sim_io.timerStart(
+            &bed.origin_stop_completion,
+            @as(u64, delay_ms) * std.time.ns_per_ms,
+            Http1Bed,
+            bed,
+            onOriginStopTimer,
+        );
+    }
+
+    fn onOriginStopTimer(bed: *Http1Bed, result: Io.TimerError!void) void {
+        result catch unreachable; // Nothing cancels the origin-stop timer.
+        bed.origin.stopListening();
     }
 
     fn tearDown(bed: *Http1Bed) void {
@@ -2355,6 +2384,35 @@ test "l7: the idle sweep reaps a parked upstream past its deadline" {
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_idle_reaped"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_reused"));
+    try bed.expectDrained();
+}
+
+test "l7: ejecting an endpoint closes its parked connections" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 55,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .check = true,
+        .health_interval_ms = 40,
+    });
+    defer bed.tearDown();
+
+    // The exchange parks its upstream; then the origin stops listening,
+    // the probes start missing, and the third miss ejects the endpoint —
+    // which must close the parked connection on the spot (§5), long
+    // before the idle sweep (interval 500ms here) would have reaped it.
+    // The client must not drain (that reaps parked instantly), so a
+    // timer drains after the ejection has had time to land.
+    bed.client.drain_on_finish = false;
+    bed.armOriginStopTimer(25);
+    bed.armDrainTimer(300);
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_parked_closed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_idle_reaped"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.unhealthy_count);
     try bed.expectDrained();
 }
 

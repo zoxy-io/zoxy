@@ -99,6 +99,26 @@ pub const Counters = struct {
     upstream_replayed: Value = Value.init(0),
     /// Parked upstream connections reaped by the idle sweep (§5).
     upstream_idle_reaped: Value = Value.init(0),
+    /// §7 active health probes dispatched — one per checked endpoint per
+    /// sweep. Not in the gate identity: a probe is the prober's own dial,
+    /// never an accepted connection.
+    health_probes_sent: Value = Value.init(0),
+    /// Probes that failed: refused, unreachable, timed out under the
+    /// connect budget, or kernel pressure on our side (§7). The pressure
+    /// case also lands in `kernel_pressure_connect`, same as a data-path
+    /// dial.
+    health_probes_failed: Value = Value.init(0),
+    /// Endpoints ejected from balancing after `health_probe_fall`
+    /// consecutive failed probes (§7). Their parked connections are
+    /// closed at the transition (§5, `health_parked_closed`).
+    health_endpoint_down: Value = Value.init(0),
+    /// Ejected endpoints restored to balancing after `health_probe_rise`
+    /// consecutive successful probes (§7).
+    health_endpoint_up: Value = Value.init(0),
+    /// Parked upstream connections closed because their endpoint was
+    /// ejected (§5): a parked socket to a dead origin is a stale replay
+    /// waiting to be spent.
+    health_parked_closed: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
     /// across every completion (accept, connect, setNodelay, and the relay
     /// recv/send data path). The total; `kernel_pressure_by_op` below
@@ -207,12 +227,21 @@ pub const Counters = struct {
         /// counters already carry the history. This is what keeps an
         /// `other_cause` diagnosable instead of merely counted.
         kernel_pressure_last_errno: u32,
+        /// Endpoints under §7 active checks — static per config (the
+        /// sum of `endpoints` over every `check` cluster). The capacity
+        /// the unhealthy level below is read against.
+        health_endpoints_checked: u32,
+        /// Checked endpoints currently ejected from balancing (§7). A
+        /// level, not a counter: `health_endpoint_down`/`_up` carry the
+        /// history; a scrape wants how many are out *now*.
+        health_endpoints_unhealthy: u32,
 
         /// The invariant every producer owes: a level never exceeds its
         /// own capacity, and the two upstream levels share one.
         pub fn valid(gauges: *const Gauges) bool {
             if (gauges.conn_slots_in_use > gauges.conn_slots_capacity) return false;
             if (gauges.relay_buffers_in_use > gauges.relay_buffers_capacity) return false;
+            if (gauges.health_endpoints_unhealthy > gauges.health_endpoints_checked) return false;
             const upstream_in_use = @as(u64, gauges.upstream_slots_leased) +
                 gauges.upstream_slots_parked;
             return upstream_in_use <= gauges.upstream_slots_capacity;
@@ -424,6 +453,12 @@ pub const Counters = struct {
         // Every §7 replay rides a checkout: only a reused connection's
         // early failure is blamed on staleness.
         assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));
+        // A probe can only fail if it was sent; an ejection needs at least
+        // one failed probe; a restore needs a prior ejection (endpoints
+        // start healthy, §7).
+        assert(counters.get("health_probes_failed") <= counters.get("health_probes_sent"));
+        assert(counters.get("health_endpoint_down") <= counters.get("health_probes_failed"));
+        assert(counters.get("health_endpoint_up") <= counters.get("health_endpoint_down"));
         // The op split partitions the total exactly: a witness that
         // incremented one without the other would make the split lie about
         // where the pressure is, which is the only thing it exists to say.
@@ -463,6 +498,8 @@ const test_gauges: Counters.Gauges = .{
     .upstream_slots_parked = 11,
     .upstream_slots_capacity = 16,
     .kernel_pressure_last_errno = 105, // ENOBUFS on Linux
+    .health_endpoints_checked = 4,
+    .health_endpoints_unhealthy = 1,
 };
 
 test "counters: render emits Prometheus exposition for every field" {

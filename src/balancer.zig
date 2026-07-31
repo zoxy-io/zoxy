@@ -53,12 +53,15 @@ pub const Balancer = struct {
     /// Choose the endpoint to dial for `cluster_index` under the
     /// cluster's configured policy. `leased_counts` is the pool's
     /// per-endpoint load table (indexed by `upstream.endpointKey`),
-    /// consulted by p2c and ignored by rr. Bounded work, no allocation,
-    /// and a validated config guarantees at least one endpoint.
+    /// consulted by p2c and ignored by rr; `healthy` is the §7 health
+    /// mask (same index) — the prober owns that truth the way the pool
+    /// owns the load. Bounded work, no allocation, and a validated
+    /// config guarantees at least one endpoint.
     pub fn pick(
         balancer: *Balancer,
         cluster_index: u16,
         leased_counts: *const [upstream.endpoint_keys_max]u16,
+        healthy: *const [upstream.endpoint_keys_max]bool,
     ) Pick {
         assert(cluster_index < balancer.config.clusters.len);
         const cluster = &balancer.config.clusters[cluster_index];
@@ -66,12 +69,15 @@ pub const Balancer = struct {
         assert(cluster.endpoints.len <= constants.endpoints_per_cluster_max);
         if (cluster.endpoints.len == 1) {
             // Neither a rotation nor a draw: single-endpoint clusters
-            // stay branch-cheap and policy state is untouched.
+            // stay branch-cheap and policy state is untouched. The mask
+            // is moot too — one endpoint ejected is the fail-open case.
             return .{ .address = cluster.endpoints[0], .endpoint_index = 0 };
         }
+        var eligible: [constants.endpoints_per_cluster_max]u16 = undefined;
+        const count = eligibleEndpoints(cluster_index, cluster, healthy, &eligible);
         const chosen = switch (cluster.pick) {
-            .rr => balancer.pickRoundRobin(cluster_index, cluster),
-            .p2c => balancer.pickPowerOfTwo(cluster_index, cluster, leased_counts),
+            .rr => balancer.pickRoundRobin(cluster_index, eligible[0..count]),
+            .p2c => balancer.pickPowerOfTwo(cluster_index, eligible[0..count], leased_counts),
         };
         assert(chosen < cluster.endpoints.len);
         return .{
@@ -80,42 +86,80 @@ pub const Balancer = struct {
         };
     }
 
-    /// Strict rotation: the cursor modulo the endpoint count, then
-    /// incremented — every endpoint sees exactly its share, in order.
+    /// The §7-eligible endpoints: the healthy ones — or, the fail-open
+    /// rule, every endpoint when the whole cluster is ejected. Dialing a
+    /// maybe-dead endpoint reports the outage the way it always did;
+    /// routing nowhere would turn a probe verdict into an outage of its
+    /// own, and a same-port TCP probe cannot know better than the dial.
+    fn eligibleEndpoints(
+        cluster_index: u16,
+        cluster: *const config_module.Config.Cluster,
+        healthy: *const [upstream.endpoint_keys_max]bool,
+        eligible: *[constants.endpoints_per_cluster_max]u16,
+    ) u16 {
+        assert(cluster.endpoints.len >= 2); // pick() short-circuited 1.
+        var count: u16 = 0;
+        for (0..cluster.endpoints.len) |endpoint_index| {
+            const index: u16 = @intCast(endpoint_index);
+            if (healthy[upstream.endpointKey(cluster_index, index)]) {
+                eligible[count] = index;
+                count += 1;
+            }
+        }
+        if (count == 0) {
+            for (0..cluster.endpoints.len) |endpoint_index| {
+                eligible[endpoint_index] = @intCast(endpoint_index);
+            }
+            count = @intCast(cluster.endpoints.len);
+        }
+        assert(count >= 1);
+        assert(count <= cluster.endpoints.len);
+        return count;
+    }
+
+    /// Strict rotation over the eligible set: the cursor modulo its
+    /// size, then incremented — every eligible endpoint sees its share,
+    /// in order. Ejections shift the rotation phase; the share stays
+    /// exact for whatever set is eligible at each pick.
     fn pickRoundRobin(
         balancer: *Balancer,
         cluster_index: u16,
-        cluster: *const config_module.Config.Cluster,
+        eligible: []const u16,
     ) u16 {
-        assert(cluster.pick == .rr);
-        assert(cluster.endpoints.len >= 2); // pick() short-circuited 1.
-        const chosen: u16 =
-            @intCast(balancer.cursors[cluster_index] % cluster.endpoints.len);
+        assert(balancer.config.clusters[cluster_index].pick == .rr);
+        assert(eligible.len >= 1);
+        const slot: u16 = @intCast(balancer.cursors[cluster_index] % eligible.len);
         balancer.cursors[cluster_index] += 1;
-        assert(chosen < cluster.endpoints.len);
-        return chosen;
+        assert(slot < eligible.len);
+        return eligible[slot];
     }
 
-    /// P2C: two distinct uniform candidates, the lower leased count
-    /// wins, a tie goes to the first.
+    /// P2C over the eligible set: two distinct uniform candidates, the
+    /// lower leased count wins, a tie goes to the first. A mask narrowed
+    /// to one endpoint skips the draw the way a one-endpoint cluster
+    /// does — no candidates to compare, no PRNG state spent.
     fn pickPowerOfTwo(
         balancer: *Balancer,
         cluster_index: u16,
-        cluster: *const config_module.Config.Cluster,
+        eligible: []const u16,
         leased_counts: *const [upstream.endpoint_keys_max]u16,
     ) u16 {
-        assert(cluster.pick == .p2c);
-        const endpoint_count = cluster.endpoints.len;
-        assert(endpoint_count >= 2); // pick() short-circuited 1.
-        const first: u16 = @intCast(balancer.next() % endpoint_count);
-        var second: u16 = @intCast(balancer.next() % (endpoint_count - 1));
-        // Skip past `first`, mapping the (n-1)-range draw onto the other
-        // n-1 endpoints uniformly.
-        if (second >= first) {
-            second += 1;
+        assert(balancer.config.clusters[cluster_index].pick == .p2c);
+        assert(eligible.len >= 1);
+        if (eligible.len == 1) {
+            return eligible[0];
         }
-        assert(first != second);
-        assert(second < endpoint_count);
+        const first_slot: u16 = @intCast(balancer.next() % eligible.len);
+        var second_slot: u16 = @intCast(balancer.next() % (eligible.len - 1));
+        // Skip past `first_slot`, mapping the (n-1)-range draw onto the
+        // other n-1 eligible slots uniformly.
+        if (second_slot >= first_slot) {
+            second_slot += 1;
+        }
+        assert(first_slot != second_slot);
+        assert(second_slot < eligible.len);
+        const first = eligible[first_slot];
+        const second = eligible[second_slot];
         const first_load = leased_counts[upstream.endpointKey(cluster_index, first)];
         const second_load = leased_counts[upstream.endpointKey(cluster_index, second)];
         return if (second_load < first_load) second else first;
@@ -138,6 +182,10 @@ pub const Balancer = struct {
 };
 
 const test_counts_len = upstream.endpoint_keys_max;
+
+/// The no-prober baseline every pre-mask test picks through: all healthy,
+/// exactly what `Checker.init` hands a server whose clusters never check.
+const test_healthy_all = [_]bool{true} ** upstream.endpoint_keys_max;
 
 fn testConfig(clusters: []const config_module.Config.Cluster) config_module.Config {
     return .{
@@ -169,7 +217,7 @@ test "balancer: rr cycles endpoints and wraps per cluster" {
     counts[upstream.endpointKey(0, 0)] = 100;
     const expected = [_]u16{ 0, 1, 2, 0, 1 };
     for (expected) |want_index| {
-        const picked = balancer.pick(0, &counts);
+        const picked = balancer.pick(0, &counts, &test_healthy_all);
         try std.testing.expectEqual(want_index, picked.endpoint_index);
         try std.testing.expectEqual(trio[want_index], picked.address);
     }
@@ -190,7 +238,7 @@ test "balancer: a single-endpoint cluster short-circuits without a draw" {
     const counts = [_]u16{0} ** test_counts_len;
     var round: u32 = 0;
     while (round < 10) : (round += 1) {
-        const picked = balancer.pick(0, &counts);
+        const picked = balancer.pick(0, &counts, &test_healthy_all);
         try std.testing.expectEqual(solo, picked.address);
         try std.testing.expectEqual(@as(u16, 0), picked.endpoint_index);
     }
@@ -218,7 +266,7 @@ test "balancer: p2c prefers the less-loaded of its two candidates" {
     counts[upstream.endpointKey(0, 1)] = 100;
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
-        const picked = balancer.pick(0, &counts);
+        const picked = balancer.pick(0, &counts, &test_healthy_all);
         try std.testing.expect(picked.endpoint_index != 1);
     }
 }
@@ -242,7 +290,7 @@ test "balancer: p2c spreads across endpoints under equal load" {
     var hits = [_]u32{0} ** 3;
     var round: u32 = 0;
     while (round < 300) : (round += 1) {
-        const picked = balancer.pick(0, &counts);
+        const picked = balancer.pick(0, &counts, &test_healthy_all);
         hits[picked.endpoint_index] += 1;
     }
     for (hits) |hit_count| {
@@ -270,9 +318,114 @@ test "balancer: same seed, same picks — the p2c draw is deterministic" {
     var round: u32 = 0;
     while (round < 100) : (round += 1) {
         try std.testing.expectEqual(
-            left.pick(0, &counts).endpoint_index,
-            right.pick(0, &counts).endpoint_index,
+            left.pick(0, &counts, &test_healthy_all).endpoint_index,
+            right.pick(0, &counts, &test_healthy_all).endpoint_index,
         );
+    }
+}
+
+test "balancer: rr rotates over the healthy endpoints only" {
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
+    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "trio", .endpoints = &trio, .pick = .rr },
+    };
+    const config = testConfig(&clusters);
+
+    var balancer: Balancer = undefined;
+    balancer.init(&config);
+
+    // Endpoint 1 is ejected (§7): rotation covers the survivors exactly,
+    // never the ejected one.
+    var healthy = test_healthy_all;
+    healthy[upstream.endpointKey(0, 1)] = false;
+    const counts = [_]u16{0} ** test_counts_len;
+    const expected = [_]u16{ 0, 2, 0, 2, 0 };
+    for (expected) |want_index| {
+        const picked = balancer.pick(0, &counts, &healthy);
+        try std.testing.expectEqual(want_index, picked.endpoint_index);
+    }
+}
+
+test "balancer: p2c never picks an ejected endpoint" {
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
+    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "trio", .endpoints = &trio, .pick = .p2c },
+    };
+    const config = testConfig(&clusters);
+
+    var balancer: Balancer = undefined;
+    balancer.init(&config);
+
+    // Even the least-loaded endpoint is off the table while ejected —
+    // health outranks load (§7).
+    var healthy = test_healthy_all;
+    healthy[upstream.endpointKey(0, 1)] = false;
+    var counts = [_]u16{0} ** test_counts_len;
+    counts[upstream.endpointKey(0, 0)] = 50;
+    counts[upstream.endpointKey(0, 2)] = 50;
+    var round: u32 = 0;
+    while (round < 200) : (round += 1) {
+        const picked = balancer.pick(0, &counts, &healthy);
+        try std.testing.expect(picked.endpoint_index != 1);
+    }
+}
+
+test "balancer: p2c narrowed to one healthy endpoint spends no draw" {
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "pair", .endpoints = &pair, .pick = .p2c },
+    };
+    const config = testConfig(&clusters);
+
+    var balancer: Balancer = undefined;
+    balancer.init(&config);
+    const state_before = balancer.pick_state;
+
+    // One survivor: the pick is forced, so the PRNG must not advance —
+    // the same no-draw rule as a single-endpoint cluster.
+    var healthy = test_healthy_all;
+    healthy[upstream.endpointKey(0, 0)] = false;
+    const counts = [_]u16{0} ** test_counts_len;
+    var round: u32 = 0;
+    while (round < 10) : (round += 1) {
+        const picked = balancer.pick(0, &counts, &healthy);
+        try std.testing.expectEqual(@as(u16, 1), picked.endpoint_index);
+    }
+    try std.testing.expectEqual(state_before, balancer.pick_state);
+}
+
+test "balancer: a fully-ejected cluster fails open to every endpoint" {
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
+    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "trio", .endpoints = &trio, .pick = .rr },
+    };
+    const config = testConfig(&clusters);
+
+    var balancer: Balancer = undefined;
+    balancer.init(&config);
+
+    // Every endpoint ejected: the mask must not brick the cluster —
+    // rotation runs over the full set as if no prober existed (§7).
+    var healthy = test_healthy_all;
+    healthy[upstream.endpointKey(0, 0)] = false;
+    healthy[upstream.endpointKey(0, 1)] = false;
+    healthy[upstream.endpointKey(0, 2)] = false;
+    const counts = [_]u16{0} ** test_counts_len;
+    const expected = [_]u16{ 0, 1, 2, 0, 1 };
+    for (expected) |want_index| {
+        const picked = balancer.pick(0, &counts, &healthy);
+        try std.testing.expectEqual(want_index, picked.endpoint_index);
     }
 }
 
@@ -294,7 +447,7 @@ test "balancer: policies keep independent state across clusters" {
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 1, 0, 1, 0 };
     for (expected) |want_index| {
-        try std.testing.expectEqual(want_index, balancer.pick(0, &counts).endpoint_index);
-        _ = balancer.pick(1, &counts);
+        try std.testing.expectEqual(want_index, balancer.pick(0, &counts, &test_healthy_all).endpoint_index);
+        _ = balancer.pick(1, &counts, &test_healthy_all);
     }
 }

@@ -465,7 +465,11 @@ pub fn Proxy(comptime IoType: type) type {
             // beats a fresh dial. A close that slipped through while it
             // was parked surfaces as a failure on first use — absorbed by
             // the §7 free replay (`upstreamFailed`).
-            const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
+            const pick = server.balancer.pick(
+                conn.cluster_index,
+                &server.upstreams.leased_counts,
+                &server.health.healthy,
+            );
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
@@ -1563,7 +1567,11 @@ pub fn Proxy(comptime IoType: type) type {
             conn.directions = .{ .{}, .{} };
             // A fresh pick and a fresh dial — never another checkout (§7):
             // the endpoint's whole idle list may be stale the same way.
-            const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
+            const pick = server.balancer.pick(
+                conn.cluster_index,
+                &server.upstreams.leased_counts,
+                &server.health.healthy,
+            );
             dialUpstream(server, conn, pick);
         }
 
