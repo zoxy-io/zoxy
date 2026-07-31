@@ -374,8 +374,11 @@ Three shared pools, all owned and touched only by the loop thread:
    an in-flight op per idle upstream in the ring budget (§8) for a race
    that is already covered: the parked connection's deadline timer serves
    as an idle timeout (kept below typical origin keep-alive windows, so
-   most origin-side closes are pre-empted), and a close that slips through
-   is detected at checkout and absorbed by the stale-replay rung (§7).
+   most origin-side closes are pre-empted), a close that slips through is
+   detected at checkout and absorbed by the stale-replay rung (§7), and
+   active health checks (§7) close the parked connections of an endpoint
+   at its ejection — a parked socket to a dead origin is a stale replay
+   waiting to be spent.
 
 Sizing shape. The comptime constants are the hard, budget-asserted
 *ceilings*; the config `limits` block sizes the *effective* pools anywhere
@@ -654,8 +657,25 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   from a fixed-seed PRNG, the lower leased count wins) by default, `rr`
   for strict rotation. Cluster endpoints are static socket addresses
   resolved once at config load, never on the loop (dynamic DNS is a
-  non-goal, §1). Circuit breakers, outlier ejection, retry budgets,
-  health checks are *deferred* — the previous iteration proved them
+  non-goal, §1).
+- **Active TCP health checks** are per-cluster opt-in (`check` —
+  HAProxy's model) so a request is not routed to an endpoint known to be
+  down. One prober per server sweeps every checked endpoint with a
+  single probe in flight, budgeted like the admin plane (§8:
+  `health_probe_ops_max` ring ops and one fd, reserved unconditionally);
+  each probe is a dial under the `connect_ms` budget, and sweeps pace
+  sweep-end to sweep-start on `timeouts.health_interval_ms`. A SYN/ACK
+  passes; refused, unreachable, timed out, or kernel pressure (witnessed
+  §8) fails. `health_probe_fall` (3) consecutive misses eject the
+  endpoint from balancing and close its parked pooled connections (§5);
+  `health_probe_rise` (2) passes restore it. Endpoints start healthy —
+  probing demotes, never gates startup — and the pick **fails open**: a
+  cluster with every endpoint ejected balances as if none were, because
+  routing nowhere would turn a probe verdict into an outage of its own,
+  and a same-port TCP probe cannot know better than the dial it stands
+  in for. The check is TCP-level: it proves the port accepts, not that
+  the application behind it is well. Circuit breakers, outlier ejection,
+  retry budgets stay *deferred* — the previous iteration proved them
   buildable in this architecture; simplicity says they wait for a
   demonstrated need.
 
