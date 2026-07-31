@@ -524,6 +524,12 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
 /// predates it keeps — and the rest split between the two trust modes, so
 /// the render's suppression and the chain assembly both take the schedule
 /// fuzz rather than only the directed tests.
+///
+/// The mode alone is not coverage, and the census said so. `append` and
+/// `replace` render identical bytes unless a request actually carries an
+/// inbound chain, so what separates them lives in the scripts:
+/// `forwarded_inbound` supplies one every mode must handle, and
+/// `forwarded_oversize` one that only `append` can drop.
 fn deriveForwarded(random: std.Random) ?zoxy.config.Config.Listener.Forwarded {
     return switch (random.uintLessThan(u8, 3)) {
         0 => null,
