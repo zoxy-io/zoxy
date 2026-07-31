@@ -11,6 +11,7 @@ const std = @import("std");
 
 const zoxy = @import("zoxy");
 
+const constants = zoxy.constants;
 const parser = zoxy.http.parser;
 
 const assert = std.debug.assert;
@@ -70,6 +71,21 @@ pub const Script = enum(u8) {
     /// `/sim`. It routes on the original path and succeeds (200); the
     /// origin sees a canonical rewritten path, never `//`-merged.
     filter_rewrite,
+    /// A GET carrying an inbound `X-Forwarded-For` chain, spread over two
+    /// header lines of which the second is already a chain itself (§7).
+    /// The listener's drawn mode decides what the origin sees: `append`
+    /// joins all three hops ahead of the peer it observed, `replace`
+    /// discards them, and forwarding off passes both lines through
+    /// untouched. Without a script sending one, `append` and `replace`
+    /// render identical bytes and drawing the mode proves nothing about
+    /// either — the join and the render's suppression of inbound copies
+    /// are reachable only from here.
+    forwarded_inbound,
+    /// The same shape with a chain past `forwarded_chain_bytes_max`,
+    /// which an `append` listener must drop *whole* rather than truncate
+    /// (§7). Only seeds that drew `append` reach the rung, and
+    /// `forwarded_chain_dropped` witnesses it.
+    forwarded_oversize,
 };
 
 /// Everything the client's oracles need to know about one script. The
@@ -120,6 +136,52 @@ const big_body = blk: {
 comptime {
     assert(post_body.len == 24);
     assert(big_body.len == 6000);
+}
+
+/// The two `X-Forwarded-For` lines `forwarded_inbound` sends — the second
+/// already comma-joined, so the §7 join is exercised both across lines
+/// and within one. The head is built from these rather than from a second
+/// copy of the same bytes, so the bound asserted below is a check on what
+/// is actually sent instead of one that would keep passing after an edit.
+const forwarded_inbound_lines = [_][]const u8{ "1.1.1.1", "2.2.2.2, 3.3.3.3" };
+
+/// An inbound chain small enough that every mode carries it whole.
+const forwarded_inbound_head = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++
+    "X-Forwarded-For: " ++ forwarded_inbound_lines[0] ++ "\r\n" ++
+    "X-Forwarded-For: " ++ forwarded_inbound_lines[1] ++ "\r\n\r\n";
+
+/// One line of the oversize chain: hops enough to reach three quarters of
+/// the §7 chain bound, so a single line fits and two cannot. Built from
+/// the constant rather than a literal, so raising the bound keeps the
+/// script oversize instead of silently making it a second `get`.
+const forwarded_oversize_line = blk: {
+    const hop = "10.11.12.13";
+    const target = @divFloor(@as(usize, constants.forwarded_chain_bytes_max) * 3, 4);
+    var chain: []const u8 = hop;
+    while (chain.len + 2 + hop.len <= target) chain = chain ++ ", " ++ hop;
+    const frozen = chain;
+    break :blk frozen;
+};
+
+const forwarded_oversize_head = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++
+    "X-Forwarded-For: " ++ forwarded_oversize_line ++ "\r\n" ++
+    "X-Forwarded-For: " ++ forwarded_oversize_line ++ "\r\n\r\n";
+
+comptime {
+    // The inbound chain fits, so no mode drops it — this script proves
+    // the join, never the bound. Joined as `appendInboundChain` joins it:
+    // the lines in order, separated by ", ".
+    assert(forwarded_inbound_lines[0].len + 2 + forwarded_inbound_lines[1].len <=
+        constants.forwarded_chain_bytes_max);
+    // One oversize line fits the bound and two cannot, so the drop is
+    // reached only after the first line has already been joined — the
+    // accumulating path, not a single header oversize on its own.
+    assert(forwarded_oversize_line.len <= constants.forwarded_chain_bytes_max);
+    assert(2 * forwarded_oversize_line.len + 2 > constants.forwarded_chain_bytes_max);
+    // Both heads must reach the origin as heads, not as 414/431 verdicts:
+    // the proxy's own cap is the ceiling either way.
+    assert(forwarded_inbound_head.len < constants.head_bytes_max);
+    assert(forwarded_oversize_head.len < constants.head_bytes_max);
 }
 
 /// Valid requests meet the canonical 200, the §8 rungs (503), an
@@ -287,6 +349,30 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
     },
     .filter_rewrite = .{
         .request = "GET /rewrite HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = statuses_routed,
+    },
+    // §7 client-address forwarding: both route and forward like a plain
+    // GET, so the §8 rungs and a killed dial can precede the 200. What
+    // they change is what the *origin* is told, which the client cannot
+    // see. What they buy is reach, not verdicts: the assembly runs under
+    // the adversarial schedule, and the origin's oracle holds it to a
+    // head that parses. Which hops survived and in what order is pinned
+    // by the directed tests in src/http_proxy_test.zig, not here — a join
+    // bug that stayed well-formed would pass this seed and fail those.
+    .forwarded_inbound = .{
+        .request = forwarded_inbound_head,
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = statuses_routed,
+    },
+    .forwarded_oversize = .{
+        .request = forwarded_oversize_head,
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 200,

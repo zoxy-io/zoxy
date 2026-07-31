@@ -39,6 +39,12 @@ pub const protected_names = [_][]const u8{
     "transfer-encoding",
 };
 
+/// The one header this proxy writes on the client's behalf (§7). Public
+/// so `config.zig` can bar filter edits from naming it — a filter can
+/// only write a constant, and one fixed address for every client is the
+/// opposite of forwarding one.
+pub const forwarded_for_name = "X-Forwarded-For";
+
 /// True when `list` names `name` exactly. Comptime-only, for the check
 /// below; the runtime path compares tags, not strings.
 fn nameListHas(list: []const []const u8, name: []const u8) bool {
@@ -85,6 +91,17 @@ pub fn renderRequestHead(
     target: parser.CanonicalTarget,
     edits: []const filter.AppliedHeaderEdit,
     inject_close: bool,
+    /// The complete `X-Forwarded-For` value to emit, or null to leave the
+    /// header exactly as it arrived (§7).
+    ///
+    /// Fully assembled by the time it gets here: the caller resolved the
+    /// trust mode, bounded any inbound chain, formatted the observed peer
+    /// and joined them. So this file has no policy left to get wrong — it
+    /// suppresses the inbound copies and writes one line, through the same
+    /// `appendHeaderLine` every other header uses. The split is
+    /// deliberate: the trust rule is a security decision with a counter
+    /// attached, and a byte-assembler should have access to neither.
+    forwarded_for: ?[]const u8,
     buffer: []u8,
 ) error{Oversize}![]const u8 {
     // The proxy answers CONNECT with 501 itself, never forwards it (§7).
@@ -105,7 +122,17 @@ pub fn renderRequestHead(
         .http_1_0 => " HTTP/1.0\r\n",
         .http_1_1 => " HTTP/1.1\r\n",
     });
-    try appendEndToEndHeaders(&staging, request.headers, request.connection_nominates_header, edits);
+    try appendEndToEndHeaders(
+        &staging,
+        request.headers,
+        request.connection_nominates_header,
+        edits,
+        forwarded_for != null,
+    );
+    if (forwarded_for) |value| {
+        assert(value.len >= 1);
+        try staging.appendHeaderLine(forwarded_for_name, value);
+    }
     if (inject_close) {
         try staging.append("Connection: close\r\n");
     }
@@ -139,7 +166,13 @@ pub fn renderResponseHead(
     }
     try staging.append("\r\n");
     // Filters are request-side only (§7); the response carries no edits.
-    try appendEndToEndHeaders(&staging, response.headers, response.connection_nominates_header, &.{});
+    try appendEndToEndHeaders(
+        &staging,
+        response.headers,
+        response.connection_nominates_header,
+        &.{},
+        false,
+    );
     if (inject_close) {
         try staging.append("Connection: close\r\n");
     }
@@ -212,6 +245,12 @@ fn appendEndToEndHeaders(
     headers: []const parser.Header,
     connection_nominates_header: bool,
     edits: []const filter.AppliedHeaderEdit,
+    /// True when the caller writes its own `X-Forwarded-For` line, so
+    /// inbound copies must not be forwarded beside it — under `replace`
+    /// because the inbound chain is untrusted, and under `append`
+    /// because the caller already folded it into the line it will write.
+    /// Either way the header must appear exactly once downstream.
+    suppress_forwarded_for: bool,
 ) error{Oversize}!void {
     assert(headers.len <= constants.headers_max);
     assert(edits.len <= constants.header_edits_max);
@@ -219,30 +258,11 @@ fn appendEndToEndHeaders(
     // Re-finding them inside the per-header hop-by-hop test made the walk
     // O(headers²) — the render's top user-CPU cost under load (§9).
     var connection_values: [constants.headers_max][]const u8 = undefined;
-    var connection_count: u32 = 0;
-    // Both walks capture by pointer: `parser.Header` is 40 bytes, and
-    // copying one per header is the cost this classification exists to
-    // remove, not to relocate.
-    for (headers) |*header| {
-        if (header.tag == .connection) {
-            connection_values[connection_count] = header.value;
-            connection_count += 1;
-        }
-    }
-    const nominations = connection_values[0..connection_count];
-    // Whether anything is nominated was settled by `parser.scanConnectionTokens`,
-    // which already walked these same tokens to decide keep-alive. In the
-    // common case — no nomination — the per-header scan below is skipped
-    // entirely and the value is never split here at all (§9).
-    //
-    // The flag and the values it describes are now filled in by two
-    // different passes, joined only by this bool: a nomination without a
-    // Connection header to have carried it means they have desynchronized.
-    if (connection_nominates_header) {
-        assert(connection_count >= 1);
-    }
-    const active_nominations =
-        if (connection_nominates_header) nominations else nominations[0..0];
+    const active_nominations = collectNominations(
+        headers,
+        connection_nominates_header,
+        &connection_values,
+    );
 
     // Only `set`/`remove` edits suppress source copies; `add` never does.
     // Decide once whether any suppressing edit exists, so a request with no
@@ -260,6 +280,9 @@ fn appendEndToEndHeaders(
         if (isHopByHop(header, active_nominations)) {
             continue;
         }
+        if (suppress_forwarded_for and header.tag == .x_forwarded_for) {
+            continue;
+        }
         if (has_suppressing_edit and suppressedByEdit(header.name, edits)) {
             continue;
         }
@@ -273,6 +296,43 @@ fn appendEndToEndHeaders(
             .remove => {},
         }
     }
+}
+
+/// The Connection values that actually nominate a header to strip
+/// (RFC 9110 §7.6.1), gathered once so the per-header test below is O(1)
+/// rather than a token scan per header — re-finding them inside that test
+/// made the walk O(headers²), the render's top user-CPU cost under load
+/// (§9). Empty in the common case, where Connection carries only
+/// `close`/`keep-alive` and nominates nothing.
+///
+/// The returned slice aliases `values`, which the caller owns.
+fn collectNominations(
+    headers: []const parser.Header,
+    connection_nominates_header: bool,
+    values: *[constants.headers_max][]const u8,
+) []const []const u8 {
+    assert(headers.len <= constants.headers_max);
+    var count: u32 = 0;
+    // Captures by pointer: `parser.Header` is 40 bytes, and copying one
+    // per header is the cost this classification exists to remove, not to
+    // relocate.
+    for (headers) |*header| {
+        if (header.tag == .connection) {
+            values[count] = header.value;
+            count += 1;
+        }
+    }
+    // Whether anything is nominated was settled by
+    // `parser.scanConnectionTokens`, which already walked these same
+    // tokens to decide keep-alive. The flag and the values it describes
+    // are filled in by two different passes, joined only by this bool: a
+    // nomination with no Connection header to have carried it means they
+    // have desynchronized.
+    if (connection_nominates_header) {
+        assert(count >= 1);
+        return values[0..count];
+    }
+    return values[0..0];
 }
 
 /// True when a `set` or `remove` edit names this header, so its source
@@ -345,13 +405,13 @@ test "render: request strips hop-by-hop and nominated, keeps the rest" {
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
 
-    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\n\r\n",
         rendered,
     );
 
-    const closed = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, true, &buffer);
+    const closed = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, true, null, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\nConnection: close\r\n\r\n",
         closed,
@@ -372,7 +432,7 @@ test "render: filter edits set, add, and remove headers" {
         .{ .kind = .remove, .name = "cookie", .value = "" },
     };
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, &buffer);
     // Surviving source headers first (Host, kept X-Trace, X-Keep), then the
     // injected set/add lines; the source X-Env and Cookie are gone.
     try testing.expectEqualStrings(
@@ -402,7 +462,7 @@ test "render: an edit that overflows the buffer is Oversize" {
     var tight: [34]u8 = undefined;
     try testing.expectError(
         error.Oversize,
-        renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, &tight),
+        renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, &tight),
     );
 }
 
@@ -435,7 +495,7 @@ test "render: the edited oracle skips a head that grows past head_bytes_max" {
         .{ .kind = .remove, .name = "X-Fuzz-Remove", .value = "" },
     };
     var render_buf: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&parsed, .{ .path = "/", .query = "" }, &edits, false, &render_buf);
+    const rendered = try renderRequestHead(&parsed, .{ .path = "/", .query = "" }, &edits, false, null, &render_buf);
     try testing.expect(rendered.len > constants.head_bytes_max);
     // Must return cleanly instead of panicking in the reparse precondition.
     checkRequestRenderEdited(&source);
@@ -449,7 +509,7 @@ test "render: nominating a protected header does not strip it" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, &buffer);
     try testing.expectEqualStrings(
         "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n",
         rendered,
@@ -467,7 +527,7 @@ test "render: a nomination on a second Connection line still strips" {
     const request = try parser.parseRequestHead(head, false, &storage);
     try testing.expect(request.connection_nominates_header);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, &buffer);
     // Both Connection lines are hop-by-hop; X-Nominated goes because the
     // second line named it; X-Keep is untouched.
     try testing.expectEqualStrings(
@@ -487,7 +547,7 @@ test "render: standard Connection options do not nominate a same-named header" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, &buffer);
     // Connection stripped (hop-by-hop) and Keep-Alive stripped (a
     // hop-by-hop name); the "Close" header survives — close nominates
     // nothing.
@@ -502,7 +562,7 @@ test "render: framing headers travel with the body" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, &buffer);
 
     var reparse_storage: parser.HeaderStorage = undefined;
     const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage);
@@ -513,7 +573,7 @@ test "render: client version is preserved" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, &buffer);
     try testing.expectEqualStrings("GET / HTTP/1.0\r\n\r\n", rendered);
 }
 
@@ -553,7 +613,7 @@ test "render: a head that no longer fits is Oversize" {
     const request = try parser.parseRequestHead(head, false, &storage);
     const target = parser.CanonicalTarget{ .path = "/path", .query = "" };
     var small: [16]u8 = undefined;
-    try testing.expectError(error.Oversize, renderRequestHead(&request, target, &.{}, false, &small));
+    try testing.expectError(error.Oversize, renderRequestHead(&request, target, &.{}, false, null, &small));
 }
 
 // Fuzzing (§9 gate 2): whatever the parser accepts, the renderer must
@@ -576,7 +636,7 @@ fn checkRequestRender(input: []const u8) void {
         .{ .path = request.target, .query = "" };
 
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderRequestHead(&request, target, &.{}, false, &buffer) catch unreachable;
+    const rendered = renderRequestHead(&request, target, &.{}, false, null, &buffer) catch unreachable;
 
     // The oracle buffer carries slack past `head_bytes_max` so normalization
     // growth never truncates the comparison; production renders into an
@@ -633,7 +693,7 @@ fn checkRequestRenderEdited(input: []const u8) void {
         .{ .kind = .remove, .name = "X-Fuzz-Remove", .value = "" },
     };
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderRequestHead(&request, target, &edits, false, &buffer) catch return;
+    const rendered = renderRequestHead(&request, target, &edits, false, null, &buffer) catch return;
 
     // The appended edits can push an already-large head past `head_bytes_max`
     // — the oversize-after-edits verdict (431 in production, which renders
@@ -691,5 +751,64 @@ fn fuzzRenderInputs(context: void, smith: *std.testing.Smith) !void {
     const input = input_buffer[0..input_len];
     checkRequestRender(input);
     checkRequestRenderEdited(input);
+    checkRequestRenderForwarded(input);
     checkResponseRender(input);
+}
+
+/// The §9 reparse oracle with a §7 forwarded line added: a rendered head
+/// must still parse as one, and the header must appear exactly once
+/// however many the input carried.
+///
+/// The forwarded path is what this diff adds to the render's output, and
+/// the oracle's whole claim is that the proxy never emits a request it
+/// would itself reject — so the claim has to cover it. The suppression is
+/// the part worth fuzzing: an input with several inbound
+/// `X-Forwarded-For` headers must leave exactly one downstream, or the
+/// origin and the next hop can read different clients out of one request.
+fn checkRequestRenderForwarded(input: []const u8) void {
+    var storage: parser.HeaderStorage = undefined;
+    const request = parser.parseRequestHead(input, false, &storage) catch return;
+    if (request.method == .connect) {
+        return;
+    }
+    var scratch: [constants.head_bytes_max]u8 = undefined;
+    const target: parser.CanonicalTarget = if (request.target[0] == '/')
+        (parser.canonicalTarget(request.target, &scratch) catch return)
+    else
+        .{ .path = request.target, .query = "" };
+
+    // A fixed value stands in for the caller's assembled one: what varies
+    // here is the *input head*, and the value's own assembly is bounded
+    // and unit-tested rather than fuzzed.
+    const forwarded_for = "203.0.113.9";
+    var buffer: [oracle_buffer_bytes]u8 = undefined;
+    const rendered = renderRequestHead(
+        &request,
+        target,
+        &.{},
+        false,
+        forwarded_for,
+        &buffer,
+    ) catch return;
+    if (rendered.len > constants.head_bytes_max) {
+        return;
+    }
+    var reparse_storage: parser.HeaderStorage = undefined;
+    // `catch return`, not `unreachable`, and for a reason the byte guard
+    // above does not cover: `Staging` bounds bytes, never header *count*.
+    // An input already carrying `headers_max` headers, none of them an
+    // inbound `X-Forwarded-For` to suppress, renders one line more than
+    // the parser will accept — short in bytes, over in count. That is the
+    // §7 oversize verdict, which production answers 431, not a head this
+    // oracle has anything left to say about. `checkRequestRenderEdited`
+    // declines for the same reason: its edits can add lines too.
+    const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage) catch return;
+    var seen: u32 = 0;
+    for (reparsed.headers) |header| {
+        if (header.tag == .x_forwarded_for) {
+            assert(std.mem.eql(u8, header.value, forwarded_for));
+            seen += 1;
+        }
+    }
+    assert(seen == 1);
 }

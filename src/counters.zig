@@ -211,6 +211,13 @@ pub const Counters = struct {
     /// flow identity as an ordinary completion, and folding it into the
     /// admission-gate sum would make that identity false.
     l4_shed_endpoint_inflight: Value = Value.init(0),
+    /// §7 client-address forwarding: an inbound `X-Forwarded-For` chain
+    /// too long to carry, dropped so the emitted line states only the peer
+    /// this proxy observed. Not an error — the bound exists because a chain
+    /// is client-supplied and unbounded by the protocol — but a rising
+    /// count means someone is sending chains no real topology produces,
+    /// which is worth knowing.
+    forwarded_chain_dropped: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).

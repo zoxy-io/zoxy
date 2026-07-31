@@ -612,6 +612,38 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   which is the same design with better boundaries.) Not a runtime
   filter chain: programmability is added by extending the owning module
   at compile time; the proxy core stays generic and small.
+- **Telling the origin who the client is: `X-Forwarded-For`, and the
+  trust rule is config.** A proxy is the last component that knows the
+  client's address, so without this an origin's logs, allowlists and rate
+  limits all see zoxy. A per-listener `forwarded` block turns it on;
+  absent, the header travels exactly as it arrived, which is what every
+  config predating the feature keeps doing.
+  **There is deliberately no default mode**, because the two answers are
+  each a security bug in the other's position and no proxy can tell from
+  the inside which position it occupies. `replace` states the peer this
+  proxy observed and discards whatever arrived — correct at the edge,
+  where an inbound chain is client-controlled and honoring it would let a
+  caller choose the address every downstream allowlist and audit log then
+  believes. `append` extends the inbound chain — correct exactly when
+  every hop in front is one the operator owns, and a forgery anywhere
+  else. The setting lives on the *listener* rather than the cluster
+  because it describes what sits in front of that socket; one cluster may
+  be reachable from an edge listener that must not trust a chain and an
+  internal one that must.
+  The chain is **bounded** (`forwarded_chain_bytes_max`): it grows by an
+  address per hop and the protocol bounds it nowhere, so a client would
+  otherwise decide how much of the head buffer its request occupies. Past
+  the bound the chain is dropped *whole* rather than truncated — a
+  truncated chain reads as complete and is not — leaving the line stating
+  only the observed peer, which is the `replace` behavior and the
+  fail-safe direction. `forwarded_chain_dropped` witnesses it.
+  Two supporting decisions. The header is classified in the parser like
+  every other proxy-managed name, so the render suppresses inbound copies
+  by tag rather than by comparing this spelling against every header of
+  every request. And filter edits may not name it: a filter can only
+  write a *constant*, so an edit here would encode one fixed address for
+  every client — forwarding's exact opposite — and barring the name means
+  one mechanism owns the header rather than two that can disagree.
 - **Configurable filters/rules: filters are data, not code.**
   Zero-alloc extensibility means no plugins,
   no closures, no dynamic dispatch chains — instead, a rule is *compiled

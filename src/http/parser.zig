@@ -74,12 +74,16 @@ pub const HeaderName = enum(u8) {
     proxy_connection,
     te,
     upgrade,
+    /// Named so the §7 forwarded-address render can suppress inbound
+    /// copies in O(1) like every other managed header, rather than
+    /// comparing this spelling against every header of every request.
+    x_forwarded_for,
 
     /// Connection-specific headers (RFC 9110 §7.6.1): never forwarded.
     pub fn hopByHop(tag: HeaderName) bool {
         return switch (tag) {
             .connection, .keep_alive, .proxy_connection, .te, .upgrade => true,
-            .other, .host, .content_length, .transfer_encoding => false,
+            .other, .host, .content_length, .transfer_encoding, .x_forwarded_for => false,
         };
     }
 
@@ -89,7 +93,7 @@ pub const HeaderName = enum(u8) {
     pub fn protected(tag: HeaderName) bool {
         return switch (tag) {
             .host, .content_length, .transfer_encoding => true,
-            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade => false,
+            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for => false,
         };
     }
 
@@ -106,6 +110,7 @@ pub const HeaderName = enum(u8) {
             .proxy_connection => "proxy-connection",
             .te => "te",
             .upgrade => "upgrade",
+            .x_forwarded_for => "x-forwarded-for",
         };
     }
 };
@@ -127,6 +132,7 @@ pub fn classifyHeaderName(name: []const u8) HeaderName {
             break :length_10 .other;
         },
         14 => if (eql(name, "content-length")) .content_length else .other,
+        15 => if (eql(name, "x-forwarded-for")) .x_forwarded_for else .other,
         16 => if (eql(name, "proxy-connection")) .proxy_connection else .other,
         17 => if (eql(name, "transfer-encoding")) .transfer_encoding else .other,
         else => .other,
@@ -750,7 +756,10 @@ fn analyzeHeaders(
                 // Multiple Connection headers combine as one list (RFC 9110).
                 scanConnectionTokens(raw_header.value, &analysis);
             },
-            .other, .keep_alive, .proxy_connection, .te, .upgrade => {},
+            // `x_forwarded_for` joins the no-analysis set: the tag exists
+            // so the *render* can find it cheaply (§7), and nothing about
+            // framing, routing or persistence reads it here.
+            .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for => {},
         }
     }
     assert(!(analysis.te_chunked and analysis.te_other));

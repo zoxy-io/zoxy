@@ -214,6 +214,43 @@ a live L4 connection are each one unit of work the backend is carrying.
 refusals — kept apart from `zoxy_l7_shed_upstream_slots`, which means zoxy
 ran out of its own slots and wants a wider pool rather than a busier backend.
 
+### Telling the origin who the client is
+
+Without this, everything behind zoxy sees zoxy — origin logs, IP
+allowlists, per-client rate limits. An `http` listener can add
+`X-Forwarded-For`:
+
+```json
+{
+    "bind": "0.0.0.0:80",
+    "protocol": "http",
+    "cluster": "web",
+    "forwarded": { "mode": "replace" }
+}
+```
+
+**There is no default mode, on purpose.** The two answers are each a
+security bug in the other's position, and zoxy cannot tell from the
+inside which position it is in:
+
+| mode | behaviour | use when |
+|---|---|---|
+| `replace` | state the peer zoxy observed, discard any inbound chain | **at the edge** — an inbound chain is client-controlled there, so honouring it lets a caller pick the address your allowlists then trust |
+| `append` | extend the inbound chain with the observed peer | **only behind proxies you own** — anywhere else this is the forgery above, appended to |
+
+Omit the block and the header is passed through untouched, exactly as
+before the feature existed.
+
+The carried chain is bounded: a chain grows by an address per hop and
+nothing in HTTP caps it, so past `forwarded_chain_bytes_max` (512) it is
+dropped *whole* — leaving the line stating only the observed peer, which
+is the safe direction, since a truncated chain reads as complete and
+isn't. `zoxy_forwarded_chain_dropped` counts that.
+
+Filters may not set `X-Forwarded-For`; the loader rejects it. A filter
+can only write a constant, so it would pin one fixed address to every
+client — which looks like forwarding and is the opposite of it.
+
 ### Filters
 
 An `http` listener can carry up to 32 rules, evaluated top-down. Each has a
