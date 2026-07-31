@@ -380,6 +380,22 @@ Three shared pools, all owned and touched only by the loop thread:
    at its ejection — a parked socket to a dead origin is a stale replay
    waiting to be spent.
 
+Defaults shape. **A working config is a listener and a cluster.** Every
+other block — `timeouts`, `limits`, `access_log` — is optional, and so is
+every field inside them, so tuning is what an operator opts into rather
+than what they must supply to start. The rule for whether a field gets a
+default is what zoxy can honestly answer: `connect_ms` and `idle_ms` have
+conventional figures to borrow (nginx ships 60 s and 75 s for the same
+budgets), so they default; `request_ms` is a policy set against a
+particular origin's latency, so it defaults *off* rather than to a guess.
+`drain_deadline_ms` is the interesting one — nginx, HAProxy and Caddy all
+wait indefinitely by default, Traefik picks 10 s and Envoy 600 s, and a
+sixty-fold spread across mature implementations is not a consensus
+waiting to be found. It defaults to `0`, "no cap", and the supervisor
+that sent the signal keeps the upper bound it already enforces with
+`SIGKILL`. Where a zero would break rather than disable — a 0 ms dial,
+idle, or probe interval — it stays rejected.
+
 Sizing shape. The comptime constants are the hard, budget-asserted
 *ceilings*; the config `limits` block sizes the *effective* pools anywhere
 from 1 up to them. An omitted block takes the lean **defaults**, so the
@@ -959,6 +975,19 @@ stop honoring downstream keep-alive (`Connection: close` injection), let
 admitted work finish under one drain deadline (`drain_deadline_ms`), then
 tear down stragglers and exit. Drain reuses the pressure machinery — it
 is maximum pressure — and the zero-alloc gate runs it (§9).
+By default that deadline is `0` — no cap (§5): no timer is armed, and the
+drain ends when the last connection does. That is the majority behaviour
+among comparable proxies, and under a supervisor that keeps its own
+stopwatch — systemd's `TimeoutStopSec`, Kubernetes'
+`terminationGracePeriodSeconds` — it is bounded in practice by the
+`SIGKILL` that follows. Under a bare init with no such timeout it is
+genuinely unbounded, and a deployment there should set a number. Setting
+one means zoxy gives up *before* its platform would, which is a narrower
+thing than being bounded at all.
+What still bounds a straggler either way is its own per-connection
+deadlines: `idle_ms` always, plus `request_ms` and `max_lifetime_ms` when
+configured, and the drain's `Connection: close` injection stops an idle
+keep-alive connection from waiting on a request that will never come.
 
 ## 9. Testing — required from day 0
 

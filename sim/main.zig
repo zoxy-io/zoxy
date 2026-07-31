@@ -46,12 +46,17 @@ const failures_max: u8 = 16;
 ///
 /// The thinnest rung sets the real bound, so it is worth knowing which,
 /// and it is not the one this comment first named. Per 1024 seeds across
-/// the starts above, `shed_draining` lands 15-23 times and
-/// `drained_at_deadline` 24-51 — but `upstream_replayed` lands 1-8, and
+/// the starts above, `shed_draining` lands 11-25 times and
+/// `drained_at_deadline` 19-33 — but `upstream_replayed` lands 1-8, and
 /// the 1 is start 5000. It is the rung the paragraph above already caught
 /// standing alone at 128 seeds, so the floor rests on it rather than on
 /// either of the others. A change that pushes *it* down has made this
 /// floor a coin flip, whatever the sweep still says.
+///
+/// The two drain figures are lower than they were: a quarter of
+/// early-draining seeds now draw an unbounded deadline (§5), which by
+/// construction reaps nothing. They stayed two-digit, so the floor did
+/// not move — but that is what re-measuring them was for.
 const census_iterations_min: u64 = 1024;
 
 /// A counter the sweep expects to stay at zero, and why.

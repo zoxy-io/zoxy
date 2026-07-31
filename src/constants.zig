@@ -317,6 +317,22 @@ pub const header_edits_max: u16 = 16;
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
 
+/// Default `timeouts.connect_ms`: the per-try upstream dial budget when
+/// the config omits it (§5). Five seconds is the conventional figure — an
+/// order below nginx's 60 s `proxy_connect_timeout`, which is a read
+/// timeout's worth of patience for what is only a handshake. A dial that
+/// has not completed in five seconds is answered 504 and, on a
+/// multi-endpoint cluster, retried elsewhere sooner.
+pub const connect_ms_default: u32 = 5_000;
+
+/// Default `timeouts.idle_ms`: the idle and head-read deadline when the
+/// config omits it (§5). nginx's neighbours are `keepalive_timeout` at
+/// 75 s and `client_header_timeout` at 60 s; this takes the lower of the
+/// two, since the same number here also bounds a slowloris dribbling its
+/// head. Shortened further under pool pressure (§8), so this is the
+/// unpressured ceiling rather than what a busy proxy actually waits.
+pub const idle_ms_default: u32 = 60_000;
+
 /// Bytes of inbound `X-Forwarded-For` chain an `append` listener will
 /// carry (§7). A chain grows by one address at every hop, and nothing in
 /// the protocol bounds it — so a client that sends a megabyte of forged
@@ -636,6 +652,23 @@ comptime {
     assert(loop_completions_per_tick_max >= 1);
     assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);
+    // The two defaulted deadlines must themselves be configs the loader
+    // would accept: non-zero, and under the shared ceiling.
+    assert(connect_ms_default >= 1);
+    assert(connect_ms_default <= timeout_ms_max);
+    assert(idle_ms_default >= 1);
+    assert(idle_ms_default <= timeout_ms_max);
+    // The dial budget must sit below the idle one. A connection's first
+    // deadline is armed at `connect_ms` (`Server.entryTimeoutMs`) and the
+    // dial's completion re-stores it to `idle_ms`, but the *physical*
+    // timer never moves earlier — only the stored target does (§4). So an
+    // idle budget below the dial budget is not shortened by the
+    // handoff; it waits out the connect-phase timer instead.
+    //
+    // This guards the pair above and nothing else: `validateTimeouts`
+    // does not cross-check an operator's own two values, so the same
+    // ordering is unenforced for a hand-written config.
+    assert(connect_ms_default < idle_ms_default);
     assert(accept_retry_delay_ms >= 1);
     assert(pressure_idle_divisor >= 2);
     assert(head_bytes_max >= 1024);
