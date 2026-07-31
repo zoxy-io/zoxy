@@ -756,12 +756,26 @@ origin, not one this proxy can pick for them.
   look fine. Optional — a config `access_log` block names a sink, and
   absent it the whole feature reserves nothing and reads no clock — it
   writes one JSON object per line: one per HTTP exchange (including every
-  reject, shed and verdict) and one per L4 connection, carrying the
+  reject, request-level shed and verdict) and one per L4 connection,
+  carrying the
   client, method, canonical host and path (§7), status, outcome,
   duration, byte counts each way, and the cluster and endpoint that
   served. `outcome` is not derivable from `status` and that is the point:
   an origin's own `503` and this proxy's shed `503` are the same three
   digits and opposite events.
+  **The unit is an admitted connection**, which is what draws the line
+  between the two kinds of shed in the table above. A request-level shed
+  — a `503` for relay buffers or upstream slots — belongs to a connection
+  that holds a slot, so it gets a line like any other answer. An
+  *admission-gate* shed does not: `shed_conn_slots`, `shed_relay_buffers`
+  and `shed_draining` fire on a socket that never got a slot, so there is
+  no capture state to report from, and asking the kernel for a peer
+  address would put a syscall and a render on the one path this section
+  keeps to "at most two direct syscalls" — the path that is hottest
+  exactly when it fires. Their witness stays the counters, which is also
+  the honest one: under a shed storm the log would be the highest-volume
+  thing in the process, so the lines an operator most wanted would be the
+  first the drop rung took.
   **A log line must never stall the data path.** The sink is a pipe the
   operator owns, so it can block for arbitrarily long, and a proxy that
   waited on it would hand every client's latency to whatever reads its

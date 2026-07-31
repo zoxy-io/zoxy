@@ -52,8 +52,8 @@ locally by `zig build schema`).
 ### Access log
 
 The optional `access_log` block writes one JSON object per line to
-stdout — one per HTTP exchange (rejects, sheds and timeouts included) and
-one per L4 connection:
+stdout — one per HTTP exchange (rejects, `503` sheds and timeouts
+included) and one per L4 connection:
 
 ```json
 {"time":"2026-07-31T09:14:22.481Z","kind":"http","outcome":"ok","client":"10.1.2.3:52344","method":"GET","host":"api.example.com","path":"/v1/items","status":200,"upstream_reused":true,"upstream_replayed":false,"duration_us":1873,"bytes_in":142,"bytes_out":4096,"cluster":"api","upstream":"10.0.0.7:8080"}
@@ -63,6 +63,12 @@ one per L4 connection:
 `503` and zoxy shedding a request with `503` are the same three digits
 and opposite events. It reads `ok` (the origin answered), `rejected`,
 `shed`, `timed_out`, `upstream_failed`, `aborted`, or — for L4 — `closed`.
+
+The unit is an *admitted* connection. A connection refused at the
+accept gate — no conn slot, no relay buffer, or a drain already under
+way — never gets a line; those are counted by `zoxy_shed_conn_slots`,
+`zoxy_shed_relay_buffers` and `zoxy_shed_draining` instead, because at
+that point there is nothing to report from and a shed has to stay cheap.
 
 Rotation is the operator's: pipe stdout wherever this process's output
 already goes. Logging never blocks the event loop, so a sink that stalls
