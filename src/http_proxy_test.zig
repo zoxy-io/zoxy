@@ -2847,6 +2847,43 @@ test "l7: a shed and an origin 503 are the same status and different outcomes" {
     try std.testing.expect(std.mem.indexOf(u8, origin_line, "\"upstream\":\"127.0.0.1:9000\"") != null);
 }
 
+test "l7: a response cut off mid-flight logs aborted, not ok" {
+    // `ok` is defined as "the whole response reached the client" (§8), so
+    // it is earned at `finishExchange` and nowhere earlier. Setting it when
+    // the response head is *queued* — which is what the code did until the
+    // §9 log oracle became an equality — makes every exchange that dies
+    // mid-response log a success that never happened, with the origin's
+    // status attached to lend it weight. An operator counting
+    // `outcome:"ok"` would have read more successes than
+    // `zoxy_l7_responses` reports, with nothing in the line to say which
+    // ones were fiction.
+    //
+    // The origin promises 32 bytes and sends none, so the head reaches the
+    // client and the body never does; the request deadline then fires on
+    // an exchange that has already started responding, which §8 answers by
+    // tearing down rather than by a 504.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 12,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n",
+        .request_timeout_ms = 30,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /cut HTTP/1.1\r\nHost: a\r\n\r\n");
+    try bed.expectDrained();
+
+    // No exchange completed, so nothing may claim to have.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_responses"));
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"ok\"") == null);
+    // The status still reports what the origin said: it is a fact about
+    // the origin, and the outcome is the separate fact about the client.
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"status\":200") != null);
+}
+
 test "l7: a reject logs the target the client actually sent" {
     // A path that will not canonicalize has no §7 spelling to report, and
     // an empty field would tell an operator investigating a 400 nothing at

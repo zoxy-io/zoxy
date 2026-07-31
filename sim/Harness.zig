@@ -730,23 +730,87 @@ fn verifyAccessLog(harness: *Harness) !void {
     // The drain does not stop the loop until the sink is quiet (§8), so
     // the last byte written is the last byte of a line — never half of one.
     if (sink.len != 0 and sink[sink.len - 1] != '\n') return error.AccessLogTruncatedLine;
+    const tally = try tallyAccessLog(sink);
+    if (tally.total != counters.get("access_log_lines")) {
+        return error.AccessLogLineCountDiverged;
+    }
+
+    // A dropped line would make the equality below false for a reason
+    // that has nothing to do with the counter list it exists to pin, so
+    // the real condition fails first and under its own name. The rung is
+    // out of a scenario's reach (see the §9 census's `uncovered` entry),
+    // and the census proves that across the range — but only once the
+    // range finishes, which is too late to explain a single seed.
+    if (counters.get("access_log_dropped") != 0) return error.AccessLogDroppedInSweep;
+
+    // Every HTTP line is either an outcome the data path counted or an
+    // abort — an equality, and the reason this file no longer asks
+    // whether the log wrote *enough* lines. The `>=` it replaces was
+    // satisfied by writing too many, which is precisely how #129's
+    // phantom line per keep-alive connection cleared 4096 seeds.
+    //
+    // It also pins `l7OutcomeTotal`'s list: a new answered counter left
+    // out of it fails this on the first seed that reaches the rung, which
+    // is how `l7_shed_endpoint_inflight` turned out to have been missing
+    // since it shipped.
+    if (tally.http != l7OutcomeTotal(counters) + tally.http_aborted) {
+        return error.AccessLogHttpLinesDiverged;
+    }
+
+    // A clean seed answers everything it starts, so an abort is a bug
+    // rather than an adversary's work. Not quite by construction: what a
+    // clean seed removes is every *cause* of an abort — no resets, no
+    // kernel pressure, a well-behaved origin, and no drawn drain
+    // (`deriveDrainAt` skips clean seeds) — while the request and
+    // lifetime deadlines are still drawn and armed. They do not fire
+    // because a well-behaved origin answers within microseconds of
+    // virtual time, which is an argument about pacing rather than a
+    // guarantee; it held across all 1578 clean runs of the sweep.
+    //
+    // This is the half with teeth. The equality above counts a phantom
+    // abort on both sides and passes; this one refuses it outright, and
+    // is what fails on seed 10 when #129's bug is put back.
+    if (harness.clean) {
+        if (tally.http_aborted != 0) return error.AccessLogAbortedOnCleanSeed;
+        // And each L4 connection is one line: the clients connect once
+        // apiece, clean-seed pools are sized well past the population so
+        // none is shed at admission, and an L4 connection stamps its
+        // clock on admission rather than on first byte — so even the
+        // silent clients (`sim/l4.zig` draws some) owe a line, theirs
+        // reporting `bytes_in: 0`.
+        if (tally.l4 != harness.l4_count) return error.AccessLogL4LinesDiverged;
+    }
+}
+
+/// What the sink's lines are, counted by kind and outcome. Every line is
+/// shape-checked on the way past, so a malformed one fails here rather
+/// than being silently tallied.
+const LineTally = struct {
+    total: u64 = 0,
+    http: u64 = 0,
+    l4: u64 = 0,
+    http_aborted: u64 = 0,
+};
+
+fn tallyAccessLog(sink: []const u8) !LineTally {
+    var tally: LineTally = .{};
     var lines = std.mem.splitScalar(u8, sink, '\n');
-    var line_count: u64 = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue; // The tail after the final newline.
-        line_count += 1;
+        tally.total += 1;
         try verifyAccessLogLine(line);
-    }
-    if (line_count != counters.get("access_log_lines")) return error.AccessLogLineCountDiverged;
-
-    // Nothing was dropped, so every outcome the data path counted owes a
-    // line — plus one per L4 connection and per request that ended without
-    // a verdict, which is why this is an inequality.
-    if (counters.get("access_log_dropped") == 0) {
-        if (counters.get("access_log_lines") < l7OutcomeTotal(counters)) {
-            return error.AccessLogMissedAnOutcome;
+        if (std.mem.indexOf(u8, line, "\"kind\":\"http\"") == null) {
+            tally.l4 += 1;
+            continue;
+        }
+        tally.http += 1;
+        if (std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null) {
+            tally.http_aborted += 1;
         }
     }
+    assert(tally.http + tally.l4 == tally.total);
+    assert(tally.http_aborted <= tally.http);
+    return tally;
 }
 
 /// Every L7 outcome that answers a client, summed. Each one runs through
@@ -762,6 +826,7 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_filtered",
         "l7_shed_relay_buffers",
         "l7_shed_upstream_slots",
+        "l7_shed_endpoint_inflight",
         "l7_bad_gateway",
         "l7_gateway_timeout",
     };
