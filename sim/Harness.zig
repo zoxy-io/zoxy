@@ -213,8 +213,20 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms);
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
     harness.clusters = .{
-        .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick_l4, .check = health.check_l4 },
-        .{ .name = "origin-http", .endpoints = &harness.endpoints_http, .pick = pick_http, .check = health.check_http },
+        .{
+            .name = "origin-l4",
+            .endpoints = &harness.endpoints_l4,
+            .pick = pick_l4,
+            .check = health.check_l4,
+            .max_inflight = deriveMaxInflight(harness.clean, random),
+        },
+        .{
+            .name = "origin-http",
+            .endpoints = &harness.endpoints_http,
+            .pick = pick_http,
+            .check = health.check_http,
+            .max_inflight = deriveMaxInflight(harness.clean, random),
+        },
     };
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
@@ -249,6 +261,26 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         .access_log_sink = if (random.uintLessThan(u8, 4) == 0) null else .stdout,
         .health_interval_ms = health.interval_ms,
     };
+}
+
+/// The §8 per-endpoint cap for one cluster, or null for uncapped.
+///
+/// Only adversarial seeds cap, and the reason is the oracle rather than
+/// the mechanism: a refusal is a `503` an L7 script did not ask for and a
+/// close an L4 client did not expect, both of which a clean seed's golden
+/// outcomes forbid. Under the adversary they are ordinary fates — the
+/// prefix oracles already tolerate a cut, and a cap-shed `503` is the
+/// same shape as the pool-exhaustion one those seeds already produce.
+///
+/// The value is drawn *below* the client population on purpose. A cap
+/// the scenario cannot reach exercises the comparison and nothing else;
+/// at one or two against up to six clients, both refusal paths run
+/// against real contention, and every seed still crosses back under the
+/// cap as connections finish — so the recovery side runs too.
+fn deriveMaxInflight(clean: bool, random: std.Random) ?u32 {
+    if (clean) return null;
+    if (random.uintLessThan(u8, 3) != 0) return null;
+    return 1 + random.uintAtMost(u32, 1);
 }
 
 /// Which check the http cluster runs, if any. An outage seed always

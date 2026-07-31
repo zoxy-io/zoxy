@@ -660,6 +660,18 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   for strict rotation, `hash` for stickiness. Cluster endpoints are
   static socket addresses resolved once at config load, never on the
   loop (dynamic DNS is a non-goal, §1).
+- **A pick chooses among the endpoints that are both healthy and under
+  capacity**, in that order, and the two filters differ in what an empty
+  result means. Health fails **open**: a cluster with every endpoint
+  ejected balances as if none were. `max_inflight` (§8) fails **closed**:
+  every endpoint at its cap refuses the request rather than dialing one.
+  The asymmetry is the point — an ejection says *we do not know whether
+  these work*, so trying beats refusing, while a cap says *we know they
+  are full*, and the whole reason it exists is to not send more. Capacity
+  is judged over whatever health left, so a cluster that fails open still
+  respects its caps. The in-flight total both this and `p2c` read counts
+  L7 leases and live L4 connections alike, which is what lets an L4-only
+  deployment be protected and load-balanced at all.
 - **`hash` is rendezvous hashing, and it is stateless because it has to
   be.** Client-to-backend stickiness is normally a *table* — the proxy
   records which server a client went to. That mechanism cannot work
