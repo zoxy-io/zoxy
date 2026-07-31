@@ -164,3 +164,28 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "zoxy: update to $version"
           git push
+
+      # zoxy.io's /config page is generated from this release: the config JSON
+      # Schema asset published above, config/example.json at this tag, and the
+      # tarball sizes. Tell the site to pull them — it documents the zoxy people
+      # can install, so a release is the only event that changes the page.
+      # SITE_DISPATCH_TOKEN is a fine-grained PAT with contents:write on
+      # zoxy-io/site (its refresh-config.yml commits the refreshed files).
+      #
+      # Last step on purpose: the release and the tap are already published by
+      # the time it runs, so a rejected token fails loudly here without holding
+      # either of them up. Left strict rather than continue-on-error for that
+      # reason — a red step is how an expired token gets noticed, and the site's
+      # weekly refresh catches the page up in the meantime.
+      - name: Notify zoxy-io/site
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # the body goes in as JSON rather than as -f/-F fields: client_payload
+          # is a nested object, and this leaves no question about how the key is
+          # parsed or the tag typed
+          jq -n --arg tag "$TAG" \
+            '{event_type: "zoxy-release", client_payload: {tag: $tag}}' |
+            gh api repos/zoxy-io/site/dispatches --input -
