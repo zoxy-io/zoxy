@@ -654,10 +654,24 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   replay is spent before its try begins (no loop) and always dials
   fresh — the endpoint's whole idle list may be stale the same way. The
   endpoint pick is per-cluster config: `p2c` (two uniform candidates
-  from a fixed-seed PRNG, the lower leased count wins) by default, `rr`
+  from a fixed-seed PRNG, the lower **in-flight total** wins — L7 leases
+  and live L4 connections summed, since both are work the origin is
+  carrying) by default, `rr`
   for strict rotation, `hash` for stickiness. Cluster endpoints are
   static socket addresses resolved once at config load, never on the
   loop (dynamic DNS is a non-goal, §1).
+- **A pick chooses among the endpoints that are both healthy and under
+  capacity**, in that order, and the two filters differ in what an empty
+  result means. Health fails **open**: a cluster with every endpoint
+  ejected balances as if none were. `max_inflight` (§8) fails **closed**:
+  every endpoint at its cap refuses the request rather than dialing one.
+  The asymmetry is the point — an ejection says *we do not know whether
+  these work*, so trying beats refusing, while a cap says *we know they
+  are full*, and the whole reason it exists is to not send more. Capacity
+  is judged over whatever health left, so a cluster that fails open still
+  respects its caps. The in-flight total both this and `p2c` read counts
+  L7 leases and live L4 connections alike, which is what lets an L4-only
+  deployment be protected and load-balanced at all.
 - **`hash` is rendezvous hashing, and it is stateless because it has to
   be.** Client-to-backend stickiness is normally a *table* — the proxy
   records which server a client went to. That mechanism cannot work
@@ -745,16 +759,25 @@ the loop thread.
 | relay buffers (L4) | accept admission | close immediately |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) |
+| **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
-Every rung but one sheds on a *resource* running out. That is a real gap
-and it was measured, not theorised: at c10k the upstream pool's ceiling
-was the only thing saying no, and once it was given enough headroom to
-stop firing (§5), nothing bounded an overloaded exchange at all —
-latency grew until the *client* gave up, and this proxy went on spending
-CPU answering requests whose callers had left. The numbers are in
-IMPLEMENTATION_NOTES.md.
+Most rungs shed on a *resource of this proxy's* running out. That was
+once every rung, and it was a real gap — measured, not theorised: at
+c10k the upstream pool's ceiling was the only thing saying no, and once
+it was given enough headroom to stop firing (§5), nothing bounded an
+overloaded exchange at all — latency grew until the *client* gave up,
+and this proxy went on spending CPU answering requests whose callers had
+left. The numbers are in IMPLEMENTATION_NOTES.md.
+
+Two rungs answer on something else. One is **time** (below). The other
+is the **origin's** capacity rather than this proxy's: `max_inflight`
+caps the work one endpoint may carry, counted across both protocols
+(§7), and refuses past it. The distinction is the point — running out of
+upstream slots says *widen the pool*, while a capped endpoint says *the
+backend is full*, and the two have their own counters so an operator
+cannot read one as the other.
 
 The rung that answers on **time** rather than on exhaustion is the
 request deadline, and `timeouts.request_ms` is what arms it: an absolute

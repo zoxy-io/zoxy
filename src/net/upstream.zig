@@ -225,6 +225,37 @@ pub fn endpointKey(cluster_index: u16, endpoint_index: u16) u32 {
     return @as(u32, cluster_index) * constants.endpoints_per_cluster_max + endpoint_index;
 }
 
+/// How much work an endpoint is carrying right now, across both
+/// protocols (§7). Two tables rather than one running total, because
+/// each has its own provable bound and its own single writer: the pool
+/// owns `l7` (leases, `leased_counts`) and the server owns `l4` (live
+/// relayed connections, which hold no pool slot at all). A shared
+/// counter would have to give up `leased_counts <= slot_pool.slots.len`,
+/// since L4 connections outnumber the upstream pool whenever
+/// `conn_slots` exceeds `upstream_slots` — a legal config.
+///
+/// A view, not storage: it borrows both tables so the sum is computed
+/// where it is read and can never drift from either writer.
+///
+/// The two count different things — an L7 lease is one in-flight
+/// *request*, an L4 charge is one live *connection* — and the sum is
+/// deliberate: both are work the origin is doing right now, which is
+/// what a load comparison and a capacity limit are about. A cluster
+/// reached by both an `l4` and an `http` listener is representable, and
+/// there the total is that mixed unit.
+pub const Load = struct {
+    l7: *const [endpoint_keys_max]u16,
+    l4: *const [endpoint_keys_max]u16,
+
+    /// Total in-flight work against one endpoint. `u32` because the two
+    /// ceilings sum past a `u16`'s range in principle, even though no
+    /// single deployment reaches both at once.
+    pub fn inFlight(load: *const Load, key: u32) u32 {
+        assert(key < endpoint_keys_max);
+        return @as(u32, load.l7[key]) + load.l4[key];
+    }
+};
+
 // Tests drive the pool through a socket-free fake Io: the pool never
 // touches the socket, it only stores it for the owner.
 

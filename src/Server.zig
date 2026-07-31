@@ -42,6 +42,17 @@ pub fn Server(comptime IoType: type) type {
         /// The shared upstream connection pool (§3, §5): leased per L7
         /// exchange today; parking joins with keep-alive.
         upstreams: upstream_module.UpstreamPool(IoType),
+        /// Live L4 relayed connections per endpoint (§7), the other half
+        /// of `upstream_module.Load`. The pool cannot hold this: an L4
+        /// connection leases no upstream slot, so it is the server —
+        /// which owns the conn slots such a connection *does* hold —
+        /// that counts them. Charged at the dial, released with the conn
+        /// slot, so the two move together.
+        ///
+        /// `u16` for the same reason `leased_counts` is: one charge per
+        /// live conn slot bounds every entry by `conn_slots_max`, which
+        /// `constants` asserts fits (`conn_slots_max - 1 <= maxInt(u16)`).
+        l4_inflight: [upstream_module.endpoint_keys_max]u16,
         listeners: []ListenerState,
         listeners_count: u16,
         /// The load-balancing policy: resolves a cluster to the endpoint to
@@ -156,6 +167,7 @@ pub fn Server(comptime IoType: type) type {
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
             try server.upstreams.init(arena, options.upstream_slots);
+            @memset(&server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
             server.balancer.init(config);
@@ -331,11 +343,24 @@ pub fn Server(comptime IoType: type) type {
             server.ensureUpstreamSweep();
         }
 
+        /// Every L4 endpoint charge has been released (§7). A scan, not a
+        /// running total: a second counter would be one more thing that
+        /// can disagree with the table it summarises, and this is asked
+        /// only at the idle checks, never on the serving path.
+        pub fn l4Released(server: *const Self) bool {
+            for (server.l4_inflight) |count| {
+                if (count != 0) return false;
+            }
+            return true;
+        }
+
         /// The simulator's leak invariant (§9). The admin conn holds no
         /// pool slot, but a leaked armed op or an open admin fd is a leak
-        /// all the same, so its quiescence is part of "idle".
+        /// all the same, so its quiescence is part of "idle" — and so is
+        /// an endpoint left carrying a charge for a connection that ended.
         pub fn isIdle(server: *const Self) bool {
-            return server.conns.isFullyReleased() and
+            return server.l4Released() and
+                server.conns.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
                 server.admin.isQuiescent() and
@@ -634,20 +659,32 @@ pub fn Server(comptime IoType: type) type {
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
-            conn.arm(&conn.op_connect, "connect");
-            // L4 dials hold no Upstream slot, so the load table reflects
-            // L7 leases only — the P2C draw still spreads L4 dials by the
-            // observed L7 load, and evenly when there is none.
             const pick = server.balancer.pick(
                 cluster_index,
-                &server.upstreams.leased_counts,
+                &server.endpointLoad(),
                 &server.health.healthy,
                 &conn.client_address,
-            );
+            ) orelse {
+                // Every endpoint is at its §8 cap. An L4 listener has no
+                // way to say so — it relays bytes, and there is no
+                // protocol to answer in — so the ladder's L4 answer
+                // applies: close. Counted outside the gate identity,
+                // because this connection was admitted before an endpoint
+                // was ever picked (§8).
+                server.counters.increment("l4_shed_endpoint_inflight");
+                // Nothing was armed for this dial yet — the arm below is
+                // the first — so teardown here cancels only the deadline
+                // admission left running (§5).
+                assert(!conn.armed.connect);
+                server.beginTeardown(conn);
+                return;
+            };
+            conn.arm(&conn.op_connect, "connect");
             // An L4 dial holds no slot to record the endpoint on, so the
             // access log takes it here — the only place that knows which
             // origin this connection is being relayed to (§8).
             conn.log.endpoint_index = pick.endpoint_index;
+            server.chargeL4(conn, cluster_index, pick.endpoint_index);
             server.io.connect(
                 pick.address,
                 &conn.op_connect.completion,
@@ -758,8 +795,13 @@ pub fn Server(comptime IoType: type) type {
                 server.releaseUpstream(leased);
                 conn.upstream = null;
             }
+            // The L4 endpoint charge rides the same rule: the socket that
+            // made this connection work against an origin is closed just
+            // above, so the origin is no longer carrying it (§7).
+            server.releaseL4(conn);
             assert(conn.relay_buffer == null);
             assert(conn.upstream == null);
+            assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
             // The last chance to say anything about this connection (§8).
             // An exchange that reached a verdict already spoke and is
             // skipped by `emitted`; what is left here is everything that
@@ -1010,6 +1052,47 @@ pub fn Server(comptime IoType: type) type {
             assert(leased.endpoint_index == endpoint_index);
             server.updateUpstreamPressure();
             return leased;
+        }
+
+        /// The per-endpoint in-flight view both policies read (§7): the
+        /// pool's L7 leases beside the server's L4 charges. Built at the
+        /// read rather than stored, so it cannot drift from either
+        /// writer.
+        pub fn endpointLoad(server: *const Self) upstream_module.Load {
+            return .{
+                .l7 = &server.upstreams.leased_counts,
+                .l4 = &server.l4_inflight,
+            };
+        }
+
+        /// The L4 counterpart of `acquireUpstream`: a dial about to go
+        /// out counts against its endpoint. The endpoint is recorded on
+        /// the connection so the release cannot guess, and so a slot
+        /// that never dialed releases nothing.
+        fn chargeL4(server: *Self, conn: *ConnType, cluster_index: u16, endpoint_index: u16) void {
+            assert(conn.protocol == .l4);
+            assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
+            const key = upstream_module.endpointKey(cluster_index, endpoint_index);
+            server.l4_inflight[key] += 1;
+            // Every charge is held by a live conn slot, so one endpoint's
+            // count can never pass the conn pool's own size — the same
+            // shape `leased_counts` asserts against the upstream pool, and
+            // a far tighter canary for a missed release than the type's
+            // ceiling would be.
+            assert(server.l4_inflight[key] <= server.conns.capacity());
+            conn.charged_cluster = cluster_index;
+            conn.charged_endpoint = endpoint_index;
+        }
+
+        /// The release side, from the one place every L4 teardown passes
+        /// through. Idempotent by the sentinel: a connection shed before
+        /// its dial, or torn down twice, has nothing charged.
+        fn releaseL4(server: *Self, conn: *ConnType) void {
+            if (conn.charged_endpoint == conn_module.LogState.endpoint_none) return;
+            const key = upstream_module.endpointKey(conn.charged_cluster, conn.charged_endpoint);
+            assert(server.l4_inflight[key] >= 1);
+            server.l4_inflight[key] -= 1;
+            conn.charged_endpoint = conn_module.LogState.endpoint_none;
         }
 
         pub fn releaseUpstream(

@@ -132,6 +132,14 @@ pub const Config = struct {
         /// cluster, so absent means the balancer never skips anything
         /// here and the prober never dials it.
         check: ?Check = null,
+        /// The §8 concurrency cap protecting each of this cluster's
+        /// endpoints, or null for uncapped. **Per endpoint, not per
+        /// cluster**: it is a statement about what one origin can carry,
+        /// the same unit HAProxy's `server ... maxconn` names, so a
+        /// cluster's total admitted work is this times its endpoint
+        /// count. Counted against the endpoint's in-flight total —
+        /// L7 requests and live L4 connections alike (§7).
+        max_inflight: ?u32 = null,
 
         /// What a `hash` cluster keys its endpoint choice on (§7). Read
         /// only when `pick == .hash`; the loader rejects a `hash` block
@@ -229,6 +237,7 @@ pub const ValidationError = error{
     ClusterCheckPathNotCanonical,
     ClusterCheckHostInvalid,
     ClusterCheckStatusInvalid,
+    ClusterMaxInflightOutOfRange,
     ClusterHashKeyUnknown,
     ClusterHashWithoutHashPick,
     ListenerClusterOrRoutes,
@@ -689,6 +698,8 @@ pub const ClusterJson = struct {
     /// Optional §7 active health checks; absent means off, so an
     /// unprobed cluster reserves nothing and is never skipped.
     check: ?CheckJson = null,
+    /// Optional §8 per-endpoint concurrency cap; absent means uncapped.
+    max_inflight: ?u32 = null,
     /// Optional §7 hash-policy detail; only valid beside `"pick": "hash"`,
     /// and absent there means the default key.
     hash: ?ClusterHashJson = null,
@@ -711,6 +722,11 @@ pub const ClusterJson = struct {
         },
         .hash = .{
             .desc = "Hash-policy detail; only valid alongside \"pick\": \"hash\".",
+        },
+        .max_inflight = .{
+            .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
+            .minimum = 1,
+            .maximum = constants.endpoint_inflight_max,
         },
     };
 };
@@ -999,6 +1015,7 @@ fn resolveClusters(
             .pick = pick,
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
             .hash_key = try hashKeyOf(pick, entry.cluster.hash),
+            .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
         };
     }
     assert(clusters.len == count);
@@ -1512,6 +1529,20 @@ fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Htt
         .host = check.host,
         .expect_status = check.expect_status,
     };
+}
+
+/// Resolve the §8 per-endpoint concurrency cap. Absent leaves the
+/// cluster uncapped; zero would refuse every request to an endpoint that
+/// is doing nothing, and a value at or above the largest representable
+/// in-flight total could never refuse anything — both are far more
+/// likely a mistake than an intent, and "uncapped" already has a
+/// spelling.
+fn resolveMaxInflight(max_inflight: ?u32) ParseError!?u32 {
+    const cap = max_inflight orelse return null;
+    if (cap < 1 or cap > constants.endpoint_inflight_max) {
+        return error.ClusterMaxInflightOutOfRange;
+    }
+    return cap;
 }
 
 /// The closed pick-policy vocabulary; anything else is its own error so
@@ -2592,4 +2623,51 @@ test "config: the hash pick policy and its key resolve, or fail loudly" {
         error.UnknownField,
         head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"source_ip\",\"mask\":24}" ++ tail,
     );
+}
+
+test "config: max_inflight resolves, defaults to uncapped, rejects the useless" {
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"max_inflight":64},
+            \\   "b":{"endpoints":["127.0.0.1:3"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(?u32, 64), parsed.clusters[0].max_inflight);
+        // Absent is uncapped, which is the only spelling of "no limit".
+        try std.testing.expectEqual(@as(?u32, null), parsed.clusters[1].max_inflight);
+    }
+    // Zero would refuse every request to an idle endpoint, and a value
+    // past the largest representable load could never refuse one —
+    // both are typos rather than intents (§8).
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"max_inflight":
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    ;
+    try expectParseError(error.ClusterMaxInflightOutOfRange, head ++ "0" ++ tail);
+    try expectParseError(error.ClusterMaxInflightOutOfRange, head ++ "4294967295" ++ tail);
+    // The ceiling itself is legal, and deliberately so: it is reachable
+    // only if every conn and upstream slot in the process piles onto one
+    // endpoint, which is a real (if extreme) shape rather than a no-op.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        var buffer: [512]u8 = undefined;
+        const json = try std.fmt.bufPrint(
+            &buffer,
+            "{s}{d}{s}",
+            .{ head, constants.endpoint_inflight_max, tail },
+        );
+        const parsed = try parse(arena_state.allocator(), json);
+        try std.testing.expectEqual(
+            @as(?u32, constants.endpoint_inflight_max),
+            parsed.clusters[0].max_inflight,
+        );
+    }
 }
