@@ -208,6 +208,12 @@ pub const TestBed = struct {
         /// Turn the §8 access log on. Off by default so every existing
         /// scenario keeps paying nothing for it.
         access_log: bool = false,
+        /// §7 active health checks on the one cluster; off by default so
+        /// existing scenarios see no probe traffic.
+        check: bool = false,
+        /// Probe pacing for `check` scenarios — tight, so fall/rise fit
+        /// inside a short virtual run.
+        health_interval_ms: u32 = 20,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -225,7 +231,7 @@ pub const TestBed = struct {
 
         try bed.sim_io.init(arena, options.sim);
         bed.endpoints = .{originAddress()};
-        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .l4 }};
         bed.config = .{
@@ -239,6 +245,7 @@ pub const TestBed = struct {
             // this bed never routes one.
             .request_timeout_ms = 0,
             .access_log_sink = if (options.access_log) .stdout else null,
+            .health_interval_ms = options.health_interval_ms,
         };
         var server_options = options.server;
         server_options.access_log_buffer_bytes = if (options.access_log)
@@ -870,4 +877,86 @@ test "relay: a connection reaped by the idle deadline is logged as aborted" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"bytes_in\":0,") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"bytes_out\":0,") != null);
+}
+
+test "health: probes against a listening origin keep the endpoint healthy" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 71 },
+        .check = true,
+        .health_interval_ms = 50,
+    });
+    defer bed.tearDown();
+
+    // No clients: the prober is the only source of work. The terminate
+    // signal ends the scenario the §8 way, which must leave the prober
+    // quiescent and the pools untouched.
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 120 * std.time.ns_per_ms);
+    try bed.sim_io.run();
+
+    // The immediate first sweep plus at least one interval-paced one,
+    // all passing: no ejection, no counted failure, mask untouched.
+    try std.testing.expect(bed.server.counters.get("health_probes_sent") >= 2);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.checked_count);
+    try std.testing.expectEqual(@as(u32, 0), bed.server.health.unhealthy_count);
+    try bed.expectDrained();
+}
+
+test "health: consecutive refusals eject the endpoint" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 72 },
+        .origin_listens = false,
+        .check = true,
+        .health_interval_ms = 20,
+    });
+    defer bed.tearDown();
+
+    // Nothing listens at the endpoint: every probe is refused. The third
+    // consecutive miss (constants.health_probe_fall) ejects; later misses
+    // keep counting probes but never re-eject.
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 200 * std.time.ns_per_ms);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_up"));
+    try std.testing.expect(!bed.server.health.healthy[0]);
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.unhealthy_count);
+    // The level reaches the scrape as a gauge, and the snapshot is valid.
+    const gauges = bed.server.gauges();
+    try std.testing.expectEqual(@as(u32, 1), gauges.health_endpoints_unhealthy);
+    try std.testing.expectEqual(@as(u32, 1), gauges.health_endpoints_checked);
+    try bed.expectDrained();
+}
+
+test "health: rise restores an ejected endpoint after passing probes" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 73 },
+        .check = true,
+        .health_interval_ms = 20,
+    });
+    defer bed.tearDown();
+
+    // Three injected dial faults fail exactly the first three probes —
+    // ejecting the endpoint and witnessing §8 kernel pressure on the
+    // probe path — then the listening origin answers, and the second
+    // consecutive pass (constants.health_probe_rise) restores it.
+    bed.sim_io.injectConnectError(TestBed.originAddress());
+    bed.sim_io.injectConnectError(TestBed.originAddress());
+    bed.sim_io.injectConnectError(TestBed.originAddress());
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 160 * std.time.ns_per_ms);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 3), bed.server.counters.get("health_probes_failed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_up"));
+    try std.testing.expectEqual(@as(u64, 3), bed.server.counters.get("kernel_pressure_connect"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    try std.testing.expectEqual(@as(u32, 0), bed.server.health.unhealthy_count);
+    try bed.expectDrained();
 }

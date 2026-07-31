@@ -57,11 +57,12 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// deepest CQ the kernel allows (`completion_queue_entries`,
 /// IORING_SETUP_CQSIZE) against the 4096 SQ, so at the largest fill a
 /// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
-/// parked-upstream, admin and access-log reservations carved out first,
-/// this caps at `(57344 - 24) / (conn_ops_max + 1) = 11464` —
-/// comptime-derived below (the 24 is the fixed ops: two per config and
+/// parked-upstream, admin, access-log and health-probe reservations
+/// carved out first, this caps at
+/// `(57344 - 27) / (conn_ops_max + 1) = 11463` —
+/// comptime-derived below (the 27 is the fixed ops: two per config and
 /// admin listener [18], the admin client's op budget [3], the access log's
-/// in-flight sink write [1], the signal
+/// in-flight sink write [1], the health prober's op budget [3], the signal
 /// wake [1], and the drain timer [1]). That clears a round 10k on a
 /// single ring; a deployment trades the ceiling back down for more burst
 /// headroom via `limits.cq_fill_eighths` (§8).
@@ -72,8 +73,8 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// every admitted connection can be mid-exchange at once. A conn ceiling
 /// above the upstream ceiling is therefore capacity that cannot be served
 /// — slots that admit connections the pool has no upstream for — and one
-/// below it is a pool that can never be drawn down. `11464` is the
-/// largest N with `N * (conn_ops_max + 1) <= 57320`, which keeps both
+/// below it is a pool that can never be drawn down. `11463` is the
+/// largest N with `N * (conn_ops_max + 1) <= 57317`, which keeps both
 /// ceilings clear of a round 10k: what §1 asks for, c10k reachable on
 /// either axis rather than a shape tuned for it.
 ///
@@ -84,7 +85,7 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// The pair is still a policy choice made on the operator's behalf;
 /// IMPLEMENTATION_NOTES.md ("Open questions" — pool ceilings) holds the
 /// standing question of handing it to them instead.
-pub const conn_slots_max: u32 = 11464;
+pub const conn_slots_max: u32 = 11463;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -234,6 +235,31 @@ pub const clusters_min: u16 = 1;
 /// Upper bound on endpoints in one cluster.
 pub const endpoints_per_cluster_max: u16 = 64;
 
+/// Worst-case simultaneously armed ring ops for the §7 health prober:
+/// three. One probe is in flight at a time — {connect, probe deadline}
+/// co-armed while dialing — and settling a verdict or draining adds one
+/// cancel to whichever op is still armed ({connect, deadline,
+/// connect_cancel} at the peak; a drain teardown cancels serially, never
+/// both cancels at once). Reserved in the fd and ring budgets below
+/// unconditionally, the same rule as `admin_conn_ops_max`: the ceiling
+/// is a comptime constant, so it must cover the worst case even when no
+/// cluster sets `check`.
+pub const health_probe_ops_max: u32 = 3;
+
+/// Consecutive failed probes that eject an endpoint from balancing (§7).
+/// HAProxy's `fall` default: three misses is an outage, one is a blip.
+pub const health_probe_fall: u8 = 3;
+
+/// Consecutive successful probes that restore an ejected endpoint (§7).
+/// HAProxy's `rise` default: recovery must prove itself twice.
+pub const health_probe_rise: u8 = 2;
+
+/// Default `timeouts.health_interval_ms`: the pause between health-probe
+/// sweeps when the config omits it (§7). HAProxy's `inter` default. The
+/// probe's own connect budget is `timeouts.connect_ms` — a probe is a
+/// dial try, so it runs under the dial's deadline, not its own.
+pub const health_interval_ms_default: u32 = 2_000;
+
 /// Upper bound on routes in one listener's path-routing table (§7). Config
 /// data, not a runtime pool: routes are immutable arena slices, and the
 /// request-time match is a bounded linear scan over at most this many.
@@ -341,11 +367,12 @@ pub const access_log_line_bytes_max: u32 = blk: {
 /// draining listener holds its armed accept — or the accept-retry backoff
 /// timer — plus the async cancel that reaps it), `admin_conn_ops_max` ops
 /// per admin client (its send/deadline/teardown peak), the access log's one
-/// in-flight sink write, the single async
-/// wakeup op for signals, and the server's one drain-deadline timer. Closed
-/// form so it can be evaluated on the *effective* pool sizes too (XevIo's
-/// per-deployment CQ), not only the ceilings; the admin and access-log
-/// reservations are fixed — always covered even when a config leaves either
+/// in-flight sink write, `health_probe_ops_max` ops for the single
+/// in-flight health probe (§7), the single async wakeup op for signals, and
+/// the server's one drain-deadline timer. Closed form so it can be
+/// evaluated on the *effective* pool sizes too (XevIo's per-deployment CQ),
+/// not only the ceilings; the admin, access-log and health-probe
+/// reservations are fixed — always covered even when a config leaves them
 /// off; `in_flight_ops_max` is it at the ceilings.
 pub fn inFlightOps(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
     assert(conn_slots <= conn_slots_max);
@@ -353,7 +380,8 @@ pub fn inFlightOps(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
     assert(listeners <= listeners_max);
     return conn_slots * conn_ops_max + upstream_slots +
         2 * (listeners + admin_listeners) +
-        admin_conns * admin_conn_ops_max + access_log_ops_max + 1 + 1;
+        admin_conns * admin_conn_ops_max + access_log_ops_max +
+        health_probe_ops_max + 1 + 1;
 }
 pub const in_flight_ops_max: u32 =
     inFlightOps(conn_slots_max, upstream_slots_max, listeners_max);
@@ -448,15 +476,16 @@ pub const completion_queue_entries: u32 =
 /// per admitted connection (client plus the exchange's upstream) + the one
 /// transient just-accepted fd an admission decision is pending on + one
 /// socket per in-flight admin scrape + one socket per parked upstream,
-/// which belongs to no connection. Closed form so `ensureFdBudget` can
-/// check the *effective* size against RLIMIT_NOFILE; the admin reservation
-/// is fixed; `fds_max` is it at the ceilings.
+/// which belongs to no connection + the one socket the in-flight health
+/// probe may hold while dialing (§7). Closed form so `ensureFdBudget` can
+/// check the *effective* size against RLIMIT_NOFILE; the admin and
+/// health-probe reservations are fixed; `fds_max` is it at the ceilings.
 pub fn fdsRequired(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(upstream_slots <= upstream_slots_max);
     assert(listeners <= listeners_max);
     return 3 + 1 + 1 + (listeners + admin_listeners) +
-        2 * conn_slots + 1 + admin_conns + upstream_slots;
+        2 * conn_slots + 1 + admin_conns + upstream_slots + 1;
 }
 pub const fds_max: u32 =
     fdsRequired(conn_slots_max, upstream_slots_max, listeners_max);
@@ -487,19 +516,20 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 /// deployment needs one upstream slot per busy conn slot (see
 /// `conn_slots_max`), because the out-of-box shape is bounded by the
 /// stock 4096 `RLIMIT_NOFILE` rather than by admission: matching 1386
-/// would put the default at 4167 fds, over that line, for capacity an
-/// unconfigured proxy is not there to serve. 1314 is the largest value
+/// would put the default at 4168 fds, over that line, for capacity an
+/// unconfigured proxy is not there to serve. 1313 is the largest value
 /// that still clears that line — `fdsRequired(conn_slots_default, x, 1)`
-/// is `2781 + x`, and that must stay strictly under 4096 (the out-of-box
-/// budget stays *under* the stock limit, not flush against it), so
-/// `4096 - 2781 - 1 = 1314` — the default leans as far toward
+/// is `2782 + x` (the health probe's reserved fd included), and that must
+/// stay strictly under 4096 (the out-of-box budget stays *under* the
+/// stock limit, not flush against it), so `4096 - 2782 - 1 = 1313` — the
+/// default leans as far toward
 /// `conn_slots_default` as the stock fd budget allows. An L4
 /// deployment never leases from this pool at all — an L4 dial reads its
 /// `leased_counts` for the P2C draw and holds no slot. A deployment that
 /// means to fill its conn pool raises both together in `limits` — which
 /// is what the ceilings exist to permit and what the c10k benchmark
 /// configuration does.
-pub const upstream_slots_default: u32 = 1314;
+pub const upstream_slots_default: u32 = 1313;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
@@ -569,7 +599,8 @@ comptime {
     assert(conn_slots_max == @divFloor(
         @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
             2 * (@as(u32, listeners_max) + admin_listeners) -
-            admin_conns * admin_conn_ops_max - access_log_ops_max - 1 - 1,
+            admin_conns * admin_conn_ops_max - access_log_ops_max -
+            health_probe_ops_max - 1 - 1,
         conn_ops_max + 1,
     ));
     assert(admin_listeners >= 1);
@@ -591,6 +622,15 @@ comptime {
     assert(access_log_path_bytes_max >= 16);
     assert(access_log_method_bytes_max >= 7); // "OPTIONS", the longest standard method.
     assert(cluster_name_bytes_max >= 1);
+    // The health prober's reservations and thresholds (§7): the op budget
+    // covers dial + deadline + one cancel, a threshold of zero would eject
+    // or restore on no evidence, and the default probe interval is a legal
+    // configured timeout.
+    assert(health_probe_ops_max >= 1);
+    assert(health_probe_fall >= 1);
+    assert(health_probe_rise >= 1);
+    assert(health_interval_ms_default >= 1);
+    assert(health_interval_ms_default <= timeout_ms_max);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool
@@ -736,7 +776,7 @@ test "budgets: c10k ceiling fd count needs a raised NOFILE" {
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
-    try std.testing.expectEqual(@as(u32, 34408), fds_max);
+    try std.testing.expectEqual(@as(u32, 34406), fds_max);
     try std.testing.expect(fds_max <= 65536);
     // The out-of-box side of this is pinned by "the default deployment is
     // lean" below, not restated here.
@@ -765,7 +805,8 @@ test "budgets: conn slots sit at the completion-queue ceiling" {
     try std.testing.expect(in_flight_ops_max <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
     const one_more = (conn_slots_max + 1) * conn_ops_max + upstream_slots_max +
         2 * (@as(u32, listeners_max) + admin_listeners) +
-        admin_conns * admin_conn_ops_max + access_log_ops_max + 1 + 1;
+        admin_conns * admin_conn_ops_max + access_log_ops_max +
+        health_probe_ops_max + 1 + 1;
     try std.testing.expect(one_more > @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
 }
 

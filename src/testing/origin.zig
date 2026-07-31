@@ -44,7 +44,11 @@ pub fn Origin(comptime IoType: type) type {
         context: ?*anyopaque = null,
 
         const Self = @This();
-        pub const conns_max: u8 = 16;
+        /// Sized for the sim's worst case: the client population plus a
+        /// `check` scenario's passing probes, each of which accepts and
+        /// vanishes (§7) but still consumes a slot — conns are tracked
+        /// monotonically, never recycled.
+        pub const conns_max: u8 = 32;
         const buffer_bytes: usize = 128;
 
         pub const Conn = struct {

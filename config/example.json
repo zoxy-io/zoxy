@@ -3,7 +3,7 @@
         { "bind": "127.0.0.1:8080", "cluster": "origin", "protocol": "l4" }
     ],
     "clusters": {
-        "origin": { "endpoints": ["127.0.0.1:9000"] }
+        "origin": { "endpoints": ["127.0.0.1:9000"], "check": true }
     },
     "timeouts": {
         "connect_ms": 5000,

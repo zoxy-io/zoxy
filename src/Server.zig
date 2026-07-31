@@ -19,6 +19,7 @@ const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const counters_module = @import("counters.zig");
 const conn_module = @import("net/Conn.zig");
+const health_module = @import("net/health.zig");
 const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
 const proxy = @import("http/proxy.zig");
@@ -92,6 +93,11 @@ pub fn Server(comptime IoType: type) type {
         /// ring op and two staging buffers, both reserved unconditionally
         /// in the budgets and allocated only when it is on.
         access_log: AccessLogType,
+        /// The §7 active health prober: one probe in flight, budgeted
+        /// separately (`constants.health_probe_ops_max`). Off unless a
+        /// cluster sets `check`; its `healthy` mask is what the balancer
+        /// picks through.
+        health: health_module.Checker(IoType),
 
         const Self = @This();
 
@@ -166,6 +172,7 @@ pub fn Server(comptime IoType: type) type {
             server.admin.init(server, config.admin_bind);
             server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
             try server.access_log.reserve(arena);
+            server.health.init(server);
         }
 
         /// Override the admin/metrics bind before `start` — the simulator
@@ -197,6 +204,7 @@ pub fn Server(comptime IoType: type) type {
                 server.armAccept(state);
             }
             try server.admin.start();
+            server.health.start();
             server.io.signalWait(Self, server, onSignal);
         }
 
@@ -215,6 +223,10 @@ pub fn Server(comptime IoType: type) type {
             // The admin listener stops accepting and any in-flight scrape
             // is torn down under the same drain (§8).
             server.admin.beginDrain();
+            // The prober stops too: a drain has no routing decisions left
+            // for its verdicts to inform, and its armed ops must drain
+            // before the loop may stop (§8).
+            server.health.beginStop();
             // Parked upstreams are idle capacity; the drain sheds them
             // first (§8). Synchronous closes: no armed op to wait for.
             server.reapParked(true);
@@ -263,6 +275,8 @@ pub fn Server(comptime IoType: type) type {
             // reading, and stopping the loop over an armed sink write
             // would lose exactly those (§8).
             if (!server.access_log.isQuiescent()) return;
+            // Same rule for the prober's armed ops (§8).
+            if (!server.health.isQuiescent()) return;
             assert(server.relay_buffers.isFullyReleased());
             // beginDrain reaped every parked slot synchronously and no
             // conn is left to lease one, so the pool must be empty.
@@ -325,7 +339,8 @@ pub fn Server(comptime IoType: type) type {
                 server.relay_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
                 server.admin.isQuiescent() and
-                server.access_log.isQuiescent();
+                server.access_log.isQuiescent() and
+                server.health.isQuiescent();
         }
 
         pub fn activeCount(server: *const Self) u32 {
@@ -623,7 +638,11 @@ pub fn Server(comptime IoType: type) type {
             // L4 dials hold no Upstream slot, so the load table reflects
             // L7 leases only — the P2C draw still spreads L4 dials by the
             // observed L7 load, and evenly when there is none.
-            const pick = server.balancer.pick(cluster_index, &server.upstreams.leased_counts);
+            const pick = server.balancer.pick(
+                cluster_index,
+                &server.upstreams.leased_counts,
+                &server.health.healthy,
+            );
             // An L4 dial holds no slot to record the endpoint on, so the
             // access log takes it here — the only place that knows which
             // origin this connection is being relayed to (§8).
@@ -962,6 +981,8 @@ pub fn Server(comptime IoType: type) type {
                 .upstream_slots_parked = server.upstreams.parkedCount(),
                 .upstream_slots_capacity = server.upstreams.capacity(),
                 .kernel_pressure_last_errno = server.last_pressure_errno,
+                .health_endpoints_checked = server.health.checked_count,
+                .health_endpoints_unhealthy = server.health.unhealthy_count,
             };
             // Asserted at the producer, not in the renderer: a level past
             // its capacity would mean a pool miscounted, and that is a bug

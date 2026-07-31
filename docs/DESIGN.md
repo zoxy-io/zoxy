@@ -374,8 +374,11 @@ Three shared pools, all owned and touched only by the loop thread:
    an in-flight op per idle upstream in the ring budget (§8) for a race
    that is already covered: the parked connection's deadline timer serves
    as an idle timeout (kept below typical origin keep-alive windows, so
-   most origin-side closes are pre-empted), and a close that slips through
-   is detected at checkout and absorbed by the stale-replay rung (§7).
+   most origin-side closes are pre-empted), a close that slips through is
+   detected at checkout and absorbed by the stale-replay rung (§7), and
+   active health checks (§7) close the parked connections of an endpoint
+   at its ejection — a parked socket to a dead origin is a stale replay
+   waiting to be spent.
 
 Sizing shape. The comptime constants are the hard, budget-asserted
 *ceilings*; the config `limits` block sizes the *effective* pools anywhere
@@ -389,9 +392,9 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 11464 | ~1.7 KiB state + 8 KiB head |
-| relay buffers | 1386 | 11464 | 2 × 4 KiB |
-| upstream slots | 1314 | 11464 | ~40 B state + 8 KiB head |
+| conn slots | 1386 | 11463 | ~1.7 KiB state + 8 KiB head |
+| relay buffers | 1386 | 11463 | 2 × 4 KiB |
+| upstream slots | 1313 | 11463 | ~40 B state + 8 KiB head |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
 
 The access log (§8) adds one fixed reservation beside the pools — two
@@ -406,7 +409,7 @@ have to be copied out while they are still there.
 The ceilings sit on one completion-queue line — a conn slot costs
 `conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
 is **pinned to the conn ceiling**, so that line has a single divisor:
-`conn_ops_max + 1` ring ops per admitted connection, 11464 of them. On
+`conn_ops_max + 1` ring ops per admitted connection, 11463 of them. On
 the L7 path a connection that is mid-exchange holds an upstream slot as
 well as its conn slot, and at saturation every admitted connection can be
 mid-exchange at once — so an upstream ceiling below the conn ceiling is
@@ -424,8 +427,8 @@ recorded there.
 
 The *defaults* are not pinned to each other, and deliberately: the
 out-of-box shape is bounded by the stock 4096 `RLIMIT_NOFILE` rather than
-by admission (matching 1386 would cost 4167 fds), so the upstream default
-sits at 1314 — the largest value that still stays strictly under that
+by admission (matching 1386 would cost 4168 fds), so the upstream default
+sits at 1313 — the largest value that still stays strictly under that
 line — rather than at the conn default. An L4 deployment never touches
 the upstream pool at all — an L4 dial holds no upstream slot. A
 deployment that means to fill its conn pool raises both together through
@@ -654,8 +657,25 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   from a fixed-seed PRNG, the lower leased count wins) by default, `rr`
   for strict rotation. Cluster endpoints are static socket addresses
   resolved once at config load, never on the loop (dynamic DNS is a
-  non-goal, §1). Circuit breakers, outlier ejection, retry budgets,
-  health checks are *deferred* — the previous iteration proved them
+  non-goal, §1).
+- **Active TCP health checks** are per-cluster opt-in (`check` —
+  HAProxy's model) so a request is not routed to an endpoint known to be
+  down. One prober per server sweeps every checked endpoint with a
+  single probe in flight, budgeted like the admin plane (§8:
+  `health_probe_ops_max` ring ops and one fd, reserved unconditionally);
+  each probe is a dial under the `connect_ms` budget, and sweeps pace
+  sweep-end to sweep-start on `timeouts.health_interval_ms`. A SYN/ACK
+  passes; refused, unreachable, timed out, or kernel pressure (witnessed
+  §8) fails. `health_probe_fall` (3) consecutive misses eject the
+  endpoint from balancing and close its parked pooled connections (§5);
+  `health_probe_rise` (2) passes restore it. Endpoints start healthy —
+  probing demotes, never gates startup — and the pick **fails open**: a
+  cluster with every endpoint ejected balances as if none were, because
+  routing nowhere would turn a probe verdict into an outage of its own,
+  and a same-port TCP probe cannot know better than the dial it stands
+  in for. The check is TCP-level: it proves the port accepts, not that
+  the application behind it is well. Circuit breakers, outlier ejection,
+  retry budgets stay *deferred* — the previous iteration proved them
   buildable in this architecture; simplicity says they wait for a
   demonstrated need.
 
