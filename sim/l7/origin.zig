@@ -153,7 +153,14 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 };
                 assert(received >= 1);
                 if (conn.mode == .reset) {
-                    conn.origin.io.setLingerRst(conn.socket) catch unreachable;
+                    // An injected set-option fault (§9) can land here
+                    // rather than on the server: the injector is a
+                    // process-wide one-shot, and this double shares the
+                    // seam. Absorbing it costs the scenario an RST and
+                    // leaves a graceful close — a shape this origin
+                    // already produces in other modes, so every client
+                    // oracle still holds.
+                    conn.origin.io.setLingerRst(conn.socket) catch {};
                     conn.close();
                     return;
                 }

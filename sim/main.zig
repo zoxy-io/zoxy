@@ -38,11 +38,16 @@ const failures_max: u8 = 16;
 /// coverage.
 ///
 /// Measured, not guessed: 256 seeds cover the whole non-exempt set from
-/// every start tried (1, 5k, 100k, 777_777, 31_415_926), while 64 leaves
-/// five rungs silent — `l7_uri_too_long`, `upstream_replayed`,
-/// `health_parked_closed`, and the recv/send halves of kernel pressure.
-/// This is four times the measured floor, and `ci`'s 4096 clears it with
-/// the same margin the sweep size itself was chosen for.
+/// every start tried (1, 5k, 100k, 777_777, 31_415_926), while 128 still
+/// leaves `upstream_replayed` silent and 64 leaves six rungs silent. This
+/// is four times the measured floor, and `ci`'s 4096 clears it with the
+/// same margin the sweep size itself was chosen for.
+///
+/// The thinnest rung sets the real bound, so it is worth knowing which:
+/// per 1024 seeds, `shed_draining` lands 15-23 times and
+/// `drained_at_deadline` 24-51 across the starts above. A change that
+/// pushes either toward single digits has quietly made this floor a
+/// coin flip, whatever the sweep still says.
 const census_iterations_min: u64 = 1024;
 
 /// A counter no scenario can move, and where it is covered instead.
@@ -92,33 +97,6 @@ const uncovered = [_]Uncovered{
             "src/http_proxy_test.zig builds that delivery",
     },
     .{
-        .name = "kernel_pressure_accept",
-        .reason = "the harness never calls injectAcceptError; " ++
-            "src/server_test.zig drives the backoff-and-recover path",
-    },
-    .{
-        .name = "kernel_pressure_set_option",
-        .reason = "the harness never calls injectSetOptionError; " ++
-            "src/server_test.zig and src/http_proxy_test.zig drive both sites",
-    },
-    .{
-        .name = "kernel_pressure_out_of_memory",
-        .reason = "the sim classifies every injected failure as out_of_buffers; " ++
-            "src/server_test.zig walks the classification arms",
-    },
-    .{
-        .name = "kernel_pressure_fd_limit",
-        .reason = "as kernel_pressure_out_of_memory: one cause per sim run",
-    },
-    .{
-        .name = "kernel_pressure_address_unavailable",
-        .reason = "as kernel_pressure_out_of_memory: one cause per sim run",
-    },
-    .{
-        .name = "kernel_pressure_other_cause",
-        .reason = "as kernel_pressure_out_of_memory: one cause per sim run",
-    },
-    .{
         .name = "admin_served",
         .reason = "the sweep configures no admin listener; " ++
             "src/admin_test.zig covers the scrape",
@@ -138,16 +116,6 @@ const uncovered = [_]Uncovered{
         .name = "access_log_write_failed",
         .reason = "the harness never calls injectLogWriteError; " ++
             "src/access_log_test.zig covers the stop-and-witness",
-    },
-    .{
-        .name = "shed_draining",
-        .reason = "no seed schedules a terminate signal; " ++
-            "src/server_test.zig drives the accept that raced the drain",
-    },
-    .{
-        .name = "drained_at_deadline",
-        .reason = "no seed schedules a terminate signal; " ++
-            "src/server_test.zig drives the drain deadline",
     },
 };
 
@@ -207,10 +175,12 @@ fn reasonFor(name: []const u8) ?[]const u8 {
 /// `reconcile` gates each seed's *shape* — work is never lost, every shed
 /// is witnessed — but nothing gated the sweep's *reach*, so a rung could
 /// quietly become unreachable and the gate would stay green describing a
-/// path no scenario walks. `kernel_pressure_set_option` is the standing
+/// path no scenario walks. `kernel_pressure_set_option` was the standing
 /// example: `SimIo` grew an injector precisely because "64 seeds stayed
-/// green because nothing could make the call fail", and no seed has made
-/// the call fail since.
+/// green because nothing could make the call fail", and then no seed
+/// called the injector for as long as it existed. The census is what
+/// said so out loud; the harness now draws that fault, and the entry
+/// this table used to carry for it is gone.
 const Census = struct {
     totals: [Counters.names.len]u64 = @splat(0),
 
