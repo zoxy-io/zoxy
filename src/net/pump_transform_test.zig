@@ -5,7 +5,7 @@
 //! bytes on the wire can be a different count, in a different buffer, from
 //! the bytes framing measured. This file is the seam's first real user —
 //! deterministic and crypto-free — so those mechanics are exercised before
-//! TLS depends on them (PLANS.md, B1 + B5).
+//! TLS depends on them.
 //!
 //! The toy mirrors TLS's shape: the *client* side of the connection speaks
 //! frames (`[u16 big-endian length][payload]`) while framing and the upstream

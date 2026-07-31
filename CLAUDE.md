@@ -3,14 +3,15 @@
 Bullet-proof L4/L7 proxy in Zig 0.16 (toolchain pinned via devenv/Nix;
 direnv activates the shell). Read before writing code:
 
-- [docs/DESIGN.md](docs/DESIGN.md) — the settled design. Bare § references
-  in code and commits point here.
+- [docs/DESIGN.md](docs/DESIGN.md) — the settled design: what's shipped
+  and how it works. Bare § references in code and commits point here.
+  Planned features are tracked as GitHub issues, not here.
 - [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md) — enforced coding rules:
   static allocation only, ≤ 70-line functions, assertion density ≥ 2,
   bounded loops, explicitly-sized integers, naming conventions.
-- [docs/PLANS.md](docs/PLANS.md) — phasing and deferred work.
 - [docs/IMPLEMENTATION_NOTES.md](docs/IMPLEMENTATION_NOTES.md) — measured
-  findings and shelved experiments; do not re-litigate settled verdicts.
+  findings, shelved experiments, and open technical questions; do not
+  re-litigate settled verdicts.
 
 ## Gates — run before every commit
 

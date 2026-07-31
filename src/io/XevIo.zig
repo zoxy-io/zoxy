@@ -340,8 +340,7 @@ pub fn connect(
                     // A routing failure and a dial timeout are both "the
                     // endpoint could not be reached" — distinct from
                     // kernel-pressure/unknown (Unexpected), so upstream
-                    // health logic (deferred, docs/PLANS.md) can tell
-                    // them apart.
+                    // health logic (deferred) can tell them apart.
                     error.HostUnreachable => error.Unreachable,
                     error.TimedOut, error.ConnectionTimedOut => error.Unreachable,
                     error.Canceled => error.Canceled,

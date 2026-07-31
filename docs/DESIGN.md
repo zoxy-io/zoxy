@@ -15,8 +15,9 @@ measured lessons — paid for with implementation time and simulator seeds —
 are folded into the relevant sections below as constraints, not
 suggestions, and its dead ends are not revisited.
 
-This document is the settled design. Phasing and future work live in
-[`PLANS.md`](PLANS.md); measured findings and shelved experiments in
+This document is the settled design — what is shipped and how it works.
+Planned features are tracked as GitHub issues; measured findings, shelved
+experiments, and open technical questions live in
 [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
 
 ---
@@ -57,10 +58,10 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   (§3, settled 2026-07-25) and it is deleted, not dormant. The binary is
   single-threaded and CPU scale-out is process-per-core behind
   SO_REUSEPORT. Re-adding threads is a from-scratch decision behind a
-  measured gate ([PLANS.md](PLANS.md)), not un-commenting a seam.
+  measured gate, not un-commenting a seam.
 - Config reload. Config is parse-once immutable (§5); a change is a
   process restart — consistent with process-per-port scale-out (§3). Hot
-  restart / drain-to-successor stays deferred ([PLANS.md](PLANS.md)).
+  restart / drain-to-successor is out of scope for the same reason.
 - Dynamic DNS for upstreams. Cluster endpoints are static socket
   addresses resolved once at config load (§7); re-resolution waits for a
   demonstrated need.
@@ -101,8 +102,8 @@ levers are session resumption (µs-class for returning clients) and then
 more cores — which this design buys as **N independent processes behind
 SO_REUSEPORT**, never as threads sharing pool memory. Single-threaded is
 a property of the design, not a phase of it; should a workload ever
-demand in-process parallelism, the re-entry gate in
-[PLANS.md](PLANS.md) treats it as a from-scratch decision.
+demand in-process parallelism, that re-entry is a from-scratch decision,
+not a resumed one.
 
 <details>
   <summary><b>Why this is the simplest topology that satisfies the goals</b></summary>
@@ -178,8 +179,8 @@ the common case — keep the fully global reuse win.
 seam: one bounded SPMC job queue, per-worker SPSC completion rings, an
 `xev.Async` wake, and the parked-slot ownership rules that went with it
 in §5. It existed for exactly one workload — TLS handshakes — and the
-Phase-3a measurements took that workload away (above), so the seam is
-**deleted, not kept dormant.** A dormant design is not free: it leaves
+TLS handshake measurements (above) took that workload away, so the seam
+is **deleted, not kept dormant.** A dormant design is not free: it leaves
 ownership rules in §5, a rung in §8, and a module in §10 that no code
 exercises and no gate proves, and every later change has to stay
 compatible with a mechanism that may never exist. What replaces it is
@@ -190,7 +191,7 @@ more processes second, and neither needs a shared-memory concurrency
 model. The retired trade study (one shared queue vs per-worker queues vs
 work stealing, and why stealing solves a problem this design does not
 have) is in git history; re-adding threads means re-deriving it against
-the measurement that retired it ([PLANS.md](PLANS.md)).
+the measurement that retired it (above).
 
 </details>
 
@@ -205,8 +206,7 @@ iteration's hand-rolled TigerBeetle pattern, and the same shape as
 takes its recorded exceptions here, and both are pure Zig, vendored by
 content hash in `build.zig.zon`: **libxev** (this section) and **hparse**
 (the HTTP/1.1 head parser — as a hardened fork, §7). No C-FFI dependency
-exists in the codebase; any future one (a TLS stack is the known
-Phase-3 candidate — [PLANS.md](PLANS.md)) is a
+exists in the codebase; any future one is a
 separate deliberate decision, not a default. The pinned hash is an
 *audited commit*, never a branch tip — libxev's Zig 0.16 support is a
 self-described compatibility shim (PR #220) with real fixes still
@@ -310,9 +310,9 @@ unmerged behind it, so the pin moves only after re-audit.
 - **Plain ops only.** Multishot accept/recv, buffer rings, `send_zc`,
   `splice` stay behind measurement — the previous iteration never became
   CPU-bound without them, and this one is latency-bound with CPU
-  headroom. Each has since been evaluated: verdicts and revisit
-  conditions live in [`PLANS.md`](PLANS.md), the measurements behind
-  them in [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
+  headroom. Each has since been evaluated; verdicts, revisit conditions,
+  and the measurements behind them live in
+  [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
 
 ## 5. Memory — shared pools, fixed at startup
 
@@ -330,9 +330,8 @@ is not OOM but `tcp_mem` pressure, where the kernel starts collapsing
 queues — invisible to this budget, and with no counter of ours on it.
 Closing that gap means setting `SO_RCVBUF`/`SO_SNDBUF` explicitly so the
 per-socket cap becomes a named constant like everything else; the
-measurement and the autotuning trade-off are in
-[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md), the revisit
-condition in [`PLANS.md`](PLANS.md). Per-worker
+measurement, the autotuning trade-off, and the revisit condition are in
+[`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md). Per-worker
 reservation — sizing a pool per core for a worst case that never co-occurs
 on every core at once — multiplies memory by core count for nothing; the
 previous iteration paid that cost, and shared pools sized for concurrent
@@ -364,10 +363,8 @@ Three shared pools, all owned and touched only by the loop thread:
    an in-flight op per idle upstream in the ring budget (§8) for a race
    that is already covered: the parked connection's deadline timer serves
    as an idle timeout (kept below typical origin keep-alive windows, so
-   most origin-side closes are pre-empted), a close that slips through is
-   detected at checkout and absorbed by the stale-replay rung (§7), and
-   active health checks — when they land ([PLANS.md](PLANS.md)) — close
-   the parked connections of ejected endpoints.
+   most origin-side closes are pre-empted), and a close that slips through
+   is detected at checkout and absorbed by the stale-replay rung (§7).
 
 Sizing shape. The comptime constants are the hard, budget-asserted
 *ceilings*; the config `limits` block sizes the *effective* pools anywhere
@@ -402,8 +399,8 @@ The two moved apart twice before they were pinned: upstream slots were
 the one thing an operator could only shrink, and then 8192 against a conn
 ceiling of 12282, which left ~2200 conn slots idle while the pool they
 depend on pinned. Both measurements are in IMPLEMENTATION_NOTES.md.
-Whether the ceiling should be ours to choose at all is an open question
-in PLANS.md.
+Whether the ceiling should be ours to choose at all is an open question,
+recorded there.
 
 The *defaults* are not pinned to each other, and deliberately: the
 out-of-box shape is bounded by the stock 4096 `RLIMIT_NOFILE` rather than
@@ -470,7 +467,7 @@ Rules:
 
 ## 6. L4 data path — TCP relay
 
-The minimal proxy, and Phase 0's deliverable:
+The minimal proxy:
 
 ```
 accept → admit (slots? buffers?) → route by listener → connect upstream
@@ -507,15 +504,15 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   [hparse](https://github.com/nikneym/hparse)** (pure Zig,
   SIMD-vectorized, never allocates or copies — picohttpparser-shaped
   API; "streaming" means detect-and-retry — partial input re-parses
-  from byte 0, bounded by `head_bytes_max`). Upstream is not adoptable
-  as-is; the fork must clear a recorded hardening gate before Phase 1
-  lands: bounds-check the cursor (upstream dereferences one byte past
+  from byte 0, bounded by `head_bytes_max`). Upstream was not adoptable
+  as-is; the fork cleared a recorded hardening gate before landing:
+  bounds-check the cursor (upstream dereferences one byte past
   the buffer on partial input — silent UB), accept HTAB in field values
   (RFC 9110), reject bare-LF line terminators (a smuggling ingredient),
   make header-array overflow distinguishable from malformed input (431
   vs 400), and open the closed method enum to extension tokens. The
-  fork is vendored by audited commit like every dependency (§4); if
-  hardening proves costlier than rewriting, the fallback is our own
+  fork is vendored by audited commit like every dependency (§4); the
+  fallback, had hardening proved costlier than rewriting, was our own
   parser behind the same wrapper. It parses into a caller-owned bounded
   header array over the linear head buffer. Oversize request-line →
   414; oversize header field or total head → 431; never grow. hparse

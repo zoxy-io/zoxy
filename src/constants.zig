@@ -10,8 +10,8 @@ const assert = std.debug.assert;
 /// Upper bound on configured listeners.
 pub const listeners_max: u16 = 8;
 
-/// The single dedicated admin/metrics listener (DESIGN.md §8, PLANS.md
-/// §243): separate from the configured `listeners_max` so a scrape can
+/// The single dedicated admin/metrics listener (DESIGN.md §8): separate
+/// from the configured `listeners_max` so a scrape can
 /// never consume a data-path listener slot, and reserved in the fd and
 /// ring budgets below unconditionally — the ceiling is a comptime
 /// constant, so it must cover the worst case (admin enabled) even when a
@@ -81,7 +81,8 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// pinned at its own ceiling; IMPLEMENTATION_NOTES.md ("The upstream pool
 /// tracks connections, not requests") is the one home for those numbers.
 /// The pair is still a policy choice made on the operator's behalf;
-/// PLANS.md holds the standing question of handing it to them instead.
+/// IMPLEMENTATION_NOTES.md ("Open questions" — pool ceilings) holds the
+/// standing question of handing it to them instead.
 pub const conn_slots_max: u32 = 11464;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4

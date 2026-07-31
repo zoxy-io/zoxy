@@ -1,13 +1,135 @@
 # zoxy — implementation notes
 
-Measured findings and shelved experiments, recorded so they are not
-re-chased. The settled design lives in [`DESIGN.md`](DESIGN.md) — bare
-section references (§) point there — and future work in
-[`PLANS.md`](PLANS.md). All numbers are from the 8-core hybrid dev box
-over loopback unless stated otherwise; read "Bench hygiene" at the
-bottom before comparing any of them. The detailed perf write-ups from
-2026-07-12 were deliberately removed from history — this file carries
-the durable conclusions.
+Measured findings, shelved experiments, and open technical questions,
+recorded so they are not re-chased. The settled design lives in
+[`DESIGN.md`](DESIGN.md) — bare section references (§) point there.
+Planned features live as GitHub issues; this file is for threads that
+carry unresolved measurement or design tradeoffs rather than a feature
+request. All numbers are from the 8-core hybrid dev box over loopback
+unless stated otherwise; read "Bench hygiene" at the bottom before
+comparing any of them. The detailed perf write-ups from 2026-07-12 were
+deliberately removed from history — this file carries the durable
+conclusions.
+
+## Open questions
+
+Threads still being worked, carrying real tradeoffs rather than a simple
+feature request. Each stays here until resolved, or promoted to a
+GitHub issue once there's a concrete plan.
+
+### TLS termination — unshipped, hardening gate open
+
+The design settled on **no worker threads** for TLS handshakes (§3,
+DESIGN.md; measured below in "TLS handshake CPU" and "TLS on the
+loop"): handshakes run on the loop under a per-tick budget, ECDSA/Ed25519
+only (RSA excluded by policy — the ~1–2 ms figure that once motivated a
+worker pool was an RSA number). The stack is a hardened fork of
+[tls.zig](https://github.com/ianic/tls.zig), pinned at `5452baf`, chosen
+for its sans-I/O `nonblock.Server`, allocation-free handshake path, and
+injectable `rng`/`now` (so SimIo can drive handshakes deterministically).
+Not yet landed — the fork's hardening gate is open:
+
+1. Server-side session resumption (NewSessionTicket issuance, PSK-DHE
+   acceptance, binder verification) — load-bearing: without tickets a
+   full-population reconnect storm is ~14k × ~260 µs ≈ seconds of
+   handshake CPU; with them, µs-class per connection.
+2. Fragmented ClientHello (upstream tls.zig #36) — a robustness gap the
+   fuzz gate would find anyway.
+3. Three post-pin fixes to backport (CBC-padding overflow `106d10b`,
+   dangling `alpn_protocol` `47c402a`, `d633a0f`).
+4. The server handshake fuzzed through zoxy's wrapper, hparse-style (§9,
+   DESIGN.md).
+
+The server must emit its post-handshake flight (NewSessionTicket)
+*after* processing the client's `Finished`, not alongside the server
+flight — see "The ~45 ms stall, identified" below; this is why
+resumption is load-bearing rather than a latency nicety.
+
+Fallback if hardening proves costlier than estimated: **picotls** —
+functioning, but a C dependency with an un-hookable malloc, plus OpenSSL
+libcrypto for acceptable sign speed (two policy exceptions beyond the
+pure-Zig rule). `std.crypto.tls` stays client-only (re-verified against
+the pinned toolchain and upstream master).
+
+Follow-up once TLS termination lands: **kTLS record offload**
+(Linux-only) — hand the negotiated keys to the kernel
+(`setsockopt(SOL_TLS)`, the fork's `Ktls.zig` payloads) so the record
+layer costs zero userspace CPU and the `splice` c10k lever (below) stays
+applicable to TLS traffic. Known fiddly parts: KeyUpdate/post-handshake
+control messages arrive via CMSG, and session tickets must be sent
+before the switchover.
+
+### Pool ceilings — policy we choose, or a range the operator picks?
+
+`conn_slots_max` and `upstream_slots_max` are pinned together at compile
+time (11464/11464 — "The upstream pool tracks connections, not
+requests" below) because they share one completion-queue budget:
+`conn_slots × 4 + upstream_slots + fixed <= 57344`. That's the right
+point on the line for an L7 deployment, but it's still a compile-time
+policy choice — an L4-only deployment wants no upstream slots at all and
+would rather spend the whole budget on conn slots, and zoxy ships
+prebuilt release binaries, so a build-time knob is invisible to anyone
+who installs rather than compiles.
+
+The alternative: let the ceilings be what the types and kernel allow
+(`upstream_slots_max -> maxInt(u16)`, `conn_slots_max` likewise,
+independently) and let the operator name both in `limits`, rejecting an
+infeasible pair at config load (`cqFillFits` already exists and already
+runs unconditionally — this would stop it being shadowed by a comptime
+pre-decision).
+
+The cost: `assert(in_flight_ops_max <= completion_queue_entries)` in §5
+(DESIGN.md) states a property of *the chosen point*; with independent
+ceilings there's no chosen point, so it becomes a startup rejection
+instead of a comptime assertion — a real narrowing of "budgets are
+comptime-asserted" to "comptime-asserted where a budget is a property of
+one constant, rejected at startup where it's a property of a
+combination." Nothing else moves: `SimIo`'s `ready_buffer` is already
+sized off `in_flight_ops_max` (the budget itself, not the ceilings'
+product), so it doesn't grow.
+
+Entry gate: demonstrate a workload that actually saturates the
+*current* conn-slot ceiling first (the c10k runs that motivated the
+upstream-ceiling work never came close — ~10k held connections against
+12282 then). Take the decision before the code.
+
+### c10k — the splice lever
+
+Concurrent L4 connections are CQ-bound (see "The concurrency ceiling is
+CQ-bound" below), and the CQSIZE lever plus the `conn_ops_max` cut have
+already lifted the ceiling to 11464 connections. The one remaining lever
+is **`splice`** — libxev-fork work requiring a re-audit — the only op
+that removes the userspace copy while preserving §6 backpressure
+naturally (a bounded pipe). Real costs: two pipes per L4 connection (+4
+fds, tripling the fd budget), a `Pool(Pipe)`, a SimIo virtual-pipe
+primitive, a bigger per-connection op budget against the CQ. TLS and
+chunked L7 bodies fall back to copy regardless. Revisit only under
+genuine CPU/memory-bandwidth saturation — the copy is not the bottleneck
+today (§3's envelope; the loop profile below).
+
+### libxev fork queue
+
+The §4 pin policy (DESIGN.md) makes fork changes deliberate, batched
+work. Landed: ring setup flags, CQSIZE (#61), per-errno surfacing on
+data ops (zoxy-io/libxev#2, "libxev error surfacing is lossy — resolved
+by the fork" below). Still queued, in rough value order:
+
+1. `IORING_OP_SPLICE` (the op union is closed today) — see the c10k
+   splice lever above.
+2. Name the two peer-gone errnos still funneled to `error.Unexpected`
+   (#106, the bug-5 shape): ENETUNREACH on connect (a routing failure,
+   counted today as §8 dial pressure with only the errno gauge to say
+   otherwise) and ETIMEDOUT on the data ops (a retransmission-timeout
+   peer-gone verdict, same mislabel). One named error each in the fork's
+   connect/read/write maps lets XevIo map them portably — cheap,
+   zero-behavior-change for every other arm; batch with the next pin
+   move. Worse on kqueue: the macOS backend's data-op maps name only
+   CANCELED, so every dev-box data-op failure reads as §8 pressure until
+   the fork names these there too.
+3. Multishot **accept** — only behind a `Connection: close` storm
+   workload, still unmeasured. Multishot **recv is closed**, not
+   pending — see "The loop is not submission-bound" below; reopen only
+   on a measured `cqes/wake` approaching 1.
 
 ## Loop profile at the Tier-1 band (2026-07-12)
 
@@ -31,7 +153,7 @@ flags: landed; multishot recv: parked 2026-07-12 and **closed**
 2026-07-28 once its named workload was measured and turned out not to be
 submission-bound; pre-block spin: rejected — all below). Remaining wins
 are environmental (nft bypass) or workload-level (`splice`/`send_zc` for
-large bodies — PLANS.md).
+large bodies — see "Open questions" above).
 
 ## Ring setup flags — landed 2026-07-12 (196ffbf)
 
@@ -142,8 +264,7 @@ workload whose header values are genuinely short.
 
 §4's "plain ops only" holds: on the loop profile above (latency-bound,
 zoxy user code ~1.3% of cycles) none of the deferred ops pays for
-itself. The durable "why" for each, so it is not re-chased — PLANS.md
-carries only the one-line revisit condition per op.
+itself. The durable "why" for each, so it is not re-chased.
 
 - **Multishot accept** — parked, unmeasured. Saves only the userspace
   re-arm (one SQE prep per connection), invisible under keep-alive, and
@@ -160,9 +281,10 @@ carries only the one-line revisit condition per op.
   notification CQE per send doubles CQE consumption, eroding the CQ
   budget that already caps concurrency (CQ-bound note below). Revisit
   only for a large-body workload with ≥16 KiB sends.
-- **`splice`** — deferred; the last open c10k lever (PLANS.md). The only
-  op that removes the userspace copy, and it preserves §6 backpressure
-  naturally (a bounded pipe) — but the copy is not the bottleneck (§3's
+- **`splice`** — deferred; the last open c10k lever (see "Open
+  questions" above). The only op that removes the userspace copy, and it
+  preserves §6 backpressure naturally (a bounded pipe) — but the copy is
+  not the bottleneck (§3's
   envelope; the profile above), and the costs are real: two pipes per L4
   connection (+4 fds, tripling the fd budget), a `Pool(Pipe)`, a SimIo
   virtual-pipe primitive, and a bigger per-connection op budget against
@@ -172,9 +294,9 @@ carries only the one-line revisit condition per op.
 
 ## TLS handshake CPU — measured, on-loop verdict (2026-07-24)
 
-Decision input for Phase 3a (PLANS.md): do handshakes need the §3
-worker pool, or can they run on the event loop under a per-tick
-budget? Pure std.crypto on the pinned 0.16 toolchain, ReleaseFast,
+Decision input for TLS termination (see "Open questions" above): do
+handshakes need the §3 worker pool, or can they run on the event loop
+under a per-tick budget? Pure std.crypto on the pinned 0.16 toolchain, ReleaseFast,
 200 iterations per primitive, pinned to a fast and a slow core:
 
 | primitive | fast core | slow core |
@@ -551,7 +673,7 @@ so a c10k deployment raises `RLIMIT_NOFILE` at startup, §8).
 `constants.zig` owns the arithmetic and comptime-asserts it — one line,
 one divisor, so the assert is what keeps a change from silently
 overcommitting the ring. The remaining ceiling lever — `splice` — is
-fork work, in PLANS.md "c10k".
+fork work; see "Open questions" above, "c10k — the splice lever".
 
 ## The upstream pool was a wall, not a range (2026-07-27)
 
@@ -642,11 +764,12 @@ which is the shape of a shared environmental cost, not of a
 concurrency-driven one. Partial writes were a guess at a layer the ring
 counters say is not moving.
 
-PLANS.md carries the standing question of whether the operator should
-pick the ceiling instead of inheriting ours — the machinery (`cqFillFits`,
-`ensureFdBudget`, effective-size pools) already exists; what it would
-cost is a §5 amendment, spelled out there. Pinning narrows that question
-to one number rather than settling it.
+"Open questions" above ("Pool ceilings") carries the standing question
+of whether the operator should pick the ceiling instead of inheriting
+ours — the machinery (`cqFillFits`, `ensureFdBudget`, effective-size
+pools) already exists; what it would cost is a §5 amendment, spelled out
+there. Pinning narrows that question to one number rather than settling
+it.
 
 ## The 503 was the only backpressure, and it was accidental (2026-07-28)
 
@@ -845,7 +968,8 @@ CANCELED/CONNRESET/PIPE — everything else, including ENOBUFS/ENOMEM,
 funnels through `posix.unexpectedErrno` → `error.Unexpected` before the
 seam ever sees it. The specific errno is gone at the boundary, and this
 generalizes: any future feature needing a particular errno on a data op
-hits the same wall (fork queue: PLANS.md). What shipped instead
+hits the same wall (see "Open questions" above, "libxev fork queue").
+What shipped instead
 (0a4c0bb): a categorical witness — `relay.zig` counts a data-path
 `error.Unexpected` as `kernel_pressure_errors`, matching the
 accept/connect/setNodelay sites, since on an established relay socket
@@ -888,8 +1012,8 @@ by the fork (`result_errno`) and surfaced through the
 `kernel_pressure_last_errno` gauge — so a mislabeled arm is a visible
 lead (172 EPIPEs were how #106 bug 5 was caught), never a silent zero.
 The two known peer-gone errnos still landing in the fallback are queued
-fork work (PLANS.md, fork queue): the fix for a forgotten mapping is to
-name it, not to crash on it.
+fork work (see "Open questions" above, "libxev fork queue"): the fix for
+a forgotten mapping is to name it, not to crash on it.
 
 ## Build mode for the simulator — Debug, and ReleaseSafe is a trap (2026-07-28)
 

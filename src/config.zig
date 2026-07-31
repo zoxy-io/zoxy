@@ -48,7 +48,7 @@ pub const Config = struct {
     /// the real shed rungs at loopback-feasible load. Defaulted so the
     /// test beds' literal configs keep the full pools.
     limits: Limits = .{},
-    /// The admin/metrics listener's bind address (§8, PLANS.md Phase 2.5),
+    /// The admin/metrics listener's bind address (§8),
     /// or null when no `admin` block is configured — the plane stays off.
     /// A static IP:port literal like every other bind (hostnames rejected).
     admin_bind: ?std.Io.net.IpAddress = null,
@@ -189,7 +189,7 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     };
 }
 
-/// Resolve the optional admin/metrics listener (§8, PLANS.md Phase 2.5):
+/// Resolve the optional admin/metrics listener (§8):
 /// absent means the plane is off; a present `bind` must be a static IP:port
 /// literal (hostnames rejected, like every other bind — DNS is a non-goal).
 fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddress {
@@ -261,7 +261,7 @@ pub const ConfigJson = struct {
     /// Optional pool sizes and the CQ-fill headroom knob (§5, §8); absent
     /// fields take the lean defaults, not the compiled ceilings.
     limits: LimitsJson = .{},
-    /// Optional admin/metrics listener (§8, PLANS.md Phase 2.5); absent
+    /// Optional admin/metrics listener (§8); absent
     /// leaves the plane off.
     admin: ?AdminJson = null,
 

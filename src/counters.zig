@@ -137,8 +137,8 @@ pub const Counters = struct {
     kernel_pressure_fd_limit: Value = Value.init(0),
     kernel_pressure_address_unavailable: Value = Value.init(0),
     kernel_pressure_other_cause: Value = Value.init(0),
-    /// Admin/metrics scrapes whose full response was written (§8, PLANS.md
-    /// §243). Pure observability: the admin plane sits entirely outside
+    /// Admin/metrics scrapes whose full response was written (§8).
+    /// Pure observability: the admin plane sits entirely outside
     /// `reconcile`'s accepted/admitted/shed accounting, so these never enter
     /// the gate identity.
     admin_served: Value = Value.init(0),
