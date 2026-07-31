@@ -173,9 +173,15 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
         // sites on both dial paths were unreachable under every seed
         // until this fate existed (issue #106, kind B).
         .connect_pressure_percent = random.uintAtMost(u8, 5),
-        // A sink that has fallen behind (§8). Most seeds keep it instant;
-        // some stall it past a whole scenario, which is what fills the
-        // staging buffers and makes the drop rung reachable at all.
+        // A sink that has fallen behind (§8): the resume-a-short-write and
+        // stalled-drain paths, under schedule fuzz. Most seeds keep it
+        // instant; some stall it past a whole scenario.
+        //
+        // It does *not* reach the drop rung, whatever a stall's length: a
+        // scenario emits single-digit lines against staging buffers
+        // holding ~130, so there is nothing to overflow. The sweep's
+        // census names `access_log_dropped` as uncovered for exactly that
+        // reason, and src/access_log_test.zig drives the burst instead.
         .log_write_stall_ns = if (random.uintLessThan(u8, 4) == 0)
             random.uintAtMost(u64, 200_000_000)
         else

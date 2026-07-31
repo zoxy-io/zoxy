@@ -961,6 +961,16 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
    completion is delivered to a freed or reused slot (slot generations
    checked on every delivery, §5). A failure prints its seed; the same
    seed replays the exact schedule.
+   Those invariants gate each seed's *shape*; a **coverage census** gates
+   the sweep's *reach*. Every counter is totalled across the range, and a
+   sweep of at least 1024 seeds fails unless each one fired at least once
+   — a rung no scenario reaches is a finding, not silence, and the gate
+   cannot claim a path it never walked. Counters the simulator provably
+   cannot move (an admin listener it does not configure, a fault it does
+   not inject, a volume it cannot reach) are exempted by name in a table
+   that says what covers them instead, and the census fails just as loudly
+   when an exemption *does* fire — so widening a scenario deletes its
+   entry rather than leaving a stale excuse behind.
    `zig build sim -- fuzz` runs forever on entropy-derived seeds.
 2. **Fuzzing — `zig build test --fuzz`.** `std.testing.fuzz` on every
    parser edge: HTTP/1.1 head parser, chunked decoder, config parser.

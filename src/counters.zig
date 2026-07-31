@@ -206,6 +206,21 @@ pub const Counters = struct {
 
     const Value = std.atomic.Value(u64);
 
+    /// Every counter's field name, in declaration order — the one place
+    /// the set is enumerated. `render` walks it, `render_bytes_max` sizes
+    /// against it, `shedTotal` picks the `shed_` prefix out of it, and the
+    /// §9 sweep's coverage census requires each name to have moved. A
+    /// counter added above joins all four without being listed anywhere
+    /// else.
+    pub const names: []const []const u8 = blk: {
+        var collected: []const []const u8 = &.{};
+        for (@typeInfo(Counters).@"struct".fields) |field| {
+            if (field.type != Value) continue;
+            collected = collected ++ [_][]const u8{field.name};
+        }
+        break :blk collected;
+    };
+
     /// Live pool occupancy against capacity (§8 "watermarks before
     /// walls"). Gauges, not counters: they go both ways, and a scrape
     /// wants the level, not the history.
@@ -286,9 +301,8 @@ pub const Counters = struct {
         const u64_digits_max = 20; // len("18446744073709551615")
         const u32_digits_max = 10; // len("4294967295")
         var total: usize = 0;
-        for (@typeInfo(Counters).@"struct".fields) |field| {
-            if (field.type != Value) continue;
-            const name_len = metric_prefix.len + field.name.len;
+        for (names) |name| {
+            const name_len = metric_prefix.len + name.len;
             total += "# TYPE ".len + name_len + " counter\n".len;
             total += name_len + " ".len + u64_digits_max + "\n".len;
         }
@@ -318,16 +332,15 @@ pub const Counters = struct {
         // merely sufficient one.
         assert(buffer.len >= render_bytes_max);
         var cursor: usize = 0;
-        inline for (@typeInfo(Counters).@"struct".fields) |field| {
-            if (field.type != Value) continue;
+        inline for (names) |name| {
             // The format string is fully comptime (only the value is
             // runtime), so bufPrint cannot fail for a value that fits u64
             // in a buffer sized to render_bytes_max.
             const written = std.fmt.bufPrint(
                 buffer[cursor..],
-                "# TYPE " ++ metric_prefix ++ field.name ++ " counter\n" ++
-                    metric_prefix ++ field.name ++ " {d}\n",
-                .{counters.get(field.name)},
+                "# TYPE " ++ metric_prefix ++ name ++ " counter\n" ++
+                    metric_prefix ++ name ++ " {d}\n",
+                .{counters.get(name)},
             ) catch unreachable;
             cursor += written.len;
         }
@@ -378,9 +391,8 @@ pub const Counters = struct {
     /// identity vacuously true.
     const shed_rung_count: usize = blk: {
         var count: usize = 0;
-        for (@typeInfo(Counters).@"struct".fields) |field| {
-            if (field.type != Value) continue;
-            if (std.mem.startsWith(u8, field.name, shed_prefix)) count += 1;
+        for (names) |name| {
+            if (std.mem.startsWith(u8, name, shed_prefix)) count += 1;
         }
         break :blk count;
     };
@@ -389,10 +401,9 @@ pub const Counters = struct {
     fn shedTotal(counters: *const Counters) u64 {
         comptime assert(shed_rung_count >= 1);
         var total: u64 = 0;
-        inline for (@typeInfo(Counters).@"struct".fields) |field| {
-            if (field.type != Value) continue;
-            if (comptime !std.mem.startsWith(u8, field.name, shed_prefix)) continue;
-            total += counters.get(field.name);
+        inline for (names) |name| {
+            if (comptime !std.mem.startsWith(u8, name, shed_prefix)) continue;
+            total += counters.get(name);
         }
         return total;
     }
