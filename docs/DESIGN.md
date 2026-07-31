@@ -463,7 +463,12 @@ Rules:
   Schema can express: the loader's semantic checks (canonical
   prefixes/hosts, address literals, reserved header names, port ≠ 0) and
   the "exactly one of" forks stay the loader's job, so passing the schema
-  means well-shaped, not accepted.
+  means well-shaped, not accepted. The one concession strictness makes to
+  the schema is a root `$schema` key: it is a declared, optional field that
+  the loader parses and ignores, so an editor can point a config at the
+  document without the proxy refusing to start over the pointer. It buys no
+  general laxity — `$schemas`, or a `$schema` nested inside any other
+  object, is still an unknown field.
 - **A slot is released only when its armed-op set is empty.** Teardown is
   where the races live — a lesson paid for in implementation time and
   simulator seeds last iteration. Every op references a completion

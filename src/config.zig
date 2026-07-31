@@ -432,6 +432,12 @@ fn resolveAccessLogBuffer(
 // `config_schema.zig` walks the same DTOs to emit the JSON Schema. Public
 // so the emitter and its tests can reflect over the real wire shape.
 pub const ConfigJson = struct {
+    /// Editor hint only: the URL of the JSON Schema this file claims to
+    /// follow (`$id` in the emitted document). Declared so an editor may add
+    /// it for completion and validation without the loader rejecting the
+    /// file; parsed, never read. Strictness is unharmed — a near miss like
+    /// `$schemas` is still an unknown field.
+    @"$schema": ?[]const u8 = null,
     listeners: []const ListenerJson,
     clusters: ClustersJson,
     timeouts: TimeoutsJson,
@@ -450,6 +456,9 @@ pub const ConfigJson = struct {
         "IP:port literal parsing, reserved header names, endpoint port != 0) " ++
         "are enforced by the loader and are not expressible in JSON Schema.";
     pub const schema_fields = .{
+        .@"$schema" = .{
+            .desc = "URL of the JSON Schema this config follows; an editor hint, ignored by the loader.",
+        },
         .listeners = .{
             .desc = "Sockets the proxy accepts connections on.",
             .min_items = 1,
@@ -2330,6 +2339,38 @@ test "config: strictness rejects unknown and duplicate fields" {
     );
     try expectParseError(error.MissingField,
         \\{"clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: a `$schema` editor hint loads and is ignored" {
+    // Editors point at the shipped schema by writing `$schema` into the
+    // file; a strict loader that rejected it would make the schema asset
+    // unusable for the very files it describes.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"$schema":"https://zoxy.io/schema/config.schema.json",
+            \\ "listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        // Accepted, and it changed nothing about the resolved config.
+        try std.testing.expectEqual(@as(usize, 1), parsed.listeners.len);
+        try std.testing.expectEqual(@as(usize, 1), parsed.clusters.len);
+    }
+    // The hint buys no general laxity: a near miss is still unknown, and it
+    // is only a root key — nested objects reject it like any other extra.
+    try expectParseError(error.UnknownField,
+        \\{"$schemas":"x",
+        \\ "listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","$schema":"x"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
     );
 }
