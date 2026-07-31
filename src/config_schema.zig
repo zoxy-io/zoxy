@@ -332,6 +332,25 @@ test "config_schema: the emitted document is valid, documented JSON" {
     try std.testing.expectEqual(false, root.object.get("additionalProperties").?.bool);
 }
 
+test "config_schema: the `$schema` editor hint is a declared root property" {
+    // `additionalProperties: false` is what makes the schema mirror the
+    // strict loader, so the key an editor writes to *find* this schema has
+    // to be declared here too — otherwise pointing at it flags the pointer.
+    var buffer: [64 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+
+    const properties = parsed.value.object.get("properties").?.object;
+    const hint = properties.get("$schema").?.object;
+    try std.testing.expectEqualStrings("string", hint.get("type").?.string);
+    // Optional, exactly as the loader has it: a config without the hint is
+    // still valid.
+    for (parsed.value.object.get("required").?.array.items) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name.string, "$schema"));
+    }
+}
+
 test "config_schema: emission is deterministic" {
     var buffer_a: [64 * 1024]u8 = undefined;
     var buffer_b: [64 * 1024]u8 = undefined;
