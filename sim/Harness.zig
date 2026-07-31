@@ -244,9 +244,16 @@ fn deriveDrainAt(clean: bool, random: std.Random) u64 {
 /// a setting production operators tune too. Seeds that drain only at the
 /// scenario's end keep the roomy default: there is nothing left to reap
 /// by then, and a short deadline would say nothing about it.
+///
+/// A minority draw 0 — "no cap" (§5), the shape a config that names no
+/// deadline gets, where `beginDrain` arms no timer at all and the drain
+/// ends only when the last connection does. Kept a minority on purpose:
+/// those seeds cannot reach `drained_at_deadline`, and that rung's
+/// census margin is already the thinnest in the gate.
 fn deriveDrainDeadlineMs(drain_at_ns: u64, random: std.Random) u32 {
     assert(drain_at_ns < scenario_end_ns);
     if (drain_at_ns == 0) return 100;
+    if (random.uintLessThan(u8, 4) == 0) return 0;
     if (!random.boolean()) return 100;
     const deadline_ms = 1 + random.uintAtMost(u32, 4);
     assert(deadline_ms >= 1);

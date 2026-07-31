@@ -468,7 +468,11 @@ pub const ConfigJson = struct {
     @"$schema": ?[]const u8 = null,
     listeners: []const ListenerJson,
     clusters: ClustersJson,
-    timeouts: TimeoutsJson,
+    /// Optional as a whole, like `limits` below and for the same reason
+    /// (§5): an omitted block takes the defaults, so a working config is
+    /// a listener and a cluster, and tuning is what an operator opts
+    /// into.
+    timeouts: TimeoutsJson = .{},
     /// Optional pool sizes and the CQ-fill headroom knob (§5, §8); absent
     /// fields take the lean defaults, not the compiled ceilings.
     limits: LimitsJson = .{},
@@ -867,9 +871,26 @@ pub const ClusterHashJson = struct {
 };
 
 pub const TimeoutsJson = struct {
-    connect_ms: u32,
-    idle_ms: u32,
-    drain_deadline_ms: u32,
+    /// Optional: nginx ships 60 s for the same budget and HAProxy's
+    /// `timeout connect` is conventionally single-digit seconds, so a
+    /// value zoxy can pick without guessing at anyone's policy. Zero
+    /// stays rejected — it would fail every dial before it left.
+    connect_ms: u32 = constants.connect_ms_default,
+    /// Optional, same argument: nginx's `keepalive_timeout` is 75 s and
+    /// its `client_header_timeout` 60 s. Zero would reap on arrival.
+    idle_ms: u32 = constants.idle_ms_default,
+    /// Optional, and `0` means "no cap" — the drain waits for the last
+    /// connection however long that takes (§8).
+    ///
+    /// Unlike the two above there is no convention to borrow: nginx,
+    /// HAProxy and Caddy all default to waiting indefinitely, while
+    /// Traefik picks 10 s and Envoy 600 s. A sixty-fold spread across
+    /// mature implementations is not a default waiting to be discovered,
+    /// so zoxy declines to invent one and joins the majority. The
+    /// supervisor that sent the signal already owns the upper bound and
+    /// enforces it with SIGKILL; an operator who wants zoxy to give up
+    /// sooner than their platform does sets a number here.
+    drain_deadline_ms: u32 = 0,
     /// Optional: absent or `0` means "no cap" (§6). The default keeps every
     /// pre-existing config valid and leaves max-lifetime opt-in.
     max_lifetime_ms: u32 = 0,
@@ -895,8 +916,8 @@ pub const TimeoutsJson = struct {
             .maximum = constants.timeout_ms_max,
         },
         .drain_deadline_ms = .{
-            .desc = "Graceful-drain deadline on shutdown.",
-            .minimum = 1,
+            .desc = "Graceful-drain deadline on shutdown; 0 waits indefinitely.",
+            .minimum = 0,
             .maximum = constants.timeout_ms_max,
         },
         .max_lifetime_ms = .{
@@ -1688,16 +1709,17 @@ fn clusterIndexOf(
 }
 
 fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
-    // The three lifecycle timeouts are correctness bounds — a 0 ms connect,
-    // idle, or drain deadline would reap instantly, so zero is a mistake.
-    // The health-probe interval rides the same rule from the other side:
-    // zero would probe in a tight loop (§7) — probing is switched by the
-    // cluster `check` flag, never by zeroing its pace.
-    const required = [_]u32{
-        timeouts.connect_ms,        timeouts.idle_ms,
-        timeouts.drain_deadline_ms, timeouts.health_interval_ms,
+    // Deadlines a zero would break rather than disable: a 0 ms connect or
+    // idle budget reaps on arrival, and a 0 ms probe interval would probe
+    // in a tight loop (§7) — probing is switched by the cluster `check`
+    // flag, never by zeroing its pace. Each has a default, so absence is
+    // fine here and only an explicit zero is the mistake.
+    const nonzero = [_]u32{
+        timeouts.connect_ms,
+        timeouts.idle_ms,
+        timeouts.health_interval_ms,
     };
-    for (required) |value| {
+    for (nonzero) |value| {
         if (value == 0) {
             return error.TimeoutZero;
         }
@@ -1705,18 +1727,27 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
             return error.TimeoutOverLimit;
         }
     }
-    // The two optional bounds (§6, §8): 0 means "no cap" on either, so only
-    // the shared ceiling is enforced — zero stays legal.
-    const optional = [_]u32{ timeouts.max_lifetime_ms, timeouts.request_ms };
+    // The three optional caps (§6, §8): 0 means "no cap" on each — no age
+    // limit, no request deadline, and a drain that waits for the last
+    // connection — so only the shared ceiling is enforced.
+    const optional = [_]u32{
+        timeouts.max_lifetime_ms,
+        timeouts.request_ms,
+        timeouts.drain_deadline_ms,
+    };
     for (optional) |value| {
         if (value > constants.timeout_ms_max) {
             return error.TimeoutOverLimit;
         }
     }
-    // Postconditions: reaching here means every required bound is in
-    // range — what every consumer of these values relies on.
-    for (required) |value| {
+    // Postconditions: reaching here means every bound a consumer reads
+    // without checking is in range, and every optional one is at most the
+    // ceiling — zero included, which each consumer reads as "off".
+    for (nonzero) |value| {
         assert(value >= 1);
+        assert(value <= constants.timeout_ms_max);
+    }
+    for (optional) |value| {
         assert(value <= constants.timeout_ms_max);
     }
 }
@@ -1819,9 +1850,65 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
     }
 }
 
-test "config: max_lifetime_ms accepts zero (the one legal zero timeout) and real values" {
-    // Explicit 0 is legal — it is *not* a TimeoutZero, unlike the other
-    // three timeouts (§6).
+test "config: the whole timeouts block is optional, and every default is usable" {
+    // A config that names none of them is the out-of-box shape (§5), the
+    // same argument `limits` already makes: an operator opts into tuning,
+    // never into a working config.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}}}
+    );
+    try std.testing.expectEqual(constants.connect_ms_default, parsed.connect_timeout_ms);
+    try std.testing.expectEqual(constants.idle_ms_default, parsed.idle_timeout_ms);
+    try std.testing.expectEqual(constants.health_interval_ms_default, parsed.health_interval_ms);
+    // The three caps default off, the drain one included: nginx, HAProxy
+    // and Caddy all wait indefinitely, and the supervisor that sent the
+    // signal owns the upper bound.
+    try std.testing.expectEqual(@as(u32, 0), parsed.drain_deadline_ms);
+    try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
+    try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
+}
+
+test "config: a zero drain deadline is no cap, but a zero connect or idle is still a mistake" {
+    // The asymmetry is the point: 0 disables a *cap*, and there is no
+    // sense in which a 0 ms dial or idle budget is a policy rather than a
+    // configuration error, so those two keep rejecting it.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"drain_deadline_ms":0}}
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.drain_deadline_ms);
+    }
+    const rejected = [_][]const u8{
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":0}}
+        ,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"idle_ms":0}}
+        ,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"health_interval_ms":0}}
+        ,
+    };
+    for (rejected) |json| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        try std.testing.expectError(error.TimeoutZero, parse(arena_state.allocator(), json));
+    }
+}
+
+test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real values" {
+    // Explicit 0 is legal — it is *not* a TimeoutZero, unlike the dial
+    // and idle budgets (§6).
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();

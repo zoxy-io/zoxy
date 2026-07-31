@@ -38,8 +38,9 @@ zoxy --version       # print the version (-V)
 Signals: `SIGTERM`/`SIGINT` drain in-flight connections and exit 0;
 `SIGUSR1` dumps counters to stdout.
 
-A minimal config — one L4 listener forwarding to one origin
-([`config/example.json`](config/example.json)):
+A minimal config — one L4 listener forwarding to one origin. For a fuller
+one with health checks, tuned timeouts and the access log, see
+[`config/example.json`](config/example.json):
 
 ```json
 {
@@ -48,14 +49,13 @@ A minimal config — one L4 listener forwarding to one origin
     ],
     "clusters": {
         "origin": { "endpoints": ["127.0.0.1:9000"] }
-    },
-    "timeouts": {
-        "connect_ms": 5000,
-        "idle_ms": 60000,
-        "drain_deadline_ms": 10000
     }
 }
 ```
+
+That is the whole file: every other block — `timeouts`, `limits`,
+`access_log` — has defaults, so tuning is what you opt into rather than
+what you start with.
 
 ## Configuration
 
@@ -298,14 +298,26 @@ the cluster from the original path, so a rewrite never re-routes.
 }
 ```
 
-| field | meaning |
-|---|---|
-| `connect_ms` **required** | per-try upstream connect budget |
-| `idle_ms` **required** | idle and head-read deadline — what a slowloris meets |
-| `drain_deadline_ms` **required** | how long a `SIGTERM` drain waits before reaping stragglers |
-| `max_lifetime_ms` | absolute connection-age cap regardless of activity; `0` disables |
-| `request_ms` | cap on one L7 exchange, **not** refreshed by activity — bounds a request that is merely slow, where `idle_ms` only bounds one that has stalled; `0` disables |
-| `health_interval_ms` | pause between health-probe sweeps |
+The whole block is optional, and so is every field in it — the values
+above are the defaults, written out. An explicit `0` disables the three
+caps; for `connect_ms` and `idle_ms` it is rejected, since a zero-length
+dial or idle budget is a mistake rather than a policy.
+
+| field | default | meaning |
+|---|---|---|
+| `connect_ms` | `5000` | per-try upstream connect budget |
+| `idle_ms` | `60000` | idle and head-read deadline — what a slowloris meets |
+| `drain_deadline_ms` | `0` | how long a `SIGTERM` drain waits before reaping stragglers; `0` waits for the last connection |
+| `max_lifetime_ms` | `0` | absolute connection-age cap regardless of activity; `0` disables |
+| `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity — bounds a request that is merely slow, where `idle_ms` only bounds one that has stalled; `0` disables |
+| `health_interval_ms` | `2000` | pause between health-probe sweeps |
+
+`drain_deadline_ms` defaults to waiting indefinitely because there is no
+figure to borrow: nginx, HAProxy and Caddy all wait forever by default,
+Traefik picks 10 s and Envoy 600 s. Whatever sent the signal already owns
+the upper bound — systemd's `TimeoutStopSec`, Kubernetes'
+`terminationGracePeriodSeconds` — and ends the wait with `SIGKILL`. Set a
+number here when you want zoxy to give up before your platform does.
 
 ### Limits
 

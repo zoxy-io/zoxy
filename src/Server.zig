@@ -247,13 +247,23 @@ pub fn Server(comptime IoType: type) type {
             // Parked upstreams are idle capacity; the drain sheds them
             // first (§8). Synchronous closes: no armed op to wait for.
             server.reapParked(true);
-            server.io.timerStart(
-                &server.drain_deadline_completion,
-                @as(u64, server.config.drain_deadline_ms) * std.time.ns_per_ms,
-                Self,
-                server,
-                onDrainDeadline,
-            );
+            // A zero deadline is "no cap" (§5): the drain waits for the
+            // last connection however long that takes, which is what
+            // nginx, HAProxy and Caddy all do by default. Whoever sent
+            // the signal owns the upper bound — systemd's
+            // `TimeoutStopSec`, Kubernetes' `terminationGracePeriodSeconds`
+            // — and answers a drain that will not end with SIGKILL. Not
+            // arming the timer is what makes that true rather than
+            // merely documented.
+            if (server.config.drain_deadline_ms != 0) {
+                server.io.timerStart(
+                    &server.drain_deadline_completion,
+                    @as(u64, server.config.drain_deadline_ms) * std.time.ns_per_ms,
+                    Self,
+                    server,
+                    onDrainDeadline,
+                );
+            }
             server.maybeStopAfterDrain();
         }
 

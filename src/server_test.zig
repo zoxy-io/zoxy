@@ -571,6 +571,42 @@ test "server: kernel-pressure on the upstream dial is witnessed and the conn tor
     try bed.expectDrained();
 }
 
+test "drain: a zero deadline waits for the straggler instead of reaping it" {
+    // `drain_deadline_ms: 0` is "no cap" (§5, §8) — the shape a config
+    // that names no deadline gets, and what nginx, HAProxy and Caddy all
+    // do by default. `beginDrain` arms no timer at all, so the same
+    // silent client the test below reaps at the deadline is left alone
+    // here and leaves on its own terms.
+    //
+    // What bounds this in production is the supervisor that sent the
+    // signal — systemd's `TimeoutStopSec`, Kubernetes'
+    // `terminationGracePeriodSeconds` — which is why the drain is allowed
+    // to be unbounded rather than obliged to invent a number. Here it is
+    // the client closing that ends it.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 41 },
+        // Short enough that the connection ends the run rather than
+        // hanging the test, and far longer than the drain deadline the
+        // sibling test relies on: the point is that *this* is what ends
+        // it, not a drain timer.
+        .idle_timeout_ms = 50,
+        .drain_deadline_ms = 0,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, false);
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 5_000_000);
+    try bed.sim_io.run();
+
+    // Nothing was reaped by a deadline that does not exist.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("drained_at_deadline"));
+    // And the drain still completed: the idle deadline ended the
+    // connection, the pools drained, and the loop stopped.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 test "drain: terminate signal stops accepting and reaps stragglers at the drain deadline" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 41 }, .idle_timeout_ms = 60_000 });
