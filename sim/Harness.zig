@@ -203,7 +203,8 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // a single-endpoint topology's routing unchanged whatever the
     // verdicts, so the L7 golden oracles hold on clean seeds (where
     // probes always pass) and prefix-legality holds under the adversary.
-    const health = deriveHealthChecks(harness.clean, random);
+    const connect_timeout_ms: u32 = 20 + random.uintAtMost(u32, 40);
+    const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms);
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
     harness.clusters = .{
         .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick_l4, .check = health.check_l4 },
@@ -215,7 +216,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.config = .{
         .listeners = &harness.listener_configs,
         .clusters = &harness.clusters,
-        .connect_timeout_ms = 20 + random.uintAtMost(u32, 40),
+        .connect_timeout_ms = connect_timeout_ms,
         .idle_timeout_ms = 30 + random.uintAtMost(u32, 70),
         .drain_deadline_ms = 100,
         // A third of seeds arm the max-lifetime cap (§6). The range
@@ -247,11 +248,13 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
 /// The §7 health-check shape of one scenario: which clusters probe, how
 /// fast, and whether the HTTP origin dies mid-run.
 const HealthDraw = struct {
-    check_l4: bool,
-    check_http: bool,
+    check_l4: ?Check,
+    check_http: ?Check,
     interval_ms: u32,
     http_origin_stop_at_ns: u64,
 };
+
+const Check = zoxy.config.Config.Cluster.Check;
 
 /// An eighth of adversarial seeds are outage seeds: the HTTP origin
 /// stops listening while clients are still live and parked connections
@@ -263,11 +266,19 @@ const HealthDraw = struct {
 /// conn table, while the stopped HTTP origin refuses its probes and a
 /// refused probe consumes no origin conn. Everyone else paces from the
 /// `health_interval_floor_ms` the origin-capacity bound is derived at.
-fn deriveHealthChecks(clean: bool, random: std.Random) HealthDraw {
+fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDraw {
+    assert(timeout_ms >= 1);
     const outage = !clean and random.uintLessThan(u8, 8) == 0;
+    // Thresholds draw around their defaults so a configured fall/rise —
+    // not only the compiled one — decides ejections under the fuzz.
+    const tcp_check: Check = .{
+        .timeout_ms = timeout_ms,
+        .fall = 1 + random.uintAtMost(u8, 3),
+        .rise = 1 + random.uintAtMost(u8, 2),
+    };
     const draw: HealthDraw = .{
-        .check_l4 = !outage and random.boolean(),
-        .check_http = outage or random.boolean(),
+        .check_l4 = if (!outage and random.boolean()) tcp_check else null,
+        .check_http = if (outage or random.boolean()) tcp_check else null,
         .interval_ms = if (outage)
             5 + random.uintAtMost(u32, 10)
         else
@@ -279,7 +290,7 @@ fn deriveHealthChecks(clean: bool, random: std.Random) HealthDraw {
     };
     // An outage always probes the cluster it exists to eject, and the
     // instant always precedes the scenario-end backstop.
-    assert(draw.http_origin_stop_at_ns == 0 or draw.check_http);
+    assert(draw.http_origin_stop_at_ns == 0 or draw.check_http != null);
     assert(draw.http_origin_stop_at_ns < scenario_end_ns);
     assert(draw.interval_ms >= 1);
     return draw;

@@ -124,7 +124,7 @@ pub fn Checker(comptime IoType: type) type {
             assert(clusters.len >= 1);
             assert(clusters.len <= constants.clusters_max);
             for (clusters) |cluster| {
-                if (cluster.check) {
+                if (cluster.check != null) {
                     checker.checked_count += @intCast(cluster.endpoints.len);
                 }
             }
@@ -193,7 +193,7 @@ pub fn Checker(comptime IoType: type) type {
             const clusters = checker.server.config.clusters;
             while (checker.cursor_cluster < clusters.len) {
                 const cluster = &clusters[checker.cursor_cluster];
-                if (!cluster.check or checker.cursor_endpoint >= cluster.endpoints.len) {
+                if (cluster.check == null or checker.cursor_endpoint >= cluster.endpoints.len) {
                     checker.cursor_cluster += 1;
                     checker.cursor_endpoint = 0;
                     continue;
@@ -204,21 +204,34 @@ pub fn Checker(comptime IoType: type) type {
             checker.rest();
         }
 
+        /// The cluster's resolved check policy. Only a checked cluster is
+        /// ever probed, so the option is settled by the walk in
+        /// `probeNext` before anything here reads it.
+        fn checkOf(checker: *const Self, cluster_index: u16) *const config_module.Config.Cluster.Check {
+            assert(cluster_index < checker.server.config.clusters.len);
+            const check = &checker.server.config.clusters[cluster_index].check;
+            assert(check.* != null);
+            return &check.*.?;
+        }
+
         fn beginProbe(checker: *Self, cluster: *const config_module.Config.Cluster) void {
             assert(checker.state == .probing);
             assert(checker.armedCount() == 0);
-            assert(cluster.check);
+            assert(cluster.check != null);
             assert(checker.cursor_endpoint < cluster.endpoints.len);
             assert(checker.pending_verdict == .none);
             const server = checker.server;
+            const check = &cluster.check.?;
             server.counters.increment("health_probes_sent");
             checker.canceled = .{};
-            // The probe runs under the dial's own budget (§7): a probe is
-            // a connect try, and `connect_ms` is the connect budget.
+            // One budget covers the whole probe (§7) — the dial alone for
+            // a tcp check, dial + request + response for an http one —
+            // because what an operator cares about is how long an
+            // endpoint may take to prove itself, not which leg was slow.
             checker.armed.deadline = true;
             server.io.timerStart(
                 &checker.op_deadline,
-                @as(u64, server.config.connect_timeout_ms) * std.time.ns_per_ms,
+                @as(u64, check.timeout_ms) * std.time.ns_per_ms,
                 Self,
                 checker,
                 onProbeDeadline,
@@ -336,6 +349,8 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         fn witnessPass(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
+            const rise = checker.checkOf(cluster_index).rise;
+            assert(rise >= 1);
             const key = upstream.endpointKey(cluster_index, endpoint_index);
             checker.fail_streaks[key] = 0;
             if (checker.healthy[key]) {
@@ -343,8 +358,8 @@ pub fn Checker(comptime IoType: type) type {
                 return;
             }
             checker.ok_streaks[key] += 1;
-            assert(checker.ok_streaks[key] <= constants.health_probe_rise);
-            if (checker.ok_streaks[key] < constants.health_probe_rise) return;
+            assert(checker.ok_streaks[key] <= rise);
+            if (checker.ok_streaks[key] < rise) return;
             checker.ok_streaks[key] = 0;
             checker.healthy[key] = true;
             assert(checker.unhealthy_count >= 1);
@@ -353,15 +368,17 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         fn witnessFail(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
+            const fall = checker.checkOf(cluster_index).fall;
+            assert(fall >= 1);
             checker.server.counters.increment("health_probes_failed");
             const key = upstream.endpointKey(cluster_index, endpoint_index);
             checker.ok_streaks[key] = 0;
             // Already ejected: nothing further to count — streaks resume
             // meaning only once a pass starts a recovery.
             if (!checker.healthy[key]) return;
-            assert(checker.fail_streaks[key] < constants.health_probe_fall);
+            assert(checker.fail_streaks[key] < fall);
             checker.fail_streaks[key] += 1;
-            if (checker.fail_streaks[key] < constants.health_probe_fall) return;
+            if (checker.fail_streaks[key] < fall) return;
             checker.fail_streaks[key] = 0;
             checker.healthy[key] = false;
             checker.unhealthy_count += 1;

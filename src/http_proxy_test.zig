@@ -508,9 +508,9 @@ const Http1Bed = struct {
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
         access_log: bool = false,
-        /// §7 active health checks on the one cluster; off by default so
+        /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
-        check: bool = false,
+        check: ?config_module.Config.Cluster.Check = null,
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 40,
@@ -2392,7 +2392,7 @@ test "l7: ejecting an endpoint closes its parked connections" {
     try bed.setUp(std.testing.allocator, .{
         .seed = 55,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-        .check = true,
+        .check = .{ .timeout_ms = Http1Bed.connect_timeout_ms },
         .health_interval_ms = 40,
     });
     defer bed.tearDown();

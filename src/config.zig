@@ -127,18 +127,59 @@ pub const Config = struct {
         /// (predictable spread, cache warming, pure-L4 clusters whose
         /// load p2c cannot see).
         pick: Pick = .p2c,
-        /// §7 active TCP health checks for every endpoint in this
-        /// cluster: the server's prober dials each endpoint every
-        /// `health_interval_ms`, and the balancer skips endpoints that
-        /// failed `constants.health_probe_fall` consecutive probes until
-        /// `constants.health_probe_rise` successes restore them. The
-        /// JSON field is optional and defaults off — probing is opt-in
-        /// per cluster.
-        check: bool = false,
+        /// §7 active health checks for every endpoint in this cluster,
+        /// or null when the cluster is unprobed — probing is opt-in per
+        /// cluster, so absent means the balancer never skips anything
+        /// here and the prober never dials it.
+        check: ?Check = null,
 
         pub const Pick = enum(u1) {
             rr,
             p2c,
+        };
+
+        /// One cluster's resolved check policy (§7). Every field is
+        /// settled at load: the thresholds, the per-probe budget, and —
+        /// for an HTTP check — the exact request to send and the status
+        /// that passes. Nothing here is decided on the loop.
+        pub const Check = struct {
+            /// What a probe proves. `tcp` proves the port accepts;
+            /// `http` proves the application answered a chosen path with
+            /// a chosen status, which a SYN/ACK cannot.
+            kind: Kind = .tcp,
+            /// Consecutive failures that eject, successes that restore.
+            fall: u8 = constants.health_probe_fall_default,
+            rise: u8 = constants.health_probe_rise_default,
+            /// Budget for one whole probe — the dial for a `tcp` check,
+            /// and dial + request + response for an `http` one. Defaults
+            /// to `connect_timeout_ms`: a probe is at least a dial, and
+            /// an operator who has tuned that has said what a
+            /// too-slow origin looks like.
+            timeout_ms: u32,
+            /// The rest is meaningful only when `kind == .http`, and the
+            /// loader rejects it otherwise rather than leaving dead
+            /// fields to be misread.
+            http: ?Http = null,
+
+            pub const Kind = enum(u1) {
+                tcp,
+                http,
+            };
+
+            pub const Http = struct {
+                /// Canonical origin-form path, validated at load exactly
+                /// like a route prefix — the probe sends it verbatim.
+                path: []const u8,
+                /// `Host` value. Null means the endpoint's own literal,
+                /// which is what a non-vhosted origin expects; a name
+                /// here is what makes a vhosted origin probeable.
+                host: ?[]const u8 = null,
+                /// The one status that passes. A single value, not a
+                /// class: an endpoint that answers 200 today and 302
+                /// tomorrow has changed its meaning, and a check that
+                /// shrugged at that would be reporting the wrong thing.
+                expect_status: u16 = 200,
+            };
         };
     };
 };
@@ -157,6 +198,15 @@ pub const ValidationError = error{
     ClusterNameEmpty,
     ClusterNameTooLong,
     ClusterPickUnknown,
+    ClusterCheckTypeUnknown,
+    ClusterCheckThresholdOutOfRange,
+    ClusterCheckTimeoutOutOfRange,
+    ClusterCheckHttpFieldOnTcp,
+    ClusterCheckPathMissing,
+    ClusterCheckPathTooLong,
+    ClusterCheckPathNotCanonical,
+    ClusterCheckHostInvalid,
+    ClusterCheckStatusInvalid,
     ListenerClusterOrRoutes,
     ListenerL4Routes,
     RoutesEmpty,
@@ -209,9 +259,12 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
         .ignore_unknown_fields = false,
     });
 
-    const clusters = try resolveClusters(arena, &parsed.clusters);
-    const listeners = try resolveListeners(arena, parsed.listeners, clusters);
+    // Timeouts first: a cluster's check budget defaults to the connect
+    // timeout, so that value must already be known to be in range before
+    // any check inherits it.
     try validateTimeouts(&parsed.timeouts);
+    const clusters = try resolveClusters(arena, &parsed.clusters, parsed.timeouts.connect_ms);
+    const listeners = try resolveListeners(arena, parsed.listeners, clusters);
     const access_log_sink = try resolveAccessLogSink(parsed.access_log);
     const limits = try resolveLimits(
         &parsed.limits,
@@ -609,11 +662,11 @@ pub const ClusterJson = struct {
     /// Optional §7 pick policy; absent means `p2c` (the design's
     /// trajectory), `rr` opts back into strict rotation.
     pick: []const u8 = "p2c",
-    /// Optional §7 active TCP health checks; absent means off, so a
-    /// config that never heard of probing keeps its exact behavior.
-    check: bool = false,
+    /// Optional §7 active health checks; absent means off, so an
+    /// unprobed cluster reserves nothing and is never skipped.
+    check: ?CheckJson = null,
 
-    pub const schema_doc = "One upstream cluster: its endpoints and pick policy.";
+    pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
         .endpoints = .{
             .desc = "IP:port endpoint literals (port must be non-zero).",
@@ -625,7 +678,61 @@ pub const ClusterJson = struct {
             .enum_type = Config.Cluster.Pick,
         },
         .check = .{
-            .desc = "Active TCP health checks for every endpoint in this cluster (default off).",
+            .desc = "Active health checks for every endpoint in this cluster; absent leaves them off.",
+        },
+    };
+};
+
+/// One cluster's health-check block (§7). `type` picks what a probe
+/// proves; the `http` fields are rejected under `tcp` rather than
+/// ignored, so a config cannot quietly describe a check it is not
+/// running.
+pub const CheckJson = struct {
+    type: []const u8 = "tcp",
+    /// Thresholds, HAProxy's `fall`/`rise`.
+    fall: u8 = constants.health_probe_fall_default,
+    rise: u8 = constants.health_probe_rise_default,
+    /// Budget for one whole probe; absent means `timeouts.connect_ms`.
+    timeout_ms: ?u32 = null,
+    /// Required for `http`, rejected for `tcp`.
+    path: ?[]const u8 = null,
+    /// `Host` for an `http` probe; absent sends the endpoint literal.
+    host: ?[]const u8 = null,
+    expect_status: u16 = 200,
+
+    pub const schema_doc = "Active health checks for a cluster's endpoints.";
+    pub const schema_fields = .{
+        .type = .{
+            .desc = "What a probe proves: tcp (the port accepts) or http (a path answered the expected status).",
+            .enum_type = Config.Cluster.Check.Kind,
+        },
+        .fall = .{
+            .desc = "Consecutive failed probes that eject an endpoint from balancing.",
+            .minimum = 1,
+            .maximum = constants.health_probe_threshold_max,
+        },
+        .rise = .{
+            .desc = "Consecutive successful probes that restore an ejected endpoint.",
+            .minimum = 1,
+            .maximum = constants.health_probe_threshold_max,
+        },
+        .timeout_ms = .{
+            .desc = "Budget for one whole probe; absent uses timeouts.connect_ms.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
+        },
+        .path = .{
+            .desc = "Canonical origin-form path an http probe requests; required for http, rejected for tcp.",
+            .min_length = 1,
+        },
+        .host = .{
+            .desc = "Host header an http probe sends; absent sends the endpoint's own IP:port literal.",
+            .min_length = 1,
+        },
+        .expect_status = .{
+            .desc = "The one response status an http probe accepts as healthy.",
+            .minimum = 100,
+            .maximum = 599,
         },
     };
 };
@@ -798,7 +905,7 @@ pub const dto_types = .{
     ConfigJson,  ListenerJson,    RouteJson,    FilterJson,
     MatchJson,   HeaderMatchJson, ActionJson,   HeaderEditJson,
     RewriteJson, ClusterJson,     TimeoutsJson, LimitsJson,
-    AdminJson,   AccessLogJson,
+    AdminJson,   AccessLogJson,   CheckJson,
 };
 
 comptime {
@@ -808,7 +915,9 @@ comptime {
 fn resolveClusters(
     arena: std.mem.Allocator,
     clusters_json: *const ClustersJson,
+    connect_timeout_ms: u32,
 ) ParseError![]const Config.Cluster {
+    assert(connect_timeout_ms >= 1);
     if (clusters_json.seen_count < constants.clusters_min) {
         return error.ClustersEmpty;
     }
@@ -837,7 +946,7 @@ fn resolveClusters(
             .name = entry.name,
             .endpoints = try resolveEndpoints(arena, entry.cluster.endpoints),
             .pick = try pickOf(entry.cluster.pick),
-            .check = entry.cluster.check,
+            .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
         };
     }
     assert(clusters.len == count);
@@ -1277,6 +1386,82 @@ fn validateRoutePrefix(prefix: []const u8) ParseError!void {
     }
 }
 
+/// Resolve one cluster's §7 check block. Absent leaves the cluster
+/// unprobed. Every limit gets its own error (§5), and the `http` fields
+/// are rejected under `tcp` rather than ignored: a config that names a
+/// path for a check that will never request it is describing something
+/// the process is not doing, which is exactly the negative space this
+/// loader exists to refuse.
+fn resolveCheck(
+    check_json: ?CheckJson,
+    connect_timeout_ms: u32,
+) ParseError!?Config.Cluster.Check {
+    assert(connect_timeout_ms >= 1);
+    const check = check_json orelse return null;
+    const kind = std.meta.stringToEnum(Config.Cluster.Check.Kind, check.type) orelse
+        return error.ClusterCheckTypeUnknown;
+    if (check.fall < 1 or check.fall > constants.health_probe_threshold_max) {
+        return error.ClusterCheckThresholdOutOfRange;
+    }
+    if (check.rise < 1 or check.rise > constants.health_probe_threshold_max) {
+        return error.ClusterCheckThresholdOutOfRange;
+    }
+    const timeout_ms = check.timeout_ms orelse connect_timeout_ms;
+    if (timeout_ms < 1 or timeout_ms > constants.timeout_ms_max) {
+        return error.ClusterCheckTimeoutOutOfRange;
+    }
+    const http = switch (kind) {
+        .tcp => blk: {
+            // A TCP probe sends nothing and reads nothing, so every
+            // HTTP-shaped field here would be inert.
+            if (check.path != null or check.host != null) {
+                return error.ClusterCheckHttpFieldOnTcp;
+            }
+            break :blk null;
+        },
+        .http => try resolveHttpCheck(&check),
+    };
+    return .{
+        .kind = kind,
+        .fall = check.fall,
+        .rise = check.rise,
+        .timeout_ms = timeout_ms,
+        .http = http,
+    };
+}
+
+/// The `http` half: a canonical path (validated exactly as a route
+/// prefix is, so the probe sends bytes the origin's own router will
+/// recognize), a bounded Host, and a status in the real range.
+fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Http {
+    const path = check.path orelse return error.ClusterCheckPathMissing;
+    if (path.len > constants.health_check_path_bytes_max) {
+        return error.ClusterCheckPathTooLong;
+    }
+    validateRoutePrefix(path) catch return error.ClusterCheckPathNotCanonical;
+    if (check.host) |host| {
+        if (host.len == 0 or host.len > constants.health_check_host_bytes_max) {
+            return error.ClusterCheckHostInvalid;
+        }
+        // The value is rendered into a request head, so it must not be
+        // able to inject one: no CR, LF, or NUL, the same rule the §7
+        // filter header values obey.
+        for (host) |byte| {
+            if (byte == '\r' or byte == '\n' or byte == 0) {
+                return error.ClusterCheckHostInvalid;
+            }
+        }
+    }
+    if (check.expect_status < 100 or check.expect_status > 599) {
+        return error.ClusterCheckStatusInvalid;
+    }
+    return .{
+        .path = path,
+        .host = check.host,
+        .expect_status = check.expect_status,
+    };
+}
+
 /// The closed pick-policy vocabulary; anything else is its own error so
 /// a typo ("pc2") fails loudly instead of silently balancing as p2c.
 fn pickOf(literal: []const u8) error{ClusterPickUnknown}!Config.Cluster.Pick {
@@ -1361,7 +1546,14 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
     try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].getPort());
-    try std.testing.expectEqual(true, parsed.clusters[0].check);
+    // The example's tcp check resolves with its thresholds, and its
+    // omitted budget inherits the connect timeout.
+    const example_check = parsed.clusters[0].check.?;
+    try std.testing.expectEqual(Config.Cluster.Check.Kind.tcp, example_check.kind);
+    try std.testing.expectEqual(@as(u8, 3), example_check.fall);
+    try std.testing.expectEqual(@as(u8, 2), example_check.rise);
+    try std.testing.expectEqual(@as(u32, 5000), example_check.timeout_ms);
+    try std.testing.expectEqual(@as(?Config.Cluster.Check.Http, null), example_check.http);
     try std.testing.expectEqual(@as(u32, 5000), parsed.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 60000), parsed.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
@@ -1713,28 +1905,119 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
     );
 }
 
-test "config: cluster check flag parses, defaults off, rejects non-bool" {
-    // Explicit true and false both resolve; absent defaults off (§7:
-    // probing is opt-in per cluster).
+test "config: a check block resolves its kind, thresholds and budget" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
+        \\     "check":{"type":"tcp","fall":5,"rise":1,"timeout_ms":250}},
+        \\   "b":{"endpoints":["127.0.0.1:3"],"check":{"type":"tcp"}},
+        \\   "c":{"endpoints":["127.0.0.1:4"]}},
+        \\ "timeouts":{"connect_ms":7,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+    const tuned = parsed.clusters[0].check.?;
+    try std.testing.expectEqual(@as(u8, 5), tuned.fall);
+    try std.testing.expectEqual(@as(u8, 1), tuned.rise);
+    try std.testing.expectEqual(@as(u32, 250), tuned.timeout_ms);
+    // Omitted thresholds take the compiled defaults, and an omitted
+    // budget inherits the connect timeout rather than inventing one.
+    const defaulted = parsed.clusters[1].check.?;
+    try std.testing.expectEqual(constants.health_probe_fall_default, defaulted.fall);
+    try std.testing.expectEqual(constants.health_probe_rise_default, defaulted.rise);
+    try std.testing.expectEqual(@as(u32, 7), defaulted.timeout_ms);
+    // Absent means unprobed — the cluster the balancer never skips.
+    try std.testing.expectEqual(@as(?Config.Cluster.Check, null), parsed.clusters[2].check);
+}
+
+test "config: an http check resolves its request and expected status" {
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
-            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"check":true},
-            \\   "b":{"endpoints":["127.0.0.1:3"],"check":false},
-            \\   "c":{"endpoints":["127.0.0.1:4"]}},
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
+            \\     "check":{"type":"http","path":"/healthz","host":"api.example",
+            \\       "expect_status":204}}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
         );
-        try std.testing.expectEqual(true, parsed.clusters[0].check);
-        try std.testing.expectEqual(false, parsed.clusters[1].check);
-        try std.testing.expectEqual(false, parsed.clusters[2].check);
+        const check = parsed.clusters[0].check.?;
+        try std.testing.expectEqual(Config.Cluster.Check.Kind.http, check.kind);
+        const http = check.http.?;
+        try std.testing.expectEqualStrings("/healthz", http.path);
+        try std.testing.expectEqualStrings("api.example", http.host.?);
+        try std.testing.expectEqual(@as(u16, 204), http.expect_status);
     }
-    // The flag is a bool, not a truthy string — strict JSON stage 1.
-    try expectParseError(error.UnexpectedToken,
+    // Host is optional: absent means the endpoint's own literal (§7).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
+            \\     "check":{"type":"http","path":"/health"}}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        const http = parsed.clusters[0].check.?.http.?;
+        try std.testing.expectEqual(@as(?[]const u8, null), http.host);
+        try std.testing.expectEqual(@as(u16, 200), http.expect_status);
+    }
+}
+
+test "config: a check block rejects every shape it cannot run" {
+    const head =
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
-        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"check":"on"}},
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"check":
+    ;
+    const tail =
+        \\}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    ;
+    // A typo in the vocabulary must not silently probe as tcp.
+    try expectParseError(error.ClusterCheckTypeUnknown, head ++ "{\"type\":\"htp\"}" ++ tail);
+    // Thresholds are counts of probes: zero would eject or restore on no
+    // evidence at all, and the ceiling keeps the u8 streaks from wrapping.
+    try expectParseError(error.ClusterCheckThresholdOutOfRange, head ++ "{\"fall\":0}" ++ tail);
+    try expectParseError(error.ClusterCheckThresholdOutOfRange, head ++ "{\"rise\":0}" ++ tail);
+    try expectParseError(error.ClusterCheckThresholdOutOfRange, head ++ "{\"fall\":65}" ++ tail);
+    // A zero budget would expire before the dial was submitted.
+    try expectParseError(error.ClusterCheckTimeoutOutOfRange, head ++ "{\"timeout_ms\":0}" ++ tail);
+    // An http check with nothing to request is not a check.
+    try expectParseError(error.ClusterCheckPathMissing, head ++ "{\"type\":\"http\"}" ++ tail);
+    // A path a tcp probe would never send is a config describing
+    // something the process is not doing.
+    try expectParseError(
+        error.ClusterCheckHttpFieldOnTcp,
+        head ++ "{\"type\":\"tcp\",\"path\":\"/health\"}" ++ tail,
+    );
+    // The probe sends the path verbatim, so it must already be canonical
+    // — the same rule a route prefix obeys (§7).
+    try expectParseError(
+        error.ClusterCheckPathNotCanonical,
+        head ++ "{\"type\":\"http\",\"path\":\"health\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckPathNotCanonical,
+        head ++ "{\"type\":\"http\",\"path\":\"/a/../b\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckPathNotCanonical,
+        head ++ "{\"type\":\"http\",\"path\":\"/health?x=1\"}" ++ tail,
+    );
+    // A Host is rendered into a request head, so it may not carry the
+    // bytes that would end one.
+    try expectParseError(
+        error.ClusterCheckHostInvalid,
+        head ++ "{\"type\":\"http\",\"path\":\"/h\",\"host\":\"a\\r\\nX: y\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckHostInvalid,
+        head ++ "{\"type\":\"http\",\"path\":\"/h\",\"host\":\"\"}" ++ tail,
+    );
+    // A status outside the real range can never match a response.
+    try expectParseError(
+        error.ClusterCheckStatusInvalid,
+        head ++ "{\"type\":\"http\",\"path\":\"/h\",\"expect_status\":99}" ++ tail,
     );
 }
 

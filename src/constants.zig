@@ -246,19 +246,42 @@ pub const endpoints_per_cluster_max: u16 = 64;
 /// cluster sets `check`.
 pub const health_probe_ops_max: u32 = 3;
 
-/// Consecutive failed probes that eject an endpoint from balancing (§7).
+/// Default consecutive failed probes that eject an endpoint from
+/// balancing (§7), when a cluster's `check` block omits `fall`.
 /// HAProxy's `fall` default: three misses is an outage, one is a blip.
-pub const health_probe_fall: u8 = 3;
+pub const health_probe_fall_default: u8 = 3;
 
-/// Consecutive successful probes that restore an ejected endpoint (§7).
+/// Default consecutive successful probes that restore an ejected
+/// endpoint (§7), when a cluster's `check` block omits `rise`.
 /// HAProxy's `rise` default: recovery must prove itself twice.
-pub const health_probe_rise: u8 = 2;
+pub const health_probe_rise_default: u8 = 2;
+
+/// Upper bound on a configured `fall`/`rise`. The streak counters are
+/// `u8`, so this is what keeps them from wrapping; it is also far past
+/// any useful tuning — a threshold in the dozens means the *interval* is
+/// the wrong knob, since detection latency is `fall × interval`.
+pub const health_probe_threshold_max: u8 = 64;
 
 /// Default `timeouts.health_interval_ms`: the pause between health-probe
-/// sweeps when the config omits it (§7). HAProxy's `inter` default. The
-/// probe's own connect budget is `timeouts.connect_ms` — a probe is a
-/// dial try, so it runs under the dial's deadline, not its own.
+/// sweeps when the config omits it (§7). HAProxy's `inter` default. What
+/// bounds a single probe is the check's own `timeout_ms`, which defaults
+/// to `timeouts.connect_ms`.
 pub const health_interval_ms_default: u32 = 2_000;
+
+/// Upper bound on a configured HTTP-check request path (§7). The probe
+/// renders one request into a fixed buffer, so the path it may carry is
+/// bounded like every other config string; a health endpoint's path is a
+/// handful of bytes in practice.
+pub const health_check_path_bytes_max: u16 = 256;
+
+/// Upper bound on a configured HTTP-check `Host` value (§7). Same bound
+/// as a routing host, and for the same reason — it is a DNS name.
+pub const health_check_host_bytes_max: u16 = host_bytes_max;
+
+/// The probe's rendered request buffer (§7): request line + Host +
+/// the two fixed headers, all bounded by the two limits above.
+pub const health_check_request_bytes_max: u32 =
+    64 + health_check_path_bytes_max + health_check_host_bytes_max;
 
 /// Upper bound on routes in one listener's path-routing table (§7). Config
 /// data, not a runtime pool: routes are immutable arena slices, and the
@@ -627,10 +650,21 @@ comptime {
     // or restore on no evidence, and the default probe interval is a legal
     // configured timeout.
     assert(health_probe_ops_max >= 1);
-    assert(health_probe_fall >= 1);
-    assert(health_probe_rise >= 1);
+    assert(health_probe_fall_default >= 1);
+    assert(health_probe_rise_default >= 1);
+    assert(health_probe_fall_default <= health_probe_threshold_max);
+    assert(health_probe_rise_default <= health_probe_threshold_max);
     assert(health_interval_ms_default >= 1);
     assert(health_interval_ms_default <= timeout_ms_max);
+    // The rendered probe request must fit its buffer whatever a config
+    // names, which is what makes the render infallible (§5).
+    assert(health_check_path_bytes_max >= 1);
+    assert(health_check_host_bytes_max >= 1);
+    assert(health_check_request_bytes_max >
+        @as(u32, health_check_path_bytes_max) + health_check_host_bytes_max);
+    // A probe response is parsed by the same head parser the data path
+    // uses, so its buffer may never exceed what that parser accepts.
+    assert(health_check_request_bytes_max <= head_bytes_max);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool
