@@ -57,10 +57,11 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// deepest CQ the kernel allows (`completion_queue_entries`,
 /// IORING_SETUP_CQSIZE) against the 4096 SQ, so at the largest fill a
 /// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
-/// parked-upstream and admin reservations carved out first, this caps at
-/// `(57344 - 23) / (conn_ops_max + 1) = 11464` —
-/// comptime-derived below (the 23 is the fixed ops: two per config and
-/// admin listener [18], the admin client's op budget [3], the signal
+/// parked-upstream, admin and access-log reservations carved out first,
+/// this caps at `(57344 - 24) / (conn_ops_max + 1) = 11464` —
+/// comptime-derived below (the 24 is the fixed ops: two per config and
+/// admin listener [18], the admin client's op budget [3], the access log's
+/// in-flight sink write [1], the signal
 /// wake [1], and the drain timer [1]). That clears a round 10k on a
 /// single ring; a deployment trades the ceiling back down for more burst
 /// headroom via `limits.cq_fill_eighths` (§8).
@@ -72,7 +73,7 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// above the upstream ceiling is therefore capacity that cannot be served
 /// — slots that admit connections the pool has no upstream for — and one
 /// below it is a pool that can never be drawn down. `11464` is the
-/// largest N with `N * (conn_ops_max + 1) <= 57321`, which keeps both
+/// largest N with `N * (conn_ops_max + 1) <= 57320`, which keeps both
 /// ceilings clear of a round 10k: what §1 asks for, c10k reachable on
 /// either axis rather than a shape tuned for it.
 ///
@@ -220,6 +221,11 @@ pub const config_bytes_max: u32 = 256 * 1024;
 /// Upper bound on configured clusters.
 pub const clusters_max: u16 = 16;
 
+/// Upper bound on a cluster's name. Names are identifiers an operator
+/// writes and the access log echoes (§8), so the bound is what keeps a
+/// log line's width closed-form rather than a function of the config file.
+pub const cluster_name_bytes_max: u16 = 64;
+
 /// Lower bound on configured clusters: a config with no cluster can route
 /// nowhere, so the loader rejects an empty map and the config JSON Schema
 /// emits it as `minProperties`.
@@ -253,6 +259,80 @@ pub const header_edits_max: u16 = 16;
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
 
+// -- the access log (§8) --
+//
+// One JSON line per L7 exchange and per L4 connection, written to the
+// configured sink through the seam's one ring op. The bounds below are what
+// make that a closed-form cost: two staging buffers of a fixed size, a line
+// that cannot exceed a fixed width, and per-record captures that cannot
+// exceed a fixed share of a connection slot.
+
+/// Bytes per access-log staging buffer when the config does not say; there
+/// are two (`access_log_buffers`), so the default reservation is twice
+/// this. Two rather than one because a write is a ring op: while it is in
+/// flight its bytes must not move, and the lines still arriving need
+/// somewhere to go. One buffer accepts appends while the other is being
+/// written, and they swap when it drains — no memmove, and no window where
+/// a line has nowhere to land except the drop counter.
+///
+/// 32 KiB holds ~130 typical lines, which at any plausible request rate is
+/// far more than one sink write takes to complete. A burst that outruns it
+/// drops lines and counts them (§8's ladder: exhaustion sheds the newest
+/// work), because the alternative — waiting for the sink — would make an
+/// operator's log pipe able to stall the data path.
+pub const access_log_buffer_bytes_default: u32 = 32 * 1024;
+/// The ceiling and floor `limits.access_log_buffer_bytes` may name. The
+/// floor is one line: a buffer that could not hold the widest single line
+/// would drop every wide one regardless of backpressure, which is the one
+/// thing the drop counter must never mean. The simulator sizes down to it
+/// to force the drop rung, the same way it sizes the pools down to force
+/// theirs (§9).
+pub const access_log_buffer_bytes_min: u32 = access_log_line_bytes_max;
+pub const access_log_buffer_bytes_max: u32 = 1024 * 1024;
+pub const access_log_buffers: u32 = 2;
+
+/// Worst-case simultaneously armed ring ops for the access log: one. The
+/// sink has a single write in flight at a time by construction — the second
+/// staging buffer is what absorbs everything that arrives meanwhile — so it
+/// costs exactly one entry in the §8 ring budget, reserved unconditionally
+/// like the admin plane's so the compiled ceiling covers a config that
+/// enables it.
+pub const access_log_ops_max: u32 = 1;
+
+/// Raw bytes of a request's canonical path kept for its log line. The path
+/// lives in the connection's head buffer, which the response head renders
+/// over (§7 buffer rotation), so what the log reports has to be copied out
+/// while it is still there. A longer path is truncated with a trailing
+/// `...` rather than dropped: the prefix is what identifies the resource.
+pub const access_log_path_bytes_max: u16 = 256;
+
+/// Raw bytes of a request method token kept for its log line. Standard
+/// methods are at most 7 bytes; the bound covers extension tokens (§7)
+/// without letting one widen a log line without limit.
+pub const access_log_method_bytes_max: u8 = 24;
+
+/// Upper bound on one rendered access-log line, including its newline
+/// (§5: the caller sizes a fixed buffer to it, so a line never has to be
+/// dropped for want of room in an *empty* buffer). Derived from the field
+/// caps rather than chosen, so raising one of them cannot silently make
+/// the bound a lie. The `6 *` on the two text fields is JSON's worst case:
+/// a control byte escapes to `\u00XX`, and a percent-decoded path may
+/// legitimately contain one.
+pub const access_log_line_bytes_max: u32 = blk: {
+    // Every key, brace, comma, quote, and the trailing newline, with slack
+    // for a field or two more before the bound has to be re-derived.
+    const scaffolding = 320;
+    const timestamp = 30; // "2026-07-31T09:14:22.481Z"
+    // "[" + 39 bytes of IPv6 + "]:" + 5 port digits, quoted.
+    const address = 48;
+    const number = 20; // a u64 at its widest
+    const addresses = 2; // client and upstream
+    const numbers = 4; // duration, bytes in, bytes out, status
+    break :blk scaffolding + timestamp + addresses * address + numbers * number +
+        @as(u32, access_log_method_bytes_max) + @as(u32, cluster_name_bytes_max) +
+        6 * @as(u32, host_bytes_max) + 6 * @as(u32, access_log_path_bytes_max);
+};
+
 /// Worst-case in-flight ring ops (§8: the ring is pre-budgeted, not shed):
 /// every connection slot at its op peak (L7 slots hold armed ops with or
 /// without a relay buffer, so the term is per slot, not per buffer), one
@@ -260,19 +340,20 @@ pub const timeout_ms_max: u32 = 3_600_000;
 /// keep-alive slice), two ops per listener — configured *and* admin — (a
 /// draining listener holds its armed accept — or the accept-retry backoff
 /// timer — plus the async cancel that reaps it), `admin_conn_ops_max` ops
-/// per admin client (its send/deadline/teardown peak), the single async
+/// per admin client (its send/deadline/teardown peak), the access log's one
+/// in-flight sink write, the single async
 /// wakeup op for signals, and the server's one drain-deadline timer. Closed
 /// form so it can be evaluated on the *effective* pool sizes too (XevIo's
-/// per-deployment CQ), not only the ceilings; the admin reservation is
-/// fixed — always covered even when a config leaves the plane unbound;
-/// `in_flight_ops_max` is it at the ceilings.
+/// per-deployment CQ), not only the ceilings; the admin and access-log
+/// reservations are fixed — always covered even when a config leaves either
+/// off; `in_flight_ops_max` is it at the ceilings.
 pub fn inFlightOps(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(upstream_slots <= upstream_slots_max);
     assert(listeners <= listeners_max);
     return conn_slots * conn_ops_max + upstream_slots +
         2 * (listeners + admin_listeners) +
-        admin_conns * admin_conn_ops_max + 1 + 1;
+        admin_conns * admin_conn_ops_max + access_log_ops_max + 1 + 1;
 }
 pub const in_flight_ops_max: u32 =
     inFlightOps(conn_slots_max, upstream_slots_max, listeners_max);
@@ -488,7 +569,7 @@ comptime {
     assert(conn_slots_max == @divFloor(
         @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
             2 * (@as(u32, listeners_max) + admin_listeners) -
-            admin_conns * admin_conn_ops_max - 1 - 1,
+            admin_conns * admin_conn_ops_max - access_log_ops_max - 1 - 1,
         conn_ops_max + 1,
     ));
     assert(admin_listeners >= 1);
@@ -496,6 +577,20 @@ comptime {
     assert(admin_conn_ops_max >= 1);
     assert(admin_scrape_deadline_ms >= 1);
     assert(admin_drain_scratch_bytes >= 1);
+    // A staging buffer that could not hold the widest line would drop
+    // lines it had room for — the bound exists precisely so a drop always
+    // means backpressure, never arithmetic. The floor is that bound, so
+    // no config can name a buffer that breaks it.
+    assert(access_log_buffer_bytes_min >= access_log_line_bytes_max);
+    assert(access_log_buffer_bytes_default >= access_log_buffer_bytes_min);
+    assert(access_log_buffer_bytes_default <= access_log_buffer_bytes_max);
+    // Two buffers exactly: the swap is what lets appends continue during
+    // a write, and a third would be a queue nobody drains.
+    assert(access_log_buffers == 2);
+    assert(access_log_ops_max >= 1);
+    assert(access_log_path_bytes_max >= 16);
+    assert(access_log_method_bytes_max >= 7); // "OPTIONS", the longest standard method.
+    assert(cluster_name_bytes_max >= 1);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool
@@ -522,7 +617,24 @@ pub const PoolSizes = struct {
     relay_buffer_pair_bytes: u64,
     upstream_slots: u32,
     upstream_bytes: u64,
+    /// The access log's staging buffers (§8), or zero when the config
+    /// leaves the log off. Not a pool — it is one fixed reservation, not a
+    /// per-connection unit — but it is startup arena memory this process
+    /// holds for its life, and §5's promise is that the printed total
+    /// covers all of that. `accessLogBytes` is the closed form.
+    access_log_bytes: u64,
 };
+
+/// What the access log reserves: nothing when it is off, both staging
+/// buffers at the effective size when it is on (§8). `buffer_bytes` is
+/// zero exactly when the log is off, so one argument carries both facts
+/// and they cannot be passed inconsistently.
+pub fn accessLogBytes(buffer_bytes: u32) u64 {
+    if (buffer_bytes == 0) return 0;
+    assert(buffer_bytes >= access_log_buffer_bytes_min);
+    assert(buffer_bytes <= access_log_buffer_bytes_max);
+    return @as(u64, access_log_buffers) * buffer_bytes;
+}
 
 /// By pointer: `PoolSizes` is past the 16-byte threshold TIGER_STYLE sets
 /// for by-value arguments, and a stack copy of the budget buys nothing.
@@ -536,9 +648,18 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     assert(sizes.conn_bytes > 0);
     assert(sizes.relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
     assert(sizes.upstream_bytes >= head_bytes_max);
+    // Either the log is off and costs nothing, or it holds exactly its two
+    // buffers at a size the loader validated — never some third number.
+    assert(sizes.access_log_bytes % access_log_buffers == 0);
+    assert(sizes.access_log_bytes == 0 or
+        sizes.access_log_bytes >=
+            @as(u64, access_log_buffers) * access_log_buffer_bytes_min);
+    assert(sizes.access_log_bytes <=
+        @as(u64, access_log_buffers) * access_log_buffer_bytes_max);
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
-        @as(u64, sizes.upstream_slots) * sizes.upstream_bytes;
+        @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
+        sizes.access_log_bytes;
     assert(total > 0);
     return total;
 }
@@ -568,10 +689,14 @@ test "budgets: memory total matches the closed form" {
     const conn_bytes: u64 = 10240;
     const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
     const upstream_bytes: u64 = head_bytes_max + 64;
-    // At the ceilings and at a shrunken (config-limits) shape alike.
+    // At the ceilings and at a shrunken (config-limits) shape alike, with
+    // the access log on at the ceiling and off below it — the term is a
+    // fixed reservation, so it must move the total by exactly its own size
+    // and by nothing else.
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
-        @as(u64, upstream_slots_max) * upstream_bytes;
+        @as(u64, upstream_slots_max) * upstream_bytes +
+        accessLogBytes(access_log_buffer_bytes_default);
     try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
@@ -579,6 +704,7 @@ test "budgets: memory total matches the closed form" {
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = upstream_slots_max,
         .upstream_bytes = upstream_bytes,
+        .access_log_bytes = accessLogBytes(access_log_buffer_bytes_default),
     }));
     const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
@@ -588,7 +714,20 @@ test "budgets: memory total matches the closed form" {
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = 8,
         .upstream_bytes = upstream_bytes,
+        .access_log_bytes = accessLogBytes(0),
     }));
+    // An unconfigured access log reserves nothing (§5), and a configured
+    // one reserves both buffers at whatever size it was given — the term
+    // tracks `limits`, not the compiled default.
+    try std.testing.expectEqual(@as(u64, 0), accessLogBytes(0));
+    try std.testing.expectEqual(
+        @as(u64, access_log_buffers) * access_log_buffer_bytes_default,
+        accessLogBytes(access_log_buffer_bytes_default),
+    );
+    try std.testing.expectEqual(
+        @as(u64, access_log_buffers) * access_log_buffer_bytes_min,
+        accessLogBytes(access_log_buffer_bytes_min),
+    );
 }
 
 test "budgets: c10k ceiling fd count needs a raised NOFILE" {
@@ -626,7 +765,7 @@ test "budgets: conn slots sit at the completion-queue ceiling" {
     try std.testing.expect(in_flight_ops_max <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
     const one_more = (conn_slots_max + 1) * conn_ops_max + upstream_slots_max +
         2 * (@as(u32, listeners_max) + admin_listeners) +
-        admin_conns * admin_conn_ops_max + 1 + 1;
+        admin_conns * admin_conn_ops_max + access_log_ops_max + 1 + 1;
     try std.testing.expect(one_more > @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
 }
 

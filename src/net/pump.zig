@@ -28,6 +28,7 @@
 //!   beforeRecv(conn) / beforeSend(conn)   pre-arm bookkeeping (flags, phase)
 //!   onRecvEntry(conn)                     post-await recv invariant re-checks
 //!   afterFeed(conn, received, fr)         e.g. pipelined-tail detection
+//!   afterSend(conn, sent)                 e.g. access-log byte accounting
 //!   onSendEntry(server, conn) bool        divert a settled verdict; true = handled
 //!   recvBuffer(conn) []u8                 where a read lands
 //!   transformIn(conn, chunk) ?[]const u8  read bytes → framed bytes
@@ -310,6 +311,10 @@ pub fn Pump(
             const sent = result catch |err| return Policy.onSendError(server, conn, err);
             assert(sent >= 1);
             creditSend(conn, sent);
+            // What actually left on the wire, whether or not framing
+            // counts in the same units (the transform seam above): the
+            // access log reports bytes moved, not bytes framed.
+            if (@hasDecl(Policy, "afterSend")) Policy.afterSend(conn, sent);
             // "Anything left to write?" rather than "is the framed debt
             // settled?" — the same question for a plain policy, whose
             // `sendSlice` empties exactly when the debt does, and the only

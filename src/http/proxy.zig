@@ -33,6 +33,7 @@
 
 const std = @import("std");
 
+const access_log = @import("../access_log.zig");
 const Balancer = @import("../balancer.zig").Balancer;
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
@@ -151,6 +152,15 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(received >= 1);
+            // A request begins with its first byte, and only with a byte:
+            // started here rather than before the unwrap above, because
+            // the read that ends an *idle* kept-alive connection completes
+            // in this same callback with EOF, and starting a request there
+            // would owe the log a line for a request nobody made. Nor at
+            // the parse: a slowloris that dribbles for the whole head-read
+            // deadline must report the time it spent doing it (§8).
+            server.beginLogRequest(conn);
+            conn.log.bytes_in += received;
             fillHead(conn, received);
             parseAndDispatch(server, conn);
         }
@@ -359,6 +369,10 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.request_framing = framingFromParsed(request.framing);
             conn.l7.request_head_len = request.head_len;
             conn.l7.client_keep_alive = request.keep_alive;
+            // Copied out now because the head buffer is not the log's to
+            // read later: the response head renders over it (§7 buffer
+            // rotation), and by the exchange's settle these bytes are gone.
+            conn.log.captureMethod(request.method_token);
         }
 
         /// Start this exchange's §8 deadline, if the deployment set one.
@@ -379,6 +393,26 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.request_deadline_ns > now_ns);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.rebaseDeadline(conn);
+        }
+
+        /// Record what this request asked for, before any rung can reject
+        /// it (§8): every reject, shed and verdict below reports the same
+        /// spelling the router matched on, and the head buffer these bytes
+        /// live in is gone by the time the line is written (§7 rotation).
+        ///
+        /// `path` is the canonical view when there is one and the raw
+        /// target when there is not — the 400 case, where no canonical
+        /// spelling exists and the raw one is both the honest answer and
+        /// the useful one, since a 400 line is read to find out what was
+        /// actually asked for.
+        fn captureTarget(conn: *ConnType, host: ?[]const u8, path: []const u8) void {
+            assert(conn.state == .l7_reading_head);
+            assert(path.len >= 1);
+            conn.log.capturePath(path);
+            if (host) |canonical| {
+                assert(canonical.len >= 1);
+                conn.log.captureHost(canonical);
+            }
         }
 
         /// Policy gate, then the exchange's admission: tunnels and
@@ -405,8 +439,10 @@ pub fn Proxy(comptime IoType: type) type {
             var scratch: [constants.head_bytes_max]u8 = undefined;
             var host_scratch: [constants.host_bytes_max]u8 = undefined;
             const keys = requestKeys(request, &scratch, &host_scratch) catch {
+                captureTarget(conn, null, request.target);
                 return respond(server, conn, 400, "l7_bad_request");
             };
+            captureTarget(conn, keys.host, keys.views.match);
             // §7 filters run before routing: a policy reject stops the
             // request whether or not it would have routed.
             if (filter.firstReject(conn.filters, .{
@@ -432,6 +468,11 @@ pub fn Proxy(comptime IoType: type) type {
             const pick = server.balancer.pick(conn.cluster_index, &server.upstreams.leased_counts);
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
+                // Recorded once the slot is actually held, never at the
+                // pick: a request shed for want of a slot contacted no
+                // origin, and a line claiming one would send an operator
+                // looking at a backend that never saw the request (§8).
+                conn.log.endpoint_index = pick.endpoint_index;
                 conn.upstream = parked;
                 conn.upstream_socket = parked.socket;
                 parked.head_len = 0;
@@ -459,6 +500,10 @@ pub fn Proxy(comptime IoType: type) type {
             conn.upstream = server.acquireUpstream(conn.cluster_index, pick.endpoint_index) orelse {
                 return respond(server, conn, 503, "l7_shed_upstream_slots");
             };
+            // The slot is held, so this try really is going to this
+            // endpoint — whether or not the dial ends up succeeding. A
+            // replay overwrites it, naming the endpoint that served (§7).
+            conn.log.endpoint_index = pick.endpoint_index;
             conn.state = .l7_dialing;
             // The head-read/idle timer is already armed; re-base it to the
             // tighter per-try connect budget so a hung origin fires the §8
@@ -802,6 +847,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
 
             pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
+                // Body bytes this request owns, counted where framing said
+                // which they were: a pipelined tail belongs to the *next*
+                // request, so it must not land on this one's line (§8).
+                conn.log.bytes_in += fr.consumed;
                 if (fr.consumed < received) {
                     // Bytes past the body are a pipelined next request; the
                     // connection will close after this exchange (§2 note).
@@ -1035,6 +1084,11 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.response_leg = .sending_head;
             // Committed to answering: no verdict may intervene from here (§7).
             conn.l7.response_started = true;
+            // The origin's own status, and `ok` whatever it is: `outcome`
+            // exists precisely so an origin's 503 and this proxy's shed
+            // 503 do not read as the same event (§8).
+            conn.log.status = response.status;
+            conn.log.outcome = .ok;
             armClientWrite(server, conn, conn.head[0..head_write_len], .response_excess);
         }
 
@@ -1094,6 +1148,7 @@ pub fn Proxy(comptime IoType: type) type {
             };
             assert(sent >= 1);
             assert(sent <= write.pending.len);
+            conn.log.bytes_out += sent;
             write.pending = write.pending[sent..];
             if (write.pending.len > 0) {
                 resumeClientWrite(server, conn); // Short send resumes (§6).
@@ -1117,8 +1172,19 @@ pub fn Proxy(comptime IoType: type) type {
                     assert(conn.l7.response_leg == .sending_body_excess);
                     afterResponseExcess(server, conn);
                 },
-                .lingering_close => beginLingeringClose(server, conn),
-                .next_request => resumeAfterStaticResponse(server, conn),
+                // A static answer is fully delivered. Log it here rather
+                // than where the verdict was decided, so the byte count
+                // includes the answer, and before either continuation runs
+                // — the keep path resets what the line reports, and the
+                // close path hands the connection to a drain (§8).
+                .lingering_close => {
+                    server.logExchange(conn);
+                    beginLingeringClose(server, conn);
+                },
+                .next_request => {
+                    server.logExchange(conn);
+                    resumeAfterStaticResponse(server, conn);
+                },
             }
         }
 
@@ -1185,6 +1251,14 @@ pub fn Proxy(comptime IoType: type) type {
                 return feedFraming(&conn.l7.response_framing, chunk);
             }
 
+            /// Response body bytes that reached the client. The head and
+            /// any coalesced excess are counted by the client-write
+            /// channel; between them every byte this proxy sends the
+            /// client is counted exactly once (§8).
+            pub fn afterSend(conn: *ConnType, sent: u32) void {
+                conn.log.bytes_out += sent;
+            }
+
             pub fn framingDone(conn: *ConnType) bool {
                 return framingDoneOf(&conn.l7.response_framing);
             }
@@ -1239,6 +1313,10 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.response_started);
             conn.l7.response_leg = .done;
             server.counters.increment("l7_responses");
+            // The whole response reached the client: the line goes out
+            // now, before the turnaround below clears what it reports.
+            assert(conn.log.outcome == .ok);
+            server.logExchange(conn);
 
             const request_complete = conn.l7.request_leg == .done;
             if (conn.l7.upstream_reusable and request_complete and !server.draining) {
@@ -1328,8 +1406,14 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.relay_buffer == null);
             assert(conn.upstream == null);
             assert(conn.client_write.pending.len == 0);
+            // The exchange that just ended has spoken for itself, so its
+            // accounting resets with the rest of the per-request state
+            // (§8). The captures are left in place: their lengths are what
+            // gate every read, and this zeroes those.
+            assert(conn.log.emitted or conn.log.started_wall_ns == 0);
             conn.head_len = 0;
             conn.l7 = .{};
+            conn.log.reset();
             conn.directions = .{ .{}, .{} };
             conn.state = .l7_reading_head;
             server.storeDeadline(conn, server.idleTimeoutMs());
@@ -1554,6 +1638,37 @@ pub fn Proxy(comptime IoType: type) type {
             return conn.head_len == conn.l7.request_head_len;
         }
 
+        /// Everything a static response no longer needs, returned before
+        /// the answer goes out rather than at teardown (§5, §8).
+        ///
+        /// The relay buffer: the response and its lingering drain
+        /// read/write only conn.head, so a reject or 503 storm holding
+        /// buffers for the whole drain window would pin the L4 admissions
+        /// those buffers gate. The upstream slot: a still-attached one — a
+        /// failed dial with no socket, an oversize-after-edit reject, a
+        /// malformed body — would otherwise ride the same window. Both
+        /// data ops are free at every caller, so nothing is armed on the
+        /// upstream socket and the close is synchronous, like `detach`.
+        fn releaseForStaticResponse(server: *ServerType, conn: *ConnType) void {
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            if (conn.relay_buffer) |buffer| {
+                server.releaseRelayBuffer(buffer);
+                conn.relay_buffer = null;
+            }
+            if (conn.upstream) |leased| {
+                if (conn.upstream_socket) |socket| {
+                    server.io.closeNow(socket);
+                }
+                server.releaseUpstream(leased);
+                conn.upstream = null;
+                conn.upstream_socket = null;
+            }
+            assert(conn.relay_buffer == null);
+            assert(conn.upstream == null);
+            assert(conn.upstream_socket == null);
+        }
+
         /// Answer a comptime static error response, then keep the
         /// connection or close it (§8). Legal from head reading (rejects),
         /// dialing (502), and the exchange (upstream failures) — every
@@ -1570,27 +1685,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!conn.armed.data_client_to_upstream);
             assert(!conn.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
-            // The static response and its lingering drain read/write only
-            // conn.head, never a relay buffer; free any held one now so a
-            // reject or 503 storm cannot pin buffers — and the L4 admissions
-            // they gate — for the whole drain window (§5, §8).
-            if (conn.relay_buffer) |buffer| {
-                server.releaseRelayBuffer(buffer);
-                conn.relay_buffer = null;
-            }
-            // A still-attached upstream (a failed dial with no socket, an
-            // oversize-after-edit reject, a malformed body) closes and frees
-            // its slot now instead of riding the whole lingering drain (§5).
-            // Both data ops are free (asserted above), so nothing is armed on
-            // the upstream socket and the close is synchronous, like detach.
-            if (conn.upstream) |leased| {
-                if (conn.upstream_socket) |socket| {
-                    server.io.closeNow(socket);
-                }
-                server.releaseUpstream(leased);
-                conn.upstream = null;
-                conn.upstream_socket = null;
-            }
+            releaseForStaticResponse(server, conn);
             // A rung committed to an answer: retire the §8 request deadline
             // so it cannot expire the connection out from under the write
             // that delivers it (`clearRequestDeadline` owns the rule).
@@ -1603,6 +1698,11 @@ pub fn Proxy(comptime IoType: type) type {
             ServerType.clearRequestDeadline(conn);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment(counter);
+            // What the line will say, recorded here where the verdict is
+            // made; it is written once the response is on the wire, so the
+            // byte count includes the answer itself (§8).
+            conn.log.status = status;
+            conn.log.outcome = comptime outcomeOfCounter(counter);
             // §8's "then keep or close per pressure". Closing is not free:
             // it costs the client a fresh handshake and this proxy a fresh
             // accept, conn slot and admission — which is how a shed storm
@@ -1630,6 +1730,36 @@ pub fn Proxy(comptime IoType: type) type {
             } else {
                 armClientWrite(server, conn, shed.staticResponse(status, .close), .lingering_close);
             }
+        }
+
+        /// The access-log outcome a `respond` rung reports (§8), keyed off
+        /// the counter it already names so the two cannot drift: a rung
+        /// that grows a counter must place it here or fail to compile.
+        ///
+        /// The split is the one an operator acts on, not the one HTTP's
+        /// status classes make. `503` covers both a resource wall and,
+        /// from an origin, a perfectly ordinary answer; `502` and `504`
+        /// each name a distinct failure of the upstream leg; everything
+        /// else in the list is this proxy refusing the request on its own
+        /// terms. Reading those apart from the status alone is impossible,
+        /// which is why `outcome` exists at all.
+        fn outcomeOfCounter(comptime counter: []const u8) access_log.Outcome {
+            const rejects = [_][]const u8{
+                "l7_bad_request",
+                "l7_uri_too_long",
+                "l7_headers_too_large",
+                "l7_not_implemented",
+                "l7_no_route",
+                "l7_filtered",
+            };
+            for (rejects) |name| {
+                if (std.mem.eql(u8, counter, name)) return .rejected;
+            }
+            if (std.mem.eql(u8, counter, "l7_shed_relay_buffers")) return .shed;
+            if (std.mem.eql(u8, counter, "l7_shed_upstream_slots")) return .shed;
+            if (std.mem.eql(u8, counter, "l7_bad_gateway")) return .upstream_failed;
+            if (std.mem.eql(u8, counter, "l7_gateway_timeout")) return .timed_out;
+            @compileError("static-response counter with no access-log outcome: " ++ counter);
         }
 
         /// The static response is out and the stream is still synchronized:

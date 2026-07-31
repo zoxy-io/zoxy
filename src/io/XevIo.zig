@@ -21,16 +21,23 @@ const linux = std.os.linux;
 
 const XevIo = @This();
 
-/// kqueue (macOS, local bench runs) dispatches `.close` ops to a thread
-/// pool — io_uring closes inside the ring, so Linux never spawns a thread.
-/// Pool threads only perform the blocking syscall; completion callbacks
-/// still run on the loop thread, so the single-threaded discipline holds.
-const close_needs_thread_pool = xev.backend == .kqueue;
+/// kqueue (macOS, local bench runs) dispatches `.close` ops — and the
+/// access log's file writes — to a thread pool; io_uring performs both
+/// inside the ring, so Linux never spawns a thread. Pool threads only
+/// perform the blocking syscall; completion callbacks still run on the
+/// loop thread, so the single-threaded discipline holds.
+const needs_thread_pool = xev.backend == .kqueue;
+
+/// The access-log sink (§8): the process's own stdout, inherited, never
+/// opened here. Config names the sink by enum and this is the only value
+/// it can name today, so the fd budget is unchanged — stdout is already
+/// one of the three stdio descriptors `fdsRequired` reserves.
+const log_sink_fd: posix.fd_t = 1;
 
 loop: xev.Loop,
 timer: xev.Timer,
 notifier: xev.Async,
-thread_pool: if (close_needs_thread_pool) xev.ThreadPool else void,
+thread_pool: if (needs_thread_pool) xev.ThreadPool else void,
 notifier_completion: xev.Completion,
 signal_mask: std.atomic.Value(u8),
 signal_callback: ?*const fn (?*anyopaque, Io.Signal) void,
@@ -64,16 +71,16 @@ const ListenerEntry = struct {
 /// deployment (`constants.completionQueueDepthFor` of the effective config,
 /// §8) — the io_uring backend sizes its ring to it; other backends ignore it.
 pub fn init(io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
-    if (comptime close_needs_thread_pool) {
+    if (comptime needs_thread_pool) {
         io.thread_pool = xev.ThreadPool.init(.{});
     }
-    errdefer if (comptime close_needs_thread_pool) {
+    errdefer if (comptime needs_thread_pool) {
         io.thread_pool.shutdown();
         io.thread_pool.deinit();
     };
     io.loop = try initLoop(
         cq_entries,
-        if (comptime close_needs_thread_pool) &io.thread_pool else null,
+        if (comptime needs_thread_pool) &io.thread_pool else null,
     );
     errdefer io.loop.deinit();
     io.notifier = try xev.Async.init();
@@ -162,7 +169,7 @@ pub fn deinit(io: *XevIo) void {
     io.timer.deinit();
     io.notifier.deinit();
     io.loop.deinit();
-    if (comptime close_needs_thread_pool) {
+    if (comptime needs_thread_pool) {
         io.thread_pool.shutdown();
         io.thread_pool.deinit();
     }
@@ -462,6 +469,65 @@ pub fn send(
     }).adapter);
 }
 
+/// Write one batch of access-log bytes to the sink (§8). A ring op, not a
+/// direct `write`: the sink is whatever the operator pointed stdout at, and
+/// a pipe whose reader has stalled would block the whole loop for as long
+/// as it stays stalled — the one thing this proxy must never do. Through
+/// the ring the kernel punts a would-block write to its own worker and the
+/// loop keeps serving; the caller's staging buffer absorbs the interval and
+/// drops when it cannot (§8's ladder, applied to logging).
+///
+/// `xev.File` rather than `xev.TCP`: the io_uring backend submits `send`
+/// for a TCP write, which a non-socket fd answers with ENOTSOCK.
+pub fn logWrite(
+    io: *XevIo,
+    bytes: []const u8,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.LogWriteError!u32) void,
+) void {
+    assert(bytes.len >= 1);
+    const file = xev.File.initFd(log_sink_fd);
+    file.write(&io.loop, completion, .{ .slice = bytes }, Userdata, userdata, (struct {
+        fn adapter(
+            context: ?*Userdata,
+            loop: *xev.Loop,
+            write_completion: *xev.Completion,
+            file_inner: xev.File,
+            write_buffer: xev.WriteBuffer,
+            result: xev.WriteError!usize,
+        ) xev.CallbackAction {
+            const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+            // The sink's failures are not §8 kernel pressure and must not be
+            // witnessed as it, but a classified cause left over from an
+            // earlier op would be read as this one's — clear it, the same
+            // honest reset `setNodelay` performs when it has no completion
+            // to classify from.
+            io_inner.recordPressure(write_completion);
+            _ = file_inner;
+            _ = write_buffer;
+            callback(context.?, if (result) |n|
+                @as(u32, @intCast(n))
+            else |_|
+                error.Unexpected);
+            return .disarm;
+        }
+    }).adapter);
+}
+
+/// Who is on the other end of an accepted socket (§8 access log). A
+/// `getpeername` rather than the sockaddr libxev's accept op fills:
+/// that field is a bare `posix.sockaddr`, 16 bytes, so the kernel
+/// truncates every IPv6 peer into it. One syscall per admitted connection
+/// — against the accept's ring op, the `setNodelay` setsockopt, and the
+/// dial that follows it, an unmeasurable addition on a path that runs once
+/// per connection, never per request.
+pub fn peerAddress(io: *XevIo, socket: Socket) std.Io.net.IpAddress {
+    _ = io;
+    return addressOf(@intFromEnum(socket), posix.system.getpeername);
+}
+
 pub fn close(
     io: *XevIo,
     socket: Socket,
@@ -705,6 +771,39 @@ pub fn nowNs(io: *XevIo) u64 {
         @as(u64, @intCast(cached.nsec));
 }
 
+/// Wall-clock nanoseconds since the Unix epoch, for the access log (§8) —
+/// both a line's timestamp and, read again at the end, its duration.
+///
+/// A second clock beside `nowNs`, deliberately, and on the opposite side of
+/// both of that one's trade-offs. It is *precise*, not coarse: `nowNs`
+/// feeds second-scale deadlines where a millisecond granule is free, while
+/// a duration quantized to the coarse granule would report 0 µs for every
+/// request a loopback or LAN hop actually serves. And it is *not* cached
+/// per tick: a cached read would give every request in one completion batch
+/// the same start and end, which is the same failure a second time.
+///
+/// The cost is bounded by being rare — two vDSO reads per *logged request*,
+/// against `nowNs`'s one per tick — and it is paid only when an operator
+/// turned the log on. Deriving durations from a wall clock does mean an NTP
+/// step lands in whichever line spans it; the saturating subtraction at the
+/// call site keeps that a wrong number rather than a wrapped one.
+pub fn nowWallNs(io: *XevIo) u64 {
+    _ = io;
+    var ts: linux.timespec = undefined;
+    // The read stands on its own line, never inside the assert: an
+    // assertion argument is not the place for the syscall the function
+    // exists to make. CLOCK_REALTIME with a valid pointer has no failure
+    // mode on a running kernel — EFAULT and EINVAL are both unreachable
+    // from here — so the result is an invariant, asserted rather than
+    // absorbed into a zero stamp that would date every line to 1970 and
+    // report a fifty-year duration. Same shape as `shutdown` and `closeFd`.
+    const rc = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
+    assert(posix.errno(rc) == .SUCCESS);
+    assert(ts.sec >= 0);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(ts.nsec));
+}
+
 pub fn run(io: *XevIo) Io.RunError!void {
     // anyerror: CompletionQueueOvercommitted exists only on io_uring.
     io.loop.run(.until_done) catch |err| switch (@as(anyerror, err)) {
@@ -830,17 +929,64 @@ fn listenerEntryConst(io: *const XevIo, listener: Listener) *const ListenerEntry
 /// both address families (IPv4/IPv6 share the family/port prefix). Public
 /// for the raw-libxev smoke test, which lives under src/io/ too.
 pub fn boundPort(fd: posix.socket_t) error{Unexpected}!u16 {
-    var bound: posix.sockaddr.in6 = undefined;
-    var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
-    const rc = posix.system.getsockname(fd, @ptrCast(&bound), &bound_len);
-    if (posix.errno(rc) != .SUCCESS) {
+    const port = addressOf(fd, posix.system.getsockname).getPort();
+    // Both failure modes land here as zero: a getsockname that did not
+    // succeed, and a socket that is somehow still unbound. Neither is a
+    // port a listener may serve on, and the caller's answer to both is
+    // the same — refuse to start.
+    if (port == 0) {
         return error.Unexpected;
     }
-    // sockaddr.in and sockaddr.in6 share the family/port prefix layout.
-    const family_port: *const posix.sockaddr.in = @ptrCast(&bound);
-    assert(family_port.family == posix.AF.INET or family_port.family == posix.AF.INET6);
-    return std.mem.bigToNative(u16, family_port.port);
+    return port;
 }
+
+/// What a socket reports for one end of its address pair, decoded into the
+/// seam's address type. `getter` is `getsockname` or `getpeername`; the two
+/// differ only in which end they name, and sharing the decode is what keeps
+/// the family fork written once.
+///
+/// A failure yields `address_unknown` rather than an error: the only caller
+/// that can fail meaningfully is `boundPort` (which reads the zero port
+/// back as one), and the other — the access log — asks about a peer that
+/// may already have reset, where "unknown" is the honest answer and there
+/// is nothing an access-log line could do with an error anyway.
+fn addressOf(fd: posix.socket_t, comptime getter: anytype) std.Io.net.IpAddress {
+    var storage: posix.sockaddr.in6 = undefined;
+    var length: posix.socklen_t = @sizeOf(posix.sockaddr.in6);
+    const rc = getter(fd, @ptrCast(&storage), &length);
+    if (posix.errno(rc) != .SUCCESS) {
+        return address_unknown;
+    }
+    // sockaddr.in and sockaddr.in6 share the family/port prefix layout.
+    const family_port: *const posix.sockaddr.in = @ptrCast(&storage);
+    const port = std.mem.bigToNative(u16, family_port.port);
+    if (family_port.family == posix.AF.INET) {
+        assert(length >= @sizeOf(posix.sockaddr.in));
+        return .{ .ip4 = .{
+            .bytes = @bitCast(family_port.addr),
+            .port = port,
+        } };
+    }
+    assert(family_port.family == posix.AF.INET6);
+    assert(length >= @sizeOf(posix.sockaddr.in6));
+    // `fromIp6` unwraps an IPv4-mapped address back to the IPv4 one it
+    // is, so a client reaching a dual-stack listener is logged as the
+    // address it dialed from rather than as `::ffff:a.b.c.d`. The scope
+    // is dropped: it names a local interface, not the peer.
+    return .fromIp6(.{
+        .port = port,
+        .bytes = storage.addr,
+        .flow = storage.flowinfo,
+        .interface = .none,
+    });
+}
+
+/// The answer when a socket cannot name an end of its pair. Distinguishable
+/// in a log line — no real peer connects from port 0 — without needing an
+/// optional at every consumer.
+const address_unknown: std.Io.net.IpAddress = .{
+    .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 },
+};
 
 fn closeFd(fd: posix.socket_t) void {
     const rc = posix.system.close(fd);

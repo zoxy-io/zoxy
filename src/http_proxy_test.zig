@@ -48,6 +48,12 @@ const HttpClient = struct {
     /// The last client begins the drain; a scenario that wants to watch
     /// the idle sweep instead arms a drain timer and clears this.
     drain_on_finish: bool = true,
+    /// Close from the client side once the response is in, rather than
+    /// waiting for the proxy to close. This is what an ordinary keep-alive
+    /// client does — curl, a browser, any pooled HTTP client — and it is
+    /// the only way to reach the read that ends an *idle* kept-alive
+    /// connection, which no `Connection: close` scenario can.
+    close_after_response: bool = false,
     sent_len: u32 = 0,
     send_in_flight: bool = false,
     /// Twice the proxy's head buffer: a response that fills that buffer and
@@ -162,32 +168,51 @@ const HttpClient = struct {
         client.received_len += received;
         assert(client.received_len <= client.receive_buffer.len);
         client.maybeSendSecond();
+        if (client.maybeCloseAfterResponse()) return;
         client.armRecv();
     }
 
-    /// Sequential keep-alive: once the first response is complete (its
-    /// content-length body fully received), send the queued second
-    /// request on the same connection.
-    fn maybeSendSecond(client: *HttpClient) void {
-        const queued = client.second_request orelse return;
+    /// Whether the first response has fully arrived — head plus whatever
+    /// body its framing declared.
+    fn firstResponseComplete(client: *const HttpClient) bool {
         var storage: parser.HeaderStorage = undefined;
         const first = parser.parseResponseHead(
             client.receive_buffer[0..client.received_len],
             false,
             &storage,
             .get,
-        ) catch return; // Incomplete head: keep reading.
+        ) catch return false; // Incomplete head: keep reading.
         const body_len: u32 = switch (first.framing) {
             .content_length => |length| @intCast(length),
             else => 0,
         };
-        if (client.received_len < first.head_len + body_len) {
-            return;
-        }
+        return client.received_len >= first.head_len + body_len;
+    }
+
+    /// Sequential keep-alive: once the first response is complete, send
+    /// the queued second request on the same connection.
+    fn maybeSendSecond(client: *HttpClient) void {
+        const queued = client.second_request orelse return;
+        if (!firstResponseComplete(client)) return;
         client.second_request = null;
         client.request = queued;
         client.sent_len = 0;
         client.armSend();
+    }
+
+    /// Hang up from this end once the exchange is done, leaving the proxy
+    /// to observe the close on a connection it was keeping alive. Returns
+    /// whether the client is finished, so the caller does not re-arm a
+    /// read on a socket that is gone.
+    fn maybeCloseAfterResponse(client: *HttpClient) bool {
+        if (!client.close_after_response) return false;
+        if (client.second_request != null) return false;
+        if (!firstResponseComplete(client)) return false;
+        // The connection ended cleanly; that this end sent the FIN rather
+        // than received one is not a distinction any caller draws.
+        client.outcome = .fin;
+        client.finish();
+        return true;
     }
 
     fn response(client: *const HttpClient) []const u8 {
@@ -476,6 +501,10 @@ const Http1Bed = struct {
         /// scenarios are unfiltered. A test supplies compiled rules to
         /// drive the filter reject/edit paths.
         filters: []const filter.Rule = &.{},
+        /// Turn the §8 access log on. Off by default so every existing
+        /// scenario keeps paying nothing for it; a test that turns it on
+        /// reads the emitted lines straight out of SimIo's virtual sink.
+        access_log: bool = false,
     };
 
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
@@ -505,11 +534,16 @@ const Http1Bed = struct {
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = options.max_lifetime_ms,
             .request_timeout_ms = options.request_timeout_ms,
+            .access_log_sink = if (options.access_log) .stdout else null,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
             .relay_buffers = options.relay_buffers,
             .upstream_slots = options.upstream_slots,
+            .access_log_buffer_bytes = if (options.access_log)
+                constants.access_log_buffer_bytes_default
+            else
+                0,
         });
         try bed.server.start();
         bed.origin = .{
@@ -2625,4 +2659,206 @@ test "l7: the replay path allocates nothing after init" {
     strict_bed.client2.request = second_request;
     try strict_bed.exchange(first_request);
     try strict_bed.expectDrained();
+}
+
+/// The single line the §8 access log wrote during a scenario. Fails rather
+/// than returning null when there is not exactly one: a test asserting on
+/// "the" line must not silently read the first of several.
+fn onlyAccessLogLine(bed: *const Http1Bed) ![]const u8 {
+    const sink = bed.sim_io.sinkBytes();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink, "\n"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("access_log_lines"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("access_log_dropped"));
+    return std.mem.trimEnd(u8, sink, "\n");
+}
+
+/// The one access-log line containing `needle`, for scenarios that emit
+/// several. Fails when it is not exactly one, so a needle that matched
+/// every line — or none — is a test bug rather than a passing assertion.
+fn accessLogLineFor(bed: *const Http1Bed, needle: []const u8) ![]const u8 {
+    var found: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, bed.sim_io.sinkBytes(), '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, needle) == null) continue;
+        try std.testing.expect(found == null);
+        found = line;
+    }
+    return found orelse error.NoSuchAccessLogLine;
+}
+
+test "l7: a proxied GET writes one access-log line naming the origin's status" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 6,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    const request = "GET /path?q=1 HTTP/1.1\r\nHost: Origin.Example:8080\r\nConnection: close\r\n\r\n";
+    try bed.exchange(request);
+    try bed.expectDrained();
+
+    const line = try onlyAccessLogLine(&bed);
+    // The line names what the *client* asked and what the *origin*
+    // answered: the canonical routing path (query split off, §7), the
+    // canonical host (lowercased and port-stripped, §7), and the origin's
+    // own status under outcome `ok`.
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"http\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"method\":\"GET\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"path\":\"/path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"host\":\"origin.example\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"status\":200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"cluster\":\"origin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"upstream\":\"127.0.0.1:9000\"") != null);
+    // Byte counts are what crossed this proxy's client side: the whole
+    // request head in, the rendered response head plus its body out.
+    var expected: [64]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        line,
+        try std.fmt.bufPrint(&expected, "\"bytes_in\":{d}", .{request.len}),
+    ) != null);
+    const relayed = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        line,
+        try std.fmt.bufPrint(&expected, "\"bytes_out\":{d}", .{relayed.len}),
+    ) != null);
+}
+
+test "l7: a shed and an origin 503 are the same status and different outcomes" {
+    // The whole reason `outcome` exists beside `status` (§8): read off the
+    // three digits alone, a resource wall and an origin's own answer are
+    // indistinguishable, and they call for opposite responses.
+    //
+    // The single upstream slot goes to a client the origin never answers,
+    // so the second client's request meets the wall — the same technique
+    // the shed-persistence test uses.
+    var shed_bed: Http1Bed = undefined;
+    try shed_bed.setUp(std.testing.allocator, .{
+        .seed = 11,
+        .upstream_slots = 1,
+        .origin_mute = true,
+        .access_log = true,
+    });
+    defer shed_bed.tearDown();
+    shed_bed.client.drain_on_finish = false;
+    shed_bed.client2.send_delay_ms = 100;
+    shed_bed.client2.request = "GET /shed HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    shed_bed.client2.start(&shed_bed.sim_io, &shed_bed.server, Http1Bed.bindAddress());
+    try shed_bed.exchange("GET /held HTTP/1.1\r\nHost: o\r\n\r\n");
+    try shed_bed.expectDrained();
+
+    const shed_line = try accessLogLineFor(&shed_bed, "\"path\":\"/shed\"");
+    try std.testing.expect(std.mem.indexOf(u8, shed_line, "\"status\":503") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shed_line, "\"outcome\":\"shed\"") != null);
+    // No endpoint was ever leased, so the line names none.
+    try std.testing.expect(std.mem.indexOf(u8, shed_line, "\"upstream\":null") != null);
+    // The held request met the deadline against a mute origin and was
+    // answered 504 — a third 5xx that `status` alone cannot tell from
+    // either of the two above, and that names the endpoint it was waiting
+    // on, which is the one an operator would go and look at.
+    const held_line = try accessLogLineFor(&shed_bed, "\"path\":\"/held\"");
+    try std.testing.expect(std.mem.indexOf(u8, held_line, "\"status\":504") != null);
+    try std.testing.expect(std.mem.indexOf(u8, held_line, "\"outcome\":\"timed_out\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, held_line, "\"upstream\":\"127.0.0.1:9000\"") != null);
+
+    var origin_bed: Http1Bed = undefined;
+    try origin_bed.setUp(std.testing.allocator, .{
+        .seed = 11,
+        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        .access_log = true,
+    });
+    defer origin_bed.tearDown();
+    try origin_bed.exchange("GET /path HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    try origin_bed.expectDrained();
+
+    const origin_line = try onlyAccessLogLine(&origin_bed);
+    try std.testing.expect(std.mem.indexOf(u8, origin_line, "\"status\":503") != null);
+    try std.testing.expect(std.mem.indexOf(u8, origin_line, "\"outcome\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, origin_line, "\"upstream\":\"127.0.0.1:9000\"") != null);
+}
+
+test "l7: a reject logs the target the client actually sent" {
+    // A path that will not canonicalize has no §7 spelling to report, and
+    // an empty field would tell an operator investigating a 400 nothing at
+    // all — so the raw target is what the line carries.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 12, .access_log = true });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /a%2Fb HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    try bed.expectDrained();
+
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"status\":400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"path\":\"/a%2Fb\"") != null);
+}
+
+test "l7: each request on a kept-alive connection gets its own line" {
+    // The turnaround resets the per-request accounting (§8), so two
+    // requests over one connection must produce two lines with their own
+    // paths and their own byte counts — not one line, and not a running
+    // total carried across.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 13,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    const second_request = "GET /second HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    bed.client.next = &bed.client2;
+    bed.client2.request = second_request;
+    try bed.exchange("GET /first HTTP/1.1\r\nHost: a\r\n\r\n");
+    try bed.expectDrained();
+
+    const sink = bed.sim_io.sinkBytes();
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("access_log_lines"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, sink, "\n"));
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, sink, "\n"), '\n');
+    const first = lines.next().?;
+    const second = lines.next().?;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"path\":\"/first\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"path\":\"/second\"") != null);
+    // The second request's counts are its own, not the pair's.
+    var expected: [64]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        second,
+        try std.fmt.bufPrint(&expected, "\"bytes_in\":{d},", .{second_request.len}),
+    ) != null);
+}
+
+test "l7: an idle kept-alive connection closing owes no line" {
+    // The read that ends an idle kept-alive connection completes in the
+    // same callback as the read that starts a request, and for a while
+    // this proxy could not tell them apart: every keep-alive client got a
+    // second, empty line reading `aborted` with no method, no path and no
+    // status — one phantom request per real one. A request begins with a
+    // *byte*, and a connection the client simply closed made none.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 14,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    // No `Connection: close`: the proxy keeps the connection, the client
+    // reads its response and then closes, and that close must be silent.
+    bed.client.close_after_response = true;
+    try bed.exchange("GET /kept HTTP/1.1\r\nHost: a\r\n\r\n");
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("access_log_lines"));
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"path\":\"/kept\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"ok\"") != null);
 }

@@ -307,6 +307,17 @@ unmerged behind it, so the pin moves only after re-audit.
   re-base drains it through the same `isTearingDown` checks.
   libxev cancellation is internally cancel+resubmit and consumes its own
   caller-owned completion, embedded in the slot like every other op.
+- **Three seam ops exist for the access log** (§8) and for nothing else.
+  `logWrite` puts the sink on the ring like every other write, so a log
+  reader that stalls cannot stall the loop. `peerAddress` is asked once
+  per admitted connection rather than at log time, when the socket may
+  already be closed and the fd number reused. `nowWallNs` is a *second*
+  clock: precise and uncached, where `now_ns` is coarse and refreshed once
+  per tick. Both of those properties are wrong for a log — a line needs a
+  date, which a monotonic clock cannot give, and a duration measured
+  against the tick would read 0 µs for every request served inside one
+  completion batch. It costs two vDSO reads per logged request, against
+  `now_ns`'s one per tick, and only when a deployment turns the log on.
 - **Plain ops only.** Multishot accept/recv, buffer rings, `send_zc`,
   `splice` stay behind measurement — the previous iteration never became
   CPU-bound without them, and this one is latency-bound with CPU
@@ -381,7 +392,16 @@ a raised `RLIMIT_NOFILE`:
 | conn slots | 1386 | 11464 | ~1.7 KiB state + 8 KiB head |
 | relay buffers | 1386 | 11464 | 2 × 4 KiB |
 | upstream slots | 1314 | 11464 | ~40 B state + 8 KiB head |
-| **pool memory** | **~33 MiB** | **~284 MiB** | |
+| **pool memory** | **~34 MiB** | **~288 MiB** | |
+
+The access log (§8) adds one fixed reservation beside the pools — two
+staging buffers, 64 KiB together by default — and nothing at all when it
+is off. It is in the printed total, because §5's promise is that the
+total covers everything this process holds for its life, not only what is
+shaped like a pool. Roughly half a kilobyte of the conn-slot state above
+is its per-request capture: the method, host and path a line reports live
+in the head buffer, which the response head renders over (§7), so they
+have to be copied out while they are still there.
 
 The ceilings sit on one completion-queue line — a conn slot costs
 `conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
@@ -730,6 +750,39 @@ origin, not one this proxy can pick for them.
   the admin/metrics listener's Prometheus rendering (`admin.zig`, one
   reserved scrape slot off the shared pools) plus a SIGUSR1 dump through
   the seam's `signal` primitive (§4).
+- **The access log is a shed rung of its own.** Counters say how much and
+  how often; an access log says *which request*, and that is what an
+  operator needs when one client is being served badly and the aggregates
+  look fine. Optional — a config `access_log` block names a sink, and
+  absent it the whole feature reserves nothing and reads no clock — it
+  writes one JSON object per line: one per HTTP exchange (including every
+  reject, shed and verdict) and one per L4 connection, carrying the
+  client, method, canonical host and path (§7), status, outcome,
+  duration, byte counts each way, and the cluster and endpoint that
+  served. `outcome` is not derivable from `status` and that is the point:
+  an origin's own `503` and this proxy's shed `503` are the same three
+  digits and opposite events.
+  **A log line must never stall the data path.** The sink is a pipe the
+  operator owns, so it can block for arbitrarily long, and a proxy that
+  waited on it would hand every client's latency to whatever reads its
+  logs. So the write is a ring op like every other (§4) with at most one
+  in flight — one entry in the ring budget, reserved unconditionally —
+  lines accumulate in a second staging buffer while it is out, the two
+  swap when it lands, and **a line that does not fit is dropped and
+  counted.** That is this section's own rule applied to logging: the
+  newest work gives way at a well-defined point, `access_log_dropped`
+  is the witness, and losing a log line is the right trade against
+  stalling a relay. Flushing is self-clocked rather than timer-driven — a
+  record with no write in flight starts one at once — so a quiet proxy's
+  line leaves immediately and a busy one batches a whole write's worth.
+  A sink write that *fails* (a closed pipe) marks the sink broken rather
+  than retrying: what reaches that point is not transient, since the ring
+  already absorbed every would-block. The drain (below) does not stop the
+  loop until the sink is quiet, because the lines describing a shutdown
+  are the ones most likely to be read. The record's per-line width is
+  closed-form in `src/constants.zig` like every other limit, which is why
+  the head-buffer captures it needs — method, host, path — are bounded and
+  truncation is marked rather than silent.
 - **File descriptors are pre-budgeted, not shed.** The fd count is
   closed-form — listeners + connection slots + upstream slots + ring,
   async and signal fds — evaluated on the *effective* config
@@ -881,6 +934,7 @@ src/
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
   admin.zig           // admin/metrics listener: one reserved scrape slot (§8)
+  access_log.zig      // JSON access log: double-buffered sink, drop rung (§8)
 sim/                  // simulator harness + invariants
 bench/                // micro benches (poop) + loopback harness (zrk), §9
 ```

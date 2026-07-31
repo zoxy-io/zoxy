@@ -40,13 +40,34 @@ A minimal config — an L4 listener forwarding to one origin
         "idle_ms": 60000,
         "drain_deadline_ms": 10000,
         "max_lifetime_ms": 0
-    }
+    },
+    "access_log": { "sink": "stdout" }
 }
 ```
 
 The full config format — every field, enum, and numeric bound — is
 described by the JSON Schema shipped as a release asset (also emitted
 locally by `zig build schema`).
+
+### Access log
+
+The optional `access_log` block writes one JSON object per line to
+stdout — one per HTTP exchange (rejects, sheds and timeouts included) and
+one per L4 connection:
+
+```json
+{"time":"2026-07-31T09:14:22.481Z","kind":"http","outcome":"ok","client":"10.1.2.3:52344","method":"GET","host":"api.example.com","path":"/v1/items","status":200,"upstream_reused":true,"upstream_replayed":false,"duration_us":1873,"bytes_in":142,"bytes_out":4096,"cluster":"api","upstream":"10.0.0.7:8080"}
+```
+
+`outcome` is the field `status` cannot give you: an origin answering
+`503` and zoxy shedding a request with `503` are the same three digits
+and opposite events. It reads `ok` (the origin answered), `rejected`,
+`shed`, `timed_out`, `upstream_failed`, `aborted`, or — for L4 — `closed`.
+
+Rotation is the operator's: pipe stdout wherever this process's output
+already goes. Logging never blocks the event loop, so a sink that stalls
+costs dropped lines rather than latency; `zoxy_access_log_dropped` counts
+them exactly.
 
 ## Development
 
