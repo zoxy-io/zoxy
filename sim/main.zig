@@ -7,9 +7,14 @@
 
 const std = @import("std");
 
+const zoxy = @import("zoxy");
+
 const Harness = @import("Harness.zig");
 
 const assert = std.debug.assert;
+
+const Counters = zoxy.counters.Counters;
+const SimIo = zoxy.Io.SimIo;
 
 const default_seed: u64 = 1;
 /// What `zig build sim` (and so `ci`) sweeps. Sized by census, not by
@@ -27,6 +32,348 @@ const progress_interval: u64 = 500;
 /// line per seed; the sweep reports the range it actually reached, so a
 /// run that hits this cap never reads as having cleared the remainder.
 const failures_max: u8 = 16;
+
+/// The smallest sweep whose census (see `Census`) is believed. Below it a
+/// range can miss a rung for want of seeds rather than for want of a
+/// path, so a replay — `zig build sim -- <seed> 1` — never fails on
+/// coverage.
+///
+/// Measured, not guessed: 256 seeds cover the whole non-exempt set from
+/// every start tried (1, 5k, 100k, 777_777, 31_415_926), while 128 still
+/// leaves `upstream_replayed` silent and 64 leaves six rungs silent. This
+/// is four times the measured floor, and `ci`'s 4096 clears it with the
+/// same margin the sweep size itself was chosen for.
+///
+/// The thinnest rung sets the real bound, so it is worth knowing which:
+/// per 1024 seeds, `shed_draining` lands 15-23 times and
+/// `drained_at_deadline` 24-51 across the starts above. A change that
+/// pushes either toward single digits has quietly made this floor a
+/// coin flip, whatever the sweep still says.
+const census_iterations_min: u64 = 1024;
+
+/// A counter the sweep expects to stay at zero, and why.
+const Uncovered = struct {
+    name: []const u8,
+    why: Why,
+    /// The argument itself: what reaches the counter instead, or what a
+    /// non-zero reading would mean. Printed when the entry's claim stops
+    /// holding, so it has to read as an argument rather than a label.
+    reason: []const u8,
+
+    /// The two reasons an entry is here. They look identical to the gate
+    /// — both must read zero — and want opposite things from whoever the
+    /// gate wakes, so the remedy is printed from this rather than assumed.
+    const Why = enum {
+        /// No scenario reaches it. A non-zero reading is good news: some
+        /// scenario grew, and the entry has outlived its argument.
+        unreached,
+        /// It can be reached and must not be. A non-zero reading is a bug
+        /// report, and deleting the entry would be deleting the alarm.
+        must_stay_zero,
+    };
+
+    /// What to tell the reader when this entry's counter fires.
+    fn remedy(entry: *const Uncovered) []const u8 {
+        return switch (entry.why) {
+            .unreached => "a scenario now reaches it, so delete this entry",
+            .must_stay_zero => "this is the alarm, not a coverage note — " ++
+                "the invariant broke, so fix the code rather than the table",
+        };
+    }
+};
+
+/// The counters a full sweep never moves. Most are unreachable: a
+/// listener the simulator does not configure, a fault it does not
+/// inject, a volume it cannot reach — and each names the directed test
+/// that covers the path instead, because "no seed reaches it" and
+/// "nothing tests it" are different claims and only the first is made
+/// here.
+///
+/// A few are here for the opposite reason: they *can* fire and must not,
+/// so a reading of zero is the invariant rather than an admission. `why`
+/// says which an entry is, and the gate prints the matching remedy —
+/// telling someone to delete the entry when the alarm they just tripped
+/// *is* the entry would be the worst advice the tool could give.
+///
+/// The gate reads both ways — a counter absent from this table must fire
+/// at least once, and a counter present must stay at zero — which is what
+/// serves both kinds at once, and what stops the table rotting into stale
+/// excuses.
+const uncovered = [_]Uncovered{
+    .{
+        .name = "health_probe_deadline_raced",
+        .why = .must_stay_zero,
+        .reason = "the §4 race it counts — a probe deadline firing after its " ++
+            "own cancel was issued — is legal but has never occurred in a " ++
+            "sweep, while a prober that stopped cancelling at all reports " ++
+            "every verdict correctly and moves only this. That is #130 " ++
+            "exactly. Measured: 0 with the fix, 4760 with it reverted",
+    },
+    .{
+        .name = "l7_headers_too_large",
+        .why = .unreached,
+        .reason = "no script sends a header section past the head buffer; " ++
+            "src/http_proxy_test.zig drives both 431 shapes",
+    },
+    .{
+        .name = "l7_no_route",
+        .why = .unreached,
+        .reason = "the sim's route table is a single \"/\" prefix, which no " ++
+            "path can miss; src/http_proxy_test.zig covers the path- and " ++
+            "host-miss 404s",
+    },
+    .{
+        .name = "l7_shed_upstream_slots",
+        .why = .unreached,
+        .reason = "the only seeds that starve a pool set relay_buffers and " ++
+            "upstream_slots both to 1, and the L7 path takes the relay " ++
+            "buffer first, so the relay rung answers every request that " ++
+            "would have reached this one; src/http_proxy_test.zig " ++
+            "exhausts the upstream pool directly",
+    },
+    .{
+        .name = "l7_response_excess_sent",
+        .why = .unreached,
+        .reason = "no seed raises the adversary's recv cap to head_bytes_max, " ++
+            "so no origin delivery fills the head buffer; " ++
+            "src/http_proxy_test.zig builds that delivery",
+    },
+    .{
+        .name = "admin_served",
+        .why = .unreached,
+        .reason = "the sweep configures no admin listener; " ++
+            "src/admin_test.zig covers the scrape",
+    },
+    .{
+        .name = "admin_reaped",
+        .why = .unreached,
+        .reason = "the sweep configures no admin listener; " ++
+            "src/admin_test.zig covers the scrape deadline",
+    },
+    .{
+        .name = "access_log_dropped",
+        .why = .unreached,
+        .reason = "a scenario emits single-digit lines against staging buffers " ++
+            "holding ~130, so no schedule can overflow them; " ++
+            "src/access_log_test.zig drives the burst",
+    },
+    .{
+        .name = "access_log_write_failed",
+        .why = .unreached,
+        .reason = "the harness never calls injectLogWriteError; " ++
+            "src/access_log_test.zig covers the stop-and-witness",
+    },
+};
+
+comptime {
+    // Every exemption is compared against every counter name, so the
+    // default quota runs out at this table's size.
+    @setEvalBranchQuota(uncovered.len * Counters.names.len * 32);
+    // A census over an empty set would pass by saying nothing, and a
+    // table that exempted everything would do the same.
+    assert(Counters.names.len >= 1);
+    assert(uncovered.len < Counters.names.len);
+    // An entry naming a counter that does not exist would exempt nothing
+    // while reading as though it exempted something, and a duplicate
+    // would let one deletion leave the other behind.
+    for (uncovered, 0..) |entry, index| {
+        var found = false;
+        for (Counters.names) |name| {
+            if (std.mem.eql(u8, name, entry.name)) found = true;
+        }
+        if (!found) {
+            @compileError("uncovered names a counter that does not exist: " ++ entry.name);
+        }
+        // The reason is the whole point of the entry: it is what the
+        // sweep prints when the exemption stops being true, and a blank
+        // one exempts a rung while saying nothing about what covers it.
+        if (entry.reason.len == 0) {
+            @compileError("uncovered gives no reason for " ++ entry.name);
+        }
+        for (uncovered[index + 1 ..]) |later| {
+            if (std.mem.eql(u8, entry.name, later.name)) {
+                @compileError("uncovered names " ++ entry.name ++ " twice");
+            }
+        }
+    }
+}
+
+/// The §4 seam ops no scenario delivers, on the same both-ways terms as
+/// `uncovered`. One entry today, and it is a finding rather than a
+/// footnote: the whole asynchronous close path is unreached by 4096
+/// seeds.
+const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
+    .{
+        .kind = .close,
+        .reason = "src/admin.zig is the only asynchronous close in the tree — " ++
+            "every serving path closes synchronously via closeNow — and the " ++
+            "sweep configures no admin listener; src/admin_test.zig covers it",
+    },
+};
+
+comptime {
+    // The twin of `uncovered`'s validation: an entry naming `.none`
+    // exempts an op that is never delivered by construction, a duplicate
+    // lets one deletion leave the other behind, and a blank reason
+    // exempts a slice of the seam while saying nothing about it.
+    for (uncovered_ops, 0..) |entry, index| {
+        if (entry.kind == .none) @compileError("uncovered_ops names the .none op");
+        if (entry.reason.len == 0) {
+            @compileError("uncovered_ops gives no reason for " ++ @tagName(entry.kind));
+        }
+        for (uncovered_ops[index + 1 ..]) |later| {
+            if (entry.kind == later.kind) {
+                @compileError("uncovered_ops names " ++ @tagName(entry.kind) ++ " twice");
+            }
+        }
+    }
+    // `.none` is not a deliverable op, so it is never counted as covered.
+    assert(uncovered_ops.len < std.enums.values(SimIo.OpKind).len - 1);
+}
+
+fn opReasonFor(kind: SimIo.OpKind) ?[]const u8 {
+    assert(kind != .none);
+    for (uncovered_ops) |entry| {
+        if (entry.kind == kind) {
+            assert(entry.reason.len >= 1);
+            return entry.reason;
+        }
+    }
+    return null;
+}
+
+/// The entry for `name`, or null when the sweep is expected to reach it.
+/// Linear over a table of a few dozen entries, run once per counter at
+/// the end of a sweep.
+fn entryFor(name: []const u8) ?*const Uncovered {
+    assert(name.len >= 1);
+    for (&uncovered) |*entry| {
+        if (std.mem.eql(u8, name, entry.name)) {
+            // An empty reason would print as an exemption that argued
+            // nothing — the comptime block rejects one, and this is where
+            // that rejection is felt if it ever stops running.
+            assert(entry.reason.len >= 1);
+            return entry;
+        }
+    }
+    return null;
+}
+
+/// What every counter totalled across a swept range, and the coverage
+/// verdict those totals carry (§9).
+///
+/// `reconcile` gates each seed's *shape* — work is never lost, every shed
+/// is witnessed — but nothing gated the sweep's *reach*, so a rung could
+/// quietly become unreachable and the gate would stay green describing a
+/// path no scenario walks. `kernel_pressure_set_option` was the standing
+/// example: `SimIo` grew an injector precisely because "64 seeds stayed
+/// green because nothing could make the call fail", and then no seed
+/// called the injector for as long as it existed. The census is what
+/// said so out loud; the harness now draws that fault, and the entry
+/// this table used to carry for it is gone.
+const Census = struct {
+    totals: [Counters.names.len]u64 = @splat(0),
+    /// The same question asked of the §4 seam rather than the §8 ladder:
+    /// which *ops* the sweep ever delivered. A counter says a decision was
+    /// taken; an op says the ring carried the work. They fail
+    /// independently — `close` is delivered by exactly one call site in
+    /// the tree, so no counter's silence would have named it.
+    ops: [std.enums.values(SimIo.OpKind).len]u64 = @splat(0),
+
+    fn add(census: *Census, harness: *const Harness) void {
+        inline for (Counters.names, 0..) |name, index| {
+            const before = census.totals[index];
+            census.totals[index] += harness.server.counters.get(name);
+            // A sweep is bounded by `iterations`, so no honest total can
+            // wrap — one that did would read as a rung going quiet.
+            assert(census.totals[index] >= before);
+        }
+        for (std.enums.values(SimIo.OpKind)) |kind| {
+            if (kind == .none) continue;
+            const before = census.ops[@intFromEnum(kind)];
+            census.ops[@intFromEnum(kind)] += harness.io.deliveredCount(kind);
+            // As the counter loop above: a wrap would read as an op going
+            // quiet, which is the one thing this table exists to notice.
+            assert(census.ops[@intFromEnum(kind)] >= before);
+        }
+    }
+
+    /// True when every counter agrees with its side of `uncovered`. Each
+    /// disagreement prints what to do about it, which is not the same
+    /// sentence twice: a silent rung wants a scenario that reaches it, and
+    /// a fired entry wants either its deletion or a bug fixed, depending
+    /// on which kind of entry it was (`Uncovered.remedy`).
+    fn verify(census: *const Census) bool {
+        var held = true;
+        var fired: usize = 0;
+        for (Counters.names, census.totals) |name, total| {
+            if (total != 0) fired += 1;
+            const entry = entryFor(name);
+            if (entry == null and total == 0) {
+                std.debug.print(
+                    "sim census: {s} never fired — no scenario reaches it; " ++
+                        "widen one, or exempt it and say what covers it instead\n",
+                    .{name},
+                );
+                held = false;
+            }
+            if (entry) |exempt| {
+                if (total != 0) {
+                    std.debug.print(
+                        "sim census: {s} fired {d} time(s), and should not have.\n" ++
+                            "  why: {s}\n  do: {s}\n",
+                        .{ name, total, exempt.reason, exempt.remedy() },
+                    );
+                    held = false;
+                }
+            }
+        }
+        assert(fired <= Counters.names.len);
+        // The verdict restated as a partition: holding means the set that
+        // fired is exactly the complement of the exemption table — not
+        // merely that no single name was caught on the wrong side.
+        if (held) assert(fired == Counters.names.len - uncovered.len);
+        return census.verifyOps() and held;
+    }
+
+    /// Every op of the §4 seam must be delivered somewhere in the range.
+    /// An op no seed ever carries is a slice of the seam the gate has
+    /// never run, whatever its counters say.
+    fn verifyOps(census: *const Census) bool {
+        var held = true;
+        var carried: usize = 0;
+        for (std.enums.values(SimIo.OpKind)) |kind| {
+            if (kind == .none) continue;
+            const delivered = census.ops[@intFromEnum(kind)];
+            if (delivered != 0) carried += 1;
+            const reason = opReasonFor(kind);
+            if (reason == null and delivered == 0) {
+                std.debug.print(
+                    "sim census: op {t} never delivered — the seam carried it " ++
+                        "no work; widen a scenario, or exempt it and say what does\n",
+                    .{kind},
+                );
+                held = false;
+            }
+            if (reason != null and delivered != 0) {
+                std.debug.print(
+                    "sim census: op {t} was delivered {d} time(s) but is exempt " ++
+                        "as \"{s}\" — the exemption is no longer true, so delete it\n",
+                    .{ kind, delivered, reason.? },
+                );
+                held = false;
+            }
+        }
+        assert(carried < std.enums.values(SimIo.OpKind).len);
+        // The same partition `verify` states for counters: holding means
+        // the ops the seam carried are exactly the deliverable set minus
+        // the exemptions, not merely that no one op landed wrongly.
+        if (held) {
+            assert(carried == std.enums.values(SimIo.OpKind).len - 1 - uncovered_ops.len);
+        }
+        return held;
+    }
+};
 
 /// One swept range, and whether a failure ends it.
 const Sweep = struct {
@@ -62,7 +409,8 @@ fn fuzzForever(arena_state: *std.heap.ArenaAllocator, io: std.Io) !u8 {
         var seed_bytes: [8]u8 = undefined;
         io.random(&seed_bytes);
         const seed = std.mem.readInt(u64, &seed_bytes, .little);
-        checkSeed(arena_state, seed) catch return 1;
+        // No census: a random walk has no range to make a claim about.
+        checkSeed(arena_state, seed, null) catch return 1;
         if (count % progress_interval == 0) {
             std.debug.print("sim fuzz: {d} seeds ok, latest {d}\n", .{ count + 1, seed });
         }
@@ -109,8 +457,9 @@ fn sweep(arena_state: *std.heap.ArenaAllocator, options: *const Sweep) !u8 {
     var failed: [failures_max]u64 = @splat(0);
     var failed_count: u8 = 0;
     var seed = options.first_seed;
+    var census: Census = .{};
     while (seed < end) : (seed += 1) {
-        checkSeed(arena_state, seed) catch {
+        checkSeed(arena_state, seed, &census) catch {
             assert(failed_count < failures_max);
             failed[failed_count] = seed;
             failed_count += 1;
@@ -121,17 +470,52 @@ fn sweep(arena_state: *std.heap.ArenaAllocator, options: *const Sweep) !u8 {
             }
         };
     }
-    if (failed_count == 0) {
-        assert(seed == end);
-        std.debug.print("sim: {d} seed(s) ok, {d}..{d}\n", .{
+    if (failed_count != 0) {
+        reportFailures(options, failed[0..failed_count], @min(seed, end - 1));
+        return 1;
+    }
+    assert(seed == end);
+    if (!checkCensus(options, &census)) {
+        std.debug.print("sim: {d} seed(s) ran, {d}..{d}, census FAILED\n", .{
             options.iterations,
             options.first_seed,
             end - 1,
         });
-        return 0;
+        return 1;
     }
-    reportFailures(options, failed[0..failed_count], @min(seed, end - 1));
-    return 1;
+    std.debug.print("sim: {d} seed(s) ok, {d}..{d}\n", .{
+        options.iterations,
+        options.first_seed,
+        end - 1,
+    });
+    return 0;
+}
+
+/// The coverage census over a completed range, and its verdict on stdout.
+/// False means the census failed. Only ranges that swept clean reach
+/// here — a sweep that stopped early has nothing to say about the rungs
+/// its abandoned remainder was carrying.
+///
+/// A range too short to trust says so rather than passing quietly. That
+/// line is the difference between "coverage held" and "coverage was not
+/// asked", which a replay would otherwise report identically.
+fn checkCensus(options: *const Sweep, census: *const Census) bool {
+    assert(options.iterations >= 1);
+    if (options.iterations < census_iterations_min) {
+        std.debug.print("sim: census skipped, a range of {d} is under the {d} seeds it needs\n", .{
+            options.iterations,
+            census_iterations_min,
+        });
+        return true;
+    }
+    if (!census.verify()) return false;
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} seam op(s), {d} exempt\n", .{
+        Counters.names.len - uncovered.len,
+        uncovered.len,
+        std.enums.values(SimIo.OpKind).len - 1 - uncovered_ops.len,
+        uncovered_ops.len,
+    });
+    return true;
 }
 
 /// Names every failing seed, then the range actually covered: a sweep
@@ -154,13 +538,15 @@ fn reportFailures(options: *const Sweep, failed: []const u64, swept_last: u64) v
 }
 
 /// One seed, run twice: the second run must produce a byte-identical
-/// delivery trace or determinism itself is broken.
-fn checkSeed(arena_state: *std.heap.ArenaAllocator, seed: u64) !void {
-    const first = runSeed(arena_state, seed) catch |err| {
+/// delivery trace or determinism itself is broken. Only the first run
+/// feeds the census — the replay would double every total, and a census
+/// is a claim about what one pass over the range reached.
+fn checkSeed(arena_state: *std.heap.ArenaAllocator, seed: u64, census: ?*Census) !void {
+    const first = runSeed(arena_state, seed, census) catch |err| {
         std.debug.print("sim: FAILURE seed={d} error={t}\n", .{ seed, err });
         return err;
     };
-    const second = runSeed(arena_state, seed) catch |err| {
+    const second = runSeed(arena_state, seed, null) catch |err| {
         std.debug.print("sim: FAILURE on replay seed={d} error={t}\n", .{ seed, err });
         return err;
     };
@@ -173,7 +559,7 @@ fn checkSeed(arena_state: *std.heap.ArenaAllocator, seed: u64) !void {
     }
 }
 
-fn runSeed(arena_state: *std.heap.ArenaAllocator, seed: u64) !u64 {
+fn runSeed(arena_state: *std.heap.ArenaAllocator, seed: u64, census: ?*Census) !u64 {
     _ = arena_state.reset(.retain_capacity);
     const arena = arena_state.allocator();
 
@@ -185,5 +571,8 @@ fn runSeed(arena_state: *std.heap.ArenaAllocator, seed: u64) !u64 {
         return err;
     };
     try harness.verify();
+    // After `verify`, so a seed that failed its own oracles never counts
+    // toward coverage: a rung is only reached by a run that held.
+    if (census) |totals| totals.add(&harness);
     return harness.io.trace_hash;
 }

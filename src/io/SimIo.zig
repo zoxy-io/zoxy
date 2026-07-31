@@ -99,6 +99,13 @@ stopped: bool,
 dump_on_deadlock: bool,
 /// FNV-1a over every delivery; two runs of one seed must end equal (§9).
 trace_hash: u64,
+/// Completions delivered so far, by op kind (§9). `trace_hash` says two
+/// runs of a seed did the *same* work; this says how much work that was,
+/// which is the question a hash cannot answer — a run doing three times
+/// as much hashes identically both times. Cumulative rather than
+/// concurrent, so it extends §8's closed-form op budgets from
+/// "worst-case in flight" to "total consumed".
+delivered: [std.enums.values(OpKind).len]u64,
 blackholed_addresses: [blackholed_addresses_max]std.Io.net.IpAddress,
 blackholed_count: u8,
 /// One-shot dial faults by address (`injectConnectError`): the next
@@ -189,7 +196,22 @@ pub const Completion = struct {
     pub const State = enum(u8) { dead, pending };
 };
 
-const Op = union(enum) {
+/// The seam's op set, named so the §9 gate can count and report
+/// deliveries by kind rather than by tag number.
+pub const OpKind = enum(u8) {
+    none,
+    accept,
+    connect,
+    recv,
+    send,
+    close,
+    log_write,
+    timer,
+    timer_cancel,
+    connect_cancel,
+};
+
+const Op = union(OpKind) {
     none,
     accept: struct { listener_index: u16 },
     connect: struct { address: std.Io.net.IpAddress, fate: ConnectFate, canceled: bool },
@@ -380,6 +402,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.stopped = false;
     io.dump_on_deadlock = options.dump_on_deadlock;
     io.trace_hash = std.hash.Fnv1a_64.init().value;
+    io.delivered = @splat(0);
     io.blackholed_addresses = undefined;
     io.blackholed_count = 0;
     io.connect_error_addresses = undefined;
@@ -1415,7 +1438,17 @@ fn closeEntryWithReset(io: *SimIo, socket: Socket) void {
     io.closeEntry(socket);
 }
 
+/// Deliveries of one op kind so far this run (§9).
+pub fn deliveredCount(io: *const SimIo, kind: OpKind) u64 {
+    assert(kind != .none);
+    return io.delivered[@intFromEnum(kind)];
+}
+
 fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) void {
+    // Every delivery funnels through here, which is what makes one
+    // increment enough to count them all.
+    assert(completion.op != .none);
+    io.delivered[@intFromEnum(completion.op)] += 1;
     io.mix(@intFromEnum(completion.op));
     io.mix(@intFromEnum(result.*));
     const detail: u64 = switch (result.*) {

@@ -89,6 +89,27 @@ end_timer_completion: SimIo.Completion,
 /// to land often, not on every draw.
 http_origin_stop_at_ns: u64,
 http_origin_stop_completion: SimIo.Completion,
+/// Virtual instant at which the drain begins, or 0 for "at the
+/// scenario's end like every other seed".
+///
+/// Every seed already drains — `endScenario` calls `beginDrain` — but by
+/// then the clients have finished, so the drain's two race-dependent
+/// rungs stay out of reach: an accept completion already in flight when
+/// the drain starts (`shed_draining`), and a connection still live when
+/// the drain deadline fires (`drained_at_deadline`). Starting the drain
+/// while the scenario is still working is what puts traffic in front of
+/// it. Clean seeds never draw one — a drain is a legitimate reason to
+/// miss a golden outcome, which is the thing those seeds exist to
+/// forbid.
+///
+/// It is not free: a seed that stops accepting early serves less. Across
+/// the 4096-seed sweep this costs about 6% of the client work
+/// (`accepted` 12599 → 11858, `l7_responses` 2234 → 2119) and a quarter
+/// of the probes, since a draining server stops the prober. Eight rungs
+/// for 6% is the trade being made, and raising the draw rate would buy
+/// coverage margin at a steeper one.
+drain_at_ns: u64,
+drain_completion: SimIo.Completion,
 scenario_prng: std.Random.DefaultPrng,
 
 fn bindAddress() std.Io.net.IpAddress {
@@ -122,8 +143,21 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         .seed = seed,
         .adversary = deriveAdversary(random, harness.clean),
     });
+    // Which cause the sim reports for every failure it injects (§8).
+    // Production reads it off an errno; a virtual socket table has none,
+    // so the scenario states one — and drawing it per seed is what makes
+    // four of the five `kernel_pressure_*` cause counters reachable at
+    // all: under the fixed `out_of_buffers` default that one counter
+    // carried every injected failure of a 4096-seed sweep and the other
+    // four stayed at zero. A clean seed injects nothing, so it keeps the
+    // default rather than choosing a cause it will never report.
+    if (!harness.clean) {
+        harness.io.setPressureCause(random.enumValue(Io.Pressure.Cause));
+    }
+    harness.drain_at_ns = deriveDrainAt(harness.clean, random);
     harness.deriveTopology(random);
     try harness.startServerAndOrigins(arena, random);
+    harness.injectOneShotFaults(random);
     harness.populateClients(random);
 
     harness.end_timer_completion = .{};
@@ -134,6 +168,17 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         harness,
         onScenarioEnd,
     );
+    harness.drain_completion = .{};
+    if (harness.drain_at_ns != 0) {
+        assert(harness.drain_at_ns < scenario_end_ns);
+        harness.io.timerStart(
+            &harness.drain_completion,
+            harness.drain_at_ns,
+            Harness,
+            harness,
+            onDrainStart,
+        );
+    }
     harness.http_origin_stop_completion = .{};
     if (harness.http_origin_stop_at_ns != 0) {
         assert(harness.http_origin_stop_at_ns < scenario_end_ns);
@@ -144,6 +189,98 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
             harness,
             onHttpOriginStop,
         );
+    }
+}
+
+/// When the drain starts, for the seeds that start one early.
+///
+/// Bimodal, because the two rungs want opposite instants and one window
+/// cannot serve both. `shed_draining` needs the drain inside the opening
+/// accept burst, while sockets are still queued — a millisecond in.
+/// `drained_at_deadline` needs the drain to arrive after an exchange has
+/// begun, with a deadline short enough to still find it running (see
+/// `drain_deadline_ms` below, which is the other half of reaching it).
+///
+/// The split is load-bearing, not decoration: replacing it with one
+/// uniform 0.1-150 ms window drops `shed_draining` to 1 and 0 per 1024
+/// seeds from two starts — a census failure — while leaving
+/// `drained_at_deadline` untouched at 23-24.
+fn deriveDrainAt(clean: bool, random: std.Random) u64 {
+    if (clean) return 0;
+    if (random.uintLessThan(u8, 4) != 0) return 0;
+    const at_ns = if (random.boolean())
+        100_000 + random.uintAtMost(u64, 3 * std.time.ns_per_ms)
+    else
+        (10 + random.uintAtMost(u64, 140)) * std.time.ns_per_ms;
+    assert(at_ns >= 100_000);
+    assert(at_ns < scenario_end_ns);
+    return at_ns;
+}
+
+/// How long the drain gives its stragglers (§8).
+///
+/// A deadline long enough that the drain always finishes first is a
+/// deadline that never reaps, and `drained_at_deadline` stays
+/// unreachable however the drain itself is timed — measured: at the
+/// fixed 100 ms the timer delivered on 54 of 400 seeds and found every
+/// connection already tearing down. Seeds that drain early therefore
+/// sometimes draw one short enough to still find work running, which is
+/// a setting production operators tune too. Seeds that drain only at the
+/// scenario's end keep the roomy default: there is nothing left to reap
+/// by then, and a short deadline would say nothing about it.
+fn deriveDrainDeadlineMs(drain_at_ns: u64, random: std.Random) u32 {
+    assert(drain_at_ns < scenario_end_ns);
+    if (drain_at_ns == 0) return 100;
+    if (!random.boolean()) return 100;
+    const deadline_ms = 1 + random.uintAtMost(u32, 4);
+    assert(deadline_ms >= 1);
+    return deadline_ms;
+}
+
+/// The drawn mid-scenario drain (§8). `beginDrain` is idempotent, so the
+/// scenario-end drain that follows is a no-op rather than a second one.
+fn onDrainStart(harness: *Harness, result: Io.TimerError!void) void {
+    result catch return;
+    harness.server.beginDrain();
+}
+
+/// The one-shot faults the sweep would otherwise never pull (§9).
+///
+/// `SimIo` carries an injector for each — the set-option one exists
+/// precisely because "64 seeds stayed green because nothing could make
+/// the call fail" — but until now no seed called either, so the paths
+/// they reach stayed as unreachable as they were before the injectors
+/// were written. Adversarial seeds only: a fault is the wrong thing to
+/// hand a seed whose oracle is an exact golden outcome.
+///
+/// A pending set-option fault is claimed by whoever makes the next
+/// `setNodelay`/`setLingerRst` call, and that is not always the server:
+/// an origin double closing in reset mode makes one too. The first
+/// version of this function assumed the server always got there first
+/// and panicked the sweep on the seed that proved otherwise, which is
+/// why both doubles now absorb the error instead of taking it as
+/// `unreachable`. A fault landing on a double costs that origin its RST
+/// and nothing else, and the server still claims most of them: it calls
+/// `setNodelay` on every admission and every upstream dial, far earlier
+/// and far oftener than a double reaches a reset-mode close. Measured,
+/// since the split is the part worth doubting rather than asserting —
+/// `kernel_pressure_set_option` lands 232-265 times per 1024 seeds
+/// against roughly 288 faults drawn.
+fn injectOneShotFaults(harness: *Harness, random: std.Random) void {
+    assert(harness.server.listeners.len >= 1);
+    assert(harness.server.listeners.len <= harness.listener_configs.len);
+    if (harness.clean) return;
+    if (random.uintLessThan(u8, 4) == 0) {
+        const faults = 1 + random.uintAtMost(u8, 1);
+        for (0..faults) |_| harness.io.injectSetOptionError();
+    }
+    // An accept that fails backs the listener off by
+    // `accept_retry_delay_ms` and retries; the queued socket keeps its
+    // place, so no client is lost to this — it costs the scenario ten
+    // milliseconds of its two seconds.
+    if (random.uintLessThan(u8, 4) == 0) {
+        const index = random.uintLessThan(usize, harness.server.listeners.len);
+        harness.io.injectAcceptError(harness.server.listeners[index].listener);
     }
 }
 
@@ -173,9 +310,15 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
         // sites on both dial paths were unreachable under every seed
         // until this fate existed (issue #106, kind B).
         .connect_pressure_percent = random.uintAtMost(u8, 5),
-        // A sink that has fallen behind (§8). Most seeds keep it instant;
-        // some stall it past a whole scenario, which is what fills the
-        // staging buffers and makes the drop rung reachable at all.
+        // A sink that has fallen behind (§8): the resume-a-short-write and
+        // stalled-drain paths, under schedule fuzz. Most seeds keep it
+        // instant; some stall it past a whole scenario.
+        //
+        // It does *not* reach the drop rung, whatever a stall's length: a
+        // scenario emits single-digit lines against staging buffers
+        // holding ~130, so there is nothing to overflow. The sweep's
+        // census names `access_log_dropped` as uncovered for exactly that
+        // reason, and src/access_log_test.zig drives the burst instead.
         .log_write_stall_ns = if (random.uintLessThan(u8, 4) == 0)
             random.uintAtMost(u64, 200_000_000)
         else
@@ -236,7 +379,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         .clusters = &harness.clusters,
         .connect_timeout_ms = connect_timeout_ms,
         .idle_timeout_ms = 30 + random.uintAtMost(u32, 70),
-        .drain_deadline_ms = 100,
+        .drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random),
         // A third of seeds arm the max-lifetime cap (§6). The range
         // straddles the idle timeout so the clamp sometimes reaps an
         // actively-relaying connection and sometimes never bites —
@@ -587,23 +730,87 @@ fn verifyAccessLog(harness: *Harness) !void {
     // The drain does not stop the loop until the sink is quiet (§8), so
     // the last byte written is the last byte of a line — never half of one.
     if (sink.len != 0 and sink[sink.len - 1] != '\n') return error.AccessLogTruncatedLine;
+    const tally = try tallyAccessLog(sink);
+    if (tally.total != counters.get("access_log_lines")) {
+        return error.AccessLogLineCountDiverged;
+    }
+
+    // A dropped line would make the equality below false for a reason
+    // that has nothing to do with the counter list it exists to pin, so
+    // the real condition fails first and under its own name. The rung is
+    // out of a scenario's reach (see the §9 census's `uncovered` entry),
+    // and the census proves that across the range — but only once the
+    // range finishes, which is too late to explain a single seed.
+    if (counters.get("access_log_dropped") != 0) return error.AccessLogDroppedInSweep;
+
+    // Every HTTP line is either an outcome the data path counted or an
+    // abort — an equality, and the reason this file no longer asks
+    // whether the log wrote *enough* lines. The `>=` it replaces was
+    // satisfied by writing too many, which is precisely how #129's
+    // phantom line per keep-alive connection cleared 4096 seeds.
+    //
+    // It also pins `l7OutcomeTotal`'s list: a new answered counter left
+    // out of it fails this on the first seed that reaches the rung, which
+    // is how `l7_shed_endpoint_inflight` turned out to have been missing
+    // since it shipped.
+    if (tally.http != l7OutcomeTotal(counters) + tally.http_aborted) {
+        return error.AccessLogHttpLinesDiverged;
+    }
+
+    // A clean seed answers everything it starts, so an abort is a bug
+    // rather than an adversary's work. Not quite by construction: what a
+    // clean seed removes is every *cause* of an abort — no resets, no
+    // kernel pressure, a well-behaved origin, and no drawn drain
+    // (`deriveDrainAt` skips clean seeds) — while the request and
+    // lifetime deadlines are still drawn and armed. They do not fire
+    // because a well-behaved origin answers within microseconds of
+    // virtual time, which is an argument about pacing rather than a
+    // guarantee; it held across all 1578 clean runs of the sweep.
+    //
+    // This is the half with teeth. The equality above counts a phantom
+    // abort on both sides and passes; this one refuses it outright, and
+    // is what fails on seed 10 when #129's bug is put back.
+    if (harness.clean) {
+        if (tally.http_aborted != 0) return error.AccessLogAbortedOnCleanSeed;
+        // And each L4 connection is one line: the clients connect once
+        // apiece, clean-seed pools are sized well past the population so
+        // none is shed at admission, and an L4 connection stamps its
+        // clock on admission rather than on first byte — so even the
+        // silent clients (`sim/l4.zig` draws some) owe a line, theirs
+        // reporting `bytes_in: 0`.
+        if (tally.l4 != harness.l4_count) return error.AccessLogL4LinesDiverged;
+    }
+}
+
+/// What the sink's lines are, counted by kind and outcome. Every line is
+/// shape-checked on the way past, so a malformed one fails here rather
+/// than being silently tallied.
+const LineTally = struct {
+    total: u64 = 0,
+    http: u64 = 0,
+    l4: u64 = 0,
+    http_aborted: u64 = 0,
+};
+
+fn tallyAccessLog(sink: []const u8) !LineTally {
+    var tally: LineTally = .{};
     var lines = std.mem.splitScalar(u8, sink, '\n');
-    var line_count: u64 = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue; // The tail after the final newline.
-        line_count += 1;
+        tally.total += 1;
         try verifyAccessLogLine(line);
-    }
-    if (line_count != counters.get("access_log_lines")) return error.AccessLogLineCountDiverged;
-
-    // Nothing was dropped, so every outcome the data path counted owes a
-    // line — plus one per L4 connection and per request that ended without
-    // a verdict, which is why this is an inequality.
-    if (counters.get("access_log_dropped") == 0) {
-        if (counters.get("access_log_lines") < l7OutcomeTotal(counters)) {
-            return error.AccessLogMissedAnOutcome;
+        if (std.mem.indexOf(u8, line, "\"kind\":\"http\"") == null) {
+            tally.l4 += 1;
+            continue;
+        }
+        tally.http += 1;
+        if (std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null) {
+            tally.http_aborted += 1;
         }
     }
+    assert(tally.http + tally.l4 == tally.total);
+    assert(tally.http_aborted <= tally.http);
+    return tally;
 }
 
 /// Every L7 outcome that answers a client, summed. Each one runs through
@@ -619,6 +826,7 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_filtered",
         "l7_shed_relay_buffers",
         "l7_shed_upstream_slots",
+        "l7_shed_endpoint_inflight",
         "l7_bad_gateway",
         "l7_gateway_timeout",
     };

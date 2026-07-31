@@ -526,10 +526,17 @@ pub fn Checker(comptime IoType: type) type {
                     // or a mute origin releases the prober (§5).
                     checker.pending_verdict = .fail;
                     checker.endArmedLeg();
+                } else {
+                    // The fire raced its own cancel (a legal §4 race): the
+                    // outcome is decided, this delivery is op accounting
+                    // only. Counted because "rare race" and "the cancel is
+                    // never issued" produce the same *outcomes* and differ
+                    // only in how much budget each probe burns — which is
+                    // exactly the shape of #130, where every probe idled
+                    // out its whole `timeout_ms` and every check still
+                    // reported the right verdict.
+                    checker.server.counters.increment("health_probe_deadline_raced");
                 }
-                // Otherwise the fire raced its own cancel (a legal §4
-                // race): the outcome is decided, this delivery is op
-                // accounting only.
             } else |err| {
                 assert(err == error.Canceled);
                 assert(checker.pending_verdict != .none);

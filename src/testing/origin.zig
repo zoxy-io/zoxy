@@ -88,7 +88,13 @@ pub fn Origin(comptime IoType: type) type {
                         conn.armSend();
                     },
                     .reset_on_first_chunk => {
-                        io.setLingerRst(conn.socket) catch unreachable;
+                        // As the L7 origin double: an injected set-option
+                        // fault (§9) is a process-wide one-shot and can be
+                        // claimed here instead of by the server. A
+                        // graceful close in place of the RST is a shape
+                        // this origin already produces, so the byte-level
+                        // oracles are unaffected.
+                        io.setLingerRst(conn.socket) catch {};
                         io.closeNow(conn.socket);
                         conn.done = true;
                     },

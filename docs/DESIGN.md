@@ -863,7 +863,13 @@ origin, not one this proxy can pick for them.
   duration, byte counts each way, and the cluster and endpoint that
   served. `outcome` is not derivable from `status` and that is the point:
   an origin's own `503` and this proxy's shed `503` are the same three
-  digits and opposite events.
+  digits and opposite events. The two answer different questions — what
+  the origin said, and whether the client got it — so `status` is
+  recorded as soon as the response head is rendered (which the head
+  buffer can defer past the parse), while `ok` means "the whole response
+  reached the client" and is earned only when the last byte does. An exchange cut off mid-response logs its origin's status
+  with outcome `aborted`; exactly one `ok` line per `zoxy_l7_responses`
+  is what the §9 oracle asserts.
   **The unit is an admitted connection**, which is what draws the line
   between the two kinds of shed in the table above. A request-level shed
   — a `503` for relay buffers or upstream slots — belongs to a connection
@@ -966,6 +972,29 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
    completion is delivered to a freed or reused slot (slot generations
    checked on every delivery, §5). A failure prints its seed; the same
    seed replays the exact schedule.
+   The access log is checked as an *equality*, not a sufficiency: every
+   HTTP line is either an outcome the data path counted or an abort, and
+   on a clean seed there are no aborts at all. An inequality — "at least
+   as many lines as outcomes" — is satisfied by writing too many, which
+   is how a phantom line per keep-alive connection once cleared 4096
+   seeds.
+   Those invariants gate each seed's *shape*; a **coverage census** gates
+   the sweep's *reach*. Every counter is totalled across the range, and a
+   sweep of at least 1024 seeds fails unless each one fired at least once
+   — a rung no scenario reaches is a finding, not silence, and the gate
+   cannot claim a path it never walked. Counters the simulator provably
+   cannot move (an admin listener it does not configure, a fault it does
+   not inject, a volume it cannot reach) are exempted by name in a table
+   that says what covers them instead, and the census fails just as loudly
+   when an exemption *does* fire — so widening a scenario deletes its
+   entry rather than leaving a stale excuse behind. That second half also
+   carries the invariants that are *supposed* to read zero: a counter
+   whose whole point is to stay at zero is exempted with a reason saying
+   so, and the gate then fails the moment it moves.
+   `SimIo` counts deliveries per op kind for the same reason, so the
+   census covers the §4 seam as well as the §8 ladder — an op no seed ever
+   carries is a slice of the seam the gate has never run, and no counter's
+   silence would name it.
    `zig build sim -- fuzz` runs forever on entropy-derived seeds.
 2. **Fuzzing — `zig build test --fuzz`.** `std.testing.fuzz` on every
    parser edge: HTTP/1.1 head parser, chunked decoder, config parser.

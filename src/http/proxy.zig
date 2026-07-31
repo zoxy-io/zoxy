@@ -1112,11 +1112,11 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.response_leg = .sending_head;
             // Committed to answering: no verdict may intervene from here (§7).
             conn.l7.response_started = true;
-            // The origin's own status, and `ok` whatever it is: `outcome`
-            // exists precisely so an origin's 503 and this proxy's shed
-            // 503 do not read as the same event (§8).
+            // What the origin said, so a line can report it even if the
+            // exchange never finishes. Whether the client *got* it is a
+            // separate fact, and `outcome` stays `aborted` until
+            // `finishExchange` earns `ok` (§8).
             conn.log.status = response.status;
-            conn.log.outcome = .ok;
             armClientWrite(server, conn, conn.head[0..head_write_len], .response_excess);
         }
 
@@ -1343,7 +1343,11 @@ pub fn Proxy(comptime IoType: type) type {
             server.counters.increment("l7_responses");
             // The whole response reached the client: the line goes out
             // now, before the turnaround below clears what it reports.
-            assert(conn.log.outcome == .ok);
+            // This is also the only place `ok` is earned — nothing between
+            // the response head being queued and this point may claim it,
+            // which is what keeps one `ok` line per `l7_responses`.
+            assert(conn.log.outcome == .aborted);
+            conn.log.outcome = .ok;
             server.logExchange(conn);
 
             const request_complete = conn.l7.request_leg == .done;
