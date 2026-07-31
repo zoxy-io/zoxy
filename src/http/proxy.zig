@@ -467,7 +467,7 @@ pub fn Proxy(comptime IoType: type) type {
             // the §7 free replay (`upstreamFailed`).
             const pick = server.balancer.pick(
                 conn.cluster_index,
-                &server.upstreams.leased_counts,
+                &server.endpointLoad(),
                 &server.health.healthy,
                 &conn.client_address,
             );
@@ -1570,7 +1570,7 @@ pub fn Proxy(comptime IoType: type) type {
             // the endpoint's whole idle list may be stale the same way.
             const pick = server.balancer.pick(
                 conn.cluster_index,
-                &server.upstreams.leased_counts,
+                &server.endpointLoad(),
                 &server.health.healthy,
                 &conn.client_address,
             );

@@ -278,6 +278,19 @@ pub fn Conn(comptime IoType: type) type {
         /// teardown alongside the conn slot (§5). Null outside exchanges
         /// and on the whole L4 path.
         upstream: ?*UpstreamType,
+        /// The endpoint this L4 connection is charged against in the
+        /// server's per-endpoint in-flight table (§7), or `endpoint_none`
+        /// when it is charged against none — every L7 connection, and
+        /// every L4 one shed before it dialed. Separate from
+        /// `log.endpoint_index`, which the access log still needs after
+        /// the charge is released; this one is the release's own
+        /// bookkeeping, and clearing it is what makes the release
+        /// exactly-once.
+        charged_endpoint: u16,
+        /// The cluster half of that key. `cluster_index` cannot serve:
+        /// the L7 path overwrites it per request at routing, so a key
+        /// built from it at teardown need not be the key charged.
+        charged_cluster: u16,
         /// L7 exchange bookkeeping (§7); reset per exchange.
         l7: L7State,
         /// What this connection speaks (§6, §7). Read only by the access
@@ -531,6 +544,8 @@ pub fn Conn(comptime IoType: type) type {
             conn.routes = &.{};
             conn.filters = &.{};
             conn.upstream = null;
+            conn.charged_endpoint = LogState.endpoint_none;
+            conn.charged_cluster = 0;
             conn.l7 = .{};
             conn.protocol = protocol;
             conn.client_address = client_address;

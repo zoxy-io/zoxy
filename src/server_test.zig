@@ -16,6 +16,7 @@ const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
 const origin_mod = @import("testing/origin.zig");
+const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
 
@@ -35,6 +36,15 @@ pub const Scenario = struct {
     /// test); the shared Origin fires on_accept on every accept, so the
     /// hook makes this one-shot.
     pending_racer: ?*Client = null,
+    /// The §7 L4 charge against endpoint 0 sampled the moment the origin
+    /// accepted, so a test can prove the count *rises* — "it drained to
+    /// zero" is satisfied just as well by never counting at all.
+    l4_sample: u16 = 0,
+
+    fn sampleL4Charge(context: ?*anyopaque) void {
+        const scenario: *Scenario = @ptrCast(@alignCast(context.?));
+        scenario.l4_sample = scenario.server.l4_inflight[upstream_module.endpointKey(0, 0)];
+    }
 
     fn clientEnded(scenario: *Scenario) void {
         scenario.ended_count += 1;
@@ -958,5 +968,51 @@ test "health: rise restores an ejected endpoint after passing probes" {
     try std.testing.expectEqual(@as(u64, 3), bed.server.counters.get("kernel_pressure_connect"));
     try std.testing.expect(bed.server.health.healthy[0]);
     try std.testing.expectEqual(@as(u32, 0), bed.server.health.unhealthy_count);
+    try bed.expectDrained();
+}
+
+test "relay: an L4 connection charges its endpoint, and gives it back" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 12 } });
+    defer bed.tearDown();
+
+    // Sampled inside the origin's accept, which can only happen while the
+    // dial that charged the endpoint is still live: the count must be up
+    // by then. Without this the drain check below passes on a charge that
+    // never happened.
+    bed.scenario.origin.on_accept = Scenario.sampleL4Charge;
+    bed.scenario.origin.context = &bed.scenario;
+
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u16, 1), bed.scenario.l4_sample);
+    try std.testing.expectEqual(Client.Outcome.eof, bed.scenario.clients[0].outcome);
+    // And back to zero afterwards — `expectDrained` asks the server, whose
+    // idle check now covers the charge table for every scenario in this
+    // file and every sim seed (§9).
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        bed.server.l4_inflight[upstream_module.endpointKey(0, 0)],
+    );
+    try bed.expectDrained();
+}
+
+test "relay: a refused dial releases the endpoint charge it took" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 13 },
+        // Nothing listens: the dial is charged at `armConnect` and then
+        // refused, so the release rides a teardown that never relayed a
+        // byte — the path where an unbalanced charge would hide.
+        .origin_listens = false,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expect(bed.server.l4Released());
     try bed.expectDrained();
 }

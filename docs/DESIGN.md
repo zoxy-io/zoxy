@@ -654,7 +654,9 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   replay is spent before its try begins (no loop) and always dials
   fresh — the endpoint's whole idle list may be stale the same way. The
   endpoint pick is per-cluster config: `p2c` (two uniform candidates
-  from a fixed-seed PRNG, the lower leased count wins) by default, `rr`
+  from a fixed-seed PRNG, the lower **in-flight total** wins — L7 leases
+  and live L4 connections summed, since both are work the origin is
+  carrying) by default, `rr`
   for strict rotation, `hash` for stickiness. Cluster endpoints are
   static socket addresses resolved once at config load, never on the
   loop (dynamic DNS is a non-goal, §1).
