@@ -1,4 +1,4 @@
-//! The admin/metrics listener (DESIGN.md §8, PLANS.md §243): one dedicated
+//! The admin/metrics listener (DESIGN.md §8): one dedicated
 //! listener, off the three shared pools, that answers any request on the
 //! admin port with the Prometheus rendering of the counters
 //! (`counters.zig`). Exactly one scrape at a time — the "reserved slot" —

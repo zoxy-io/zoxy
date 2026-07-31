@@ -647,8 +647,8 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u
 /// What one band measures. `keep_alive` and `close` differ only in
 /// persistence and rate; `large_body` swaps the tiny origin reply for a
 /// bulk one, so the bands show per-*byte* cost rather than per-request cost
-/// — the number the record layer's price (and so the Phase-3b kTLS
-/// decision) has to be judged against (PLANS.md).
+/// — the number the record layer's price (and so a future kTLS decision)
+/// has to be judged against.
 const Scenario = enum {
     keep_alive,
     close,

@@ -42,7 +42,8 @@
 //!           (`result_errno`). Two known peer-gone errnos still land
 //!           there — ENETUNREACH on connect, ETIMEDOUT on the data ops —
 //!           because the fork leaves them unnamed; naming them is queued
-//!           in docs/PLANS.md (libxev fork queue).
+//!           in docs/IMPLEMENTATION_NOTES.md ("Open questions" — libxev
+//!           fork queue).
 
 const std = @import("std");
 const xev = @import("xev");
@@ -674,8 +675,9 @@ test "xevio: a recv against a linger-RST close is Reset, with the errno pinned" 
     // io_uring only: the arm under test is the io_uring adapter's. The
     // kqueue backend's data-op maps name only CANCELED, so on the macOS
     // dev box the RST arrives as error.Unexpected — the same
-    // peer-gone-as-pressure gap the fork queue tracks (PLANS.md), which
-    // this test would otherwise report as its own failure.
+    // peer-gone-as-pressure gap the fork queue tracks
+    // (docs/IMPLEMENTATION_NOTES.md, "Open questions"), which this test
+    // would otherwise report as its own failure.
     if (comptime xev.backend != .io_uring) return error.SkipZigTest;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

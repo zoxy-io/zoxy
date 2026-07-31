@@ -82,7 +82,7 @@ pub fn Server(comptime IoType: type) type {
         /// timer.
         upstream_sweep_completion: IoType.Completion,
         upstream_sweep_armed: bool,
-        /// The dedicated admin/metrics listener (§8, PLANS.md §243): one
+        /// The dedicated admin/metrics listener (§8): one
         /// reserved scrape slot off the shared pools, budgeted separately
         /// (`constants.admin_*`). Off unless a bind is set before `start`.
         admin: admin_module.Admin(IoType),
@@ -440,7 +440,7 @@ pub fn Server(comptime IoType: type) type {
         /// admission for a fresh connection, and by any phase that runs
         /// *ahead* of the protocol and hands a live connection over when it
         /// finishes. TLS termination is the phase that will need it
-        /// (§4, PLANS.md): it is orthogonal to l4/http, so the protocol
+        /// (§4): it is orthogonal to l4/http, so the protocol
         /// fork happens after the handshake rather than at accept.
         ///
         /// It takes the protocol as an argument rather than reading it off
