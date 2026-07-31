@@ -42,6 +42,13 @@ pub const Config = struct {
     /// otherwise. `0` disables it, so it is optional in the JSON and
     /// defaults off. L4 connections never set it.
     request_timeout_ms: u32,
+    /// Pause between §7 health-probe sweeps over every `check` cluster's
+    /// endpoints. Probing itself is enabled per cluster (`Cluster.check`);
+    /// this only paces it, so it is optional in the JSON and defaults to
+    /// HAProxy's `inter` (`constants.health_interval_ms_default`). Zero is
+    /// rejected — a pause of nothing would probe in a tight loop. Each
+    /// probe dials under `connect_timeout_ms`, its own budget.
+    health_interval_ms: u32 = constants.health_interval_ms_default,
     /// Effective pool sizes (§5, §8). The comptime constants stay the
     /// hard, budget-asserted ceilings; config may only shrink below them
     /// — for capacity planning, and so the overload benchmark can hit
@@ -120,6 +127,14 @@ pub const Config = struct {
         /// (predictable spread, cache warming, pure-L4 clusters whose
         /// load p2c cannot see).
         pick: Pick = .p2c,
+        /// §7 active TCP health checks for every endpoint in this
+        /// cluster: the server's prober dials each endpoint every
+        /// `health_interval_ms`, and the balancer skips endpoints that
+        /// failed `constants.health_probe_fall` consecutive probes until
+        /// `constants.health_probe_rise` successes restore them. The
+        /// JSON field is optional and defaults off — probing is opt-in
+        /// per cluster.
+        check: bool = false,
 
         pub const Pick = enum(u1) {
             rr,
@@ -215,6 +230,7 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
         .request_timeout_ms = parsed.timeouts.request_ms,
+        .health_interval_ms = parsed.timeouts.health_interval_ms,
         .limits = limits,
         .admin_bind = admin_bind,
         .access_log_sink = access_log_sink,
@@ -593,6 +609,9 @@ pub const ClusterJson = struct {
     /// Optional §7 pick policy; absent means `p2c` (the design's
     /// trajectory), `rr` opts back into strict rotation.
     pick: []const u8 = "p2c",
+    /// Optional §7 active TCP health checks; absent means off, so a
+    /// config that never heard of probing keeps its exact behavior.
+    check: bool = false,
 
     pub const schema_doc = "One upstream cluster: its endpoints and pick policy.";
     pub const schema_fields = .{
@@ -604,6 +623,9 @@ pub const ClusterJson = struct {
         .pick = .{
             .desc = "Endpoint-pick policy: p2c (power-of-two-choices) or rr (strict round-robin).",
             .enum_type = Config.Cluster.Pick,
+        },
+        .check = .{
+            .desc = "Active TCP health checks for every endpoint in this cluster (default off).",
         },
     };
 };
@@ -619,6 +641,10 @@ pub const TimeoutsJson = struct {
     /// because a request deadline is a policy an operator sets against
     /// their own origin's latency, not a value zoxy can pick for them.
     request_ms: u32 = 0,
+    /// Optional §7 health-probe pacing; absent means HAProxy's `inter`
+    /// default. Unlike the two caps above, zero is rejected: probing is
+    /// switched per cluster (`check`), never by zeroing its interval.
+    health_interval_ms: u32 = constants.health_interval_ms_default,
 
     pub const schema_doc = "Connection lifecycle deadlines, in milliseconds.";
     pub const schema_fields = .{
@@ -645,6 +671,11 @@ pub const TimeoutsJson = struct {
         .request_ms = .{
             .desc = "Cap on one L7 exchange, not refreshed by activity; 0 disables it.",
             .minimum = 0,
+            .maximum = constants.timeout_ms_max,
+        },
+        .health_interval_ms = .{
+            .desc = "Pause between health-probe sweeps over checked clusters.",
+            .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
     };
@@ -806,6 +837,7 @@ fn resolveClusters(
             .name = entry.name,
             .endpoints = try resolveEndpoints(arena, entry.cluster.endpoints),
             .pick = try pickOf(entry.cluster.pick),
+            .check = entry.cluster.check,
         };
     }
     assert(clusters.len == count);
@@ -1281,7 +1313,13 @@ fn clusterIndexOf(
 fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
     // The three lifecycle timeouts are correctness bounds — a 0 ms connect,
     // idle, or drain deadline would reap instantly, so zero is a mistake.
-    const required = [_]u32{ timeouts.connect_ms, timeouts.idle_ms, timeouts.drain_deadline_ms };
+    // The health-probe interval rides the same rule from the other side:
+    // zero would probe in a tight loop (§7) — probing is switched by the
+    // cluster `check` flag, never by zeroing its pace.
+    const required = [_]u32{
+        timeouts.connect_ms,        timeouts.idle_ms,
+        timeouts.drain_deadline_ms, timeouts.health_interval_ms,
+    };
     for (required) |value| {
         if (value == 0) {
             return error.TimeoutZero;
@@ -1297,6 +1335,12 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
         if (value > constants.timeout_ms_max) {
             return error.TimeoutOverLimit;
         }
+    }
+    // Postconditions: reaching here means every required bound is in
+    // range — what every consumer of these values relies on.
+    for (required) |value| {
+        assert(value >= 1);
+        assert(value <= constants.timeout_ms_max);
     }
 }
 
@@ -1317,10 +1361,13 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
     try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].getPort());
+    try std.testing.expectEqual(true, parsed.clusters[0].check);
     try std.testing.expectEqual(@as(u32, 5000), parsed.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 60000), parsed.idle_timeout_ms);
     try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
     try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
+    // The example omits the probe interval: the HAProxy-inter default.
+    try std.testing.expectEqual(constants.health_interval_ms_default, parsed.health_interval_ms);
 }
 
 test "config: max_lifetime_ms is optional and defaults to disabled" {
@@ -1663,6 +1710,69 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"pc2"}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: cluster check flag parses, defaults off, rejects non-bool" {
+    // Explicit true and false both resolve; absent defaults off (§7:
+    // probing is opt-in per cluster).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"check":true},
+            \\   "b":{"endpoints":["127.0.0.1:3"],"check":false},
+            \\   "c":{"endpoints":["127.0.0.1:4"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(true, parsed.clusters[0].check);
+        try std.testing.expectEqual(false, parsed.clusters[1].check);
+        try std.testing.expectEqual(false, parsed.clusters[2].check);
+    }
+    // The flag is a bool, not a truthy string — strict JSON stage 1.
+    try expectParseError(error.UnexpectedToken,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"check":"on"}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: health interval parses, defaults to inter, rejects zero" {
+    // Explicit value resolves; absent means the HAProxy-inter default.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,
+            \\   "health_interval_ms":250}}
+        );
+        try std.testing.expectEqual(@as(u32, 250), parsed.health_interval_ms);
+    }
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(),
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(constants.health_interval_ms_default, parsed.health_interval_ms);
+    }
+    // Zero would probe in a tight loop; the cluster flag is the switch.
+    try expectParseError(error.TimeoutZero,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,
+        \\   "health_interval_ms":0}}
+    );
+    try expectParseError(error.TimeoutOverLimit,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,
+        \\   "health_interval_ms":3600001}}
     );
 }
 
