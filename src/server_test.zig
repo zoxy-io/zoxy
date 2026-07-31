@@ -221,6 +221,9 @@ pub const TestBed = struct {
         /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
         check: ?config_module.Config.Cluster.Check = null,
+        /// §8 per-endpoint concurrency cap; null leaves the cluster
+        /// uncapped, which is what every pre-existing scenario wants.
+        max_inflight: ?u32 = null,
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 20,
@@ -241,7 +244,7 @@ pub const TestBed = struct {
 
         try bed.sim_io.init(arena, options.sim);
         bed.endpoints = .{originAddress()};
-        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .l4 }};
         bed.config = .{
@@ -1014,5 +1017,34 @@ test "relay: a refused dial releases the endpoint charge it took" {
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
     try std.testing.expect(bed.server.l4Released());
+    try bed.expectDrained();
+}
+
+test "relay: an L4 connection past the endpoint cap is closed, not dialed" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 21 },
+        // One in flight per endpoint against this bed's single endpoint.
+        .max_inflight = 1,
+        // Silent clients hold their charge until the idle deadline, so
+        // the second one certainly meets a full endpoint rather than
+        // racing the first one's completion.
+        .idle_timeout_ms = 60,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(2, false);
+    try bed.sim_io.run();
+
+    // Exactly one was refused, and the origin only ever saw the other:
+    // an L4 listener cannot say "try later", so the ladder's L4 answer
+    // is a close (§8).
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_shed_endpoint_inflight"));
+    try std.testing.expectEqual(@as(u8, 1), bed.scenario.origin.conns_count);
+    // Both were admitted and both completed: the refusal happens after
+    // admission, so it must not disturb the gate identity (§8, §9).
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("completed"));
+    try std.testing.expect(bed.server.reconcile());
     try bed.expectDrained();
 }

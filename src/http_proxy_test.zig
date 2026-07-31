@@ -515,6 +515,9 @@ const Http1Bed = struct {
         /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
         check: ?config_module.Config.Cluster.Check = null,
+        /// §8 per-endpoint concurrency cap; null leaves the cluster
+        /// uncapped, which is what every pre-existing scenario wants.
+        max_inflight: ?u32 = null,
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 40,
@@ -531,7 +534,7 @@ const Http1Bed = struct {
         }
         try bed.sim_io.init(arena, .{ .seed = options.seed, .adversary = adversary });
         bed.endpoints = .{originAddress()};
-        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{
             .bind_address = bindAddress(),
@@ -3017,4 +3020,37 @@ test "health: an http probe fails when the origin never answers" {
     try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
     try bed.expectDrained();
+}
+
+test "l7: a request past the endpoint cap is answered 503, not sent" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 71,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        // One in flight per endpoint, and this bed has exactly one
+        // endpoint: the second concurrent request has nowhere under
+        // capacity to go.
+        .max_inflight = 1,
+        // The origin reads the first request and never answers, so that
+        // request stays in flight while the second arrives.
+        .origin_mute = true,
+        .request_timeout_ms = 400,
+    });
+    defer bed.tearDown();
+
+    bed.client.request = "GET /one HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    bed.client2.request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    bed.client2.send_delay_ms = 40;
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.sim_io.run();
+
+    // The second client is refused to protect the origin — and the
+    // origin must never have seen it: exactly one connection accepted.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_shed_endpoint_inflight"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    try std.testing.expect(std.mem.startsWith(u8, bed.client2.response(), "HTTP/1.1 503"));
+    // The pool never ran out — that is a different rung with a different
+    // fix, and confusing the two is what the separate counter prevents.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_upstream_slots"));
 }

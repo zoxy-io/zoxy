@@ -460,7 +460,23 @@ pub fn Proxy(comptime IoType: type) type {
             conn.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, conn, 503, "l7_shed_relay_buffers");
             };
+            beginUpstream(server, conn, request, &keys.views);
+        }
 
+        /// Route resolved and a relay buffer held: choose an endpoint and
+        /// get onto it, by reuse when the pool has one parked and by a
+        /// fresh dial otherwise. Split from `routeRequest` because the
+        /// two halves answer different questions — *where does this
+        /// request go* and *how does it get there* — and the first was
+        /// already at the length limit.
+        fn beginUpstream(
+            server: *ServerType,
+            conn: *ConnType,
+            request: *const parser.RequestHead,
+            views: *const TargetViews,
+        ) void {
+            assert(conn.state == .l7_reading_head);
+            assert(conn.relay_buffer != null);
             // The §3 reuse win: a parked connection to the picked endpoint
             // beats a fresh dial. A close that slipped through while it
             // was parked surfaces as a failure on first use — absorbed by
@@ -470,7 +486,14 @@ pub fn Proxy(comptime IoType: type) type {
                 &server.endpointLoad(),
                 &server.health.healthy,
                 &conn.client_address,
-            );
+            ) orelse {
+                // Every endpoint of this cluster is at its §8 cap. The
+                // reuse path is capped too, deliberately: checking out a
+                // parked connection starts a request the origin has to
+                // serve, which is the thing being bounded — the saved
+                // handshake does not make it free.
+                return respond(server, conn, 503, "l7_shed_endpoint_inflight");
+            };
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
@@ -488,7 +511,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // the hot one — skips the re-parse the dial path needs,
                 // and hands over the canonical target it already built
                 // rather than having it decoded and collapsed again.
-                renderRequestAndStartLegs(server, conn, request, &keys.views);
+                renderRequestAndStartLegs(server, conn, request, views);
                 return;
             }
             dialUpstream(server, conn, pick);
@@ -1573,7 +1596,12 @@ pub fn Proxy(comptime IoType: type) type {
                 &server.endpointLoad(),
                 &server.health.healthy,
                 &conn.client_address,
-            );
+            ) orelse {
+                // The replay is a fresh try against the same cluster, so
+                // it meets the same cap. Its budget is already spent, so
+                // this answers rather than replaying again (§7).
+                return respond(server, conn, 503, "l7_shed_endpoint_inflight");
+            };
             dialUpstream(server, conn, pick);
         }
 
@@ -1767,6 +1795,11 @@ pub fn Proxy(comptime IoType: type) type {
             }
             if (std.mem.eql(u8, counter, "l7_shed_relay_buffers")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_upstream_slots")) return .shed;
+            // A capped endpoint is a shed like any other from the
+            // client's side: the request was refused to protect the
+            // origin, and the line should read the same as the rungs
+            // that refuse to protect this proxy (§8).
+            if (std.mem.eql(u8, counter, "l7_shed_endpoint_inflight")) return .shed;
             if (std.mem.eql(u8, counter, "l7_bad_gateway")) return .upstream_failed;
             if (std.mem.eql(u8, counter, "l7_gateway_timeout")) return .timed_out;
             @compileError("static-response counter with no access-log outcome: " ++ counter);

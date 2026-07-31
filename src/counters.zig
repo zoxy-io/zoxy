@@ -70,6 +70,12 @@ pub const Counters = struct {
     /// and the ratio to `accepted` is the churn signal.
     l7_shed_relay_buffers: Value = Value.init(0),
     l7_shed_upstream_slots: Value = Value.init(0),
+    /// §8 requests answered 503 because every endpoint of their cluster
+    /// was already carrying its configured `max_inflight`. Distinct from
+    /// `l7_shed_upstream_slots` on purpose: that one says this proxy ran
+    /// out of slots, this one says the origins were protected — opposite
+    /// diagnoses, and an operator widening the wrong limit fixes neither.
+    l7_shed_endpoint_inflight: Value = Value.init(0),
     /// Upstream leg failed before any response byte reached the client:
     /// answered 502 (§7, §8). A spent-replay second failure lands here
     /// too — the one free §7 replay never loops.
@@ -185,6 +191,14 @@ pub const Counters = struct {
     /// things at once: some already-accepted lines never reached the sink,
     /// and every line since has been counted as dropped.
     access_log_write_failed: Value = Value.init(0),
+    /// §8 L4 connections closed because every endpoint of their cluster
+    /// was already carrying its configured `max_inflight`. An L4 listener
+    /// has no way to say "try later", so the ladder's L4 answer applies:
+    /// close. Deliberately **not** `shed_`-prefixed — the connection was
+    /// admitted before an endpoint could be picked, so it counts in the
+    /// flow identity as an ordinary completion, and folding it into the
+    /// admission-gate sum would make that identity false.
+    l4_shed_endpoint_inflight: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).

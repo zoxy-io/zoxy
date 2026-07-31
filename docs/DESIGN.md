@@ -747,16 +747,25 @@ the loop thread.
 | relay buffers (L4) | accept admission | close immediately |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) |
+| **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
-Every rung but one sheds on a *resource* running out. That is a real gap
-and it was measured, not theorised: at c10k the upstream pool's ceiling
-was the only thing saying no, and once it was given enough headroom to
-stop firing (§5), nothing bounded an overloaded exchange at all —
-latency grew until the *client* gave up, and this proxy went on spending
-CPU answering requests whose callers had left. The numbers are in
-IMPLEMENTATION_NOTES.md.
+Most rungs shed on a *resource of this proxy's* running out. That was
+once every rung, and it was a real gap — measured, not theorised: at
+c10k the upstream pool's ceiling was the only thing saying no, and once
+it was given enough headroom to stop firing (§5), nothing bounded an
+overloaded exchange at all — latency grew until the *client* gave up,
+and this proxy went on spending CPU answering requests whose callers had
+left. The numbers are in IMPLEMENTATION_NOTES.md.
+
+Two rungs answer on something else. One is **time** (below). The other
+is the **origin's** capacity rather than this proxy's: `max_inflight`
+caps the work one endpoint may carry, counted across both protocols
+(§7), and refuses past it. The distinction is the point — running out of
+upstream slots says *widen the pool*, while a capped endpoint says *the
+backend is full*, and the two have their own counters so an operator
+cannot read one as the other.
 
 The rung that answers on **time** rather than on exhaustion is the
 request deadline, and `timeouts.request_ms` is what arms it: an absolute

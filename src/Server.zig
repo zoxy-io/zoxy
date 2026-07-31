@@ -659,13 +659,27 @@ pub fn Server(comptime IoType: type) type {
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
-            conn.arm(&conn.op_connect, "connect");
             const pick = server.balancer.pick(
                 cluster_index,
                 &server.endpointLoad(),
                 &server.health.healthy,
                 &conn.client_address,
-            );
+            ) orelse {
+                // Every endpoint is at its §8 cap. An L4 listener has no
+                // way to say so — it relays bytes, and there is no
+                // protocol to answer in — so the ladder's L4 answer
+                // applies: close. Counted outside the gate identity,
+                // because this connection was admitted before an endpoint
+                // was ever picked (§8).
+                server.counters.increment("l4_shed_endpoint_inflight");
+                // Nothing was armed for this dial yet — the arm below is
+                // the first — so teardown here cancels only the deadline
+                // admission left running (§5).
+                assert(!conn.armed.connect);
+                server.beginTeardown(conn);
+                return;
+            };
+            conn.arm(&conn.op_connect, "connect");
             // An L4 dial holds no slot to record the endpoint on, so the
             // access log takes it here — the only place that knows which
             // origin this connection is being relayed to (§8).

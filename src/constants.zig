@@ -235,6 +235,15 @@ pub const clusters_min: u16 = 1;
 /// Upper bound on endpoints in one cluster.
 pub const endpoints_per_cluster_max: u16 = 64;
 
+/// The largest in-flight total one endpoint can ever carry (§7), and so
+/// the ceiling a configured `max_inflight` is validated against: one L7
+/// lease per upstream slot plus one L4 charge per conn slot, since a
+/// connection of either kind holds exactly one of those. A cap at or
+/// above this can never refuse anything, so the loader rejects it rather
+/// than letting a typo'd figure read as "unlimited" — which is what
+/// omitting the field already says, unambiguously.
+pub const endpoint_inflight_max: u32 = conn_slots_max + upstream_slots_max;
+
 /// Worst-case simultaneously armed ring ops for the §7 health prober:
 /// three. One probe is in flight at a time — {connect, probe deadline}
 /// co-armed while dialing — and settling a verdict or draining adds one
@@ -585,6 +594,14 @@ comptime {
     assert(clusters_min >= 1);
     assert(clusters_max >= clusters_min);
     assert(endpoints_per_cluster_max >= 1);
+    // The §8 cap ceiling is the largest load one endpoint can carry: one
+    // L7 lease per upstream slot plus one L4 charge per conn slot, since
+    // a connection of either kind holds exactly one. Asserted rather than
+    // merely written that way, so a change to either pool ceiling cannot
+    // silently leave a cap validated against a total nothing can reach.
+    assert(endpoint_inflight_max == conn_slots_max + upstream_slots_max);
+    assert(endpoint_inflight_max >= conn_slots_max);
+    assert(endpoint_inflight_max >= upstream_slots_max);
     assert(routes_max >= 1);
     assert(filters_per_listener_max >= 1);
     assert(actions_per_filter_max >= 1);
