@@ -276,9 +276,30 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
         .fall = 1 + random.uintAtMost(u8, 3),
         .rise = 1 + random.uintAtMost(u8, 2),
     };
+    // Half the checked http clusters probe with a real request instead of
+    // a dial, so the send and recv legs — and the shutdown that ends one
+    // when a deadline or a drain lands mid-leg — take the schedule fuzz.
+    // A quarter of those expect a status the origin never sends, which is
+    // the only way to reach the wrong-status ejection: every other
+    // failure here is a transport failure, and a check that could not
+    // tell those apart would be the whole point missed.
+    var http_check = tcp_check;
+    http_check.kind = .http;
+    http_check.http = .{
+        .path = "/health",
+        .expect_status = if (random.uintLessThan(u8, 4) == 0) 599 else 200,
+    };
+    const checked_http = outage or random.boolean();
     const draw: HealthDraw = .{
+        // The L4 origin echoes bytes rather than speaking HTTP, so only
+        // the dial check is meaningful against it.
         .check_l4 = if (!outage and random.boolean()) tcp_check else null,
-        .check_http = if (outage or random.boolean()) tcp_check else null,
+        .check_http = if (!checked_http)
+            null
+        else if (!outage and random.boolean())
+            http_check
+        else
+            tcp_check,
         .interval_ms = if (outage)
             5 + random.uintAtMost(u32, 10)
         else
