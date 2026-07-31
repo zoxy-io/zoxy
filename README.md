@@ -130,7 +130,7 @@ is chosen. Up to 16 clusters, 64 endpoints each.
 
 | `pick` | behavior |
 |---|---|
-| `p2c` *(default)* | two uniform candidates; the one with fewer requests in flight wins |
+| `p2c` *(default)* | two uniform candidates; the one carrying less in-flight work wins — HTTP requests and L4 connections both count |
 | `rr` | strict rotation — predictable spread, useful for cache warming |
 | `hash` | the same client always reaches the same endpoint |
 
@@ -184,6 +184,35 @@ budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
 
 If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
 all — routing nowhere would turn a probe verdict into an outage of its own.
+
+### Protecting a backend from overload
+
+`max_inflight` caps the concurrent work zoxy will ask of **one endpoint**.
+It is the per-server unit, so a three-endpoint cluster with a cap of 100
+admits up to 300 — the same shape as HAProxy's `server ... maxconn`.
+
+```json
+"api": {
+    "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080"],
+    "max_inflight": 100
+}
+```
+
+An endpoint at its cap is skipped, so requests keep flowing while any
+endpoint has room. Only when *every* endpoint is full does zoxy refuse: an
+HTTP request is answered `503` and an L4 connection is closed, since a byte
+relay has no way to say "try later". Absent, a cluster is uncapped.
+
+This is the one limit that fails **closed**, and the difference from health
+checks is deliberate: an ejected cluster means *we do not know whether these
+work*, so trying is better than refusing — while a capped one means *we know
+they are full*, and sending more is precisely what the cap exists to prevent.
+
+Both protocols count against the same figure: an in-flight HTTP request and
+a live L4 connection are each one unit of work the backend is carrying.
+`zoxy_l7_shed_endpoint_inflight` and `zoxy_l4_shed_endpoint_inflight` count
+refusals — kept apart from `zoxy_l7_shed_upstream_slots`, which means zoxy
+ran out of its own slots and wants a wider pool rather than a busier backend.
 
 ### Filters
 
