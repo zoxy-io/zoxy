@@ -1,24 +1,35 @@
-//! Active TCP health checks (DESIGN.md §7, HAProxy's `check` model): one
-//! prober per server sweeps every endpoint of every `check` cluster,
-//! dialing each in turn under the `connect_ms` budget — a SYN/ACK is a
-//! pass, anything else (refused, unreachable, timed out, kernel
-//! pressure) is a fail. `health_probe_fall` consecutive fails eject an
-//! endpoint from balancing and close its parked pooled connections (the
-//! §5 obligation: a parked socket to a dead origin is a stale replay
-//! waiting to be spent); `health_probe_rise` consecutive passes restore
-//! it. Endpoints start healthy — probing demotes, never gates startup —
-//! and an unchecked endpoint is permanently healthy, so the balancer
-//! applies the mask unconditionally (§7 fail-open lives there, not
-//! here).
+//! Active health checks (DESIGN.md §7, HAProxy's `check` model): one
+//! prober per server sweeps every endpoint of every checked cluster,
+//! probing each in turn under the check's own `timeout_ms`. What a probe
+//! proves is the cluster's choice: a `tcp` check dials and takes the
+//! SYN/ACK as its answer, while an `http` check goes on to send a
+//! request and require the configured status — the difference between
+//! knowing the port accepts and knowing the application answered.
+//! Anything else (refused, unreachable, timed out, a wrong status, a
+//! head that will not parse, kernel pressure) is a fail. `fall`
+//! consecutive fails eject an endpoint from balancing and close its
+//! parked pooled connections (the §5 obligation: a parked socket to a
+//! dead origin is a stale replay waiting to be spent); `rise`
+//! consecutive passes restore it. Endpoints start healthy — probing
+//! demotes, never gates startup — and an unchecked endpoint is
+//! permanently healthy, so the balancer applies the mask unconditionally
+//! (§7 fail-open lives there, not here).
 //!
-//! One probe is in flight at a time, which is what keeps the prober's
-//! reservation closed-form (`health_probe_ops_max` ring ops, one fd,
-//! §8): sweeps serialize endpoint-by-endpoint, and the interval paces
-//! sweep-end to sweep-start. Cancels are serialized too — one cancel op,
-//! spent on whichever armed op must die next — so the armed set never
-//! exceeds the budget. The probe socket is closed synchronously in the
-//! connect delivery itself and never stored: the probe wanted the
-//! verdict, not a connection.
+//! One probe is in flight at a time, and its legs run in sequence — dial,
+//! then send, then recv — which is what keeps the prober's reservation
+//! closed-form whichever kind is configured (`health_probe_ops_max` ring
+//! ops, one fd, §8): the peak is one leg, the deadline, and at most one
+//! cancel. Sweeps serialize endpoint-by-endpoint and the interval paces
+//! sweep-end to sweep-start.
+//!
+//! Ending a probe early depends on which leg is armed, because data ops
+//! are never canceled (§4, §5). A dial takes the one legal cancel; a
+//! send or recv is ended by shutting the socket down, which makes it
+//! complete. So a `tcp` probe's socket is closed inside the dial's own
+//! delivery and never stored — it wanted the verdict, not a connection —
+//! while an `http` probe holds its socket across the data legs and
+//! closes it once every armed op has drained, the same
+//! release-when-quiescent rule `continueTeardown` follows.
 
 const std = @import("std");
 
@@ -393,6 +404,11 @@ pub fn Checker(comptime IoType: type) type {
             }
             assert(checker.state == .probing);
             const sent = result catch |err| {
+                // Never a cancel: data ops are ended by the shutdown in
+                // `endArmedLeg`, never by one (§4, §5). A Canceled here
+                // would mean some path reached for a cancel op that this
+                // design says does not exist for a data leg.
+                assert(err != error.Canceled);
                 // The origin hung up on the request, or the deadline shut
                 // this socket down. Either way the probe has its answer.
                 if (checker.pending_verdict == .none) {
@@ -444,6 +460,7 @@ pub fn Checker(comptime IoType: type) type {
             }
             assert(checker.state == .probing);
             const received = result catch |err| {
+                assert(err != error.Canceled); // Same rule as the send leg.
                 // EOF or reset before a whole head arrived: an origin
                 // that hangs up mid-status has not answered the check.
                 if (checker.pending_verdict == .none) {
@@ -537,11 +554,19 @@ pub fn Checker(comptime IoType: type) type {
         /// it complete. Both are idempotent here, because a deadline and
         /// a drain can each reach this for the same probe.
         fn endArmedLeg(checker: *Self) void {
+            // Only ever called with a leg outstanding: a deadline fires
+            // against the leg it was armed beside, and the drain ladder
+            // reaches here only under its own armed guard.
+            assert(checker.armed.connect or checker.armed.send or checker.armed.recv);
+            assert(checker.state == .probing or checker.state == .stopping);
             if (checker.armed.connect and !checker.armed.cancel and !checker.canceled.connect) {
                 checker.armCancelConnect();
                 return;
             }
             if ((checker.armed.send or checker.armed.recv) and !checker.probe_shutdown) {
+                // A data leg exists only for an http probe, which is the
+                // only kind that holds a socket to shut down.
+                assert(checker.probe_socket != null);
                 checker.probe_shutdown = true;
                 checker.server.io.shutdown(checker.probe_socket.?, .both);
             }
@@ -553,6 +578,7 @@ pub fn Checker(comptime IoType: type) type {
         /// against this fd (§5).
         fn closeProbeSocket(checker: *Self) void {
             assert(checker.armedCount() == 0);
+            assert(checker.state == .probing or checker.state == .stopping);
             if (checker.probe_socket) |socket| {
                 checker.server.io.closeNow(socket);
                 checker.probe_socket = null;
@@ -741,8 +767,10 @@ pub fn Checker(comptime IoType: type) type {
             // makes it complete, and its delivery re-enters here. It
             // therefore does not `return` — the shutdown consumes no
             // completion to wait on, so the armed check below is what
-            // decides whether anything is still outstanding.
-            if ((checker.armed.send or checker.armed.recv) and !checker.probe_shutdown) {
+            // decides whether anything is still outstanding. The guard
+            // lives inside `endArmedLeg`, which is idempotent, so this
+            // states only that a leg is what it is being called for.
+            if (checker.armed.send or checker.armed.recv) {
                 checker.endArmedLeg();
             }
             if (checker.armedCount() != 0) return;

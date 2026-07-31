@@ -245,6 +245,21 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     };
 }
 
+/// Which check the http cluster runs, if any. An outage seed always
+/// takes the dial check: its origin stops listening, so a request check
+/// would only ever reach the same refused dial by a longer route.
+fn checkHttpDraw(
+    checked: bool,
+    outage: bool,
+    random: std.Random,
+    tcp_check: Check,
+    http_check: Check,
+) ?Check {
+    if (!checked) return null;
+    if (outage) return tcp_check;
+    return if (random.boolean()) http_check else tcp_check;
+}
+
 /// The §7 health-check shape of one scenario: which clusters probe, how
 /// fast, and whether the HTTP origin dies mid-run.
 const HealthDraw = struct {
@@ -294,12 +309,7 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
         // The L4 origin echoes bytes rather than speaking HTTP, so only
         // the dial check is meaningful against it.
         .check_l4 = if (!outage and random.boolean()) tcp_check else null,
-        .check_http = if (!checked_http)
-            null
-        else if (!outage and random.boolean())
-            http_check
-        else
-            tcp_check,
+        .check_http = checkHttpDraw(checked_http, outage, random, tcp_check, http_check),
         .interval_ms = if (outage)
             5 + random.uintAtMost(u32, 10)
         else
