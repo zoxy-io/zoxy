@@ -655,9 +655,46 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   fresh — the endpoint's whole idle list may be stale the same way. The
   endpoint pick is per-cluster config: `p2c` (two uniform candidates
   from a fixed-seed PRNG, the lower leased count wins) by default, `rr`
-  for strict rotation. Cluster endpoints are static socket addresses
-  resolved once at config load, never on the loop (dynamic DNS is a
-  non-goal, §1).
+  for strict rotation, `hash` for stickiness. Cluster endpoints are
+  static socket addresses resolved once at config load, never on the
+  loop (dynamic DNS is a non-goal, §1).
+- **`hash` is rendezvous hashing, and it is stateless because it has to
+  be.** Client-to-backend stickiness is normally a *table* — the proxy
+  records which server a client went to. That mechanism cannot work
+  here. Scale-out is N independent processes behind SO_REUSEPORT (§3),
+  and the kernel picks the listening socket by hashing the connection's
+  4-tuple, source port included, so one client's connections land on
+  *different processes*. A per-process table would be filled by whichever
+  process saw that client first and consulted by processes that never
+  did. HAProxy documents exactly this — stick-tables are per process and
+  never shared, and the peers protocol cannot sync processes on one host
+  — and its answer was to abandon multi-process for threads sharing
+  memory, which §1 rules out here.
+  So the endpoint is a *pure function* of the key and the eligible set:
+  every process computes the same answer with nothing shared, which is
+  what makes stickiness correct under this process model rather than
+  merely cheap. `hash.key` names the identity — `source_ip` today, all
+  four bytes of an IPv4 address and the **/64 prefix** of an IPv6 one,
+  since RFC 8981 privacy addressing rotates the interface identifier and
+  hashing it whole would re-home mobile clients on a timer.
+  Rendezvous rather than a ring or Maglev because both of those answer
+  from a precomputed table, and a table must be *rebuilt* whenever
+  membership changes — which here is every health-check ejection and
+  recovery, on the one thread that must not stall (§3). Rendezvous scans
+  the eligible set the health mask already produced: no table, no
+  rebuild, and only the clients of an ejected endpoint move (the 1/n
+  optimum — measured at 13.1% of clients for a 1-of-8 ejection). The
+  cost is O(n) per pick instead of O(log n), which is why
+  `endpoints_per_cluster_max` matters: 71 ns at the 64 endpoints a
+  cluster may hold, against a request served in ~100 µs. Jump consistent
+  hash is excluded outright — it can only add or remove the *last*
+  bucket, and an ejection removes an arbitrary one.
+  Two honest costs. Stickiness holds only while processes agree on the
+  eligible set, and each probes independently (below), so a health flap
+  opens a divergence window — confined, by the same 1/n property, to the
+  clients of the flapping endpoint, who are already affected by it.
+  And source-IP hashing balances by *client*, not by request: NAT puts
+  many clients on one address, and one heavy client cannot be split.
 - **Active health checks** are per-cluster opt-in (a `check` block —
   HAProxy's model) so a request is not routed to an endpoint known to be
   down:
@@ -980,7 +1017,7 @@ src/
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
-  balancer.zig        // upstream endpoint pick: per-cluster rr | p2c (§7)
+  balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)
   shed.zig            // exhaustion ladder: decisions + static responses
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
   admin.zig           // admin/metrics listener: one reserved scrape slot (§8)

@@ -469,6 +469,7 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.cluster_index,
                 &server.upstreams.leased_counts,
                 &server.health.healthy,
+                &conn.client_address,
             );
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
@@ -1571,6 +1572,7 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.cluster_index,
                 &server.upstreams.leased_counts,
                 &server.health.healthy,
+                &conn.client_address,
             );
             dialUpstream(server, conn, pick);
         }

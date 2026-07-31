@@ -642,6 +642,7 @@ pub fn Server(comptime IoType: type) type {
                 cluster_index,
                 &server.upstreams.leased_counts,
                 &server.health.healthy,
+                &conn.client_address,
             );
             // An L4 dial holds no slot to record the endpoint on, so the
             // access log takes it here — the only place that knows which

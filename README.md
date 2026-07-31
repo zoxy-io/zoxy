@@ -49,6 +49,39 @@ The full config format — every field, enum, and numeric bound — is
 described by the JSON Schema shipped as a release asset (also emitted
 locally by `zig build schema`).
 
+### Sticky sessions
+
+A cluster picks endpoints with `p2c` (default), `rr`, or `hash` — the last
+sending a given client to a given backend every time, for services that
+keep per-user state:
+
+```json
+"clusters": {
+    "api": {
+        "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080"],
+        "pick": "hash",
+        "hash": { "key": "source_ip" }
+    }
+}
+```
+
+`hash` is **rendezvous hashing over the healthy endpoints**, and it keeps
+no table. That matters because zoxy scales out as independent processes
+behind SO_REUSEPORT, and the kernel spreads one client's connections
+across them by hashing the 4-tuple — so a per-process stickiness table
+(HAProxy's stick-table model) would be consulted by processes that never
+saw the client. Being a pure function of the key and the healthy set,
+every process agrees without sharing anything.
+
+When a backend is ejected by a health check, only *its* clients move; the
+rest are untouched, and they all return when it recovers. `source_ip`
+hashes all four bytes of an IPv4 address and the /64 prefix of an IPv6
+one, so stickiness survives IPv6 privacy-address rotation.
+
+The tradeoff is inherent to hashing on client address: NAT hides many
+clients behind one address, and a single heavy client cannot be split
+across backends. Use `p2c` where even load matters more than stickiness.
+
 ### Access log
 
 The optional `access_log` block writes one JSON object per line to

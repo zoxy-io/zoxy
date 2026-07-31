@@ -133,9 +133,31 @@ pub const Config = struct {
         /// here and the prober never dials it.
         check: ?Check = null,
 
-        pub const Pick = enum(u1) {
+        /// What a `hash` cluster keys its endpoint choice on (§7). Read
+        /// only when `pick == .hash`; the loader rejects a `hash` block
+        /// beside any other policy rather than leaving it inert.
+        hash_key: HashKey = .source_ip,
+
+        pub const Pick = enum(u2) {
             rr,
             p2c,
+            /// Rendezvous hashing (§7): the same key always lands on the
+            /// same endpoint, so a client reaches one stateful backend
+            /// across connections — and, because the answer is a pure
+            /// function of the key and the eligible set, every process
+            /// behind SO_REUSEPORT computes it identically with nothing
+            /// shared (§3).
+            hash,
+        };
+
+        /// The identity a `hash` cluster is sticky on. One arm today; a
+        /// closed enum rather than a bool so a request-derived key (a
+        /// header, a cookie) is a new arm rather than a new mechanism.
+        pub const HashKey = enum(u1) {
+            /// The client's own address, which both data paths have —
+            /// an L4 connection has nothing else, and an L7 request need
+            /// not have been parsed yet.
+            source_ip,
         };
 
         /// One cluster's resolved check policy (§7). Every field is
@@ -207,6 +229,8 @@ pub const ValidationError = error{
     ClusterCheckPathNotCanonical,
     ClusterCheckHostInvalid,
     ClusterCheckStatusInvalid,
+    ClusterHashKeyUnknown,
+    ClusterHashWithoutHashPick,
     ListenerClusterOrRoutes,
     ListenerL4Routes,
     RoutesEmpty,
@@ -665,6 +689,9 @@ pub const ClusterJson = struct {
     /// Optional §7 active health checks; absent means off, so an
     /// unprobed cluster reserves nothing and is never skipped.
     check: ?CheckJson = null,
+    /// Optional §7 hash-policy detail; only valid beside `"pick": "hash"`,
+    /// and absent there means the default key.
+    hash: ?ClusterHashJson = null,
 
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
@@ -674,11 +701,16 @@ pub const ClusterJson = struct {
             .max_items = constants.endpoints_per_cluster_max,
         },
         .pick = .{
-            .desc = "Endpoint-pick policy: p2c (power-of-two-choices) or rr (strict round-robin).",
+            .desc = "Endpoint-pick policy: p2c (power-of-two-choices), rr (strict " ++
+                "round-robin), or hash (rendezvous hashing on a stable key, for " ++
+                "client-to-backend stickiness).",
             .enum_type = Config.Cluster.Pick,
         },
         .check = .{
             .desc = "Active health checks for every endpoint in this cluster; absent leaves them off.",
+        },
+        .hash = .{
+            .desc = "Hash-policy detail; only valid alongside \"pick\": \"hash\".",
         },
     };
 };
@@ -733,6 +765,24 @@ pub const CheckJson = struct {
             .desc = "The one response status an http probe accepts as healthy.",
             .minimum = 100,
             .maximum = 599,
+        },
+    };
+};
+
+pub const ClusterHashJson = struct {
+    key: []const u8 = "source_ip",
+
+    pub const schema_doc =
+        "How a `hash` cluster identifies a client. The same key always " ++
+        "selects the same endpoint, and the mapping is a pure function of " ++
+        "the key and the healthy endpoint set — so every zoxy process " ++
+        "behind SO_REUSEPORT agrees without sharing any state.";
+    pub const schema_fields = .{
+        .key = .{
+            .desc = "What to hash. `source_ip` uses the client address: all four " ++
+                "bytes of an IPv4 address, and the /64 prefix of an IPv6 one so " ++
+                "stickiness survives privacy-address rotation (RFC 8981).",
+            .enum_type = Config.Cluster.HashKey,
         },
     };
 };
@@ -905,7 +955,7 @@ pub const dto_types = .{
     ConfigJson,  ListenerJson,    RouteJson,    FilterJson,
     MatchJson,   HeaderMatchJson, ActionJson,   HeaderEditJson,
     RewriteJson, ClusterJson,     TimeoutsJson, LimitsJson,
-    AdminJson,   AccessLogJson,   CheckJson,
+    AdminJson,   AccessLogJson,   CheckJson,    ClusterHashJson,
 };
 
 comptime {
@@ -942,11 +992,13 @@ fn resolveClusters(
         if (entry.name.len > constants.cluster_name_bytes_max) {
             return error.ClusterNameTooLong;
         }
+        const pick = try pickOf(entry.cluster.pick);
         clusters[index] = .{
             .name = entry.name,
             .endpoints = try resolveEndpoints(arena, entry.cluster.endpoints),
-            .pick = try pickOf(entry.cluster.pick),
+            .pick = pick,
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
+            .hash_key = try hashKeyOf(pick, entry.cluster.hash),
         };
     }
     assert(clusters.len == count);
@@ -1467,6 +1519,23 @@ fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Htt
 fn pickOf(literal: []const u8) error{ClusterPickUnknown}!Config.Cluster.Pick {
     return std.meta.stringToEnum(Config.Cluster.Pick, literal) orelse
         error.ClusterPickUnknown;
+}
+
+/// The §7 hash key for a cluster: its `hash` block's, or the default when
+/// the block is absent. A block beside any *other* policy is rejected
+/// rather than ignored — it reads as a request for stickiness that the
+/// cluster would silently not provide, which is exactly the mistake worth
+/// failing at load.
+fn hashKeyOf(
+    pick: Config.Cluster.Pick,
+    hash_json: ?ClusterHashJson,
+) ValidationError!Config.Cluster.HashKey {
+    const hash = hash_json orelse return .source_ip;
+    if (pick != .hash) {
+        return error.ClusterHashWithoutHashPick;
+    }
+    return std.meta.stringToEnum(Config.Cluster.HashKey, hash.key) orelse
+        error.ClusterHashKeyUnknown;
 }
 
 /// The closed protocol vocabulary; anything else is its own error so a
@@ -2457,5 +2526,70 @@ test "config: a cluster name is bounded, because the access log echoes it" {
         error.ClusterNameEmpty,
         head ++ "\"}],\"clusters\":{\"\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+    );
+}
+
+test "config: the hash pick policy and its key resolve, or fail loudly" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],\"clusters\":{\"a\":{";
+    const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+    const endpoints = "\"endpoints\":[\"127.0.0.1:2\"]";
+
+    // `pick: hash` with no `hash` block takes the default key, so the
+    // common case needs no second line of config.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ endpoints ++ ",\"pick\":\"hash\"" ++ tail,
+        );
+        try std.testing.expectEqual(Config.Cluster.Pick.hash, parsed.clusters[0].pick);
+        try std.testing.expectEqual(Config.Cluster.HashKey.source_ip, parsed.clusters[0].hash_key);
+    }
+    // Naming the key explicitly resolves to the same thing.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"source_ip\"}" ++ tail,
+        );
+        try std.testing.expectEqual(Config.Cluster.HashKey.source_ip, parsed.clusters[0].hash_key);
+    }
+    // A cluster that says nothing keeps the p2c default and the default
+    // key, which is inert there.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(), head ++ endpoints ++ tail);
+        try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[0].pick);
+    }
+
+    // A `hash` block beside another policy is a request for stickiness the
+    // cluster would silently not provide — the mistake most worth catching
+    // at load rather than in production.
+    try expectParseError(
+        error.ClusterHashWithoutHashPick,
+        head ++ endpoints ++ ",\"pick\":\"rr\",\"hash\":{\"key\":\"source_ip\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterHashWithoutHashPick,
+        head ++ endpoints ++ ",\"hash\":{\"key\":\"source_ip\"}" ++ tail,
+    );
+    // The key vocabulary is closed, and distinct from the policy's own
+    // error so a typo says which field it is in.
+    try expectParseError(
+        error.ClusterHashKeyUnknown,
+        head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"cookie\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterPickUnknown,
+        head ++ endpoints ++ ",\"pick\":\"hsah\"" ++ tail,
+    );
+    // The block is strict like every other: unknown fields are rejected
+    // rather than ignored.
+    try expectParseError(
+        error.UnknownField,
+        head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"source_ip\",\"mask\":24}" ++ tail,
     );
 }

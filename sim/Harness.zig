@@ -183,19 +183,25 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
     };
 }
 
+fn randomPick(random: std.Random) zoxy.config.Config.Cluster.Pick {
+    return random.enumValue(zoxy.config.Config.Cluster.Pick);
+}
+
 fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.endpoints_l4 = .{originAddress()};
     harness.endpoints_http = .{httpOriginAddress()};
-    // Each cluster draws its pick policy independently so mixed
-    // rr+p2c configs (one cluster each way) flow through the balancer
-    // under the schedule fuzz, not just the two uniform pairings.
-    // Single-endpoint clusters short-circuit either policy identically
-    // today; the draw is pre-wired coverage for a multi-endpoint
-    // topology.
-    const pick_l4: zoxy.config.Config.Cluster.Pick =
-        if (random.boolean()) .p2c else .rr;
-    const pick_http: zoxy.config.Config.Cluster.Pick =
-        if (random.boolean()) .p2c else .rr;
+    // Each cluster draws its pick policy independently so mixed configs
+    // (one cluster each way) flow through the balancer under the schedule
+    // fuzz, not just the uniform pairings. Single-endpoint clusters
+    // short-circuit every policy identically today; the draw is pre-wired
+    // coverage for a multi-endpoint topology. `hash` rides here for what
+    // the *scenario* can exercise — the pick path, the health mask, and
+    // the L4/L7 plumbing of the client address — while the properties it
+    // exists for (stickiness, minimal disruption on ejection) are pinned
+    // by `balancer.zig`'s own tests, which can hold thousands of distinct
+    // clients against a multi-endpoint cluster as a scenario cannot.
+    const pick_l4 = randomPick(random);
+    const pick_http = randomPick(random);
     // Each cluster draws §7 active health checks independently, so the
     // prober runs its whole lifecycle — sweeps, fall/rise transitions
     // under the adversary's connect fates, parked-close on ejection, and
