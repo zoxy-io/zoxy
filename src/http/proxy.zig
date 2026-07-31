@@ -1156,6 +1156,31 @@ pub fn Proxy(comptime IoType: type) type {
             renderResponse(server, conn, &response);
         }
 
+        /// The §8 persistence decision, made once and honored: keep the
+        /// client's connection unless pipelining, pressure, or drain says
+        /// otherwise — then announce whatever was decided (§2).
+        ///
+        /// Only relay pressure suppresses keep-alive: the next request on
+        /// this connection would claim a relay buffer the pool is running
+        /// out of. Conn-slot pressure deliberately does not reach here
+        /// (`keepAliveSuppressed`, #57) — under slot scarcity this serving
+        /// connection *is* the population, and closing it trades one
+        /// briefly-free slot for a reconnect wave. An until-close body
+        /// forces the close unconditionally: the FIN is the only thing
+        /// delimiting the relayed body for the client, exactly as it
+        /// delimited it for us.
+        fn downstreamKeepAlive(
+            server: *const ServerType,
+            conn: *const ConnType,
+            response: *const parser.ResponseHead,
+        ) bool {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.response_leg == .awaiting_head);
+            return conn.l7.client_keep_alive and
+                !conn.l7.client_pipelined and !server.draining and
+                !server.keepAliveSuppressed() and response.framing != .until_close;
+        }
+
         /// Render the origin's head into conn.head (free once the request
         /// head has vacated it) and forward the coalesced body excess
         /// straight from upstream.head — never copied through a relay
@@ -1170,22 +1195,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.request_head_vacated);
             const upstream = conn.upstream.?;
 
-            // The §8 persistence decision, made once and honored: honor
-            // the client's ask unless pipelining, pressure, or drain says
-            // otherwise — then announce whatever was decided (§2). Only
-            // relay pressure suppresses keep-alive: the next request on
-            // this connection would claim a relay buffer the pool is
-            // running out of. Conn-slot pressure deliberately does not
-            // reach here (`keepAliveSuppressed`, #57) — under slot
-            // scarcity this serving connection *is* the population, and
-            // closing it trades one briefly-free slot for a reconnect
-            // wave. An until-close body forces the close
-            // unconditionally: the FIN is the only thing delimiting the
-            // relayed body for the client, exactly as it delimited it
-            // for us.
-            const keep_downstream = conn.l7.client_keep_alive and
-                !conn.l7.client_pipelined and !server.draining and
-                !server.keepAliveSuppressed() and response.framing != .until_close;
+            const keep_downstream = downstreamKeepAlive(server, conn, response);
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
             const rendered = render.renderResponseHead(

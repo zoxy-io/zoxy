@@ -192,6 +192,22 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     }
 }
 
+/// One of the two optional deadlines a scenario may arm, or 0 for "off".
+///
+/// A third of seeds arm each, over a range that straddles the connect and
+/// idle timeouts drawn alongside them — so an armed one sometimes fires
+/// inside a dial, sometimes mid-exchange, and sometimes never, all under
+/// the adversary. The two callers share this because they share the
+/// question; what differs is the clock each hangs off, which is what
+/// their call sites say.
+fn deriveOptionalDeadlineMs(random: std.Random) u32 {
+    if (random.uintLessThan(u8, 3) != 0) return 0;
+    const deadline_ms = 10 + random.uintAtMost(u32, 90);
+    assert(deadline_ms >= 10);
+    assert(deadline_ms <= 100);
+    return deadline_ms;
+}
+
 /// When the drain starts, for the seeds that start one early.
 ///
 /// Bimodal, because the two rungs want opposite instants and one window
@@ -380,23 +396,12 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         .connect_timeout_ms = connect_timeout_ms,
         .idle_timeout_ms = 30 + random.uintAtMost(u32, 70),
         .drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random),
-        // A third of seeds arm the max-lifetime cap (§6). The range
-        // straddles the idle timeout so the clamp sometimes reaps an
-        // actively-relaying connection and sometimes never bites —
-        // both paths under the adversary. 0 leaves it disabled.
-        .max_lifetime_ms = if (random.uintLessThan(u8, 3) == 0)
-            10 + random.uintAtMost(u32, 90)
-        else
-            0,
-        // Same shape for the §8 request deadline: a third of seeds arm
-        // it, over a range that straddles both the connect and idle
-        // timeouts drawn above — so it sometimes fires inside a dial,
-        // sometimes mid-exchange, and sometimes never, all under the
-        // adversary. 0 leaves it disabled.
-        .request_timeout_ms = if (random.uintLessThan(u8, 3) == 0)
-            10 + random.uintAtMost(u32, 90)
-        else
-            0,
+        // The §6 age cap: measured from the connection's birth, so the
+        // clamp sometimes reaps an actively-relaying connection.
+        .max_lifetime_ms = deriveOptionalDeadlineMs(random),
+        // The §8 per-exchange deadline: measured from routing instead, so
+        // the same range lands on a different clock.
+        .request_timeout_ms = deriveOptionalDeadlineMs(random),
         // Three seeds in four run with the access log on, so the sink,
         // its staging swap, and the per-request captures all take the
         // schedule fuzz; the fourth leaves it off, which is the shape
