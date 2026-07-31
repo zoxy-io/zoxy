@@ -658,23 +658,39 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   for strict rotation. Cluster endpoints are static socket addresses
   resolved once at config load, never on the loop (dynamic DNS is a
   non-goal, §1).
-- **Active TCP health checks** are per-cluster opt-in (`check` —
+- **Active health checks** are per-cluster opt-in (a `check` block —
   HAProxy's model) so a request is not routed to an endpoint known to be
-  down. One prober per server sweeps every checked endpoint with a
-  single probe in flight, budgeted like the admin plane (§8:
-  `health_probe_ops_max` ring ops and one fd, reserved unconditionally);
-  each probe is a dial under the `connect_ms` budget, and sweeps pace
-  sweep-end to sweep-start on `timeouts.health_interval_ms`. A SYN/ACK
-  passes; refused, unreachable, timed out, or kernel pressure (witnessed
-  §8) fails. `health_probe_fall` (3) consecutive misses eject the
-  endpoint from balancing and close its parked pooled connections (§5);
-  `health_probe_rise` (2) passes restore it. Endpoints start healthy —
-  probing demotes, never gates startup — and the pick **fails open**: a
-  cluster with every endpoint ejected balances as if none were, because
-  routing nowhere would turn a probe verdict into an outage of its own,
-  and a same-port TCP probe cannot know better than the dial it stands
-  in for. The check is TCP-level: it proves the port accepts, not that
-  the application behind it is well. Circuit breakers, outlier ejection,
+  down:
+
+  ```json
+  "api": { "endpoints": ["10.0.0.1:80"],
+           "check": { "type": "http", "path": "/health",
+                      "expect_status": 200, "fall": 3, "rise": 2 } }
+  ```
+
+  One prober per server sweeps every checked endpoint with a **single
+  probe in flight**, budgeted like the admin plane (§8:
+  `health_probe_ops_max` ring ops and one fd, reserved unconditionally).
+  Sweeps pace sweep-end to sweep-start on `timeouts.health_interval_ms`;
+  one probe is bounded by the check's `timeout_ms`, which defaults to
+  `connect_ms`.
+
+  What a probe proves is the operator's choice. A **`tcp`** check dials:
+  a SYN/ACK passes, and refused, unreachable, timed out or kernel
+  pressure (witnessed §8) fails. It proves the port accepts, which an
+  origin that is listening but answering 500s also does. An **`http`**
+  check therefore sends `GET <path>` and requires the configured status,
+  reading the response with the data path's own head parser (§7) — so a
+  probe accepts exactly the heads this proxy would forward. Its legs run
+  in sequence, dial then send then recv, which is why the op budget is
+  the same for both kinds.
+
+  `fall` consecutive misses eject the endpoint from balancing and close
+  its parked pooled connections (§5); `rise` consecutive passes restore
+  it. Endpoints start healthy — probing demotes, it never gates startup
+  — and the pick **fails open**: a cluster with every endpoint ejected
+  balances as if none were, because routing nowhere would turn a probe
+  verdict into an outage of its own. Circuit breakers, outlier ejection,
   retry budgets stay *deferred* — the previous iteration proved them
   buildable in this architecture; simplicity says they wait for a
   demonstrated need.

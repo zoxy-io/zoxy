@@ -203,7 +203,8 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // a single-endpoint topology's routing unchanged whatever the
     // verdicts, so the L7 golden oracles hold on clean seeds (where
     // probes always pass) and prefix-legality holds under the adversary.
-    const health = deriveHealthChecks(harness.clean, random);
+    const connect_timeout_ms: u32 = 20 + random.uintAtMost(u32, 40);
+    const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms);
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
     harness.clusters = .{
         .{ .name = "origin-l4", .endpoints = &harness.endpoints_l4, .pick = pick_l4, .check = health.check_l4 },
@@ -215,7 +216,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.config = .{
         .listeners = &harness.listener_configs,
         .clusters = &harness.clusters,
-        .connect_timeout_ms = 20 + random.uintAtMost(u32, 40),
+        .connect_timeout_ms = connect_timeout_ms,
         .idle_timeout_ms = 30 + random.uintAtMost(u32, 70),
         .drain_deadline_ms = 100,
         // A third of seeds arm the max-lifetime cap (§6). The range
@@ -244,14 +245,31 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     };
 }
 
+/// Which check the http cluster runs, if any. An outage seed always
+/// takes the dial check: its origin stops listening, so a request check
+/// would only ever reach the same refused dial by a longer route.
+fn checkHttpDraw(
+    checked: bool,
+    outage: bool,
+    random: std.Random,
+    tcp_check: Check,
+    http_check: Check,
+) ?Check {
+    if (!checked) return null;
+    if (outage) return tcp_check;
+    return if (random.boolean()) http_check else tcp_check;
+}
+
 /// The §7 health-check shape of one scenario: which clusters probe, how
 /// fast, and whether the HTTP origin dies mid-run.
 const HealthDraw = struct {
-    check_l4: bool,
-    check_http: bool,
+    check_l4: ?Check,
+    check_http: ?Check,
     interval_ms: u32,
     http_origin_stop_at_ns: u64,
 };
+
+const Check = zoxy.config.Config.Cluster.Check;
 
 /// An eighth of adversarial seeds are outage seeds: the HTTP origin
 /// stops listening while clients are still live and parked connections
@@ -263,11 +281,35 @@ const HealthDraw = struct {
 /// conn table, while the stopped HTTP origin refuses its probes and a
 /// refused probe consumes no origin conn. Everyone else paces from the
 /// `health_interval_floor_ms` the origin-capacity bound is derived at.
-fn deriveHealthChecks(clean: bool, random: std.Random) HealthDraw {
+fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDraw {
+    assert(timeout_ms >= 1);
     const outage = !clean and random.uintLessThan(u8, 8) == 0;
+    // Thresholds draw around their defaults so a configured fall/rise —
+    // not only the compiled one — decides ejections under the fuzz.
+    const tcp_check: Check = .{
+        .timeout_ms = timeout_ms,
+        .fall = 1 + random.uintAtMost(u8, 3),
+        .rise = 1 + random.uintAtMost(u8, 2),
+    };
+    // Half the checked http clusters probe with a real request instead of
+    // a dial, so the send and recv legs — and the shutdown that ends one
+    // when a deadline or a drain lands mid-leg — take the schedule fuzz.
+    // A quarter of those expect a status the origin never sends, which is
+    // the only way to reach the wrong-status ejection: every other
+    // failure here is a transport failure, and a check that could not
+    // tell those apart would be the whole point missed.
+    var http_check = tcp_check;
+    http_check.kind = .http;
+    http_check.http = .{
+        .path = "/health",
+        .expect_status = if (random.uintLessThan(u8, 4) == 0) 599 else 200,
+    };
+    const checked_http = outage or random.boolean();
     const draw: HealthDraw = .{
-        .check_l4 = !outage and random.boolean(),
-        .check_http = outage or random.boolean(),
+        // The L4 origin echoes bytes rather than speaking HTTP, so only
+        // the dial check is meaningful against it.
+        .check_l4 = if (!outage and random.boolean()) tcp_check else null,
+        .check_http = checkHttpDraw(checked_http, outage, random, tcp_check, http_check),
         .interval_ms = if (outage)
             5 + random.uintAtMost(u32, 10)
         else
@@ -279,7 +321,7 @@ fn deriveHealthChecks(clean: bool, random: std.Random) HealthDraw {
     };
     // An outage always probes the cluster it exists to eject, and the
     // instant always precedes the scenario-end backstop.
-    assert(draw.http_origin_stop_at_ns == 0 or draw.check_http);
+    assert(draw.http_origin_stop_at_ns == 0 or draw.check_http != null);
     assert(draw.http_origin_stop_at_ns < scenario_end_ns);
     assert(draw.interval_ms >= 1);
     return draw;

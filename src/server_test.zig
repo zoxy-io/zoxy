@@ -208,9 +208,9 @@ pub const TestBed = struct {
         /// Turn the §8 access log on. Off by default so every existing
         /// scenario keeps paying nothing for it.
         access_log: bool = false,
-        /// §7 active health checks on the one cluster; off by default so
+        /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
-        check: bool = false,
+        check: ?config_module.Config.Cluster.Check = null,
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 20,
@@ -883,7 +883,7 @@ test "health: probes against a listening origin keep the endpoint healthy" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .sim = .{ .seed = 71 },
-        .check = true,
+        .check = .{ .timeout_ms = 50 },
         .health_interval_ms = 50,
     });
     defer bed.tearDown();
@@ -910,7 +910,7 @@ test "health: consecutive refusals eject the endpoint" {
     try bed.setUp(std.testing.allocator, .{
         .sim = .{ .seed = 72 },
         .origin_listens = false,
-        .check = true,
+        .check = .{ .timeout_ms = 50 },
         .health_interval_ms = 20,
     });
     defer bed.tearDown();
@@ -937,7 +937,7 @@ test "health: rise restores an ejected endpoint after passing probes" {
     var bed: TestBed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .sim = .{ .seed = 73 },
-        .check = true,
+        .check = .{ .timeout_ms = 50 },
         .health_interval_ms = 20,
     });
     defer bed.tearDown();

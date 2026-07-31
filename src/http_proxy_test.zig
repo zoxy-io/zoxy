@@ -250,7 +250,11 @@ const HttpOrigin = struct {
     /// `check` scenario's probes each accept-and-vanish too — hence four
     /// slots, not two. Tests that must prove reuse assert
     /// `accepted_count == 1`.
-    conns: [4]OConn = .{ .{}, .{}, .{}, .{} },
+    /// Client-driven dials (fresh, replay, post-ejection) plus one per
+    /// http health probe, which accepts and hangs up but still consumes a
+    /// slot — conns are tracked monotonically, never recycled. Tests that
+    /// must prove reuse assert `accepted_count == 1` regardless.
+    conns: [16]OConn = @splat(.{}),
     accepted_count: u32 = 0,
     requests_served: u32 = 0,
 
@@ -508,9 +512,9 @@ const Http1Bed = struct {
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
         access_log: bool = false,
-        /// §7 active health checks on the one cluster; off by default so
+        /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
-        check: bool = false,
+        check: ?config_module.Config.Cluster.Check = null,
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 40,
@@ -2392,7 +2396,7 @@ test "l7: ejecting an endpoint closes its parked connections" {
     try bed.setUp(std.testing.allocator, .{
         .seed = 55,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-        .check = true,
+        .check = .{ .timeout_ms = Http1Bed.connect_timeout_ms },
         .health_interval_ms = 40,
     });
     defer bed.tearDown();
@@ -2405,7 +2409,7 @@ test "l7: ejecting an endpoint closes its parked connections" {
     // timer drains after the ejection has had time to land.
     bed.client.drain_on_finish = false;
     bed.armOriginStopTimer(25);
-    bed.armDrainTimer(300);
+    bed.armDrainTimer(220);
     try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
@@ -2919,4 +2923,98 @@ test "l7: an idle kept-alive connection closing owes no line" {
     const line = try onlyAccessLogLine(&bed);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"path\":\"/kept\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"ok\"") != null);
+}
+
+test "health: an http probe passes on the expected status" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 61,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .check = .{
+            .kind = .http,
+            .timeout_ms = Http1Bed.connect_timeout_ms,
+            .http = .{ .path = "/health" },
+        },
+        .health_interval_ms = 30,
+    });
+    defer bed.tearDown();
+
+    // No client at all: the prober is the only traffic. Each probe dials,
+    // sends its GET, reads the 200 and hangs up, so the endpoint stays
+    // healthy and nothing is ever ejected.
+    bed.armDrainTimer(110);
+    try bed.sim_io.run();
+
+    // The count is the load-bearing assertion, not just "some probes
+    // ran": a probe that reaches its verdict and then idles until its
+    // budget expires still passes and still reports healthy, so only the
+    // *rate* catches it. At a 30ms interval inside a 110ms run a probe
+    // that settles immediately gets three sweeps away; one that waits out
+    // the 50ms budget manages two. That gap is the regression this pins —
+    // it was a real bug, found because this assertion was `>= 2`.
+    try std.testing.expect(bed.server.counters.get("health_probes_sent") >= 3);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    // The origin saw real requests — an http probe that never sent one
+    // would pass this test on a TCP accept alone.
+    try std.testing.expect(bed.origin.accepted_count >= 2);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
+        "GET /health HTTP/1.1\r\n",
+    ) != null);
+    try bed.expectDrained();
+}
+
+test "health: an http probe fails on a status it was not promised" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 62,
+        // The origin is listening and answering — a TCP check would call
+        // this endpoint healthy. Only reading the status can tell.
+        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        .check = .{
+            .kind = .http,
+            .timeout_ms = Http1Bed.connect_timeout_ms,
+            .http = .{ .path = "/health" },
+        },
+        .health_interval_ms = 30,
+    });
+    defer bed.tearDown();
+
+    bed.armDrainTimer(130);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(!bed.server.health.healthy[0]);
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.unhealthy_count);
+    try bed.expectDrained();
+}
+
+test "health: an http probe fails when the origin never answers" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 63,
+        // Reads the request in full and says nothing: the recv leg is
+        // armed with no answer coming, so only the probe's own budget
+        // ends it — and a data op is never canceled (§5), so the
+        // deadline must shut the socket down to force its completion.
+        .origin_mute = true,
+        .check = .{
+            .kind = .http,
+            .timeout_ms = 30,
+            .http = .{ .path = "/health" },
+        },
+        .health_interval_ms = 30,
+    });
+    defer bed.tearDown();
+
+    bed.armDrainTimer(220);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try bed.expectDrained();
 }
