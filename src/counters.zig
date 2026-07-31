@@ -125,6 +125,18 @@ pub const Counters = struct {
     /// ejected (§5): a parked socket to a dead origin is a stale replay
     /// waiting to be spent.
     health_parked_closed: Value = Value.init(0),
+    /// Probe deadlines that fired *after* the verdict was already known —
+    /// the §4 race between a timer and its own cancel, where the delivery
+    /// is accounting and nothing else. Counts the race only while
+    /// probing: the same shape during a stop is discarded with the rest
+    /// of the prober's drain, where no verdict is waiting on it.
+    ///
+    /// It exists to be small. A prober that reaches its verdict and then
+    /// forgets to cancel the deadline still reports every check
+    /// correctly; the only thing it gets wrong is how long each probe
+    /// holds the prober, and this counter is the difference between the
+    /// race happening occasionally and it happening every time (#130).
+    health_probe_deadline_raced: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
     /// across every completion (accept, connect, setNodelay, and the relay
     /// recv/send data path). The total; `kernel_pressure_by_op` below

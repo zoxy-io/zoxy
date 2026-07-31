@@ -14,6 +14,7 @@ const Harness = @import("Harness.zig");
 const assert = std.debug.assert;
 
 const Counters = zoxy.counters.Counters;
+const SimIo = zoxy.Io.SimIo;
 
 const default_seed: u64 = 1;
 /// What `zig build sim` (and so `ci`) sweeps. Sized by census, not by
@@ -50,40 +51,80 @@ const failures_max: u8 = 16;
 /// coin flip, whatever the sweep still says.
 const census_iterations_min: u64 = 1024;
 
-/// A counter no scenario can move, and where it is covered instead.
+/// A counter the sweep expects to stay at zero, and why.
 const Uncovered = struct {
     name: []const u8,
-    /// Why the sweep cannot reach it, and what reaches it instead.
-    /// Printed when the exemption stops being true, so it has to read as
-    /// an argument rather than a label.
+    why: Why,
+    /// The argument itself: what reaches the counter instead, or what a
+    /// non-zero reading would mean. Printed when the entry's claim stops
+    /// holding, so it has to read as an argument rather than a label.
     reason: []const u8,
+
+    /// The two reasons an entry is here. They look identical to the gate
+    /// — both must read zero — and want opposite things from whoever the
+    /// gate wakes, so the remedy is printed from this rather than assumed.
+    const Why = enum {
+        /// No scenario reaches it. A non-zero reading is good news: some
+        /// scenario grew, and the entry has outlived its argument.
+        unreached,
+        /// It can be reached and must not be. A non-zero reading is a bug
+        /// report, and deleting the entry would be deleting the alarm.
+        must_stay_zero,
+    };
+
+    /// What to tell the reader when this entry's counter fires.
+    fn remedy(entry: *const Uncovered) []const u8 {
+        return switch (entry.why) {
+            .unreached => "a scenario now reaches it, so delete this entry",
+            .must_stay_zero => "this is the alarm, not a coverage note — " ++
+                "the invariant broke, so fix the code rather than the table",
+        };
+    }
 };
 
-/// The counters a full sweep provably never moves: a listener the
-/// simulator does not configure, a fault it does not inject, a volume it
-/// cannot reach. Every entry names the directed test that covers the path
-/// instead, because "no seed reaches it" and "nothing tests it" are
-/// different claims and only the first one is being made here.
+/// The counters a full sweep never moves. Most are unreachable: a
+/// listener the simulator does not configure, a fault it does not
+/// inject, a volume it cannot reach — and each names the directed test
+/// that covers the path instead, because "no seed reaches it" and
+/// "nothing tests it" are different claims and only the first is made
+/// here.
+///
+/// A few are here for the opposite reason: they *can* fire and must not,
+/// so a reading of zero is the invariant rather than an admission. `why`
+/// says which an entry is, and the gate prints the matching remedy —
+/// telling someone to delete the entry when the alarm they just tripped
+/// *is* the entry would be the worst advice the tool could give.
 ///
 /// The gate reads both ways — a counter absent from this table must fire
-/// at least once, and a counter present must stay at zero. The second
-/// half is what stops the table rotting into stale excuses: widen a
-/// scenario until one of these fires and the sweep fails until its entry
-/// is deleted.
+/// at least once, and a counter present must stay at zero — which is what
+/// serves both kinds at once, and what stops the table rotting into stale
+/// excuses.
 const uncovered = [_]Uncovered{
     .{
+        .name = "health_probe_deadline_raced",
+        .why = .must_stay_zero,
+        .reason = "the §4 race it counts — a probe deadline firing after its " ++
+            "own cancel was issued — is legal but has never occurred in a " ++
+            "sweep, while a prober that stopped cancelling at all reports " ++
+            "every verdict correctly and moves only this. That is #130 " ++
+            "exactly. Measured: 0 with the fix, 4760 with it reverted",
+    },
+    .{
         .name = "l7_headers_too_large",
+        .why = .unreached,
         .reason = "no script sends a header section past the head buffer; " ++
             "src/http_proxy_test.zig drives both 431 shapes",
     },
     .{
         .name = "l7_no_route",
+        .why = .unreached,
         .reason = "the sim's route table is a single \"/\" prefix, which no " ++
             "path can miss; src/http_proxy_test.zig covers the path- and " ++
             "host-miss 404s",
     },
     .{
         .name = "l7_shed_upstream_slots",
+        .why = .unreached,
         .reason = "the only seeds that starve a pool set relay_buffers and " ++
             "upstream_slots both to 1, and the L7 path takes the relay " ++
             "buffer first, so the relay rung answers every request that " ++
@@ -92,28 +133,33 @@ const uncovered = [_]Uncovered{
     },
     .{
         .name = "l7_response_excess_sent",
+        .why = .unreached,
         .reason = "no seed raises the adversary's recv cap to head_bytes_max, " ++
             "so no origin delivery fills the head buffer; " ++
             "src/http_proxy_test.zig builds that delivery",
     },
     .{
         .name = "admin_served",
+        .why = .unreached,
         .reason = "the sweep configures no admin listener; " ++
             "src/admin_test.zig covers the scrape",
     },
     .{
         .name = "admin_reaped",
+        .why = .unreached,
         .reason = "the sweep configures no admin listener; " ++
             "src/admin_test.zig covers the scrape deadline",
     },
     .{
         .name = "access_log_dropped",
+        .why = .unreached,
         .reason = "a scenario emits single-digit lines against staging buffers " ++
             "holding ~130, so no schedule can overflow them; " ++
             "src/access_log_test.zig drives the burst",
     },
     .{
         .name = "access_log_write_failed",
+        .why = .unreached,
         .reason = "the harness never calls injectLogWriteError; " ++
             "src/access_log_test.zig covers the stop-and-witness",
     },
@@ -152,18 +198,62 @@ comptime {
     }
 }
 
-/// The exemption for `name`, or null when the sweep is expected to reach
-/// it. Linear over a table of a few dozen entries, run once per counter
-/// at the end of a sweep.
-fn reasonFor(name: []const u8) ?[]const u8 {
+/// The §4 seam ops no scenario delivers, on the same both-ways terms as
+/// `uncovered`. One entry today, and it is a finding rather than a
+/// footnote: the whole asynchronous close path is unreached by 4096
+/// seeds.
+const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
+    .{
+        .kind = .close,
+        .reason = "src/admin.zig is the only asynchronous close in the tree — " ++
+            "every serving path closes synchronously via closeNow — and the " ++
+            "sweep configures no admin listener; src/admin_test.zig covers it",
+    },
+};
+
+comptime {
+    // The twin of `uncovered`'s validation: an entry naming `.none`
+    // exempts an op that is never delivered by construction, a duplicate
+    // lets one deletion leave the other behind, and a blank reason
+    // exempts a slice of the seam while saying nothing about it.
+    for (uncovered_ops, 0..) |entry, index| {
+        if (entry.kind == .none) @compileError("uncovered_ops names the .none op");
+        if (entry.reason.len == 0) {
+            @compileError("uncovered_ops gives no reason for " ++ @tagName(entry.kind));
+        }
+        for (uncovered_ops[index + 1 ..]) |later| {
+            if (entry.kind == later.kind) {
+                @compileError("uncovered_ops names " ++ @tagName(entry.kind) ++ " twice");
+            }
+        }
+    }
+    // `.none` is not a deliverable op, so it is never counted as covered.
+    assert(uncovered_ops.len < std.enums.values(SimIo.OpKind).len - 1);
+}
+
+fn opReasonFor(kind: SimIo.OpKind) ?[]const u8 {
+    assert(kind != .none);
+    for (uncovered_ops) |entry| {
+        if (entry.kind == kind) {
+            assert(entry.reason.len >= 1);
+            return entry.reason;
+        }
+    }
+    return null;
+}
+
+/// The entry for `name`, or null when the sweep is expected to reach it.
+/// Linear over a table of a few dozen entries, run once per counter at
+/// the end of a sweep.
+fn entryFor(name: []const u8) ?*const Uncovered {
     assert(name.len >= 1);
-    for (uncovered) |entry| {
+    for (&uncovered) |*entry| {
         if (std.mem.eql(u8, name, entry.name)) {
             // An empty reason would print as an exemption that argued
             // nothing — the comptime block rejects one, and this is where
             // that rejection is felt if it ever stops running.
             assert(entry.reason.len >= 1);
-            return entry.reason;
+            return entry;
         }
     }
     return null;
@@ -183,27 +273,43 @@ fn reasonFor(name: []const u8) ?[]const u8 {
 /// this table used to carry for it is gone.
 const Census = struct {
     totals: [Counters.names.len]u64 = @splat(0),
+    /// The same question asked of the §4 seam rather than the §8 ladder:
+    /// which *ops* the sweep ever delivered. A counter says a decision was
+    /// taken; an op says the ring carried the work. They fail
+    /// independently — `close` is delivered by exactly one call site in
+    /// the tree, so no counter's silence would have named it.
+    ops: [std.enums.values(SimIo.OpKind).len]u64 = @splat(0),
 
-    fn add(census: *Census, counters: *const Counters) void {
+    fn add(census: *Census, harness: *const Harness) void {
         inline for (Counters.names, 0..) |name, index| {
             const before = census.totals[index];
-            census.totals[index] += counters.get(name);
+            census.totals[index] += harness.server.counters.get(name);
             // A sweep is bounded by `iterations`, so no honest total can
             // wrap — one that did would read as a rung going quiet.
             assert(census.totals[index] >= before);
         }
+        for (std.enums.values(SimIo.OpKind)) |kind| {
+            if (kind == .none) continue;
+            const before = census.ops[@intFromEnum(kind)];
+            census.ops[@intFromEnum(kind)] += harness.io.deliveredCount(kind);
+            // As the counter loop above: a wrap would read as an op going
+            // quiet, which is the one thing this table exists to notice.
+            assert(census.ops[@intFromEnum(kind)] >= before);
+        }
     }
 
     /// True when every counter agrees with its side of `uncovered`. Each
-    /// disagreement prints what to do about it: a silent rung wants a
-    /// scenario that reaches it, a fired exemption wants its entry gone.
+    /// disagreement prints what to do about it, which is not the same
+    /// sentence twice: a silent rung wants a scenario that reaches it, and
+    /// a fired entry wants either its deletion or a bug fixed, depending
+    /// on which kind of entry it was (`Uncovered.remedy`).
     fn verify(census: *const Census) bool {
         var held = true;
         var fired: usize = 0;
         for (Counters.names, census.totals) |name, total| {
             if (total != 0) fired += 1;
-            const reason = reasonFor(name);
-            if (reason == null and total == 0) {
+            const entry = entryFor(name);
+            if (entry == null and total == 0) {
                 std.debug.print(
                     "sim census: {s} never fired — no scenario reaches it; " ++
                         "widen one, or exempt it and say what covers it instead\n",
@@ -211,13 +317,15 @@ const Census = struct {
                 );
                 held = false;
             }
-            if (reason != null and total != 0) {
-                std.debug.print(
-                    "sim census: {s} fired {d} time(s) but is exempt as \"{s}\" — " ++
-                        "the exemption is no longer true, so delete it\n",
-                    .{ name, total, reason.? },
-                );
-                held = false;
+            if (entry) |exempt| {
+                if (total != 0) {
+                    std.debug.print(
+                        "sim census: {s} fired {d} time(s), and should not have.\n" ++
+                            "  why: {s}\n  do: {s}\n",
+                        .{ name, total, exempt.reason, exempt.remedy() },
+                    );
+                    held = false;
+                }
             }
         }
         assert(fired <= Counters.names.len);
@@ -225,6 +333,44 @@ const Census = struct {
         // fired is exactly the complement of the exemption table — not
         // merely that no single name was caught on the wrong side.
         if (held) assert(fired == Counters.names.len - uncovered.len);
+        return census.verifyOps() and held;
+    }
+
+    /// Every op of the §4 seam must be delivered somewhere in the range.
+    /// An op no seed ever carries is a slice of the seam the gate has
+    /// never run, whatever its counters say.
+    fn verifyOps(census: *const Census) bool {
+        var held = true;
+        var carried: usize = 0;
+        for (std.enums.values(SimIo.OpKind)) |kind| {
+            if (kind == .none) continue;
+            const delivered = census.ops[@intFromEnum(kind)];
+            if (delivered != 0) carried += 1;
+            const reason = opReasonFor(kind);
+            if (reason == null and delivered == 0) {
+                std.debug.print(
+                    "sim census: op {t} never delivered — the seam carried it " ++
+                        "no work; widen a scenario, or exempt it and say what does\n",
+                    .{kind},
+                );
+                held = false;
+            }
+            if (reason != null and delivered != 0) {
+                std.debug.print(
+                    "sim census: op {t} was delivered {d} time(s) but is exempt " ++
+                        "as \"{s}\" — the exemption is no longer true, so delete it\n",
+                    .{ kind, delivered, reason.? },
+                );
+                held = false;
+            }
+        }
+        assert(carried < std.enums.values(SimIo.OpKind).len);
+        // The same partition `verify` states for counters: holding means
+        // the ops the seam carried are exactly the deliverable set minus
+        // the exemptions, not merely that no one op landed wrongly.
+        if (held) {
+            assert(carried == std.enums.values(SimIo.OpKind).len - 1 - uncovered_ops.len);
+        }
         return held;
     }
 };
@@ -363,9 +509,11 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify()) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} seam op(s), {d} exempt\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
+        std.enums.values(SimIo.OpKind).len - 1 - uncovered_ops.len,
+        uncovered_ops.len,
     });
     return true;
 }
@@ -425,6 +573,6 @@ fn runSeed(arena_state: *std.heap.ArenaAllocator, seed: u64, census: ?*Census) !
     try harness.verify();
     // After `verify`, so a seed that failed its own oracles never counts
     // toward coverage: a rung is only reached by a run that held.
-    if (census) |totals| totals.add(&harness.server.counters);
+    if (census) |totals| totals.add(&harness);
     return harness.io.trace_hash;
 }

@@ -982,7 +982,14 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
    not inject, a volume it cannot reach) are exempted by name in a table
    that says what covers them instead, and the census fails just as loudly
    when an exemption *does* fire — so widening a scenario deletes its
-   entry rather than leaving a stale excuse behind.
+   entry rather than leaving a stale excuse behind. That second half also
+   carries the invariants that are *supposed* to read zero: a counter
+   whose whole point is to stay at zero is exempted with a reason saying
+   so, and the gate then fails the moment it moves.
+   `SimIo` counts deliveries per op kind for the same reason, so the
+   census covers the §4 seam as well as the §8 ladder — an op no seed ever
+   carries is a slice of the seam the gate has never run, and no counter's
+   silence would name it.
    `zig build sim -- fuzz` runs forever on entropy-derived seeds.
 2. **Fuzzing — `zig build test --fuzz`.** `std.testing.fuzz` on every
    parser edge: HTTP/1.1 head parser, chunked decoder, config parser.
