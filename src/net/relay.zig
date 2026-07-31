@@ -96,6 +96,28 @@ pub fn Relay(comptime IoType: type) type {
                     return .{ .consumed = @intCast(chunk.len), .done = false, .malformed = false };
                 }
 
+                /// The access log's byte counts for an L4 connection (§8),
+                /// taken on the client side of the proxy in both
+                /// directions: what arrived from the client is counted as
+                /// it is received, what leaves for the client as it is
+                /// sent. Counting each direction on its client-facing half
+                /// is what makes `bytes_in`/`bytes_out` mean the same
+                /// thing here as they do on an HTTP line — bytes that
+                /// crossed the wire to and from the client — rather than
+                /// bytes the origin happened to see.
+                pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
+                    _ = received;
+                    if (direction == .client_to_upstream) {
+                        conn.log.bytes_in += fr.consumed;
+                    }
+                }
+
+                pub fn afterSend(conn: *ConnType, sent: u32) void {
+                    if (direction == .upstream_to_client) {
+                        conn.log.bytes_out += sent;
+                    }
+                }
+
                 /// A FIN never arrives through here (relay has no length to
                 /// count down); the loop only leaves on EOF or teardown.
                 pub fn framingDone(conn: *ConnType) bool {
@@ -156,6 +178,12 @@ pub fn Relay(comptime IoType: type) type {
             assert(conn.state == .relaying);
             if (conn.directions[0].phase == .finished) {
                 if (conn.directions[1].phase == .finished) {
+                    // The one L4 ending that is not a failure: both peers
+                    // said goodbye. Every other way this connection can end
+                    // — a reset, a deadline, a drain straggler — leaves the
+                    // access log's default `aborted` in place (§8), so the
+                    // line distinguishes a completed relay from a cut one.
+                    conn.log.outcome = .closed;
                     server.beginTeardown(conn);
                 }
             }

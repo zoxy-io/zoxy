@@ -19,13 +19,16 @@
 //!   recv(io, socket, buffer, c, U, u, cb(u, RecvError!u32))
 //!   send(io, socket, bytes, c, U, u, cb(u, SendError!u32))
 //!   close(io, socket, c, U, u, cb(u))
+//!   logWrite(io, bytes, c, U, u, cb(u, LogWriteError!u32))   (§8 access log)
 //!   timerStart(io, c, delay_ns, U, u, cb(u, TimerError!void))
 //!   timerCancel(io, timer_c, cancel_c, U, u, cb(u))     (the one legal cancel)
 //!   signalWait(io, U, u, cb(u, Signal))                 (persistent waiter)
 //!   setNodelay / setLingerRst (io, socket) SetOptionError!void   (sync)
 //!   shutdown(io, socket, how) void                      (sync control op)
 //!   closeNow(io, socket) void                           (sync; un-admitted sheds)
+//!   peerAddress(io, socket) IpAddress                   (sync; who connected)
 //!   nowNs(io) u64                                       (per-tick clock, §4)
+//!   nowWallNs(io) u64                                   (epoch clock, §8 log)
 //!   run(io) RunError!void, stop(io) void
 
 const std = @import("std");
@@ -90,6 +93,16 @@ pub const SendError = error{
 pub const TimerError = error{
     /// The one legal cancel: teardown (§4).
     Canceled,
+};
+
+/// The access-log sink's only failure (§8). One error rather than a set,
+/// because there is exactly one response to any of them: the sink is
+/// declared broken, the failure is counted, and further lines are dropped.
+/// An operator's log pipe closing (EPIPE) and a full disk are the same
+/// event to a proxy whose job is not to log — a distinction nobody could
+/// act on differently from inside the loop.
+pub const LogWriteError = error{
+    Unexpected,
 };
 
 pub const SetOptionError = error{
@@ -157,6 +170,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "recv",
             "send",
             "close",
+            "logWrite",
             "timerStart",
             "timerCancel",
             "signalWait",
@@ -164,8 +178,10 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "setLingerRst",
             "shutdown",
             "closeNow",
+            "peerAddress",
             "lastPressure",
             "nowNs",
+            "nowWallNs",
             "run",
             "stop",
         };

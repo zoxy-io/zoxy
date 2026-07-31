@@ -687,7 +687,15 @@ const Harness = struct {
         // through both in spirit.
         bed.server.counters.increment("accepted");
         bed.server.counters.increment("admitted");
-        conn.prepare(&bed.server, bed.proxy_client_socket, buffer, .connecting, 0);
+        conn.prepare(
+            &bed.server,
+            bed.proxy_client_socket,
+            buffer,
+            .connecting,
+            0,
+            .l4,
+            bed.server.io.peerAddress(bed.proxy_client_socket),
+        );
         conn.upstream_socket = bed.proxy_upstream_socket;
         conn.state = .relaying;
         bed.conn = conn;

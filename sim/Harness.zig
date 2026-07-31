@@ -122,6 +122,13 @@ fn deriveAdversary(random: std.Random, clean: bool) SimIo.Adversary {
         // sites on both dial paths were unreachable under every seed
         // until this fate existed (issue #106, kind B).
         .connect_pressure_percent = random.uintAtMost(u8, 5),
+        // A sink that has fallen behind (§8). Most seeds keep it instant;
+        // some stall it past a whole scenario, which is what fills the
+        // staging buffers and makes the drop rung reachable at all.
+        .log_write_stall_ns = if (random.uintLessThan(u8, 4) == 0)
+            random.uintAtMost(u64, 200_000_000)
+        else
+            0,
     };
 }
 
@@ -168,6 +175,11 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
             10 + random.uintAtMost(u32, 90)
         else
             0,
+        // Three seeds in four run with the access log on, so the sink,
+        // its staging swap, and the per-request captures all take the
+        // schedule fuzz; the fourth leaves it off, which is the shape
+        // that must reserve nothing and read no clock (§5, §8).
+        .access_log_sink = if (random.uintLessThan(u8, 4) == 0) null else .stdout,
     };
 }
 
@@ -207,14 +219,30 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     // §8 rungs; clean seeds keep ample pools so golden outcomes
     // never meet a shed.
     const force_exhaustion = !harness.clean and random.uintLessThan(u8, 4) == 0;
+    // Adversarial seeds size the staging buffers at the floor — one
+    // worst-case line each — so the buffer swap runs constantly and every
+    // line meets a nearly-full buffer, against the default's hundred-line
+    // headroom where the swap fires once a scenario. The *drop* rung
+    // itself stays out of reach here: a scenario emits a handful of lines
+    // and filling even the floor takes dozens, so it is pinned by a
+    // directed test (`access_log_test.zig`) rather than left to a seed
+    // that cannot generate the volume.
+    const access_log_buffer_bytes: u32 = if (harness.config.access_log_sink == null)
+        0
+    else if (harness.clean)
+        zoxy.constants.access_log_buffer_bytes_default
+    else
+        zoxy.constants.access_log_buffer_bytes_min;
     const options: ServerSim.InitOptions = if (force_exhaustion)
         .{
             .conn_slots = 1 + random.uintLessThan(u32, 2),
             .relay_buffers = 1,
             .upstream_slots = 1,
+            .access_log_buffer_bytes = access_log_buffer_bytes,
         }
     else
         .{
+            .access_log_buffer_bytes = access_log_buffer_bytes,
             // Clean seeds size every pool so its §8 pressure
             // watermark (ceil of 3/4 capacity: 9 of 12) sits above
             // the whole client population (6): a golden outcome must
@@ -338,12 +366,119 @@ pub fn verify(harness: *Harness) !void {
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;
+    try harness.verifyAccessLog();
     for (harness.clients[0..harness.l4_count]) |*client| {
         try client.verifyIntegrity();
     }
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         try client.verify();
     }
+}
+
+/// The §8 access log's invariants (§9). The sink is a virtual file the
+/// harness can read back, so what an operator would have seen is checkable
+/// rather than merely believed: the bytes are whole lines, there are
+/// exactly as many of them as the counter claims, each is shaped like the
+/// documented record, and — when nothing was dropped — every outcome the
+/// data path counted has a line to go with it.
+///
+/// Structural rather than a full JSON parse: `parseFromSlice` allocates,
+/// and the simulator does not. The escaping that a parse would catch is
+/// pinned by `access_log.zig`'s own tests, against inputs far more hostile
+/// than the scripts here send.
+fn verifyAccessLog(harness: *Harness) !void {
+    const counters = &harness.server.counters;
+    const sink = harness.io.sinkBytes();
+    if (harness.io.sink_overflow_bytes != 0) return error.AccessLogSinkOverflowed;
+    // The sink never fails in the sweep, so every accepted line must have
+    // reached it; a failure here would silently weaken every check below.
+    if (counters.get("access_log_write_failed") != 0) return error.AccessLogWriteFailed;
+
+    if (harness.config.access_log_sink == null) {
+        // Off means off: no bytes, and no counter moved (§5).
+        if (sink.len != 0) return error.AccessLogWroteWhileOff;
+        if (counters.get("access_log_lines") != 0) return error.AccessLogCountedWhileOff;
+        if (counters.get("access_log_dropped") != 0) return error.AccessLogCountedWhileOff;
+        return;
+    }
+
+    // The drain does not stop the loop until the sink is quiet (§8), so
+    // the last byte written is the last byte of a line — never half of one.
+    if (sink.len != 0 and sink[sink.len - 1] != '\n') return error.AccessLogTruncatedLine;
+    var lines = std.mem.splitScalar(u8, sink, '\n');
+    var line_count: u64 = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue; // The tail after the final newline.
+        line_count += 1;
+        try verifyAccessLogLine(line);
+    }
+    if (line_count != counters.get("access_log_lines")) return error.AccessLogLineCountDiverged;
+
+    // Nothing was dropped, so every outcome the data path counted owes a
+    // line — plus one per L4 connection and per request that ended without
+    // a verdict, which is why this is an inequality.
+    if (counters.get("access_log_dropped") == 0) {
+        if (counters.get("access_log_lines") < l7OutcomeTotal(counters)) {
+            return error.AccessLogMissedAnOutcome;
+        }
+    }
+}
+
+/// Every L7 outcome that answers a client, summed. Each one runs through
+/// `respond` or `finishExchange`, and both emit a line.
+fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
+    const answered = [_][]const u8{
+        "l7_responses",
+        "l7_bad_request",
+        "l7_uri_too_long",
+        "l7_headers_too_large",
+        "l7_not_implemented",
+        "l7_no_route",
+        "l7_filtered",
+        "l7_shed_relay_buffers",
+        "l7_shed_upstream_slots",
+        "l7_bad_gateway",
+        "l7_gateway_timeout",
+    };
+    var total: u64 = 0;
+    inline for (answered) |name| {
+        total += counters.get(name);
+    }
+    return total;
+}
+
+/// One line's shape: a JSON object carrying every key the record defines,
+/// in the order `renderLine` writes them.
+fn verifyAccessLogLine(line: []const u8) !void {
+    assert(line.len >= 1);
+    if (line[0] != '{') return error.AccessLogLineNotAnObject;
+    if (line[line.len - 1] != '}') return error.AccessLogLineNotAnObject;
+    const required = [_][]const u8{
+        "\"time\":\"",
+        "\"kind\":\"",
+        "\"outcome\":\"",
+        "\"client\":\"",
+        "\"duration_us\":",
+        "\"bytes_in\":",
+        "\"bytes_out\":",
+        "\"cluster\":",
+        "\"upstream\":",
+    };
+    var searched: usize = 0;
+    for (required) |key| {
+        // Searched forward from the previous key, so the order is checked
+        // too: a renderer that emitted the right keys in a shuffled order
+        // would still break a consumer reading them positionally.
+        const at = std.mem.indexOfPos(u8, line, searched, key) orelse
+            return error.AccessLogLineMissingKey;
+        searched = at + key.len;
+    }
+    // An HTTP line carries the request fields; an L4 line must not, or a
+    // consumer keying off `kind` finds a status for a connection that
+    // never had one.
+    const is_http = std.mem.indexOf(u8, line, "\"kind\":\"http\"") != null;
+    const has_status = std.mem.indexOf(u8, line, "\"status\":") != null;
+    if (is_http != has_status) return error.AccessLogLineWrongShape;
 }
 
 /// Both clients' ended hook: type-erased because the client files cannot

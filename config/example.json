@@ -10,5 +10,6 @@
         "idle_ms": 60000,
         "drain_deadline_ms": 10000,
         "max_lifetime_ms": 0
-    }
+    },
+    "access_log": { "sink": "stdout" }
 }

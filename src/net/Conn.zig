@@ -8,6 +8,8 @@
 
 const std = @import("std");
 
+const access_log = @import("../access_log.zig");
+const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const router = @import("../http/router.zig");
@@ -122,6 +124,101 @@ pub const ClientWrite = struct {
     };
 };
 
+/// What an access-log line needs that is not still on the connection when
+/// the line is written (DESIGN.md §8). The head buffer is the reason this
+/// exists: it holds the request head only until the response head renders
+/// over it (§7 buffer rotation), so a line emitted at settle time would
+/// find the method, host and path it is supposed to report already gone.
+/// Each is therefore copied out — bounded, truncation marked — while it is
+/// still there.
+///
+/// One instance per connection, covering one *request* on the L7 path
+/// (`reset` runs at every keep-alive turnaround) and the whole connection
+/// on the L4 path, which has no smaller unit. The arrays are deliberately
+/// not cleared by `reset`: the lengths beside them gate every read, so
+/// clearing 500-odd bytes per request would be work for an invariant that
+/// already holds — the same argument `Conn.head` makes.
+pub const LogState = struct {
+    /// Wall-clock nanoseconds at which this request — or, on L4, this
+    /// connection — began. Zero means nothing is in flight, which is what
+    /// keeps an idle keep-alive connection reaped by its deadline from
+    /// emitting a line about a request nobody made; it is also why nothing
+    /// sets it while the log is off, so a disabled log reads no clock.
+    ///
+    /// Wall-clock rather than the monotonic deadline clock because a line
+    /// needs both a date and a duration, and one precise read at each end
+    /// answers both — where `Io.now_ns` is coarse and cached per tick (§4),
+    /// which would report 0 µs for every request served inside one batch.
+    started_wall_ns: u64 = 0,
+    /// Bytes read from the client and written to it, for this request.
+    bytes_in: u64 = 0,
+    bytes_out: u64 = 0,
+    /// The endpoint the balancer picked (§7), or `endpoint_none` before
+    /// one was — every reject that fires ahead of routing.
+    endpoint_index: u16 = endpoint_none,
+    /// The status this request was answered with; 0 until one is decided.
+    status: u16 = 0,
+    outcome: access_log.Outcome = .aborted,
+    /// Set once this request's line has been written, so the teardown
+    /// fallback cannot emit a second one for an exchange that already
+    /// reported its own outcome.
+    emitted: bool = false,
+    method_len: u8 = 0,
+    host_len: u16 = 0,
+    path_len: u16 = 0,
+    method: [constants.access_log_method_bytes_max]u8 = undefined,
+    host: [constants.host_bytes_max]u8 = undefined,
+    path: [constants.access_log_path_bytes_max]u8 = undefined,
+
+    /// No endpoint has been picked. `maxInt` rather than a separate flag:
+    /// the pool's own ceiling is asserted below `maxInt(u16)`, so the
+    /// sentinel can never collide with a real index.
+    pub const endpoint_none: u16 = std.math.maxInt(u16);
+
+    comptime {
+        assert(constants.endpoints_per_cluster_max < endpoint_none);
+    }
+
+    /// Start a fresh request's accounting. Only the scalars: the three
+    /// captures are read through their lengths, which this zeroes.
+    pub fn reset(state: *LogState) void {
+        state.started_wall_ns = 0;
+        state.bytes_in = 0;
+        state.bytes_out = 0;
+        state.endpoint_index = endpoint_none;
+        state.status = 0;
+        state.outcome = .aborted;
+        state.emitted = false;
+        state.method_len = 0;
+        state.host_len = 0;
+        state.path_len = 0;
+    }
+
+    pub fn methodSlice(state: *const LogState) []const u8 {
+        return state.method[0..state.method_len];
+    }
+
+    pub fn hostSlice(state: *const LogState) []const u8 {
+        return state.host[0..state.host_len];
+    }
+
+    pub fn pathSlice(state: *const LogState) []const u8 {
+        return state.path[0..state.path_len];
+    }
+
+    pub fn captureMethod(state: *LogState, token: []const u8) void {
+        state.method_len = @intCast(access_log.captureTruncated(&state.method, token).len);
+    }
+
+    pub fn captureHost(state: *LogState, host: []const u8) void {
+        state.host_len = @intCast(access_log.captureTruncated(&state.host, host).len);
+    }
+
+    pub fn capturePath(state: *LogState, path: []const u8) void {
+        state.path_len = @intCast(access_log.captureTruncated(&state.path, path).len);
+    }
+};
+
 pub fn Conn(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const UpstreamType = upstream_module.UpstreamPool(IoType).Upstream;
@@ -183,6 +280,20 @@ pub fn Conn(comptime IoType: type) type {
         upstream: ?*UpstreamType,
         /// L7 exchange bookkeeping (§7); reset per exchange.
         l7: L7State,
+        /// What this connection speaks (§6, §7). Read only by the access
+        /// log, at teardown, to decide which kind of line a connection
+        /// owes — an unanswered HTTP request, or the L4 connection itself.
+        /// `startProtocol` used to argue that a stored protocol would be
+        /// state with no reader; the log is that reader.
+        protocol: config_module.Config.Listener.Protocol,
+        /// Who connected, read once at admission through the seam (§8).
+        /// Kept rather than asked for at log time: by then the socket may
+        /// already be closed, and `getpeername` on a closed fd names
+        /// whoever inherited the number.
+        client_address: std.Io.net.IpAddress,
+        /// Access-log capture (§8); per request on the L7 path, per
+        /// connection on the L4 one.
+        log: LogState,
 
         op_data_client_to_upstream: Op,
         op_data_upstream_to_client: Op,
@@ -399,6 +510,8 @@ pub fn Conn(comptime IoType: type) type {
             buffer: ?*relay.RelayBuffer,
             state: State,
             cluster_index: u16,
+            protocol: config_module.Config.Listener.Protocol,
+            client_address: std.Io.net.IpAddress,
         ) void {
             assert(state == .connecting or state == .l7_reading_head);
             conn.server = server;
@@ -419,6 +532,20 @@ pub fn Conn(comptime IoType: type) type {
             conn.filters = &.{};
             conn.upstream = null;
             conn.l7 = .{};
+            conn.protocol = protocol;
+            conn.client_address = client_address;
+            // The field defaults are `reset`'s values; a recycled slot
+            // needs both the scalars and the (unread) capture arrays, and
+            // this sets them in one write.
+            conn.log = .{};
+            // An L4 connection is its own log unit and starts here; an L7
+            // one starts a request only when its first head byte lands, so
+            // an idle keep-alive connection that is reaped without ever
+            // being asked anything owes no line. Both are gated on the log
+            // being on, so a deployment without one reads no clock here.
+            if (protocol == .l4 and server.access_log.sink != null) {
+                conn.log.started_wall_ns = server.io.nowWallNs();
+            }
             conn.op_data_client_to_upstream = .{};
             conn.op_data_upstream_to_client = .{};
             conn.op_connect = .{};
@@ -431,6 +558,8 @@ pub fn Conn(comptime IoType: type) type {
             assert(conn.client_write.pending.len == 0);
             assert(conn.upstream == null);
             assert(conn.l7.request_leg == .idle);
+            assert(!conn.log.emitted);
+            assert(conn.log.bytes_in == 0);
         }
 
         /// Records the arm in the op and the armed set; call immediately

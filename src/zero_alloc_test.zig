@@ -17,6 +17,12 @@ test "zero-alloc gate: the serving path allocates nothing after init" {
             .seed = 7,
             .adversary = .{ .partial_io = true, .connect_delay_ns_max = 1_000_000 },
         },
+        // The §8 access log renders and writes on the serving path, so it
+        // has to be inside this gate rather than beside it: the two
+        // staging buffers come out of the startup arena and everything
+        // after — the render, the swap, the sink write — must ask for
+        // nothing. A log left off here would leave that unproven.
+        .access_log = true,
     });
     defer bed.tearDown();
 
@@ -37,6 +43,12 @@ test "zero-alloc gate: the serving path allocates nothing after init" {
             .seed = 7,
             .adversary = .{ .partial_io = true, .connect_delay_ns_max = 1_000_000 },
         },
+        // The §8 access log renders and writes on the serving path, so it
+        // has to be inside this gate rather than beside it: the two
+        // staging buffers come out of the startup arena and everything
+        // after — the render, the swap, the sink write — must ask for
+        // nothing. A log left off here would leave that unproven.
+        .access_log = true,
     });
     defer strict_bed.tearDown();
     strict_bed.startClients(2, true);

@@ -50,6 +50,24 @@ const never_ns: u64 = std.math.maxInt(u64);
 const peer_none: u16 = std.math.maxInt(u16);
 /// Ports the simulator hands out for port-zero binds.
 const ephemeral_port_base: u16 = 40_000;
+/// The virtual access-log sink (§8): every byte the server writes lands
+/// here for the harness to read back and check (§9). Sized so no scenario
+/// in the sweep can fill it — `sink_overflow_bytes` is asserted zero by the
+/// harness, so a scenario that ever did would fail rather than silently
+/// hand the oracle a truncated log.
+const sink_bytes_max: u32 = 1024 * 1024;
+/// Where the simulated wall clock starts: 2020-01-01T00:00:00Z. Fixed, so
+/// a seed's log lines are byte-identical across runs — the determinism the
+/// §9 trace-hash check demands, extended to the one output that carries a
+/// date. Virtual time advances it exactly as it advances `nowNs`.
+const wall_clock_base_ns: u64 = 1_577_836_800 * std.time.ns_per_s;
+/// The address block simulated clients dial from (RFC 5737 TEST-NET-2), so
+/// a log line read out of the sink is recognizably the simulator's.
+const client_ip_bytes: [4]u8 = .{ 198, 51, 100, 1 };
+/// The first ephemeral port a simulated client connects from; each new
+/// virtual pair takes the next one, so every client in a run is
+/// distinguishable in the access log by address alone.
+const client_port_base: u16 = 50_000;
 
 sockets: Pool(SocketEntry),
 listeners: []ListenerEntry,
@@ -87,6 +105,22 @@ blackholed_count: u8,
 /// connect to a matching address fails with `error.Unexpected`.
 connect_error_addresses: [connect_error_addresses_max]std.Io.net.IpAddress,
 connect_error_count: u8,
+/// The virtual access-log sink (§8): what the server wrote, in order, for
+/// the §9 oracle to parse back. Arena-allocated at init like every other
+/// simulator buffer.
+sink: []u8,
+sink_len: u32,
+/// Bytes the sink could not hold. Not a model of anything production does
+/// — the real sink is a pipe with its own backpressure, which the server's
+/// own staging buffer already answers by dropping — but a loud way for the
+/// harness to notice its oracle was handed a truncated log.
+sink_overflow_bytes: u32,
+/// Pending one-shot sink failures (`injectLogWriteError`): the write path
+/// a real broken pipe takes, which a virtual sink would otherwise never
+/// exercise (§9) — the same argument `pending_set_option_errors` makes.
+pending_log_write_errors: u8,
+/// The ephemeral port the next simulated client connects from.
+next_client_port: u16,
 
 const blackholed_addresses_max: u8 = 4;
 const connect_error_addresses_max: u8 = 4;
@@ -116,6 +150,14 @@ pub const Adversary = struct {
     /// the origin's verdict, this is our own exhaustion, and the two
     /// want opposite responses upstream.
     connect_pressure_percent: u8 = 0,
+    /// How long a sink write takes to complete (§8 access log). Zero is an
+    /// instant sink, where lines never accumulate and the drop rung is
+    /// unreachable; a stall is a reader that has fallen behind, which is
+    /// the condition the two staging buffers and the drop counter exist
+    /// for. A scenario that stalls the sink long enough overflows the
+    /// staging buffer and must still serve every request unaffected —
+    /// which is the property being tested.
+    log_write_stall_ns: u64 = 0,
     batch_max: u32 = constants.loop_completions_per_tick_max,
 };
 
@@ -154,6 +196,7 @@ const Op = union(enum) {
     recv: struct { socket: Socket, buffer: []u8 },
     send: struct { socket: Socket, bytes: []const u8 },
     close: struct { socket: Socket },
+    log_write: struct { bytes: []const u8 },
     timer: struct { fire_at_ns: u64, canceled: bool },
     timer_cancel: struct { target: *Completion },
     connect_cancel: struct { target: *Completion },
@@ -167,6 +210,7 @@ const Result = union(enum) {
     recv: Io.RecvError!u32,
     send: Io.SendError!u32,
     close: void,
+    log_write: Io.LogWriteError!u32,
     timer: Io.TimerError!void,
     timer_cancel: void,
     connect_cancel: void,
@@ -218,6 +262,13 @@ const SocketEntry = struct {
     pool_next: u32,
     generation: u32,
     peer: u16,
+    /// What `peerAddress` reports for this socket (§8 access log): the
+    /// dialed address on a client socket, the synthesized client address
+    /// on the accepted one. Held per entry rather than derived from the
+    /// peer index because an accepted socket outlives nothing here — but
+    /// its peer may close first, and the log still has to name who
+    /// connected.
+    peer_address: std.Io.net.IpAddress,
     fin_received: bool,
     read_shutdown: bool,
     write_shutdown: bool,
@@ -312,6 +363,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
 
     io.listeners = try arena.alloc(ListenerEntry, listeners_max);
     io.pending = try arena.alloc(*Completion, pending_ops_max);
+    io.sink = try arena.alloc(u8, sink_bytes_max);
     try io.sockets.init(arena, sockets_max);
     io.listeners_count = 0;
     io.pending_count = 0;
@@ -332,6 +384,10 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.blackholed_count = 0;
     io.connect_error_addresses = undefined;
     io.connect_error_count = 0;
+    io.sink_len = 0;
+    io.sink_overflow_bytes = 0;
+    io.pending_log_write_errors = 0;
+    io.next_client_port = client_port_base;
     assert(io.sockets.isFullyReleased());
 }
 
@@ -526,6 +582,59 @@ pub fn close(
         .callback = erasedVoid(Userdata, .close, callback),
     };
     io.enqueue(completion);
+}
+
+/// The access-log sink as a ring op (§8), so the simulator sees exactly
+/// what production does: a write that may complete short, at a moment the
+/// scheduler picks, while the server keeps serving. `partialLen` fragments
+/// it like any other write, which is what exercises the sink's resume.
+pub fn logWrite(
+    io: *SimIo,
+    bytes: []const u8,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.LogWriteError!u32) void,
+) void {
+    assert(completion.state == .dead);
+    assert(bytes.len >= 1);
+    completion.* = .{
+        .op = .{ .log_write = .{ .bytes = bytes } },
+        .ready_at_ns = io.now_ns_value + io.adversary.log_write_stall_ns,
+        .userdata = userdata,
+        .callback = erasedResult(Userdata, .log_write, callback),
+    };
+    io.enqueue(completion);
+}
+
+/// Who is on the other end (§8 access log). Virtual sockets have no
+/// kernel to ask, so the address was assigned when the pair was created —
+/// deterministically, so a seed's log lines are reproducible.
+pub fn peerAddress(io: *SimIo, socket: Socket) std.Io.net.IpAddress {
+    return io.socketEntry(socket).peer_address;
+}
+
+/// The simulated wall clock (§8): the fixed epoch base plus however far
+/// virtual time has advanced. Derived from `now_ns_value` rather than
+/// tracked separately so the two clocks can never disagree about how much
+/// time a scenario took.
+pub fn nowWallNs(io: *const SimIo) u64 {
+    assert(io.now_ns_value >= clock_start_ns);
+    return wall_clock_base_ns + (io.now_ns_value - clock_start_ns);
+}
+
+/// Targeted scenario control: the next `logWrite` fails, driving the
+/// broken-sink path (§8) a virtual sink would never reach on its own —
+/// the same argument `injectSetOptionError` makes for socket options.
+pub fn injectLogWriteError(io: *SimIo) void {
+    assert(io.pending_log_write_errors < std.math.maxInt(u8));
+    io.pending_log_write_errors += 1;
+}
+
+/// Everything the server wrote to the sink, for the §9 oracle.
+pub fn sinkBytes(io: *const SimIo) []const u8 {
+    assert(io.sink_len <= io.sink.len);
+    return io.sink[0..io.sink_len];
 }
 
 pub fn timerStart(
@@ -904,6 +1013,13 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
             break :ready io.peerEntry(entry).inbox.freeSpace() > 0;
         },
         .close, .timer_cancel, .connect_cancel => true,
+        // A sink that takes its time is the whole point of the staging
+        // buffers (§8): while this write is out, lines pile up in the
+        // other one, and the drop rung fires when they overflow it. With
+        // `log_write_stall_ns` at zero the sink is instant and the rung is
+        // unreachable — which is exactly how it stayed invisible before
+        // the knob existed.
+        .log_write => io.now_ns_value >= completion.ready_at_ns,
         .timer => |op| op.canceled or io.now_ns_value >= op.fire_at_ns,
     };
 }
@@ -933,6 +1049,7 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
         },
         .recv => |op| .{ .recv = io.finishRecv(op.socket, op.buffer) },
         .send => |op| .{ .send = io.finishSend(op.socket, op.bytes) },
+        .log_write => |op| .{ .log_write = io.finishLogWrite(op.bytes) },
         .close => |op| close: {
             io.closeEntry(op.socket);
             break :close .{ .close = {} };
@@ -1008,6 +1125,20 @@ fn finishConnect(
     initSocketEntry(server_entry, io.adversary.inbox_bytes);
     client_entry.peer = @intCast(io.sockets.indexOf(server_entry));
     server_entry.peer = @intCast(io.sockets.indexOf(client_entry));
+    // Each end names the other, the way a kernel's socket pair does: the
+    // dialer's peer is what it dialed, the accepted socket's peer is the
+    // client that reached it. Ports climb so every simulated client is
+    // distinguishable in the access log; the wrap keeps that bounded
+    // rather than overflowing on a long-lived fuzz run.
+    client_entry.peer_address = address;
+    server_entry.peer_address = .{ .ip4 = .{
+        .bytes = client_ip_bytes,
+        .port = io.next_client_port,
+    } };
+    io.next_client_port = if (io.next_client_port == std.math.maxInt(u16))
+        client_port_base
+    else
+        io.next_client_port + 1;
     listener.accept_queue[listener.accept_queue_len] = io.socketHandle(server_entry);
     listener.accept_queue_len += 1;
     return io.socketHandle(client_entry);
@@ -1073,6 +1204,34 @@ fn finishSend(io: *SimIo, socket: Socket, bytes: []const u8) Io.SendError!u32 {
     return n;
 }
 
+/// Append to the virtual sink, short-writing like any other op (§9). The
+/// overflow branch is not a modeled behavior — it is the harness's tripwire
+/// for a scenario that outgrew `sink_bytes_max`, counted rather than
+/// asserted here so the failure is reported by the oracle that noticed the
+/// log was incomplete, not by a panic inside the backend.
+fn finishLogWrite(io: *SimIo, bytes: []const u8) Io.LogWriteError!u32 {
+    assert(bytes.len >= 1);
+    if (io.pending_log_write_errors > 0) {
+        io.pending_log_write_errors -= 1;
+        return error.Unexpected;
+    }
+    const free: u32 = @intCast(io.sink.len - io.sink_len);
+    const wanted: u32 = @min(@as(u32, @intCast(bytes.len)), free);
+    if (wanted == 0) {
+        io.sink_overflow_bytes += @intCast(bytes.len);
+        // A sink with no room still has to make progress, or the server's
+        // staging buffer never drains and the run deadlocks on a pending
+        // flush. Report the whole write as accepted and count what was lost.
+        return @intCast(bytes.len);
+    }
+    const n = io.partialLen(wanted);
+    @memcpy(io.sink[io.sink_len..][0..n], bytes[0..n]);
+    io.sink_len += n;
+    assert(io.sink_len <= io.sink.len);
+    assert(n >= 1);
+    return n;
+}
+
 fn deliverDueSignals(io: *SimIo) void {
     if (io.signal_callback == null) return;
     var index: u8 = 0;
@@ -1093,7 +1252,7 @@ fn earliestWakeNs(io: *const SimIo) u64 {
     var earliest: u64 = never_ns;
     for (io.pending[0..io.pending_count]) |completion| {
         const wake = switch (completion.op) {
-            .connect => completion.ready_at_ns,
+            .connect, .log_write => completion.ready_at_ns,
             .timer => |op| op.fire_at_ns,
             else => never_ns,
         };
@@ -1228,6 +1387,10 @@ fn initSocketEntry(entry: *SocketEntry, inbox_capacity: u32) void {
     entry.inbox.head = 0;
     entry.inbox.count = 0;
     entry.inbox.capacity = inbox_capacity;
+    // Overwritten by `finishConnect` for both ends of every pair it makes;
+    // the placeholder keeps a socket that somehow skipped that from
+    // reporting another connection's peer out of a recycled slot.
+    entry.peer_address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
 }
 
 fn closeEntry(io: *SimIo, socket: Socket) void {
@@ -1264,6 +1427,7 @@ fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) vo
         .close => 6000,
         .timer_cancel => 7000,
         .connect_cancel => 8000,
+        .log_write => |r| if (r) |n| 9000 + @as(u64, n) else |err| 10000 + @intFromError(err),
     };
     io.mix(detail);
 }

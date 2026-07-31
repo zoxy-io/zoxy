@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
+const constants = @import("constants.zig");
 const router = @import("http/router.zig");
 const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
@@ -204,6 +205,9 @@ pub const TestBed = struct {
         max_lifetime_ms: u32 = 0,
         connect_timeout_ms: u32 = 50,
         drain_deadline_ms: u32 = 1000,
+        /// Turn the §8 access log on. Off by default so every existing
+        /// scenario keeps paying nothing for it.
+        access_log: bool = false,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -234,8 +238,14 @@ pub const TestBed = struct {
             // L4 only: the §8 request deadline is an L7 exchange bound and
             // this bed never routes one.
             .request_timeout_ms = 0,
+            .access_log_sink = if (options.access_log) .stdout else null,
         };
-        try bed.server.init(arena, &bed.sim_io, &bed.config, options.server);
+        var server_options = options.server;
+        server_options.access_log_buffer_bytes = if (options.access_log)
+            constants.access_log_buffer_bytes_default
+        else
+            0;
+        try bed.server.init(arena, &bed.sim_io, &bed.config, server_options);
         try bed.server.start();
 
         bed.scenario = .{
@@ -787,4 +797,77 @@ test "teardown: a drain racing its own upstream dial peaks at four armed ops" {
         try std.testing.expectEqual(@as(u8, 4), bed.server.armed_ops_peak);
         try bed.expectDrained();
     }
+}
+
+test "relay: a completed L4 connection writes one line counting both directions" {
+    // The L4 half of the §8 access log. A connection, not a request, is
+    // the unit here — there is no smaller one — so the line covers the
+    // whole relay: who connected, which origin served, how long it lasted,
+    // and how many bytes crossed each way.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 3, .adversary = .{ .partial_io = true } },
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    const sink = bed.sim_io.sinkBytes();
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("access_log_lines"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("access_log_dropped"));
+    const line = std.mem.trimEnd(u8, sink, "\n");
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"l4\"") != null);
+    // Both peers said goodbye, which is the one L4 ending that is not a
+    // cut — every other way out leaves `aborted`.
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"cluster\":\"origin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"upstream\":\"127.0.0.1:9000\"") != null);
+    // The echo scenario sends the token up and reads it back down, so both
+    // counts are exactly its length — and they are *separate* counts, which
+    // a single total would have hidden.
+    var expected: [64]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        line,
+        try std.fmt.bufPrint(&expected, "\"bytes_in\":{d},", .{echo_token.len}),
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        line,
+        try std.fmt.bufPrint(&expected, "\"bytes_out\":{d},", .{echo_token.len}),
+    ) != null);
+    // The HTTP-only fields are absent on an L4 line, not empty.
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"status\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"path\"") == null);
+}
+
+test "relay: a connection reaped by the idle deadline is logged as aborted" {
+    // The negative space of the test above: a relay that never reached a
+    // clean two-way close must not read as one. `aborted` is the default
+    // precisely so every path that forgets to say otherwise says this.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 4 },
+        .idle_timeout_ms = 20,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    // `exchange = false`: the client connects and then says nothing, so
+    // the idle deadline is what ends it.
+    bed.startClients(1, false);
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("access_log_lines"));
+    const line = std.mem.trimEnd(u8, bed.sim_io.sinkBytes(), "\n");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"l4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"bytes_in\":0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"bytes_out\":0,") != null);
 }

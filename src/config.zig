@@ -52,6 +52,19 @@ pub const Config = struct {
     /// or null when no `admin` block is configured — the plane stays off.
     /// A static IP:port literal like every other bind (hostnames rejected).
     admin_bind: ?std.Io.net.IpAddress = null,
+    /// Where access-log lines go (§8), or null when no `access_log` block
+    /// is configured — the log stays off and reserves nothing.
+    access_log_sink: ?AccessLogSink = null,
+
+    /// Where the access log writes (§8). An enum with one arm today
+    /// because there is one sink: the process's own stdout, inherited
+    /// rather than opened, so the log costs no file descriptor and carries
+    /// no rotation story of its own — an operator pipes it wherever they
+    /// already send this process's output. Named rather than made a bare
+    /// boolean so a second sink is a new arm, not a new field.
+    pub const AccessLogSink = enum(u1) {
+        stdout,
+    };
 
     pub const Limits = struct {
         conn_slots: u32 = constants.conn_slots_default,
@@ -64,6 +77,14 @@ pub const Config = struct {
         /// headroom at the cost of a lower feasible conn-slot count. A value
         /// whose ring would exceed the compiled one is rejected at load.
         cq_fill_eighths: u32 = constants.cq_fill_eighths_default,
+        /// Bytes per access-log staging buffer, of which there are two
+        /// (§8). Larger buys more tolerance for a sink that has stalled,
+        /// at a fixed memory cost; smaller drops sooner. **Zero exactly
+        /// when the log is off**, which is how `accessLogBytes` reads
+        /// "reserves nothing" off this one number rather than needing the
+        /// sink beside it. Unlike the pool sizes it may be raised as well
+        /// as lowered: it is plain memory, not a share of a budgeted ring.
+        access_log_buffer_bytes: u32 = 0,
     };
 
     pub const Listener = struct {
@@ -118,6 +139,8 @@ pub const ValidationError = error{
     ClustersEmpty,
     ClustersOverLimit,
     ClusterNameDuplicate,
+    ClusterNameEmpty,
+    ClusterNameTooLong,
     ClusterPickUnknown,
     ListenerClusterOrRoutes,
     ListenerL4Routes,
@@ -153,7 +176,10 @@ pub const ValidationError = error{
     LimitUpstreamSlotsOutOfRange,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
+    LimitAccessLogBufferOutOfRange,
+    LimitAccessLogBufferWithoutSink,
     AdminBindInvalid,
+    AccessLogSinkUnknown,
 };
 
 pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
@@ -171,7 +197,12 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     const clusters = try resolveClusters(arena, &parsed.clusters);
     const listeners = try resolveListeners(arena, parsed.listeners, clusters);
     try validateTimeouts(&parsed.timeouts);
-    const limits = try resolveLimits(&parsed.limits, @intCast(listeners.len));
+    const access_log_sink = try resolveAccessLogSink(parsed.access_log);
+    const limits = try resolveLimits(
+        &parsed.limits,
+        @intCast(listeners.len),
+        access_log_sink != null,
+    );
     const admin_bind = try resolveAdminBind(parsed.admin);
 
     assert(listeners.len >= 1);
@@ -186,7 +217,20 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
         .request_timeout_ms = parsed.timeouts.request_ms,
         .limits = limits,
         .admin_bind = admin_bind,
+        .access_log_sink = access_log_sink,
     };
+}
+
+/// Resolve the optional access log (§8): absent means off — no staging
+/// buffers reserved, no lines emitted. A present block names its sink from
+/// a closed set, so an unknown value fails at load rather than silently
+/// logging somewhere the operator did not ask for.
+fn resolveAccessLogSink(
+    access_log_json: ?AccessLogJson,
+) ValidationError!?Config.AccessLogSink {
+    const access_log = access_log_json orelse return null;
+    return std.meta.stringToEnum(Config.AccessLogSink, access_log.sink) orelse
+        error.AccessLogSinkUnknown;
 }
 
 /// Resolve the optional admin/metrics listener (§8):
@@ -203,7 +247,11 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 /// relay-buffer count derives from the effective conn slots (a buffer
 /// beyond the slot count could never be acquired); a *specified* count
 /// above them is a contradiction and fails loudly.
-fn resolveLimits(limits_json: *const LimitsJson, listeners_count: u32) ValidationError!Config.Limits {
+fn resolveLimits(
+    limits_json: *const LimitsJson,
+    listeners_count: u32,
+    access_log_on: bool,
+) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     // Omitted limits default to the lean out-of-box sizes, not the
     // compiled ceilings (§5): a small footprint unless the operator opts
@@ -237,13 +285,40 @@ fn resolveLimits(limits_json: *const LimitsJson, listeners_count: u32) Validatio
     if (!constants.cqFillFits(conn_slots, upstream_slots, listeners_count, cq_fill_eighths)) {
         return error.LimitConnSlotsOverCqFill;
     }
+    // Zero exactly when the log is off, so the one number says both how
+    // big the staging buffers are and whether there are any (§8). A
+    // deployment that sized the buffers but never named a sink has asked
+    // for something contradictory, and is told so rather than quietly
+    // getting no log.
+    const access_log_buffer_bytes = try resolveAccessLogBuffer(
+        limits_json.access_log_buffer_bytes,
+        access_log_on,
+    );
     assert(relay_buffers <= conn_slots);
     return .{
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
         .upstream_slots = upstream_slots,
         .cq_fill_eighths = cq_fill_eighths,
+        .access_log_buffer_bytes = access_log_buffer_bytes,
     };
+}
+
+fn resolveAccessLogBuffer(
+    requested: ?u32,
+    access_log_on: bool,
+) ValidationError!u32 {
+    if (!access_log_on) {
+        if (requested != null) return error.LimitAccessLogBufferWithoutSink;
+        return 0;
+    }
+    const bytes = requested orelse constants.access_log_buffer_bytes_default;
+    if (bytes < constants.access_log_buffer_bytes_min or
+        bytes > constants.access_log_buffer_bytes_max)
+    {
+        return error.LimitAccessLogBufferOutOfRange;
+    }
+    return bytes;
 }
 
 // The strict parser binds JSON to these `*Json` DTOs. Each carries the
@@ -264,6 +339,8 @@ pub const ConfigJson = struct {
     /// Optional admin/metrics listener (§8); absent
     /// leaves the plane off.
     admin: ?AdminJson = null,
+    /// Optional access log (§8); absent leaves it off.
+    access_log: ?AccessLogJson = null,
 
     pub const schema_doc =
         "Startup config for the zoxy L4/L7 proxy. Encodes structure, enums, " ++
@@ -280,6 +357,23 @@ pub const ConfigJson = struct {
         .timeouts = .{ .desc = "Connection lifecycle deadlines (milliseconds)." },
         .limits = .{ .desc = "Optional pool sizes and the CQ-fill headroom knob; absent fields take the lean defaults." },
         .admin = .{ .desc = "Optional admin/metrics listener; absent leaves it off." },
+        .access_log = .{ .desc = "Optional per-request/per-connection JSON access log; absent leaves it off." },
+    };
+};
+
+pub const AccessLogJson = struct {
+    sink: []const u8,
+
+    pub const schema_doc =
+        "Optional access log. When present, zoxy writes one JSON object per " ++
+        "line for every HTTP exchange and every L4 connection; absent leaves " ++
+        "it off and reserves nothing. Lines are dropped, and counted, rather " ++
+        "than allowed to block the event loop when the sink cannot keep up.";
+    pub const schema_fields = .{
+        .sink = .{
+            .desc = "Where lines are written. `stdout` is the process's own standard output.",
+            .enum_type = Config.AccessLogSink,
+        },
     };
 };
 
@@ -299,6 +393,7 @@ pub const LimitsJson = struct {
     relay_buffers: ?u32 = null,
     upstream_slots: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
+    access_log_buffer_bytes: ?u32 = null,
 
     pub const schema_doc =
         "Optional pool sizes and the CQ-fill headroom knob; absent fields " ++
@@ -326,6 +421,13 @@ pub const LimitsJson = struct {
                 "but lowers the feasible connection-slot ceiling.",
             .minimum = constants.cq_fill_eighths_min,
             .maximum = constants.cq_fill_eighths_max,
+        },
+        .access_log_buffer_bytes = .{
+            .desc = "Bytes per access-log staging buffer, of which there are two; " ++
+                "larger tolerates a slower sink before lines are dropped. " ++
+                "Only valid alongside an `access_log` block.",
+            .minimum = constants.access_log_buffer_bytes_min,
+            .maximum = constants.access_log_buffer_bytes_max,
         },
     };
 };
@@ -665,7 +767,7 @@ pub const dto_types = .{
     ConfigJson,  ListenerJson,    RouteJson,    FilterJson,
     MatchJson,   HeaderMatchJson, ActionJson,   HeaderEditJson,
     RewriteJson, ClusterJson,     TimeoutsJson, LimitsJson,
-    AdminJson,
+    AdminJson,   AccessLogJson,
 };
 
 comptime {
@@ -690,6 +792,15 @@ fn resolveClusters(
             if (std.mem.eql(u8, previous.name, entry.name)) {
                 return error.ClusterNameDuplicate;
             }
+        }
+        // A name is an identifier an operator writes and the access log
+        // echoes (§8): bounding it is what keeps a log line's width a
+        // function of `constants.zig` rather than of the config file.
+        if (entry.name.len == 0) {
+            return error.ClusterNameEmpty;
+        }
+        if (entry.name.len > constants.cluster_name_bytes_max) {
+            return error.ClusterNameTooLong;
         }
         clusters[index] = .{
             .name = entry.name,
@@ -1845,4 +1956,113 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
             }
         }
     } else |_| {}
+}
+
+test "config: the access-log block resolves a sink, absent leaves it off" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
+
+    // Absent: the log stays off and reserves nothing. The buffer size is
+    // zero exactly then, which is how `accessLogBytes` reads "off" off one
+    // number instead of needing the sink beside it (§5, §8).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(), head ++ tail ++ "}");
+        try std.testing.expect(parsed.access_log_sink == null);
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.access_log_buffer_bytes);
+    }
+    // Present: the sink resolves and the staging buffers take the default.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\"}}",
+        );
+        try std.testing.expectEqual(Config.AccessLogSink.stdout, parsed.access_log_sink.?);
+        try std.testing.expectEqual(
+            constants.access_log_buffer_bytes_default,
+            parsed.limits.access_log_buffer_bytes,
+        );
+    }
+    // A sized buffer alongside a sink resolves verbatim.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\"}," ++
+                "\"limits\":{\"access_log_buffer_bytes\":65536}}",
+        );
+        try std.testing.expectEqual(@as(u32, 65536), parsed.limits.access_log_buffer_bytes);
+    }
+
+    // The sink vocabulary is closed: an unnamed one fails at load rather
+    // than silently logging somewhere the operator did not ask for.
+    try expectParseError(
+        error.AccessLogSinkUnknown,
+        head ++ tail ++ ",\"access_log\":{\"sink\":\"syslog\"}}",
+    );
+    // The block is strict like every other: `sink` required, extras rejected.
+    try expectParseError(error.MissingField, head ++ tail ++ ",\"access_log\":{}}");
+    try expectParseError(
+        error.UnknownField,
+        head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\",\"path\":\"/tmp/x\"}}",
+    );
+    // A buffer below one worst-case line would drop lines it had room for,
+    // which is the one thing a drop must never mean; above the ceiling is
+    // memory nobody asked to reserve.
+    try expectParseError(
+        error.LimitAccessLogBufferOutOfRange,
+        head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\"}," ++
+            "\"limits\":{\"access_log_buffer_bytes\":16}}",
+    );
+    try expectParseError(
+        error.LimitAccessLogBufferOutOfRange,
+        head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\"}," ++
+            "\"limits\":{\"access_log_buffer_bytes\":99999999}}",
+    );
+    // Sizing buffers for a log that was never turned on is a contradiction,
+    // and is told so rather than quietly getting no log.
+    try expectParseError(
+        error.LimitAccessLogBufferWithoutSink,
+        head ++ tail ++ ",\"limits\":{\"access_log_buffer_bytes\":65536}}",
+    );
+}
+
+test "config: a cluster name is bounded, because the access log echoes it" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"";
+    const long_name = "n" ** (constants.cluster_name_bytes_max + 1);
+    const at_limit = "n" ** constants.cluster_name_bytes_max;
+
+    // At the cap it resolves; one byte over fails. Without the bound a log
+    // line's width would be a function of the config file rather than of
+    // constants.zig (§8).
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ at_limit ++ "\"}],\"clusters\":{\"" ++ at_limit ++
+                "\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+                "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+        );
+        try std.testing.expectEqual(@as(usize, constants.cluster_name_bytes_max), parsed.clusters[0].name.len);
+    }
+    try expectParseError(
+        error.ClusterNameTooLong,
+        head ++ long_name ++ "\"}],\"clusters\":{\"" ++ long_name ++
+            "\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+    );
+    // An empty name names nothing and would render as `"cluster":""`.
+    try expectParseError(
+        error.ClusterNameEmpty,
+        head ++ "\"}],\"clusters\":{\"\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+    );
 }

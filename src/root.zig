@@ -4,6 +4,7 @@
 
 const std = @import("std");
 
+pub const access_log = @import("access_log.zig");
 pub const balancer = @import("balancer.zig");
 pub const config = @import("config.zig");
 pub const config_schema = @import("config_schema.zig");
@@ -32,6 +33,7 @@ pub const testing = struct {
 };
 
 test {
+    _ = access_log;
     _ = balancer;
     _ = config;
     _ = config_schema;
@@ -57,5 +59,6 @@ test {
     _ = @import("server_test.zig");
     _ = @import("http_proxy_test.zig");
     _ = @import("admin_test.zig");
+    _ = @import("access_log_test.zig");
     _ = @import("zero_alloc_test.zig");
 }

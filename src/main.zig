@@ -225,6 +225,7 @@ fn printBudgets(
         limits.upstream_slots,
         @intCast(config.listeners.len),
     );
+    const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
     const memory_total = constants.memoryBytesTotal(&.{
         .conn_slots = limits.conn_slots,
         .conn_bytes = @sizeOf(ServerXev.ConnType),
@@ -232,17 +233,18 @@ fn printBudgets(
         .relay_buffer_pair_bytes = @sizeOf(zoxy.RelayBuffer),
         .upstream_slots = limits.upstream_slots,
         .upstream_bytes = @sizeOf(UpstreamType),
+        .access_log_bytes = access_log_bytes,
     });
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;
     try writer.print(
         \\zoxy budgets (closed-form, DESIGN.md §5/§8):
-        \\  memory  pools {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
-        \\          + upstream slots {d} x {d} B
+        \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
+        \\          + upstream slots {d} x {d} B + access log {d} KiB
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
-        \\  config  {d} listener(s), {d} cluster(s)
+        \\  config  {d} listener(s), {d} cluster(s), access log {s}
         \\
     , .{
         memory_total / 1024,
@@ -252,12 +254,14 @@ fn printBudgets(
         @sizeOf(zoxy.RelayBuffer),
         limits.upstream_slots,
         @sizeOf(UpstreamType),
+        access_log_bytes / 1024,
         fds_required,
         constants.ring_entries,
         cq_entries,
         in_flight,
         config.listeners.len,
         config.clusters.len,
+        if (config.access_log_sink) |sink| @tagName(sink) else "off",
     });
     try writer.flush();
 }
@@ -271,6 +275,21 @@ fn installSignalHandlers() void {
     std.posix.sigaction(.TERM, &action, null);
     std.posix.sigaction(.INT, &action, null);
     std.posix.sigaction(.USR1, &action, null);
+    // A proxy must not die because something downstream of it went away.
+    // The access log writes to a pipe the operator owns (§8), and a `write`
+    // to a pipe with no reader raises SIGPIPE, whose default action is to
+    // terminate — an operator closing `zoxy config.json | jq` would take
+    // the data path with it. Ignoring it turns that into the EPIPE the
+    // sink already handles by declaring itself broken. Socket sends are
+    // covered too: io_uring sets MSG_NOSIGNAL for them, but a proxy
+    // relying on that for its liveness is relying on a detail of a
+    // dependency's submission path.
+    const ignore = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &ignore, null);
 }
 
 /// Async-signal-safe: delegates to the seam's atomic-mask + eventfd wake

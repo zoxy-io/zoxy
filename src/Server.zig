@@ -12,6 +12,7 @@
 
 const std = @import("std");
 
+const access_log_module = @import("access_log.zig");
 const admin_module = @import("admin.zig");
 const Balancer = @import("balancer.zig").Balancer;
 const config_module = @import("config.zig");
@@ -86,10 +87,16 @@ pub fn Server(comptime IoType: type) type {
         /// reserved scrape slot off the shared pools, budgeted separately
         /// (`constants.admin_*`). Off unless a bind is set before `start`.
         admin: admin_module.Admin(IoType),
+        /// The access log (§8): one JSON line per exchange and per L4
+        /// connection, off unless the config names a sink. It holds one
+        /// ring op and two staging buffers, both reserved unconditionally
+        /// in the budgets and allocated only when it is on.
+        access_log: AccessLogType,
 
         const Self = @This();
 
         pub const ConnType = conn_module.Conn(IoType);
+        pub const AccessLogType = access_log_module.AccessLog(IoType);
         const Proxy = proxy.Proxy(IoType);
 
         /// Pool sizes are injectable so tests and the simulator can force
@@ -157,6 +164,8 @@ pub fn Server(comptime IoType: type) type {
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
             server.admin.init(server, config.admin_bind);
+            server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
+            try server.access_log.reserve(arena);
         }
 
         /// Override the admin/metrics bind before `start` — the simulator
@@ -249,6 +258,11 @@ pub fn Server(comptime IoType: type) type {
             // An in-flight scrape holds no pool slot but does hold an armed
             // op and the admin fd; the loop must not stop until it drains.
             if (!server.admin.isQuiescent()) return;
+            // Nor until the access log has flushed: the lines describing
+            // the drain are the ones an operator is most likely to be
+            // reading, and stopping the loop over an armed sink write
+            // would lose exactly those (§8).
+            if (!server.access_log.isQuiescent()) return;
             assert(server.relay_buffers.isFullyReleased());
             // beginDrain reaped every parked slot synchronously and no
             // conn is left to lease one, so the pool must be empty.
@@ -310,7 +324,8 @@ pub fn Server(comptime IoType: type) type {
             return server.conns.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
-                server.admin.isQuiescent();
+                server.admin.isQuiescent() and
+                server.access_log.isQuiescent();
         }
 
         pub fn activeCount(server: *const Self) u32 {
@@ -555,6 +570,10 @@ pub fn Server(comptime IoType: type) type {
                 buffer,
                 entryState(listener.protocol),
                 listener.cluster_index,
+                listener.protocol,
+                // Asked once, here, and kept: at log time the socket may
+                // already be closed (§8).
+                server.io.peerAddress(client_socket),
             );
             server.io.setNodelay(client_socket) catch |err| {
                 server.witnessKernelPressure(.set_option, err);
@@ -604,8 +623,13 @@ pub fn Server(comptime IoType: type) type {
             // L4 dials hold no Upstream slot, so the load table reflects
             // L7 leases only — the P2C draw still spreads L4 dials by the
             // observed L7 load, and evenly when there is none.
+            const pick = server.balancer.pick(cluster_index, &server.upstreams.leased_counts);
+            // An L4 dial holds no slot to record the endpoint on, so the
+            // access log takes it here — the only place that knows which
+            // origin this connection is being relayed to (§8).
+            conn.log.endpoint_index = pick.endpoint_index;
             server.io.connect(
-                server.balancer.pick(cluster_index, &server.upstreams.leased_counts).address,
+                pick.address,
                 &conn.op_connect.completion,
                 ConnType,
                 conn,
@@ -716,9 +740,88 @@ pub fn Server(comptime IoType: type) type {
             }
             assert(conn.relay_buffer == null);
             assert(conn.upstream == null);
+            // The last chance to say anything about this connection (§8).
+            // An exchange that reached a verdict already spoke and is
+            // skipped by `emitted`; what is left here is everything that
+            // ended without one — a client that left mid-request, a
+            // truncated body, a drain straggler — and every L4 connection,
+            // whose whole life is the unit being logged.
+            server.logExchange(conn);
             server.releaseConn(conn);
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
+        }
+
+        /// Start this connection's access-log clock, if it owes a line and
+        /// has not started one (§8). The L7 path calls it when a request's
+        /// first head byte lands — which is when the request begins, not
+        /// when its head finishes parsing, so a slowloris's line reports
+        /// the whole time it spent dribbling.
+        pub fn beginLogRequest(server: *Self, conn: *ConnType) void {
+            if (server.access_log.sink == null) return;
+            if (conn.log.started_wall_ns != 0) return;
+            conn.log.started_wall_ns = server.io.nowWallNs();
+            assert(conn.log.started_wall_ns != 0);
+        }
+
+        /// Write the access-log line this connection owes, if any (§8).
+        ///
+        /// The caller sets `conn.log.status` and `conn.log.outcome` when it
+        /// knows them; the defaults — status 0, outcome `aborted` — are
+        /// deliberately the answer for the caller that does not, which is
+        /// teardown. That is what lets one function serve both the path
+        /// that decided an outcome and the path that never got one, with
+        /// `emitted` deciding which of the two speaks for an exchange that
+        /// took both.
+        pub fn logExchange(server: *Self, conn: *ConnType) void {
+            if (server.access_log.sink == null) return;
+            if (conn.log.emitted) return;
+            // Nothing was asked of this connection: an L7 slot that idled
+            // out between requests, or one reaped before its first byte.
+            if (conn.log.started_wall_ns == 0) return;
+            conn.log.emitted = true;
+            const now_wall_ns = server.io.nowWallNs();
+            // Both indices are pool/config positions this connection has
+            // carried since routing; a stale one would name another
+            // operator's backend in the line, so they are checked here
+            // rather than left to Zig's bounds check to turn into a panic.
+            assert(conn.cluster_index < server.config.clusters.len);
+            const cluster = server.config.clusters[conn.cluster_index];
+            if (conn.log.endpoint_index != conn_module.LogState.endpoint_none) {
+                assert(conn.log.endpoint_index < cluster.endpoints.len);
+            }
+            const entry: access_log_module.Record = .{
+                .kind = switch (conn.protocol) {
+                    .l4 => .l4,
+                    .http => .http,
+                },
+                .outcome = conn.log.outcome,
+                .started_wall_ns = conn.log.started_wall_ns,
+                // Saturating: the wall clock can step backwards under NTP,
+                // and a duration that wrapped to eighteen quintillion
+                // microseconds would be read as a stall that never happened.
+                .duration_ns = now_wall_ns -| conn.log.started_wall_ns,
+                .client = conn.client_address,
+                .upstream = if (conn.log.endpoint_index == conn_module.LogState.endpoint_none)
+                    null
+                else
+                    cluster.endpoints[conn.log.endpoint_index],
+                .cluster = cluster.name,
+                .bytes_in = conn.log.bytes_in,
+                .bytes_out = conn.log.bytes_out,
+                .method = conn.log.methodSlice(),
+                .host = conn.log.hostSlice(),
+                .path = conn.log.pathSlice(),
+                .status = conn.log.status,
+                .upstream_reused = conn.l7.upstream_was_reused,
+                .upstream_replayed = conn.l7.replay_used,
+            };
+            // A duration is never negative once saturated, and a line
+            // always names a start: both are what `renderLine` prints
+            // without checking, so they are checked here.
+            assert(entry.started_wall_ns != 0);
+            assert(entry.duration_ns <= now_wall_ns);
+            server.access_log.record(&entry);
         }
 
         /// §8 kernel-pressure rung: a non-orderly op failure on a live

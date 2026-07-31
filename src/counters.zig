@@ -145,6 +145,26 @@ pub const Counters = struct {
     /// Admin scrapes reaped by the scrape deadline before completing — a
     /// stalled or slowloris client freed from the single reserved slot (§8).
     admin_reaped: Value = Value.init(0),
+    /// Access-log lines rendered and accepted into a staging buffer (§8),
+    /// and lines dropped because there was no room for them or the sink
+    /// had already failed. Every loggable outcome increments exactly one
+    /// of the two, so their sum is how many exchanges and connections the
+    /// log had to describe — the identity the simulator checks.
+    ///
+    /// A drop is backpressure, not a bug: the sink is a pipe an operator
+    /// owns, and §8's answer to a resource running out is to shed the
+    /// newest work rather than to block. A nonzero `access_log_dropped`
+    /// says the log is incomplete and by how much; a rising one says the
+    /// sink cannot keep up with the request rate.
+    access_log_lines: Value = Value.init(0),
+    access_log_dropped: Value = Value.init(0),
+    /// Sink writes that failed (§8). At most one is ever recorded: the
+    /// first failure marks the sink broken, because what reaches here is a
+    /// closed pipe or a dead file rather than a transient — the ring
+    /// already absorbed every would-block. Nonzero therefore means two
+    /// things at once: some already-accepted lines never reached the sink,
+    /// and every line since has been counted as dropped.
+    access_log_write_failed: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).
