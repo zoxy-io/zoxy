@@ -25,6 +25,7 @@ const std = @import("std");
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const Io = @import("../io/io.zig");
+const parser = @import("../http/parser.zig");
 const upstream = @import("upstream.zig");
 
 const assert = std.debug.assert;
@@ -55,9 +56,27 @@ pub fn Checker(comptime IoType: type) type {
         cursor_cluster: u16,
         cursor_endpoint: u16,
         /// The in-flight probe's outcome, decided by whichever of the
-        /// dial or its deadline lands first; applied only once every
-        /// armed op has drained (the §5 release discipline).
+        /// dial, its data legs, or its deadline lands first; applied only
+        /// once every armed op has drained (the §5 release discipline).
         pending_verdict: Verdict,
+        /// The http probe's socket, held across its send and recv legs.
+        /// Null for a tcp probe, which closes inline in the dial's own
+        /// delivery — it wanted the SYN/ACK, not a connection.
+        probe_socket: ?IoType.Socket,
+        /// Whether this probe's socket has been shut down already. Data
+        /// ops are never canceled (§4/§5): a deadline or a drain that
+        /// must end an armed send or recv shuts the socket down instead,
+        /// which makes the op complete — and must do so exactly once.
+        probe_shutdown: bool,
+        /// The rendered request, and how much of it has gone out.
+        request: [constants.health_check_request_bytes_max]u8,
+        request_len: u32,
+        request_sent: u32,
+        /// The response head as it accumulates. Sized to what the data
+        /// path's own parser accepts, so a head this proxy would forward
+        /// is never one the probe rejects for being too big.
+        response: [constants.head_bytes_max]u8,
+        response_len: u32,
         armed: Armed,
         /// Ops a cancel was already spent on (never `.cancel` itself):
         /// what keeps the serialized drain from re-canceling an op whose
@@ -65,6 +84,11 @@ pub fn Checker(comptime IoType: type) type {
         canceled: Armed,
         op_rest: IoType.Completion,
         op_connect: IoType.Completion,
+        /// The http probe's two data legs. They never co-arm — the
+        /// request goes out in full before a byte is read — so one
+        /// completion each is the whole story.
+        op_send: IoType.Completion,
+        op_recv: IoType.Completion,
         op_deadline: IoType.Completion,
         /// The one cancel completion, reused across targets — legal
         /// because cancels are serialized (`armed.cancel` gates every
@@ -94,13 +118,18 @@ pub fn Checker(comptime IoType: type) type {
 
         /// One bit per embedded op; the prober is quiescent only when
         /// clear. At most three are ever set (`health_probe_ops_max`):
-        /// rest never co-arms with the probe ops, and the cancel is
-        /// serialized.
-        pub const Armed = packed struct(u4) {
+        /// rest never co-arms with a probe, the probe's own legs run one
+        /// at a time (dial, then send, then recv), and the cancel is
+        /// serialized — so the peak is one leg + the deadline + one
+        /// cancel however far an http probe gets.
+        pub const Armed = packed struct(u8) {
             rest: bool = false,
             connect: bool = false,
+            send: bool = false,
+            recv: bool = false,
             deadline: bool = false,
             cancel: bool = false,
+            _pad: u2 = 0,
         };
 
         pub fn init(checker: *Self, server: *ServerType) void {
@@ -114,10 +143,17 @@ pub fn Checker(comptime IoType: type) type {
             checker.cursor_cluster = 0;
             checker.cursor_endpoint = 0;
             checker.pending_verdict = .none;
+            checker.probe_socket = null;
+            checker.probe_shutdown = false;
+            checker.request_len = 0;
+            checker.request_sent = 0;
+            checker.response_len = 0;
             checker.armed = .{};
             checker.canceled = .{};
             checker.op_rest = .{};
             checker.op_connect = .{};
+            checker.op_send = .{};
+            checker.op_recv = .{};
             checker.op_deadline = .{};
             checker.op_cancel = .{};
             const clusters = server.config.clusters;
@@ -171,7 +207,7 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         pub fn armedCount(checker: *const Self) u32 {
-            return @popCount(@as(u4, @bitCast(checker.armed)));
+            return @popCount(@as(u8, @bitCast(checker.armed)));
         }
 
         fn startSweep(checker: *Self) void {
@@ -250,10 +286,23 @@ pub fn Checker(comptime IoType: type) type {
         fn onProbeConnect(checker: *Self, result: Io.ConnectError!IoType.Socket) void {
             assert(checker.armed.connect);
             checker.armed.connect = false;
-            // A socket that arrived is closed on the spot whatever the
-            // state: the probe wanted the SYN/ACK verdict, not a
-            // connection, and an unstored socket cannot leak (§9).
+            const http_check = checker.state == .probing and
+                checker.pending_verdict == .none and
+                checker.checkOf(checker.cursor_cluster).kind == .http;
             if (result) |socket| {
+                if (http_check) {
+                    // The http probe's dial is the beginning of the
+                    // probe, not its verdict: the socket is stored and
+                    // carries the request and response legs.
+                    checker.probe_socket = socket;
+                    checker.beginRequest(socket);
+                    checker.settle();
+                    return;
+                }
+                // A tcp probe wanted the SYN/ACK, not a connection — and
+                // a socket that was never stored cannot leak (§9). The
+                // same holds for a dial that lands after its own verdict
+                // or into a drain: there is nothing left to send it.
                 checker.server.io.closeNow(socket);
             } else |_| {}
             if (checker.state == .stopping) {
@@ -282,10 +331,165 @@ pub fn Checker(comptime IoType: type) type {
                     checker.server.witnessKernelPressure(.connect, err);
                 },
             }
-            if (checker.armed.deadline and !checker.armed.cancel) {
-                checker.armCancelDeadline();
+            checker.settle();
+        }
+
+        /// Render this probe's request and start writing it. The render
+        /// cannot fail: `health_check_request_bytes_max` is derived from
+        /// the path and Host bounds the loader already enforced (§5).
+        fn beginRequest(checker: *Self, socket: IoType.Socket) void {
+            assert(checker.state == .probing);
+            assert(!checker.armed.send);
+            assert(!checker.armed.recv);
+            const check = checker.checkOf(checker.cursor_cluster);
+            assert(check.kind == .http);
+            const http = check.http.?;
+            const cluster = &checker.server.config.clusters[checker.cursor_cluster];
+            const endpoint = cluster.endpoints[checker.cursor_endpoint];
+            // `Connection: close` because the probe never reuses this
+            // socket: it asks one question and hangs up, which also frees
+            // the origin from parking a connection nobody will return to.
+            const rendered = if (http.host) |host|
+                std.fmt.bufPrint(
+                    &checker.request,
+                    "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+                    .{ http.path, host },
+                ) catch unreachable
+            else
+                std.fmt.bufPrint(
+                    &checker.request,
+                    "GET {s} HTTP/1.1\r\nHost: {f}\r\nConnection: close\r\n\r\n",
+                    .{ http.path, endpoint },
+                ) catch unreachable;
+            checker.request_len = @intCast(rendered.len);
+            checker.request_sent = 0;
+            checker.response_len = 0;
+            assert(checker.request_len >= 1);
+            checker.armSend(socket);
+        }
+
+        fn armSend(checker: *Self, socket: IoType.Socket) void {
+            assert(checker.state == .probing);
+            assert(!checker.armed.send);
+            assert(checker.request_sent < checker.request_len);
+            checker.armed.send = true;
+            checker.server.io.send(
+                socket,
+                checker.request[checker.request_sent..checker.request_len],
+                &checker.op_send,
+                Self,
+                checker,
+                onProbeSend,
+            );
+            assert(checker.armedCount() <= constants.health_probe_ops_max);
+        }
+
+        fn onProbeSend(checker: *Self, result: Io.SendError!u32) void {
+            assert(checker.armed.send);
+            checker.armed.send = false;
+            if (checker.state == .stopping) {
+                checker.continueStop();
+                return;
+            }
+            assert(checker.state == .probing);
+            const sent = result catch |err| {
+                // The origin hung up on the request, or the deadline shut
+                // this socket down. Either way the probe has its answer.
+                if (checker.pending_verdict == .none) {
+                    checker.pending_verdict = .fail;
+                    checker.server.witnessKernelPressure(.send, err);
+                }
+                checker.settle();
+                return;
+            };
+            checker.request_sent += sent;
+            assert(checker.request_sent <= checker.request_len);
+            // A verdict already reached (the deadline fired and shut this
+            // socket down) ends the probe here: arming another leg would
+            // only spend an op to be told what is already known.
+            if (checker.pending_verdict == .none) {
+                const socket = checker.probe_socket.?;
+                if (checker.request_sent < checker.request_len) {
+                    // A short write is ordinary (§6): resume where it left off.
+                    checker.armSend(socket);
+                } else {
+                    checker.armRecv(socket);
+                }
             }
             checker.settle();
+        }
+
+        fn armRecv(checker: *Self, socket: IoType.Socket) void {
+            assert(checker.state == .probing);
+            assert(!checker.armed.recv);
+            assert(checker.response_len < checker.response.len);
+            checker.armed.recv = true;
+            checker.server.io.recv(
+                socket,
+                checker.response[checker.response_len..],
+                &checker.op_recv,
+                Self,
+                checker,
+                onProbeRecv,
+            );
+            assert(checker.armedCount() <= constants.health_probe_ops_max);
+        }
+
+        fn onProbeRecv(checker: *Self, result: Io.RecvError!u32) void {
+            assert(checker.armed.recv);
+            checker.armed.recv = false;
+            if (checker.state == .stopping) {
+                checker.continueStop();
+                return;
+            }
+            assert(checker.state == .probing);
+            const received = result catch |err| {
+                // EOF or reset before a whole head arrived: an origin
+                // that hangs up mid-status has not answered the check.
+                if (checker.pending_verdict == .none) {
+                    checker.pending_verdict = .fail;
+                    checker.server.witnessKernelPressure(.recv, err);
+                }
+                checker.settle();
+                return;
+            };
+            checker.response_len += received;
+            assert(checker.response_len <= checker.response.len);
+            if (checker.pending_verdict == .none) {
+                checker.judgeResponse();
+            }
+            if (checker.pending_verdict == .none) {
+                // The head is still arriving. A full buffer with no head
+                // in it is the §7 oversize-head verdict, not a shortfall.
+                if (checker.response_len == checker.response.len) {
+                    checker.pending_verdict = .fail;
+                } else {
+                    checker.armRecv(checker.probe_socket.?);
+                }
+            }
+            checker.settle();
+        }
+
+        /// Judge what has arrived so far, leaving the verdict `.none`
+        /// while the head is merely incomplete. The head parser is the
+        /// data path's own (§7), so a probe accepts exactly the responses
+        /// this proxy would forward — and nothing it would reject.
+        fn judgeResponse(checker: *Self) void {
+            assert(checker.state == .probing);
+            assert(checker.pending_verdict == .none);
+            const expect_status = checker.checkOf(checker.cursor_cluster).http.?.expect_status;
+            var storage: parser.HeaderStorage = undefined;
+            const head = parser.parseResponseHead(
+                checker.response[0..checker.response_len],
+                false,
+                &storage,
+                .get,
+            ) catch |err| {
+                if (err == error.Incomplete) return;
+                checker.pending_verdict = .fail;
+                return;
+            };
+            checker.pending_verdict = if (head.status == expect_status) .pass else .fail;
         }
 
         fn onProbeDeadline(checker: *Self, result: Io.TimerError!void) void {
@@ -299,15 +503,12 @@ pub fn Checker(comptime IoType: type) type {
             assert(checker.state == .probing);
             if (result) |_| {
                 if (checker.pending_verdict == .none) {
-                    // Fired first: the dial outlived its budget — the
-                    // probe fails and the dial is torn down so even a
-                    // black-holed endpoint reaches a terminal
-                    // completion (§5).
+                    // Fired first: the probe outlived its budget. It
+                    // fails, and whatever leg is armed is forced to a
+                    // terminal completion so even a black-holed endpoint
+                    // or a mute origin releases the prober (§5).
                     checker.pending_verdict = .fail;
-                    assert(checker.armed.connect);
-                    if (!checker.armed.cancel) {
-                        checker.armCancelConnect();
-                    }
+                    checker.endArmedLeg();
                 }
                 // Otherwise the fire raced its own cancel (a legal §4
                 // race): the outcome is decided, this delivery is op
@@ -330,13 +531,54 @@ pub fn Checker(comptime IoType: type) type {
             checker.settle();
         }
 
+        /// End whichever leg is armed, by the only means each allows: a
+        /// dial takes the one legal cancel (§4), while a send or recv is
+        /// never canceled (§5) — shutting the socket down is what makes
+        /// it complete. Both are idempotent here, because a deadline and
+        /// a drain can each reach this for the same probe.
+        fn endArmedLeg(checker: *Self) void {
+            if (checker.armed.connect and !checker.armed.cancel and !checker.canceled.connect) {
+                checker.armCancelConnect();
+                return;
+            }
+            if ((checker.armed.send or checker.armed.recv) and !checker.probe_shutdown) {
+                checker.probe_shutdown = true;
+                checker.server.io.shutdown(checker.probe_socket.?, .both);
+            }
+        }
+
+        /// The probe's socket, once no op can reference it. Closing is
+        /// synchronous for the same reason `continueTeardown`'s is: by
+        /// here the armed set is empty, so nothing is left to deliver
+        /// against this fd (§5).
+        fn closeProbeSocket(checker: *Self) void {
+            assert(checker.armedCount() == 0);
+            if (checker.probe_socket) |socket| {
+                checker.server.io.closeNow(socket);
+                checker.probe_socket = null;
+            }
+            checker.probe_shutdown = false;
+        }
+
         /// The delivery that empties the armed set applies the verdict
         /// and moves the sweep along — never earlier, so no completion
         /// can land on a probe that already advanced (§5).
         fn settle(checker: *Self) void {
             assert(checker.state == .probing);
+            // A decided probe has no use for its budget. Cancelling here
+            // rather than at each verdict site is what makes every leg —
+            // dial, send, recv — advance the sweep the moment it knows,
+            // instead of idling until the deadline fires: an http probe
+            // that answered in a microsecond must not hold the prober
+            // for the whole `timeout_ms`.
+            if (checker.pending_verdict != .none and
+                checker.armed.deadline and !checker.armed.cancel)
+            {
+                checker.armCancelDeadline();
+            }
             if (checker.armedCount() != 0) return;
             assert(checker.pending_verdict != .none);
+            checker.closeProbeSocket();
             const verdict = checker.pending_verdict;
             checker.pending_verdict = .none;
             if (verdict == .pass) {
@@ -495,8 +737,19 @@ pub fn Checker(comptime IoType: type) type {
                 checker.armCancelConnect();
                 return;
             }
+            // A data leg takes no cancel op at all (§5): the shutdown
+            // makes it complete, and its delivery re-enters here. It
+            // therefore does not `return` — the shutdown consumes no
+            // completion to wait on, so the armed check below is what
+            // decides whether anything is still outstanding.
+            if ((checker.armed.send or checker.armed.recv) and !checker.probe_shutdown) {
+                checker.endArmedLeg();
+            }
             if (checker.armedCount() != 0) return;
             assert(checker.isQuiescent());
+            // Nothing can reference the probe's fd once every op has
+            // drained, which is what makes closing it here safe (§5).
+            checker.closeProbeSocket();
             checker.state = .stopped;
             checker.server.maybeStopAfterDrain();
         }
