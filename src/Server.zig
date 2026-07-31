@@ -137,6 +137,10 @@ pub fn Server(comptime IoType: type) type {
             /// The listener's §7 filter rules, handed to each admitted L7
             /// connection so `routeRequest` can evaluate policy.
             filters: []const filter.Rule,
+            /// The listener's §7 client-address forwarding mode (null = off),
+            /// handed over the same way: trust depends on what is in front
+            /// of this socket, so it cannot live on the cluster.
+            forwarded: ?config_module.Config.Listener.Forwarded,
             /// Copied from config so admission forks without reaching back
             /// through the listener index (§6, §7).
             protocol: config_module.Config.Listener.Protocol,
@@ -210,6 +214,7 @@ pub fn Server(comptime IoType: type) type {
                     .cluster_index = listener_config.routes[0].cluster_index,
                     .routes = listener_config.routes,
                     .filters = listener_config.filters,
+                    .forwarded = listener_config.forwarded,
                     .protocol = listener_config.protocol,
                     .accepting = false,
                 };
@@ -625,6 +630,7 @@ pub fn Server(comptime IoType: type) type {
             // rule rather than a third fork.
             conn.routes = listener.routes;
             conn.filters = listener.filters;
+            conn.forwarded = listener.forwarded;
             assert(conn.routes.len >= 1);
             server.storeDeadline(conn, server.entryTimeoutMs(listener.protocol));
             server.armDeadline(conn);

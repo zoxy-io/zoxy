@@ -317,6 +317,32 @@ pub const header_edits_max: u16 = 16;
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
 
+/// Bytes of inbound `X-Forwarded-For` chain an `append` listener will
+/// carry (§7). A chain grows by one address at every hop, and nothing in
+/// the protocol bounds it — so a client that sends a megabyte of forged
+/// hops would otherwise decide how much of this proxy's head buffer its
+/// request occupies. Past this the chain is dropped entirely and the line
+/// states only the observed peer, which is the `replace` behavior: the
+/// fail-safe direction, since the alternative is trusting a chain
+/// specifically shaped to be untrustworthy. Witnessed by
+/// `forwarded_chain_dropped`.
+///
+/// 512 bytes carries roughly a dozen IPv6 hops, past any real topology.
+pub const forwarded_chain_bytes_max: u16 = 512;
+
+/// Scratch for formatting one client address before the port is stripped
+/// (§7). Sized for the *formatted* form, not the bare one it yields:
+/// `[` + 39 bytes of IPv6 + `]:` + 5 port digits is 47, and 64 leaves the
+/// bound obviously sufficient rather than exactly so.
+pub const forwarded_client_bytes_max: u8 = 64;
+
+/// The whole `X-Forwarded-For` value one request may emit: the carried
+/// chain, the `", "` joining it, and the observed peer. Derived rather
+/// than chosen, so raising the chain bound cannot leave the buffer the
+/// value is assembled in one address short.
+pub const forwarded_value_bytes_max: u32 =
+    @as(u32, forwarded_chain_bytes_max) + 2 + forwarded_client_bytes_max;
+
 // -- the access log (§8) --
 //
 // One JSON line per L7 exchange and per L4 connection, written to the
@@ -658,6 +684,13 @@ comptime {
     // Two buffers exactly: the swap is what lets appends continue during
     // a write, and a third would be a queue nobody drains.
     assert(access_log_buffers == 2);
+    // A carried chain plus the address appended to it must still leave a
+    // head that can be rendered; both are a small fraction of the buffer
+    // the whole head has to fit in.
+    assert(forwarded_value_bytes_max < head_bytes_max);
+    // The scratch must hold a bracketed IPv6 literal with its port, which
+    // is what gets formatted before the port is stripped back off.
+    assert(forwarded_client_bytes_max >= 47);
     assert(access_log_ops_max >= 1);
     assert(access_log_path_bytes_max >= 16);
     assert(access_log_method_bytes_max >= 7); // "OPTIONS", the longest standard method.

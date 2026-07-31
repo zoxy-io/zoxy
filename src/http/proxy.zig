@@ -47,6 +47,37 @@ const shed = @import("../shed.zig");
 
 const assert = std.debug.assert;
 
+/// One address without its port, which is the only shape an
+/// `X-Forwarded-For` element may take (§7).
+///
+/// Formatted through the address type's own rendering and then stripped,
+/// rather than written out here, so an IPv6 address gets std's canonical
+/// `::` compression instead of a second spelling of it that could
+/// disagree with the one every other zoxy output uses.
+///
+/// At file scope, outside `Proxy(IoType)`: it depends on no backend, and
+/// the bracket handling is the fiddly part worth testing directly rather
+/// than only through a scenario whose clients happen to be IPv4.
+fn bareAddress(
+    address: *const std.Io.net.IpAddress,
+    scratch: *[constants.forwarded_client_bytes_max]u8,
+) []const u8 {
+    // The scratch is sized for the widest formatting — a bracketed IPv6
+    // literal with its port — which `constants.zig` asserts.
+    const text = std.fmt.bufPrint(scratch, "{f}", .{address.*}) catch unreachable;
+    assert(text.len >= 1);
+    if (text[0] == '[') {
+        // IPv6 is bracketed *because* it carries a port; the brackets
+        // exist to delimit it, so both come off together.
+        const close = std.mem.indexOfScalar(u8, text, ']') orelse unreachable;
+        assert(close >= 2);
+        return text[1..close];
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse unreachable;
+    assert(colon >= 1);
+    return text[0..colon];
+}
+
 pub fn Proxy(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const ConnType = conn_module.Conn(IoType);
@@ -661,10 +692,13 @@ pub fn Proxy(comptime IoType: type) type {
                 // verdict, answered like an oversize head.
                 return respond(server, conn, 431, "l7_headers_too_large");
             };
-            // No close announcement upstream: the connection is a parking
-            // candidate (§5), and stripping the client's Connection header
-            // already made persistence the wire default.
-            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, &upstream.head) catch {
+            var forwarded_scratch: [constants.forwarded_value_bytes_max]u8 = undefined;
+            const forwarded = planForwarded(server, conn, request, &forwarded_scratch);
+            // No close announcement upstream (the `false` below): the
+            // connection is a parking candidate (§5), and stripping the
+            // client's Connection header already made persistence the wire
+            // default.
+            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, forwarded, &upstream.head) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");
@@ -676,6 +710,87 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.request_leg = .sending_head;
             server.storeDeadline(conn, server.idleTimeoutMs());
             armRequestHeadSend(server, conn);
+        }
+
+        /// Resolve this listener's §7 client-address forwarding into the
+        /// bytes the render will write, or null when the listener leaves
+        /// `X-Forwarded-For` alone.
+        ///
+        /// **The trust decision is made here and only here.** `replace`
+        /// carries no chain, so an inbound one — which at the edge is
+        /// whatever the client felt like claiming — reaches the origin
+        /// nowhere. `append` carries it, which is correct exactly when
+        /// every hop in front is one the operator owns, and a forgery
+        /// otherwise. zoxy cannot tell those apart from the inside, which
+        /// is why this reads a configured mode rather than a heuristic.
+        ///
+        /// The result aliases `scratch`, which belongs to the caller's
+        /// frame, so it must be consumed before that frame returns — and
+        /// it is: the render runs on the next line.
+        fn planForwarded(
+            server: *ServerType,
+            conn: *const ConnType,
+            request: *const parser.RequestHead,
+            scratch: *[constants.forwarded_value_bytes_max]u8,
+        ) ?[]const u8 {
+            const mode = conn.forwarded orelse return null;
+            var len: u32 = switch (mode) {
+                .replace => 0,
+                .append => appendInboundChain(server, request, scratch),
+            };
+            assert(len <= constants.forwarded_chain_bytes_max);
+            if (len >= 1) {
+                @memcpy(scratch[len..][0..2], ", ");
+                len += 2;
+            }
+            var client_scratch: [constants.forwarded_client_bytes_max]u8 = undefined;
+            const client = bareAddress(&conn.client_address, &client_scratch);
+            assert(client.len >= 1);
+            // The scratch is the chain bound plus a separator plus the
+            // widest address, so a chain that fit leaves room for these.
+            assert(len + client.len <= scratch.len);
+            @memcpy(scratch[len..][0..client.len], client);
+            len += @intCast(client.len);
+            assert(len >= 1);
+            return scratch[0..len];
+        }
+
+        /// Copy the inbound chain an `append` listener carries forward
+        /// into the front of `scratch`, returning its length: every
+        /// `X-Forwarded-For` the client sent, joined in order, because RFC
+        /// 9110 makes repeated field lines equivalent to one comma-joined
+        /// value and keeping only the first would silently lose hops.
+        ///
+        /// Bounded, and the bound fails *safe*: a chain past
+        /// `forwarded_chain_bytes_max` is discarded entirely rather than
+        /// truncated, leaving the caller to state the observed peer alone.
+        /// A truncated chain would read as complete to the origin and is
+        /// not, which is worse than saying less.
+        fn appendInboundChain(
+            server: *ServerType,
+            request: *const parser.RequestHead,
+            scratch: *[constants.forwarded_value_bytes_max]u8,
+        ) u32 {
+            assert(request.headers.len <= constants.headers_max);
+            var len: u32 = 0;
+            for (request.headers) |*header| {
+                if (header.tag != .x_forwarded_for) continue;
+                if (header.value.len == 0) continue;
+                const separator: []const u8 = if (len == 0) "" else ", ";
+                // Against the *chain* bound, not the scratch: the tail of
+                // the buffer is reserved for the separator and address
+                // this chain is about to be joined with.
+                if (len + separator.len + header.value.len > constants.forwarded_chain_bytes_max) {
+                    server.counters.increment("forwarded_chain_dropped");
+                    return 0;
+                }
+                @memcpy(scratch[len..][0..separator.len], separator);
+                len += @intCast(separator.len);
+                @memcpy(scratch[len..][0..header.value.len], header.value);
+                len += @intCast(header.value.len);
+            }
+            assert(len <= constants.forwarded_chain_bytes_max);
+            return len;
         }
 
         fn armRequestHeadSend(server: *ServerType, conn: *ConnType) void {
@@ -1944,4 +2059,27 @@ pub fn Proxy(comptime IoType: type) type {
             };
         }
     };
+}
+
+test "forwarded: an address renders bare — no port, no brackets" {
+    // The value must be a plain X-Forwarded-For list element. A port would
+    // make it one no reader parses; brackets are IPv6-with-port syntax and
+    // have no meaning once the port is gone.
+    var scratch: [constants.forwarded_client_bytes_max]u8 = undefined;
+    const cases = [_]struct { literal: []const u8, bare: []const u8 }{
+        .{ .literal = "203.0.113.9:51000", .bare = "203.0.113.9" },
+        .{ .literal = "10.0.0.1:1", .bare = "10.0.0.1" },
+        // Compression is std's, not a second implementation of it.
+        .{ .literal = "[2001:db8::1]:443", .bare = "2001:db8::1" },
+        .{ .literal = "[::1]:80", .bare = "::1" },
+        // The widest form the scratch has to hold.
+        .{
+            .literal = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535",
+            .bare = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        },
+    };
+    for (cases) |case| {
+        const address = try std.Io.net.IpAddress.parseLiteral(case.literal);
+        try std.testing.expectEqualStrings(case.bare, bareAddress(&address, &scratch));
+    }
 }

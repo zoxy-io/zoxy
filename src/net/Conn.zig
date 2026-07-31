@@ -274,6 +274,9 @@ pub fn Conn(comptime IoType: type) type {
         /// The listener's §7 filter rules, same lifetime as `routes`
         /// (empty on L4 and when no filters are configured).
         filters: []const filter.Rule,
+        /// The listener's §7 client-address forwarding mode, same lifetime
+        /// as `routes`; null leaves `X-Forwarded-For` untouched.
+        forwarded: ?config_module.Config.Listener.Forwarded,
         /// The leased upstream slot during an L7 exchange; released at
         /// teardown alongside the conn slot (§5). Null outside exchanges
         /// and on the whole L4 path.
@@ -543,6 +546,7 @@ pub fn Conn(comptime IoType: type) type {
             // listener's real tables (§7); L4 never reads them.
             conn.routes = &.{};
             conn.filters = &.{};
+            conn.forwarded = null;
             conn.upstream = null;
             conn.charged_endpoint = LogState.endpoint_none;
             conn.charged_cluster = 0;

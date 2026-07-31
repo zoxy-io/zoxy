@@ -107,6 +107,15 @@ pub const Config = struct {
         /// Compiled and interpreted by `http/filter.zig`.
         filters: []const filter.Rule = &.{},
         protocol: Protocol,
+        /// How this listener tells the origin who the client is (§7), or
+        /// null to leave `X-Forwarded-For` exactly as it arrived — the
+        /// behavior every config had before this existed.
+        ///
+        /// Per *listener*, because the answer depends on what sits in
+        /// front of this socket rather than on which backend serves it:
+        /// the same cluster may be reachable from an edge listener that
+        /// must not trust an inbound chain and an internal one that must.
+        forwarded: ?Forwarded = null,
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
         /// `http` runs the HTTP/1.1 reverse-proxy state machine. The
@@ -115,6 +124,23 @@ pub const Config = struct {
         pub const Protocol = enum(u1) {
             l4,
             http,
+        };
+
+        /// What to do with an inbound `X-Forwarded-For` (§7). There is no
+        /// default and absence means "do nothing", because either answer
+        /// is a security bug in the other's position and a proxy cannot
+        /// tell from the inside which position it is in.
+        pub const Forwarded = enum(u1) {
+            /// State the peer this proxy actually observed, discarding
+            /// whatever arrived. The correct edge behavior: an inbound
+            /// chain is client-controlled there, so honoring it would let
+            /// a caller choose the address every downstream allowlist,
+            /// rate limiter and audit log then believes.
+            replace,
+            /// Extend the inbound chain with the observed peer. Correct
+            /// only where every hop in front is one you control —
+            /// anywhere else it is the forgery above, appended to.
+            append,
         };
     };
 
@@ -248,6 +274,8 @@ pub const ValidationError = error{
     RouteHostNotCanonical,
     RouteDuplicate,
     ListenerL4Filters,
+    ListenerL4Forwarded,
+    ListenerForwardedModeUnknown,
     FiltersOverLimit,
     FilterMethodEmpty,
     FilterMethodUnknown,
@@ -553,6 +581,9 @@ pub const ListenerJson = struct {
     filters: ?[]const FilterJson = null,
     /// Optional: absent means `l4`, keeping pre-L7 configs valid.
     protocol: []const u8 = "l4",
+    /// Optional §7 client-address forwarding; absent leaves the header
+    /// untouched. HTTP-only — an l4 relay has no header to carry it.
+    forwarded: ?ForwardedJson = null,
 
     pub const schema_doc =
         "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
@@ -572,6 +603,29 @@ pub const ListenerJson = struct {
         .protocol = .{
             .desc = "What the listener speaks: l4 relays bytes blindly, http runs the reverse-proxy state machine.",
             .enum_type = Config.Listener.Protocol,
+        },
+        .forwarded = .{
+            .desc = "Tell the origin the client's address via X-Forwarded-For " ++
+                "(http listeners only); absent leaves the header untouched.",
+        },
+    };
+};
+
+pub const ForwardedJson = struct {
+    mode: []const u8,
+
+    pub const schema_doc =
+        "How this listener sets `X-Forwarded-For`. There is no default, " ++
+        "because `replace` and `append` are each a security bug in the " ++
+        "other's position: an inbound chain is client-controlled at the " ++
+        "edge and authoritative behind a proxy you own, and zoxy cannot " ++
+        "tell from the inside which side of that line it is on.";
+    pub const schema_fields = .{
+        .mode = .{
+            .desc = "replace: state the observed peer, discarding any inbound chain " ++
+                "(use at the edge). append: extend the inbound chain with the observed " ++
+                "peer (use only when every hop in front is trusted).",
+            .enum_type = Config.Listener.Forwarded,
         },
     };
 };
@@ -977,10 +1031,11 @@ pub fn assert_meta_matches(comptime T: type) void {
 /// block below runs `assert_meta_matches` on each at comptime, so the
 /// metadata cannot drift from the fields whether or not the emitter builds.
 pub const dto_types = .{
-    ConfigJson,  ListenerJson,    RouteJson,    FilterJson,
-    MatchJson,   HeaderMatchJson, ActionJson,   HeaderEditJson,
-    RewriteJson, ClusterJson,     TimeoutsJson, LimitsJson,
-    AdminJson,   AccessLogJson,   CheckJson,    ClusterHashJson,
+    ConfigJson,    ListenerJson,    RouteJson,    FilterJson,
+    MatchJson,     HeaderMatchJson, ActionJson,   HeaderEditJson,
+    RewriteJson,   ClusterJson,     TimeoutsJson, LimitsJson,
+    AdminJson,     AccessLogJson,   CheckJson,    ClusterHashJson,
+    ForwardedJson,
 };
 
 comptime {
@@ -1084,6 +1139,7 @@ fn resolveListeners(
             .routes = try resolveRoutes(arena, &listener_json, clusters, protocol),
             .filters = try resolveFilters(arena, &listener_json, protocol),
             .protocol = protocol,
+            .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
         };
     }
     assert(listeners.len == listeners_json.len);
@@ -1317,6 +1373,16 @@ fn validateEditableHeaderName(name: []const u8) ParseError!void {
         if (std.ascii.eqlIgnoreCase(name, managed)) {
             return error.FilterHeaderNameReserved;
         }
+    }
+    // Reserved unconditionally, not only on listeners that set it (§7).
+    // A filter can only write a *constant*, so an edit naming this header
+    // encodes one fixed address for every client — it looks like client
+    // forwarding and is the opposite of it. Barring the name everywhere
+    // means one mechanism owns the header, and an operator reaching for
+    // the wrong one is told at load rather than believing a log full of
+    // identical addresses.
+    if (std.ascii.eqlIgnoreCase(name, render.forwarded_for_name)) {
+        return error.FilterHeaderNameReserved;
     }
 }
 
@@ -1552,6 +1618,23 @@ fn resolveMaxInflight(max_inflight: ?u32) ParseError!?u32 {
         return error.ClusterMaxInflightOutOfRange;
     }
     return cap;
+}
+
+/// Resolve a listener's §7 client-address forwarding: absent is off, and
+/// a `forwarded` block on an `l4` listener is rejected rather than
+/// ignored — a byte relay has no header to carry an address, so asking
+/// for one there describes a proxy that is not running, exactly like
+/// `filters` and `routes` on the same listener.
+fn resolveForwarded(
+    forwarded_json: ?ForwardedJson,
+    protocol: Config.Listener.Protocol,
+) ValidationError!?Config.Listener.Forwarded {
+    const forwarded = forwarded_json orelse return null;
+    if (protocol == .l4) {
+        return error.ListenerL4Forwarded;
+    }
+    return std.meta.stringToEnum(Config.Listener.Forwarded, forwarded.mode) orelse
+        error.ListenerForwardedModeUnknown;
 }
 
 /// The closed pick-policy vocabulary; anything else is its own error so
@@ -2710,5 +2793,82 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
             @as(?u32, constants.endpoint_inflight_max),
             parsed.clusters[0].max_inflight,
         );
+    }
+}
+
+test "config: the forwarded block resolves a mode, and is http-only" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+
+    // Absent: the header is untouched, which is what every config that
+    // predates this feature must keep doing.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(), head ++ ",\"protocol\":\"http\"" ++ tail);
+        try std.testing.expect(parsed.listeners[0].forwarded == null);
+    }
+    // Both modes resolve; neither is a default.
+    inline for (.{ "replace", "append" }) |mode| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ ",\"protocol\":\"http\",\"forwarded\":{\"mode\":\"" ++ mode ++ "\"}" ++ tail,
+        );
+        try std.testing.expectEqual(
+            std.meta.stringToEnum(Config.Listener.Forwarded, mode).?,
+            parsed.listeners[0].forwarded.?,
+        );
+    }
+
+    // An l4 listener has no header to carry an address, so asking for one
+    // describes a proxy that is not running — rejected, like `filters`.
+    try expectParseError(
+        error.ListenerL4Forwarded,
+        head ++ ",\"forwarded\":{\"mode\":\"replace\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerL4Forwarded,
+        head ++ ",\"protocol\":\"l4\",\"forwarded\":{\"mode\":\"replace\"}" ++ tail,
+    );
+    // The mode vocabulary is closed and `mode` is required: there is no
+    // safe default to fall back to, which is the whole point.
+    try expectParseError(
+        error.ListenerForwardedModeUnknown,
+        head ++ ",\"protocol\":\"http\",\"forwarded\":{\"mode\":\"trust\"}" ++ tail,
+    );
+    try expectParseError(
+        error.MissingField,
+        head ++ ",\"protocol\":\"http\",\"forwarded\":{}" ++ tail,
+    );
+}
+
+test "config: a filter may not name the header zoxy manages" {
+    // A filter edit can only write a *constant*, so naming this header
+    // encodes one fixed address for every client — it looks like client
+    // forwarding and is the opposite of it. Reserved unconditionally, not
+    // only on listeners that set it, so one mechanism owns the header.
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"filters\":[";
+    const tail = "]}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+
+    inline for (.{ "header_set", "header_add" }) |action| {
+        try expectParseError(error.FilterHeaderNameReserved, head ++
+            "{\"actions\":[{\"" ++ action ++
+            "\":{\"name\":\"X-Forwarded-For\",\"value\":\"1.2.3.4\"}}]}" ++ tail);
+    }
+    // Case-insensitively, per RFC 9110 field-name comparison.
+    try expectParseError(error.FilterHeaderNameReserved, head ++
+        "{\"actions\":[{\"header_remove\":\"x-forwarded-for\"}]}" ++ tail);
+    // A neighbouring name is still editable — the guard is the header, not
+    // a prefix of it.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(), head ++
+            "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-Proto\",\"value\":\"https\"}}]}" ++ tail);
+        try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].filters.len);
     }
 }

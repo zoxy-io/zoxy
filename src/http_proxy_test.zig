@@ -508,6 +508,10 @@ const Http1Bed = struct {
         /// scenarios are unfiltered. A test supplies compiled rules to
         /// drive the filter reject/edit paths.
         filters: []const filter.Rule = &.{},
+        /// The §7 client-address forwarding mode; null (the default)
+        /// leaves `X-Forwarded-For` untouched, as every pre-existing
+        /// scenario expects.
+        forwarded: ?config_module.Config.Listener.Forwarded = null,
         /// Turn the §8 access log on. Off by default so every existing
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
@@ -541,6 +545,7 @@ const Http1Bed = struct {
             .routes = &bed.routes,
             .filters = options.filters,
             .protocol = .http,
+            .forwarded = options.forwarded,
         }};
         bed.config = .{
             .listeners = &bed.listeners,
@@ -3090,4 +3095,171 @@ test "l7: a request past the endpoint cap is answered 503, not sent" {
     // The pool never ran out — that is a different rung with a different
     // fix, and confusing the two is what the separate counter prevents.
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_upstream_slots"));
+}
+
+/// The `X-Forwarded-For` line the origin received, or null when none
+/// reached it. Reads the forwarded head the origin actually parsed, so a
+/// header suppressed by the render is genuinely absent rather than merely
+/// unasserted.
+fn forwardedForSeenByOrigin(bed: *const Http1Bed) !?[]const u8 {
+    try std.testing.expect(bed.origin.conns[0].request_complete);
+    var storage: parser.HeaderStorage = undefined;
+    const head = try parser.parseRequestHead(
+        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
+        false,
+        &storage,
+    );
+    var seen: ?[]const u8 = null;
+    for (head.headers) |header| {
+        if (header.tag != .x_forwarded_for) continue;
+        // Exactly one must reach the origin: a second would let the
+        // backend pick whichever it read first and disagree with the
+        // next hop about who the client is.
+        try std.testing.expect(seen == null);
+        seen = header.value;
+    }
+    return seen;
+}
+
+test "l7: forwarded replace states the observed peer and discards a forged chain" {
+    // The edge case, in both senses. An inbound chain is client-controlled
+    // here, so honoring any part of it would let the caller choose the
+    // address every downstream allowlist and audit log then believes.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 40,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .forwarded = .replace,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET / HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 1.2.3.4, 9.9.9.9\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+    try bed.expectDrained();
+
+    // SimIo hands each virtual client a distinct address from the
+    // TEST-NET-2 block; the port is deliberately absent from the value.
+    const seen = (try forwardedForSeenByOrigin(&bed)).?;
+    try std.testing.expectEqualStrings("198.51.100.1", seen);
+}
+
+test "l7: forwarded append extends the inbound chain in order" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 41,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .forwarded = .append,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET / HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 1.2.3.4, 9.9.9.9\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+    try bed.expectDrained();
+
+    const seen = (try forwardedForSeenByOrigin(&bed)).?;
+    try std.testing.expectEqualStrings("1.2.3.4, 9.9.9.9, 198.51.100.1", seen);
+}
+
+test "l7: repeated inbound X-Forwarded-For headers join in order" {
+    // RFC 9110 makes repeated field lines equivalent to one comma-joined
+    // value. Carrying only the first would silently drop hops, and the
+    // origin would read a chain that is short by however many it lost.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 42,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .forwarded = .append,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET / HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 1.1.1.1\r\n" ++
+            "X-Forwarded-For: 2.2.2.2\r\nConnection: close\r\n\r\n",
+    );
+    try bed.expectDrained();
+
+    const seen = (try forwardedForSeenByOrigin(&bed)).?;
+    try std.testing.expectEqualStrings("1.1.1.1, 2.2.2.2, 198.51.100.1", seen);
+}
+
+test "l7: an oversize inbound chain fails safe to the observed peer, and is counted" {
+    // A chain is client-supplied and the protocol bounds it nowhere, so it
+    // is a place a caller could otherwise decide how much of this proxy's
+    // head buffer their request occupies. Past the bound the chain is
+    // dropped whole rather than truncated: a truncated chain looks
+    // complete to the origin and is not, which is worse than saying less.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 43,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .forwarded = .append,
+        .inbox_bytes = constants.head_bytes_max,
+    });
+    defer bed.tearDown();
+
+    // One address repeated past `forwarded_chain_bytes_max`.
+    const hop = "10.0.0.1, ";
+    const hops = @divFloor(constants.forwarded_chain_bytes_max, hop.len) + 2;
+    var request: [constants.head_bytes_max]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&request);
+    try writer.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: ");
+    for (0..hops) |_| try writer.writeAll(hop);
+    try writer.writeAll("10.0.0.2\r\nConnection: close\r\n\r\n");
+    try bed.exchange(writer.buffered());
+    try bed.expectDrained();
+
+    const seen = (try forwardedForSeenByOrigin(&bed)).?;
+    try std.testing.expectEqualStrings("198.51.100.1", seen);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("forwarded_chain_dropped"),
+    );
+}
+
+test "l7: without a forwarded block the header travels untouched" {
+    // The default must stay bit-for-bit what it was before this existed:
+    // zoxy neither adds nor strips, and a client-supplied value reaches
+    // the origin exactly as sent — including a forged one, which is the
+    // operator's call to make by configuring a mode.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 44,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(
+        "GET / HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 1.2.3.4\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+    try bed.expectDrained();
+
+    const seen = (try forwardedForSeenByOrigin(&bed)).?;
+    try std.testing.expectEqualStrings("1.2.3.4", seen);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("forwarded_chain_dropped"),
+    );
+}
+
+test "l7: a client that sent no chain gets a line naming only itself" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 45,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        .forwarded = .append,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    try bed.expectDrained();
+
+    // No stray separator: `append` with nothing to append must not emit
+    // a leading comma the origin would read as an empty first hop.
+    const seen = (try forwardedForSeenByOrigin(&bed)).?;
+    try std.testing.expectEqualStrings("198.51.100.1", seen);
 }

@@ -373,7 +373,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     };
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
-    harness.wireListeners();
+    harness.wireListeners(deriveForwarded(random));
     harness.config = .{
         .listeners = &harness.listener_configs,
         .clusters = &harness.clusters,
@@ -513,7 +513,26 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
 /// so they fire only for the filter_* scripts and leave every other
 /// script's golden outcome untouched: reject `/reject`, add a header
 /// under `/edit`, rewrite `/rewrite` → `/sim`.
-fn wireListeners(harness: *Harness) void {
+///
+/// `forwarded` is the one drawn part: §7 client-address forwarding adds a
+/// rendered header on every request the listener serves, so it is a
+/// data-path state the sweep has to reach rather than leave to the
+/// directed tests. It cannot perturb a golden outcome — the scripts assert
+/// on what the *client* receives, and this only changes what the origin
+/// sees — and the origin oracle rejects malformed bytes either way.
+/// A third of seeds leave §7 forwarding off — the shape every config that
+/// predates it keeps — and the rest split between the two trust modes, so
+/// the render's suppression and the chain assembly both take the schedule
+/// fuzz rather than only the directed tests.
+fn deriveForwarded(random: std.Random) ?zoxy.config.Config.Listener.Forwarded {
+    return switch (random.uintLessThan(u8, 3)) {
+        0 => null,
+        1 => .replace,
+        else => .append,
+    };
+}
+
+fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
     harness.filters_http = .{
         .{
             .match = .{ .path_prefix = "/reject" },
@@ -535,6 +554,7 @@ fn wireListeners(harness: *Harness) void {
             .routes = &harness.routes_http,
             .filters = &harness.filters_http,
             .protocol = .http,
+            .forwarded = forwarded,
         },
     };
 }
