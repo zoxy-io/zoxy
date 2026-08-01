@@ -1202,12 +1202,7 @@ pub fn isForwardableByte(byte: u8) bool {
 }
 
 fn hexDigitValue(byte: u8) u4 {
-    return switch (byte) {
-        '0'...'9' => @intCast(byte - '0'),
-        'a'...'f' => @intCast(byte - 'a' + 10),
-        'A'...'F' => @intCast(byte - 'A' + 10),
-        else => unreachable, // Caller matched a hex digit.
-    };
+    return @intCast(hexNibble(byte) orelse unreachable); // Caller matched a hex digit.
 }
 
 // Tests. Head-parse cases go through the public wrapper only — hparse's
