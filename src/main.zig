@@ -83,19 +83,12 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    const config_bytes = std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        config_path,
-        arena,
-        .limited(zoxy.constants.config_bytes_max),
-    ) catch |err| {
-        std.debug.print("zoxy: cannot read config '{s}': {t}\n", .{ config_path, err });
-        return err;
-    };
-    const config = zoxy.config.parse(arena, config_bytes) catch |err| {
-        std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ args[1], err });
-        return err;
-    };
+    // Measured across the read, not assumed from the file size: the
+    // parse allocates its own structures beside the text it parses, and
+    // both live in the arena for the process's life (§5).
+    const arena_before = init.arena.queryCapacity();
+    const config = try readConfig(init.io, arena, config_path);
+    const config_arena_bytes = init.arena.queryCapacity() - arena_before;
 
     // fds and the ring are sized to the *effective* config, not the
     // compiled ceilings (§5, §8): a lean deployment neither demands the
@@ -117,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
     assert(fds_required <= zoxy.constants.fds_max);
     assert(cq_entries <= zoxy.constants.completion_queue_entries);
     try ensureFdBudget(fds_required);
-    try printBudgets(init.io, &config, fds_required, cq_entries);
+    try printBudgets(init.io, &config, fds_required, cq_entries, config_arena_bytes);
 
     try global_io.init(arena, cq_entries);
     var server: ServerXev = undefined;
@@ -131,6 +124,44 @@ pub fn main(init: std.process.Init) !void {
     assert(server.isIdle());
     const gauges = server.gauges();
     server.counters.dump(&gauges);
+}
+
+/// Read and parse the config file, or say on stderr why it cannot be.
+///
+/// The read is deliberately unlimited. The config is operator-provided
+/// at startup rather than attacker-controlled input, and its size is now
+/// the operator's own statement of how much startup arena this
+/// deployment should cost (§5) — there is no constant left to check it
+/// against, and none that could be justified.
+///
+/// What that trades away is worth stating plainly: a fixed cap failed a
+/// too-large file deterministically, and this does not. The arena runs
+/// over `std.heap.page_allocator`, so under Linux's default heuristic
+/// overcommit a large request can succeed at `mmap` and only fail as the
+/// read faults pages in — where the kernel's OOM killer, not a returned
+/// `OutOfMemory`, is what intervenes. The guarantee is therefore "the
+/// operator is told what their config cost" (the caller measures the
+/// arena across this call and the startup banner prints it), not "an
+/// oversized config is refused cleanly".
+fn readConfig(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config_path: []const u8,
+) !zoxy.config.Config {
+    assert(config_path.len >= 1);
+    const config_bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        config_path,
+        arena,
+        .unlimited,
+    ) catch |err| {
+        std.debug.print("zoxy: cannot read config '{s}': {t}\n", .{ config_path, err });
+        return err;
+    };
+    return zoxy.config.parse(arena, config_bytes) catch |err| {
+        std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ config_path, err });
+        return err;
+    };
 }
 
 /// What the command line asked for: run against a config, or one of the
@@ -248,6 +279,11 @@ fn printBudgets(
     config: *const zoxy.config.Config,
     fds_required: u32,
     cq_entries: u32,
+    /// What the config text and its parsed structures took from the
+    /// startup arena, measured (§5). Not closed-form like the pools —
+    /// it is whatever the operator's config file needed — which is
+    /// exactly why it is reported rather than derived.
+    config_arena_bytes: u64,
 ) !void {
     const constants = zoxy.constants;
     const UpstreamType = zoxy.UpstreamPool(XevIo).Upstream;
@@ -261,6 +297,10 @@ fn printBudgets(
         @intCast(config.listeners.len),
     );
     const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
+    // §5's promise is that the printed total covers everything this
+    // process holds for its life. The config arena qualifies — it is
+    // never freed — so it joins the total even though it is the one term
+    // measured rather than derived from constants.
     const memory_total = constants.memoryBytesTotal(&.{
         .conn_slots = limits.conn_slots,
         .conn_bytes = @sizeOf(ServerXev.ConnType),
@@ -269,7 +309,7 @@ fn printBudgets(
         .upstream_slots = limits.upstream_slots,
         .upstream_bytes = @sizeOf(UpstreamType),
         .access_log_bytes = access_log_bytes,
-    });
+    }) + config_arena_bytes;
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;
@@ -280,6 +320,7 @@ fn printBudgets(
         \\budgets (closed-form, DESIGN.md §5/§8):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B + access log {d} KiB
+        \\          + config arena {d} KiB (measured, not closed-form)
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
         \\  config  {d} listener(s), {d} cluster(s), access log {s}
@@ -295,6 +336,7 @@ fn printBudgets(
         limits.upstream_slots,
         @sizeOf(UpstreamType),
         access_log_bytes / 1024,
+        config_arena_bytes / 1024,
         fds_required,
         constants.ring_entries,
         cq_entries,

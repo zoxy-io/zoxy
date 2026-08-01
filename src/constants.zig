@@ -216,9 +216,6 @@ pub const conn_ops_max: u32 = 4;
 /// bounds both callback batches and `Io.now_ns` staleness (§4).
 pub const loop_completions_per_tick_max: u32 = 256;
 
-/// Upper bound on the config file size read at startup.
-pub const config_bytes_max: u32 = 256 * 1024;
-
 /// Upper bound on configured clusters.
 pub const clusters_max: u16 = 16;
 
@@ -645,7 +642,6 @@ comptime {
     assert(endpoint_inflight_max >= upstream_slots_max);
     assert(header_edits_max >= 1);
     assert(loop_completions_per_tick_max >= 1);
-    assert(config_bytes_max >= 1024);
     assert(timeout_ms_max >= 1000);
     // The two defaulted deadlines must themselves be configs the loader
     // would accept: non-zero, and under the shared ceiling.

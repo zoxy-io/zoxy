@@ -241,7 +241,6 @@ pub const Config = struct {
 };
 
 pub const ValidationError = error{
-    ConfigTooLarge,
     ListenersEmpty,
     ListenersOverLimit,
     ListenerBindInvalid,
@@ -308,10 +307,6 @@ pub const ValidationError = error{
 pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
 
 pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config {
-    if (json_bytes.len > constants.config_bytes_max) {
-        return error.ConfigTooLarge;
-    }
-
     const parsed = try std.json.parseFromSliceLeaky(ConfigJson, arena, json_bytes, .{
         .duplicate_field_behavior = .@"error",
         .ignore_unknown_fields = false,
@@ -1197,6 +1192,9 @@ fn resolveFilters(
     if (header_edits > constants.header_edits_max) {
         return error.FilterHeaderEditsOverLimit;
     }
+    // The one bound left on this table, and the render buffer depends on
+    // it — so state it positively rather than trusting the guard above.
+    assert(header_edits <= constants.header_edits_max);
     assert(rules.len == filters_json.len);
     return rules;
 }
@@ -1204,6 +1202,10 @@ fn resolveFilters(
 /// The number of header-edit actions (set/add/remove) in a rule — the
 /// reject and rewrite actions contribute no render-time header edit.
 fn countHeaderEdits(actions: []const filter.Action) u32 {
+    // Reached only through `resolveActions`, which rejects an empty
+    // action list — so the caps this function once asserted against are
+    // gone, but the shape they implied still holds.
+    assert(actions.len >= 1);
     var count: u32 = 0;
     for (actions) |action| {
         switch (action) {
@@ -1292,6 +1294,7 @@ fn resolveActions(
     if (actions_json.len == 0) {
         return error.FilterActionsEmpty;
     }
+    assert(actions_json.len >= 1); // Past the empty guard.
     const actions = try arena.alloc(filter.Action, actions_json.len);
     for (actions_json, actions) |action_json, *action| {
         action.* = try resolveAction(&action_json);
@@ -2550,6 +2553,47 @@ fn expectParseOk(arena_state: *std.heap.ArenaAllocator, json_bytes: []const u8) 
     return parse(arena_state.allocator(), json_bytes);
 }
 
+test "config: a table far past the old caps parses, and is bounded only by itself" {
+    // Replaces the deleted oversize-input test, and covers what took its
+    // place: 200 routes and 200 filters are each ~6x the caps that used
+    // to reject them (`routes_max`/`filters_per_listener_max`, 32), and
+    // the whole input is well past the 256 KiB `config_bytes_max` era's
+    // intent. Nothing may cap it now but the operator's own file, so the
+    // assertion is simply that it round-trips at full length.
+    const route_count = 200;
+    const json = comptime blk: {
+        // 200 rounds of `comptimePrint` each cost far more than the
+        // default 3000-branch budget allows.
+        @setEvalBranchQuota(200_000);
+        var routes: []const u8 = "";
+        var filters: []const u8 = "";
+        var index: u16 = 0;
+        while (index < route_count) : (index += 1) {
+            const n = std.fmt.comptimePrint("{d}", .{index});
+            if (index != 0) {
+                routes = routes ++ ",";
+                filters = filters ++ ",";
+            }
+            routes = routes ++ "{\"prefix\":\"/p" ++ n ++ "\",\"cluster\":\"a\"}";
+            // One header match and one action per rule — both counts the
+            // per-rule caps used to bound. No header edits: the whole
+            // table's edits still have to fit `header_edits_max`.
+            filters = filters ++
+                "{\"match\":{\"headers\":[{\"name\":\"X-K" ++ n ++ "\",\"present\":true}]}," ++
+                "\"actions\":[{\"reject\":404}]}";
+        }
+        break :blk "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+            "\"routes\":[" ++ routes ++ "],\"filters\":[" ++ filters ++ "]}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    };
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state, json);
+    try std.testing.expectEqual(@as(usize, route_count), parsed.listeners[0].routes.len);
+    try std.testing.expectEqual(@as(usize, route_count), parsed.listeners[0].filters.len);
+}
+
 test "config: strictness rejects unknown and duplicate fields" {
     try expectParseError(error.UnknownField,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","nope":1}],
@@ -2680,11 +2724,6 @@ test "config: listeners over the limit" {
         ;
     }
     try expectParseError(error.ListenersOverLimit, over_limit_json);
-}
-
-test "config: oversized input is rejected before parsing" {
-    const oversized = [_]u8{' '} ** (constants.config_bytes_max + 1);
-    try expectParseError(error.ConfigTooLarge, &oversized);
 }
 
 var fuzz_arena_buffer: [1 << 20]u8 = undefined;

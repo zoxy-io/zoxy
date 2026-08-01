@@ -437,6 +437,13 @@ is its per-request capture: the method, host and path a line reports live
 in the head buffer, which the response head renders over (§7), so they
 have to be copied out while they are still there.
 
+The config arena is in that total for the same reason — it is never
+freed — but it is the one term that is **measured rather than derived**,
+and the banner labels it so. There is no constant bounding a config
+file's size: what the operator writes is what it costs, so the only
+honest thing the budget can do is report it. Every other term is still
+closed-form in `src/constants.zig`.
+
 The ceilings sit on one completion-queue line — a conn slot costs
 `conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
 is **pinned to the conn ceiling**, so that line has a single divisor:
