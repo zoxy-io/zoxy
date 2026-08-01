@@ -108,10 +108,10 @@ pub fn Proxy(comptime IoType: type) type {
         //
         // Scoped to the request head deliberately. The origin's *response*
         // head accumulates the same way in `onResponseHeadRecv`, into the
-        // upstream slot's buffer, and does not need a source: Phase 3a
-        // terminates TLS on the client side only, so the upstream leg stays
-        // plaintext (kTLS on the origin side, if it ever comes, would revisit
-        // this).
+        // upstream slot's buffer, and does not need a source: §4's TLS
+        // termination applies to the client side only, so the upstream leg
+        // stays plaintext (kTLS on the origin side, if it ever comes, would
+        // revisit this).
         //
         // The third stays `parseAndDispatch`, the single answer to "what do
         // these bytes mean": read again, 400, 414, 431, or route. That matters
