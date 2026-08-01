@@ -23,7 +23,7 @@ const ServerSim = Server(SimIo);
 
 /// A scripted HTTP client: sends `request` (the adversary may split the
 /// send), then reads until the peer closes, recording the response bytes
-/// and whether the close was an orderly FIN or an RST — the §2 property
+/// and whether the close was an orderly FIN or an RST — the §7 property
 /// (a delivered response must end in FIN, never a data-discarding RST).
 const HttpClient = struct {
     io: *SimIo = undefined,
@@ -1115,7 +1115,7 @@ test "l7: an upstream-slot shed keeps the connection, and the client's ask decid
     //
     // The two responses differ in exactly one header, and the difference is
     // the *client's* ask, not the status: keep-alive is kept, `Connection:
-    // close` is honored (§2). One test, both spellings, so neither branch
+    // close` is honored (§7). One test, both spellings, so neither branch
     // can rot into the other.
     // The single upstream slot goes to a client the origin never answers,
     // so it stays leased and every other request meets the wall.
@@ -1214,7 +1214,7 @@ test "l7: a 501 keeps the connection, and the next request is served" {
 }
 
 test "l7: a reject closes when the client pipelined the next request" {
-    // Bytes past the head are a pipelined next request, which §2 does not
+    // Bytes past the head are a pipelined next request, which §7 does not
     // serve. Keeping the connection here would leave those bytes sitting in
     // the head buffer to be read as the *start* of the next request — the
     // desynchronization a request-smuggler wants (§7). A wide inbox carries
@@ -1283,7 +1283,7 @@ test "l7: a drain closes a reject that would otherwise be kept" {
     // so a reject arriving mid-drain is a connection the drain is waiting
     // on. Keeping it would park an idle connection until `drain_deadline_ms`
     // and turn a clean shutdown into a deadline-forced one — so the drain
-    // is a brake on keeping, exactly as it is on the render path (§2, §8).
+    // is a brake on keeping, exactly as it is on the render path (§7, §8).
     //
     // The client connects at once and is admitted, then holds its head back
     // until after the drain has begun.
@@ -1353,7 +1353,7 @@ test "l7: relay pressure closes a reject that would otherwise be kept" {
 test "l7: a reject closes when the request carries a body" {
     // A declared body is unread bytes still to come, so the stream is not
     // on a message boundary and the connection cannot resynchronize — the
-    // lingering close is what drains it (§2). Robust to delivery timing:
+    // lingering close is what drains it (§7). Robust to delivery timing:
     // if the body arrives coalesced with the head it fails the
     // nothing-past-the-head condition, and if it arrives later it fails the
     // framing-done one. Either way, close.
@@ -2059,7 +2059,7 @@ test "l7: a dial re-basing an already-expired deadline defers past the cancel" {
         // connection either way. What this pins is the discipline on the
         // way there, not a response — the exchange is condemned before it
         // can be answered, so the close is a FIN or (with the client's
-        // head still unread) an RST, and §2 constrains neither: no
+        // head still unread) an RST, and §7 constrains neither: no
         // response byte was ever delivered.
         try std.testing.expect(bed.client.outcome != .pending);
         try std.testing.expect(bed.server.counters.get("deadline_expired") >= 1);

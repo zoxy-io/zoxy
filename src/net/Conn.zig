@@ -113,10 +113,10 @@ pub const ClientWrite = struct {
         response_excess,
         /// The coalesced excess is out: the body pump, or the exchange ends.
         response_body,
-        /// A static response is out: the lingering close (§2, §8).
+        /// A static response is out: the lingering close (§7, §8).
         lingering_close,
         /// A static response is out and the client's byte stream is still
-        /// synchronized: serve the next request on this connection (§2,
+        /// synchronized: serve the next request on this connection (§7,
         /// §8). The keep half of the ladder's "then keep or close per
         /// pressure" — see `proxy.staticResponseResyncable` for what
         /// earns it.
@@ -331,7 +331,7 @@ pub fn Conn(comptime IoType: type) type {
             // `l7_responding` writes a static error response (§8); and
             // `l7_draining_request` half-closes the write side after a
             // response and drains the client's remaining input so the
-            // close does not RST away that response (§2 lingering close).
+            // close does not RST away that response (§7 lingering close).
             l7_reading_head,
             l7_dialing,
             l7_exchanging,
@@ -448,7 +448,7 @@ pub fn Conn(comptime IoType: type) type {
             client_keep_alive: bool = false,
             /// What the rendered response told the client. The connection
             /// honors its own announcement: a keep-alive answer keeps
-            /// serving, an announced close closes (§2).
+            /// serving, an announced close closes (§7).
             downstream_close_announced: bool = true,
             /// The origin's persistence verdict from its response head;
             /// parking requires it (§5).
@@ -456,7 +456,7 @@ pub fn Conn(comptime IoType: type) type {
             /// The client sent bytes past the request's framing — a
             /// pipelined next request. Pipelining is unsupported: the
             /// exchange completes and the connection closes, dropping the
-            /// early bytes (§2 note; clients recover per RFC).
+            /// early bytes (§7 note; clients recover per RFC).
             client_pipelined: bool = false,
             /// This try runs over a checked-out parked connection (§5) —
             /// the precondition for the §7 stale replay: only a *reused*

@@ -7,7 +7,7 @@
 //!
 //! Lifecycle of one scrape: accept → send the rendered response → lingering
 //! close (half-close the write side, drain client input to EOF so the close
-//! never RSTs the response away, §2) → re-arm accept. A per-scrape deadline
+//! never RSTs the response away, §7) → re-arm accept. A per-scrape deadline
 //! (`admin_scrape_deadline_ms`) reaps a stalled or slowloris client so it
 //! cannot pin the single slot, exactly as every data-path socket is reaped
 //! (§8). Drain (§8) closes the listener and tears down any in-flight scrape,
@@ -83,7 +83,7 @@ pub fn Admin(comptime IoType: type) type {
             /// Writing the rendered response to the client.
             sending,
             /// Write side half-closed; discarding client input to EOF so
-            /// the close does not RST the response away (§2).
+            /// the close does not RST the response away (§7).
             draining,
             /// Teardown: sockets shut down, data op draining, close not yet
             /// submitted (the abnormal path — deadline, error, server drain).
@@ -276,7 +276,7 @@ pub fn Admin(comptime IoType: type) type {
                 return;
             }
             // Response fully sent: half-close the write side and drain the
-            // client's input to EOF so the close does not RST it away (§2).
+            // client's input to EOF so the close does not RST it away (§7).
             admin.server.counters.increment("admin_served");
             admin.state = .draining;
             admin.server.io.shutdown(admin.socket, .write);

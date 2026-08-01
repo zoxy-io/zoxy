@@ -2,7 +2,7 @@
 //! *rendered* into a fixed staging buffer, never edited in place — the
 //! zero-copy slices of the source head stay valid throughout. Rendering
 //! strips hop-by-hop headers both ways (RFC 9110 §7.6.1), injects
-//! `Connection: close` when the proxy will close (§2), and applies the §7
+//! `Connection: close` when the proxy will close, and applies the §7
 //! filter header edits that matched the request. A head that no longer
 //! fits after rendering is oversize — 431 downstream, teardown upstream
 //! (§7) — which now includes a head that outgrows the buffer only once the
@@ -81,7 +81,7 @@ comptime {
 /// Renders the upstream request line and end-to-end headers from a
 /// parsed head. The client's version is preserved — framing decisions on
 /// both hops key off the real versions — and `inject_close` announces
-/// that this upstream connection will not be reused (§2). `edits` are the
+/// that this upstream connection will not be reused (§7). `edits` are the
 /// §7 filter header mutations that matched this request: a set/remove
 /// suppresses the source copies of its name, a set/add appends its
 /// (config-validated, injection-safe) line — proxy-managed names can never
@@ -144,7 +144,7 @@ pub fn renderRequestHead(
 /// Renders the downstream status line and end-to-end headers. The
 /// origin's version and reason phrase are preserved verbatim;
 /// `inject_close` announces that the proxy will close the downstream
-/// connection after this response (§2).
+/// connection after this response (§7).
 pub fn renderResponseHead(
     response: *const parser.ResponseHead,
     inject_close: bool,
