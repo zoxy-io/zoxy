@@ -38,8 +38,8 @@ zoxy --version       # print the version (-V)
 Signals: `SIGTERM`/`SIGINT` drain in-flight connections and exit 0;
 `SIGUSR1` dumps counters to stdout.
 
-A minimal config — one L4 listener forwarding to one origin. For a fuller
-one with health checks, tuned timeouts and the access log, see
+A minimal config — one L4 listener forwarding to one origin. For one with
+health checks and the access log turned on, see
 [`config/example.json`](config/example.json):
 
 ```json
