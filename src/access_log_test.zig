@@ -85,6 +85,7 @@ const Harness = struct {
             .conn_slots = 4,
             .relay_buffers = 2,
             .head_buffers = 4,
+            .upstream_head_buffers = 4,
             .access_log_buffer_bytes = buffer_bytes,
         });
     }

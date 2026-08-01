@@ -140,6 +140,15 @@ const uncovered = [_]Uncovered{
             "exhausts the upstream pool directly",
     },
     .{
+        .name = "l7_shed_upstream_head_buffers",
+        .why = .unreached,
+        .reason = "same shadow as l7_shed_upstream_slots: the relay rung " ++
+            "answers first on every pool-starved seed, and reaching this " ++
+            "one besides needs two concurrent renders, which upstream_slots " ++
+            "= 1 rules out; src/http_proxy_test.zig exhausts the upstream " ++
+            "head pool directly",
+    },
+    .{
         .name = "l7_response_excess_sent",
         .why = .unreached,
         .reason = "no seed raises the adversary's recv cap to head_bytes_max, " ++

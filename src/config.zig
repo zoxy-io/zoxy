@@ -91,6 +91,15 @@ pub const Config = struct {
         /// serves http without doing so dies on the seam's own assert
         /// rather than silently inheriting a production-sized ring.
         head_buffers: u32 = 0,
+        /// The §5 upstream head pool: how many exchanges may hold an
+        /// upstream head (the render-to-park window) at once. Parked
+        /// upstream connections hold none, so this bounds concurrent
+        /// *exchanges in their head phase*, not open origin connections.
+        /// The loader resolves an omitted field to upstream_slots (a
+        /// leased slot never needs more than one head — never sheds);
+        /// zero exactly when no listener speaks http, and the struct
+        /// default is the off state on the same terms as `head_buffers`.
+        upstream_head_buffers: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -313,6 +322,9 @@ pub const ValidationError = error{
     LimitHeadBuffersOutOfRange,
     LimitHeadBuffersOverConnSlots,
     LimitHeadBuffersWithoutHttpListener,
+    LimitUpstreamHeadBuffersOutOfRange,
+    LimitUpstreamHeadBuffersOverUpstreamSlots,
+    LimitUpstreamHeadBuffersWithoutHttpListener,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -424,6 +436,11 @@ fn resolveLimits(
         conn_slots,
         http_listeners_count,
     );
+    const upstream_head_buffers = try resolveUpstreamHeadBuffers(
+        limits_json.upstream_head_buffers,
+        upstream_slots,
+        http_listeners_count,
+    );
     // The CQ fill is the one limit an operator tightens for headroom, not a
     // pool shrink (§8): a smaller fill demands a deeper ring for the same
     // conn slots. Range-check first, then reject a fill that — with these
@@ -452,6 +469,7 @@ fn resolveLimits(
         .relay_buffers = relay_buffers,
         .upstream_slots = upstream_slots,
         .head_buffers = head_buffers,
+        .upstream_head_buffers = upstream_head_buffers,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
     };
@@ -482,6 +500,30 @@ fn resolveHeadBuffers(
     }
     assert(head_buffers <= conn_slots);
     return head_buffers;
+}
+
+/// The §5 upstream head pool, on `resolveHeadBuffers`'s exact terms with
+/// upstream slots as the ceiling: a leased slot never needs more than one
+/// head, so more heads than slots is waste stated as intent.
+fn resolveUpstreamHeadBuffers(
+    requested: ?u32,
+    upstream_slots: u32,
+    http_listeners_count: u32,
+) ValidationError!u32 {
+    assert(upstream_slots >= 1);
+    const upstream_head_buffers = requested orelse
+        (if (http_listeners_count >= 1) upstream_slots else 0);
+    if (upstream_head_buffers > upstream_slots) {
+        return error.LimitUpstreamHeadBuffersOverUpstreamSlots;
+    }
+    if (http_listeners_count == 0 and upstream_head_buffers >= 1) {
+        return error.LimitUpstreamHeadBuffersWithoutHttpListener;
+    }
+    if (http_listeners_count >= 1 and upstream_head_buffers == 0) {
+        return error.LimitUpstreamHeadBuffersOutOfRange;
+    }
+    assert(upstream_head_buffers <= upstream_slots);
+    return upstream_head_buffers;
 }
 
 fn resolveAccessLogBuffer(
@@ -585,6 +627,7 @@ pub const LimitsJson = struct {
     relay_buffers: ?u32 = null,
     upstream_slots: ?u32 = null,
     head_buffers: ?u32 = null,
+    upstream_head_buffers: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 
@@ -615,6 +658,14 @@ pub const LimitsJson = struct {
                 "0 without one.",
             .minimum = 0,
             .maximum = constants.conn_slots_max,
+        },
+        .upstream_head_buffers = .{
+            .desc = "Upstream head buffers (bounds exchanges in their head " ++
+                "phase; parked origin connections hold none). Defaults to " ++
+                "upstream_slots; must be 1..upstream_slots with an http " ++
+                "listener, 0 without one.",
+            .minimum = 0,
+            .maximum = constants.upstream_slots_max,
         },
         .cq_fill_eighths = .{
             .desc = "Eighths of the io_uring completion queue the worst-case " ++
@@ -2575,8 +2626,10 @@ test "config: limits shrink pools below the ceilings, never past them" {
             \\ "limits":{"conn_slots":64,"head_buffers":16}}
         );
         // An http config follows conn slots when the ring is omitted and
-        // takes the operator's number when it is not.
+        // takes the operator's number when it is not; the upstream head
+        // pool follows upstream slots on the same terms.
         try std.testing.expectEqual(@as(u32, 16), parsed.limits.head_buffers);
+        try std.testing.expectEqual(constants.upstream_slots_default, parsed.limits.upstream_head_buffers);
     }
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
@@ -2634,6 +2687,14 @@ test "config: limits shrink pools below the ceilings, never past them" {
         "\"limits\":{\"head_buffers\":1}}");
     try expectParseError(error.LimitHeadBuffersOutOfRange, http_head ++ tail ++
         "\"limits\":{\"head_buffers\":0}}");
+    // The upstream head pool refuses the same three shapes against its
+    // own ceiling, the upstream slots.
+    try expectParseError(error.LimitUpstreamHeadBuffersOverUpstreamSlots, http_head ++ tail ++
+        "\"limits\":{\"upstream_slots\":2,\"upstream_head_buffers\":4}}");
+    try expectParseError(error.LimitUpstreamHeadBuffersWithoutHttpListener, head ++ tail ++
+        "\"limits\":{\"upstream_head_buffers\":1}}");
+    try expectParseError(error.LimitUpstreamHeadBuffersOutOfRange, http_head ++ tail ++
+        "\"limits\":{\"upstream_head_buffers\":0}}");
     // The CQ fill has its own range [min, max] in eighths; below or above
     // fails loudly, each distinct from the pool-size errors.
     try expectParseError(error.LimitCqFillOutOfRange, head ++ tail ++ "\"limits\":{\"cq_fill_eighths\":0}}");

@@ -321,6 +321,8 @@ fn printBudgets(
         .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
         .head_buffers = limits.head_buffers,
         .head_buffer_bytes = constants.head_bytes_max,
+        .upstream_head_buffers = limits.upstream_head_buffers,
+        .upstream_head_buffer_bytes = @sizeOf(zoxy.UpstreamHeadBuffer),
     }) + config_arena_bytes;
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
@@ -332,7 +334,7 @@ fn printBudgets(
         \\budgets (DESIGN.md §5/§8; closed-form except where marked):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B + head buffers {d} x {d} B (+ ring {d} B)
-        \\          + access log {d} KiB
+        \\          + upstream head buffers {d} x {d} B + access log {d} KiB
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + config arena {d} KiB (measured, not closed-form)
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
@@ -354,6 +356,8 @@ fn printBudgets(
         // the closed-form total above carries it.
         constants.head_bytes_max,
         constants.bufferGroupDescriptorBytes(limits.head_buffers),
+        limits.upstream_head_buffers,
+        @sizeOf(zoxy.UpstreamHeadBuffer),
         access_log_bytes / 1024,
         ServerXev.endpointTableBytes(config),
         config.clusters.len,

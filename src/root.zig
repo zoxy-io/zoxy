@@ -23,6 +23,7 @@ pub const http = struct {
 pub const Io = @import("io/io.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;
 pub const RelayBuffer = @import("net/relay.zig").RelayBuffer;
+pub const UpstreamHeadBuffer = @import("net/upstream.zig").HeadBuffer;
 pub const UpstreamPool = @import("net/upstream.zig").UpstreamPool;
 pub const Server = @import("Server.zig").Server;
 pub const shed = @import("shed.zig");

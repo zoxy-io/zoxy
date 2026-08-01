@@ -81,6 +81,7 @@ fn bareAddress(
 pub fn Proxy(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const ConnType = conn_module.Conn(IoType);
+    const UpstreamType = @import("../net/upstream.zig").UpstreamPool(IoType).Upstream;
     const Framing = ConnType.Framing;
 
     return struct {
@@ -130,6 +131,15 @@ pub fn Proxy(comptime IoType: type) type {
         fn headBytes(server: *ServerType, conn: *ConnType) []u8 {
             assert(conn.head_buffer_id != ConnType.head_buffer_none);
             return server.io.bufferGroupSlice(conn.head_buffer_id);
+        }
+
+        /// The upstream head bytes this exchange holds (§5): acquired at
+        /// the request-head render, released before the slot parks or
+        /// with the slot. Asserting the claim here means every read of
+        /// upstream head content states its precondition.
+        fn upstreamHeadBytes(upstream: *UpstreamType) []u8 {
+            assert(upstream.head_buffer != null);
+            return upstream.head_buffer.?.bytes[0..];
         }
 
         /// Where a head continuation read lands: the free space after what
@@ -627,6 +637,12 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.upstream = parked;
                 conn.upstream_socket = parked.socket;
                 parked.head_len = 0;
+                // A parked slot released its head buffer before parking;
+                // the exchange re-acquires here, still in
+                // `.l7_reading_head` so a shed keeps (the checked-out
+                // socket is closed with the slot — the shed costs a
+                // parked origin connection, not a client one).
+                if (!acquireUpstreamHeadOrShed(server, conn)) return;
                 conn.l7.upstream_was_reused = true;
                 conn.state = .l7_dialing;
                 // No await happened: this runs in the same callback as the
@@ -640,6 +656,26 @@ pub fn Proxy(comptime IoType: type) type {
             dialUpstream(server, conn, pick);
         }
 
+        /// Acquire the exchange's upstream head buffer (§5) — the render
+        /// target and response-head accumulator — or shed. Called at the
+        /// two places a slot is obtained, deliberately *before* the state
+        /// leaves `.l7_reading_head` on the request path: the resync rule
+        /// keeps a shed connection only from there, and this rung earns
+        /// the same keep its slot sibling gets. (The §7 replay re-dials
+        /// from `.l7_exchanging`, where a shed closes — the stream is
+        /// mid-exchange and cannot be trusted kept.) On the shed path
+        /// `respond` has already released the slot the caller just
+        /// obtained, so the caller only returns.
+        fn acquireUpstreamHeadOrShed(server: *ServerType, conn: *ConnType) bool {
+            const upstream = conn.upstream.?;
+            assert(upstream.head_buffer == null);
+            upstream.head_buffer = server.acquireUpstreamHeadBuffer() orelse {
+                respond(server, conn, 503, "l7_shed_upstream_head_buffers");
+                return false;
+            };
+            return true;
+        }
+
         /// Acquire a fresh slot and dial `pick` under the per-try connect
         /// deadline (§8) — shared by the first try (`routeRequest`) and
         /// the §7 stale replay (`beginReplay`), so both tries dial
@@ -651,6 +687,7 @@ pub fn Proxy(comptime IoType: type) type {
             conn.upstream = server.acquireUpstream(conn.cluster_index, pick.endpoint_index) orelse {
                 return respond(server, conn, 503, "l7_shed_upstream_slots");
             };
+            if (!acquireUpstreamHeadOrShed(server, conn)) return;
             // The slot is held, so this try really is going to this
             // endpoint — whether or not the dial ends up succeeding. A
             // replay overwrites it, naming the endpoint that served (§7).
@@ -766,6 +803,10 @@ pub fn Proxy(comptime IoType: type) type {
             assert(views.forward.path.len >= 1);
             assert(views.match.len >= 1);
             const upstream = conn.upstream.?;
+            // Acquired back when the slot was obtained (`acquireUpstreamHeadOrShed`),
+            // while the state still allowed a kept shed; by render time it
+            // is a held invariant, not a question.
+            assert(upstream.head_buffer != null);
             // Apply the listener's filters (empty when none): a rewrite of
             // the forwarded path and any header edits, against the same
             // canonical view the reject/route phase used.
@@ -790,7 +831,7 @@ pub fn Proxy(comptime IoType: type) type {
             // connection is a parking candidate (§5), and stripping the
             // client's Connection header already made persistence the wire
             // default.
-            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, forwarded, &upstream.head) catch {
+            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, forwarded, &upstream.head_buffer.?.bytes) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");
@@ -894,7 +935,7 @@ pub fn Proxy(comptime IoType: type) type {
             conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
-                conn.upstream.?.head[l7.request_head_sent..l7.rendered_request_len],
+                upstreamHeadBytes(conn.upstream.?)[l7.request_head_sent..l7.rendered_request_len],
                 &conn.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -1152,7 +1193,7 @@ pub fn Proxy(comptime IoType: type) type {
             conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.recv(
                 conn.upstream_socket.?,
-                upstream.head[upstream.head_len..],
+                upstreamHeadBytes(upstream)[upstream.head_len..],
                 &conn.op_data_upstream_to_client.completion,
                 ConnType,
                 conn,
@@ -1192,7 +1233,7 @@ pub fn Proxy(comptime IoType: type) type {
         fn parseResponseAndDispatch(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
             const upstream = conn.upstream.?;
-            const head = upstream.head[0..upstream.head_len];
+            const head = upstreamHeadBytes(upstream)[0..upstream.head_len];
             const head_is_full = upstream.head_len == constants.head_bytes_max;
 
             var storage: parser.HeaderStorage = undefined;
@@ -1239,7 +1280,7 @@ pub fn Proxy(comptime IoType: type) type {
             const upstream = conn.upstream.?;
             var storage: parser.HeaderStorage = undefined;
             const response = parser.parseResponseHead(
-                upstream.head[0..upstream.head_len],
+                upstreamHeadBytes(upstream)[0..upstream.head_len],
                 false,
                 &storage,
                 conn.l7.request_method,
@@ -1303,7 +1344,7 @@ pub fn Proxy(comptime IoType: type) type {
 
             // Feed the framing tracker over the body excess that arrived
             // coalesced with the head.
-            const excess = upstream.head[response.head_len..upstream.head_len];
+            const excess = upstreamHeadBytes(upstream)[response.head_len..upstream.head_len];
             const feed = feedFraming(&conn.l7.response_framing, excess);
             if (feed.malformed) {
                 upstreamFailed(server, conn);
@@ -1453,7 +1494,7 @@ pub fn Proxy(comptime IoType: type) type {
             armClientWrite(
                 server,
                 conn,
-                conn.upstream.?.head[base..][0..excess_len],
+                upstreamHeadBytes(conn.upstream.?)[base..][0..excess_len],
                 .response_body,
             );
         }
@@ -1592,6 +1633,12 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             const upstream = conn.upstream.?;
             assert(!upstream.parked);
+            // The exchange's head bytes go back before the slot parks
+            // (§5): the response leg is settled, so the client-write
+            // channel no longer references them — asserted, because the
+            // excess write sends straight from this buffer.
+            assert(conn.client_write.pending.len == 0);
+            server.releaseUpstreamHeadBuffer(upstream);
             server.upstreams.park(upstream);
             upstream.deadline_ns = server.io.nowNs() +
                 @as(u64, server.parkedTimeoutMs()) * std.time.ns_per_ms;
@@ -2038,6 +2085,7 @@ pub fn Proxy(comptime IoType: type) type {
             if (std.mem.eql(u8, counter, "l7_shed_relay_buffers")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_upstream_slots")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_head_buffers")) return .shed;
+            if (std.mem.eql(u8, counter, "l7_shed_upstream_head_buffers")) return .shed;
             // A capped endpoint is a shed like any other from the
             // client's side: the request was refused to protect the
             // origin, and the line should read the same as the rungs

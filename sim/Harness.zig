@@ -629,6 +629,10 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             .relay_buffers = 1,
             .upstream_slots = 1,
             .head_buffers = harness.head_buffers,
+            // Capacity 1: the first render engages the pressure flag, so
+            // the engage counter stays reachable even though the shed
+            // rung itself is relay-shadowed (see sim/main.zig uncovered).
+            .upstream_head_buffers = 1,
             .access_log_buffer_bytes = access_log_buffer_bytes,
         }
     else
@@ -650,6 +654,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             .relay_buffers = if (harness.clean) 2 * clients_max else clients_max,
             .upstream_slots = 2 * clients_max,
             .head_buffers = harness.head_buffers,
+            .upstream_head_buffers = 2 * clients_max,
         };
     try harness.server.init(arena, &harness.io, &harness.config, options);
     try harness.server.start();
