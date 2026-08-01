@@ -8,3 +8,4 @@ result
 result-*
 .devenv*
 devenv.local.nix
+.claude/worktrees
