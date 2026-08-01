@@ -254,17 +254,23 @@ pub fn Conn(comptime IoType: type) type {
         birth_ns: u64,
         armed: Armed,
         directions: [2]DirectionState,
-        /// L7 request/response head bytes accumulate here across recv
-        /// retries (§5, §7); idle on L4 connections, which relay through
-        /// the relay buffer only. Parsing is detect-and-retry from byte 0
-        /// (§7), so these bytes stay the single source of truth: nothing
-        /// parsed is stored across callbacks, and a re-parse after an
-        /// await costs one bounded scan instead of 2 KiB of per-slot
-        /// header storage. Deliberately not zeroed at admission — bytes
-        /// past `head_len` are never read.
-        head: [constants.head_bytes_max]u8,
-        /// Bytes of `head` filled so far; the head's end is found by
-        /// parsing, the body (or a pipelined next head) follows it.
+        /// The §5 head-ring buffer this connection holds, or
+        /// `head_buffer_none`. Bound by the seam at the delivery that
+        /// starts a request (`recvGroup`) and returned at the keep-alive
+        /// turnaround, before a static response goes out, or at teardown —
+        /// so an idle connection holds no head bytes at all, and an L4
+        /// connection never binds one. The bytes live in the ring's slab
+        /// (`bufferGroupSlice`); everything the old inline array promised
+        /// still holds of them: request/response head accumulates across
+        /// recv retries, parsing is detect-and-retry from byte 0 (§7), the
+        /// buffer's content stays the single source of truth while held,
+        /// and nothing zeroes it — bytes past `head_len` are never read.
+        head_buffer_id: u16,
+        /// Bytes of the held head buffer filled so far; the head's end is
+        /// found by parsing, the body (or a pipelined next head) follows
+        /// it. A count, not content: it survives the buffer's return at a
+        /// static response, because the §7 resync rule still reads it to
+        /// decide keep-or-close; `beginNextRequest` zeroes it.
         head_len: u32,
         /// The client-directed write in flight, if any (§7, §8) — see
         /// `ClientWrite`. Idle on the L4 path, which relays through the pump.
@@ -326,6 +332,16 @@ pub fn Conn(comptime IoType: type) type {
         op_deadline_cancel: Op,
 
         const Self = @This();
+
+        /// "This connection holds no head-ring buffer." Out of range by
+        /// construction: a group never publishes more than
+        /// `buffer_group_entries_max` ids, and the comptime check below
+        /// keeps the sentinel above every real one.
+        pub const head_buffer_none: u16 = std.math.maxInt(u16);
+
+        comptime {
+            assert(constants.buffer_group_entries_max <= head_buffer_none);
+        }
 
         pub const State = enum(u8) {
             // L4 relay states.
@@ -546,6 +562,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.birth_ns = server.io.nowNs();
             conn.armed = .{};
             conn.directions = .{ .{}, .{} };
+            conn.head_buffer_id = head_buffer_none;
             conn.head_len = 0;
             conn.client_write = .{};
             conn.cluster_index = cluster_index;

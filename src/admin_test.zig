@@ -54,7 +54,11 @@ const Harness = struct {
         errdefer harness.arena_state.deinit();
         const arena = harness.arena_state.allocator();
 
-        try harness.sim_io.init(arena, sim);
+        // An L4-only bed: no head-buffer ring on either side of the seam
+        // (Server.init asserts the two agree).
+        var sim_options = sim;
+        sim_options.buffer_group_count = 0;
+        try harness.sim_io.init(arena, sim_options);
         harness.endpoints = .{originAddress()};
         harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
         harness.routes = .{.{ .prefix = "/", .cluster_index = 0 }};

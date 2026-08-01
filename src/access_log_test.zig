@@ -56,9 +56,12 @@ const Harness = struct {
         errdefer harness.arena_state.deinit();
         const arena = harness.arena_state.allocator();
 
+        // An http bed: ring on both sides of the seam, sized to the conn
+        // slots below (Server.init asserts the two agree).
         try harness.sim_io.init(arena, .{
             .seed = 1,
             .adversary = .{ .partial_io = false, .log_write_stall_ns = stall_ns },
+            .buffer_group_count = 4,
         });
         harness.endpoints = .{originAddress()};
         harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
@@ -81,6 +84,7 @@ const Harness = struct {
         try harness.server.init(arena, &harness.sim_io, &harness.config, .{
             .conn_slots = 4,
             .relay_buffers = 2,
+            .head_buffers = 4,
             .access_log_buffer_bytes = buffer_bytes,
         });
     }

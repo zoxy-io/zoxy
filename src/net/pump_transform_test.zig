@@ -609,7 +609,11 @@ const Harness = struct {
         errdefer bed.arena_state.deinit();
         const arena = bed.arena_state.allocator();
 
-        try bed.io.init(arena, options.sim);
+        // An L4-only bed: no head-buffer ring on either side of the seam
+        // (Server.init asserts the two agree).
+        var sim_options = options.sim;
+        sim_options.buffer_group_count = 0;
+        try bed.io.init(arena, sim_options);
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};

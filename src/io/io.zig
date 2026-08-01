@@ -23,6 +23,8 @@
 //!       socket pins no memory — §5's head-buffer ring rides on this)
 //!   bufferGroupSlice(io, buffer_id) []u8               (sync; the bytes)
 //!   bufferGroupReturn(io, buffer_id) void              (sync; no syscall)
+//!   bufferGroupCount(io) u32                           (sync; the group's
+//!       capacity — what the caller's own accounting must agree with)
 //!   send(io, socket, bytes, c, U, u, cb(u, SendError!u32))
 //!   close(io, socket, c, U, u, cb(u))
 //!   logWrite(io, bytes, c, U, u, cb(u, LogWriteError!u32))   (§8 access log)
@@ -201,6 +203,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "recvGroup",
             "bufferGroupSlice",
             "bufferGroupReturn",
+            "bufferGroupCount",
             "send",
             "close",
             "logWrite",

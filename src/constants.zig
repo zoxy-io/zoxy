@@ -491,6 +491,32 @@ pub const completion_queue_entries_max: u32 = 65536;
 /// two, only bounded by this.
 pub const buffer_group_entries_max: u32 = 1 << 15;
 
+comptime {
+    // Every head-buffer count a config can reach (`limits.head_buffers`
+    // ≤ conn_slots ≤ this ceiling) fits one registered group.
+    assert(conn_slots_max <= buffer_group_entries_max);
+}
+
+/// The buf_ring descriptor table behind the head-buffer ring (§5): one
+/// 16-byte `io_uring_buf` (ABI-fixed) per entry, entries the next power
+/// of two of the published count, mmapped page-granular. Zero when no
+/// ring is registered — an L4-only deployment.
+pub fn bufferGroupDescriptorBytes(head_buffers: u32) u64 {
+    assert(head_buffers <= buffer_group_entries_max);
+    if (head_buffers == 0) return 0;
+    const entries = std.math.ceilPowerOfTwo(u32, head_buffers) catch unreachable;
+    const bytes = std.mem.alignForward(u64, @as(u64, entries) * 16, 4096);
+    assert(bytes >= 4096);
+    return bytes;
+}
+
+/// One shared discard sink for every §7 lingering-close drain (the reads
+/// whose bytes are never looked at). Shared deliberately: with the head
+/// buffer returned before a static response goes out (§5), a reject storm
+/// must not need a buffer per draining connection, and recv targets whose
+/// contents nobody reads may alias.
+pub const drain_sink_bytes: u32 = 4 * 1024;
+
 /// §8 CQ fill: in-flight ring ops may occupy at most this many eighths of
 /// the completion queue; the rest stays free to absorb completion bursts.
 /// ⅞ is both the default and the largest fill a config may request — it is
@@ -818,6 +844,13 @@ pub const PoolSizes = struct {
     /// it from hardcoded widths would silently drift the moment one of
     /// them changed. `Server.endpointTableBytes` is the closed form.
     endpoint_table_bytes: u64,
+    /// The §5 head-buffer ring: how many buffers the deployment registered
+    /// (`limits.head_buffers`; zero on an L4-only config) and the unit
+    /// size of each. The total term is `count × (unit + 1)` — the slab
+    /// plus the seam's one ownership byte per buffer — plus the buf_ring
+    /// descriptor table (`bufferGroupDescriptorBytes`).
+    head_buffers: u32,
+    head_buffer_bytes: u64,
 };
 
 /// What the access log reserves: nothing when it is off, both staging
@@ -851,10 +884,14 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
             @as(u64, access_log_buffers) * access_log_buffer_bytes_min);
     assert(sizes.access_log_bytes <=
         @as(u64, access_log_buffers) * access_log_buffer_bytes_max);
+    assert(sizes.head_buffers <= buffer_group_entries_max);
+    assert(sizes.head_buffers == 0 or sizes.head_buffer_bytes >= 1);
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
-        sizes.access_log_bytes + sizes.endpoint_table_bytes;
+        sizes.access_log_bytes + sizes.endpoint_table_bytes +
+        @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
+        bufferGroupDescriptorBytes(sizes.head_buffers);
     assert(total > 0);
     return total;
 }
@@ -891,10 +928,23 @@ test "budgets: memory total matches the closed form" {
     // the access log on at the ceiling and off below it — the term is a
     // fixed reservation, so it must move the total by exactly its own size
     // and by nothing else.
+    // The head-buffer ring's term is count × (unit + 1) — the slab plus
+    // one ownership byte per buffer — plus the descriptor table, which is
+    // page-granular and next-power-of-two, so a non-power-of-two count
+    // pins the rounding too: 11466 → 16384 entries × 16 B = exactly 64
+    // pages.
+    const head_ring: u64 = @as(u64, conn_slots_max) * (head_bytes_max + 1) +
+        bufferGroupDescriptorBytes(conn_slots_max);
+    try std.testing.expectEqual(
+        @as(u64, 16384) * 16,
+        bufferGroupDescriptorBytes(conn_slots_max),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bufferGroupDescriptorBytes(0));
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes +
-        accessLogBytes(access_log_buffer_bytes_default) + endpoint_tables;
+        accessLogBytes(access_log_buffer_bytes_default) + endpoint_tables +
+        head_ring;
     try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
@@ -904,6 +954,8 @@ test "budgets: memory total matches the closed form" {
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(access_log_buffer_bytes_default),
         .endpoint_table_bytes = endpoint_tables,
+        .head_buffers = conn_slots_max,
+        .head_buffer_bytes = head_bytes_max,
     }));
     const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
@@ -915,6 +967,9 @@ test "budgets: memory total matches the closed form" {
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
+        // The L4-only shape: no ring registered, no term at all.
+        .head_buffers = 0,
+        .head_buffer_bytes = head_bytes_max,
     }));
     // An unconfigured access log reserves nothing (§5), and a configured
     // one reserves both buffers at whatever size it was given — the term

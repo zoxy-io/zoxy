@@ -77,6 +77,20 @@ pub const Config = struct {
         conn_slots: u32 = constants.conn_slots_default,
         relay_buffers: u32 = constants.relay_buffers_default,
         upstream_slots: u32 = constants.upstream_slots_default,
+        /// The §5 head-buffer ring: how many request heads may be in
+        /// flight at once. Buffers bind only to connections with a head
+        /// actually arriving or held — idle keep-alive connections hold
+        /// none — so this is a concurrency limit, not a per-connection
+        /// cost. The loader resolves an omitted field to conn_slots
+        /// (every connection could be mid-head at once: never sheds, the
+        /// same worst-case memory the inline buffers used to pin); the
+        /// operator trades it down against the `l7_shed_head_buffers`
+        /// wall. Zero exactly when no listener speaks http. The *struct*
+        /// default is the off state, like `access_log_buffer_bytes`:
+        /// hand-built (test) configs opt in explicitly, and one that
+        /// serves http without doing so dies on the seam's own assert
+        /// rather than silently inheriting a production-sized ring.
+        head_buffers: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -296,6 +310,9 @@ pub const ValidationError = error{
     LimitRelayBuffersOutOfRange,
     LimitRelayBuffersOverConnSlots,
     LimitUpstreamSlotsOutOfRange,
+    LimitHeadBuffersOutOfRange,
+    LimitHeadBuffersOverConnSlots,
+    LimitHeadBuffersWithoutHttpListener,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -319,9 +336,14 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     const clusters = try resolveClusters(arena, &parsed.clusters, parsed.timeouts.connect_ms);
     const listeners = try resolveListeners(arena, parsed.listeners, clusters);
     const access_log_sink = try resolveAccessLogSink(parsed.access_log);
+    var http_listeners_count: u32 = 0;
+    for (listeners) |*listener| {
+        if (listener.protocol == .http) http_listeners_count += 1;
+    }
     const limits = try resolveLimits(
         &parsed.limits,
         @intCast(listeners.len),
+        http_listeners_count,
         access_log_sink != null,
     );
     const admin_bind = try resolveAdminBind(parsed.admin);
@@ -372,9 +394,11 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 fn resolveLimits(
     limits_json: *const LimitsJson,
     listeners_count: u32,
+    http_listeners_count: u32,
     access_log_on: bool,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
+    assert(http_listeners_count <= listeners_count);
     // Omitted limits default to the lean out-of-box sizes, not the
     // compiled ceilings (§5): a small footprint unless the operator opts
     // up. relay buffers still follow conn slots when omitted (one buffer
@@ -395,6 +419,11 @@ fn resolveLimits(
     if (upstream_slots < 1 or upstream_slots > constants.upstream_slots_max) {
         return error.LimitUpstreamSlotsOutOfRange;
     }
+    const head_buffers = try resolveHeadBuffers(
+        limits_json.head_buffers,
+        conn_slots,
+        http_listeners_count,
+    );
     // The CQ fill is the one limit an operator tightens for headroom, not a
     // pool shrink (§8): a smaller fill demands a deeper ring for the same
     // conn slots. Range-check first, then reject a fill that — with these
@@ -417,13 +446,42 @@ fn resolveLimits(
         access_log_on,
     );
     assert(relay_buffers <= conn_slots);
+    assert(head_buffers <= conn_slots);
     return .{
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
         .upstream_slots = upstream_slots,
+        .head_buffers = head_buffers,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
     };
+}
+
+/// The §5 head-buffer ring follows conn slots when omitted (every
+/// connection could be mid-head at once — never sheds), and is zero
+/// exactly when no listener speaks http: an L4-only deployment registers
+/// no ring, and one that asked for buffers it cannot use is told so. A
+/// ring an http deployment cannot bind from (zero) would shed every
+/// request, so that is rejected too, not defaulted around.
+fn resolveHeadBuffers(
+    requested: ?u32,
+    conn_slots: u32,
+    http_listeners_count: u32,
+) ValidationError!u32 {
+    assert(conn_slots >= 1);
+    const head_buffers = requested orelse
+        (if (http_listeners_count >= 1) conn_slots else 0);
+    if (head_buffers > conn_slots) {
+        return error.LimitHeadBuffersOverConnSlots;
+    }
+    if (http_listeners_count == 0 and head_buffers >= 1) {
+        return error.LimitHeadBuffersWithoutHttpListener;
+    }
+    if (http_listeners_count >= 1 and head_buffers == 0) {
+        return error.LimitHeadBuffersOutOfRange;
+    }
+    assert(head_buffers <= conn_slots);
+    return head_buffers;
 }
 
 fn resolveAccessLogBuffer(
@@ -526,6 +584,7 @@ pub const LimitsJson = struct {
     conn_slots: ?u32 = null,
     relay_buffers: ?u32 = null,
     upstream_slots: ?u32 = null,
+    head_buffers: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 
@@ -548,6 +607,14 @@ pub const LimitsJson = struct {
             .desc = "Shared upstream connection slots.",
             .minimum = 1,
             .maximum = constants.upstream_slots_max,
+        },
+        .head_buffers = .{
+            .desc = "HTTP head buffers in the shared ring (bounds request heads " ++
+                "in flight; idle keep-alive connections hold none). Defaults " ++
+                "to conn_slots; must be 1..conn_slots with an http listener, " ++
+                "0 without one.",
+            .minimum = 0,
+            .maximum = constants.conn_slots_max,
         },
         .cq_fill_eighths = .{
             .desc = "Eighths of the io_uring completion queue the worst-case " ++
@@ -2493,8 +2560,34 @@ test "config: limits shrink pools below the ceilings, never past them" {
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
         try std.testing.expectEqual(@as(u32, 8), parsed.limits.relay_buffers);
         try std.testing.expectEqual(@as(u32, 8), parsed.limits.upstream_slots);
+        // An l4-only config registers no head-buffer ring.
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.head_buffers);
         // A tighter fill resolves verbatim when the pools leave room for it.
         try std.testing.expectEqual(@as(u32, 4), parsed.limits.cq_fill_eighths);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
+            \\ "limits":{"conn_slots":64,"head_buffers":16}}
+        );
+        // An http config follows conn slots when the ring is omitted and
+        // takes the operator's number when it is not.
+        try std.testing.expectEqual(@as(u32, 16), parsed.limits.head_buffers);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
+            \\ "limits":{"conn_slots":64}}
+        );
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.head_buffers);
     }
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
@@ -2509,6 +2602,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         try std.testing.expectEqual(constants.conn_slots_default, parsed.limits.conn_slots);
         try std.testing.expectEqual(constants.relay_buffers_default, parsed.limits.relay_buffers);
         try std.testing.expectEqual(constants.upstream_slots_default, parsed.limits.upstream_slots);
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.head_buffers);
         try std.testing.expectEqual(constants.cq_fill_eighths_default, parsed.limits.cq_fill_eighths);
     }
     const tail =
@@ -2529,6 +2623,17 @@ test "config: limits shrink pools below the ceilings, never past them" {
     // contradiction, not a derivable default.
     try expectParseError(error.LimitRelayBuffersOverConnSlots, head ++ tail ++
         "\"limits\":{\"conn_slots\":4,\"relay_buffers\":8}}");
+    // The head-buffer ring's three refusals (§5): more buffers than
+    // connections is waste stated as intent; any buffers without an http
+    // listener can never bind; an http listener with none would shed
+    // every request it is configured to serve.
+    const http_head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}],";
+    try expectParseError(error.LimitHeadBuffersOverConnSlots, http_head ++ tail ++
+        "\"limits\":{\"conn_slots\":4,\"head_buffers\":8}}");
+    try expectParseError(error.LimitHeadBuffersWithoutHttpListener, head ++ tail ++
+        "\"limits\":{\"head_buffers\":1}}");
+    try expectParseError(error.LimitHeadBuffersOutOfRange, http_head ++ tail ++
+        "\"limits\":{\"head_buffers\":0}}");
     // The CQ fill has its own range [min, max] in eighths; below or above
     // fails loudly, each distinct from the pool-size errors.
     try expectParseError(error.LimitCqFillOutOfRange, head ++ tail ++ "\"limits\":{\"cq_fill_eighths\":0}}");

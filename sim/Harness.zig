@@ -77,6 +77,11 @@ ended_count: u8,
 /// Clean seeds run without the adversary and with a well-behaved
 /// origin, so the L7 oracles demand exact golden outcomes.
 clean: bool,
+/// Decided before `io.init` (the ring the sim registers must equal the
+/// limit the server accounts against — Server.init asserts the match),
+/// consumed by `startServerAndOrigins` for the rest of the pool shape.
+force_exhaustion: bool,
+head_buffers: u32,
 end_timer_completion: SimIo.Completion,
 /// Virtual instant at which the HTTP origin stops listening mid-run, or
 /// 0 for never. Drawn on a fraction of checked-http adversarial seeds:
@@ -139,9 +144,25 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     // exact outcome — a silently dropped 400 or a shed that should
     // not happen fails the seed instead of passing as a "cut".
     harness.clean = random.uintLessThan(u8, 4) == 0;
+    // A quarter of adversarial seeds shrink the pools to force the §8
+    // rungs. Drawn here rather than in `startServerAndOrigins` because
+    // the head-buffer ring is the Io backend's to register, and its size
+    // must be settled before the backend exists. 1–3 ring buffers, so
+    // across the sweep some seeds shed at the ring (1: a second
+    // concurrent head finds it empty) and others get far enough to shed
+    // at the relay rung instead (2–3: heads bind, the deeper rungs
+    // starve) — one size would shadow one rung or the other.
+    harness.force_exhaustion = !harness.clean and random.uintLessThan(u8, 4) == 0;
+    harness.head_buffers = if (harness.force_exhaustion)
+        1 + random.uintLessThan(u32, 3)
+    else
+        // The clean-seed watermark margin, same reasoning as the pools
+        // below in `startServerAndOrigins`.
+        2 * clients_max;
     try harness.io.init(arena, .{
         .seed = seed,
         .adversary = deriveAdversary(random, harness.clean),
+        .buffer_group_count = harness.head_buffers,
     });
     // Which cause the sim reports for every failure it injects (§8).
     // Production reads it off an errno; a virtual socket table has none,
@@ -583,8 +604,9 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
 fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
     // A quarter of adversarial seeds shrink the pools to force the
     // §8 rungs; clean seeds keep ample pools so golden outcomes
-    // never meet a shed.
-    const force_exhaustion = !harness.clean and random.uintLessThan(u8, 4) == 0;
+    // never meet a shed. Decided in `setUp` (see `force_exhaustion`)
+    // because the ring size had to precede `io.init`.
+    const force_exhaustion = harness.force_exhaustion;
     // Adversarial seeds size the staging buffers at the floor — one
     // worst-case line each — so the buffer swap runs constantly and every
     // line meets a nearly-full buffer, against the default's hundred-line
@@ -601,9 +623,12 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
         zoxy.constants.access_log_buffer_bytes_min;
     const options: ServerSim.InitOptions = if (force_exhaustion)
         .{
-            .conn_slots = 1 + random.uintLessThan(u32, 2),
+            // head_buffers ≤ conn_slots is a Server.init precondition, so
+            // the slot draw starts at whatever the ring draw chose.
+            .conn_slots = harness.head_buffers + random.uintLessThan(u32, 2),
             .relay_buffers = 1,
             .upstream_slots = 1,
+            .head_buffers = harness.head_buffers,
             .access_log_buffer_bytes = access_log_buffer_bytes,
         }
     else
@@ -624,6 +649,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             .conn_slots = 2 * clients_max,
             .relay_buffers = if (harness.clean) 2 * clients_max else clients_max,
             .upstream_slots = 2 * clients_max,
+            .head_buffers = harness.head_buffers,
         };
     try harness.server.init(arena, &harness.io, &harness.config, options);
     try harness.server.start();
