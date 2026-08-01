@@ -70,12 +70,23 @@ const init_attempts_max: u8 = 5;
 /// implicitly: contract tests bind a handful of sockets, so a small fixed
 /// reservation covers every scenario here.
 const listeners_reserved: u32 = 8;
+/// Every test ring registers a small provided-buffer group, sized so the
+/// group tests can exhaust it on purpose while the rest never notice it.
+const buffer_group_count: u32 = 2;
+const buffer_group_bytes: u32 = 512;
 
 fn initTestIo(xev_io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
     var attempt: u8 = 1;
     while (true) : (attempt += 1) {
         assert(attempt <= init_attempts_max);
-        if (XevIo.init(xev_io, arena, cq_entries, listeners_reserved)) |_| {
+        if (XevIo.init(
+            xev_io,
+            arena,
+            cq_entries,
+            listeners_reserved,
+            buffer_group_count,
+            buffer_group_bytes,
+        )) |_| {
             return;
         } else |err| {
             if (err != error.SystemResources) return err;
@@ -297,6 +308,193 @@ test "contract: echo on XevIo over real loopback" {
     try scenario.start(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
     try xev_io.run();
     try scenario.verify();
+}
+
+/// The provided-buffer group contract, one story over any backend: a
+/// group-recv binds a buffer only when data arrives; a mid-message
+/// continuation is a classic recv into the bound buffer; exhaustion is
+/// `NoBuffers` delivered as a completion; a returned buffer is selectable
+/// again; and EOF consumes nothing. Driven under the SimIo adversary
+/// (splits every delivery) and over XevIo's real loopback alike.
+fn GroupContract(comptime IoType: type) type {
+    Io.assertIoInterface(IoType);
+    return struct {
+        io: *IoType,
+        accept_completion: IoType.Completion = .{},
+        connect_completion: IoType.Completion = .{},
+        op_completion: IoType.Completion = .{},
+        accepted: ?IoType.Socket = null,
+        connected: ?IoType.Socket = null,
+        sent: ?u32 = null,
+        group: ?(Io.RecvGroupError!Io.GroupRecv) = null,
+        classic: ?(Io.RecvError!u32) = null,
+
+        const Contract = @This();
+        const payload = "0123456789abcdefghijklmnopqrstuvwxyz-ok!";
+
+        fn onAccept(c: *Contract, result: Io.AcceptError!IoType.Socket) void {
+            c.accepted = result catch null;
+        }
+        fn onConnect(c: *Contract, result: Io.ConnectError!IoType.Socket) void {
+            c.connected = result catch null;
+        }
+        fn onSend(c: *Contract, result: Io.SendError!u32) void {
+            c.sent = result catch 0;
+        }
+        fn onGroup(c: *Contract, result: Io.RecvGroupError!Io.GroupRecv) void {
+            c.group = result;
+        }
+        fn onClassic(c: *Contract, result: Io.RecvError!u32) void {
+            c.classic = result;
+        }
+
+        fn pair(c: *Contract, listener: IoType.Listener) !struct { IoType.Socket, IoType.Socket } {
+            c.accepted = null;
+            c.connected = null;
+            c.accept_completion = .{};
+            c.connect_completion = .{};
+            c.io.accept(listener, &c.accept_completion, Contract, c, onAccept);
+            c.io.connect(
+                c.io.listenerAddress(listener),
+                &c.connect_completion,
+                Contract,
+                c,
+                onConnect,
+            );
+            try c.io.run();
+            return .{
+                c.connected orelse return error.ConnectNeverCompleted,
+                c.accepted orelse return error.AcceptNeverCompleted,
+            };
+        }
+
+        /// Send the whole payload, looping on the short writes both the
+        /// adversary and a real kernel may deal.
+        fn sendAll(c: *Contract, socket: IoType.Socket) !void {
+            var offset: u32 = 0;
+            while (offset < payload.len) {
+                c.sent = null;
+                c.op_completion = .{};
+                c.io.send(socket, payload[offset..], &c.op_completion, Contract, c, onSend);
+                try c.io.run();
+                const n = c.sent orelse return error.SendNeverCompleted;
+                if (n == 0) return error.SendFailed;
+                offset += n;
+            }
+        }
+
+        /// Group-recv the payload's first bytes, then continue with
+        /// classic recvs into the bound buffer — the §5 head-read shape.
+        fn recvWholePayload(c: *Contract, socket: IoType.Socket) !u16 {
+            c.group = null;
+            c.op_completion = .{};
+            c.io.recvGroup(socket, &c.op_completion, Contract, c, onGroup);
+            try c.io.run();
+            const first = try (c.group orelse return error.RecvNeverCompleted);
+            try std.testing.expect(first.len >= 1);
+            const buffer = c.io.bufferGroupSlice(first.buffer_id);
+            var total: u32 = first.len;
+            while (total < payload.len) {
+                c.classic = null;
+                c.op_completion = .{};
+                c.io.recv(socket, buffer[total..], &c.op_completion, Contract, c, onClassic);
+                try c.io.run();
+                total += try (c.classic orelse return error.RecvNeverCompleted);
+            }
+            try std.testing.expectEqualSlices(u8, payload, buffer[0..payload.len]);
+            return first.buffer_id;
+        }
+
+        /// One armed group-recv, one delivery, whatever it carries.
+        fn recvOnce(c: *Contract, socket: IoType.Socket) !Io.RecvGroupError!Io.GroupRecv {
+            c.group = null;
+            c.op_completion = .{};
+            c.io.recvGroup(socket, &c.op_completion, Contract, c, onGroup);
+            try c.io.run();
+            return c.group orelse return error.RecvNeverCompleted;
+        }
+    };
+}
+
+/// The story needs a group of exactly two 512-byte buffers — what the
+/// XevIo test harness registers, and what the SimIo variant passes.
+fn runGroupContract(comptime IoType: type, io: *IoType) !void {
+    const Contract = GroupContract(IoType);
+    var c: Contract = .{ .io = io };
+    const listener = try io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+
+    // Selection, and the classic-recv continuation into the bound buffer.
+    const client_a, const server_a = try c.pair(listener);
+    try c.sendAll(client_a);
+    const id_a = try c.recvWholePayload(server_a);
+
+    // Second delivery binds the other buffer; the group is now empty.
+    const client_b, const server_b = try c.pair(listener);
+    try c.sendAll(client_b);
+    const id_b = try c.recvWholePayload(server_b);
+    try std.testing.expect(id_a != id_b);
+
+    // Exhaustion: data waiting, group empty — NoBuffers as a completion.
+    const client_c, const server_c = try c.pair(listener);
+    try c.sendAll(client_c);
+    try std.testing.expectError(error.NoBuffers, try c.recvOnce(server_c));
+
+    // Return one buffer and the same bytes deliver into it: with exactly
+    // one buffer in the group, every backend must select it.
+    io.bufferGroupReturn(id_a);
+    const retry = try (try c.recvOnce(server_c));
+    try std.testing.expectEqual(id_a, retry.buffer_id);
+    try std.testing.expect(retry.len >= 1);
+    io.bufferGroupReturn(retry.buffer_id);
+    io.bufferGroupReturn(id_b);
+
+    // EOF consumes nothing: after the peer closes, both buffers must
+    // still be selectable — two concurrent data deliveries prove it.
+    io.closeNow(client_a);
+    const eof = try c.recvOnce(server_a);
+    try std.testing.expectError(error.EndOfStream, eof);
+    try c.sendAll(client_b);
+    const after_b = try (try c.recvOnce(server_b));
+    try c.sendAll(client_c);
+    const after_c = try (try c.recvOnce(server_c));
+    try std.testing.expect(after_b.buffer_id != after_c.buffer_id);
+    io.bufferGroupReturn(after_b.buffer_id);
+    io.bufferGroupReturn(after_c.buffer_id);
+
+    io.closeNow(server_a);
+    for ([_]IoType.Socket{ client_b, server_b, client_c, server_c }) |socket| {
+        io.closeNow(socket);
+    }
+    io.listenClose(listener);
+}
+
+test "contract: the provided-buffer group on SimIo under the adversary" {
+    var seed: u64 = 1;
+    while (seed <= 10) : (seed += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+
+        var sim_io: SimIo = undefined;
+        try sim_io.init(arena_state.allocator(), .{
+            .seed = seed,
+            .adversary = .{ .partial_io = true, .connect_delay_ns_max = 5_000_000 },
+            .buffer_group_count = 2,
+            .buffer_group_bytes = 512,
+        });
+        try runGroupContract(SimIo, &sim_io);
+        try std.testing.expect(sim_io.sockets.isFullyReleased());
+        try std.testing.expectEqual(@as(u32, 0), sim_io.group_in_use);
+    }
+}
+
+test "contract: the provided-buffer group on XevIo over real loopback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+    try runGroupContract(XevIo, &xev_io);
 }
 
 test "contract: XevIo requests a nonzero IORING_SETUP_CQSIZE depth" {
@@ -794,7 +992,8 @@ test "xevio: the listener table reserves a slot for the admin listener" {
 
     var xev_io: XevIo = undefined;
     // One configured listener; capacity must be that plus the admin slot.
-    try XevIo.init(&xev_io, arena_state.allocator(), 0, 1);
+    // No buffer group — the zero-count arm must also keep init working.
+    try XevIo.init(&xev_io, arena_state.allocator(), 0, 1, 0, 1);
     defer xev_io.deinit();
 
     const loopback = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");

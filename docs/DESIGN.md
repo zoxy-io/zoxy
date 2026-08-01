@@ -318,12 +318,17 @@ unmerged behind it, so the pin moves only after re-audit.
   against the tick would read 0 µs for every request served inside one
   completion batch. It costs two vDSO reads per logged request, against
   `now_ns`'s one per tick, and only when a deployment turns the log on.
-- **Plain ops only.** Multishot accept/recv, buffer rings, `send_zc`,
-  `splice` stay behind measurement — the previous iteration never became
-  CPU-bound without them, and this one is latency-bound with CPU
-  headroom. Each has since been evaluated; verdicts, revisit conditions,
-  and the measurements behind them live in
-  [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
+- **Plain ops only.** Multishot accept/recv, `send_zc`, `splice` stay
+  behind measurement — the previous iteration never became CPU-bound
+  without them, and this one is latency-bound with CPU headroom. Each
+  has since been evaluated; verdicts, revisit conditions, and the
+  measurements behind them live in
+  [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md). One graduation:
+  single-shot buffer-select — the buffer-ring mechanism without
+  multishot — carries the seam's `recvGroup` (§5's head-buffer ring),
+  adopted 2026-08-01 for density rather than throughput; the notes
+  record why that does not reopen the multishot closure. Every
+  completion still disarms.
 
 ## 5. Memory — shared pools, fixed at startup
 

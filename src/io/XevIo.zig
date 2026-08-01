@@ -27,6 +27,14 @@ const XevIo = @This();
 /// perform the blocking syscall; completion callbacks still run on the
 /// loop thread, so the single-threaded discipline holds.
 const needs_thread_pool = xev.backend == .kqueue;
+/// Whether the provided-buffer group is the kernel's (a registered
+/// buf_ring the fork's `recv_group` op selects from) or an app-side
+/// emulation. Only io_uring has the real thing; everywhere else the
+/// buffer binds at arm time — correct and testable on the macOS dev box,
+/// but the idle-socket density win is the io_uring deployment's alone.
+const uses_buf_ring = xev.backend == .io_uring;
+/// The one buffer group this backend registers (§5's head-buffer ring).
+const buffer_group_id: u16 = 0;
 
 /// The access-log sink (§8): the process's own stdout, inherited, never
 /// opened here. Config names the sink by enum and this is the only value
@@ -50,6 +58,25 @@ listeners_count: u16,
 /// the same callback — the loop is single-threaded and callbacks do not
 /// nest, so "most recent" is "the one being delivered".
 last_pressure: Io.Pressure,
+/// The provided-buffer group's slab: `group_count × group_bytes`, arena-
+/// allocated at init. On io_uring every buffer is published to the
+/// registered buf_ring and the kernel owns selection; the app touches the
+/// ring again only to return an id (a tail bump, no syscall).
+group_slab: []u8,
+group_count: u32,
+group_bytes: u32,
+group_br: if (uses_buf_ring) ?*align(std.heap.page_size_min) linux.io_uring_buf_ring else void,
+group_mask: if (uses_buf_ring) u16 else void,
+/// Emulation only (non-io_uring): the free ids as a stack, filled so the
+/// pop order starts at 0 — the same lowest-first shape SimIo picks, so a
+/// test reading ids behaves alike over all three backends.
+group_free: if (uses_buf_ring) void else []u16,
+group_free_len: if (uses_buf_ring) void else u32,
+/// True from the delivery that handed an id out until its return — on
+/// both arms. The kernel cannot observe a double return (it would just
+/// republish the id and let two receives alias one buffer, silently), so
+/// the seam tracks ownership itself and makes the corruption an assert.
+group_checked_out: []bool,
 
 pub const Socket = enum(i32) { _ };
 
@@ -88,6 +115,12 @@ pub fn init(
     /// table. Every admin-enabled deployment hits it, and nothing in the
     /// test suite would: `Server(XevIo)` is instantiated only by main.
     configured_listeners: u32,
+    /// The provided-buffer group (§5's head-buffer ring): how many
+    /// buffers, how wide each. Zero count is a group nobody registered —
+    /// legal, and what an L4-only deployment gets; arming `recvGroup`
+    /// against it is asserted misuse.
+    buffer_group_count: u32,
+    buffer_group_bytes: u32,
 ) !void {
     assert(configured_listeners <= std.math.maxInt(u16) - constants.admin_listeners);
     const listeners = configured_listeners + constants.admin_listeners;
@@ -115,9 +148,61 @@ pub fn init(
     io.signal_mask = std.atomic.Value(u8).init(0);
     io.signal_callback = null;
     io.signal_userdata = null;
+    try io.initBufferGroup(arena, buffer_group_count, buffer_group_bytes);
     // cached_now is undefined until the first tick; ops armed before
     // run() (accepts, timers at startup) must see a sane clock.
     io.loop.update_now();
+}
+
+/// Set up the provided-buffer group: slab from the arena, published to a
+/// kernel buf_ring on io_uring, to the app-side free stack elsewhere.
+/// Split from `init` the way `initLoop` is — for the length limit, and
+/// because the two backends' setup shares nothing but the slab.
+fn initBufferGroup(io: *XevIo, arena: std.mem.Allocator, count: u32, bytes: u32) !void {
+    assert(bytes >= 1);
+    assert(count <= constants.buffer_group_entries_max);
+    io.group_slab = try arena.alloc(u8, @as(usize, count) * bytes);
+    io.group_checked_out = try arena.alloc(bool, count);
+    @memset(io.group_checked_out, false);
+    io.group_count = count;
+    io.group_bytes = bytes;
+    if (comptime uses_buf_ring) {
+        io.group_br = null;
+        io.group_mask = 0;
+        if (count == 0) return;
+        const entries: u16 = @intCast(std.math.ceilPowerOfTwo(u32, count) catch unreachable);
+        const br = linux.IoUring.setup_buf_ring(
+            io.loop.ring.fd,
+            entries,
+            buffer_group_id,
+            .{ .inc = false },
+        ) catch |err| switch (err) {
+            // EINVAL with known-good arguments: the kernel predates
+            // IORING_REGISTER_PBUF_RING (5.19). No silent downgrade — a
+            // deployment that asked for head buffers gets the density it
+            // asked for or a refusal it can read at startup.
+            error.ArgumentsInvalid => return error.BufferRingUnsupported,
+            else => return err,
+        };
+        linux.IoUring.buf_ring_init(br);
+        io.group_mask = linux.IoUring.buf_ring_mask(entries);
+        var index: u16 = 0;
+        while (index < count) : (index += 1) {
+            linux.IoUring.buf_ring_add(br, io.sliceForId(index), index, io.group_mask, index);
+        }
+        linux.IoUring.buf_ring_advance(br, @intCast(count));
+        io.group_br = br;
+    } else {
+        io.group_free = try arena.alloc(u16, count);
+        var index: u32 = 0;
+        // Filled descending so the stack pops lowest-first — the same
+        // shape SimIo picks, so a test reading ids behaves alike over
+        // every backend.
+        while (index < count) : (index += 1) {
+            io.group_free[index] = @intCast(count - 1 - index);
+        }
+        io.group_free_len = count;
+    }
 }
 
 /// Build the event loop with zoxy's ring discipline (§3, §4, §8). Split
@@ -181,6 +266,12 @@ fn initLoop(cq_entries: u32, thread_pool: ?*xev.ThreadPool) !xev.Loop {
 
 /// Test-only teardown; production never exits except through drain.
 pub fn deinit(io: *XevIo) void {
+    if (comptime uses_buf_ring) {
+        if (io.group_br) |br| {
+            const entries: u16 = @intCast(std.math.ceilPowerOfTwo(u32, io.group_count) catch unreachable);
+            linux.IoUring.free_buf_ring(io.loop.ring.fd, br, entries, buffer_group_id);
+        }
+    }
     for (io.listeners[0..io.listeners_count]) |*entry| {
         assert(!entry.open or entry.armed_accept == null);
         if (entry.open) {
@@ -444,6 +535,171 @@ pub fn recv(
             return .disarm;
         }
     }).adapter);
+}
+
+/// A recv that carries no buffer (§5's head-buffer ring). On io_uring the
+/// fork's `recv_group` op lets the kernel bind one at delivery time; on
+/// other backends the free stack binds one here at arm time — same
+/// contract, no density win, which only the io_uring deployment claims.
+pub fn recvGroup(
+    io: *XevIo,
+    socket: Socket,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.RecvGroupError!Io.GroupRecv) void,
+) void {
+    assert(io.group_count >= 1);
+    if (comptime uses_buf_ring) {
+        assert(io.group_br != null);
+        completion.* = .{
+            .op = .{ .recv_group = .{
+                .fd = @intFromEnum(socket),
+                .group_id = buffer_group_id,
+                .max_len = io.group_bytes,
+            } },
+            .userdata = userdata,
+            .callback = (struct {
+                fn adapter(
+                    context: ?*anyopaque,
+                    loop: *xev.Loop,
+                    inner: *xev.Completion,
+                    result: xev.Result,
+                ) xev.CallbackAction {
+                    const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+                    io_inner.recordPressure(inner);
+                    const typed: *Userdata = @ptrCast(@alignCast(context.?));
+                    callback(typed, if (result.recv_group) |n| ok: {
+                        // Bytes delivered ⇒ the kernel selected a buffer
+                        // and said so in the cqe flags; trust its word
+                        // over any assumption (the fork pins this).
+                        const id = inner.bufferId() orelse unreachable;
+                        assert(n >= 1);
+                        assert(!io_inner.group_checked_out[id]);
+                        io_inner.group_checked_out[id] = true;
+                        break :ok Io.GroupRecv{ .len = @intCast(n), .buffer_id = id };
+                    } else |err| switch (err) {
+                        error.EOF => error.EndOfStream,
+                        error.ConnectionResetByPeer => error.Reset,
+                        error.Canceled => error.Canceled,
+                        error.NoBuffers => error.NoBuffers,
+                        else => error.Unexpected,
+                    });
+                    return .disarm;
+                }
+            }).adapter,
+        };
+        io.loop.add(completion);
+    } else {
+        io.recvGroupEmulated(socket, completion, Userdata, userdata, callback);
+    }
+}
+
+/// The non-io_uring arm of `recvGroup`: bind a free buffer now and issue a
+/// classic recv into it; with none free, deliver NoBuffers through a
+/// zero-delay timer so exhaustion still arrives as a completion, never
+/// re-entrantly from inside the arm call.
+fn recvGroupEmulated(
+    io: *XevIo,
+    socket: Socket,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.RecvGroupError!Io.GroupRecv) void,
+) void {
+    if (io.group_free_len == 0) {
+        io.timer.run(&io.loop, completion, 0, Userdata, userdata, (struct {
+            fn adapter(
+                context: ?*Userdata,
+                loop: *xev.Loop,
+                timer_completion: *xev.Completion,
+                result: xev.Timer.RunError!void,
+            ) xev.CallbackAction {
+                _ = loop;
+                _ = timer_completion;
+                result catch @panic("zero-delay timer failed");
+                callback(context.?, error.NoBuffers);
+                return .disarm;
+            }
+        }).adapter);
+        return;
+    }
+    io.group_free_len -= 1;
+    const id = io.group_free[io.group_free_len];
+    const tcp = xev.TCP.initFd(@intFromEnum(socket));
+    tcp.read(&io.loop, completion, .{ .slice = io.sliceForId(id) }, Userdata, userdata, (struct {
+        fn adapter(
+            context: ?*Userdata,
+            loop: *xev.Loop,
+            read_completion: *xev.Completion,
+            tcp_inner: xev.TCP,
+            read_buffer: xev.ReadBuffer,
+            result: xev.ReadError!usize,
+        ) xev.CallbackAction {
+            const io_inner: *XevIo = @fieldParentPtr("loop", loop);
+            io_inner.recordPressure(read_completion);
+            _ = tcp_inner;
+            // The id rides back in the buffer itself: its offset in the
+            // slab is the id, so nothing per-op has to store it.
+            const bound: u16 = @intCast(@divExact(
+                @intFromPtr(read_buffer.slice.ptr) - @intFromPtr(io_inner.group_slab.ptr),
+                io_inner.group_bytes,
+            ));
+            callback(context.?, if (result) |n| ok: {
+                assert(n >= 1);
+                assert(!io_inner.group_checked_out[bound]);
+                io_inner.group_checked_out[bound] = true;
+                break :ok Io.GroupRecv{ .len = @intCast(n), .buffer_id = bound };
+            } else |err| refund: {
+                // No bytes ⇒ no consumption, matching the kernel twin:
+                // the buffer goes back before the error is delivered.
+                io_inner.group_free[io_inner.group_free_len] = bound;
+                io_inner.group_free_len += 1;
+                // anyerror: kqueue's ReadError has no ConnectionResetByPeer.
+                break :refund switch (@as(anyerror, err)) {
+                    error.EOF => error.EndOfStream,
+                    error.ConnectionResetByPeer => error.Reset,
+                    error.Canceled => error.Canceled,
+                    else => error.Unexpected,
+                };
+            });
+            return .disarm;
+        }
+    }).adapter);
+}
+
+/// The bytes behind a `GroupRecv.buffer_id`, valid until returned.
+pub fn bufferGroupSlice(io: *XevIo, buffer_id: u16) []u8 {
+    // Only the holder of a delivered id may read it — the same ownership
+    // assert SimIo makes, backed here by the seam's own tracking.
+    assert(io.group_checked_out[buffer_id]);
+    return io.sliceForId(buffer_id);
+}
+
+fn sliceForId(io: *XevIo, buffer_id: u16) []u8 {
+    assert(buffer_id < io.group_count);
+    return io.group_slab[@as(usize, buffer_id) * io.group_bytes ..][0..io.group_bytes];
+}
+
+/// Give a selected buffer back to the group: on io_uring two stores and an
+/// atomic tail bump — no syscall — republishing the id to the kernel; on
+/// the emulation, a push onto the free stack.
+pub fn bufferGroupReturn(io: *XevIo, buffer_id: u16) void {
+    assert(buffer_id < io.group_count);
+    // A double return would republish the id and let two receives alias
+    // one buffer — corruption the kernel delivers silently, so it must
+    // die here instead.
+    assert(io.group_checked_out[buffer_id]);
+    io.group_checked_out[buffer_id] = false;
+    if (comptime uses_buf_ring) {
+        const br = io.group_br orelse unreachable;
+        linux.IoUring.buf_ring_add(br, io.sliceForId(buffer_id), buffer_id, io.group_mask, 0);
+        linux.IoUring.buf_ring_advance(br, 1);
+    } else {
+        assert(io.group_free_len < io.group_count);
+        io.group_free[io.group_free_len] = buffer_id;
+        io.group_free_len += 1;
+    }
 }
 
 pub fn send(

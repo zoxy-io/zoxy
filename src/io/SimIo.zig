@@ -139,6 +139,16 @@ sink_overflow_bytes: u32,
 pending_log_write_errors: u8,
 /// The ephemeral port the next simulated client connects from.
 next_client_port: u16,
+/// The provided-buffer group (§5): one slab, a free flag per buffer, and
+/// the in-use count the asserts ride on. Selection happens at delivery
+/// time — an armed `recv_group` holds nothing — mirroring the kernel's
+/// buf_ring, with lowest-free-id in place of the kernel's own choice so
+/// the schedule stays a pure function of the seed.
+group_slab: []u8,
+group_free: []bool,
+group_count: u32,
+group_bytes: u32,
+group_in_use: u32,
 
 const blackholed_addresses_max: u8 = 4;
 const connect_error_addresses_max: u8 = 4;
@@ -185,6 +195,13 @@ pub const Options = struct {
     /// Print pending-op forensics when a deadlock is detected. Tests
     /// that deliberately provoke a deadlock turn this off.
     dump_on_deadlock: bool = true,
+    /// The provided-buffer group `recvGroup` selects from — the simulated
+    /// twin of the io_uring buf_ring (§5's head-buffer ring). Selection is
+    /// deterministic (lowest free id), so a seed replays the same buffer
+    /// assignments. Defaults wide enough that no scenario sheds unless it
+    /// asks to: one buffer per possible socket, production-sized.
+    buffer_group_count: u32 = sockets_max,
+    buffer_group_bytes: u32 = constants.head_bytes_max,
 };
 
 pub const Socket = packed struct(u32) {
@@ -214,6 +231,7 @@ pub const OpKind = enum(u8) {
     accept,
     connect,
     recv,
+    recv_group,
     send,
     close,
     log_write,
@@ -227,6 +245,7 @@ const Op = union(OpKind) {
     accept: struct { listener_index: u16 },
     connect: struct { address: std.Io.net.IpAddress, fate: ConnectFate, canceled: bool },
     recv: struct { socket: Socket, buffer: []u8 },
+    recv_group: struct { socket: Socket },
     send: struct { socket: Socket, bytes: []const u8 },
     close: struct { socket: Socket },
     log_write: struct { bytes: []const u8 },
@@ -241,6 +260,7 @@ const Result = union(enum) {
     accept: Io.AcceptError!Socket,
     connect: Io.ConnectError!Socket,
     recv: Io.RecvError!u32,
+    recv_group: Io.RecvGroupError!Io.GroupRecv,
     send: Io.SendError!u32,
     close: void,
     log_write: Io.LogWriteError!u32,
@@ -393,6 +413,13 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     // wider than the backing array would index past it.
     assert(options.adversary.inbox_bytes >= 1);
     assert(options.adversary.inbox_bytes <= inbox_bytes_max);
+    // A zero-buffer group is a scenario choice (an L4-only world arms no
+    // recv_group); a zero-byte buffer is never anything but a bug. The
+    // count ceiling is the kernel twin's own (buf_ring entries are a u16
+    // power of two), stated here so ids stay u16 and the slab multiply
+    // below cannot overflow before it widens.
+    assert(options.buffer_group_bytes >= 1);
+    assert(options.buffer_group_count <= constants.buffer_group_entries_max);
 
     io.listeners = try arena.alloc(ListenerEntry, listeners_max);
     io.pending = try arena.alloc(*Completion, pending_ops_max);
@@ -422,6 +449,15 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.sink_overflow_bytes = 0;
     io.pending_log_write_errors = 0;
     io.next_client_port = client_port_base;
+    io.group_slab = try arena.alloc(
+        u8,
+        @as(usize, options.buffer_group_count) * options.buffer_group_bytes,
+    );
+    io.group_free = try arena.alloc(bool, options.buffer_group_count);
+    @memset(io.group_free, true);
+    io.group_count = options.buffer_group_count;
+    io.group_bytes = options.buffer_group_bytes;
+    io.group_in_use = 0;
     assert(io.sockets.isFullyReleased());
 }
 
@@ -577,6 +613,48 @@ pub fn recv(
         .callback = erasedResult(Userdata, .recv, callback),
     };
     io.enqueue(completion);
+}
+
+/// A recv that carries no buffer (§5's head-buffer ring): the group binds
+/// one at delivery time, or answers `error.NoBuffers` if it cannot. The
+/// armed op itself holds nothing — that is the entire point.
+pub fn recvGroup(
+    io: *SimIo,
+    socket: Socket,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.RecvGroupError!Io.GroupRecv) void,
+) void {
+    assert(completion.state == .dead);
+    assert(io.group_count >= 1);
+    _ = io.socketEntry(socket);
+    completion.* = .{
+        .op = .{ .recv_group = .{ .socket = socket } },
+        .userdata = userdata,
+        .callback = erasedResult(Userdata, .recv_group, callback),
+    };
+    io.enqueue(completion);
+}
+
+/// The bytes behind a `GroupRecv.buffer_id`, valid until returned.
+pub fn bufferGroupSlice(io: *SimIo, buffer_id: u16) []u8 {
+    assert(buffer_id < io.group_count);
+    // Only the holder of an id may read it, and the simulator can enforce
+    // what the kernel-backed twin cannot observe.
+    assert(!io.group_free[buffer_id]);
+    return io.group_slab[@as(usize, buffer_id) * io.group_bytes ..][0..io.group_bytes];
+}
+
+/// Give a selected buffer back to the group. Sync and syscall-free in
+/// production (a buf_ring tail bump); here it is the flag flip the sim's
+/// leak assertions watch.
+pub fn bufferGroupReturn(io: *SimIo, buffer_id: u16) void {
+    assert(buffer_id < io.group_count);
+    assert(!io.group_free[buffer_id]);
+    assert(io.group_in_use >= 1);
+    io.group_free[buffer_id] = true;
+    io.group_in_use -= 1;
 }
 
 pub fn send(
@@ -979,6 +1057,10 @@ fn dumpPendingOps(io: *const SimIo) void {
                 "  recv socket={d} gen={d}\n",
                 .{ op.socket.index, op.socket.generation },
             ),
+            .recv_group => |op| std.debug.print(
+                "  recv_group socket={d} gen={d}\n",
+                .{ op.socket.index, op.socket.generation },
+            ),
             .send => |op| std.debug.print(
                 "  send socket={d} gen={d} len={d}\n",
                 .{ op.socket.index, op.socket.generation, op.bytes.len },
@@ -1037,6 +1119,14 @@ fn opReady(io: *SimIo, completion: *Completion) bool {
             break :ready entry.kernel_pressure or entry.reset or entry.inbox.count > 0 or
                 entry.read_shutdown or entry.fin_received;
         },
+        // Readiness is the socket's, never the group's: the kernel twin
+        // waits for data with an empty group too, and reports NoBuffers
+        // only when bytes actually arrive to an empty one.
+        .recv_group => |op| ready: {
+            const entry = io.socketEntry(op.socket);
+            break :ready entry.kernel_pressure or entry.reset or entry.inbox.count > 0 or
+                entry.read_shutdown or entry.fin_received;
+        },
         .send => |op| ready: {
             const entry = io.socketEntry(op.socket);
             if (entry.kernel_pressure or entry.reset or
@@ -1082,6 +1172,7 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
             .connect = if (op.canceled) error.Canceled else io.finishConnect(op.address, op.fate),
         },
         .recv => |op| .{ .recv = io.finishRecv(op.socket, op.buffer) },
+        .recv_group => |op| .{ .recv_group = io.finishRecvGroup(op.socket) },
         .send => |op| .{ .send = io.finishSend(op.socket, op.bytes) },
         .log_write => |op| .{ .log_write = io.finishLogWrite(op.bytes) },
         .close => |op| close: {
@@ -1199,6 +1290,52 @@ fn finishRecv(io: *SimIo, socket: Socket, buffer: []u8) Io.RecvError!u32 {
     }
     assert(entry.read_shutdown or entry.fin_received);
     return error.EndOfStream;
+}
+
+/// `finishRecv` with the buffer bound at delivery instead of at arm — the
+/// order of the checks is the contract: reset and EOF outrank selection,
+/// so a dying socket never consumes a buffer (the kernel behaves the same;
+/// the fork's test pins it).
+fn finishRecvGroup(io: *SimIo, socket: Socket) Io.RecvGroupError!Io.GroupRecv {
+    const entry = io.socketEntry(socket);
+    if (entry.kernel_pressure) {
+        // Transient op failure: consume the flag, leave the socket usable.
+        entry.kernel_pressure = false;
+        io.recordPressure();
+        return error.Unexpected;
+    }
+    if (entry.reset) {
+        return error.Reset;
+    }
+    if (entry.inbox.count > 0 and !entry.read_shutdown) {
+        const buffer_id = io.groupPickFree() orelse return error.NoBuffers;
+        const buffer = io.bufferGroupSlice(buffer_id);
+        const available: u32 = @min(@as(u32, @intCast(buffer.len)), entry.inbox.count);
+        const n = io.partialLen(available);
+        const popped = entry.inbox.pop(buffer[0..n]);
+        assert(popped == n);
+        assert(n >= 1);
+        return .{ .len = n, .buffer_id = buffer_id };
+    }
+    assert(entry.read_shutdown or entry.fin_received);
+    return error.EndOfStream;
+}
+
+/// Lowest free id, or null on exhaustion. Lowest rather than random on
+/// purpose: buffer assignment stays a pure function of the seed's
+/// schedule, so it cannot fork a trace on its own.
+fn groupPickFree(io: *SimIo) ?u16 {
+    assert(io.group_in_use <= io.group_count);
+    for (io.group_free, 0..) |free, index| {
+        if (free) {
+            io.group_free[index] = false;
+            io.group_in_use += 1;
+            assert(io.group_in_use <= io.group_count);
+            return @intCast(index);
+        }
+    }
+    assert(io.group_in_use == io.group_count);
+    return null;
 }
 
 fn finishSend(io: *SimIo, socket: Socket, bytes: []const u8) Io.SendError!u32 {
@@ -1463,6 +1600,12 @@ fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) vo
     io.mix(@intFromEnum(result.*));
     const detail: u64 = switch (result.*) {
         .recv => |r| if (r) |n| n else |err| 1000 + @intFromError(err),
+        // Both halves matter to a trace: the same bytes landing in a
+        // different buffer is a different schedule.
+        .recv_group => |r| if (r) |g|
+            (@as(u64, g.buffer_id) << 32) | g.len
+        else |err|
+            11000 + @intFromError(err),
         .send => |r| if (r) |n| n else |err| 2000 + @intFromError(err),
         .accept => |r| if (r) |s| @as(u32, @bitCast(s)) else |err| 3000 + @intFromError(err),
         .connect => |r| if (r) |s| @as(u32, @bitCast(s)) else |err| 4000 + @intFromError(err),

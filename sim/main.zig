@@ -217,6 +217,15 @@ const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
             "every serving path closes synchronously via closeNow — and the " ++
             "sweep configures no admin listener; src/admin_test.zig covers it",
     },
+    .{
+        // TEMPORARY: deleted by the next slice, which re-arms the proxy's
+        // idle head read as a recv_group against the §5 head-buffer ring
+        // and makes every http seed deliver it.
+        .kind = .recv_group,
+        .reason = "the seam carries it but the proxy does not arm it yet — " ++
+            "the head-buffer ring lands in the next slice; " ++
+            "src/io/contract_test.zig covers the op itself",
+    },
 };
 
 comptime {
