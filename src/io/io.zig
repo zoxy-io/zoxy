@@ -17,6 +17,12 @@
 //!       pending connect — a black-holed dial must still reach a terminal
 //!       completion or its slot could never be released, §5)
 //!   recv(io, socket, buffer, c, U, u, cb(u, RecvError!u32))
+//!   recvGroup(io, socket, c, U, u, cb(u, RecvGroupError!GroupRecv))
+//!       (a recv that carries no buffer: the backend binds one from its
+//!       provided-buffer group only when data arrives, so an armed idle
+//!       socket pins no memory — §5's head-buffer ring rides on this)
+//!   bufferGroupSlice(io, buffer_id) []u8               (sync; the bytes)
+//!   bufferGroupReturn(io, buffer_id) void              (sync; no syscall)
 //!   send(io, socket, bytes, c, U, u, cb(u, SendError!u32))
 //!   close(io, socket, c, U, u, cb(u))
 //!   logWrite(io, bytes, c, U, u, cb(u, LogWriteError!u32))   (§8 access log)
@@ -77,6 +83,28 @@ pub const RecvError = error{
     EndOfStream,
     Reset,
     Canceled,
+    Unexpected,
+};
+
+/// What a `recvGroup` delivers on success: the byte count and which of the
+/// backend's provided buffers the bytes landed in. The id is the caller's
+/// claim ticket — `bufferGroupSlice` to read, `bufferGroupReturn` to give
+/// it back — and stays valid until returned.
+pub const GroupRecv = struct {
+    len: u32,
+    buffer_id: u16,
+};
+
+/// `RecvError` plus the one failure a bufferless receive exists to report.
+pub const RecvGroupError = error{
+    EndOfStream,
+    Reset,
+    Canceled,
+    /// Data arrived and the buffer group was empty. Backpressure, not a
+    /// fault: the bytes are still in the socket, and the §8 answer is a
+    /// shed — a caller that instead re-arms without returning a buffer
+    /// first spins on the same bytes forever.
+    NoBuffers,
     Unexpected,
 };
 
@@ -170,6 +198,9 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "connect",
             "connectCancel",
             "recv",
+            "recvGroup",
+            "bufferGroupSlice",
+            "bufferGroupReturn",
             "send",
             "close",
             "logWrite",

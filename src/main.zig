@@ -112,7 +112,9 @@ pub fn main(init: std.process.Init) !void {
     try ensureFdBudget(fds_required);
     try printBudgets(init.io, &config, fds_required, cq_entries, config_arena_bytes);
 
-    try global_io.init(arena, cq_entries, listeners_count);
+    // Buffer group zero until the head-buffer ring's limits knob lands:
+    // no group is registered and nothing arms against one.
+    try global_io.init(arena, cq_entries, listeners_count, 0, zoxy.constants.head_bytes_max);
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
     try server.start();

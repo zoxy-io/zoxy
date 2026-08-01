@@ -292,6 +292,33 @@ submission-bound", below, 2026-07-28). Do not re-propose without a
 workload whose *measured* `cqes/wake` approaches 1; the shape of the
 workload is not the evidence, the batch depth is.
 
+## Single-shot buffer-select — adopted for density, not throughput (2026-08-01)
+
+The closure above stands on its axis, and this does not reopen it:
+multishot recv chased *syscalls*, the measured workload was not
+submission-bound, and nothing here changes that arithmetic. What
+returned is the buffer-group *mechanism* alone, for a problem the
+closure never priced: an idle L7 connection pins an 8 KiB head buffer
+because the recv armed while it idles must name a destination up front
+(#162 — head buffers are 62% of the default budget, held per connection
+rather than per active exchange). A single-shot `IOSQE_BUFFER_SELECT`
+recv — the fork's `recv_group` op, zoxy-io/libxev#3 — arms with no
+buffer; the kernel binds one from the registered ring only when bytes
+arrive, and returning it is a tail bump, no syscall. Op count per
+request is unchanged: the closure's "forfeits most of that win" was
+about the syscall win, which this deliberately does not chase.
+
+What the closure priced as the redesign cost is now owned outright: the
+buffer-group lifecycle and the ENOBUFS coupling live in the Io contract
+(`recvGroup` / `bufferGroupSlice` / `bufferGroupReturn`;
+`error.NoBuffers` is a §8 shed signal, never a retry), and SimIo models
+the group deterministically — lowest-free-id selection, exhaustion, and
+the no-consumption-on-EOF fact the fork's test pins against a real 6.18
+kernel. The §6 one-armed-recv discipline and XevIo's
+every-callback-disarms rule are unchanged; multishot stays closed on
+its own terms (do not re-propose without measured `cqes/wake`
+approaching 1).
+
 ## Pre-block spin — rejected (2026-07-12)
 
 Spinning before the loop blocks: p50 +15–25 µs *worse* and CPU ×2. The
@@ -357,7 +384,9 @@ itself. The durable "why" for each, so it is not re-chased.
   and **closed 2026-07-28** once the workload it was waiting for was
   measured. The syscall win does not pay for the relay redesign it
   demands; single-shot buffer-select would keep the strict §6 discipline
-  but forfeits most of that win.
+  but forfeits most of that win. Buffer-select has since been adopted
+  anyway — for memory density, a different axis; see "Single-shot
+  buffer-select" above. The multishot closure itself stands.
 - **`send_zc`** — rejected at the deliberate 4 KiB relay buffer. Below
   ~10–32 KiB the kernel copy is cheaper than page pinning, and the extra
   notification CQE per send doubles CQE consumption, eroding the CQ

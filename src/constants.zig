@@ -483,6 +483,14 @@ pub fn inFlightOps(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
 /// clamp) keep it out of reach.
 pub const completion_queue_entries_max: u32 = 65536;
 
+/// The widest provided-buffer group a ring can register (the seam's
+/// `recvGroup`, §5's head-buffer ring): a buf_ring's descriptor table is
+/// sized by a u16 power-of-two `entries` argument, so 1 << 15 is the
+/// largest capacity it can name. Fewer buffers than entries may be
+/// published — the operator's count is not itself forced to a power of
+/// two, only bounded by this.
+pub const buffer_group_entries_max: u32 = 1 << 15;
+
 /// §8 CQ fill: in-flight ring ops may occupy at most this many eighths of
 /// the completion queue; the rest stays free to absorb completion bursts.
 /// ⅞ is both the default and the largest fill a config may request — it is
