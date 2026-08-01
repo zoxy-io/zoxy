@@ -350,7 +350,7 @@ reserves nor demands the ceiling's resources.
 
 The defaults are deliberately lean — 1386 connection slots, 1386 relay buffer
 pairs, 1313 upstream slots, roughly 34 MiB of pools — sized to start under a
-stock 4096 `RLIMIT_NOFILE`. The ceiling is 11463 of each. Raising the pools
+stock 4096 `RLIMIT_NOFILE`. The ceiling is 11466 of each. Raising the pools
 raises the file-descriptor demand, which zoxy asserts against `RLIMIT_NOFILE`
 at startup rather than discovering as `EMFILE` later.
 

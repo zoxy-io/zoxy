@@ -1,6 +1,6 @@
 //! zoxy startup (DESIGN.md §5, §8): read config into the arena (the only
 //! allocating region), resolve it, verify the fd budget against
-//! RLIMIT_NOFILE, print the closed-form budgets, install signal handlers
+//! RLIMIT_NOFILE, print the budgets, install signal handlers
 //! (the only raw syscall surface outside src/io/, held to the rlimit and
 //! sigaction allowlist by lint), then hand the process to the event loop
 //! until a drain completes. `--help` and `--version` are answered before any
@@ -107,12 +107,12 @@ pub fn main(init: std.process.Init) !void {
     );
     // The effective config never exceeds the compiled ceilings (§8): the
     // pools, the ring, and the fd demand all fit what the constants proved.
-    assert(fds_required <= zoxy.constants.fds_max);
+
     assert(cq_entries <= zoxy.constants.completion_queue_entries);
     try ensureFdBudget(fds_required);
     try printBudgets(init.io, &config, fds_required, cq_entries, config_arena_bytes);
 
-    try global_io.init(arena, cq_entries);
+    try global_io.init(arena, cq_entries, listeners_count);
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
     try server.start();
@@ -319,7 +319,7 @@ fn printBudgets(
     // and `--version` is what it does not think to run.
     try writer.print(
         \\zoxy {s}{s}
-        \\budgets (closed-form, DESIGN.md §5/§8):
+        \\budgets (DESIGN.md §5/§8; closed-form except where marked):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B + access log {d} KiB
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)

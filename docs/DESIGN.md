@@ -423,9 +423,9 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 11463 | ~1.7 KiB state + 8 KiB head |
-| relay buffers | 1386 | 11463 | 2 × 4 KiB |
-| upstream slots | 1313 | 11463 | ~40 B state + 8 KiB head |
+| conn slots | 1386 | 11466 | ~1.7 KiB state + 8 KiB head |
+| relay buffers | 1386 | 11466 | 2 × 4 KiB |
+| upstream slots | 1313 | 11466 | ~40 B state + 8 KiB head |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
 
 The access log (§8) adds one fixed reservation beside the pools — two
@@ -447,7 +447,7 @@ closed-form in `src/constants.zig`.
 The ceilings sit on one completion-queue line — a conn slot costs
 `conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
 is **pinned to the conn ceiling**, so that line has a single divisor:
-`conn_ops_max + 1` ring ops per admitted connection, 11463 of them. On
+`conn_ops_max + 1` ring ops per admitted connection, 11466 of them. On
 the L7 path a connection that is mid-exchange holds an upstream slot as
 well as its conn slot, and at saturation every admitted connection can be
 mid-exchange at once — so an upstream ceiling below the conn ceiling is
@@ -475,10 +475,22 @@ deployment that means to fill its conn pool raises both together through
 Rules:
 
 - **Pools never grow.** Exhaustion is a shed signal (§8), never a realloc.
-- **Limit relationships are comptime-asserted** in `src/constants.zig`
-  (TIGER_STYLE): e.g. `relay_buffers_max ≤ conn_slots_max`, and the same
-  for the defaults. Note that `relay_buffers` — not conn slots — is the
-  true bound on concurrent L4 connections plus active L7 relays (§6).
+- **Limit relationships are comptime-asserted where they can be** in
+  `src/constants.zig` (TIGER_STYLE): e.g. `relay_buffers_max ≤
+  conn_slots_max`, and the same for the defaults. Note that
+  `relay_buffers` — not conn slots — is the true bound on concurrent L4
+  connections plus active L7 relays (§6).
+
+  "Where they can be" is a real qualifier, not hedging. A budget that is
+  a property of one constant is asserted at build time. A budget that is
+  a property of a *combination the config chooses* has no compile-time
+  point to assert — there is no listener, cluster or endpoint ceiling to
+  evaluate it at — so it is refused at load instead: `cqFillFits` for the
+  ring (`LimitConnSlotsOverCqFill`) and `ensureFdBudget` for the fds.
+  Same arithmetic, refused milliseconds later. The compiled ceilings
+  `conn_slots_max`/`upstream_slots_max` are therefore stated at *zero*
+  configured listeners, and each listener a config declares spends from
+  the same budget.
 - **The CQ fill is a headroom knob, not a pool shrink.**
   `limits.cq_fill_eighths` sets how many eighths of the completion queue
   the worst-case in-flight ops may fill: ⅞ (the default, the fill the c10k

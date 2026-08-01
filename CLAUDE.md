@@ -30,9 +30,13 @@ direnv activates the shell). Read before writing code:
   C FFI — `@cImport` is lint-forbidden.
 - Boundaries (lint-enforced): raw syscalls and the `xev` import live only
   under `src/io/`; `hparse` is imported only by `src/http/parser.zig`.
-- Zero allocation after startup. Every limit is a named constant in
-  `src/constants.zig`; the memory, fd, and ring budgets are closed-form
-  functions of those constants, comptime-asserted.
+- Zero allocation after startup. The memory, fd, and ring budgets are
+  closed-form functions of `src/constants.zig` and the loaded config.
+  Where a budget is a property of one constant it is comptime-asserted;
+  where it is a property of a combination the config chooses — listener
+  count, cluster and endpoint counts — it is rejected at startup instead
+  (`cqFillFits`, `ensureFdBudget`). Config shape is the operator's to
+  size; see DESIGN.md §5.
 - Workflow: small slices, one commit per slice, descriptive commit
   messages (§ references welcome). Push and open PRs only when asked.
 - Before committing a slice, run the `tiger-style-reviewer` agent on the

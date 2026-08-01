@@ -199,7 +199,7 @@ pub fn Server(comptime IoType: type) type {
             options: InitOptions,
         ) error{OutOfMemory}!void {
             assert(config.listeners.len >= 1);
-            assert(config.listeners.len <= constants.listeners_max);
+            assert(config.listeners.len <= std.math.maxInt(u16));
             // The deadline handoff depends on this ordering (§4/§5): a
             // connection's first deadline is armed at the connect budget
             // and `onConnect` re-stores it to the idle one, but the armed

@@ -486,7 +486,6 @@ pub const ConfigJson = struct {
         .listeners = .{
             .desc = "Sockets the proxy accepts connections on.",
             .min_items = 1,
-            .max_items = constants.listeners_max,
         },
         .clusters = .{ .desc = "Named upstream clusters, keyed by cluster name." },
         .timeouts = .{ .desc = "Connection lifecycle deadlines (milliseconds)." },
@@ -1161,7 +1160,11 @@ fn resolveListeners(
     if (listeners_json.len == 0) {
         return error.ListenersEmpty;
     }
-    if (listeners_json.len > constants.listeners_max) {
+    // No policy ceiling: a listener costs two ring ops and one fd, and
+    // both are checked against this config's own budget — `cqFillFits`
+    // for the ring (`LimitConnSlotsOverCqFill`), `ensureFdBudget` for the
+    // fds. What is left is the `u16` the listener index is stored in.
+    if (listeners_json.len > std.math.maxInt(u16)) {
         return error.ListenersOverLimit;
     }
 
@@ -1170,11 +1173,6 @@ fn resolveListeners(
         const bind_address = std.Io.net.IpAddress.parseLiteral(listener_json.bind) catch {
             return error.ListenerBindInvalid;
         };
-        for (listeners[0..index]) |previous| {
-            if (std.meta.eql(previous.bind_address, bind_address)) {
-                return error.ListenerBindDuplicate;
-            }
-        }
         const protocol = try protocolOf(listener_json.protocol);
         listeners[index] = .{
             .bind_address = bind_address,
@@ -1184,8 +1182,47 @@ fn resolveListeners(
             .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
         };
     }
+
+    // Duplicate binds in O(n log n), for the reason `resolveClusters`
+    // sorts its names: the nested scan this replaces was bounded by
+    // `listeners_max` at 8 (~64 comparisons), and with the ceiling gone
+    // it is bounded only by what `cqFillFits` admits — tens of thousands
+    // at small pool sizes, which is ~8e8 comparisons at config load.
+    const order = try arena.alloc(u16, listeners.len);
+    for (order, 0..) |*slot, index| slot.* = @intCast(index);
+    const ByBind = struct {
+        listeners: []const Config.Listener,
+        fn lessThan(ctx: @This(), a: u16, b: u16) bool {
+            return bindOrder(ctx.listeners[a].bind_address) <
+                bindOrder(ctx.listeners[b].bind_address);
+        }
+    };
+    std.mem.sort(u16, order, ByBind{ .listeners = listeners }, ByBind.lessThan);
+    for (order[1..], order[0 .. order.len - 1]) |current, previous| {
+        if (std.meta.eql(
+            listeners[current].bind_address,
+            listeners[previous].bind_address,
+        )) {
+            return error.ListenerBindDuplicate;
+        }
+    }
+
     assert(listeners.len == listeners_json.len);
+    assert(order.len == listeners.len);
     return listeners;
+}
+
+/// A total order over bind addresses, for the duplicate sort above. Only
+/// the ordering matters, never the value: equal keys are re-checked with
+/// `std.meta.eql`, so a collision costs a comparison rather than a wrong
+/// verdict.
+fn bindOrder(address: std.Io.net.IpAddress) u160 {
+    return switch (address) {
+        .ip4 => |v4| (@as(u160, 0) << 152) |
+            (@as(u160, std.mem.readInt(u32, &v4.bytes, .big)) << 16) | v4.port,
+        .ip6 => |v6| (@as(u160, 1) << 152) |
+            (@as(u160, std.mem.readInt(u128, &v6.bytes, .big)) << 16) | v6.port,
+    };
 }
 
 /// Compile a listener's §7 filter rules into immutable arena tables.
@@ -2739,24 +2776,51 @@ test "config: every emptiness and limit has its own error" {
     );
 }
 
-test "config: listeners over the limit" {
-    comptime var over_limit_json: []const u8 =
-        \\{"listeners":[
-    ;
-    comptime {
-        var index: u32 = 0;
-        while (index <= constants.listeners_max) : (index += 1) {
-            if (index > 0) over_limit_json = over_limit_json ++ ",";
-            over_limit_json = over_limit_json ++ std.fmt.comptimePrint(
-                \\{{"bind":"127.0.0.1:{d}","cluster":"a"}}
-            , .{1000 + index});
-        }
-        over_limit_json = over_limit_json ++
-            \\],"clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
-        ;
+/// Builds a config with `count` listeners and the given `limits` body.
+fn listenersJson(comptime count: u32, comptime limits: []const u8) []const u8 {
+    var json: []const u8 = "{\"listeners\":[";
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        if (index > 0) json = json ++ ",";
+        json = json ++ std.fmt.comptimePrint(
+            \\{{"bind":"127.0.0.1:{d}","cluster":"a"}}
+        , .{1000 + index});
     }
-    try expectParseError(error.ListenersOverLimit, over_limit_json);
+    return json ++ "]," ++ limits ++
+        \\"clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+}
+
+test "config: listeners are bounded by the ring budget, not by a count" {
+    // Replaces the old over-`listeners_max` test. 64 listeners — 8x the
+    // ceiling that used to refuse them — load fine at the default pools,
+    // because what a listener actually costs is two ring ops.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state, comptime listenersJson(64, ""));
+    try std.testing.expectEqual(@as(usize, 64), parsed.listeners.len);
+}
+
+test "config: listeners that overflow the ring budget are refused at load" {
+    // The comptime `assert(in_flight_ops_max <= completion_queue_entries)`
+    // this replaces could only ever speak about the ceilings. This is the
+    // same arithmetic against a real config: conn slots at the ceiling
+    // leave no room for a listener's two ops, so the pair is refused —
+    // the startup rejection that the removed ceiling used to pre-empt.
+    // Both pools at their ceilings leaves 3 of the 57344-op fill budget
+    // spare at zero listeners — which is exactly what `conn_slots_max` is
+    // derived to leave — so the second listener is already one too many.
+    const at_ceiling = std.fmt.comptimePrint(
+        "\"limits\":{{\"conn_slots\":{d},\"upstream_slots\":{d}}},",
+        .{ constants.conn_slots_max, constants.upstream_slots_max },
+    );
+    try expectParseError(error.LimitConnSlotsOverCqFill, comptime listenersJson(2, at_ceiling));
+    // One listener still fits, so the refusal above is the budget talking
+    // and not the pools alone.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    _ = try expectParseOk(&arena_state, comptime listenersJson(1, at_ceiling));
 }
 
 var fuzz_arena_buffer: [1 << 20]u8 = undefined;

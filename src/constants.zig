@@ -7,11 +7,8 @@ const std = @import("std");
 
 const assert = std.debug.assert;
 
-/// Upper bound on configured listeners.
-pub const listeners_max: u16 = 8;
-
 /// The single dedicated admin/metrics listener (DESIGN.md §8): separate
-/// from the configured `listeners_max` so a scrape can
+/// from the configured listeners so a scrape can
 /// never consume a data-path listener slot, and reserved in the fd and
 /// ring budgets below unconditionally — the ceiling is a comptime
 /// constant, so it must cover the worst case (admin enabled) even when a
@@ -59,13 +56,24 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
 /// parked-upstream, admin, access-log and health-probe reservations
 /// carved out first, this caps at
-/// `(57344 - 27) / (conn_ops_max + 1) = 11463` —
-/// comptime-derived below (the 27 is the fixed ops: two per config and
-/// admin listener [18], the admin client's op budget [3], the access log's
+/// `(57344 - 11) / (conn_ops_max + 1) = 11466` —
+/// comptime-derived below (the 11 is the fixed ops: two for the admin
+/// listener [2], the admin client's op budget [3], the access log's
 /// in-flight sink write [1], the health prober's op budget [3], the signal
 /// wake [1], and the drain timer [1]). That clears a round 10k on a
 /// single ring; a deployment trades the ceiling back down for more burst
 /// headroom via `limits.cq_fill_eighths` (§8).
+///
+/// **Configured listeners are not in that 11.** They cost two ring ops
+/// each like the admin listener does, but there is no listener ceiling to
+/// reserve against — so this is the ceiling at *zero* configured
+/// listeners, and each one a config declares spends two ops out of the
+/// same budget. `cqFillFits` refuses the combination at load
+/// (`LimitConnSlotsOverCqFill`) rather than a comptime assert refusing it
+/// at build time, which is the trade this ceiling now rests on: a
+/// deployment wanting both the maximum conn slots and many listeners is
+/// told so at startup instead of being pre-empted by a number chosen for
+/// it here.
 ///
 /// `upstream_slots_max` is pinned to this, and the `+ 1` in the divisor
 /// is that pin: on the L7 path an admitted connection that is mid-exchange
@@ -73,8 +81,8 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// every admitted connection can be mid-exchange at once. A conn ceiling
 /// above the upstream ceiling is therefore capacity that cannot be served
 /// — slots that admit connections the pool has no upstream for — and one
-/// below it is a pool that can never be drawn down. `11463` is the
-/// largest N with `N * (conn_ops_max + 1) <= 57317`, which keeps both
+/// below it is a pool that can never be drawn down. `11466` is the
+/// largest N with `N * (conn_ops_max + 1) <= 57333`, which keeps both
 /// ceilings clear of a round 10k: what §1 asks for, c10k reachable on
 /// either axis rather than a shape tuned for it.
 ///
@@ -85,7 +93,7 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// The pair is still a policy choice made on the operator's behalf;
 /// IMPLEMENTATION_NOTES.md ("Open questions" — pool ceilings) holds the
 /// standing question of handing it to them instead.
-pub const conn_slots_max: u32 = 11463;
+pub const conn_slots_max: u32 = 11466;
 
 /// Relay buffer pairs (`Pool(RelayBuffer)`) — the bound on concurrent L4
 /// connections plus active L7 body relays (§5, §6). Sized to the
@@ -446,18 +454,27 @@ pub const access_log_line_bytes_max: u32 = blk: {
 /// evaluated on the *effective* pool sizes too (XevIo's per-deployment CQ),
 /// not only the ceilings; the admin, access-log and health-probe
 /// reservations are fixed — always covered even when a config leaves them
-/// off; `in_flight_ops_max` is it at the ceilings.
+/// off.
+///
+/// There is no `in_flight_ops_max` companion any more, and its absence is
+/// the shape of this whole budget now: with no listener ceiling there is
+/// no "at the ceilings" point to evaluate, because the listener term is a
+/// property of the config rather than of `constants.zig`. What used to be
+/// `assert(in_flight_ops_max <= completion_queue_entries)` at comptime is
+/// `cqFillFits` at config load (`LimitConnSlotsOverCqFill`) — the same
+/// arithmetic, refused a few milliseconds later.
 pub fn inFlightOps(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(upstream_slots <= upstream_slots_max);
-    assert(listeners <= listeners_max);
+    // No policy ceiling to check against, but the argument is not
+    // unbounded either: every caller sources it from a config the
+    // loader has already held to the `u16` a listener index is stored in.
+    assert(listeners <= std.math.maxInt(u16));
     return conn_slots * conn_ops_max + upstream_slots +
         2 * (listeners + admin_listeners) +
         admin_conns * admin_conn_ops_max + access_log_ops_max +
         health_probe_ops_max + 1 + 1;
 }
-pub const in_flight_ops_max: u32 =
-    inFlightOps(conn_slots_max, upstream_slots_max, listeners_max);
 
 /// Kernel maximum for an IORING_SETUP_CQSIZE completion queue
 /// (IORING_MAX_CQ_ENTRIES = 2 × IORING_MAX_ENTRIES) on current kernels.
@@ -541,8 +558,15 @@ pub fn cqFillFits(
 /// deployment at the compiled ceilings would request. This is the kernel
 /// maximum (65536), which is exactly what makes `conn_slots_max` the c10k
 /// ceiling — as deep as one ring allows, independent of `ring_entries`.
+/// Derived at *zero* configured listeners: with no listener ceiling there
+/// is no worst case to reserve for, so the compiled depth covers the
+/// pools and the fixed reservations, and a config's own listeners are
+/// checked against it by `cqFillFits` at load. The depth clamps to the
+/// kernel maximum either way, so the listener term never actually moved
+/// this number — it only made it look derived from a ceiling that no
+/// longer exists.
 pub const completion_queue_entries: u32 =
-    completionQueueDepthFor(conn_slots_max, upstream_slots_max, listeners_max, cq_fill_eighths_default);
+    completionQueueDepthFor(conn_slots_max, upstream_slots_max, 0, cq_fill_eighths_default);
 
 /// The fds a deployment needs (§8: fds are pre-budgeted, not shed): stdio
 /// + ring + async eventfd + listeners (configured + admin) + two sockets
@@ -552,16 +576,19 @@ pub const completion_queue_entries: u32 =
 /// which belongs to no connection + the one socket the in-flight health
 /// probe may hold while dialing (§7). Closed form so `ensureFdBudget` can
 /// check the *effective* size against RLIMIT_NOFILE; the admin and
-/// health-probe reservations are fixed; `fds_max` is it at the ceilings.
+/// health-probe reservations are fixed.
+///
+/// No `fds_max` companion, for the reason `in_flight_ops_max` has none:
+/// the listener term makes this a property of a config, not of this file.
+/// `ensureFdBudget` was always the real gate — it compares this against
+/// the actual RLIMIT_NOFILE — and it is now the only one.
 pub fn fdsRequired(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(upstream_slots <= upstream_slots_max);
-    assert(listeners <= listeners_max);
+    assert(listeners <= std.math.maxInt(u16));
     return 3 + 1 + 1 + (listeners + admin_listeners) +
         2 * conn_slots + 1 + admin_conns + upstream_slots + 1;
 }
-pub const fds_max: u32 =
-    fdsRequired(conn_slots_max, upstream_slots_max, listeners_max);
 
 /// Default effective pool sizes when the config omits a `limits` block: a
 /// lean out-of-box footprint (~33 MiB of pools, well under a routine 4096
@@ -628,8 +655,7 @@ comptime {
     assert(upstream_slots_default >= 1 and upstream_slots_default <= upstream_slots_max);
     assert(relay_buffers_max <= conn_slots_max);
     assert(relay_buffers_max >= 1);
-    assert(listeners_max >= 1);
-    assert(in_flight_ops_max <= completion_queue_entries);
+    assert(inFlightOps(conn_slots_max, upstream_slots_max, 0) <= completion_queue_entries);
     assert(conn_slots_max - 1 <= std.math.maxInt(u16));
     assert(relay_buffer_bytes >= 512);
     assert(clusters_min >= 1);
@@ -690,7 +716,7 @@ comptime {
     assert(upstream_slots_max == conn_slots_max);
     assert(conn_slots_max == @divFloor(
         @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
-            2 * (@as(u32, listeners_max) + admin_listeners) -
+            2 * admin_listeners -
             admin_conns * admin_conn_ops_max - access_log_ops_max -
             health_probe_ops_max - 1 - 1,
         conn_ops_max + 1,
@@ -826,11 +852,11 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
 }
 
 test "budgets: in-flight ops fit the completion queue with headroom" {
-    try std.testing.expect(in_flight_ops_max <= completion_queue_entries);
+    try std.testing.expect(inFlightOps(conn_slots_max, upstream_slots_max, 0) <= completion_queue_entries);
     // Headroom is deliberate: at least an eighth of the CQ stays free for
     // completion bursts even at the worst-case armed-op count (the default
     // = loosest fill the ceiling is derived at).
-    try std.testing.expect(in_flight_ops_max <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_max, upstream_slots_max, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
 }
 
 test "pressure: relay watermarks have a hysteresis gap at every capacity" {
@@ -902,8 +928,8 @@ test "budgets: c10k ceiling fd count needs a raised NOFILE" {
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
-    try std.testing.expectEqual(@as(u32, 34406), fds_max);
-    try std.testing.expect(fds_max <= 65536);
+    try std.testing.expectEqual(@as(u32, 34407), fdsRequired(conn_slots_max, upstream_slots_max, 0));
+    try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0) <= 65536);
     // The out-of-box side of this is pinned by "the default deployment is
     // lean" below, not restated here.
 }
@@ -928,9 +954,9 @@ test "budgets: conn slots sit at the completion-queue ceiling" {
     // caps concurrent connections; conn_slots_max is the largest value
     // that still satisfies it after the parked-upstream reservation, so
     // one more slot would break the budget.
-    try std.testing.expect(in_flight_ops_max <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
+    try std.testing.expect(inFlightOps(conn_slots_max, upstream_slots_max, 0) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
     const one_more = (conn_slots_max + 1) * conn_ops_max + upstream_slots_max +
-        2 * (@as(u32, listeners_max) + admin_listeners) +
+        2 * admin_listeners +
         admin_conns * admin_conn_ops_max + access_log_ops_max +
         health_probe_ops_max + 1 + 1;
     try std.testing.expect(one_more > @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
@@ -945,8 +971,8 @@ test "budgets: a tighter cq fill trades ceiling for burst headroom" {
     // The conn-slot ceiling fits only at the max fill; one eighth tighter
     // overflows even the deepest kernel CQ — the loader must reject that
     // pairing (`cqFillFits` is the guard).
-    try std.testing.expect(cqFillFits(conn_slots_max, upstream_slots_max, listeners_max, cq_fill_eighths_max));
-    try std.testing.expect(!cqFillFits(conn_slots_max, upstream_slots_max, listeners_max, cq_fill_eighths_max - 1));
+    try std.testing.expect(cqFillFits(conn_slots_max, upstream_slots_max, 0, cq_fill_eighths_max));
+    try std.testing.expect(!cqFillFits(conn_slots_max, upstream_slots_max, 0, cq_fill_eighths_max - 1));
     // The lean default still fits with plenty of room to spare, even at the
     // old ¾ (= 6/8) fill and at the tightest floor.
     try std.testing.expect(cqFillFits(conn_slots_default, upstream_slots_default, 1, 6));
