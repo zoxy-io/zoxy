@@ -1775,14 +1775,19 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(Config.Cluster.Check.Kind.tcp, example_check.kind);
     try std.testing.expectEqual(@as(u8, 3), example_check.fall);
     try std.testing.expectEqual(@as(u8, 2), example_check.rise);
-    try std.testing.expectEqual(@as(u32, 5000), example_check.timeout_ms);
+    try std.testing.expectEqual(constants.connect_ms_default, example_check.timeout_ms);
     try std.testing.expectEqual(@as(?Config.Cluster.Check.Http, null), example_check.http);
-    try std.testing.expectEqual(@as(u32, 5000), parsed.connect_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 60000), parsed.idle_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
-    try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
-    // The example omits the probe interval: the HAProxy-inter default.
+    // The example names no `timeouts` block at all, so every deadline
+    // here is a default — which is the thing it is demonstrating. A
+    // check's omitted budget still inherits the connect timeout, so this
+    // also pins that the inheritance reads the *resolved* value rather
+    // than only an explicitly configured one.
+    try std.testing.expectEqual(constants.connect_ms_default, parsed.connect_timeout_ms);
+    try std.testing.expectEqual(constants.idle_ms_default, parsed.idle_timeout_ms);
     try std.testing.expectEqual(constants.health_interval_ms_default, parsed.health_interval_ms);
+    try std.testing.expectEqual(@as(u32, 0), parsed.drain_deadline_ms);
+    try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
+    try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
 }
 
 test "config: max_lifetime_ms is optional and defaults to disabled" {
@@ -2634,8 +2639,35 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 // Zig 0.16.0 toolchain bug: the bundled compiler/test_runner.zig fails to
 // compile under -ffuzz (StackTrace type mismatch, line 566). The corpus
 // still runs deterministically as part of `zig build test`.
+/// A second corpus seed carrying the blocks the shipped example leaves to
+/// their defaults. The example is the better *documentation* for having
+/// dropped its `timeouts` block, but a corpus seed is judged on the token
+/// vocabulary it hands the mutator, and one that never spells
+/// `drain_deadline_ms` gives it no path to that branch of the parser.
+const fuzz_seed_json =
+    \\{"listeners":[{"bind":"127.0.0.1:8080","routes":[{"prefix":"/","cluster":"o"}],
+    \\ "protocol":"http"}],
+    \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000"],"pick":"p2c","max_inflight":8,
+    \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}}},
+    \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
+    \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
+    \\ "limits":{"conn_slots":64,"relay_buffers":32,"upstream_slots":32},
+    \\ "access_log":{"sink":"stdout"},"admin":{"bind":"127.0.0.1:9901"}}
+;
+
+test "config: the fuzz seed carrying every block parses" {
+    // It is a corpus entry, so it has to be a *valid* config — an
+    // unparseable seed would still fuzz, just from a worse starting point,
+    // and nothing else would say so.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(), fuzz_seed_json);
+    try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
+    try std.testing.expectEqual(@as(u32, 30000), parsed.request_timeout_ms);
+}
+
 test "fuzz: parse never panics — parse or reject, no third outcome" {
-    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &.{example_json} });
+    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &.{ example_json, fuzz_seed_json } });
 }
 
 fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
