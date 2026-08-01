@@ -5,7 +5,7 @@
 //!
 //! Lifecycle: `l7_reading_head` accumulates the request head and
 //! re-parses from byte 0 on each recv (§7 detect-and-retry); verdicts
-//! answer comptime static responses (§8) with a lingering close (§2). A
+//! answer comptime static responses (§8) with a lingering close (§7). A
 //! valid request acquires its relay buffer and upstream slot (both §8
 //! rungs, 503), dials (`l7_dialing`), then `l7_exchanging` runs two
 //! semi-independent legs over the two data ops: the request leg sends
@@ -17,7 +17,7 @@
 //! sides independently: the upstream connection parks on its endpoint's
 //! idle list when the origin allowed reuse (checked out again by any
 //! later request — §3's shared-pool win), and the downstream connection
-//! honors what its rendered response announced (§2), going idle at the
+//! honors what its rendered response announced (§7), going idle at the
 //! cost of a slot + head buffer only (§5). Pipelining is unsupported
 //! (first response, then an announced close). A stale checkout takes one
 //! free replay on a fresh dial (§7), and an expired exchange or dial
@@ -108,10 +108,10 @@ pub fn Proxy(comptime IoType: type) type {
         //
         // Scoped to the request head deliberately. The origin's *response*
         // head accumulates the same way in `onResponseHeadRecv`, into the
-        // upstream slot's buffer, and does not need a source: Phase 3a
-        // terminates TLS on the client side only, so the upstream leg stays
-        // plaintext (kTLS on the origin side, if it ever comes, would revisit
-        // this).
+        // upstream slot's buffer, and does not need a source: §4's TLS
+        // termination applies to the client side only, so the upstream leg
+        // stays plaintext (kTLS on the origin side, if it ever comes, would
+        // revisit this).
         //
         // The third stays `parseAndDispatch`, the single answer to "what do
         // these bytes mean": read again, 400, 414, 431, or route. That matters
@@ -494,6 +494,22 @@ pub fn Proxy(comptime IoType: type) type {
             beginUpstream(server, conn, request, &keys.views);
         }
 
+        /// Picks a live endpoint under the §8 per-endpoint inflight cap, or
+        /// sheds 503 and returns null when every endpoint of this cluster
+        /// is already at it. Shared by the first-try and replay dial paths
+        /// so the cap and its shed counter cannot drift between them.
+        fn pickEndpointOrShed(server: *ServerType, conn: *ConnType) ?Balancer.Pick {
+            return server.balancer.pick(
+                conn.cluster_index,
+                &server.endpointLoad(),
+                &server.health.healthy,
+                &conn.client_address,
+            ) orelse {
+                respond(server, conn, 503, "l7_shed_endpoint_inflight");
+                return null;
+            };
+        }
+
         /// Route resolved and a relay buffer held: choose an endpoint and
         /// get onto it, by reuse when the pool has one parked and by a
         /// fresh dial otherwise. Split from `routeRequest` because the
@@ -512,19 +528,12 @@ pub fn Proxy(comptime IoType: type) type {
             // beats a fresh dial. A close that slipped through while it
             // was parked surfaces as a failure on first use — absorbed by
             // the §7 free replay (`upstreamFailed`).
-            const pick = server.balancer.pick(
-                conn.cluster_index,
-                &server.endpointLoad(),
-                &server.health.healthy,
-                &conn.client_address,
-            ) orelse {
-                // Every endpoint of this cluster is at its §8 cap. The
-                // reuse path is capped too, deliberately: checking out a
-                // parked connection starts a request the origin has to
-                // serve, which is the thing being bounded — the saved
-                // handshake does not make it free.
-                return respond(server, conn, 503, "l7_shed_endpoint_inflight");
-            };
+            //
+            // The §8 cap binds the reuse path too, deliberately: checking
+            // out a parked connection starts a request the origin has to
+            // serve, which is the thing being bounded — the saved
+            // handshake does not make it free.
+            const pick = pickEndpointOrShed(server, conn) orelse return;
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
@@ -956,7 +965,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// request's own framing; a client-side recv cannot be forced, so a
         /// pending verdict makes the arm illegal and a settled verdict on a
         /// send diverts. A short body tail past the framing is a pipelined
-        /// next request (§2 note). Failures doom the exchange: a recv EOF is
+        /// next request (§7 note). Failures doom the exchange: a recv EOF is
         /// a truncated request (teardown), a send failure is the origin
         /// giving out (`upstreamFailed`).
         const RequestBodyPolicy = struct {
@@ -996,7 +1005,7 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.log.bytes_in += fr.consumed;
                 if (fr.consumed < received) {
                     // Bytes past the body are a pipelined next request; the
-                    // connection will close after this exchange (§2 note).
+                    // connection will close after this exchange (§7 note).
                     conn.l7.client_pipelined = true;
                 }
             }
@@ -1158,7 +1167,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         /// The §8 persistence decision, made once and honored: keep the
         /// client's connection unless pipelining, pressure, or drain says
-        /// otherwise — then announce whatever was decided (§2).
+        /// otherwise — then announce whatever was decided (§7).
         ///
         /// Only relay pressure suppresses keep-alive: the next request on
         /// this connection would claim a relay buffer the pool is running
@@ -1458,7 +1467,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// The response reached the client in full: settle both sides.
         /// The upstream connection parks for reuse when the origin allowed
         /// it and the request went out completely (§5); the downstream
-        /// connection honors what its response announced (§2). An early
+        /// connection honors what its response announced (§7). An early
         /// response with the request still in flight forfeits both — the
         /// two byte streams are no longer alignable.
         fn finishExchange(server: *ServerType, conn: *ConnType) void {
@@ -1720,17 +1729,11 @@ pub fn Proxy(comptime IoType: type) type {
             conn.directions = .{ .{}, .{} };
             // A fresh pick and a fresh dial — never another checkout (§7):
             // the endpoint's whole idle list may be stale the same way.
-            const pick = server.balancer.pick(
-                conn.cluster_index,
-                &server.endpointLoad(),
-                &server.health.healthy,
-                &conn.client_address,
-            ) orelse {
-                // The replay is a fresh try against the same cluster, so
-                // it meets the same cap. Its budget is already spent, so
-                // this answers rather than replaying again (§7).
-                return respond(server, conn, 503, "l7_shed_endpoint_inflight");
-            };
+            //
+            // The replay is a fresh try against the same cluster, so it
+            // meets the same §8 cap; its budget is already spent (§7), so
+            // a cap hit here answers rather than replaying again.
+            const pick = pickEndpointOrShed(server, conn) orelse return;
             dialUpstream(server, conn, pick);
         }
 
@@ -1776,7 +1779,7 @@ pub fn Proxy(comptime IoType: type) type {
         ///     is unread bytes still to come; draining it is what the
         ///     lingering close is for.
         ///   - the client sent nothing past the head. Trailing bytes are a
-        ///     pipelined next request, which §2 does not serve — and
+        ///     pipelined next request, which §7 does not serve — and
         ///     leaving them buffered to be read as the *start* of the next
         ///     request is the desynchronization §7 exists to prevent.
         ///
@@ -1878,7 +1881,7 @@ pub fn Proxy(comptime IoType: type) type {
             // reconnect loop. Keeping is one send.
             //
             // The same three brakes the render-time persistence decision
-            // honors apply here (§2, §8): the client's own ask, the drain,
+            // honors apply here (§7, §8): the client's own ask, the drain,
             // and relay pressure — a proxy shedding buffers should not also
             // be holding connections open for their next request.
             const keep = staticResponseResyncable(conn) and
@@ -1891,7 +1894,7 @@ pub fn Proxy(comptime IoType: type) type {
             // spellings are comptime byte arrays; only the choice is runtime,
             // and it must match what happens after the send — an announced
             // close that kept serving, or a kept connection the client was
-            // told to stop using, are both §2 violations.
+            // told to stop using, are both §7 violations.
             if (keep) {
                 armClientWrite(server, conn, shed.staticResponse(status, .keep), .next_request);
             } else {
@@ -1935,7 +1938,7 @@ pub fn Proxy(comptime IoType: type) type {
         }
 
         /// The static response is out and the stream is still synchronized:
-        /// serve the next request on this connection (§2, §8). `respond`
+        /// serve the next request on this connection (§7, §8). `respond`
         /// already released the relay buffer and any attached upstream, so
         /// this is `resetForNextRequest` minus the exchange it never had.
         fn resumeAfterStaticResponse(server: *ServerType, conn: *ConnType) void {
@@ -1964,7 +1967,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         /// A client can still be sending its request — a body, or the rest
         /// of an oversize head — when we answer an error. Closing then
-        /// would RST and discard the response we just sent (§2). Instead
+        /// would RST and discard the response we just sent (§7). Instead
         /// half-close the write side (the client sees our response and
         /// FIN) and drain the client's remaining input to EOF before the
         /// teardown; the head-read deadline bounds a client that never

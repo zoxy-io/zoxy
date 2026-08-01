@@ -1778,10 +1778,10 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
 const example_json = @embedFile("example_config");
 
 test "config: the shipped example parses and resolves" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
 
-    const parsed = try parse(arena_state.allocator(), example_json);
+    const parsed = try expectParseOk(&arena_state, example_json);
     try std.testing.expectEqual(@as(usize, 1), parsed.listeners.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.clusters.len);
     // The `"cluster"` sugar resolves to one catch-all route.
@@ -1816,9 +1816,9 @@ test "config: the shipped example parses and resolves" {
 test "config: max_lifetime_ms is optional and defaults to disabled" {
     // The field is absent here — pre-existing configs stay valid and the
     // cap defaults off (§6).
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(),
+    const parsed = try expectParseOk(&arena_state,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -1837,29 +1837,29 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
     // Absent: pre-existing configs stay valid and the §8 request deadline
     // defaults off, the same shape as max_lifetime_ms.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
         );
         try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
     }
     // Explicit 0 is legal — "no cap", not a TimeoutZero.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"request_ms\":0}}",
         );
         try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
     }
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"request_ms\":250}}",
         );
         try std.testing.expectEqual(@as(u32, 250), parsed.request_timeout_ms);
@@ -1867,14 +1867,13 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
     // The shared ceiling still binds — an optional cap is not an unbounded
     // one.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
         const json = try std.fmt.allocPrint(
-            arena_state.allocator(),
+            std.testing.allocator,
             "{s}\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"request_ms\":{d}}}}}",
             .{ head, @as(u64, constants.timeout_ms_max) + 1 },
         );
-        try std.testing.expectError(error.TimeoutOverLimit, parse(arena_state.allocator(), json));
+        defer std.testing.allocator.free(json);
+        try expectParseError(error.TimeoutOverLimit, json);
     }
 }
 
@@ -1882,9 +1881,9 @@ test "config: the whole timeouts block is optional, and every default is usable"
     // A config that names none of them is the out-of-box shape (§5), the
     // same argument `limits` already makes: an operator opts into tuning,
     // never into a working config.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(),
+    const parsed = try expectParseOk(&arena_state,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}}}
     );
@@ -1904,9 +1903,9 @@ test "config: a zero drain deadline is no cap, but a zero connect or idle is sti
     // sense in which a 0 ms dial or idle budget is a policy rather than a
     // configuration error, so those two keep rejecting it.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"drain_deadline_ms":0}}
@@ -1928,9 +1927,7 @@ test "config: a zero drain deadline is no cap, but a zero connect or idle is sti
         ,
     };
     for (rejected) |json| {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
-        try std.testing.expectError(error.TimeoutZero, parse(arena_state.allocator(), json));
+        try expectParseError(error.TimeoutZero, json);
     }
 }
 
@@ -1964,18 +1961,13 @@ test "config: the dial budget must sit below the idle one" {
         ,
     };
     for (rejected) |json| {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
-        try std.testing.expectError(
-            error.TimeoutOrderInvalid,
-            parse(arena_state.allocator(), json),
-        );
+        try expectParseError(error.TimeoutOrderInvalid, json);
     }
     // A single millisecond of ordering is all the rule asks for, and the
     // shipped defaults clear it by an order of magnitude.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(),
+    const parsed = try expectParseOk(&arena_state,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":5000,"idle_ms":5001}}
@@ -1989,9 +1981,9 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
     // Explicit 0 is legal — it is *not* a TimeoutZero, unlike the dial
     // and idle budgets (§6).
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":0}}
@@ -1999,9 +1991,9 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
         try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
     }
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":1800000}}
@@ -2013,9 +2005,9 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
 test "config: listener protocol defaults to l4 and accepts http" {
     // Absent field: pre-L7 configs stay valid.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -2023,9 +2015,9 @@ test "config: listener protocol defaults to l4 and accepts http" {
         try std.testing.expectEqual(Config.Listener.Protocol.l4, parsed.listeners[0].protocol);
     }
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -2035,9 +2027,9 @@ test "config: listener protocol defaults to l4 and accepts http" {
 }
 
 test "config: explicit routes resolve, sorted longest-prefix-first" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(),
+    const parsed = try expectParseOk(&arena_state,
         \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","routes":[
         \\   {"prefix":"/","cluster":"root"},
         \\   {"prefix":"/api/v2","cluster":"v2"},
@@ -2102,9 +2094,9 @@ test "config: routing schema rejects malformed tables" {
 }
 
 test "config: host routes resolve, host-specific sorted before any-host" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(),
+    const parsed = try expectParseOk(&arena_state,
         \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","routes":[
         \\   {"prefix":"/","cluster":"root"},
         \\   {"host":"api.example.com","prefix":"/","cluster":"api"},
@@ -2134,9 +2126,9 @@ test "config: host routes resolve, host-specific sorted before any-host" {
 }
 
 test "config: filters compile into rules with matches and actions" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(),
+    const parsed = try expectParseOk(&arena_state,
         \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","filters":[
         \\   {"match":{"method":["GET","POST"],"path_prefix":"/admin",
         \\             "headers":[{"name":"X-Env","equals":"prod"}]},
@@ -2242,9 +2234,9 @@ test "config: a filter set over the header-edit budget is rejected" {
 test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
     // Explicit rr and p2c both resolve; absent defaults to p2c.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"rr"},
             \\   "b":{"endpoints":["127.0.0.1:3"],"pick":"p2c"},
@@ -2264,9 +2256,9 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
 }
 
 test "config: a check block resolves its kind, thresholds and budget" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(),
+    const parsed = try expectParseOk(&arena_state,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
         \\     "check":{"type":"tcp","fall":5,"rise":1,"timeout_ms":250}},
@@ -2290,9 +2282,9 @@ test "config: a check block resolves its kind, thresholds and budget" {
 
 test "config: an http check resolves its request and expected status" {
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
             \\     "check":{"type":"http","path":"/healthz","host":"api.example",
@@ -2308,9 +2300,9 @@ test "config: an http check resolves its request and expected status" {
     }
     // Host is optional: absent means the endpoint's own literal (§7).
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
             \\     "check":{"type":"http","path":"/health"}}},
@@ -2382,9 +2374,9 @@ test "config: a check block rejects every shape it cannot run" {
 test "config: health interval parses, defaults to inter, rejects zero" {
     // Explicit value resolves; absent means the HAProxy-inter default.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,
@@ -2393,9 +2385,9 @@ test "config: health interval parses, defaults to inter, rejects zero" {
         try std.testing.expectEqual(@as(u32, 250), parsed.health_interval_ms);
     }
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -2420,9 +2412,9 @@ test "config: health interval parses, defaults to inter, rejects zero" {
 test "config: limits shrink pools below the ceilings, never past them" {
     // Partial limits: relay buffers derive from the effective conn slots.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
@@ -2440,9 +2432,9 @@ test "config: limits shrink pools below the ceilings, never past them" {
     }
     // Full limits resolve verbatim; absent block keeps the ceilings.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
@@ -2455,9 +2447,9 @@ test "config: limits shrink pools below the ceilings, never past them" {
         try std.testing.expectEqual(@as(u32, 4), parsed.limits.cq_fill_eighths);
     }
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -2498,10 +2490,8 @@ test "config: limits shrink pools below the ceilings, never past them" {
     // budgets for: the pair is pinned, so a conn slot's worst case
     // includes the upstream slot it may hold (see `conn_slots_max`).
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
         const json = try std.fmt.allocPrint(
-            arena_state.allocator(),
+            std.testing.allocator,
             "{s}{s}\"limits\":{{\"conn_slots\":{d},\"upstream_slots\":{d},\"cq_fill_eighths\":{d}}}}}",
             .{
                 head,
@@ -2511,7 +2501,8 @@ test "config: limits shrink pools below the ceilings, never past them" {
                 constants.cq_fill_eighths_max - 1,
             },
         );
-        try std.testing.expectError(error.LimitConnSlotsOverCqFill, parse(arena_state.allocator(), json));
+        defer std.testing.allocator.free(json);
+        try expectParseError(error.LimitConnSlotsOverCqFill, json);
     }
 }
 
@@ -2523,17 +2514,17 @@ test "config: admin block resolves a bind literal, absent leaves it off" {
     ;
     // Absent: the admin plane stays off.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(), head ++ tail ++ "}");
+        const parsed = try expectParseOk(&arena_state, head ++ tail ++ "}");
         try std.testing.expect(parsed.admin_bind == null);
     }
     // Present: the bind resolves to the given IP:port.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ tail ++ ",\"admin\":{\"bind\":\"127.0.0.1:9100\"}}",
         );
         try std.testing.expect(parsed.admin_bind != null);
@@ -2570,6 +2561,18 @@ fn expectParseError(expected: ParseError, json_bytes: []const u8) !void {
     try std.testing.expectError(expected, parse(arena_state.allocator(), json_bytes));
 }
 
+/// The success-path mirror of `expectParseError`: inits `arena_state`
+/// (caller-owned, so the returned `Config`'s slices stay valid as long as
+/// the caller needs them and `deinit` is the caller's to call) and parses
+/// `json_bytes` from it. `arena_state` is `undefined` until this returns —
+/// callers `defer arena_state.deinit()` right after declaring it, so
+/// nothing fallible may run between that `defer` and this call, or an
+/// early return would deinit an uninitialized arena.
+fn expectParseOk(arena_state: *std.heap.ArenaAllocator, json_bytes: []const u8) !Config {
+    arena_state.* = std.heap.ArenaAllocator.init(std.testing.allocator);
+    return parse(arena_state.allocator(), json_bytes);
+}
+
 test "config: strictness rejects unknown and duplicate fields" {
     try expectParseError(error.UnknownField,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","nope":1}],
@@ -2597,9 +2600,9 @@ test "config: a `$schema` editor hint loads and is ignored" {
     // file; a strict loader that rejected it would make the schema asset
     // unusable for the very files it describes.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"$schema":"https://zoxy.io/schema/config.schema.json",
             \\ "listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
@@ -2733,9 +2736,9 @@ test "config: the fuzz seed carrying every block parses" {
     // It is a corpus entry, so it has to be a *valid* config — an
     // unparseable seed would still fuzz, just from a worse starting point,
     // and nothing else would say so.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    const parsed = try parse(arena_state.allocator(), fuzz_seed_json);
+    const parsed = try expectParseOk(&arena_state, fuzz_seed_json);
     try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
     try std.testing.expectEqual(@as(u32, 30000), parsed.request_timeout_ms);
 }
@@ -2783,18 +2786,18 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
     // zero exactly then, which is how `accessLogBytes` reads "off" off one
     // number instead of needing the sink beside it (§5, §8).
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(), head ++ tail ++ "}");
+        const parsed = try expectParseOk(&arena_state, head ++ tail ++ "}");
         try std.testing.expect(parsed.access_log_sink == null);
         try std.testing.expectEqual(@as(u32, 0), parsed.limits.access_log_buffer_bytes);
     }
     // Present: the sink resolves and the staging buffers take the default.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\"}}",
         );
         try std.testing.expectEqual(Config.AccessLogSink.stdout, parsed.access_log_sink.?);
@@ -2805,10 +2808,10 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
     }
     // A sized buffer alongside a sink resolves verbatim.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\"}," ++
                 "\"limits\":{\"access_log_buffer_bytes\":65536}}",
         );
@@ -2857,10 +2860,10 @@ test "config: a cluster name is bounded, because the access log echoes it" {
     // line's width would be a function of the config file rather than of
     // constants.zig (§8).
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ at_limit ++ "\"}],\"clusters\":{\"" ++ at_limit ++
                 "\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
                 "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
@@ -2889,10 +2892,10 @@ test "config: the hash pick policy and its key resolve, or fail loudly" {
     // `pick: hash` with no `hash` block takes the default key, so the
     // common case needs no second line of config.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ endpoints ++ ",\"pick\":\"hash\"" ++ tail,
         );
         try std.testing.expectEqual(Config.Cluster.Pick.hash, parsed.clusters[0].pick);
@@ -2900,10 +2903,10 @@ test "config: the hash pick policy and its key resolve, or fail loudly" {
     }
     // Naming the key explicitly resolves to the same thing.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"source_ip\"}" ++ tail,
         );
         try std.testing.expectEqual(Config.Cluster.HashKey.source_ip, parsed.clusters[0].hash_key);
@@ -2911,9 +2914,9 @@ test "config: the hash pick policy and its key resolve, or fail loudly" {
     // A cluster that says nothing keeps the p2c default and the default
     // key, which is inert there.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(), head ++ endpoints ++ tail);
+        const parsed = try expectParseOk(&arena_state, head ++ endpoints ++ tail);
         try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[0].pick);
     }
 
@@ -2948,9 +2951,9 @@ test "config: the hash pick policy and its key resolve, or fail loudly" {
 
 test "config: max_inflight resolves, defaults to uncapped, rejects the useless" {
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(),
+        const parsed = try expectParseOk(&arena_state,
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"max_inflight":64},
             \\   "b":{"endpoints":["127.0.0.1:3"]}},
@@ -2977,15 +2980,15 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
     // only if every conn and upstream slot in the process piles onto one
     // endpoint, which is a real (if extreme) shape rather than a no-op.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
         var buffer: [512]u8 = undefined;
         const json = try std.fmt.bufPrint(
             &buffer,
             "{s}{d}{s}",
             .{ head, constants.endpoint_inflight_max, tail },
         );
-        const parsed = try parse(arena_state.allocator(), json);
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, json);
         try std.testing.expectEqual(
             @as(?u32, constants.endpoint_inflight_max),
             parsed.clusters[0].max_inflight,
@@ -3001,17 +3004,17 @@ test "config: the forwarded block resolves a mode, and is http-only" {
     // Absent: the header is untouched, which is what every config that
     // predates this feature must keep doing.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(), head ++ ",\"protocol\":\"http\"" ++ tail);
+        const parsed = try expectParseOk(&arena_state, head ++ ",\"protocol\":\"http\"" ++ tail);
         try std.testing.expect(parsed.listeners[0].forwarded == null);
     }
     // Both modes resolve; neither is a default.
     inline for (.{ "replace", "append" }) |mode| {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(
-            arena_state.allocator(),
+        const parsed = try expectParseOk(
+            &arena_state,
             head ++ ",\"protocol\":\"http\",\"forwarded\":{\"mode\":\"" ++ mode ++ "\"}" ++ tail,
         );
         try std.testing.expectEqual(
@@ -3062,9 +3065,9 @@ test "config: a filter may not name the header zoxy manages" {
     // A neighbouring name is still editable — the guard is the header, not
     // a prefix of it.
     {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try parse(arena_state.allocator(), head ++
+        const parsed = try expectParseOk(&arena_state, head ++
             "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-Proto\",\"value\":\"https\"}}]}" ++ tail);
         try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].filters.len);
     }

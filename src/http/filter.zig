@@ -5,8 +5,9 @@
 //! canonical forms so a filter and the router never disagree) and an
 //! ordered action list drawn from a closed enum. Cluster selection is NOT
 //! an action: the route table owns the backend decision (§7), so filters
-//! never compete with routing. This module holds the compiled shapes; the
-//! interpreter and the config-load compiler live in slices to come.
+//! never compete with routing. This module holds the compiled shapes and
+//! the interpreter (`firstReject`, `collectForward`); the config-load
+//! compiler lives in `config.zig`.
 
 const std = @import("std");
 

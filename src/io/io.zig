@@ -27,6 +27,8 @@
 //!   shutdown(io, socket, how) void                      (sync control op)
 //!   closeNow(io, socket) void                           (sync; un-admitted sheds)
 //!   peerAddress(io, socket) IpAddress                   (sync; who connected)
+//!   lastPressure(io) Pressure                           (classified cause
+//!       of the op just delivered, §8)
 //!   nowNs(io) u64                                       (per-tick clock, §4)
 //!   nowWallNs(io) u64                                   (epoch clock, §8 log)
 //!   run(io) RunError!void, stop(io) void

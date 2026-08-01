@@ -1203,12 +1203,10 @@ fn finishSend(io: *SimIo, socket: Socket, bytes: []const u8) Io.SendError!u32 {
     }
     if (entry.write_shutdown) {
         // A send that was already in flight when the teardown shut the
-        // write side down (§2: shutdown flushes pending ops); the kernel
+        // write side down (§5: shutdown flushes pending ops); the kernel
         // answers EPIPE. That is the peer being gone, not the kernel being
-        // short of anything — `error.Reset`, matching what XevIo now maps
-        // `BrokenPipe` to. The sim reproduced the production
-        // misclassification faithfully, comment and all, which is why no
-        // seed ever flagged it.
+        // short of anything — `error.Reset`, matching what XevIo maps
+        // `BrokenPipe` to.
         return error.Reset;
     }
     if (entry.peer == peer_none) {
@@ -1287,23 +1285,36 @@ fn earliestWakeNs(io: *const SimIo) u64 {
     return earliest;
 }
 
-fn maybeInjectReset(io: *SimIo) void {
-    if (io.adversary.reset_percent == 0) return;
+/// Rolls `percent` against the adversary's dice and, on a hit, probes up
+/// to 8 random socket-table indices for a live connected one, mixing
+/// `mix_seed` with the winning index into the trace hash. Returns the
+/// entry found, or null on a miss, an empty table, or an unlucky probe.
+/// Shared by `maybeInjectReset` and `maybeInjectKernelPressure` so a
+/// change to the probe bound or the liveness check cannot land in one and
+/// miss the other.
+fn pickRandomLiveConnectedSocket(io: *SimIo, percent: u8, mix_seed: u64) ?*SocketEntry {
+    if (percent == 0) return null;
     const random = io.prng.random();
-    if (random.uintLessThan(u8, 100) >= io.adversary.reset_percent) return;
-    if (io.sockets.acquired_count == 0) return;
+    if (random.uintLessThan(u8, 100) >= percent) return null;
+    if (io.sockets.acquired_count == 0) return null;
 
     var probe: u8 = 0;
     while (probe < 8) : (probe += 1) {
         const index = random.uintLessThan(u16, sockets_max);
         const entry = &io.sockets.slots[index];
         if (io.sockets.isAcquired(entry) and entry.peer != peer_none) {
-            entry.reset = true;
-            io.peerEntry(entry).reset = true;
-            io.mix(@as(u64, index) +% 0x52535421);
-            return;
+            io.mix(@as(u64, index) +% mix_seed);
+            assert(io.sockets.isAcquired(entry) and entry.peer != peer_none);
+            return entry;
         }
     }
+    return null;
+}
+
+fn maybeInjectReset(io: *SimIo) void {
+    const entry = io.pickRandomLiveConnectedSocket(io.adversary.reset_percent, 0x52535421) orelse return;
+    entry.reset = true;
+    io.peerEntry(entry).reset = true;
 }
 
 /// §8 kernel-pressure rung on the data path: flag one random live
@@ -1312,21 +1323,9 @@ fn maybeInjectReset(io: *SimIo) void {
 /// picked socket's next op fails, the peer is untouched — so the relay
 /// witnesses it and tears the connection down.
 fn maybeInjectKernelPressure(io: *SimIo) void {
-    if (io.adversary.kernel_pressure_percent == 0) return;
-    const random = io.prng.random();
-    if (random.uintLessThan(u8, 100) >= io.adversary.kernel_pressure_percent) return;
-    if (io.sockets.acquired_count == 0) return;
-
-    var probe: u8 = 0;
-    while (probe < 8) : (probe += 1) {
-        const index = random.uintLessThan(u16, sockets_max);
-        const entry = &io.sockets.slots[index];
-        if (io.sockets.isAcquired(entry) and entry.peer != peer_none) {
-            entry.kernel_pressure = true;
-            io.mix(@as(u64, index) +% 0x454e4f42); // "ENOB"
-            return;
-        }
-    }
+    const mix_seed_enob: u64 = 0x454e4f42; // "ENOB"
+    const entry = io.pickRandomLiveConnectedSocket(io.adversary.kernel_pressure_percent, mix_seed_enob) orelse return;
+    entry.kernel_pressure = true;
 }
 
 fn partialLen(io: *SimIo, available: u32) u32 {

@@ -875,7 +875,7 @@ origin, not one this proxy can pick for them.
   parsed, no declared body left to read, nothing pipelined past it), the
   client asked for keep-alive, the proxy is not draining, and relay
   pressure has not suppressed keep-alive (#57). Otherwise the lingering
-  close (§2) drains the client's inbound and closes. The
+  close (§7) drains the client's inbound and closes. The
   head-framing rejects — `400` malformed, `414`, `431` — can never keep:
   where the next request begins is exactly what the parser could not
   determine, so keeping would hand a smuggler a desynchronized stream.

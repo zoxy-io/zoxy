@@ -48,7 +48,7 @@ pub const Script = enum(u8) {
     /// reusable.
     keepalive_pair,
     /// Two GETs in one send: the proxy answers the first, announces
-    /// close (§2), and never serves the second.
+    /// close (§7), and never serves the second.
     pipelined,
     /// Connects and sends nothing: the head-read deadline reaps it;
     /// any response byte is a violation.
@@ -114,7 +114,7 @@ pub const Spec = struct {
     /// script degrades to a single-exchange transcript when its first
     /// response refuses reuse.
     second_request_when_reusable: bool = false,
-    /// Clean seeds demand the first response announces close (§2) —
+    /// Clean seeds demand the first response announces close (§7) —
     /// the pipelined shape: the proxy serves the first request and
     /// refuses to look at the second.
     golden_first_announces_close: bool = false,

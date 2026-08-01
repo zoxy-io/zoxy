@@ -185,7 +185,7 @@ pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
     // (§1, §3): N independent zoxy processes bind the same port and the
     // kernel load-balances new connections across them, with share-nothing
     // isolation at the process boundary. The intra-process accept imbalance
-    // that made SO_REUSEPORT a liability in the previous iteration (§2)
+    // that made SO_REUSEPORT a liability in the previous iteration (§3)
     // cannot arise here — each process still has exactly one accepting loop,
     // so the kernel balances between processes, never between contending
     // loops. Must precede bind; libxev sets SO_REUSEADDR inside bind, so the

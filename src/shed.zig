@@ -9,7 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 /// Whether the downstream connection survives a static response. `close`
-/// announces it in the response (§2: clients that pipeline into an
+/// announces it in the response (§7: clients that pipeline into an
 /// unannounced close read errors); `keep` leaves the connection serving.
 pub const Persistence = enum {
     keep,

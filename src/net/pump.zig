@@ -37,13 +37,13 @@
 //!   sendSlice(conn) []const u8            what a send writes; empty = drained
 //!   creditSend(conn, sent)                credit whichever cursor tracks the wire
 //!
-//! **The transform seam** (the last five). A plain relay recvs and sends the
+//! **The transform seam** (the last six). A plain relay recvs and sends the
 //! same bytes, so one buffer per direction serves both halves and the framed
 //! debt (`DirectionState`) is settled in the units it was incurred. A
 //! *transforming* direction is neither: its halves live in different buffers,
 //! and the bytes on the wire are not the bytes that arrived nor the same
 //! count of them — §4's TLS termination decrypts what it reads and encrypts
-//! what it writes. These five hooks are the only places that difference is
+//! what it writes. These six hooks are the only places that difference is
 //! encoded, and a policy declaring none of them gets exactly the plain
 //! behaviour, so the L4 and L7 body paths are unaffected by construction.
 //!

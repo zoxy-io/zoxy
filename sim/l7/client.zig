@@ -329,7 +329,7 @@ pub fn Client(comptime IoType: type) type {
                         return ClientError.GoldenOutcomeMissed;
                     }
                 }
-                // §2: a pipelined first response must announce the close
+                // §7: a pipelined first response must announce the close
                 // that follows it.
                 if (entry.golden_first_announces_close and walk.keep_alives[0]) {
                     return ClientError.GoldenOutcomeMissed;
@@ -341,7 +341,7 @@ pub fn Client(comptime IoType: type) type {
             complete_count: u8,
             offset: u32,
             statuses: [responses_max]u16,
-            /// Per-response persistence verdicts (§2): version defaults
+            /// Per-response persistence verdicts (§7): version defaults
             /// plus Connection tokens, as the parser computed them.
             keep_alives: [responses_max]bool,
             violation: ?ClientError,

@@ -7,7 +7,7 @@
 //!
 //! Lifecycle of one scrape: accept → send the rendered response → lingering
 //! close (half-close the write side, drain client input to EOF so the close
-//! never RSTs the response away, §2) → re-arm accept. A per-scrape deadline
+//! never RSTs the response away, §7) → re-arm accept. A per-scrape deadline
 //! (`admin_scrape_deadline_ms`) reaps a stalled or slowloris client so it
 //! cannot pin the single slot, exactly as every data-path socket is reaped
 //! (§8). Drain (§8) closes the listener and tears down any in-flight scrape,
@@ -83,7 +83,7 @@ pub fn Admin(comptime IoType: type) type {
             /// Writing the rendered response to the client.
             sending,
             /// Write side half-closed; discarding client input to EOF so
-            /// the close does not RST the response away (§2).
+            /// the close does not RST the response away (§7).
             draining,
             /// Teardown: sockets shut down, data op draining, close not yet
             /// submitted (the abnormal path — deadline, error, server drain).
@@ -129,8 +129,8 @@ pub fn Admin(comptime IoType: type) type {
             assert(admin.state == .off);
         }
 
-        /// Set the bind address before `start` (main.zig, from the env var;
-        /// the simulator sets it directly). A no-op default leaves admin off.
+        /// Set the bind address before `start`. A no-op default leaves
+        /// admin off.
         pub fn setBind(admin: *Self, bind_address: std.Io.net.IpAddress) void {
             assert(admin.state == .off);
             assert(!admin.listening);
@@ -138,7 +138,7 @@ pub fn Admin(comptime IoType: type) type {
         }
 
         /// Open the listener and arm the first accept, or stay off when no
-        /// bind is configured. Called from `Server.start`.
+        /// bind is configured.
         pub fn start(admin: *Self) Io.ListenError!void {
             assert(admin.state == .off);
             assert(!admin.listening);
@@ -157,6 +157,18 @@ pub fn Admin(comptime IoType: type) type {
             admin.server.io.accept(admin.listener, &admin.op_accept, Self, admin, onAccept);
         }
 
+        /// The admin plane is done accepting and now quiescent: stop
+        /// listening, go idle, and let the server re-check whether the
+        /// whole drain can finish. Shared by every drain exit path so they
+        /// cannot drift on the sequencing.
+        fn quiesceForDrain(admin: *Self) void {
+            assert(admin.server.draining);
+            assert(admin.armedCount() == 0);
+            admin.listening = false;
+            admin.state = .off;
+            admin.server.maybeStopAfterDrain();
+        }
+
         fn onAccept(admin: *Self, result: Io.AcceptError!IoType.Socket) void {
             assert(admin.state == .accepting);
             admin.disarm("accept");
@@ -172,9 +184,7 @@ pub fn Admin(comptime IoType: type) type {
                 if (result) |socket| {
                     shed.closeQuietly(IoType, admin.server.io, socket);
                 } else |_| {}
-                admin.listening = false;
-                admin.state = .off;
-                admin.server.maybeStopAfterDrain();
+                admin.quiesceForDrain();
                 return;
             }
             const socket = result catch |err| {
@@ -218,9 +228,7 @@ pub fn Admin(comptime IoType: type) type {
             // was pending is handled by cleaning up instead of re-arming.
             result catch unreachable;
             if (admin.server.draining) {
-                admin.listening = false;
-                admin.state = .off;
-                admin.server.maybeStopAfterDrain();
+                admin.quiesceForDrain();
                 return;
             }
             admin.armAccept();
@@ -276,7 +284,7 @@ pub fn Admin(comptime IoType: type) type {
                 return;
             }
             // Response fully sent: half-close the write side and drain the
-            // client's input to EOF so the close does not RST it away (§2).
+            // client's input to EOF so the close does not RST it away (§7).
             admin.server.counters.increment("admin_served");
             admin.state = .draining;
             admin.server.io.shutdown(admin.socket, .write);
@@ -429,9 +437,7 @@ pub fn Admin(comptime IoType: type) type {
             if (admin.state != .closing) return;
             if (admin.armedCount() != 0) return;
             if (admin.server.draining) {
-                admin.listening = false;
-                admin.state = .off;
-                admin.server.maybeStopAfterDrain();
+                admin.quiesceForDrain();
                 return;
             }
             admin.armAccept();

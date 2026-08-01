@@ -26,7 +26,8 @@ pub const RelayBuffer = @import("net/relay.zig").RelayBuffer;
 pub const UpstreamPool = @import("net/upstream.zig").UpstreamPool;
 pub const Server = @import("Server.zig").Server;
 pub const shed = @import("shed.zig");
-/// Shared test-support harness pieces (used by server_test and the sim).
+/// Shared test-support harness pieces, factored out so multiple test
+/// suites can drive the same origin double instead of growing their own.
 pub const testing = struct {
     pub const Origin = @import("testing/origin.zig").Origin;
     pub const Mode = @import("testing/origin.zig").Mode;

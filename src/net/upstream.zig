@@ -5,11 +5,10 @@
 //! pool-acquired for its whole connected life: leased while serving a
 //! request, parked on an idle list between requests (it still holds an
 //! fd), released only at teardown. A parked upstream holds no armed data
-//! op (§5); its deadline timer — embedded when the L7 state machine
-//! lands — is the idle timeout, and an origin close that slips through
-//! is detected at checkout. Exhaustion is a shed signal (§8), never
-//! growth. Idle lists are doubly linked so a deadline-fired teardown
-//! unparks from the middle of a list in O(1).
+//! op (§5); `deadline_ns` is the idle timeout, and an origin close that
+//! slips through is detected at checkout. Exhaustion is a shed signal
+//! (§8), never growth. Idle lists are doubly linked so a deadline-fired
+//! teardown unparks from the middle of a list in O(1).
 
 const std = @import("std");
 
@@ -41,10 +40,10 @@ pub fn UpstreamPool(comptime IoType: type) type {
         const Self = @This();
 
         /// One upstream connection slot (§5 pool 3): identity, socket,
-        /// idle links, and the head buffer response heads are parsed
-        /// into and rendered upstream heads are staged in. Embedded
-        /// completions and the deadline timer join with the L7 state
-        /// machine, one field per proven race (the Conn precedent).
+        /// idle links, the idle deadline, and the head buffer response
+        /// heads are parsed into and rendered upstream heads are staged
+        /// in. The dial and data-op completions live on the owning
+        /// `Conn`, one field per proven race (the Conn precedent).
         pub const Upstream = struct {
             pool_next: u32,
             generation: u32,

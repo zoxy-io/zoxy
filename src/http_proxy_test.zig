@@ -23,7 +23,7 @@ const ServerSim = Server(SimIo);
 
 /// A scripted HTTP client: sends `request` (the adversary may split the
 /// send), then reads until the peer closes, recording the response bytes
-/// and whether the close was an orderly FIN or an RST — the §2 property
+/// and whether the close was an orderly FIN or an RST — the §7 property
 /// (a delivered response must end in FIN, never a data-discarding RST).
 const HttpClient = struct {
     io: *SimIo = undefined,
@@ -741,6 +741,18 @@ fn expectRejectedAfterDial(bed: *const Http1Bed) !void {
     try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
 }
 
+/// Parses what the origin actually received as a request head, into
+/// `storage` — caller-owned so the returned head's slices (into
+/// `storage` and the origin's own request buffer) stay valid as long as
+/// the caller needs them.
+fn forwardedRequest(bed: *const Http1Bed, storage: *parser.HeaderStorage) !parser.RequestHead {
+    return parser.parseRequestHead(
+        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
+        false,
+        storage,
+    );
+}
+
 test "l7: a head that fits on arrival but not after forwarding is 431" {
     // Two arms the head-parse verdicts above cannot reach: a head the parser
     // accepted, rejected only when the proxy renders what it will forward
@@ -845,11 +857,7 @@ test "l7: OPTIONS asterisk-form is forwarded as \"*\", not as the \"/\" it match
 
     try std.testing.expect(bed.origin.conns[0].request_complete);
     var storage: parser.HeaderStorage = undefined;
-    const forwarded = try parser.parseRequestHead(
-        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-        false,
-        &storage,
-    );
+    const forwarded = try forwardedRequest(&bed, &storage);
     try std.testing.expectEqual(parser.Method.options, forwarded.method);
     try std.testing.expectEqualStrings("*", forwarded.target);
     try bed.expectDrained();
@@ -875,11 +883,7 @@ test "l7: a GET is proxied and the origin's response relayed back" {
     // The origin received the request, rewritten with Connection: close.
     try std.testing.expect(bed.origin.conns[0].request_complete);
     var storage: parser.HeaderStorage = undefined;
-    const forwarded = try parser.parseRequestHead(
-        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-        false,
-        &storage,
-    );
+    const forwarded = try forwardedRequest(&bed, &storage);
     try std.testing.expectEqual(parser.Method.get, forwarded.method);
     try std.testing.expectEqualStrings("/path", forwarded.target);
     // The client asked to close, but that is hop-by-hop: the upstream
@@ -905,11 +909,7 @@ test "l7: the origin sees the canonical path, query verbatim (§7)" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     var storage: parser.HeaderStorage = undefined;
-    const forwarded = try parser.parseRequestHead(
-        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-        false,
-        &storage,
-    );
+    const forwarded = try forwardedRequest(&bed, &storage);
     // Router and origin agree on the same canonical resource: /a/.. pops
     // to /, then /b/./c collapses to /b/c; the query rides along untouched.
     try std.testing.expectEqualStrings("/b/c?x=1%2F2", forwarded.target);
@@ -1115,7 +1115,7 @@ test "l7: an upstream-slot shed keeps the connection, and the client's ask decid
     //
     // The two responses differ in exactly one header, and the difference is
     // the *client's* ask, not the status: keep-alive is kept, `Connection:
-    // close` is honored (§2). One test, both spellings, so neither branch
+    // close` is honored (§7). One test, both spellings, so neither branch
     // can rot into the other.
     // The single upstream slot goes to a client the origin never answers,
     // so it stays leased and every other request meets the wall.
@@ -1214,7 +1214,7 @@ test "l7: a 501 keeps the connection, and the next request is served" {
 }
 
 test "l7: a reject closes when the client pipelined the next request" {
-    // Bytes past the head are a pipelined next request, which §2 does not
+    // Bytes past the head are a pipelined next request, which §7 does not
     // serve. Keeping the connection here would leave those bytes sitting in
     // the head buffer to be read as the *start* of the next request — the
     // desynchronization a request-smuggler wants (§7). A wide inbox carries
@@ -1283,7 +1283,7 @@ test "l7: a drain closes a reject that would otherwise be kept" {
     // so a reject arriving mid-drain is a connection the drain is waiting
     // on. Keeping it would park an idle connection until `drain_deadline_ms`
     // and turn a clean shutdown into a deadline-forced one — so the drain
-    // is a brake on keeping, exactly as it is on the render path (§2, §8).
+    // is a brake on keeping, exactly as it is on the render path (§7, §8).
     //
     // The client connects at once and is admitted, then holds its head back
     // until after the drain has begun.
@@ -1353,7 +1353,7 @@ test "l7: relay pressure closes a reject that would otherwise be kept" {
 test "l7: a reject closes when the request carries a body" {
     // A declared body is unread bytes still to come, so the stream is not
     // on a message boundary and the connection cannot resynchronize — the
-    // lingering close is what drains it (§2). Robust to delivery timing:
+    // lingering close is what drains it (§7). Robust to delivery timing:
     // if the body arrives coalesced with the head it fails the
     // nothing-past-the-head condition, and if it arrives later it fails the
     // framing-done one. Either way, close.
@@ -1414,11 +1414,7 @@ test "l7: filter header edits reach the origin, applied once" {
     // gone, and exactly one request served.
     try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
     var storage: parser.HeaderStorage = undefined;
-    const forwarded = try parser.parseRequestHead(
-        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-        false,
-        &storage,
-    );
+    const forwarded = try forwardedRequest(&bed, &storage);
     try std.testing.expectEqualStrings("prod", parser.headerValue(forwarded.headers, "x-env").?);
     try std.testing.expectEqualStrings("on", parser.headerValue(forwarded.headers, "x-trace").?);
     try std.testing.expectEqual(@as(?[]const u8, null), parser.headerValue(forwarded.headers, "cookie"));
@@ -1452,11 +1448,7 @@ test "l7: a filter rewrite changes only the forwarded path, not the route" {
     );
     try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
     var storage: parser.HeaderStorage = undefined;
-    const forwarded = try parser.parseRequestHead(
-        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-        false,
-        &storage,
-    );
+    const forwarded = try forwardedRequest(&bed, &storage);
     try std.testing.expectEqualStrings("/new/x?q=1", forwarded.target);
     try bed.expectDrained();
 }
@@ -1484,11 +1476,7 @@ test "l7: a header edit reaches the origin exactly once under adversarial delive
 
         try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
         var storage: parser.HeaderStorage = undefined;
-        const forwarded = try parser.parseRequestHead(
-            bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-            false,
-            &storage,
-        );
+        const forwarded = try forwardedRequest(&bed, &storage);
         // The client sent dev; the edit replaced it with exactly one prod.
         try std.testing.expectEqualStrings("prod", parser.headerValue(forwarded.headers, "x-env").?);
         try bed.expectDrained();
@@ -1519,11 +1507,7 @@ test "l7: a path rewrite forwards the rewritten path under adversarial delivery"
 
         try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
         var storage: parser.HeaderStorage = undefined;
-        const forwarded = try parser.parseRequestHead(
-            bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-            false,
-            &storage,
-        );
+        const forwarded = try forwardedRequest(&bed, &storage);
         try std.testing.expectEqualStrings("/new/x", forwarded.target);
         try bed.expectDrained();
     }
@@ -1579,11 +1563,7 @@ test "l7: a POST body is forwarded and a sized response returned, byte-exact und
         // The origin received the whole 11-byte body after the head.
         try std.testing.expect(bed.origin.conns[0].request_complete);
         var storage: parser.HeaderStorage = undefined;
-        const forwarded = try parser.parseRequestHead(
-            bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-            false,
-            &storage,
-        );
+        const forwarded = try forwardedRequest(&bed, &storage);
         const body = bed.origin.conns[0].request_buffer[forwarded.head_len..bed.origin.conns[0].request_len];
         try std.testing.expectEqualStrings("hello world", body);
         try bed.expectDrained();
@@ -1620,11 +1600,7 @@ test "l7: a body coalesced with the head, larger than a relay buffer, forwards i
     // The origin received the whole 6000-byte body byte-for-byte.
     try std.testing.expect(bed.origin.conns[0].request_complete);
     var storage: parser.HeaderStorage = undefined;
-    const forwarded = try parser.parseRequestHead(
-        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-        false,
-        &storage,
-    );
+    const forwarded = try forwardedRequest(&bed, &storage);
     const forwarded_body = bed.origin.conns[0].request_buffer[forwarded.head_len..bed.origin.conns[0].request_len];
     try std.testing.expectEqualStrings(request[head.len..request_len], forwarded_body);
     try bed.expectDrained();
@@ -2059,7 +2035,7 @@ test "l7: a dial re-basing an already-expired deadline defers past the cancel" {
         // connection either way. What this pins is the discipline on the
         // way there, not a response — the exchange is condemned before it
         // can be answered, so the close is a FIN or (with the client's
-        // head still unread) an RST, and §2 constrains neither: no
+        // head still unread) an RST, and §7 constrains neither: no
         // response byte was ever delivered.
         try std.testing.expect(bed.client.outcome != .pending);
         try std.testing.expect(bed.server.counters.get("deadline_expired") >= 1);
@@ -2221,89 +2197,80 @@ test "l7: the §7 replay inherits the request deadline, it does not restart it" 
     try bed.expectDrained();
 }
 
-test "l7: the 504 verdict path allocates nothing after init" {
-    // §9 zero-alloc gate for the pending-verdict machinery: the forced
-    // completion, the settle, and the static 504 answer must all run
-    // without an allocation. Counting run, then a failing run pinned to
-    // the init count.
+/// §9 zero-alloc gate shared by every "allocates nothing after init" test
+/// below: run `Scenario.run` under a counting allocator, confirm no
+/// allocation past init, then rerun the identical scenario under an
+/// allocator that *fails* past that same count — surviving proves the
+/// hot path never asks. `Scenario.verify`, if declared, checks the
+/// scenario actually exercised the path it gates; it only runs on the
+/// counting pass, since the strict pass only needs to survive.
+fn zeroAllocGate(comptime Scenario: type, options: Http1Bed.Options) !void {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var bed: Http1Bed = undefined;
-    try bed.setUp(failing.allocator(), .{ .seed = 73, .origin_mute = true });
+    try bed.setUp(failing.allocator(), options);
     defer bed.tearDown();
     const allocations_after_init = failing.allocations;
-    try bed.exchange("GET /stalled HTTP/1.1\r\nHost: o\r\n\r\n");
+    try Scenario.run(&bed);
     try bed.expectDrained();
-    // The verdict must actually have fired, or this gates nothing.
-    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    if (@hasDecl(Scenario, "verify")) try Scenario.verify(&bed);
     try std.testing.expectEqual(allocations_after_init, failing.allocations);
 
     var strict = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = allocations_after_init,
     });
     var strict_bed: Http1Bed = undefined;
-    try strict_bed.setUp(strict.allocator(), .{ .seed = 73, .origin_mute = true });
+    try strict_bed.setUp(strict.allocator(), options);
     defer strict_bed.tearDown();
-    try strict_bed.exchange("GET /stalled HTTP/1.1\r\nHost: o\r\n\r\n");
+    try Scenario.run(&strict_bed);
     try strict_bed.expectDrained();
+}
+
+test "l7: the 504 verdict path allocates nothing after init" {
+    // §9 zero-alloc gate for the pending-verdict machinery: the forced
+    // completion, the settle, and the static 504 answer must all run
+    // without an allocation.
+    const Scenario = struct {
+        fn run(bed: *Http1Bed) !void {
+            try bed.exchange("GET /stalled HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn verify(bed: *Http1Bed) !void {
+            // The verdict must actually have fired, or this gates nothing.
+            try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+        }
+    };
+    try zeroAllocGate(Scenario, .{ .seed = 73, .origin_mute = true });
 }
 
 test "l7: a single close-terminated exchange allocates nothing after init" {
     // §9 zero-alloc gate for the L7 upstream leg: a full proxied
-    // exchange — dial, request head + body, response, forward, close —
-    // under a counting allocator, then again under one that *fails* past
-    // the init count.
+    // exchange — dial, request head + body, response, forward, close.
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var bed: Http1Bed = undefined;
-    try bed.setUp(failing.allocator(), .{ .seed = 9, .partial_io = true, .origin_response = response });
-    defer bed.tearDown();
-    const allocations_after_init = failing.allocations;
-    try bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc");
-    try bed.expectDrained();
-    try std.testing.expectEqual(allocations_after_init, failing.allocations);
-
-    var strict = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = allocations_after_init,
-    });
-    var strict_bed: Http1Bed = undefined;
-    try strict_bed.setUp(strict.allocator(), .{ .seed = 9, .partial_io = true, .origin_response = response });
-    defer strict_bed.tearDown();
-    try strict_bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc");
-    try strict_bed.expectDrained();
+    const Scenario = struct {
+        fn run(bed: *Http1Bed) !void {
+            try bed.exchange("POST /p HTTP/1.1\r\nHost: o\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc");
+        }
+    };
+    try zeroAllocGate(Scenario, .{ .seed = 9, .partial_io = true, .origin_response = response });
 }
 
 test "l7: the keep-alive reuse turnaround allocates nothing after init" {
     // §9 zero-alloc gate for the §5 park/checkout/reset path: two
     // requests on one client connection reuse the parked upstream — the
     // most allocation-prone L7 lifecycle code, and the one a single
-    // close-terminated exchange never touches. Counting run, then a
-    // failing run pinned to the init count.
+    // close-terminated exchange never touches.
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-    const second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
-    const first_request = "GET /one HTTP/1.1\r\nHost: o\r\n\r\n";
-
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var bed: Http1Bed = undefined;
-    try bed.setUp(failing.allocator(), .{ .seed = 50, .origin_response = response });
-    defer bed.tearDown();
-    const allocations_after_init = failing.allocations;
-    bed.client.second_request = second_request;
-    try bed.exchange(first_request);
-    try bed.expectDrained();
-    // The turnaround must actually have parked and reused the upstream,
-    // or this gates nothing.
-    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
-    try std.testing.expectEqual(allocations_after_init, failing.allocations);
-
-    var strict = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = allocations_after_init,
-    });
-    var strict_bed: Http1Bed = undefined;
-    try strict_bed.setUp(strict.allocator(), .{ .seed = 50, .origin_response = response });
-    defer strict_bed.tearDown();
-    strict_bed.client.second_request = second_request;
-    try strict_bed.exchange(first_request);
-    try strict_bed.expectDrained();
+    const Scenario = struct {
+        fn run(bed: *Http1Bed) !void {
+            bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+            try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+        }
+        fn verify(bed: *Http1Bed) !void {
+            // The turnaround must actually have parked and reused the
+            // upstream, or this gates nothing.
+            try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+        }
+    };
+    try zeroAllocGate(Scenario, .{ .seed = 50, .origin_response = response });
 }
 
 test "l7: an http listener admits without a relay buffer" {
@@ -2693,42 +2660,24 @@ test "l7: the stale replay survives 1-byte adversarial delivery across seeds" {
 test "l7: the replay path allocates nothing after init" {
     // §9 zero-alloc gate for the §7 replay: stale detection, slot
     // disposal, the re-parse, and the fresh dial must all run without an
-    // allocation. Counting run, then a failing run pinned to the count.
+    // allocation.
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-    const second_request = "GET /b HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
-    const first_request = "GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
-
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var bed: Http1Bed = undefined;
-    try bed.setUp(failing.allocator(), .{
+    const Scenario = struct {
+        fn run(bed: *Http1Bed) !void {
+            bed.client.next = &bed.client2;
+            bed.client2.request = "GET /b HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+            try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+        }
+        fn verify(bed: *Http1Bed) !void {
+            // The replay must actually have fired, or this gates nothing.
+            try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_replayed"));
+        }
+    };
+    try zeroAllocGate(Scenario, .{
         .seed = 57,
         .origin_response = response,
         .origin_closes = true,
     });
-    defer bed.tearDown();
-    const allocations_after_init = failing.allocations;
-    bed.client.next = &bed.client2;
-    bed.client2.request = second_request;
-    try bed.exchange(first_request);
-    try bed.expectDrained();
-    // The replay must actually have fired, or this gates nothing.
-    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_replayed"));
-    try std.testing.expectEqual(allocations_after_init, failing.allocations);
-
-    var strict = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = allocations_after_init,
-    });
-    var strict_bed: Http1Bed = undefined;
-    try strict_bed.setUp(strict.allocator(), .{
-        .seed = 57,
-        .origin_response = response,
-        .origin_closes = true,
-    });
-    defer strict_bed.tearDown();
-    strict_bed.client.next = &strict_bed.client2;
-    strict_bed.client2.request = second_request;
-    try strict_bed.exchange(first_request);
-    try strict_bed.expectDrained();
 }
 
 /// The single line the §8 access log wrote during a scenario. Fails rather
@@ -3104,11 +3053,7 @@ test "l7: a request past the endpoint cap is answered 503, not sent" {
 fn forwardedForSeenByOrigin(bed: *const Http1Bed) !?[]const u8 {
     try std.testing.expect(bed.origin.conns[0].request_complete);
     var storage: parser.HeaderStorage = undefined;
-    const head = try parser.parseRequestHead(
-        bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
-        false,
-        &storage,
-    );
+    const head = try forwardedRequest(bed, &storage);
     var seen: ?[]const u8 = null;
     for (head.headers) |header| {
         if (header.tag != .x_forwarded_for) continue;
