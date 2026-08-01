@@ -157,6 +157,18 @@ pub fn Admin(comptime IoType: type) type {
             admin.server.io.accept(admin.listener, &admin.op_accept, Self, admin, onAccept);
         }
 
+        /// The admin plane is done accepting and now quiescent: stop
+        /// listening, go idle, and let the server re-check whether the
+        /// whole drain can finish. Shared by every drain exit path so they
+        /// cannot drift on the sequencing.
+        fn quiesceForDrain(admin: *Self) void {
+            assert(admin.server.draining);
+            assert(admin.armedCount() == 0);
+            admin.listening = false;
+            admin.state = .off;
+            admin.server.maybeStopAfterDrain();
+        }
+
         fn onAccept(admin: *Self, result: Io.AcceptError!IoType.Socket) void {
             assert(admin.state == .accepting);
             admin.disarm("accept");
@@ -172,9 +184,7 @@ pub fn Admin(comptime IoType: type) type {
                 if (result) |socket| {
                     shed.closeQuietly(IoType, admin.server.io, socket);
                 } else |_| {}
-                admin.listening = false;
-                admin.state = .off;
-                admin.server.maybeStopAfterDrain();
+                admin.quiesceForDrain();
                 return;
             }
             const socket = result catch |err| {
@@ -218,9 +228,7 @@ pub fn Admin(comptime IoType: type) type {
             // was pending is handled by cleaning up instead of re-arming.
             result catch unreachable;
             if (admin.server.draining) {
-                admin.listening = false;
-                admin.state = .off;
-                admin.server.maybeStopAfterDrain();
+                admin.quiesceForDrain();
                 return;
             }
             admin.armAccept();
@@ -429,9 +437,7 @@ pub fn Admin(comptime IoType: type) type {
             if (admin.state != .closing) return;
             if (admin.armedCount() != 0) return;
             if (admin.server.draining) {
-                admin.listening = false;
-                admin.state = .off;
-                admin.server.maybeStopAfterDrain();
+                admin.quiesceForDrain();
                 return;
             }
             admin.armAccept();
