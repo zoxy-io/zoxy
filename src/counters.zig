@@ -34,6 +34,10 @@ pub const Counters = struct {
     /// the counter is the alert an operator sizes `limits.head_buffers`
     /// by, before the wall (`l7_shed_head_buffers`) starts refusing.
     head_pressure_engaged: Value = Value.init(0),
+    /// The upstream head pool's crossing, on the same no-bias terms: a
+    /// parked upstream holds no head buffer, so there is nothing idle to
+    /// evict — the alert for sizing `limits.upstream_head_buffers`.
+    upstream_head_pressure_engaged: Value = Value.init(0),
     /// §8 rung: request/idle deadline fired → teardown.
     deadline_expired: Value = Value.init(0),
     /// Upstream dial failed (refused/unreachable/canceled-by-teardown).
@@ -82,6 +86,15 @@ pub const Counters = struct {
     /// kept connection would re-arm onto the same bytes and shed the same
     /// request forever. `respond` enforces the close at comptime.
     l7_shed_head_buffers: Value = Value.init(0),
+    /// §8 rung: the upstream head pool was empty at the request-head
+    /// render — answered 503 with the ordinary keep-or-close rules (the
+    /// request was fully read and parsed, unlike the ring rung above).
+    /// Distinct from `l7_shed_upstream_slots` the way that one is
+    /// distinct from the endpoint cap: slots say the proxy ran out of
+    /// connections, this says it ran out of head staging — different
+    /// knobs (`upstream_slots` vs `upstream_head_buffers`), and an
+    /// operator widening the wrong one fixes nothing.
+    l7_shed_upstream_head_buffers: Value = Value.init(0),
     /// §8 requests answered 503 because every endpoint of their cluster
     /// was already carrying its configured `max_inflight`. Distinct from
     /// `l7_shed_upstream_slots` on purpose: that one says this proxy ran
@@ -289,6 +302,11 @@ pub const Counters = struct {
         /// conn level but not here.
         head_buffers_in_use: u32,
         head_buffers_capacity: u32,
+        /// Upstream head buffers held by exchanges right now (§5): the
+        /// render-to-park window, so with parking healthy this sits far
+        /// below the leased count — the gap is what the pool buys.
+        upstream_head_buffers_in_use: u32,
+        upstream_head_buffers_capacity: u32,
         /// The raw errno of the most recent kernel-pressure failure, or 0
         /// for "none since start". A gauge, not a counter: the question is
         /// which errno is failing *now*, and the `kernel_pressure_*` cause
@@ -310,6 +328,7 @@ pub const Counters = struct {
             if (gauges.conn_slots_in_use > gauges.conn_slots_capacity) return false;
             if (gauges.relay_buffers_in_use > gauges.relay_buffers_capacity) return false;
             if (gauges.head_buffers_in_use > gauges.head_buffers_capacity) return false;
+            if (gauges.upstream_head_buffers_in_use > gauges.upstream_head_buffers_capacity) return false;
             if (gauges.health_endpoints_unhealthy > gauges.health_endpoints_checked) return false;
             const upstream_in_use = @as(u64, gauges.upstream_slots_leased) +
                 gauges.upstream_slots_parked;
@@ -564,6 +583,8 @@ const test_gauges: Counters.Gauges = .{
     .upstream_slots_capacity = 16,
     .head_buffers_in_use = 2,
     .head_buffers_capacity = 8,
+    .upstream_head_buffers_in_use = 1,
+    .upstream_head_buffers_capacity = 6,
     .kernel_pressure_last_errno = 105, // ENOBUFS on Linux
     .health_endpoints_checked = 4,
     .health_endpoints_unhealthy = 1,

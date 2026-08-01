@@ -42,6 +42,12 @@ pub fn Server(comptime IoType: type) type {
         /// The shared upstream connection pool (§3, §5): leased per L7
         /// exchange today; parking joins with keep-alive.
         upstreams: upstream_module.UpstreamPool(IoType),
+        /// The §5 upstream head buffers, pooled apart from the slots so a
+        /// parked connection holds a socket and ~48 B of slot, never 8 KiB
+        /// of head. App-side (not the seam's kernel ring) because the
+        /// acquire is synchronous: a render needs the bytes now.
+        upstream_head_buffers: Pool(upstream_module.HeadBuffer),
+        upstream_head_pressure: bool,
         /// Live L4 relayed connections per endpoint (§7), the other half
         /// of `upstream_module.Load`. The pool cannot hold this: an L4
         /// connection leases no upstream slot, so it is the server —
@@ -254,6 +260,8 @@ pub fn Server(comptime IoType: type) type {
             // endpoint-keyed table so they cannot disagree about a key.
             const keys = endpointKeysFor(config);
             try server.upstreams.init(arena, options.upstream_slots, keys);
+            assert(options.upstream_head_buffers <= options.upstream_slots);
+            try server.upstream_head_buffers.init(arena, options.upstream_head_buffers);
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
@@ -267,6 +275,7 @@ pub fn Server(comptime IoType: type) type {
             server.head_pressure = false;
             server.head_buffers_in_use = 0;
             server.head_buffers_capacity = options.head_buffers;
+            server.upstream_head_pressure = false;
             // Deliberately not zeroed: a discard sink's contents are never
             // read, the same argument the head buffers make (§5).
             server.drain_sink = undefined;
@@ -399,8 +408,10 @@ pub fn Server(comptime IoType: type) type {
             // conn is left to lease one, so the pool must be empty.
             assert(server.upstreams.isFullyReleased());
             // Every conn released its ring buffer on the way out, so the
-            // in-use count the server owns must have followed to zero.
+            // in-use count the server owns must have followed to zero —
+            // and every released or parked upstream let go of its head.
             assert(server.head_buffers_in_use == 0);
+            assert(server.upstream_head_buffers.isFullyReleased());
             server.io.stop();
         }
 
@@ -471,6 +482,7 @@ pub fn Server(comptime IoType: type) type {
                 server.conns.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
+                server.upstream_head_buffers.isFullyReleased() and
                 server.head_buffers_in_use == 0 and
                 server.admin.isQuiescent() and
                 server.access_log.isQuiescent() and
@@ -1125,6 +1137,18 @@ pub fn Server(comptime IoType: type) type {
             );
         }
 
+        fn updateUpstreamHeadPressure(server: *Self) void {
+            // Reachable only through an acquire or release, both of which
+            // imply a nonzero pool — the watermark math needs that.
+            assert(server.upstream_head_buffers.slots.len >= 1);
+            server.updatePressureFlag(
+                &server.upstream_head_pressure,
+                server.upstream_head_buffers.acquired_count,
+                @intCast(server.upstream_head_buffers.slots.len),
+                "upstream_head_pressure_engaged",
+            );
+        }
+
         fn updateHeadPressure(server: *Self) void {
             // Reachable only through a bind or return, both of which imply
             // a registered ring — so the capacity the watermark math needs
@@ -1178,6 +1202,8 @@ pub fn Server(comptime IoType: type) type {
                 .upstream_slots_capacity = server.upstreams.capacity(),
                 .head_buffers_in_use = server.head_buffers_in_use,
                 .head_buffers_capacity = server.head_buffers_capacity,
+                .upstream_head_buffers_in_use = server.upstream_head_buffers.acquired_count,
+                .upstream_head_buffers_capacity = server.upstream_head_buffers.capacity(),
                 .kernel_pressure_last_errno = server.last_pressure_errno,
                 .health_endpoints_checked = server.health.checked_count,
                 .health_endpoints_unhealthy = server.health.unhealthy_count,
@@ -1258,8 +1284,35 @@ pub fn Server(comptime IoType: type) type {
             // links would dangle), and at least this slot is leased.
             assert(!leased.parked);
             assert(server.upstreams.leasedCount() >= 1);
+            // A slot released mid-exchange — teardown, a static response,
+            // a stale replay — usually still holds its head buffer; one
+            // that never got one (the shed at its own head acquire) or
+            // released it at park arrives here empty-handed. One
+            // conditional chokepoint, so no release path can leak it.
+            if (leased.head_buffer != null) {
+                server.releaseUpstreamHeadBuffer(leased);
+            }
             server.upstreams.release(leased);
             server.updateUpstreamPressure();
+        }
+
+        /// The §5 upstream head-buffer pair: acquired at the request-head
+        /// render, released before the slot parks or with the slot itself.
+        /// Both sides recompute the watermark.
+        pub fn acquireUpstreamHeadBuffer(server: *Self) ?*upstream_module.HeadBuffer {
+            const head_buffer = server.upstream_head_buffers.acquire() orelse return null;
+            server.updateUpstreamHeadPressure();
+            return head_buffer;
+        }
+
+        pub fn releaseUpstreamHeadBuffer(
+            server: *Self,
+            leased: *upstream_module.UpstreamPool(IoType).Upstream,
+        ) void {
+            const head_buffer = leased.head_buffer orelse unreachable;
+            leased.head_buffer = null;
+            server.upstream_head_buffers.release(head_buffer);
+            server.updateUpstreamHeadPressure();
         }
 
         /// The idle timeout to apply now, shortened under downstream

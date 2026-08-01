@@ -851,6 +851,12 @@ pub const PoolSizes = struct {
     /// descriptor table (`bufferGroupDescriptorBytes`).
     head_buffers: u32,
     head_buffer_bytes: u64,
+    /// The §5 upstream head pool (`limits.upstream_head_buffers`; zero on
+    /// an L4-only config) and its unit size — `@sizeOf` the pool element,
+    /// so the intrusive free-list header rides along like every other
+    /// pool's.
+    upstream_head_buffers: u32,
+    upstream_head_buffer_bytes: u64,
 };
 
 /// What the access log reserves: nothing when it is off, both staging
@@ -875,7 +881,9 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     assert(sizes.upstream_slots <= upstream_slots_max);
     assert(sizes.conn_bytes > 0);
     assert(sizes.relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
-    assert(sizes.upstream_bytes >= head_bytes_max);
+    // Once 8 KiB of head, now scalars: the slot's head moved to the §5
+    // upstream head pool, whose own bound is asserted below.
+    assert(sizes.upstream_bytes > 0);
     // Either the log is off and costs nothing, or it holds exactly its two
     // buffers at a size the loader validated — never some third number.
     assert(sizes.access_log_bytes % access_log_buffers == 0);
@@ -886,12 +894,15 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, access_log_buffers) * access_log_buffer_bytes_max);
     assert(sizes.head_buffers <= buffer_group_entries_max);
     assert(sizes.head_buffers == 0 or sizes.head_buffer_bytes >= 1);
+    assert(sizes.upstream_head_buffers <= sizes.upstream_slots);
+    assert(sizes.upstream_head_buffers == 0 or sizes.upstream_head_buffer_bytes >= head_bytes_max);
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.endpoint_table_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
-        bufferGroupDescriptorBytes(sizes.head_buffers);
+        bufferGroupDescriptorBytes(sizes.head_buffers) +
+        @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes;
     assert(total > 0);
     return total;
 }
@@ -920,7 +931,9 @@ test "pressure: relay watermarks have a hysteresis gap at every capacity" {
 test "budgets: memory total matches the closed form" {
     const conn_bytes: u64 = 10240;
     const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
-    const upstream_bytes: u64 = head_bytes_max + 64;
+    // Scalars only since the head moved to its own pool (§5).
+    const upstream_bytes: u64 = 64;
+    const upstream_head_bytes: u64 = head_bytes_max + 8;
     // The endpoint-keyed tables (§7): like the access log, a reservation
     // that must move the total by exactly its own size and nothing else.
     const endpoint_tables: u64 = 4096;
@@ -944,7 +957,8 @@ test "budgets: memory total matches the closed form" {
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes +
         accessLogBytes(access_log_buffer_bytes_default) + endpoint_tables +
-        head_ring;
+        head_ring +
+        @as(u64, upstream_slots_max) * upstream_head_bytes;
     try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
@@ -956,6 +970,8 @@ test "budgets: memory total matches the closed form" {
         .endpoint_table_bytes = endpoint_tables,
         .head_buffers = conn_slots_max,
         .head_buffer_bytes = head_bytes_max,
+        .upstream_head_buffers = upstream_slots_max,
+        .upstream_head_buffer_bytes = upstream_head_bytes,
     }));
     const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
@@ -967,9 +983,11 @@ test "budgets: memory total matches the closed form" {
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
-        // The L4-only shape: no ring registered, no term at all.
+        // The L4-only shape: no ring, no upstream head pool, no terms.
         .head_buffers = 0,
         .head_buffer_bytes = head_bytes_max,
+        .upstream_head_buffers = 0,
+        .upstream_head_buffer_bytes = head_bytes_max,
     }));
     // An unconfigured access log reserves nothing (§5), and a configured
     // one reserves both buffers at whatever size it was given — the term

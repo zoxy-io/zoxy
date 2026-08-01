@@ -36,6 +36,19 @@ const idle_none: u32 = std.math.maxInt(u32);
 /// on the pick path, and the waste is bounded by the config the operator
 /// wrote — the same trade the fixed arrays made, minus the part that had
 /// nothing to do with this deployment.
+/// One §5 upstream head buffer: the render target for an outgoing request
+/// head and the accumulator for the origin's response head — one buffer
+/// deliberately serving both, in sequence (the response leg asserts the
+/// request's use is over before it starts). Pooled app-side rather than
+/// through the seam's kernel ring because its first use is synchronous:
+/// a render needs the bytes now, and a kernel-selected buffer only
+/// arrives with a delivery. `Pool(HeadBuffer)` supplies the free list.
+pub const HeadBuffer = struct {
+    pool_next: u32,
+    generation: u32,
+    bytes: [constants.head_bytes_max]u8,
+};
+
 pub const EndpointKeys = struct {
     /// Entries per cluster: the largest endpoint count any one cluster
     /// declares. At least 1, so a key is always addressable.
@@ -78,9 +91,9 @@ pub fn UpstreamPool(comptime IoType: type) type {
         const Self = @This();
 
         /// One upstream connection slot (§5 pool 3): identity, socket,
-        /// idle links, the idle deadline, and the head buffer response
-        /// heads are parsed into and rendered upstream heads are staged
-        /// in. The dial and data-op completions live on the owning
+        /// idle links, the idle deadline, and a claim on the head buffer
+        /// response heads are parsed into and rendered upstream heads are
+        /// staged in. The dial and data-op completions live on the owning
         /// `Conn`, one field per proven race (the Conn precedent).
         pub const Upstream = struct {
             pool_next: u32,
@@ -93,10 +106,17 @@ pub fn UpstreamPool(comptime IoType: type) type {
             parked: bool,
             idle_next: u32,
             idle_prev: u32,
-            head: [constants.head_bytes_max]u8,
-            /// Valid prefix of `head` while it accumulates a response
-            /// head; the rendered upstream request head tracks its own
-            /// length in the owning connection instead.
+            /// The §5 upstream head buffer this exchange holds, acquired
+            /// at the request-head render and released before the slot
+            /// parks — a parked connection holds a socket and this slot's
+            /// scalars, never 8 KiB of head. Null outside that window.
+            head_buffer: ?*HeadBuffer,
+            /// Valid prefix of the held head buffer while it accumulates
+            /// a response head; the rendered upstream request head tracks
+            /// its own length in the owning connection instead. A count,
+            /// not content: §7 replay eligibility reads it (and requires
+            /// zero) without caring what the buffer holds, and checkout
+            /// zeroes it on a slot whose buffer is long since released.
             head_len: u32,
             /// Absolute idle deadline while parked (§5): a parked
             /// connection holds no armed op, so the Server's single sweep
@@ -139,6 +159,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.parked = false;
             upstream.idle_next = idle_none;
             upstream.idle_prev = idle_none;
+            upstream.head_buffer = null;
             upstream.head_len = 0;
             upstream.deadline_ns = 0;
             const key = pool.keys.key(cluster_index, endpoint_index);
@@ -153,6 +174,10 @@ pub fn UpstreamPool(comptime IoType: type) type {
         /// likely to still be open and cache-warm).
         pub fn park(pool: *Self, upstream: *Upstream) void {
             assert(!upstream.parked);
+            // Parking with the head buffer still claimed is the leak §5's
+            // whole upstream story exists to prevent: the caller releases
+            // it first, and a parked slot provably holds no head bytes.
+            assert(upstream.head_buffer == null);
             assert(upstream.idle_next == idle_none);
             assert(upstream.idle_prev == idle_none);
             const index = pool.slot_pool.indexOf(upstream);

@@ -391,7 +391,17 @@ only by the loop thread:
    purpose: recv targets nobody reads may.
 3. **Upstream connections — `Pool(Upstream)` + per-endpoint idle lists.**
    Checked out by any request, parked on keep-alive, one shared pool for
-   the whole process (§3: the Pingora reuse win). **A parked upstream has
+   the whole process (§3: the Pingora reuse win). The slot carries ~48 B
+   of scalars; its head buffer — the request-head render target and
+   response-head accumulator — lives in its own pool
+   (`limits.upstream_head_buffers`), acquired with the slot and released
+   before the slot parks, so a parked origin connection holds a socket
+   and scalars, never 8 KiB of head. App-side `Pool(HeadBuffer)` rather
+   than the seam's kernel ring, because its first use is synchronous: a
+   render needs the bytes now, and a kernel-selected buffer only arrives
+   with a delivery. Exhaustion is the `l7_shed_upstream_head_buffers`
+   rung, with the ordinary keep-or-close rules — unlike the client ring,
+   this request was fully read. **A parked upstream has
    no armed op** — deliberately no per-connection poll, which would cost
    an in-flight op per idle upstream in the ring budget (§8) for a race
    that is already covered: the parked connection's deadline timer serves
@@ -447,8 +457,9 @@ a raised `RLIMIT_NOFILE`:
 |---|---|---|---|
 | conn slots | 1386 | 11466 | ~1.7 KiB state |
 | relay buffers | 1386 | 11466 | 2 × 4 KiB |
-| upstream slots | 1313 | 11466 | ~40 B state + 8 KiB head |
+| upstream slots | 1313 | 11466 | ~48 B state |
 | head buffers (ring) | = conn slots | 11466 | 8 KiB + 1 B |
+| upstream head buffers | = upstream slots | 11466 | 8 KiB + 8 B |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
 
 The access log (§8) adds one fixed reservation beside the pools — two
@@ -880,6 +891,7 @@ the loop thread.
 | head buffers | a client's first byte, before the parse | static `503`, then **always close** — the refused bytes are still unread in the socket, and a kept connection would shed them forever |
 | relay buffers (L7) | request admission on a kept-alive conn | static `503` from static memory, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) |
+| upstream head buffers | beside the slot, as it is obtained | static `503`, then keep or close per pressure |
 | **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |

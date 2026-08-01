@@ -490,6 +490,9 @@ const Http1Bed = struct {
         /// The §5 head-buffer ring; null follows conn_slots (never
         /// sheds), a number drives the `l7_shed_head_buffers` rung.
         head_buffers: ?u32 = null,
+        /// The §5 upstream head pool; null follows upstream_slots (never
+        /// sheds), a number drives `l7_shed_upstream_head_buffers`.
+        upstream_head_buffers: ?u32 = null,
         /// The §6 absolute age cap; 0 (the default) disables it. A cap the
         /// exchange outlives clamps every stored deadline to it, so a
         /// re-based target can already be in the past.
@@ -574,6 +577,7 @@ const Http1Bed = struct {
             .relay_buffers = options.relay_buffers,
             .upstream_slots = options.upstream_slots,
             .head_buffers = head_buffers,
+            .upstream_head_buffers = options.upstream_head_buffers orelse options.upstream_slots,
             .access_log_buffer_bytes = if (options.access_log)
                 constants.access_log_buffer_bytes_default
             else
@@ -1218,6 +1222,43 @@ test "l7: keep-alive returns the head buffer between requests" {
 
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_head_buffers"));
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("head_pressure_engaged"));
+    try bed.expectDrained();
+}
+
+test "l7: an upstream head-pool shed keeps the connection like any post-parse rung" {
+    // The §5 upstream head pool's wall, distinct from the slot wall: two
+    // slots free, one head buffer — the first exchange holds it from the
+    // moment its slot was obtained (a mute origin never lets it park), so
+    // the second request gets a slot and sheds at the head acquire right
+    // beside it. Unlike the client-side ring rung this request was fully
+    // read and parsed, so the ordinary keep-or-close rules apply — pinned
+    // the same way the slot-shed test pins them: two requests answered on
+    // one connection, the close spelling honoring the client's own ask.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 63,
+        .upstream_slots = 2,
+        .upstream_head_buffers = 1,
+        .origin_mute = true,
+    });
+    defer bed.tearDown();
+
+    bed.client.drain_on_finish = false;
+    bed.client2.send_delay_ms = 100;
+    bed.client2.request = "GET /one HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /held HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_relay_buffers"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_head_buffers"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_upstream_slots"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_shed_upstream_head_buffers"));
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n" ++
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client2.response(),
+    );
     try bed.expectDrained();
 }
 
