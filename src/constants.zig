@@ -292,18 +292,17 @@ pub const health_check_host_bytes_max: u16 = host_bytes_max;
 pub const health_check_request_bytes_max: u32 =
     64 + health_check_path_bytes_max + health_check_host_bytes_max;
 
-/// Upper bound on routes in one listener's path-routing table (§7). Config
-/// data, not a runtime pool: routes are immutable arena slices, and the
-/// request-time match is a bounded linear scan over at most this many.
-pub const routes_max: u16 = 32;
-
-/// §7 "filters are data" bounds — one listener's rule table and each
-/// rule's shape. Config data, not pools: rules are immutable arena
-/// slices and evaluation is bounded loops over at most these many, so a
-/// filter set cannot make request handling unbounded.
-pub const filters_per_listener_max: u16 = 32;
-pub const actions_per_filter_max: u16 = 8;
-pub const header_matches_per_filter_max: u16 = 8;
+// Routes and filters carry no ceiling of their own (§7 "filters are
+// data"). They are immutable arena slices allocated at exactly the
+// length the config asked for, so they size nothing that a comptime
+// bound could protect: what a large table costs is arena bytes and a
+// longer request-time linear scan, both of which are the operator's
+// call to make in their own config. The request-time loops stay bounded
+// — by a length fixed at startup rather than by a constant here.
+//
+// `header_edits_max` below is the exception, and the difference is the
+// rule: it bounds a *fixed buffer* the renderer materializes into, so
+// the number must be known before the config is read.
 
 /// Upper bound on a listener's *total* header-edit actions (set/add/remove
 /// summed across every rule). A request applies the edits of all rules it
@@ -644,10 +643,6 @@ comptime {
     assert(endpoint_inflight_max == conn_slots_max + upstream_slots_max);
     assert(endpoint_inflight_max >= conn_slots_max);
     assert(endpoint_inflight_max >= upstream_slots_max);
-    assert(routes_max >= 1);
-    assert(filters_per_listener_max >= 1);
-    assert(actions_per_filter_max >= 1);
-    assert(header_matches_per_filter_max >= 1);
     assert(header_edits_max >= 1);
     assert(loop_completions_per_tick_max >= 1);
     assert(config_bytes_max >= 1024);

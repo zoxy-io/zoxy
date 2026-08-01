@@ -269,24 +269,20 @@ pub const ValidationError = error{
     ListenerClusterOrRoutes,
     ListenerL4Routes,
     RoutesEmpty,
-    RoutesOverLimit,
     RoutePrefixNotCanonical,
     RouteHostNotCanonical,
     RouteDuplicate,
     ListenerL4Filters,
     ListenerL4Forwarded,
     ListenerForwardedModeUnknown,
-    FiltersOverLimit,
     FilterMethodEmpty,
     FilterMethodUnknown,
-    FilterHeaderMatchesOverLimit,
     FilterHeaderMatchKind,
     FilterHeaderContainsEmpty,
     FilterHeaderNameInvalid,
     FilterHeaderNameReserved,
     FilterHeaderValueInvalid,
     FilterActionsEmpty,
-    FilterActionsOverLimit,
     FilterActionKind,
     FilterRejectStatus,
     FilterHeaderEditsOverLimit,
@@ -599,11 +595,9 @@ pub const ListenerJson = struct {
         .routes = .{
             .desc = "Explicit longest-prefix route table (http listeners only).",
             .min_items = 1,
-            .max_items = constants.routes_max,
         },
         .filters = .{
             .desc = "Request filter rules, evaluated top-down (http listeners only).",
-            .max_items = constants.filters_per_listener_max,
         },
         .protocol = .{
             .desc = "What the listener speaks: l4 relays bytes blindly, http runs the reverse-proxy state machine.",
@@ -645,7 +639,6 @@ pub const FilterJson = struct {
         .actions = .{
             .desc = "Actions applied in order when the rule matches.",
             .min_items = 1,
-            .max_items = constants.actions_per_filter_max,
         },
     };
 };
@@ -668,7 +661,6 @@ pub const MatchJson = struct {
         .path_prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
         .headers = .{
             .desc = "Header predicates; all must match.",
-            .max_items = constants.header_matches_per_filter_max,
         },
     };
 };
@@ -1190,9 +1182,6 @@ fn resolveFilters(
     if (filters_json.len == 0) {
         return &.{};
     }
-    if (filters_json.len > constants.filters_per_listener_max) {
-        return error.FiltersOverLimit;
-    }
     const rules = try arena.alloc(filter.Rule, filters_json.len);
     var header_edits: u32 = 0;
     for (filters_json, rules) |rule_json, *rule| {
@@ -1209,14 +1198,12 @@ fn resolveFilters(
         return error.FilterHeaderEditsOverLimit;
     }
     assert(rules.len == filters_json.len);
-    assert(rules.len <= constants.filters_per_listener_max);
     return rules;
 }
 
 /// The number of header-edit actions (set/add/remove) in a rule — the
 /// reject and rewrite actions contribute no render-time header edit.
 fn countHeaderEdits(actions: []const filter.Action) u32 {
-    assert(actions.len <= constants.actions_per_filter_max);
     var count: u32 = 0;
     for (actions) |action| {
         switch (action) {
@@ -1261,9 +1248,6 @@ fn resolveHeaderMatches(
     arena: std.mem.Allocator,
     headers_json: []const HeaderMatchJson,
 ) ParseError![]const filter.HeaderMatch {
-    if (headers_json.len > constants.header_matches_per_filter_max) {
-        return error.FilterHeaderMatchesOverLimit;
-    }
     const matches = try arena.alloc(filter.HeaderMatch, headers_json.len);
     for (headers_json, matches) |header_json, *match| {
         try validateHeaderName(header_json.name);
@@ -1308,15 +1292,11 @@ fn resolveActions(
     if (actions_json.len == 0) {
         return error.FilterActionsEmpty;
     }
-    if (actions_json.len > constants.actions_per_filter_max) {
-        return error.FilterActionsOverLimit;
-    }
     const actions = try arena.alloc(filter.Action, actions_json.len);
     for (actions_json, actions) |action_json, *action| {
         action.* = try resolveAction(&action_json);
     }
     assert(actions.len == actions_json.len);
-    assert(actions.len <= constants.actions_per_filter_max);
     return actions;
 }
 
@@ -1467,9 +1447,6 @@ fn resolveRoutes(
     if (routes_json.len == 0) {
         return error.RoutesEmpty;
     }
-    if (routes_json.len > constants.routes_max) {
-        return error.RoutesOverLimit;
-    }
     const routes = try arena.alloc(router.Route, routes_json.len);
     for (routes_json, 0..) |route_json, index| {
         try validateRoutePrefix(route_json.prefix);
@@ -1495,7 +1472,6 @@ fn resolveRoutes(
     // group the longest prefix. Ties are rejected as duplicates above.
     std.mem.sort(router.Route, routes, {}, routeMoreSpecific);
     assert(routes.len >= 1);
-    assert(routes.len <= constants.routes_max);
     return routes;
 }
 
@@ -2214,9 +2190,10 @@ test "config: a filter set over the header-edit budget is rejected" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
-    // One header_edits_max+1 header edits spread one-per-rule (each rule
-    // stays under actions_per_filter_max): the whole-table total is what
-    // the renderer's fixed buffer must hold, so it is the total that caps.
+    // header_edits_max+1 header edits spread one-per-rule: neither the
+    // rule count nor a rule's action count is bounded any more, so the
+    // whole-table total is the only thing that caps — which is the point,
+    // since that total is what the renderer's fixed buffer must hold.
     const rules = comptime blk: {
         var s: []const u8 = "";
         var edit: u16 = 0;
@@ -2765,7 +2742,6 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
         assert(parsed.connect_timeout_ms < parsed.idle_timeout_ms);
         for (parsed.listeners) |listener| {
             assert(listener.routes.len >= 1);
-            assert(listener.routes.len <= constants.routes_max);
             for (listener.routes) |route| {
                 assert(route.cluster_index < parsed.clusters.len);
                 assert(route.prefix.len >= 1);
