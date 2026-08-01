@@ -63,9 +63,12 @@ pub const Outcome = enum(u8) {
     /// `502` (§7, §8) — a refused dial, a dead origin, an unparseable
     /// response head.
     upstream_failed,
-    /// No answer was delivered: the connection was torn down mid-request.
-    /// The client left, the deadline fired with a response already in
-    /// flight, or a drain reaped a straggler.
+    /// No complete answer reached the client: the connection was torn
+    /// down mid-request or mid-response. The client left, the deadline
+    /// fired (possibly with a response already in flight, in which case
+    /// the origin's status is still recorded), or a drain reaped a
+    /// straggler. The default outcome, so any teardown path that skips
+    /// setting a more specific one lands here too.
     aborted,
     /// L4 only: both directions drained and the connection closed cleanly.
     closed,
