@@ -219,7 +219,7 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 if (target[0] != '/') {
                     return true;
                 }
-                var canon_buf: [constants.head_bytes_max]u8 = undefined;
+                var canon_buf: [constants.head_buffer_bytes_default]u8 = undefined;
                 const canonical = parser.canonicalTarget(target, &canon_buf) catch {
                     return false;
                 };

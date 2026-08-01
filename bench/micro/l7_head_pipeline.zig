@@ -43,9 +43,9 @@ const no_edits: []const zoxy.http.filter.AppliedHeaderEdit = &.{};
 pub fn main() void {
     var request_storage: parser.HeaderStorage = undefined;
     var response_storage: parser.HeaderStorage = undefined;
-    var path_scratch: [zoxy.constants.head_bytes_max]u8 = undefined;
-    var upstream_head: [zoxy.constants.head_bytes_max]u8 = undefined;
-    var downstream_head: [zoxy.constants.head_bytes_max]u8 = undefined;
+    var path_scratch: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
+    var upstream_head: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
+    var downstream_head: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
 
     var checksum: u64 = 0;
     var index: u64 = 0;

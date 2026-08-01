@@ -138,12 +138,36 @@ pub fn poolPressureOff(capacity: u32) u32 {
 /// configured idle timeout is already small.
 pub const pressure_idle_divisor: u32 = 4;
 
-/// Upper bound on one L7 request or response head, including the final
-/// CRLF — the size of a connection slot's head buffer (§5). A request
-/// head that cannot complete inside this budget is answered 414 (request
-/// line still open) or 431 (header section); an oversize origin response
-/// head tears the exchange down (§7).
-pub const head_bytes_max: u32 = 8 * 1024;
+/// The default upper bound on one L7 request or response head, including
+/// the final CRLF — the per-buffer size of both §5 head pools unless
+/// `limits.head_buffer_bytes` says otherwise. A request head that cannot
+/// complete inside the configured budget is answered 414 (request line
+/// still open) or 431 (header section); an oversize origin response head
+/// tears the exchange down (§7). The default stays 8 KiB deliberately:
+/// zoxy already accepts roughly half of HAProxy's ~15 KiB usable head,
+/// and shrinking further would reject heads its peers accept — the knob
+/// exists to *raise* for big-cookie/JWT deployments, and to lower only
+/// for operators who know their traffic.
+pub const head_buffer_bytes_default: u32 = 8 * 1024;
+
+/// The floor on `limits.head_buffer_bytes`. Below this, ordinary
+/// requests start dying as 414/431 — and it is what the comptime
+/// relations below hold against, so every derived buffer (the forwarded
+/// chain, the health probe) fits any size an operator may choose.
+pub const head_buffer_bytes_min: u32 = 1024;
+
+/// The ceiling on `limits.head_buffer_bytes` (the precedent is
+/// `access_log_buffer_bytes_max`: a size knob gets a sanity wall even
+/// where a count knob gets a relation). Also the widest head the parser
+/// layer must be prepared to see, whatever the config chose — its
+/// bounds-guarding asserts hold against this, not the default.
+pub const head_buffer_bytes_max: u32 = 1024 * 1024;
+
+comptime {
+    assert(head_buffer_bytes_min >= 1024);
+    assert(head_buffer_bytes_min <= head_buffer_bytes_default);
+    assert(head_buffer_bytes_default <= head_buffer_bytes_max);
+}
 
 /// Bounded per-head header array. Overflowing it is load, not malice: it
 /// maps to 431, distinguishable from malformed input's 400 (§7).
@@ -724,7 +748,6 @@ comptime {
     assert(connect_ms_default < idle_ms_default);
     assert(accept_retry_delay_ms >= 1);
     assert(pressure_idle_divisor >= 2);
-    assert(head_bytes_max >= 1024);
     assert(headers_max >= 8);
     assert(host_bytes_max >= 1);
     assert(upstream_slots_max >= 1);
@@ -771,9 +794,10 @@ comptime {
     // a write, and a third would be a queue nobody drains.
     assert(access_log_buffers == 2);
     // A carried chain plus the address appended to it must still leave a
-    // head that can be rendered; both are a small fraction of the buffer
-    // the whole head has to fit in.
-    assert(forwarded_value_bytes_max < head_bytes_max);
+    // head that can be rendered — inside the *smallest* head buffer an
+    // operator may configure, so the relation stays comptime while the
+    // size itself went runtime.
+    assert(forwarded_value_bytes_max < head_buffer_bytes_min);
     // The scratch must hold a bracketed IPv6 literal with its port, which
     // is what gets formatted before the port is stripped back off.
     assert(forwarded_client_bytes_max >= 47);
@@ -798,9 +822,10 @@ comptime {
     assert(health_check_host_bytes_max >= 1);
     assert(health_check_request_bytes_max >
         @as(u32, health_check_path_bytes_max) + health_check_host_bytes_max);
-    // A probe response is parsed by the same head parser the data path
-    // uses, so its buffer may never exceed what that parser accepts.
-    assert(health_check_request_bytes_max <= head_bytes_max);
+    // A probe request must fit the smallest head buffer an operator may
+    // configure — its response buffer follows `limits.head_buffer_bytes`
+    // at init, so only the request side needs a comptime floor.
+    assert(health_check_request_bytes_max <= head_buffer_bytes_min);
 }
 
 /// Total pool memory as a closed-form function of the *effective* pool
@@ -857,6 +882,12 @@ pub const PoolSizes = struct {
     /// pool's.
     upstream_head_buffers: u32,
     upstream_head_buffer_bytes: u64,
+    /// The head-sized side buffers (§5): the serving path's two
+    /// canonicalization scratches (present only where a head can exist)
+    /// and the health prober's response buffer (always). A fixed
+    /// reservation like the access log's, in the total on the same
+    /// promise; `main.zig` composes it to mirror `Server.init` exactly.
+    head_scratch_bytes: u64,
 };
 
 /// What the access log reserves: nothing when it is off, both staging
@@ -895,14 +926,18 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     assert(sizes.head_buffers <= buffer_group_entries_max);
     assert(sizes.head_buffers == 0 or sizes.head_buffer_bytes >= 1);
     assert(sizes.upstream_head_buffers <= sizes.upstream_slots);
-    assert(sizes.upstream_head_buffers == 0 or sizes.upstream_head_buffer_bytes >= head_bytes_max);
+    assert(sizes.upstream_head_buffers == 0 or
+        sizes.upstream_head_buffer_bytes >= head_buffer_bytes_min);
+    // At least the prober's one buffer, at least the smallest legal size.
+    assert(sizes.head_scratch_bytes >= head_buffer_bytes_min);
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.endpoint_table_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
-        @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes;
+        @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes +
+        sizes.head_scratch_bytes;
     assert(total > 0);
     return total;
 }
@@ -933,7 +968,7 @@ test "budgets: memory total matches the closed form" {
     const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
     // Scalars only since the head moved to its own pool (§5).
     const upstream_bytes: u64 = 64;
-    const upstream_head_bytes: u64 = head_bytes_max + 8;
+    const upstream_head_bytes: u64 = head_buffer_bytes_default + 8;
     // The endpoint-keyed tables (§7): like the access log, a reservation
     // that must move the total by exactly its own size and nothing else.
     const endpoint_tables: u64 = 4096;
@@ -946,19 +981,22 @@ test "budgets: memory total matches the closed form" {
     // page-granular and next-power-of-two, so a non-power-of-two count
     // pins the rounding too: 11466 → 16384 entries × 16 B = exactly 64
     // pages.
-    const head_ring: u64 = @as(u64, conn_slots_max) * (head_bytes_max + 1) +
+    const head_ring: u64 = @as(u64, conn_slots_max) * (head_buffer_bytes_default + 1) +
         bufferGroupDescriptorBytes(conn_slots_max);
     try std.testing.expectEqual(
         @as(u64, 16384) * 16,
         bufferGroupDescriptorBytes(conn_slots_max),
     );
     try std.testing.expectEqual(@as(u64, 0), bufferGroupDescriptorBytes(0));
+    // The side buffers: two serving scratches plus the prober's one.
+    const head_scratch: u64 = 3 * @as(u64, head_buffer_bytes_default);
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes +
         accessLogBytes(access_log_buffer_bytes_default) + endpoint_tables +
         head_ring +
-        @as(u64, upstream_slots_max) * upstream_head_bytes;
+        @as(u64, upstream_slots_max) * upstream_head_bytes +
+        head_scratch;
     try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
@@ -969,11 +1007,14 @@ test "budgets: memory total matches the closed form" {
         .access_log_bytes = accessLogBytes(access_log_buffer_bytes_default),
         .endpoint_table_bytes = endpoint_tables,
         .head_buffers = conn_slots_max,
-        .head_buffer_bytes = head_bytes_max,
+        .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = upstream_slots_max,
         .upstream_head_buffer_bytes = upstream_head_bytes,
+        .head_scratch_bytes = head_scratch,
     }));
-    const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
+    // The L4-only shape still carries the prober's one response buffer.
+    const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes +
+        head_buffer_bytes_default;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
         .conn_slots = 64,
         .conn_bytes = conn_bytes,
@@ -983,11 +1024,13 @@ test "budgets: memory total matches the closed form" {
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
-        // The L4-only shape: no ring, no upstream head pool, no terms.
+        // The L4-only shape: no ring, no upstream head pool, no scratch
+        // terms — but the prober's buffer is unconditional.
         .head_buffers = 0,
-        .head_buffer_bytes = head_bytes_max,
+        .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = 0,
-        .upstream_head_buffer_bytes = head_bytes_max,
+        .upstream_head_buffer_bytes = head_buffer_bytes_default,
+        .head_scratch_bytes = head_buffer_bytes_default,
     }));
     // An unconfigured access log reserves nothing (§5), and a configured
     // one reserves both buffers at whatever size it was given — the term

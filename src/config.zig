@@ -100,6 +100,15 @@ pub const Config = struct {
         /// zero exactly when no listener speaks http, and the struct
         /// default is the off state on the same terms as `head_buffers`.
         upstream_head_buffers: u32 = 0,
+        /// Bytes per head buffer, in both §5 head pools — and therefore
+        /// the largest request or response head this proxy accepts: an
+        /// oversize request head is 414/431, an oversize origin head
+        /// tears the exchange down (§7). Operator-visible behaviour, not
+        /// just a size, which is why it gets a floor (below it, ordinary
+        /// requests start dying) as well as a ceiling. May be raised as
+        /// well as lowered — the big-cookie/JWT case is the reason it
+        /// exists. Inert when both pools are zero (an L4-only config).
+        head_buffer_bytes: u32 = constants.head_buffer_bytes_default,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -325,6 +334,7 @@ pub const ValidationError = error{
     LimitUpstreamHeadBuffersOutOfRange,
     LimitUpstreamHeadBuffersOverUpstreamSlots,
     LimitUpstreamHeadBuffersWithoutHttpListener,
+    LimitHeadBufferBytesOutOfRange,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -346,18 +356,31 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
     // any check inherits it.
     try validateTimeouts(&parsed.timeouts);
     const clusters = try resolveClusters(arena, &parsed.clusters, parsed.timeouts.connect_ms);
-    const listeners = try resolveListeners(arena, parsed.listeners, clusters);
-    const access_log_sink = try resolveAccessLogSink(parsed.access_log);
-    var http_listeners_count: u32 = 0;
-    for (listeners) |*listener| {
-        if (listener.protocol == .http) http_listeners_count += 1;
+    // Limits resolve before listeners, off the raw DTO counts: the route
+    // prefixes inside `resolveListeners` are gated against the resolved
+    // `head_buffer_bytes` — a prefix longer than the head can never
+    // match a parsed path, and belongs refused at load, not left to 404
+    // forever at runtime. The reorder moves precedences, pinned by
+    // tests: emptiness still outranks everything after the clusters
+    // (the limits resolver asserts a non-empty set, so the gate fires
+    // first here); a bad protocol string surfaces from the count below —
+    // before any bind or sink is looked at; and a bad bind, resolved
+    // last, now reports after a bad access-log sink.
+    if (parsed.listeners.len == 0) {
+        return error.ListenersEmpty;
     }
+    var http_listeners_count: u32 = 0;
+    for (parsed.listeners) |listener_json| {
+        if (try protocolOf(listener_json.protocol) == .http) http_listeners_count += 1;
+    }
+    const access_log_sink = try resolveAccessLogSink(parsed.access_log);
     const limits = try resolveLimits(
         &parsed.limits,
-        @intCast(listeners.len),
+        @intCast(parsed.listeners.len),
         http_listeners_count,
         access_log_sink != null,
     );
+    const listeners = try resolveListeners(arena, parsed.listeners, clusters, limits.head_buffer_bytes);
     const admin_bind = try resolveAdminBind(parsed.admin);
 
     assert(listeners.len >= 1);
@@ -441,6 +464,7 @@ fn resolveLimits(
         upstream_slots,
         http_listeners_count,
     );
+    const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
     // The CQ fill is the one limit an operator tightens for headroom, not a
     // pool shrink (§8): a smaller fill demands a deeper ring for the same
     // conn slots. Range-check first, then reject a fill that — with these
@@ -470,6 +494,7 @@ fn resolveLimits(
         .upstream_slots = upstream_slots,
         .head_buffers = head_buffers,
         .upstream_head_buffers = upstream_head_buffers,
+        .head_buffer_bytes = head_buffer_bytes,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
     };
@@ -524,6 +549,23 @@ fn resolveUpstreamHeadBuffers(
     }
     assert(upstream_head_buffers <= upstream_slots);
     return upstream_head_buffers;
+}
+
+/// The head-buffer size (§5): a plain range, unlike its two count
+/// siblings — the size is a property of the pools and of the health
+/// prober's buffer, so it needs no http-listener coupling; an L4-only
+/// config's value still sizes the prober. The floor is behaviour, not
+/// memory: below it ordinary requests start dying as 414/431.
+fn resolveHeadBufferBytes(requested: ?u32) ValidationError!u32 {
+    const head_buffer_bytes = requested orelse constants.head_buffer_bytes_default;
+    if (head_buffer_bytes < constants.head_buffer_bytes_min or
+        head_buffer_bytes > constants.head_buffer_bytes_max)
+    {
+        return error.LimitHeadBufferBytesOutOfRange;
+    }
+    assert(head_buffer_bytes >= constants.head_buffer_bytes_min);
+    assert(head_buffer_bytes <= constants.head_buffer_bytes_max);
+    return head_buffer_bytes;
 }
 
 fn resolveAccessLogBuffer(
@@ -628,6 +670,7 @@ pub const LimitsJson = struct {
     upstream_slots: ?u32 = null,
     head_buffers: ?u32 = null,
     upstream_head_buffers: ?u32 = null,
+    head_buffer_bytes: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 
@@ -666,6 +709,13 @@ pub const LimitsJson = struct {
                 "listener, 0 without one.",
             .minimum = 0,
             .maximum = constants.upstream_slots_max,
+        },
+        .head_buffer_bytes = .{
+            .desc = "Bytes per head buffer in both head pools — the largest " ++
+                "HTTP head accepted (oversize requests get 414/431). May be " ++
+                "raised for big-cookie/JWT traffic as well as lowered.",
+            .minimum = constants.head_buffer_bytes_min,
+            .maximum = constants.head_buffer_bytes_max,
         },
         .cq_fill_eighths = .{
             .desc = "Eighths of the io_uring completion queue the worst-case " ++
@@ -1273,6 +1323,7 @@ fn resolveListeners(
     arena: std.mem.Allocator,
     listeners_json: []const ListenerJson,
     clusters: []const Config.Cluster,
+    head_buffer_bytes: u32,
 ) ParseError![]const Config.Listener {
     assert(clusters.len >= 1);
     if (listeners_json.len == 0) {
@@ -1294,8 +1345,8 @@ fn resolveListeners(
         const protocol = try protocolOf(listener_json.protocol);
         listeners[index] = .{
             .bind_address = bind_address,
-            .routes = try resolveRoutes(arena, &listener_json, clusters, protocol),
-            .filters = try resolveFilters(arena, &listener_json, protocol),
+            .routes = try resolveRoutes(arena, &listener_json, clusters, protocol, head_buffer_bytes),
+            .filters = try resolveFilters(arena, &listener_json, protocol, head_buffer_bytes),
             .protocol = protocol,
             .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
         };
@@ -1352,6 +1403,7 @@ fn resolveFilters(
     arena: std.mem.Allocator,
     listener_json: *const ListenerJson,
     protocol: Config.Listener.Protocol,
+    head_buffer_bytes: u32,
 ) ParseError![]const filter.Rule {
     const filters_json = listener_json.filters orelse return &.{};
     // Any `filters` key on an l4 listener is a mistake — l4 relays bytes,
@@ -1367,8 +1419,8 @@ fn resolveFilters(
     var header_edits: u32 = 0;
     for (filters_json, rules) |rule_json, *rule| {
         rule.* = .{
-            .match = try resolveMatch(arena, &rule_json.match),
-            .actions = try resolveActions(arena, rule_json.actions),
+            .match = try resolveMatch(arena, &rule_json.match, head_buffer_bytes),
+            .actions = try resolveActions(arena, rule_json.actions, head_buffer_bytes),
         };
         header_edits += countHeaderEdits(rule.actions);
     }
@@ -1406,13 +1458,14 @@ fn countHeaderEdits(actions: []const filter.Action) u32 {
 fn resolveMatch(
     arena: std.mem.Allocator,
     match_json: *const MatchJson,
+    head_buffer_bytes: u32,
 ) ParseError!filter.Match {
     var match: filter.Match = .{};
     if (match_json.host) |host| {
         match.host = try validateRouteHost(host);
     }
     if (match_json.path_prefix) |prefix| {
-        try validateRoutePrefix(prefix);
+        try validateRoutePrefix(prefix, head_buffer_bytes);
         match.path_prefix = prefix;
     }
     if (match_json.method) |tokens| {
@@ -1476,6 +1529,7 @@ fn resolveHeaderMatches(
 fn resolveActions(
     arena: std.mem.Allocator,
     actions_json: []const ActionJson,
+    head_buffer_bytes: u32,
 ) ParseError![]const filter.Action {
     if (actions_json.len == 0) {
         return error.FilterActionsEmpty;
@@ -1483,13 +1537,13 @@ fn resolveActions(
     assert(actions_json.len >= 1); // Past the empty guard.
     const actions = try arena.alloc(filter.Action, actions_json.len);
     for (actions_json, actions) |action_json, *action| {
-        action.* = try resolveAction(&action_json);
+        action.* = try resolveAction(&action_json, head_buffer_bytes);
     }
     assert(actions.len == actions_json.len);
     return actions;
 }
 
-fn resolveAction(action_json: *const ActionJson) ParseError!filter.Action {
+fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseError!filter.Action {
     // Exactly one action field carries the kind.
     const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
         @intFromBool(action_json.header_set != null) +
@@ -1517,8 +1571,8 @@ fn resolveAction(action_json: *const ActionJson) ParseError!filter.Action {
         return .{ .header_remove = name };
     }
     const rewrite = action_json.rewrite_prefix.?;
-    try validateRoutePrefix(rewrite.from);
-    try validateRoutePrefix(rewrite.to);
+    try validateRoutePrefix(rewrite.from, head_buffer_bytes);
+    try validateRoutePrefix(rewrite.to, head_buffer_bytes);
     return .{ .rewrite_prefix = .{ .from = rewrite.from, .to = rewrite.to } };
 }
 
@@ -1614,6 +1668,7 @@ fn resolveRoutes(
     listener_json: *const ListenerJson,
     clusters: []const Config.Cluster,
     protocol: Config.Listener.Protocol,
+    head_buffer_bytes: u32,
 ) ParseError![]const router.Route {
     const has_cluster = listener_json.cluster != null;
     const has_routes = listener_json.routes != null;
@@ -1638,7 +1693,7 @@ fn resolveRoutes(
     }
     const routes = try arena.alloc(router.Route, routes_json.len);
     for (routes_json, 0..) |route_json, index| {
-        try validateRoutePrefix(route_json.prefix);
+        try validateRoutePrefix(route_json.prefix, head_buffer_bytes);
         const host = if (route_json.host) |raw| try validateRouteHost(raw) else null;
         for (routes_json[0..index]) |previous| {
             // Earlier routes already passed validateRouteHost, so their raw
@@ -1703,15 +1758,24 @@ fn validateRouteHost(host: []const u8) ParseError![]const u8 {
 /// prefix that canonicalization would change (dot-segments, decodable or
 /// structure-changing escapes, a missing leading slash, a query) is
 /// rejected at load, not silently mismatched at request time.
-fn validateRoutePrefix(prefix: []const u8) ParseError!void {
+fn validateRoutePrefix(prefix: []const u8, head_buffer_bytes: u32) ParseError!void {
+    assert(head_buffer_bytes >= constants.head_buffer_bytes_min);
+    assert(head_buffer_bytes <= constants.head_buffer_bytes_max);
     if (prefix.len == 0 or prefix[0] != '/') {
         return error.RoutePrefixNotCanonical;
     }
-    if (prefix.len > constants.head_bytes_max) {
+    // Against the *resolved* size (`limits` resolves before listeners
+    // for exactly this): a prefix longer than the configured head can
+    // never match a parsed path, and belongs refused at load, not left
+    // to 404 forever at runtime.
+    if (prefix.len > head_buffer_bytes) {
         return error.RoutePrefixNotCanonical;
     }
-    var out: [constants.head_bytes_max]u8 = undefined;
-    const canonical = parser.canonicalTarget(prefix, &out) catch {
+    // Canonicalization only ever shrinks, so the compile-time ceiling on
+    // the runtime gate above bounds the scratch. Stack is fine here:
+    // this is the loader, not the serving path §5 constrains.
+    var out: [constants.head_buffer_bytes_max]u8 = undefined;
+    const canonical = parser.canonicalTarget(prefix, out[0..]) catch {
         return error.RoutePrefixNotCanonical;
     };
     if (canonical.query.len != 0 or !std.mem.eql(u8, canonical.path, prefix)) {
@@ -1771,7 +1835,13 @@ fn resolveHttpCheck(check: *const CheckJson) ParseError!Config.Cluster.Check.Htt
     if (path.len > constants.health_check_path_bytes_max) {
         return error.ClusterCheckPathTooLong;
     }
-    validateRoutePrefix(path) catch return error.ClusterCheckPathNotCanonical;
+    // The floor stands in for the resolved size here: clusters resolve
+    // before `limits`, and a probe path is already capped far below the
+    // smallest head buffer any config can choose (the comptime relation
+    // in constants.zig), so the tighter runtime gate can never bind.
+    comptime assert(constants.health_check_path_bytes_max < constants.head_buffer_bytes_min);
+    validateRoutePrefix(path, constants.head_buffer_bytes_min) catch
+        return error.ClusterCheckPathNotCanonical;
     if (check.host) |host| {
         if (host.len == 0 or host.len > constants.health_check_host_bytes_max) {
             return error.ClusterCheckHostInvalid;
@@ -2630,6 +2700,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         // pool follows upstream slots on the same terms.
         try std.testing.expectEqual(@as(u32, 16), parsed.limits.head_buffers);
         try std.testing.expectEqual(constants.upstream_slots_default, parsed.limits.upstream_head_buffers);
+        try std.testing.expectEqual(constants.head_buffer_bytes_default, parsed.limits.head_buffer_bytes);
     }
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
@@ -2695,6 +2766,29 @@ test "config: limits shrink pools below the ceilings, never past them" {
         "\"limits\":{\"upstream_head_buffers\":1}}");
     try expectParseError(error.LimitUpstreamHeadBuffersOutOfRange, http_head ++ tail ++
         "\"limits\":{\"upstream_head_buffers\":0}}");
+    // The size knob has a floor as well as a ceiling: below it ordinary
+    // requests start dying as 414/431, which is behaviour, not memory.
+    try expectParseError(error.LimitHeadBufferBytesOutOfRange, http_head ++ tail ++
+        "\"limits\":{\"head_buffer_bytes\":512}}");
+    try expectParseError(error.LimitHeadBufferBytesOutOfRange, http_head ++ tail ++
+        "\"limits\":{\"head_buffer_bytes\":2097152}}");
+    // The parse-order precedences the limits-before-listeners reorder
+    // moved, pinned deliberately (see `parse`): emptiness beats a bad
+    // sink; a bad protocol (even on a later listener) beats a bad bind
+    // on an earlier one, because the http count reads every protocol
+    // before any listener resolves.
+    try expectParseError(error.ListenersEmpty,
+        \\{"listeners":[],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
+        \\ "access_log":{"sink":"nonsense"}}
+    );
+    try expectParseError(error.ListenerProtocolUnknown,
+        \\{"listeners":[{"bind":"not-an-address","cluster":"a"},
+        \\               {"bind":"127.0.0.1:1","cluster":"a","protocol":"gopher"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
     // The CQ fill has its own range [min, max] in eighths; below or above
     // fails loudly, each distinct from the pool-size errors.
     try expectParseError(error.LimitCqFillOutOfRange, head ++ tail ++ "\"limits\":{\"cq_fill_eighths\":0}}");

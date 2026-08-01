@@ -101,6 +101,17 @@ pub fn Server(comptime IoType: type) type {
         /// and die. Inline rather than arena so it is part of no budget
         /// term and can never be under-counted.
         drain_sink: [constants.drain_sink_bytes]u8,
+        /// The §7 canonicalization scratches for the serving path (the
+        /// balancer's `eligible_scratch` precedent): their length is the
+        /// config's `head_buffer_bytes`, and a runtime-length stack array
+        /// is exactly the dynamic allocation §5 forbids — allocated once
+        /// at init, reused per request. Two, not one: on the checkout
+        /// path the routed views still alias the target scratch while the
+        /// filter rewrite writes the other. Sound because the loop is
+        /// single-threaded and neither window suspends or re-enters.
+        /// Empty on an L4-only config, which never canonicalizes.
+        target_scratch: []u8,
+        rewrite_scratch: []u8,
         /// Highest armed-op count any one connection has reached (§8):
         /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and,
         /// under runtime safety only (never in the shipped ReleaseFast
@@ -248,10 +259,13 @@ pub fn Server(comptime IoType: type) type {
             assert(options.upstream_slots >= 1);
             assert(options.relay_buffers <= options.conn_slots);
             assert(options.head_buffers <= options.conn_slots);
-            // The ring the backend registered and the limit this server
-            // accounts against must be the same number, or the shed rung
-            // fires at a size no config names. Zero is the L4-only shape.
+            // The ring the backend registered and the limits this server
+            // accounts against must agree — count and unit size both — or
+            // the shed rung fires at a shape no config names. A zero
+            // count is the L4-only shape; the size holds regardless,
+            // because the health prober's buffer follows it too.
             assert(io.bufferGroupCount() == options.head_buffers);
+            assert(io.bufferGroupBytes() == options.head_buffer_bytes);
             server.io = io;
             server.config = config;
             try server.conns.init(arena, options.conn_slots);
@@ -262,6 +276,26 @@ pub fn Server(comptime IoType: type) type {
             try server.upstreams.init(arena, options.upstream_slots, keys);
             assert(options.upstream_head_buffers <= options.upstream_slots);
             try server.upstream_head_buffers.init(arena, options.upstream_head_buffers);
+            // The pool's slab, wired once: `Pool` never touches `data`,
+            // so the wiring survives every acquire/release cycle.
+            const upstream_head_slab = try arena.alloc(
+                u8,
+                @as(usize, options.upstream_head_buffers) * options.head_buffer_bytes,
+            );
+            for (server.upstream_head_buffers.slots, 0..) |*head_buffer, index| {
+                head_buffer.data =
+                    upstream_head_slab[index * options.head_buffer_bytes ..][0..options.head_buffer_bytes];
+            }
+            // The serving path's canonicalization scratches (see the
+            // fields): sized only where a head can exist to canonicalize.
+            // `headScratchBytes` is the closed form the banner prints;
+            // asserting the sum here is what keeps the two from drifting.
+            const scratch_bytes: usize =
+                if (options.head_buffers >= 1) options.head_buffer_bytes else 0;
+            server.target_scratch = try arena.alloc(u8, scratch_bytes);
+            server.rewrite_scratch = try arena.alloc(u8, scratch_bytes);
+            assert(server.target_scratch.len + server.rewrite_scratch.len +
+                options.head_buffer_bytes == headScratchBytes(options));
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
@@ -287,7 +321,7 @@ pub fn Server(comptime IoType: type) type {
             server.admin.init(server, config.admin_bind);
             server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
             try server.access_log.reserve(arena);
-            try server.health.init(arena, server, keys);
+            try server.health.init(arena, server, keys, options.head_buffer_bytes);
         }
 
         /// Override the admin/metrics bind before `start` — the simulator
@@ -571,8 +605,9 @@ pub fn Server(comptime IoType: type) type {
         /// already hold to be admitted at all. An L4 connection relays for
         /// its whole life, so a missing relay buffer is an admission-time
         /// shed (§8), counted before `admitted`; an idle L7 connection
-        /// holds a slot and head buffer only and acquires a buffer per body
-        /// leg (§5). The second divergence is `startProtocol`.
+        /// holds a slot only — its head buffer binds at the first byte,
+        /// its relay buffer per body leg (§5). The second divergence is
+        /// `startProtocol`.
         fn admit(server: *Self, state: *ListenerState, client_socket: IoType.Socket) void {
             assert(!server.draining);
             const conn = server.admitConn(client_socket) orelse return;
@@ -599,7 +634,7 @@ pub fn Server(comptime IoType: type) type {
         /// The first deadline that connection runs under: an L4 connection
         /// is dialing, so it gets the connect budget (§8); an L7 one is
         /// reading a head, so a slowloris meets the clock or
-        /// `head_bytes_max`, whichever comes first (§7).
+        /// `limits.head_buffer_bytes`, whichever comes first (§7).
         fn entryTimeoutMs(
             server: *const Self,
             protocol: config_module.Config.Listener.Protocol,
@@ -793,6 +828,16 @@ pub fn Server(comptime IoType: type) type {
         /// The shared lingering-close discard target (§7) — see the field.
         pub fn drainSink(server: *Self) []u8 {
             return server.drain_sink[0..];
+        }
+
+        /// The head-sized side buffers' closed form (§5): the two serving
+        /// scratches (only where a head can exist) plus the health
+        /// prober's response buffer (always). The budget banner prints
+        /// this; `init` asserts its allocations sum to it, so the printed
+        /// number cannot drift from what is actually reserved.
+        pub fn headScratchBytes(options: InitOptions) u64 {
+            const serving: u64 = if (options.head_buffers >= 1) 2 else 0;
+            return (serving + 1) * options.head_buffer_bytes;
         }
 
         /// The same pair for conn slots, with `admitConn` as its acquire

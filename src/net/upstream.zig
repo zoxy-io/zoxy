@@ -46,7 +46,12 @@ const idle_none: u32 = std.math.maxInt(u32);
 pub const HeadBuffer = struct {
     pool_next: u32,
     generation: u32,
-    bytes: [constants.head_bytes_max]u8,
+    /// Into the pool's one slab, wired at `Server.init` right after the
+    /// pool itself and never touched again — `Pool` only ever writes the
+    /// two header fields above, so the wiring survives every
+    /// acquire/release. `limits.head_buffer_bytes` long: the size is the
+    /// config's, which is why this is a slice and not an array.
+    data: []u8,
 };
 
 pub const EndpointKeys = struct {

@@ -139,16 +139,17 @@ pub fn Proxy(comptime IoType: type) type {
         /// upstream head content states its precondition.
         fn upstreamHeadBytes(upstream: *UpstreamType) []u8 {
             assert(upstream.head_buffer != null);
-            return upstream.head_buffer.?.bytes[0..];
+            return upstream.head_buffer.?.data;
         }
 
         /// Where a head continuation read lands: the free space after what
         /// has already accumulated in the bound buffer.
         fn headRecvBuffer(server: *ServerType, conn: *ConnType) []u8 {
+            const bytes = headBytes(server, conn);
             // Parsing turns a full buffer into an oversize verdict before
             // we ever get here, so there is always room to read into.
-            assert(conn.head_len < constants.head_bytes_max);
-            return headBytes(server, conn)[conn.head_len..];
+            assert(conn.head_len < bytes.len);
+            return bytes[conn.head_len..];
         }
 
         /// Account for bytes that became head bytes. Named because a
@@ -159,10 +160,12 @@ pub fn Proxy(comptime IoType: type) type {
         /// more head bytes than there is room for — a decrypted record is up
         /// to 16 KiB against an 8 KiB head — fills what fits, records the
         /// surplus, and lets `parseAndDispatch` answer it. Handing an overrun
-        /// to this function is a bug, and asserts as one.
-        fn fillHead(conn: *ConnType, appended: u32) void {
+        /// to this function is a bug, and asserts as one. `capacity` is the
+        /// bound buffer's own length, passed because the size is the
+        /// config's now, not this file's to name.
+        fn fillHead(conn: *ConnType, appended: u32, capacity: usize) void {
             assert(appended >= 1);
-            assert(conn.head_len + appended <= constants.head_bytes_max);
+            assert(conn.head_len + appended <= capacity);
             conn.head_len += appended;
         }
 
@@ -256,7 +259,7 @@ pub fn Proxy(comptime IoType: type) type {
             // deadline must report the time it spent doing it (§8).
             server.beginLogRequest(conn);
             conn.log.bytes_in += bound.len;
-            fillHead(conn, bound.len);
+            fillHead(conn, bound.len, headBytes(server, conn).len);
             parseAndDispatch(server, conn);
         }
 
@@ -285,7 +288,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.head_buffer_id != ConnType.head_buffer_none);
             assert(conn.head_len >= 1);
             conn.log.bytes_in += received;
-            fillHead(conn, received);
+            fillHead(conn, received, headBytes(server, conn).len);
             parseAndDispatch(server, conn);
         }
 
@@ -294,8 +297,9 @@ pub fn Proxy(comptime IoType: type) type {
         /// static reject; a valid head → routing.
         fn parseAndDispatch(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
-            const head = headBytes(server, conn)[0..conn.head_len];
-            const head_is_full = conn.head_len == constants.head_bytes_max;
+            const bytes = headBytes(server, conn);
+            const head = bytes[0..conn.head_len];
+            const head_is_full = conn.head_len == bytes.len;
 
             var storage: parser.HeaderStorage = undefined;
             const request = parser.parseRequestHead(head, head_is_full, &storage) catch |err| switch (err) {
@@ -338,7 +342,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn requestKeys(
             request: *const parser.RequestHead,
-            scratch: *[constants.head_bytes_max]u8,
+            scratch: []u8,
             host_scratch: *[constants.host_bytes_max]u8,
         ) error{BadPath}!RequestKeys {
             assert(request.target.len >= 1);
@@ -373,7 +377,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn targetViews(
             request: *const parser.RequestHead,
-            scratch: *[constants.head_bytes_max]u8,
+            scratch: []u8,
         ) error{BadPath}!TargetViews {
             assert(request.target.len >= 1);
             if (request.target[0] != '/') {
@@ -426,7 +430,7 @@ pub fn Proxy(comptime IoType: type) type {
             request: *const parser.RequestHead,
             views: *const TargetViews,
             host_scratch: *[constants.host_bytes_max]u8,
-            rewrite_scratch: *[constants.head_bytes_max]u8,
+            rewrite_scratch: []u8,
             edit_buffer: *[constants.header_edits_max]filter.AppliedHeaderEdit,
         ) error{Oversize}!Forwarded {
             const base = views.forward;
@@ -559,10 +563,15 @@ pub fn Proxy(comptime IoType: type) type {
             // §7: canonicalize the host and path once, then apply filters
             // and routing to that one view before acquiring any resource,
             // so a bad path, a policy reject, or an unrouted host/path is
-            // answered cheaply.
-            var scratch: [constants.head_bytes_max]u8 = undefined;
+            // answered cheaply. The target scratch is the server's (§5):
+            // its length is the config's `head_buffer_bytes` now, and a
+            // runtime-length stack array is exactly the dynamic allocation
+            // §5 forbids. Sound because uses never overlap — the loop is
+            // single-threaded, and the window (through routing into the
+            // checkout path's render) neither suspends nor re-enters.
+            const scratch = server.target_scratch;
             var host_scratch: [constants.host_bytes_max]u8 = undefined;
-            const keys = requestKeys(request, &scratch, &host_scratch) catch {
+            const keys = requestKeys(request, scratch, &host_scratch) catch {
                 captureTarget(conn, null, request.target);
                 return respond(server, conn, 400, "l7_bad_request");
             };
@@ -771,12 +780,12 @@ pub fn Proxy(comptime IoType: type) type {
             ) catch unreachable;
             assert(request.head_len == conn.l7.request_head_len);
             // Only this path pays for canonicalization twice, and it has
-            // to: routeRequest's scratch died with its frame at the dial.
-            // The scratch lives here so the views outlive the call.
-            var scratch: [constants.head_bytes_max]u8 = undefined;
+            // to: routeRequest's use of the shared scratch ended with its
+            // frame at the dial — which is also why reusing the same
+            // server-owned scratch here cannot overlap it.
             // Same bytes routeRequest already canonicalized, so this cannot
             // fail — the §7 single-source-of-truth rule again.
-            const views = targetViews(&request, &scratch) catch unreachable;
+            const views = targetViews(&request, server.target_scratch) catch unreachable;
             renderRequestAndStartLegs(server, conn, &request, &views);
         }
 
@@ -811,14 +820,16 @@ pub fn Proxy(comptime IoType: type) type {
             // the forwarded path and any header edits, against the same
             // canonical view the reject/route phase used.
             var host_scratch: [constants.host_bytes_max]u8 = undefined;
-            var rewrite_scratch: [constants.head_bytes_max]u8 = undefined;
             var edit_buffer: [constants.header_edits_max]filter.AppliedHeaderEdit = undefined;
+            // The rewrite scratch is the server's, distinct from the
+            // target scratch: on the checkout path the routed views still
+            // alias that one while the rewrite runs.
             const plan = planForward(
                 conn,
                 request,
                 views,
                 &host_scratch,
-                &rewrite_scratch,
+                server.rewrite_scratch,
                 &edit_buffer,
             ) catch {
                 // A rewritten path too long to forward: the §7 oversize
@@ -831,7 +842,7 @@ pub fn Proxy(comptime IoType: type) type {
             // connection is a parking candidate (§5), and stripping the
             // client's Connection header already made persistence the wire
             // default.
-            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, forwarded, &upstream.head_buffer.?.bytes) catch {
+            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, forwarded, upstreamHeadBytes(upstream)) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");
@@ -1189,7 +1200,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.response_leg == .awaiting_head);
             const upstream = conn.upstream.?;
-            assert(upstream.head_len < constants.head_bytes_max);
+            assert(upstream.head_len < upstreamHeadBytes(upstream).len);
             conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.recv(
                 conn.upstream_socket.?,
@@ -1222,7 +1233,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(received >= 1);
             const upstream = conn.upstream.?;
             upstream.head_len += received;
-            assert(upstream.head_len <= constants.head_bytes_max);
+            assert(upstream.head_len <= upstreamHeadBytes(upstream).len);
             parseResponseAndDispatch(server, conn);
         }
 
@@ -1234,7 +1245,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             const upstream = conn.upstream.?;
             const head = upstreamHeadBytes(upstream)[0..upstream.head_len];
-            const head_is_full = upstream.head_len == constants.head_bytes_max;
+            const head_is_full = upstream.head_len == upstreamHeadBytes(upstream).len;
 
             var storage: parser.HeaderStorage = undefined;
             const response = parser.parseResponseHead(
@@ -1334,7 +1345,7 @@ pub fn Proxy(comptime IoType: type) type {
             const rendered = render.renderResponseHead(
                 response,
                 !keep_downstream,
-                headBytes(server, conn)[0..constants.head_bytes_max],
+                headBytes(server, conn),
             ) catch {
                 upstreamFailed(server, conn);
                 return;
@@ -1356,7 +1367,7 @@ pub fn Proxy(comptime IoType: type) type {
             // round trip per response. The fallback writes the head, then
             // the excess from upstream.head as the channel's next write.
             var head_write_len: u32 = @intCast(rendered.len);
-            if (rendered.len + feed.consumed <= constants.head_bytes_max) {
+            if (rendered.len + feed.consumed <= headBytes(server, conn).len) {
                 @memcpy(
                     headBytes(server, conn)[rendered.len..][0..feed.consumed],
                     excess[0..feed.consumed],
@@ -2186,7 +2197,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// message ended mid-chunk; the rest is pipelined data, dropped
         /// while every exchange closes its connection.
         fn feedFraming(framing: *Framing, bytes: []const u8) FeedResult {
-            assert(bytes.len <= constants.head_bytes_max);
+            assert(bytes.len <= constants.head_buffer_bytes_max);
             switch (framing.*) {
                 .none => return .{ .consumed = 0, .done = true, .malformed = false },
                 .content_length => |*remaining| {

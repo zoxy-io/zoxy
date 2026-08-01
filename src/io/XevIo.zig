@@ -687,6 +687,11 @@ pub fn bufferGroupCount(io: *const XevIo) u32 {
     return io.group_count;
 }
 
+/// One buffer's size, on the same asserted-not-trusted terms.
+pub fn bufferGroupBytes(io: *const XevIo) u32 {
+    return io.group_bytes;
+}
+
 /// Give a selected buffer back to the group: on io_uring two stores and an
 /// atomic tail bump — no syscall — republishing the id to the kernel; on
 /// the emulation, a push onto the free stack.

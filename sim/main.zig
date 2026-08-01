@@ -151,7 +151,7 @@ const uncovered = [_]Uncovered{
     .{
         .name = "l7_response_excess_sent",
         .why = .unreached,
-        .reason = "no seed raises the adversary's recv cap to head_bytes_max, " ++
+        .reason = "no seed raises the adversary's recv cap to head_buffer_bytes_default, " ++
             "so no origin delivery fills the head buffer; " ++
             "src/http_proxy_test.zig builds that delivery",
     },

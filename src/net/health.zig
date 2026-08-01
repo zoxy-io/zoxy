@@ -83,10 +83,12 @@ pub fn Checker(comptime IoType: type) type {
         request: [constants.health_check_request_bytes_max]u8,
         request_len: u32,
         request_sent: u32,
-        /// The response head as it accumulates. Sized to what the data
-        /// path's own parser accepts, so a head this proxy would forward
-        /// is never one the probe rejects for being too big.
-        response: [constants.head_bytes_max]u8,
+        /// The response head as it accumulates. Sized at init to what the
+        /// data path's own parser accepts (`limits.head_buffer_bytes`),
+        /// so a head this proxy would forward is never one the probe
+        /// rejects for being too big — a relation that followed the size
+        /// into the config.
+        response: []u8,
         response_len: u32,
         armed: Armed,
         /// Ops a cancel was already spent on (never `.cancel` itself):
@@ -148,9 +150,14 @@ pub fn Checker(comptime IoType: type) type {
             arena: std.mem.Allocator,
             server: *ServerType,
             keys: upstream.EndpointKeys,
+            /// The probe's response buffer size — `limits.head_buffer_bytes`,
+            /// so the probe accepts exactly the heads the data path does.
+            response_bytes: u32,
         ) error{OutOfMemory}!void {
             assert(keys.count >= 1);
+            assert(response_bytes >= constants.head_buffer_bytes_min);
             checker.server = server;
+            checker.response = try arena.alloc(u8, response_bytes);
             checker.healthy = try arena.alloc(bool, keys.count);
             checker.fail_streaks = try arena.alloc(u8, keys.count);
             checker.ok_streaks = try arena.alloc(u8, keys.count);

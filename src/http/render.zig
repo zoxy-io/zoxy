@@ -395,8 +395,8 @@ const testing = std.testing;
 /// Fuzz/test staging: normalization can grow a head (a missing space
 /// after `:` is rendered back, one byte per header), so the oracle
 /// buffer carries slack; the production staging area is exactly
-/// `head_bytes_max` and overflowing it is the 431/teardown verdict.
-const oracle_buffer_bytes = constants.head_bytes_max + @as(u32, constants.headers_max) + 64;
+/// `head_buffer_bytes_default` and overflowing it is the 431/teardown verdict.
+const oracle_buffer_bytes = constants.head_buffer_bytes_default + @as(u32, constants.headers_max) + 64;
 
 test "render: request strips hop-by-hop and nominated, keeps the rest" {
     const head = "GET /p HTTP/1.1\r\nHost: a\r\nConnection: close, X-Nominated\r\n" ++
@@ -466,27 +466,27 @@ test "render: an edit that overflows the buffer is Oversize" {
     );
 }
 
-test "render: the edited oracle skips a head that grows past head_bytes_max" {
+test "render: the edited oracle skips a head that grows past head_buffer_bytes_default" {
     // Regression: `parseRequestHead`'s first statement asserts
-    // `head.len <= head_bytes_max`, so an edited head rendered past that
+    // `head.len <= head_buffer_bytes_default`, so an edited head rendered past that
     // ceiling (into the slack oracle buffer) would trip that assert before
     // any error could surface — a panic reachable under `--fuzz`. The oracle
     // guards on `rendered.len`; this input, a source exactly at the ceiling
     // with a no-space colon (render re-adds ": ", +1 byte) plus the fixed
     // edits, is guaranteed over it. Without the guard the call panics.
-    var source: [constants.head_bytes_max]u8 = undefined;
+    var source: [constants.head_buffer_bytes_default]u8 = undefined;
     const prefix = "GET / HTTP/1.1\r\nHost: a\r\nX:";
     @memcpy(source[0..prefix.len], prefix);
     // Pad the value so the whole head, including the terminating CRLF, is
-    // exactly head_bytes_max bytes.
-    const value_end = constants.head_bytes_max - "\r\n\r\n".len;
+    // exactly head_buffer_bytes_default bytes.
+    const value_end = constants.head_buffer_bytes_default - "\r\n\r\n".len;
     @memset(source[prefix.len..value_end], 'x');
     @memcpy(source[value_end..], "\r\n\r\n");
 
-    // The source is legal (head.len == head_bytes_max is within the limit).
+    // The source is legal (head.len == head_buffer_bytes_default is within the limit).
     var storage: parser.HeaderStorage = undefined;
     const parsed = try parser.parseRequestHead(&source, false, &storage);
-    try testing.expectEqual(@as(u32, constants.head_bytes_max), parsed.head_len);
+    try testing.expectEqual(@as(u32, constants.head_buffer_bytes_default), parsed.head_len);
     // Confirm the edited render genuinely crosses the ceiling — otherwise
     // this test would exercise nothing. (The edit set mirrors the oracle's.)
     const edits = [_]filter.AppliedHeaderEdit{
@@ -496,7 +496,7 @@ test "render: the edited oracle skips a head that grows past head_bytes_max" {
     };
     var render_buf: [oracle_buffer_bytes]u8 = undefined;
     const rendered = try renderRequestHead(&parsed, .{ .path = "/", .query = "" }, &edits, false, null, &render_buf);
-    try testing.expect(rendered.len > constants.head_bytes_max);
+    try testing.expect(rendered.len > constants.head_buffer_bytes_default);
     // Must return cleanly instead of panicking in the reparse precondition.
     checkRequestRenderEdited(&source);
 }
@@ -629,7 +629,7 @@ fn checkRequestRender(input: []const u8) void {
     // Mirror the routeRequest gate (§7): an origin-form target that will
     // not canonicalize is a 400 and never reaches the renderer; OPTIONS
     // asterisk-form has no path and forwards verbatim.
-    var scratch: [constants.head_bytes_max]u8 = undefined;
+    var scratch: [constants.head_buffer_bytes_default]u8 = undefined;
     const target: parser.CanonicalTarget = if (request.target[0] == '/')
         (parser.canonicalTarget(request.target, &scratch) catch return)
     else
@@ -638,12 +638,12 @@ fn checkRequestRender(input: []const u8) void {
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = renderRequestHead(&request, target, &.{}, false, null, &buffer) catch unreachable;
 
-    // The oracle buffer carries slack past `head_bytes_max` so normalization
+    // The oracle buffer carries slack past `head_buffer_bytes_default` so normalization
     // growth never truncates the comparison; production renders into an
-    // exactly-`head_bytes_max` buffer and 431s anything larger. A head that
+    // exactly-`head_buffer_bytes_default` buffer and 431s anything larger. A head that
     // grew past that ceiling here is that oversize verdict — not a reparse
     // input, and past the parser's own size precondition — so stop before it.
-    if (rendered.len > constants.head_bytes_max) {
+    if (rendered.len > constants.head_buffer_bytes_default) {
         return;
     }
     var reparse_storage: parser.HeaderStorage = undefined;
@@ -679,7 +679,7 @@ fn checkRequestRenderEdited(input: []const u8) void {
     if (request.method == .connect) {
         return;
     }
-    var scratch: [constants.head_bytes_max]u8 = undefined;
+    var scratch: [constants.head_buffer_bytes_default]u8 = undefined;
     const target: parser.CanonicalTarget = if (request.target[0] == '/')
         (parser.canonicalTarget(request.target, &scratch) catch return)
     else
@@ -695,13 +695,13 @@ fn checkRequestRenderEdited(input: []const u8) void {
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = renderRequestHead(&request, target, &edits, false, null, &buffer) catch return;
 
-    // The appended edits can push an already-large head past `head_bytes_max`
+    // The appended edits can push an already-large head past `head_buffer_bytes_default`
     // — the oversize-after-edits verdict (431 in production, which renders
-    // into an exactly-`head_bytes_max` buffer). Past that ceiling the head is
+    // into an exactly-`head_buffer_bytes_default` buffer). Past that ceiling the head is
     // not a reparse input and would trip the parser's size precondition, so
     // stop; a reparse miss below is then only the benign headers-count
     // overflow (source at `headers_max` plus the appended lines).
-    if (rendered.len > constants.head_bytes_max) {
+    if (rendered.len > constants.head_buffer_bytes_default) {
         return;
     }
     var reparse_storage: parser.HeaderStorage = undefined;
@@ -745,7 +745,7 @@ test "fuzz: parse-render-reparse keeps routing and framing intact" {
 
 fn fuzzRenderInputs(context: void, smith: *std.testing.Smith) !void {
     _ = context;
-    var input_buffer: [constants.head_bytes_max]u8 = undefined;
+    var input_buffer: [constants.head_buffer_bytes_default]u8 = undefined;
     const input_len = smith.slice(&input_buffer);
     assert(input_len <= input_buffer.len);
     const input = input_buffer[0..input_len];
@@ -771,7 +771,7 @@ fn checkRequestRenderForwarded(input: []const u8) void {
     if (request.method == .connect) {
         return;
     }
-    var scratch: [constants.head_bytes_max]u8 = undefined;
+    var scratch: [constants.head_buffer_bytes_default]u8 = undefined;
     const target: parser.CanonicalTarget = if (request.target[0] == '/')
         (parser.canonicalTarget(request.target, &scratch) catch return)
     else
@@ -790,7 +790,7 @@ fn checkRequestRenderForwarded(input: []const u8) void {
         forwarded_for,
         &buffer,
     ) catch return;
-    if (rendered.len > constants.head_bytes_max) {
+    if (rendered.len > constants.head_buffer_bytes_default) {
         return;
     }
     var reparse_storage: parser.HeaderStorage = undefined;

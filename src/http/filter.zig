@@ -543,7 +543,7 @@ test "filter: rewritePath is a segment-correct prefix replacement" {
         try std.testing.expectEqualStrings(case.want, got);
         // The result must be what canonicalization would produce — the join
         // yields canonical output directly, no second pass.
-        var canon: [constants.head_bytes_max]u8 = undefined;
+        var canon: [constants.head_buffer_bytes_default]u8 = undefined;
         const recanon = try parser.canonicalTarget(got, &canon);
         try std.testing.expectEqualStrings(got, recanon.path);
     }

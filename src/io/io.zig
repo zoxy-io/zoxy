@@ -25,6 +25,8 @@
 //!   bufferGroupReturn(io, buffer_id) void              (sync; no syscall)
 //!   bufferGroupCount(io) u32                           (sync; the group's
 //!       capacity — what the caller's own accounting must agree with)
+//!   bufferGroupBytes(io) u32                           (sync; one buffer's
+//!       size — what the caller's own limits must agree with)
 //!   send(io, socket, bytes, c, U, u, cb(u, SendError!u32))
 //!   close(io, socket, c, U, u, cb(u))
 //!   logWrite(io, bytes, c, U, u, cb(u, LogWriteError!u32))   (§8 access log)
@@ -204,6 +206,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "bufferGroupSlice",
             "bufferGroupReturn",
             "bufferGroupCount",
+            "bufferGroupBytes",
             "send",
             "close",
             "logWrite",
