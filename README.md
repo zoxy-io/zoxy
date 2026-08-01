@@ -5,8 +5,6 @@
 [![Project stage: Experimental][project-stage-badge: Experimental]][project-stage-page]
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> A zero-allocation L4/L7 edge proxy in Zig.
-
 zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — completion-based
 with caller-owned completions — and follows [TigerStyle](docs/TIGER_STYLE.md):
 **all memory is reserved at startup, and the request-serving path allocates nothing.**
