@@ -24,11 +24,12 @@ const SimIo = @This();
 const sockets_max: u16 = 1024;
 const listeners_max: u16 = 32;
 const accept_queue_max: u16 = 64;
-/// The widest a scenario may open a socket ring. Sized to the head buffer
-/// so a scenario can reproduce a production-shaped delivery — one read
-/// filling `conn.head`/`upstream.head` outright — which a narrower ring
-/// makes unrepresentable whatever the seed.
-const inbox_bytes_max: u32 = constants.head_bytes_max;
+/// The widest a scenario may open a socket ring. The simulator's own
+/// 8 KiB rather than the production head size — which is the config's
+/// now (`limits.head_buffer_bytes`) — matching the *default* head
+/// buffer, so a scenario can still reproduce a production-shaped
+/// delivery: one read filling a default-sized head buffer outright.
+const inbox_bytes_max: u32 = 8 * 1024;
 /// What a scenario gets unless it asks for more. Half the head buffer, so
 /// a head larger than it still arrives in pieces by default and the §7
 /// detect-and-retry re-parse keeps being exercised.
@@ -38,7 +39,9 @@ comptime {
     assert(inbox_bytes_default <= inbox_bytes_max);
     // The default must stay narrower than a head buffer, or every scenario
     // silently loses the piecewise head arrival it covers today.
-    assert(inbox_bytes_default < constants.head_bytes_max);
+    assert(inbox_bytes_default < inbox_bytes_max);
+    // The whole-head delivery stays representable at the default size.
+    assert(inbox_bytes_max >= constants.head_buffer_bytes_default);
 }
 /// The simulator's own in-flight-op bound (§9), derived from *its*
 /// listener limit rather than production's — which no longer has one, so
@@ -201,7 +204,7 @@ pub const Options = struct {
     /// assignments. Defaults wide enough that no scenario sheds unless it
     /// asks to: one buffer per possible socket, production-sized.
     buffer_group_count: u32 = sockets_max,
-    buffer_group_bytes: u32 = constants.head_bytes_max,
+    buffer_group_bytes: u32 = constants.head_buffer_bytes_default,
 };
 
 pub const Socket = packed struct(u32) {
@@ -650,6 +653,11 @@ pub fn bufferGroupSlice(io: *SimIo, buffer_id: u16) []u8 {
 /// agree with, asserted at the composition site rather than trusted.
 pub fn bufferGroupCount(io: *const SimIo) u32 {
     return io.group_count;
+}
+
+/// One buffer's size, on the same asserted-not-trusted terms.
+pub fn bufferGroupBytes(io: *const SimIo) u32 {
+    return io.group_bytes;
 }
 
 /// Give a selected buffer back to the group. Sync and syscall-free in

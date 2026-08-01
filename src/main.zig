@@ -112,14 +112,14 @@ pub fn main(init: std.process.Init) !void {
     try ensureFdBudget(fds_required);
     try printBudgets(init.io, &config, fds_required, cq_entries, config_arena_bytes);
 
-    // The ring is the config's to size (§5); Server.init asserts its own
-    // accounting against the same number.
+    // The ring is the config's to size (§5), count and unit both;
+    // Server.init asserts its own accounting against the same numbers.
     try global_io.init(
         arena,
         cq_entries,
         listeners_count,
         config.limits.head_buffers,
-        zoxy.constants.head_bytes_max,
+        config.limits.head_buffer_bytes,
     );
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
@@ -282,6 +282,37 @@ fn ensureFdBudget(fds_required: u32) !void {
     try std.posix.setrlimit(.NOFILE, limits);
 }
 
+/// The §5 pool-size vector for the effective config — split from
+/// `printBudgets` for the length limit, and so the composition reads as
+/// one thing: every term the closed form takes, sourced from the limit
+/// or `@sizeOf` that owns it.
+fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
+    const limits = config.limits;
+    const UpstreamType = zoxy.UpstreamPool(XevIo).Upstream;
+    // The head-sized side buffers (§5): Server owns the closed form and
+    // asserts its own allocations against it, so printing it here cannot
+    // drift from what init actually reserves.
+    const head_scratch_bytes = ServerXev.headScratchBytes(limits);
+    assert(head_scratch_bytes >= limits.head_buffer_bytes);
+    return .{
+        .conn_slots = limits.conn_slots,
+        .conn_bytes = @sizeOf(ServerXev.ConnType),
+        .relay_buffers = limits.relay_buffers,
+        .relay_buffer_pair_bytes = @sizeOf(zoxy.RelayBuffer),
+        .upstream_slots = limits.upstream_slots,
+        .upstream_bytes = @sizeOf(UpstreamType),
+        .access_log_bytes = zoxy.constants.accessLogBytes(limits.access_log_buffer_bytes),
+        .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
+        .head_buffers = limits.head_buffers,
+        .head_buffer_bytes = limits.head_buffer_bytes,
+        .upstream_head_buffers = limits.upstream_head_buffers,
+        // The pool element (the free-list header and the slab slice) plus
+        // its share of the slab itself.
+        .upstream_head_buffer_bytes = @sizeOf(zoxy.UpstreamHeadBuffer) + limits.head_buffer_bytes,
+        .head_scratch_bytes = head_scratch_bytes,
+    };
+}
+
 fn printBudgets(
     io: std.Io,
     config: *const zoxy.config.Config,
@@ -294,7 +325,6 @@ fn printBudgets(
     config_arena_bytes: u64,
 ) !void {
     const constants = zoxy.constants;
-    const UpstreamType = zoxy.UpstreamPool(XevIo).Upstream;
     // Every budget reflects the *effective* config (§5, §8): the config may
     // shrink the pools, the fd demand, and the requested ring below the
     // compiled ceilings, and all three are shown as actually sized.
@@ -306,24 +336,12 @@ fn printBudgets(
     );
     const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
     const endpoint_stride = ServerXev.endpointKeysFor(config).stride;
+    const sizes = poolSizesFor(config);
     // §5's promise is that the printed total covers everything this
     // process holds for its life. The config arena qualifies — it is
     // never freed — so it joins the total even though it is the one term
     // measured rather than derived from constants.
-    const memory_total = constants.memoryBytesTotal(&.{
-        .conn_slots = limits.conn_slots,
-        .conn_bytes = @sizeOf(ServerXev.ConnType),
-        .relay_buffers = limits.relay_buffers,
-        .relay_buffer_pair_bytes = @sizeOf(zoxy.RelayBuffer),
-        .upstream_slots = limits.upstream_slots,
-        .upstream_bytes = @sizeOf(UpstreamType),
-        .access_log_bytes = access_log_bytes,
-        .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
-        .head_buffers = limits.head_buffers,
-        .head_buffer_bytes = constants.head_bytes_max,
-        .upstream_head_buffers = limits.upstream_head_buffers,
-        .upstream_head_buffer_bytes = @sizeOf(zoxy.UpstreamHeadBuffer),
-    }) + config_arena_bytes;
+    const memory_total = constants.memoryBytesTotal(&sizes) + config_arena_bytes;
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;
@@ -334,7 +352,8 @@ fn printBudgets(
         \\budgets (DESIGN.md §5/§8; closed-form except where marked):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B + head buffers {d} x {d} B (+ ring {d} B)
-        \\          + upstream head buffers {d} x {d} B + access log {d} KiB
+        \\          + upstream head buffers {d} x {d} B + head scratch {d} B
+        \\          + access log {d} KiB
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + config arena {d} KiB (measured, not closed-form)
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
@@ -350,14 +369,15 @@ fn printBudgets(
         limits.relay_buffers,
         @sizeOf(zoxy.RelayBuffer),
         limits.upstream_slots,
-        @sizeOf(UpstreamType),
+        sizes.upstream_bytes,
         limits.head_buffers,
         // The +1 ownership byte stays out of the banner's per-unit figure;
         // the closed-form total above carries it.
-        constants.head_bytes_max,
+        limits.head_buffer_bytes,
         constants.bufferGroupDescriptorBytes(limits.head_buffers),
         limits.upstream_head_buffers,
-        @sizeOf(zoxy.UpstreamHeadBuffer),
+        sizes.upstream_head_buffer_bytes,
+        sizes.head_scratch_bytes,
         access_log_bytes / 1024,
         ServerXev.endpointTableBytes(config),
         config.clusters.len,

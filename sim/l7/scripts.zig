@@ -180,8 +180,8 @@ comptime {
     assert(2 * forwarded_oversize_line.len + 2 > constants.forwarded_chain_bytes_max);
     // Both heads must reach the origin as heads, not as 414/431 verdicts:
     // the proxy's own cap is the ceiling either way.
-    assert(forwarded_inbound_head.len < constants.head_bytes_max);
-    assert(forwarded_oversize_head.len < constants.head_bytes_max);
+    assert(forwarded_inbound_head.len < constants.head_buffer_bytes_default);
+    assert(forwarded_oversize_head.len < constants.head_buffer_bytes_default);
 }
 
 /// Valid requests meet the canonical 200, the §8 rungs (503), an

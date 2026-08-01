@@ -344,7 +344,10 @@ reserves nor demands the ceiling's resources.
 "limits": {
     "conn_slots": 4096,
     "relay_buffers": 4096,
-    "upstream_slots": 4096
+    "upstream_slots": 4096,
+    "head_buffers": 1024,
+    "upstream_head_buffers": 512,
+    "head_buffer_bytes": 16384
 }
 ```
 
@@ -353,6 +356,15 @@ pairs, 1313 upstream slots, roughly 34 MiB of pools — sized to start under a
 stock 4096 `RLIMIT_NOFILE`. The ceiling is 11466 of each. Raising the pools
 raises the file-descriptor demand, which zoxy asserts against `RLIMIT_NOFILE`
 at startup rather than discovering as `EMFILE` later.
+
+`head_buffers` and `upstream_head_buffers` bound *request heads in flight*
+rather than open connections: idle keep-alive connections and parked origin
+connections hold no head buffer, so these default to their never-shedding
+ceilings (`conn_slots` and `upstream_slots`) and are the knobs a keep-alive-
+heavy deployment trades down for memory. `head_buffer_bytes` sizes every head
+buffer and is therefore the largest HTTP head accepted (oversize requests are
+answered `414`/`431`) — raise it for big-cookie/JWT traffic, 1 KiB to 1 MiB,
+default 8 KiB.
 
 `cq_fill_eighths` trades connection ceiling for `io_uring` completion-queue
 burst headroom; `access_log_buffer_bytes` sizes the access log's staging

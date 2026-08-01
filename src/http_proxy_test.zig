@@ -59,7 +59,7 @@ const HttpClient = struct {
     /// Twice the proxy's head buffer: a response that fills that buffer and
     /// then grows in the render exceeds it, and the separate-excess scenario
     /// needs the whole response in one place to compare against.
-    receive_buffer: [2 * constants.head_bytes_max]u8 = undefined,
+    receive_buffer: [2 * constants.head_buffer_bytes_default]u8 = undefined,
     received_len: u32 = 0,
     outcome: Outcome = .pending,
 
@@ -493,6 +493,8 @@ const Http1Bed = struct {
         /// The §5 upstream head pool; null follows upstream_slots (never
         /// sheds), a number drives `l7_shed_upstream_head_buffers`.
         upstream_head_buffers: ?u32 = null,
+        /// Bytes per head buffer — the configured largest-accepted head.
+        head_buffer_bytes: u32 = constants.head_buffer_bytes_default,
         /// The §6 absolute age cap; 0 (the default) disables it. A cap the
         /// exchange outlives clamps every stored deadline to it, so a
         /// re-based target can already be in the past.
@@ -550,6 +552,7 @@ const Http1Bed = struct {
             .seed = options.seed,
             .adversary = adversary,
             .buffer_group_count = head_buffers,
+            .buffer_group_bytes = options.head_buffer_bytes,
         });
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
@@ -578,6 +581,7 @@ const Http1Bed = struct {
             .upstream_slots = options.upstream_slots,
             .head_buffers = head_buffers,
             .upstream_head_buffers = options.upstream_head_buffers orelse options.upstream_slots,
+            .head_buffer_bytes = options.head_buffer_bytes,
             .access_log_buffer_bytes = if (options.access_log)
                 constants.access_log_buffer_bytes_default
             else
@@ -774,14 +778,14 @@ test "l7: a head that fits on arrival but not after forwarding is 431" {
     // accepted, rejected only when the proxy renders what it will forward
     // (#87).
     {
-        // An added header pushes an exactly-`head_bytes_max` head over.
+        // An added header pushes an exactly-`head_buffer_bytes_default` head over.
         const rules = [_]filter.Rule{.{
             .match = .{ .path_prefix = "/api" },
             .actions = &.{.{ .header_add = .{ .name = "X-Trace", .value = "on" } }},
         }};
         const prefix = "GET /api HTTP/1.1\r\nHost: o\r\nX-Pad: ";
         const suffix = "\r\n\r\n";
-        var request: [constants.head_bytes_max]u8 = undefined;
+        var request: [constants.head_buffer_bytes_default]u8 = undefined;
         @memcpy(request[0..prefix.len], prefix);
         @memset(request[prefix.len..][0 .. request.len - prefix.len - suffix.len], 'p');
         @memcpy(request[request.len - suffix.len ..][0..suffix.len], suffix);
@@ -1262,6 +1266,38 @@ test "l7: an upstream head-pool shed keeps the connection like any post-parse ru
     try bed.expectDrained();
 }
 
+test "l7: the configured head size is the accepted head size" {
+    // The §5 size knob is behaviour, not just memory: at 1024 bytes a
+    // request line that would sail through the 8 KiB default dies as the
+    // 414 the smaller buffer makes of it, and an ordinary GET still fits.
+    // The oversize half proves the wall moved down with the config; the
+    // ordinary half proves it did not move below what it promises.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 64,
+        .origin_response = response,
+        .head_buffer_bytes = constants.head_buffer_bytes_min,
+    });
+    defer bed.tearDown();
+
+    // 1100 path bytes: past the 1024 buffer with no newline in sight —
+    // the request line alone overflows, which is the 414 shape.
+    const oversize = "GET /" ++ ("a" ** 1100) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.send_delay_ms = 50;
+    bed.client2.request = oversize;
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /ok HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_uri_too_long"));
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client2.response(),
+    );
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 OK"));
+    try bed.expectDrained();
+}
+
 test "l7: kernel pressure on a socket option is witnessed per op, on both sockets" {
     // A fresh L7 exchange sets TCP_NODELAY twice: once on the accepted
     // client socket (`Server` admission) and once on the dialled upstream
@@ -1723,18 +1759,18 @@ test "l7: a coalesced excess too large to ride the rendered head is written sepa
     // injection then grows the render past it and the excess cannot ride
     // along — it leaves as a second write straight from upstream.head (§7).
     // Sizes derive from the bound rather than being spelled out, so a change
-    // to `head_bytes_max` fails here loudly instead of quietly sliding the
+    // to `head_buffer_bytes_default` fails here loudly instead of quietly sliding the
     // scenario off the branch it exists to cover (#77).
     const injected_len = "Connection: close\r\n".len;
     const body_len = 42;
-    const head_len: usize = constants.head_bytes_max - body_len;
+    const head_len: usize = constants.head_buffer_bytes_default - body_len;
     const prefix = std.fmt.comptimePrint(
         "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nX-Pad: ",
         .{body_len},
     );
     const suffix = "\r\n\r\n";
 
-    var response_bytes: [constants.head_bytes_max]u8 = undefined;
+    var response_bytes: [constants.head_buffer_bytes_default]u8 = undefined;
     @memcpy(response_bytes[0..prefix.len], prefix);
     @memset(response_bytes[prefix.len..][0 .. head_len - prefix.len - suffix.len], 'p');
     @memcpy(response_bytes[head_len - suffix.len ..][0..suffix.len], suffix);
@@ -1799,7 +1835,7 @@ test "l7: the coalesced excess in the shape production delivers it" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 12,
-        .inbox_bytes = constants.head_bytes_max,
+        .inbox_bytes = constants.head_buffer_bytes_default,
         .origin_response = &response_bytes,
     });
     defer bed.tearDown();
@@ -1919,13 +1955,13 @@ test "l7: an origin response head the proxy cannot parse is 502" {
         try bed.expectDrained();
     }
     {
-        // A head that never terminates. It accumulates to `head_bytes_max`
+        // A head that never terminates. It accumulates to `head_buffer_bytes_default`
         // over several reads, and the parser turns the last Incomplete into
         // the oversize verdict rather than asking for a read that has
         // nowhere to land.
         const unterminated = "HTTP/1.1 200 OK\r\nX-Pad: ";
         const response = unterminated ++
-            ("p" ** (constants.head_bytes_max - unterminated.len));
+            ("p" ** (constants.head_buffer_bytes_default - unterminated.len));
 
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{ .seed = 8, .origin_response = response });
@@ -1951,7 +1987,7 @@ test "l7: an origin head that no longer fits once the close is injected is 502" 
     // like any other upstream failure — 502, not a truncated response (#87).
     const prefix = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Pad: ";
     const suffix = "\r\n\r\n";
-    var response_bytes: [constants.head_bytes_max]u8 = undefined;
+    var response_bytes: [constants.head_buffer_bytes_default]u8 = undefined;
     @memcpy(response_bytes[0..prefix.len], prefix);
     @memset(
         response_bytes[prefix.len..][0 .. response_bytes.len - prefix.len - suffix.len],
@@ -3253,14 +3289,14 @@ test "l7: an oversize inbound chain fails safe to the observed peer, and is coun
         .seed = 43,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
         .forwarded = .append,
-        .inbox_bytes = constants.head_bytes_max,
+        .inbox_bytes = constants.head_buffer_bytes_default,
     });
     defer bed.tearDown();
 
     // One address repeated past `forwarded_chain_bytes_max`.
     const hop = "10.0.0.1, ";
     const hops = @divFloor(constants.forwarded_chain_bytes_max, hop.len) + 2;
-    var request: [constants.head_bytes_max]u8 = undefined;
+    var request: [constants.head_buffer_bytes_default]u8 = undefined;
     var writer = std.Io.Writer.fixed(&request);
     try writer.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: ");
     for (0..hops) |_| try writer.writeAll(hop);

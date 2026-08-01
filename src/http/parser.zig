@@ -9,7 +9,7 @@
 //! into caller-owned storage over the linear head buffer, and "streaming"
 //! is detect-and-retry — a partial head returns `error.Incomplete` and the
 //! caller re-parses from byte 0 once more bytes arrive, bounded by
-//! `constants.head_bytes_max`.
+//! `limits.head_buffer_bytes`.
 //!
 //! The §7 fork hardening gate is fully cleared at the current pin: the
 //! fork rejects bare-LF line terminators itself (CRLF only) and parses
@@ -311,7 +311,7 @@ pub fn parseRequestHead(
     head_is_full: bool,
     headers_storage: *HeaderStorage,
 ) HeadError!RequestHead {
-    assert(head.len <= constants.head_bytes_max);
+    assert(head.len <= constants.head_buffer_bytes_max);
     if (head_is_full) {
         assert(head.len >= 1);
     }
@@ -360,7 +360,7 @@ pub fn parseResponseHead(
     headers_storage: *HeaderStorage,
     request_method: Method,
 ) HeadError!ResponseHead {
-    assert(head.len <= constants.head_bytes_max);
+    assert(head.len <= constants.head_buffer_bytes_max);
     // The proxy rejects CONNECT before dialing (§7 keeps tunnels out), so
     // a CONNECT response is unrepresentable here.
     assert(request_method != .connect);
@@ -782,7 +782,7 @@ fn analyzeHeaders(
 fn scanConnectionTokens(value: []const u8, analysis: *HeaderAnalysis) void {
     // The value is a slice of the parsed head (an empty value is legal:
     // `Connection:` with nothing after it), so it is head-buffer bounded.
-    assert(value.len <= constants.head_bytes_max);
+    assert(value.len <= constants.head_buffer_bytes_max);
     var tokens = std.mem.splitScalar(u8, value, ',');
     while (tokens.next()) |raw_token| {
         const token = std.mem.trim(u8, raw_token, " \t");
@@ -906,7 +906,11 @@ pub const CanonicalTarget = struct {
 /// never disagree about which resource a request names.
 pub fn canonicalTarget(
     target: []const u8,
-    out: *[constants.head_bytes_max]u8,
+    /// Caller-owned decode target, at least `target.len` wide — a slice
+    /// now that head sizes are the config's (`limits.head_buffer_bytes`):
+    /// the callers own buffers of that runtime size, and decoding only
+    /// ever shrinks, so the length relation is the whole contract.
+    out: []u8,
 ) error{Malformed}!CanonicalTarget {
     // validateTarget admitted only origin-form here; asterisk-form and
     // CONNECT never route by path and stay with the caller.
@@ -985,7 +989,7 @@ fn decodeTargetPath(path: []const u8, out: []u8) error{Malformed}!u32 {
 fn collapseDotSegments(bytes: []u8) error{Malformed}!u32 {
     assert(bytes.len >= 1);
     assert(bytes[0] == '/');
-    assert(bytes.len <= constants.head_bytes_max);
+    assert(bytes.len <= constants.head_buffer_bytes_max);
     var read: u32 = 0;
     var write: u32 = 0;
     while (read < bytes.len) {
@@ -1685,7 +1689,7 @@ test "fuzz: heads and chunked framing — parse or reject, no third outcome" {
 
 fn fuzzParserInputs(context: void, smith: *std.testing.Smith) !void {
     _ = context;
-    var input_buffer: [constants.head_bytes_max]u8 = undefined;
+    var input_buffer: [constants.head_buffer_bytes_default]u8 = undefined;
     const input_len = smith.slice(&input_buffer);
     assert(input_len <= input_buffer.len);
     const input = input_buffer[0..input_len];
@@ -1767,7 +1771,7 @@ test "canonicalTarget: table of canonical forms and rejects" {
         .{ .target = "/./..", .path = null },
     };
     for (cases) |case| {
-        var out: [constants.head_bytes_max]u8 = undefined;
+        var out: [constants.head_buffer_bytes_default]u8 = undefined;
         const result = canonicalTarget(case.target, &out);
         if (case.path) |expected_path| {
             const canonical = try result;
@@ -1782,9 +1786,9 @@ test "canonicalTarget: table of canonical forms and rejects" {
 test "canonicalTarget: canonicalization is idempotent" {
     const targets = [_][]const u8{ "/a/../b", "/caf%c3%a9", "//a/./b%7e", "/a/b/.." };
     for (targets) |target| {
-        var out: [constants.head_bytes_max]u8 = undefined;
+        var out: [constants.head_buffer_bytes_default]u8 = undefined;
         const first = try canonicalTarget(target, &out);
-        var out_again: [constants.head_bytes_max]u8 = undefined;
+        var out_again: [constants.head_buffer_bytes_default]u8 = undefined;
         const second = try canonicalTarget(first.path, &out_again);
         try std.testing.expectEqualStrings(first.path, second.path);
         try std.testing.expectEqual(@as(usize, 0), second.query.len);
@@ -1802,12 +1806,12 @@ test "fuzz: canonicalTarget rejects or emits the canonical form" {
 
 fn fuzzCanonicalTarget(context: void, smith: *std.testing.Smith) !void {
     _ = context;
-    var input_buffer: [constants.head_bytes_max]u8 = undefined;
+    var input_buffer: [constants.head_buffer_bytes_default]u8 = undefined;
     input_buffer[0] = '/';
     const tail_len = smith.slice(input_buffer[1..]);
     const input = input_buffer[0 .. 1 + tail_len];
 
-    var out: [constants.head_bytes_max]u8 = undefined;
+    var out: [constants.head_buffer_bytes_default]u8 = undefined;
     // Reject-or-canonical, no third outcome: a reject ends the case.
     const canonical = canonicalTarget(input, &out) catch return;
     // Rooted, never grown, and the split covers the input.
@@ -1820,7 +1824,7 @@ fn fuzzCanonicalTarget(context: void, smith: *std.testing.Smith) !void {
     assert(!std.mem.endsWith(u8, canonical.path, "/.."));
     assert(!std.mem.endsWith(u8, canonical.path, "/."));
     // The canonical form is its own canonical form.
-    var out_again: [constants.head_bytes_max]u8 = undefined;
+    var out_again: [constants.head_buffer_bytes_default]u8 = undefined;
     const again = try canonicalTarget(canonical.path, &out_again);
     assert(std.mem.eql(u8, again.path, canonical.path));
     assert(again.query.len == 0);
