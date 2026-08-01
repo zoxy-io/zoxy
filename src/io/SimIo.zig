@@ -1205,10 +1205,8 @@ fn finishSend(io: *SimIo, socket: Socket, bytes: []const u8) Io.SendError!u32 {
         // A send that was already in flight when the teardown shut the
         // write side down (§5: shutdown flushes pending ops); the kernel
         // answers EPIPE. That is the peer being gone, not the kernel being
-        // short of anything — `error.Reset`, matching what XevIo now maps
-        // `BrokenPipe` to. The sim reproduced the production
-        // misclassification faithfully, comment and all, which is why no
-        // seed ever flagged it.
+        // short of anything — `error.Reset`, matching what XevIo maps
+        // `BrokenPipe` to.
         return error.Reset;
     }
     if (entry.peer == peer_none) {
