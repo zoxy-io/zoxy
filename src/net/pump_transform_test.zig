@@ -108,7 +108,13 @@ const Scratch = struct {
 };
 
 /// Everything both directions share: the L4 shape — no framing of its own,
-/// EOF is a half-close, teardown once both directions finish.
+/// EOF is a half-close, teardown once both directions finish. Deliberately
+/// narrower than `relay.zig`'s production `Policy`: no idle-deadline
+/// extension on half-close, no kernel-pressure witnessing on a recv error.
+/// Both are already exercised against the real `Policy` in
+/// `server_test.zig`; this file's adversary never enables reset or
+/// kernel-pressure injection, so replaying that behavior here would be
+/// dead code — the transform seam is this file's only job.
 fn Base(comptime direction: Direction) type {
     return struct {
         fn state(conn: *ConnSim) *conn_module.DirectionState {
