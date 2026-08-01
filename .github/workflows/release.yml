@@ -71,8 +71,16 @@ jobs:
             label="$(echo "$pair" | cut -d: -f2)"
             cpu="$(echo "$pair" | cut -d: -f3)"
             echo "::group::$label ($zig_t${cpu:+, -Dcpu=$cpu})"
+            # -Dbuild-id is passed rather than left to build.zig's `git
+            # describe` fallback: this checkout is shallow and carries no
+            # tags, so describe would fall back to a bare commit SHA and
+            # stamp every release binary with one. Handing it the tag makes
+            # the identifier equal the version, which `zoxy --version`
+            # recognises and omits — a release says `zoxy 0.0.7` and
+            # nothing else, whatever the checkout depth happens to be.
             devenv shell -- zig build \
-              -Dtarget="$zig_t" ${cpu:+-Dcpu="$cpu"} -Doptimize=ReleaseFast --prefix "out/$label"
+              -Dtarget="$zig_t" ${cpu:+-Dcpu="$cpu"} -Doptimize=ReleaseFast \
+              -Dbuild-id="${{ steps.ver.outputs.tag }}" --prefix "out/$label"
             tar czf "dist/zoxy-$version-$label.tar.gz" -C "out/$label/bin" zoxy
             echo "::endgroup::"
           done
