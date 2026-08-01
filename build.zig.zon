@@ -63,9 +63,19 @@
         // the cloud benchmark runs, so a local band and a fleet number
         // come off the same generator; runs on mismatched versions are not
         // comparable, which is a trap this pin exists to close.
+        //
+        // v1.4.1, matching zoxy-io/benchmark's `bench/build.zig.zon`
+        // verbatim — including the `?ref=` form, which the other three pins
+        // here do not use: zrk is the one dependency whose *version* the
+        // comparability rule above is stated in, so the tag is carried in
+        // the URL where a reader sees it without resolving the sha.
+        // Since v1.3.1 it carries three UB/panic guards
+        // found in review (zoxy-io/zrk#46) and two dashboard fixes that the
+        // harness does not reach; what matters to a band is the zio pin
+        // below, which #46 moved and v1.4.1 settled.
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk#3940a4570c02ff70094c46d1507ecebadf3e6404",
-            .hash = "zrk-1.3.1-WqdFOzSEBABi11K0XkWd67ny1dp-nYFBXRtIOLqLBiB7",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v1.4.1#b2b7ddaa0b125817ea105f258710563f65d42bdc",
+            .hash = "zrk-1.4.1-WqdFO0rIBAABbP3sI9jkhfqcIn4ZQM2zQ2HL9eh4KaAP",
         },
         // zrk embeds its load off a zio (io_uring) runtime, not the default
         // std.Io.Threaded backend — plain Threaded is missing pieces zrk
@@ -77,9 +87,19 @@
         // rather than a fork, deliberately — a fork of a dependency we do
         // not patch is a second thing to keep in sync with zrk's pin, and
         // the only way it can differ from upstream is by being wrong.
+        //
+        // b822fda is lalinsky/zio#628, "flush a full submission queue
+        // instead of dropping SQEs". Before it, zio dropped a cancel when
+        // the io_uring SQ was full, leaving the target completion stuck
+        // `.running` forever and the awaiting task blocked with it — which a
+        // c10k load reaches reliably, since ten thousand per-operation
+        // timeouts expiring together submit thousands of cancels at once
+        // (lalinsky/zio#623). It postdates the v0.16.0 tag, so there is no
+        // release to name and this pins the bare commit — as zrk's own zio
+        // entry does, which is what makes the two identical.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#3566a3a8ca706e90de0ef1e1c46226ec4464f659",
-            .hash = "zio-0.16.0-xHbVVDxFJADhW5CgWRdQmPa8bg_YrOAiPFHTKGFq8jwk",
+            .url = "git+https://github.com/lalinsky/zio#b822fda55af546ce47918776950338cdf23315c0",
+            .hash = "zio-0.16.0-xHbVVJqoJADE1sz0O0ssHXOjaYODH86TWCUG9Pg4N69C",
         },
         // Audited fork: zoxy-io/hparse main at the DESIGN.md §7
         // hardening-gate merge (PR #3: CRLF-only line terminators +

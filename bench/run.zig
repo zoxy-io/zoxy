@@ -248,10 +248,29 @@ fn runOverload(
     return overloadPassed(rss_before_kb, rss_after_kb, &report, drained_cleanly);
 }
 
-/// The overload gates. Accept-RSTs (connect errors) are the conn-slot
-/// shed working as designed; read errors and timeouts are relay stalls
-/// and stay under 1% of completions — a shed must be fast and correct,
-/// never a hang.
+/// The overload gates. The stall gate holds `timeouts` — and only
+/// `timeouts` — under 1% of completions, because that is the one
+/// client-visible failure that belongs to *admitted* work: a request that
+/// completed is a sample whatever its status, and one that never got an
+/// answer is a timeout.
+///
+/// Connect, write and read errors are all the conn-slot wall's RST,
+/// observed at whichever syscall the generator happened to be in when it
+/// landed. Measured (#82): with `timeouts` at zero the three are the
+/// whole of zrk's `socketErrors()`, and on the four runs that captured
+/// zoxy's counters alongside, that total landed within 0.1% of its
+/// `shed_conn_slots` — one socket error per connection the wall refused.
+/// How they divide is pure race: across six runs the connect share ranged
+/// 28–54%, write 43–71%, read 1.3–3.3%. The old gate exempted the connect share
+/// as "the shed working as designed", ignored the write share, and failed
+/// the run on the read share, so it measured how much load was refused
+/// rather than how well the proxy served what it took: 2–14% against a 1%
+/// ceiling, with `timeouts` at zero every time.
+///
+/// A relay that genuinely breaks mid-exchange is still gated — by
+/// `proxiesHealthy` on the keep-alive, close and large-body bands, where
+/// no RST wall fires and a socket error can only be the proxy's fault.
+/// What this band cannot do is tell the two apart, so it does not try.
 fn overloadPassed(
     rss_before_kb: u64,
     rss_after_kb: u64,
@@ -277,8 +296,8 @@ fn overloadPassed(
     }
     // Bounded latency for admitted work: every completion (2xx and fast
     // 5xx sheds alike) landed within zrk's wire timeout, or it would be
-    // a timeout below, not a sample.
-    const stalls = counters.read_errors + counters.timeouts;
+    // a timeout here, not a sample.
+    const stalls = counters.timeouts;
     const stalls_ok = stalls * 100 < counters.completed;
     if (!stalls_ok) {
         std.debug.print(
@@ -286,6 +305,16 @@ fn overloadPassed(
             .{ stalls, counters.completed },
         );
     }
+    // The band log is read by a human (§9), so print the split every run
+    // rather than only when the gate trips: a threshold whose margin is
+    // invisible until it fails cannot be watched across runs, which is how
+    // this one sat mis-specified (#82). The refused count is the wall's
+    // work, not a fault — it belongs in the log, never in the verdict.
+    const refused = counters.connect_errors + counters.write_errors + counters.read_errors;
+    std.debug.print(
+        "zoxy overload refused {d} at the wall (connect {d}, write {d}, read {d}); {d} timed out\n",
+        .{ refused, counters.connect_errors, counters.write_errors, counters.read_errors, stalls },
+    );
     if (!drained_cleanly) {
         std.debug.print("FAIL: overload zoxy did not drain cleanly\n", .{});
     }
