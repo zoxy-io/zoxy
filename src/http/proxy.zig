@@ -494,6 +494,22 @@ pub fn Proxy(comptime IoType: type) type {
             beginUpstream(server, conn, request, &keys.views);
         }
 
+        /// Picks a live endpoint under the §8 per-endpoint inflight cap, or
+        /// sheds 503 and returns null when every endpoint of this cluster
+        /// is already at it. Shared by the first-try and replay dial paths
+        /// so the cap and its shed counter cannot drift between them.
+        fn pickEndpointOrShed(server: *ServerType, conn: *ConnType) ?Balancer.Pick {
+            return server.balancer.pick(
+                conn.cluster_index,
+                &server.endpointLoad(),
+                &server.health.healthy,
+                &conn.client_address,
+            ) orelse {
+                respond(server, conn, 503, "l7_shed_endpoint_inflight");
+                return null;
+            };
+        }
+
         /// Route resolved and a relay buffer held: choose an endpoint and
         /// get onto it, by reuse when the pool has one parked and by a
         /// fresh dial otherwise. Split from `routeRequest` because the
@@ -512,19 +528,12 @@ pub fn Proxy(comptime IoType: type) type {
             // beats a fresh dial. A close that slipped through while it
             // was parked surfaces as a failure on first use — absorbed by
             // the §7 free replay (`upstreamFailed`).
-            const pick = server.balancer.pick(
-                conn.cluster_index,
-                &server.endpointLoad(),
-                &server.health.healthy,
-                &conn.client_address,
-            ) orelse {
-                // Every endpoint of this cluster is at its §8 cap. The
-                // reuse path is capped too, deliberately: checking out a
-                // parked connection starts a request the origin has to
-                // serve, which is the thing being bounded — the saved
-                // handshake does not make it free.
-                return respond(server, conn, 503, "l7_shed_endpoint_inflight");
-            };
+            //
+            // The §8 cap binds the reuse path too, deliberately: checking
+            // out a parked connection starts a request the origin has to
+            // serve, which is the thing being bounded — the saved
+            // handshake does not make it free.
+            const pick = pickEndpointOrShed(server, conn) orelse return;
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
@@ -1720,17 +1729,11 @@ pub fn Proxy(comptime IoType: type) type {
             conn.directions = .{ .{}, .{} };
             // A fresh pick and a fresh dial — never another checkout (§7):
             // the endpoint's whole idle list may be stale the same way.
-            const pick = server.balancer.pick(
-                conn.cluster_index,
-                &server.endpointLoad(),
-                &server.health.healthy,
-                &conn.client_address,
-            ) orelse {
-                // The replay is a fresh try against the same cluster, so
-                // it meets the same cap. Its budget is already spent, so
-                // this answers rather than replaying again (§7).
-                return respond(server, conn, 503, "l7_shed_endpoint_inflight");
-            };
+            //
+            // The replay is a fresh try against the same cluster, so it
+            // meets the same §8 cap; its budget is already spent (§7), so
+            // a cap hit here answers rather than replaying again.
+            const pick = pickEndpointOrShed(server, conn) orelse return;
             dialUpstream(server, conn, pick);
         }
 
