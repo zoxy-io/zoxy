@@ -780,9 +780,11 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   the eligible set the health mask already produced: no table, no
   rebuild, and only the clients of an ejected endpoint move (the 1/n
   optimum — measured at 13.1% of clients for a 1-of-8 ejection). The
-  cost is O(n) per pick instead of O(log n), which is why
-  `endpoints_per_cluster_max` matters: 71 ns at the 64 endpoints a
-  cluster may hold, against a request served in ~100 µs. Jump consistent
+  cost is O(n) per pick instead of O(log n), which is why a cluster's
+  endpoint count is a cost the operator chooses: 71 ns per pick at 64
+  endpoints, against a request served in ~100 µs, and linear in the
+  count from there. Nothing caps it — the pick simply gets slower, and
+  that trade is visible where it is made. Jump consistent
   hash is excluded outright — it can only add or remove the *last*
   bucket, and an ejection removes an arbitrary one.
   Two honest costs. Stickiness holds only while processes agree on the

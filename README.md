@@ -123,7 +123,8 @@ escapes) are rejected with `400`; no matching route is a `404`.
 
 A cluster is a named set of endpoints — static `IP:port` literals, resolved
 once at load, since dynamic DNS is deliberately out of scope — plus how one
-is chosen. Up to 16 clusters, 64 endpoints each.
+is chosen. Cluster and endpoint counts are bounded by your config, not
+by a compiled ceiling — the startup banner prints what the endpoint tables cost.
 
 ```json
 "clusters": {

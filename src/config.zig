@@ -764,7 +764,6 @@ pub const ClusterJson = struct {
         .endpoints = .{
             .desc = "IP:port endpoint literals (port must be non-zero).",
             .min_items = 1,
-            .max_items = constants.endpoints_per_cluster_max,
         },
         .pick = .{
             .desc = "Endpoint-pick policy: p2c (power-of-two-choices), rr (strict " ++
@@ -928,33 +927,35 @@ pub const TimeoutsJson = struct {
     };
 };
 
-/// JSON object map of cluster name → cluster, parsed into a bounded array
+/// JSON object map of cluster name → cluster, parsed into an ordered list
 /// so duplicate keys can be rejected in stage 2 (std.json's map types
 /// silently keep the last duplicate — negative space we refuse to have).
-/// Bodies past the capacity are skipped but counted, so the over-limit
-/// error stays distinct from a syntax error.
 pub const ClustersJson = struct {
-    entries: [constants.clusters_max]Entry,
-    seen_count: u32,
+    /// Every key the object carried, in order. Arena-backed and grown as
+    /// the object is read: there is no ceiling on cluster count, so there
+    /// is no capacity to skip past either — what used to be parsed-then-
+    /// discarded past a cluster ceiling is now simply parsed.
+    entries: []const Entry,
 
     const Entry = struct {
         name: []const u8,
         cluster: ClusterJson,
     };
 
-    /// Hard ceiling on keys consumed before giving up entirely — a bound
-    /// on the bound (an adversarial config cannot spin this loop).
-    const keys_seen_max: u32 = 4096;
-
     pub fn jsonParse(
         allocator: std.mem.Allocator,
         source: anytype,
         options: std.json.ParseOptions,
     ) !@This() {
-        var clusters: @This() = .{ .entries = undefined, .seen_count = 0 };
+        var entries: std.ArrayList(Entry) = .empty;
         if (try source.next() != .object_begin) {
             return error.UnexpectedToken;
         }
+        // Terminated by the object's own `}` or by the input running out,
+        // which the scanner reports as an error — the same bound every
+        // other array in this config now has, and the reason the old
+        // `keys_seen_max` backstop is gone: with no ceiling above it, that
+        // 4096 would have quietly become the new cluster limit.
         while (true) {
             const token = try source.nextAlloc(allocator, .alloc_if_needed);
             const name: []const u8 = switch (token) {
@@ -963,21 +964,19 @@ pub const ClustersJson = struct {
                 .allocated_string => |slice| slice,
                 else => return error.UnexpectedToken,
             };
-            if (clusters.seen_count < constants.clusters_max) {
-                clusters.entries[clusters.seen_count] = .{
-                    .name = name,
-                    .cluster = try std.json.innerParse(ClusterJson, allocator, source, options),
-                };
-            } else {
-                try source.skipValue();
-            }
-            clusters.seen_count += 1;
-            if (clusters.seen_count > keys_seen_max) {
-                return error.UnexpectedToken;
-            }
+            try entries.append(allocator, .{
+                .name = name,
+                .cluster = try std.json.innerParse(ClusterJson, allocator, source, options),
+            });
         }
-        assert(clusters.seen_count <= keys_seen_max);
-        return clusters;
+        const seen = entries.items.len;
+        const parsed: @This() = .{ .entries = try entries.toOwnedSlice(allocator) };
+        // The postcondition every sibling resolver states: the handed-back
+        // slice is every key the object carried, not a prefix of them —
+        // which is exactly what the removed skip-past-capacity branch used
+        // to make untrue.
+        assert(parsed.entries.len == seen);
+        return parsed;
     }
 };
 
@@ -1059,21 +1058,47 @@ fn resolveClusters(
     connect_timeout_ms: u32,
 ) ParseError![]const Config.Cluster {
     assert(connect_timeout_ms >= 1);
-    if (clusters_json.seen_count < constants.clusters_min) {
+    if (clusters_json.entries.len < constants.clusters_min) {
         return error.ClustersEmpty;
     }
-    if (clusters_json.seen_count > constants.clusters_max) {
+    // No upper bound: a cluster costs an arena `Config.Cluster` and a row
+    // in the §7 endpoint tables, both sized from this count (§5), so how
+    // many is the operator's call. `u16` is the one hard edge left — the
+    // index type the endpoint key and every `cluster_index` field use.
+    if (clusters_json.entries.len > std.math.maxInt(u16)) {
         return error.ClustersOverLimit;
     }
 
-    const count: u16 = @intCast(clusters_json.seen_count);
+    const count: u16 = @intCast(clusters_json.entries.len);
     const clusters = try arena.alloc(Config.Cluster, count);
-    for (clusters_json.entries[0..count], 0..) |entry, index| {
-        for (clusters_json.entries[0..index]) |previous| {
-            if (std.mem.eql(u8, previous.name, entry.name)) {
-                return error.ClusterNameDuplicate;
-            }
+
+    // Duplicate names in O(n log n), by sorting an index permutation and
+    // comparing neighbours. It was a nested scan over the entries, which
+    // the 16-cluster ceiling kept to ~120 compares; with the ceiling gone
+    // that same scan would cost ~2.1e9 string compares on a config at the
+    // index type's edge — minutes of startup for a config whose memory
+    // fits easily. Which name is reported first changes, and nothing
+    // reads it: the error carries no payload.
+    const order = try arena.alloc(u16, count);
+    for (order, 0..) |*slot, index| slot.* = @intCast(index);
+    const ByName = struct {
+        entries: []const ClustersJson.Entry,
+        fn lessThan(ctx: @This(), a: u16, b: u16) bool {
+            return std.mem.lessThan(u8, ctx.entries[a].name, ctx.entries[b].name);
         }
+    };
+    std.mem.sort(u16, order, ByName{ .entries = clusters_json.entries }, ByName.lessThan);
+    for (order[1..], order[0 .. order.len - 1]) |current, previous| {
+        if (std.mem.eql(
+            u8,
+            clusters_json.entries[current].name,
+            clusters_json.entries[previous].name,
+        )) {
+            return error.ClusterNameDuplicate;
+        }
+    }
+
+    for (clusters_json.entries, 0..) |entry, index| {
         // A name is an identifier an operator writes and the access log
         // echoes (§8): bounding it is what keeps a log line's width a
         // function of `constants.zig` rather than of the config file.
@@ -1104,7 +1129,13 @@ fn resolveEndpoints(
     if (endpoint_literals.len == 0) {
         return error.EndpointsEmpty;
     }
-    if (endpoint_literals.len > constants.endpoints_per_cluster_max) {
+    // No policy bound: endpoints cost an arena address each and a column
+    // in the §7 endpoint tables, both sized from this count (§5). What is
+    // left is the index type's own edge — `n` endpoints produce indices
+    // `0..n-1`, and the largest of those must stay inside
+    // `endpoint_index_max`, which `Conn` asserts sits below its
+    // no-endpoint sentinel.
+    if (endpoint_literals.len > @as(usize, constants.endpoint_index_max) + 1) {
         return error.EndpointsOverLimit;
     }
 
@@ -1681,7 +1712,9 @@ fn clusterIndexOf(
     name: []const u8,
 ) error{ClusterUnknown}!u16 {
     assert(clusters.len >= 1);
-    assert(clusters.len <= constants.clusters_max);
+    // The `@intCast` below is why: `resolveClusters` rejects a count past
+    // the index type, so every position here fits the `u16` it returns.
+    assert(clusters.len <= std.math.maxInt(u16));
     for (clusters, 0..) |cluster, index| {
         if (std.mem.eql(u8, cluster.name, name)) {
             return @intCast(index);

@@ -216,8 +216,14 @@ pub const conn_ops_max: u32 = 4;
 /// bounds both callback batches and `Io.now_ns` staleness (§4).
 pub const loop_completions_per_tick_max: u32 = 256;
 
-/// Upper bound on configured clusters.
-pub const clusters_max: u16 = 16;
+/// The largest endpoint index a cluster may produce — the index type's
+/// edge, not a policy ceiling. `Conn.endpoint_none` is `maxInt(u16)` and
+/// must never collide with a real index, so this sits one below it. The
+/// loader rejects a cluster that would produce a larger index
+/// (`EndpointsOverLimit`) and `Conn` asserts the relationship, so the two
+/// halves are tied together by this constant rather than by two files
+/// happening to spell `maxInt(u16)` the same way.
+pub const endpoint_index_max: u16 = std.math.maxInt(u16) - 1;
 
 /// Upper bound on a cluster's name. Names are identifiers an operator
 /// writes and the access log echoes (§8), so the bound is what keeps a
@@ -228,9 +234,6 @@ pub const cluster_name_bytes_max: u16 = 64;
 /// nowhere, so the loader rejects an empty map and the config JSON Schema
 /// emits it as `minProperties`.
 pub const clusters_min: u16 = 1;
-
-/// Upper bound on endpoints in one cluster.
-pub const endpoints_per_cluster_max: u16 = 64;
 
 /// The largest in-flight total one endpoint can ever carry (§7), and so
 /// the ceiling a configured `max_inflight` is validated against: one L7
@@ -630,8 +633,6 @@ comptime {
     assert(conn_slots_max - 1 <= std.math.maxInt(u16));
     assert(relay_buffer_bytes >= 512);
     assert(clusters_min >= 1);
-    assert(clusters_max >= clusters_min);
-    assert(endpoints_per_cluster_max >= 1);
     // The §8 cap ceiling is the largest load one endpoint can carry: one
     // L7 lease per upstream slot plus one L4 charge per conn slot, since
     // a connection of either kind holds exactly one. Asserted rather than

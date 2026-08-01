@@ -32,8 +32,8 @@
 //! (§3). A 64-endpoint ring at any useful virtual-node count is a
 //! thousands-of-entries sort per flap. Rendezvous has no table to rebuild:
 //! it scans the eligible set the health mask already produced. It costs
-//! O(n) instead of O(log n), which is why the endpoint ceiling matters —
-//! measured at 71 ns per pick for the 64 endpoints a cluster may hold,
+//! O(n) instead of O(log n), which is why a cluster's endpoint count is a
+//! cost the operator chooses: measured at 71 ns per pick at 64 endpoints,
 //! against a request this proxy serves in ~100 µs. Jump consistent hash is
 //! excluded outright: it can only add or remove the *last* bucket, and an
 //! ejection removes an arbitrary one.
@@ -416,7 +416,7 @@ pub const Balancer = struct {
     /// xorshift64* (Vigna): the full-period 64-bit shift generator with a
     /// multiplicative output scramble — plenty for candidate draws, one
     /// mul and three shifts on the pick path. The modulo bias of a draw
-    /// is ≤ 2⁻⁵⁸ for the ≤ 64 endpoints a cluster may hold — negligible.
+    /// is ≤ 2⁻⁴⁸ even at the u16 index type's edge — negligible.
     fn next(balancer: *Balancer) u64 {
         assert(balancer.pick_state != 0);
         var x = balancer.pick_state;

@@ -265,17 +265,20 @@ fn writeMethodEnum(out: *Stringify) Writer.Error!void {
     comptime assert(emitted); // at least one real method token exists
 }
 
-/// The clusters map: a name-keyed object whose values are cluster schemas,
-/// bounded by `clusters_max`. The DTO is a custom parser (not a plain
-/// struct), so its shape is emitted here rather than reflected.
+/// The clusters map: a name-keyed object whose values are cluster schemas.
+/// The DTO is a custom parser (not a plain struct), so its shape is
+/// emitted here rather than reflected.
+///
+/// `minProperties` only: there is no `maxProperties` because there is no
+/// cluster ceiling left to emit. The loader's one remaining rejection is
+/// the `u16` index type's edge, which is not a number worth putting in a
+/// schema an editor uses for completion.
 fn writeClustersMap(out: *Stringify) Writer.Error!void {
-    comptime assert(constants.clusters_max >= constants.clusters_min);
+    comptime assert(constants.clusters_min >= 1);
     try out.objectField("type");
     try out.write("object");
     try out.objectField("minProperties");
     try out.write(constants.clusters_min);
-    try out.objectField("maxProperties");
-    try out.write(constants.clusters_max);
     try out.objectField("additionalProperties");
     try out.beginObject();
     try writeObjectBody(out, config.ClusterJson, true);
