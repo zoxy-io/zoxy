@@ -31,7 +31,7 @@
 //! 1-byte deliveries across a spread of seeds: the payload must reach the
 //! origin whole, and the origin's echo must come back framed and whole. The
 //! scratch lives here rather than on `Conn` — a slot does not grow a field
-//! for a test, and issue #75 is about the one it already has.
+//! for a test, and issue #75 already measured the cost of the one it has.
 
 const std = @import("std");
 
