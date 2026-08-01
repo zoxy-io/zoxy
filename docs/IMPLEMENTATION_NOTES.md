@@ -1086,6 +1086,48 @@ is answered by the idle-timeout division plus the accept-time RST wall —
 the nginx/haproxy norm: never close an established keep-alive connection
 to admit a newcomer.
 
+## The overload stall gate was counting the shed, not the stall (#82)
+
+The Tier-1 overload band gated `read_errors + timeouts` under 1% of
+completions. On this box it failed 4 runs in 5 at 2.0–6.2% (zrk v1.3.1),
+and 4 in 4 at 4.8–14.2% after the v1.4.1 pin move — reproducibly, with
+nothing wrong with the proxy.
+
+The filed theory was that the queue is legitimately deeper than zrk's 2 s
+wire timeout, so a slice of requests crossing it is arithmetic.
+Measurement says otherwise: **`timeouts` is 0 in every failing run**, and
+the run with the lowest tail (p99 642 µs, three orders inside the
+timeout) failed at 2.04%. The stall rate does not track the tail at all.
+
+What it tracks is the conn-slot wall. With `timeouts` at zero, zrk's
+`connect + write + read` is the whole of its `socketErrors()`, and on the
+four runs that captured zoxy's counters alongside, that total landed
+within 0.1% of `shed_conn_slots` — one socket error per RST'd connection.
+How it divides is pure race, and it moves run to run: across six runs the
+connect share ranged 28–54%, write 43–71%, read 1.3–3.3%. Which bucket a
+given connection lands in is only how far the generator got before the RST
+arrived. Meanwhile zoxy witnessed no relay fault at all on those runs:
+`deadline_expired`, `upstream_connect_failed`, every `kernel_pressure_*`,
+`l7_bad_gateway` and `l7_gateway_timeout` all 0, with
+`accepted = admitted + shed_conn_slots` balancing exactly. Causally
+confirmed: raising the scenario's `conn_slots` 64 → 200, nothing else
+changed, cut the shed 205k → 46k and the gate passed.
+
+So the old gate exempted the connect share as "the shed working as
+designed", ignored the write share, and failed the run on the read share.
+Raising the ceiling or lowering the offered rate would both have made it
+pass — by producing fewer RSTs, which is why neither was the fix.
+
+Verdict (settled): the stall gate holds `timeouts` alone, the one
+client-visible failure that belongs to *admitted* work. Every socket
+error in this band is a connection that was never admitted, already
+witnessed by the 5xx status gate and the accept-RST count. A genuine
+mid-exchange break is still gated by `proxiesHealthy` on the keep-alive,
+close and large-body bands, where no RST wall fires and a socket error
+can only be the proxy's fault. The band now prints the refused/timed-out
+split every run: a threshold whose margin is invisible until it trips is
+how this one sat mis-specified for a week.
+
 ## Phase 0 baselines (2026-07-10/11)
 
 - Debug-build zoxy over loopback (`zig build bench`, nginx origin, rate
