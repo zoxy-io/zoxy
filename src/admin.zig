@@ -129,8 +129,8 @@ pub fn Admin(comptime IoType: type) type {
             assert(admin.state == .off);
         }
 
-        /// Set the bind address before `start` (main.zig, from the env var;
-        /// the simulator sets it directly). A no-op default leaves admin off.
+        /// Set the bind address before `start`. A no-op default leaves
+        /// admin off.
         pub fn setBind(admin: *Self, bind_address: std.Io.net.IpAddress) void {
             assert(admin.state == .off);
             assert(!admin.listening);
@@ -138,7 +138,7 @@ pub fn Admin(comptime IoType: type) type {
         }
 
         /// Open the listener and arm the first accept, or stay off when no
-        /// bind is configured. Called from `Server.start`.
+        /// bind is configured.
         pub fn start(admin: *Self) Io.ListenError!void {
             assert(admin.state == .off);
             assert(!admin.listening);

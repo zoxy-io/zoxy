@@ -1,8 +1,8 @@
-//! A shared scripted origin for the L4 harnesses (server_test.zig and the
-//! sim). It accepts connections and runs the same strict recv → send →
-//! recv echo the proxy relays through, with per-connection misbehavior
-//! modes for the adversarial paths (§9). Generic over the Io backend;
-//! both current users instantiate `Origin(SimIo)`. The scripted *clients*
+//! A shared scripted origin for L4 test harnesses. It accepts connections
+//! and runs the same strict recv → send → recv echo the proxy relays
+//! through, with per-connection misbehavior modes for the adversarial
+//! paths (§9). Generic over the Io backend; both current users instantiate
+//! `Origin(SimIo)`. The scripted *clients*
 //! are deliberately not shared — the directed suite tracks connection
 //! outcomes and drives drain races, while the sim tracks byte-exact
 //! integrity under the adversary, and unifying them would force an
