@@ -458,9 +458,16 @@ a raised `RLIMIT_NOFILE`:
 | conn slots | 1386 | 11466 | ~1.7 KiB state |
 | relay buffers | 1386 | 11466 | 2 × 4 KiB |
 | upstream slots | 1313 | 11466 | ~48 B state |
-| head buffers (ring) | = conn slots | 11466 | 8 KiB + 1 B |
-| upstream head buffers | = upstream slots | 11466 | 8 KiB + 8 B |
+| head buffers (ring) | = conn slots | 11466 | `head_buffer_bytes` + 1 B |
+| upstream head buffers | = upstream slots | 11466 | `head_buffer_bytes` + 24 B |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
+
+`head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
+(oversize → 414/431, §7), with a 1 KiB floor and a 1 MiB ceiling: a size
+knob is operator-visible behaviour, not only memory. Three head-sized
+side buffers ride the same knob — the serving path's two
+canonicalization scratches and the health prober's response buffer — and
+appear in the banner as their own term.
 
 The access log (§8) adds one fixed reservation beside the pools — two
 staging buffers, 64 KiB together by default — and nothing at all when it
@@ -617,8 +624,9 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   [hparse](https://github.com/nikneym/hparse)** (pure Zig,
   SIMD-vectorized, never allocates or copies — picohttpparser-shaped
   API; "streaming" means detect-and-retry — partial input re-parses
-  from byte 0, bounded by `head_bytes_max`). Upstream was not adoptable
-  as-is; the fork cleared a recorded hardening gate before landing:
+  from byte 0, bounded by `limits.head_buffer_bytes`). Upstream was
+  not adoptable as-is; the fork cleared a recorded hardening gate
+  before landing:
   bounds-check the cursor (upstream dereferences one byte past
   the buffer on partial input — silent UB), accept HTAB in field values
   (RFC 9110), reject bare-LF line terminators (a smuggling ingredient),
@@ -769,9 +777,10 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   owning phase module at compile time.
 - **Resilience is minimal by design:** per-request and per-try deadlines
   (head-read gets its own deadline, so a slowloris meets the clock or
-  `head_bytes_max`, whichever comes first; each dial — the first try and
-  the replay's — runs under its own connect deadline); one free replay
-  of a request that hit a stale pooled connection — only when the
+  `limits.head_buffer_bytes`, whichever comes first; each dial — the
+  first try and the replay's — runs under its own connect deadline);
+  one free replay of a request that hit a stale pooled connection —
+  only when the
   connection was a *reused* checkout, no response byte was received, and
   the request leg never entered the body pump, so the whole try still
   sits byte-reconstructible in the head buffer. "May have begun
@@ -1212,9 +1221,9 @@ src/
   mem/
     Pool.zig          // Pool(T): startup alloc, intrusive free list
   net/
-    Conn.zig          // connection slot: state, completions, head buffer
+    Conn.zig          // connection slot: state, completions, head-ring claim
     relay.zig         // strict recv→send→recv relay (L4 + L7 bodies)
-    upstream.zig      // shared upstream pool + endpoint idle lists
+    upstream.zig      // shared upstream pool + endpoint idle lists + head pool
   http/
     parser.zig        // hparse wrapper: strictness + framing + chunked decoder
     render.zig        // §7 head rendering: hop-by-hop strip + close injection

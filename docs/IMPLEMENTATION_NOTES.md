@@ -319,6 +319,64 @@ every-callback-disarms rule are unchanged; multishot stays closed on
 its own terms (do not re-propose without measured `cqes/wake`
 approaching 1).
 
+## Head buffers left the slots (2026-08-02, #162)
+
+Before: 21.09 MiB of the 34.2 MiB default budget — 62% — was head
+buffers, inline in the conn and upstream slots, pinned for the *slot's*
+life rather than the exchange's. An idle keep-alive connection held
+8 KiB it needed only between first byte and turnaround; a parked origin
+connection held 8 KiB that was provably dead; an L4 connection held
+8 KiB the protocol cannot address. After: both heads are pooled and
+memory follows request heads in flight. Three knobs
+(`limits.head_buffers`, `upstream_head_buffers`, `head_buffer_bytes`)
+default to the never-shedding shapes, so out of the box nothing sheds
+and the total is unchanged — the wins are the idle/parked/L4 zeros and
+the operator's ability to trade the counts down and the size either way.
+
+The client side rides the seam's provided-buffer ring (`recvGroup`, the
+buffer-select note above): an idle connection's armed recv carries no
+buffer, the kernel binds one at the first byte, and the return is a
+tail bump. The upstream side is an app pool — its first use is a
+synchronous render, which a kernel ring cannot serve. Op count per
+request is unchanged; poll-first arming was designed, offered, and
+rejected for costing one SQE/CQE pair per request on a kernel-bound
+core.
+
+What the build actually taught, for the next pooling change:
+
+- **The shed's keep-or-close is decided by *where* the acquire sits.**
+  The upstream head acquire was planned at the render (`.l7_dialing`) —
+  and the directed test immediately showed those sheds always closing:
+  the §7 resync rule keeps only from `.l7_reading_head`. The acquire
+  moved beside the slot acquire, and the rung behaves like its
+  siblings. Place acquires where the ladder can still answer kindly.
+- **The client ring's rung is the one shed that precedes the parse**, so
+  it can pre-empt verdicts (400/414/501/403) that were provably
+  first-answer before — four sim script oracles and a DESIGN table row
+  had encoded that provability and failed honestly (seed 634). And it
+  must always close: the refused bytes are unread in the socket, and a
+  kept connection would re-arm onto them and shed the same request
+  forever (`respond` enforces the close at comptime).
+- **A delivery can carry a resource into a teardown.** The group-recv
+  completion racing `beginTeardown` arrives with a kernel-bound buffer
+  id; the early-return teardown path dropped it — an uncounted leak no
+  drain assert could see, because the bind was never recorded. The
+  `onUpstreamConnect` capture-then-release shape applies to every
+  resource a completion can hand a dying connection.
+- **EOF does not consume a provided buffer** — pinned by the fork's own
+  test against a real 6.18 kernel and mirrored in SimIo's check order
+  (reset and EOF outrank selection). The whole no-leak-at-teardown story
+  rests on that fact, which is why it is a test and not a comment.
+
+Deferred, deliberately: fuzz buffers exercise the 8 KiB default, not the
+1 MiB `head_buffer_bytes_max` the parser's guards now formally span —
+a capacity change, not new parsing logic, but worth a fuzz shape if the
+ceiling ever earns real traffic. The banner's "access log 0 KiB" nit
+(the log's 536 B/conn capture arrays living in the conn slots) also
+stays open: the LogState move was cut from #162's scope on measurement —
+its scalars are written unconditionally on both protocols, so moving
+them buys 40 B of stride for 14 hot-path guards.
+
 ## Pre-block spin — rejected (2026-07-12)
 
 Spinning before the loop blocks: p50 +15–25 µs *worse* and CPU ×2. The

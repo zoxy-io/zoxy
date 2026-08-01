@@ -32,15 +32,31 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // Audited fork: zoxy-io/libxev branch zoxy-op-errno = upstream
+        // Audited fork: zoxy-io/libxev branch zoxy-buffer-group = upstream
         // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
-        // plus three commits, each its own stacked PR:
+        // plus four commits, each its own stacked PR:
         //   c369817 expose io_uring setup flags through Options
         //   6bd950d expose the CQ depth (IORING_SETUP_CQSIZE) — the c10k
         //           lever
         //   b3d6b55 keep the raw errno on the Completion (zoxy-io/libxev#2)
+        //   24da6d0 recv_group — provided-buffer receives (zoxy-io/libxev#3)
         // Diff against that upstream commit to audit; the pin moves only
         // after re-audit.
+        //
+        // Re-audit for 24da6d0 (§4, §5's head-buffer ring) — PENDING:
+        // zoxy-io/libxev#3 is open, and the PR that carries this pin stays
+        // a draft until that sign-off lands; what follows is the diff
+        // summary the audit reviews, not a record of one already done.
+        // One backend op
+        // (`recv_group`: prep mirrors std's buffer_selection recv arm), the
+        // raw cqe flags kept on `Completion` beside `result_errno` with a
+        // `bufferId` reader, and ENOBUFS surviving the recv mapping as
+        // `error.NoBuffers`. io_uring only; no watcher or dynamic-API
+        // surface (a new op, not a new ReadBuffer arm, so the shared
+        // exhaustive switches stay untouched); registration and buffer
+        // returns stay caller-side via std against `loop.ring`. The test
+        // pins selection, exhaustion, syscall-free reuse, and that EOF
+        // consumes no buffer — the fact §5's no-leak-at-teardown rests on.
         //
         // Re-audit for b3d6b55: one `posix.E` field on `Completion`
         // defaulting to `.SUCCESS`, one assignment at the top of `invoke`
@@ -54,8 +70,8 @@
         // arms discard which errno failed, which is what left a c10k run
         // reporting 227,628 indistinguishable failures.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#b3d6b55bfbea1de0401d11f69ad9755fed9a6144",
-            .hash = "libxev-0.0.0-86vtc6cnFACJYqPSG_os9Ea-nUgWmjAqi3CwCQGiFj2z",
+            .url = "git+https://github.com/zoxy-io/libxev#24da6d01bdc426cbbee045d7bfaf18843d0e6d2e",
+            .hash = "libxev-0.0.0-86vtczxOFAB_0IplaVvIkI3iUUo61wUtF10OMILaoVRG",
         },
         // Load generator, §9 Tier 0/1 only — never linked into the proxy
         // (no `src/` file imports it), so a bump moves what the benchmark
