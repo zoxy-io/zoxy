@@ -35,6 +35,14 @@ zoxy --help          # usage summary (-h)
 zoxy --version       # print the version (-V)
 ```
 
+A release prints its bare version, `zoxy 0.0.7`. A build made from source
+after that release adds what distinguishes it —
+`zoxy 0.0.7 (v0.0.7-5-gabc1234)`, and `-dirty` when the tree had
+uncommitted changes — so a version in a bug report is never a release's
+number attached to something else. Packagers can name their own build
+with `zig build -Dbuild-id=…`. The same line opens the startup banner,
+which is what a bug report usually pastes.
+
 Signals: `SIGTERM`/`SIGINT` drain in-flight connections and exit 0;
 `SIGUSR1` dumps counters to stdout.
 

@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     const zoxy_version = @import("build.zig.zon").version;
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", zoxy_version);
+    build_options.addOption([]const u8, "build_id", resolveBuildId(b));
 
     // libxev is pinned by content hash to the zoxy-io fork's
     // zoxy-ring-flags branch: the audited upstream snapshot plus the
@@ -352,4 +353,47 @@ pub fn build(b: *std.Build) void {
         "Line coverage via kcov (Linux): unit tests + sim, merged to zig-out/coverage",
     );
     cov_step.dependOn(&install_cov.step);
+}
+
+/// Which build this binary is, beyond its release version.
+///
+/// A release binary's version already names one commit — the tag points at
+/// exactly one — so this is empty there and `zoxy --version` stays the bare
+/// `zoxy 0.0.7`. What it exists for is every *other* build: one made from
+/// `main` five commits later reports the same version string as the release
+/// unless something says otherwise, which turns a bug report's "0.0.7" into
+/// a claim that is not true. `git describe` answers exactly that question —
+/// `0.0.7-5-gabc1234`, and `-dirty` when the tree carries uncommitted
+/// changes, which is otherwise unanswerable from a binary.
+///
+/// `-Dbuild-id=...` overrides, for a builder that has the answer but no
+/// `.git` — a source tarball, or a CI checkout too shallow to describe.
+/// Absent both, empty: an unknown build says nothing rather than guessing.
+///
+/// This is the one place the build shells out *unconditionally*. The
+/// `coverage` step runs `kcov` and `sed`, but through `addSystemCommand`,
+/// so those fire only when that step is asked for; this runs during
+/// `build()` itself and so on every `zig build`, `test`, `sim` and `ci`.
+/// That is a `git` invocation's worth of cost per invocation, and it makes
+/// the *identifier* non-hermetic — deliberately, because a local build
+/// that cannot say what it is is the problem being solved. Nothing about
+/// the produced code depends on it, and a failure is not one: no git, no
+/// repository, or a killed process all land in the `catch` below and
+/// report nothing rather than breaking the build.
+fn resolveBuildId(b: *std.Build) []const u8 {
+    if (b.option([]const u8, "build-id", "Build identifier, e.g. git describe output")) |given| {
+        return given;
+    }
+    // `runAllowFail` reports a non-zero exit as an error and only then
+    // writes `exit_code`, so the catch is the whole failure path — reading
+    // the code on success would read whatever the variable held. It is
+    // initialized anyway rather than left `undefined`, because a future
+    // reader tempted to check it should find a number rather than garbage.
+    var exit_code: u8 = 0;
+    const described = b.runAllowFail(
+        &.{ "git", "describe", "--tags", "--always", "--dirty" },
+        &exit_code,
+        .ignore,
+    ) catch return "";
+    return std.mem.trim(u8, described, " \t\r\n");
 }

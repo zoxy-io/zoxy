@@ -24,6 +24,41 @@ comptime {
     assert(build_options.version.len > 0);
 }
 
+/// What this build is, when the version alone does not say it.
+///
+/// A release binary is built at its tag, so `git describe` returns exactly
+/// `v<version>` and repeating it would be noise — that case reports the
+/// bare version. Every other build is the reason this exists: one made
+/// from `main` after a release otherwise claims the release's version
+/// string, which is not merely vague but false. There the suffix carries
+/// the distance and commit (`v0.0.7-5-gabc1234`), and `-dirty` when the
+/// tree had uncommitted changes, which no binary can otherwise be asked.
+///
+/// Empty when the build could not tell — no `.git`, no `-Dbuild-id` — and
+/// an unknown build says nothing rather than guessing.
+const build_id_suffix: []const u8 = buildIdSuffix(build_options.version, build_options.build_id);
+
+/// The suffix itself, as a function of the two strings, so the three cases
+/// it decides between are testable rather than only observable by building
+/// at a tag and not at one.
+fn buildIdSuffix(comptime version: []const u8, comptime id: []const u8) []const u8 {
+    // The same invariant the module-level block guards, restated where the
+    // `"v" ++ version` comparison below depends on it.
+    assert(version.len > 0);
+    if (id.len == 0) return "";
+    // `describe` spells the *tag*, which carries the `v` the version does
+    // not; both spellings name the same build as the version already does.
+    // Full equality, not a prefix test: `0.0.70` must not be swallowed by
+    // a build whose version is `0.0.7`.
+    if (comptime std.mem.eql(u8, id, "v" ++ version)) return "";
+    if (comptime std.mem.eql(u8, id, version)) return "";
+    const suffix = " (" ++ id ++ ")";
+    // Whatever it reports, it appends to a version rather than replacing
+    // one, so it always starts with the separating space.
+    assert(suffix[0] == ' ');
+    return suffix;
+}
+
 /// The sigaction handler needs a stable address before main returns;
 /// the loop lives for the whole process (§3).
 var global_io: XevIo = undefined;
@@ -172,7 +207,7 @@ fn printVersion(io: std.Io) !void {
     var buffer: [64]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;
-    try writer.print("zoxy {s}\n", .{build_options.version});
+    try writer.print("zoxy {s}{s}\n", .{ build_options.version, build_id_suffix });
     try writer.flush();
 }
 
@@ -238,8 +273,11 @@ fn printBudgets(
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const writer = &file_writer.interface;
+    // The version leads, because this banner is what a bug report pastes
+    // and `--version` is what it does not think to run.
     try writer.print(
-        \\zoxy budgets (closed-form, DESIGN.md §5/§8):
+        \\zoxy {s}{s}
+        \\budgets (closed-form, DESIGN.md §5/§8):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B + access log {d} KiB
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
@@ -247,6 +285,8 @@ fn printBudgets(
         \\  config  {d} listener(s), {d} cluster(s), access log {s}
         \\
     , .{
+        build_options.version,
+        build_id_suffix,
         memory_total / 1024,
         limits.conn_slots,
         @sizeOf(ServerXev.ConnType),
@@ -315,6 +355,34 @@ test "classifyArgs: a single positional is the config path" {
 test "classifyArgs: --help and -h request help" {
     try testing.expect(classifyArgs(&.{ "zoxy", "--help" }) == .help);
     try testing.expect(classifyArgs(&.{ "zoxy", "-h" }) == .help);
+}
+
+test "buildIdSuffix: a release says nothing extra, every other build says what it is" {
+    // The case the whole thing exists for: built after a release, the
+    // version alone would claim to *be* that release.
+    try testing.expectEqualStrings(
+        " (v0.0.7-5-gabc1234)",
+        buildIdSuffix("0.0.7", "v0.0.7-5-gabc1234"),
+    );
+    // And the question a binary cannot otherwise be asked.
+    try testing.expectEqualStrings(
+        " (v0.0.7-5-gabc1234-dirty)",
+        buildIdSuffix("0.0.7", "v0.0.7-5-gabc1234-dirty"),
+    );
+    // At the tag `describe` returns the tag, which is the version with a
+    // `v`. Repeating it would make every release binary noisier to read
+    // for no information, so both spellings collapse to nothing.
+    try testing.expectEqualStrings("", buildIdSuffix("0.0.7", "v0.0.7"));
+    try testing.expectEqualStrings("", buildIdSuffix("0.0.7", "0.0.7"));
+    // No `.git` and no `-Dbuild-id`: an unknown build stays quiet instead
+    // of inventing a provenance.
+    try testing.expectEqualStrings("", buildIdSuffix("0.0.7", ""));
+    // An override that is not a version at all still travels — a tarball
+    // or distro build naming itself is the point of the flag.
+    try testing.expectEqualStrings(" (nixpkgs-25.05)", buildIdSuffix("0.0.7", "nixpkgs-25.05"));
+    // A *different* version's tag is not this build's version, so it is
+    // reported rather than swallowed by the prefix match.
+    try testing.expectEqualStrings(" (v0.0.6)", buildIdSuffix("0.0.7", "v0.0.6"));
 }
 
 test "classifyArgs: --version and -V request the version" {
