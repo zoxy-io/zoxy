@@ -593,8 +593,10 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   "/api", "cluster": "api" }, …]`; the existing `"cluster"` field stays
   as sugar for a single catch-all route). The table is resolved at
   config load into an immutable arena table sorted longest-prefix-first
-  — matching is a bounded linear scan, never an allocation — and
-  `routes_max` caps it. No route matches → static `404` (§8). Matching
+  — matching is a bounded linear scan, never an allocation. The scan's
+  bound is the table's own length, fixed once config load returns; there
+  is no constant capping it, because the table sizes nothing but its own
+  arena slice. No route matches → static `404` (§8). Matching
   consults only the **canonical path**, computed once in the trust
   boundary: the query splits off untouched (opaque to the proxy,
   forwarded verbatim); unreserved percent-escapes (RFC 3986 §2.3) are
@@ -681,8 +683,13 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   at config time* into bounded, immutable tables in the config arena
   (match programs over method/host/path/header slices; action lists drawn
   from a closed enum: reject-with-status, add/remove/set header, rewrite
-  path prefix), each with a static limit
-  (`rules_per_route_max`, `actions_per_rule_max`, `header_edits_max`).
+  path prefix). The rule table, a rule's action list and a rule's header
+  matches carry no static limit: each is an arena slice at exactly the
+  length the config asked for, and evaluation is a bounded loop over
+  that length. `header_edits_max` is the one static limit here, and the
+  difference is the rule — it bounds a *fixed buffer* the renderer
+  materializes the matched rules' edits into, so it must be known before
+  the config is read.
   Cluster selection is deliberately *not* a filter action: the route
   table (host + path) is the single mechanism that decides which backend
   serves a request, so there is one precedence rule, not two engines
