@@ -192,6 +192,79 @@ re-audit is not spent on a non-win. Revisit only under genuine CPU
 saturation with large CQE batches, never loopback. Recorded so the
 profiler's headline symbol is not re-chased.
 
+Half of that revisit condition has since been tested and the other half
+found unreachable on this box — see "The loopback harness cannot
+saturate zoxy" below. Under large batches the symbol gets *cheaper*, so
+nothing here reopens.
+
+## The loopback harness cannot saturate zoxy (2026-08-01)
+
+A rate sweep looking for misspent cycles found the knee, then found the
+knee is not zoxy's. L7, 64 connections, `--threads 6`, 10 s rows:
+
+| offered | delivered | p50 | p99 | cqes/wake |
+|---|---|---|---|---|
+| 150 k | 149,957 | 73 µs | 14.3 ms | 27.9 |
+| 200 k | 199,928 | 119 µs | 30.7 ms | 619 |
+| 300 k | 208,905 | 1.63 s | 3.0 s | 670 |
+| 450 k | 215,299 | 2.60 s | 5.2 s | 1439 |
+
+Delivered flattens at ~210–215 k however hard it is pushed. What is
+saturated at that point is **not the proxy**. Two `/proc` measurements,
+each on its own 250 k-offered 20 s run (so they are two runs, not one
+row): zoxy's dedicated core runs **57.2% busy — 51.9 points kernel, 5.2
+points user**, while the whole box runs 82.7% of 8 cores = 6.62 cores
+active, leaving ~6.05 cores on the other seven for nginx and zrk, i.e.
+**86%**. The origin and the load generator run out of machine while zoxy
+still has 43% of its core idle.
+
+So #40's "genuine CPU saturation" is unreachable here, and no rate on
+this box will make it reachable: raising the offered rate spends the
+extra cycles on the load side. Reaching it needs an external origin and
+generator, or a bigger box.
+
+The "large CQE batches" half *is* reachable, and it answers the opposite
+of a reopening. Comparing 100 k (13.0 cqes/wake, `--threads 2` — the
+load side only, both rows delivered their offered rate) against
+250 k-offered:
+
+| | 100 k | 250 k offered |
+|---|---|---|
+| `copy_cqes` subtree | 13.2 / 15.9% | **6.47%** |
+| `main.main` (loop body) | 12.9% | 5.8% |
+| `IoUring.enter` | 4.2% | ~0% |
+| http parser | ~25% | 35.7% |
+
+Batching amortises the drain away — the `memcpy` even leaves the small-
+copy path for `copyBlocksAlignedSource` — and `IoUring.enter` disappears
+because a loop that always has work stops syscalling. User cycles/s is
+roughly flat across the two (374 → 365 Mcyc/s), so per-request userspace
+cost roughly halves, 3740 → 1714 cycles/request.
+
+Three caveats, each of which changes what the table above means.
+
+- **The batch depth here is the never-caught-up kind.** p50 is 1.4 s at
+  250 k offered; this is the 504-per-wake signature from "A short timer
+  takes over the loop's wake schedule", not efficient batching. Three
+  250 k runs gave 1492 / 1013 / 669 cqes/wake at 214.5 k / 213.2 k /
+  210.8 k delivered — the same offered rate, batch depth varying 2.2×.
+  That independently re-confirms the existing rule: `cqes/wake` tracks
+  box load and is not comparable across rows.
+- **`zig build profile` samples `cpu_core/cycles/u` — userspace only.**
+  Every percentage it prints is a share of ~5% of one core, not of the
+  machine. "http parser 35.7%" is ~1.9% of a core; the kernel outweighs
+  all of zoxy's userspace work about 10:1 and the profiler cannot see
+  it. This is the easiest number in the repo to misread, and it was
+  misread once before believing the `/proc` measurement above.
+- Ops/req measured 4.00 flat at every rate, matching the 4.0 already
+  recorded across a 156× connection sweep.
+
+Not measured, and the honest gap: what the 51.9 points of kernel time
+are actually doing. That needs kernel-mode samples, which needs a
+`perf_event_paranoid` this box does not grant by default and a profiler
+event without the `:u` suffix — two changes, neither of which the
+userspace question above required.
+
 ## Multishot recv — measured and parked (2026-07-12), closed (2026-07-28)
 
 Best-case echo microbench (pinned cores, ABBA, single-shot vs multishot
