@@ -41,7 +41,6 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
-const constants = @import("constants.zig");
 const upstream = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -113,9 +112,8 @@ pub const Balancer = struct {
     /// Per-cluster round-robin cursors, used by `.rr` clusters only.
     /// u64 so a cursor never wraps in any realistic process lifetime — a
     /// u16 wrap reset the rotation phase and double-picked one endpoint
-    /// for non-power-of-two cluster sizes. Fixed at the config ceiling:
-    /// 16 × 8 bytes of static state beats an arena allocation.
-    cursors: [constants.clusters_max]u64,
+    /// for non-power-of-two cluster sizes. One per configured cluster.
+    cursors: []u64,
     /// xorshift64* draw state, used by `.p2c` clusters only. Seeded from
     /// a fixed named constant, never the clock: the simulator replays
     /// every seed twice and demands byte-identical traces (§9), and load
@@ -128,37 +126,63 @@ pub const Balancer = struct {
     /// the exact disruption consistent hashing exists to avoid. Computed
     /// once at init because a pick would otherwise re-hash every candidate
     /// address on every request.
-    endpoint_hashes: [upstream.endpoint_keys_max]u64,
+    endpoint_hashes: []u64,
+    /// The config's endpoint index space, shared with the pool and the
+    /// health checker so all three agree on what a key means.
+    keys: upstream.EndpointKeys,
+    /// Scratch for `pick`'s eligible-endpoint list, `keys.stride` long.
+    /// It was a stack array sized by the old compile-time ceiling; with
+    /// the ceiling gone the length is a runtime value, and a
+    /// runtime-length stack array is exactly the dynamic allocation §5
+    /// forbids — so it is allocated once at init and reused. Sound
+    /// because a pick never overlaps another: the loop is single-threaded
+    /// and `pick` neither suspends nor re-enters.
+    eligible_scratch: []u16,
 
     /// Any nonzero constant seeds xorshift64* soundly; this one is the
     /// 64-bit golden-ratio constant, chosen for being recognizable.
     const pick_seed: u64 = 0x9E3779B97F4A7C15;
 
-    pub fn init(balancer: *Balancer, config: *const config_module.Config) void {
+    pub fn init(
+        balancer: *Balancer,
+        arena: std.mem.Allocator,
+        config: *const config_module.Config,
+        keys: upstream.EndpointKeys,
+    ) error{OutOfMemory}!void {
         assert(config.clusters.len >= 1);
-        assert(config.clusters.len <= constants.clusters_max);
+        assert(keys.count >= 1);
+        // The keys must describe *this* config. Tests and the simulator
+        // build a `Config` directly, bypassing the loader, so a mismatched
+        // pair would size these tables for one shape and index them for
+        // another — which is what the `clusters_max` ceiling used to catch
+        // here, before the tables stopped being sized by it.
+        assert(keys.count == @as(u32, @intCast(config.clusters.len)) * keys.stride);
         balancer.config = config;
-        @memset(&balancer.cursors, 0);
+        balancer.keys = keys;
+        balancer.cursors = try arena.alloc(u64, config.clusters.len);
+        balancer.endpoint_hashes = try arena.alloc(u64, keys.count);
+        balancer.eligible_scratch = try arena.alloc(u16, keys.stride);
+        @memset(balancer.cursors, 0);
         balancer.pick_state = pick_seed;
         assert(balancer.pick_state != 0); // xorshift64* cycles on nonzero state.
-        // Every key, not only the configured ones: an unconfigured slot is
-        // never read, and zeroing the whole table keeps "what did init
-        // leave here" a question with one answer.
-        @memset(&balancer.endpoint_hashes, 0);
+        // Every key, not only the configured ones: a ragged config leaves
+        // holes between clusters, those slots are never read, and zeroing
+        // the whole table keeps "what did init leave here" a question with
+        // one answer.
+        @memset(balancer.endpoint_hashes, 0);
         for (config.clusters, 0..) |cluster, cluster_index| {
             // Re-checked here rather than trusted from the loader, the
             // same defense `pick` and `eligibleEndpoints` keep: this loop
-            // indexes a table sized by that ceiling.
+            // indexes a table sized by that stride.
             assert(cluster.endpoints.len >= 1);
-            assert(cluster.endpoints.len <= constants.endpoints_per_cluster_max);
+            assert(cluster.endpoints.len <= keys.stride);
             for (cluster.endpoints, 0..) |*address, endpoint_index| {
-                const key = upstream.endpointKey(
-                    @intCast(cluster_index),
-                    @intCast(endpoint_index),
-                );
+                const key = keys.key(@intCast(cluster_index), @intCast(endpoint_index));
                 balancer.endpoint_hashes[key] = endpointId(address);
             }
         }
+        assert(balancer.cursors.len == config.clusters.len);
+        assert(balancer.endpoint_hashes.len == keys.count);
     }
 
     /// A pick names the endpoint both ways: the address to dial and the
@@ -179,13 +203,13 @@ pub const Balancer = struct {
         balancer: *Balancer,
         cluster_index: u16,
         load: *const upstream.Load,
-        healthy: *const [upstream.endpoint_keys_max]bool,
+        healthy: []const bool,
         client_address: *const std.Io.net.IpAddress,
     ) ?Pick {
         assert(cluster_index < balancer.config.clusters.len);
         const cluster = &balancer.config.clusters[cluster_index];
         assert(cluster.endpoints.len >= 1);
-        assert(cluster.endpoints.len <= constants.endpoints_per_cluster_max);
+        assert(cluster.endpoints.len <= balancer.keys.stride);
         if (cluster.endpoints.len == 1 and cluster.max_inflight == null) {
             // Neither a rotation nor a draw: uncapped single-endpoint
             // clusters stay branch-cheap and policy state is untouched.
@@ -194,8 +218,8 @@ pub const Balancer = struct {
             // general path below.
             return .{ .address = cluster.endpoints[0], .endpoint_index = 0 };
         }
-        var eligible: [constants.endpoints_per_cluster_max]u16 = undefined;
-        const count = eligibleEndpoints(cluster_index, cluster, load, healthy, &eligible);
+        const eligible = balancer.eligible_scratch;
+        const count = eligibleEndpoints(balancer.keys, cluster_index, cluster, load, healthy, eligible);
         if (count == 0) {
             // Every endpoint is at its §8 cap. Unlike the health mask
             // this does *not* fail open: an ejected cluster means "we do
@@ -231,17 +255,19 @@ pub const Balancer = struct {
     /// is judged over the endpoints health would have used, so a cluster
     /// that fails open still respects its caps.
     fn eligibleEndpoints(
+        keys: upstream.EndpointKeys,
         cluster_index: u16,
         cluster: *const config_module.Config.Cluster,
         load: *const upstream.Load,
-        healthy: *const [upstream.endpoint_keys_max]bool,
-        eligible: *[constants.endpoints_per_cluster_max]u16,
+        healthy: []const bool,
+        eligible: []u16,
     ) u16 {
         assert(cluster.endpoints.len >= 1);
+        assert(cluster.endpoints.len <= eligible.len);
         var count: u16 = 0;
         for (0..cluster.endpoints.len) |endpoint_index| {
             const index: u16 = @intCast(endpoint_index);
-            if (healthy[upstream.endpointKey(cluster_index, index)]) {
+            if (healthy[keys.key(cluster_index, index)]) {
                 eligible[count] = index;
                 count += 1;
             }
@@ -257,7 +283,7 @@ pub const Balancer = struct {
             assert(cap >= 1);
             var under: u16 = 0;
             for (eligible[0..count]) |index| {
-                if (load.inFlight(upstream.endpointKey(cluster_index, index)) < cap) {
+                if (load.inFlight(keys.key(cluster_index, index)) < cap) {
                     eligible[under] = index;
                     under += 1;
                 }
@@ -315,8 +341,8 @@ pub const Balancer = struct {
         // slot, so before this view the draw on a pure-L4 cluster read a
         // table of zeros and spread uniformly while presenting as
         // load-aware.
-        const first_load = load.inFlight(upstream.endpointKey(cluster_index, first));
-        const second_load = load.inFlight(upstream.endpointKey(cluster_index, second));
+        const first_load = load.inFlight(balancer.keys.key(cluster_index, first));
+        const second_load = load.inFlight(balancer.keys.key(cluster_index, second));
         return if (second_load < first_load) second else first;
     }
 
@@ -380,7 +406,7 @@ pub const Balancer = struct {
         assert(cluster_index < balancer.config.clusters.len);
         assert(endpoint_index < balancer.config.clusters[cluster_index].endpoints.len);
         const endpoint_hash =
-            balancer.endpoint_hashes[upstream.endpointKey(cluster_index, endpoint_index)];
+            balancer.endpoint_hashes[balancer.keys.key(cluster_index, endpoint_index)];
         // Both operands are already avalanched, so the xor combines them
         // without structure and the final mix restores it to a uniform
         // 64-bit score.
@@ -403,18 +429,36 @@ pub const Balancer = struct {
     }
 };
 
-const test_counts_len = upstream.endpoint_keys_max;
+/// The index space every test here builds its tables against. Wider than
+/// any test cluster on both axes, so a stride bug shows up as a key
+/// landing in another cluster's row rather than out of bounds.
+const test_keys: upstream.EndpointKeys = .init(4, 8);
+
+/// The index space a test's own config implies — the same derivation
+/// `Server.endpointKeysFor` does in production, which `init` now asserts
+/// the caller got right. Tables below stay `test_keys`-sized (wider than
+/// any test config) because every test indexes cluster 0, where the key
+/// is the endpoint index whatever the stride is.
+fn testKeysFor(config: *const config_module.Config) upstream.EndpointKeys {
+    var stride: u16 = 1;
+    for (config.clusters) |cluster| {
+        stride = @max(stride, @as(u16, @intCast(cluster.endpoints.len)));
+    }
+    return .init(@intCast(config.clusters.len), stride);
+}
+
+const test_counts_len = test_keys.count;
 
 /// The no-prober baseline every pre-mask test picks through: all healthy,
 /// exactly what `Checker.init` hands a server whose clusters never check.
-const test_healthy_all = [_]bool{true} ** upstream.endpoint_keys_max;
+const test_healthy_all = [_]bool{true} ** test_keys.count;
 
 /// The L4 half of the load view, all zero: what a pure-L7 test sees.
-const test_l4_idle = [_]u16{0} ** upstream.endpoint_keys_max;
+const test_l4_idle = [_]u16{0} ** test_keys.count;
 
 /// A load view over an L7 lease table, for the tests that only vary
 /// that half. The pair-of-tables shape is what production passes.
-fn testLoad(l7: *const [upstream.endpoint_keys_max]u16) upstream.Load {
+fn testLoad(l7: *const [test_keys.count]u16) upstream.Load {
     return .{ .l7 = l7, .l4 = &test_l4_idle };
 }
 
@@ -448,12 +492,14 @@ test "balancer: rr cycles endpoints and wraps per cluster" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Rotation is exact whatever the load table says: rr ignores it.
     var counts = [_]u16{0} ** test_counts_len;
-    counts[upstream.endpointKey(0, 0)] = 100;
+    counts[test_keys.key(0, 0)] = 100;
     const expected = [_]u16{ 0, 1, 2, 0, 1 };
     for (expected) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
@@ -470,8 +516,10 @@ test "balancer: a single-endpoint cluster short-circuits without a draw" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
     const state_before = balancer.pick_state;
 
     const counts = [_]u16{0} ** test_counts_len;
@@ -495,14 +543,16 @@ test "balancer: p2c prefers the less-loaded of its two candidates" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Endpoint 1 is drowning; 0 and 2 are idle. Whatever pair is drawn,
     // the pick must never be the drowning endpoint: any pair containing
     // it also contains an idle endpoint that wins the comparison.
     var counts = [_]u16{0} ** test_counts_len;
-    counts[upstream.endpointKey(0, 1)] = 100;
+    counts[test_keys.key(0, 1)] = 100;
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
@@ -520,8 +570,10 @@ test "balancer: p2c spreads across endpoints under equal load" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // With every count equal the tie rule keeps the first candidate — a
     // uniform draw — so all endpoints must be hit over a modest run.
@@ -546,10 +598,14 @@ test "balancer: same seed, same picks — the p2c draw is deterministic" {
     };
     const config = testConfig(&clusters);
 
+    var left_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer left_arena.deinit();
     var left: Balancer = undefined;
-    left.init(&config);
+    try left.init(left_arena.allocator(), &config, testKeysFor(&config));
+    var right_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer right_arena.deinit();
     var right: Balancer = undefined;
-    right.init(&config);
+    try right.init(right_arena.allocator(), &config, testKeysFor(&config));
 
     // The simulator replays every seed twice and hashes the traces (§9);
     // two same-seed balancers must agree draw for draw.
@@ -573,13 +629,15 @@ test "balancer: rr rotates over the healthy endpoints only" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Endpoint 1 is ejected (§7): rotation covers the survivors exactly,
     // never the ejected one.
     var healthy = test_healthy_all;
-    healthy[upstream.endpointKey(0, 1)] = false;
+    healthy[test_keys.key(0, 1)] = false;
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 2, 0, 2, 0 };
     for (expected) |want_index| {
@@ -598,16 +656,18 @@ test "balancer: p2c never picks an ejected endpoint" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Even the least-loaded endpoint is off the table while ejected —
     // health outranks load (§7).
     var healthy = test_healthy_all;
-    healthy[upstream.endpointKey(0, 1)] = false;
+    healthy[test_keys.key(0, 1)] = false;
     var counts = [_]u16{0} ** test_counts_len;
-    counts[upstream.endpointKey(0, 0)] = 50;
-    counts[upstream.endpointKey(0, 2)] = 50;
+    counts[test_keys.key(0, 0)] = 50;
+    counts[test_keys.key(0, 2)] = 50;
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client).?;
@@ -624,14 +684,16 @@ test "balancer: p2c narrowed to one healthy endpoint spends no draw" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
     const state_before = balancer.pick_state;
 
     // One survivor: the pick is forced, so the PRNG must not advance —
     // the same no-draw rule as a single-endpoint cluster.
     var healthy = test_healthy_all;
-    healthy[upstream.endpointKey(0, 0)] = false;
+    healthy[test_keys.key(0, 0)] = false;
     const counts = [_]u16{0} ** test_counts_len;
     var round: u32 = 0;
     while (round < 10) : (round += 1) {
@@ -651,15 +713,17 @@ test "balancer: a fully-ejected cluster fails open to every endpoint" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Every endpoint ejected: the mask must not brick the cluster —
     // rotation runs over the full set as if no prober existed (§7).
     var healthy = test_healthy_all;
-    healthy[upstream.endpointKey(0, 0)] = false;
-    healthy[upstream.endpointKey(0, 1)] = false;
-    healthy[upstream.endpointKey(0, 2)] = false;
+    healthy[test_keys.key(0, 0)] = false;
+    healthy[test_keys.key(0, 1)] = false;
+    healthy[test_keys.key(0, 2)] = false;
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 1, 2, 0, 1 };
     for (expected) |want_index| {
@@ -678,8 +742,10 @@ test "balancer: policies keep independent state across clusters" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Interleaving a p2c cluster's draws must not perturb the rr
     // cluster's rotation: cursor and PRNG are separate state.
@@ -717,8 +783,10 @@ test "balancer: hash sends one client to one endpoint, every time" {
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
     const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     const counts = [_]u16{0} ** test_counts_len;
     const client = testAddress("203.0.113.9:51000");
@@ -732,7 +800,7 @@ test "balancer: hash sends one client to one endpoint, every time" {
     // The load table is what p2c reads; hash must ignore it, or two
     // processes under different load would disagree about one client.
     var loaded = [_]u16{0} ** test_counts_len;
-    loaded[upstream.endpointKey(0, first)] = 10_000;
+    loaded[test_keys.key(0, first)] = 10_000;
     try std.testing.expectEqual(
         first,
         balancer.pick(0, &testLoad(&loaded), &test_healthy_all, &client).?.endpoint_index,
@@ -747,8 +815,10 @@ test "balancer: hash spends no PRNG state and needs none" {
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
     const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
     const state_before = balancer.pick_state;
 
     const counts = [_]u16{0} ** test_counts_len;
@@ -765,8 +835,10 @@ test "balancer: hash spreads distinct clients across every endpoint" {
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
     const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     const counts = [_]u16{0} ** test_counts_len;
     const clients: u16 = 4000;
@@ -797,8 +869,10 @@ test "balancer: ejecting an endpoint moves its clients and nobody else's" {
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
     const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     const counts = [_]u16{0} ** test_counts_len;
     const clients: u16 = 4000;
@@ -810,7 +884,7 @@ test "balancer: ejecting an endpoint moves its clients and nobody else's" {
 
     const ejected: u16 = 3;
     var healthy = test_healthy_all;
-    healthy[upstream.endpointKey(0, ejected)] = false;
+    healthy[test_keys.key(0, ejected)] = false;
 
     var moved: u32 = 0;
     index = 0;
@@ -870,10 +944,14 @@ test "balancer: two processes agree, and so do a config's reorderings" {
     const forward_config = testConfig(&forward_clusters);
     const reversed_config = testConfig(&reversed_clusters);
 
+    var left_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer left_arena.deinit();
     var left: Balancer = undefined;
-    left.init(&forward_config);
+    try left.init(left_arena.allocator(), &forward_config, testKeysFor(&forward_config));
+    var right_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer right_arena.deinit();
     var right: Balancer = undefined;
-    right.init(&reversed_config);
+    try right.init(right_arena.allocator(), &reversed_config, testKeysFor(&reversed_config));
 
     const counts = [_]u16{0} ** test_counts_len;
     var index: u16 = 0;
@@ -896,8 +974,10 @@ test "balancer: an IPv6 client keeps its endpoint when its /64 does" {
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
     const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     const counts = [_]u16{0} ** test_counts_len;
     const first = testAddress("[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:51000");
@@ -976,11 +1056,13 @@ test "balancer: a fully ejected hash cluster still answers, deterministically" {
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
     const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     const counts = [_]u16{0} ** test_counts_len;
-    const none_healthy = [_]bool{false} ** upstream.endpoint_keys_max;
+    const none_healthy = [_]bool{false} ** test_keys.count;
     var index: u16 = 0;
     while (index < 500) : (index += 1) {
         const client = testClientAt(index);
@@ -1016,8 +1098,10 @@ test "balancer: p2c weighs L4 connections, not only L7 leases" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // A pure-L4 cluster: the lease table stays empty for its whole life,
     // so before the load view this draw compared zero against zero and
@@ -1026,7 +1110,7 @@ test "balancer: p2c weighs L4 connections, not only L7 leases" {
     // contains a calmer endpoint, so it must never win.
     const l7_idle = [_]u16{0} ** test_counts_len;
     var l4 = [_]u16{0} ** test_counts_len;
-    l4[upstream.endpointKey(0, 1)] = 100;
+    l4[test_keys.key(0, 1)] = 100;
     const load: upstream.Load = .{ .l7 = &l7_idle, .l4 = &l4 };
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
@@ -1043,8 +1127,10 @@ test "balancer: p2c compares the sum of both protocols" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Endpoint 0 carries 5 requests and no connections; endpoint 1
     // carries 1 request and 9 connections. Reading either table alone
@@ -1052,12 +1138,12 @@ test "balancer: p2c compares the sum of both protocols" {
     // the origin actually feels.
     var l7 = [_]u16{0} ** test_counts_len;
     var l4 = [_]u16{0} ** test_counts_len;
-    l7[upstream.endpointKey(0, 0)] = 5;
-    l7[upstream.endpointKey(0, 1)] = 1;
-    l4[upstream.endpointKey(0, 1)] = 9;
+    l7[test_keys.key(0, 0)] = 5;
+    l7[test_keys.key(0, 1)] = 1;
+    l4[test_keys.key(0, 1)] = 9;
     const load: upstream.Load = .{ .l7 = &l7, .l4 = &l4 };
-    try std.testing.expectEqual(@as(u32, 5), load.inFlight(upstream.endpointKey(0, 0)));
-    try std.testing.expectEqual(@as(u32, 10), load.inFlight(upstream.endpointKey(0, 1)));
+    try std.testing.expectEqual(@as(u32, 5), load.inFlight(test_keys.key(0, 0)));
+    try std.testing.expectEqual(@as(u32, 10), load.inFlight(test_keys.key(0, 1)));
     var round: u32 = 0;
     while (round < 100) : (round += 1) {
         try std.testing.expectEqual(
@@ -1076,14 +1162,16 @@ test "balancer: a capped endpoint is skipped while another has room" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Endpoint 0 is at its cap, endpoint 1 is not. Rotation must land on
     // 1 every time — a cap narrows the eligible set, it does not shed
     // while any endpoint can still take work.
     var l7 = [_]u16{0} ** test_counts_len;
-    l7[upstream.endpointKey(0, 0)] = 2;
+    l7[test_keys.key(0, 0)] = 2;
     const load = testLoad(&l7);
     var round: u32 = 0;
     while (round < 8) : (round += 1) {
@@ -1103,22 +1191,24 @@ test "balancer: a fully capped cluster refuses rather than failing open" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Both endpoints at capacity: no pick. This is the deliberate
     // difference from the health mask, which fails *open* — an ejected
     // cluster means "we do not know", a capped one means "we know they
     // are full", and dialing anyway is what the cap exists to stop.
     var l7 = [_]u16{0} ** test_counts_len;
-    l7[upstream.endpointKey(0, 0)] = 3;
-    l7[upstream.endpointKey(0, 1)] = 3;
+    l7[test_keys.key(0, 0)] = 3;
+    l7[test_keys.key(0, 1)] = 3;
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
         balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client),
     );
     // One request completes on endpoint 1 and the cluster serves again.
-    l7[upstream.endpointKey(0, 1)] = 2;
+    l7[test_keys.key(0, 1)] = 2;
     try std.testing.expectEqual(
         @as(u16, 1),
         balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client).?.endpoint_index,
@@ -1133,24 +1223,26 @@ test "balancer: the cap counts both protocols, and covers one endpoint" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // A single-endpoint cluster takes the fast path when uncapped; with
     // a cap it must not, or the one endpoint could never be protected.
     // Three L7 requests and one L4 connection is four: at the cap.
     var l7 = [_]u16{0} ** test_counts_len;
     var l4 = [_]u16{0} ** test_counts_len;
-    l7[upstream.endpointKey(0, 0)] = 3;
-    l4[upstream.endpointKey(0, 0)] = 1;
+    l7[test_keys.key(0, 0)] = 3;
+    l4[test_keys.key(0, 0)] = 1;
     const load: upstream.Load = .{ .l7 = &l7, .l4 = &l4 };
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
         balancer.pick(0, &load, &test_healthy_all, &test_client),
     );
     // Reading either table alone would leave room and dial anyway.
-    try std.testing.expect(l7[upstream.endpointKey(0, 0)] < 4);
-    try std.testing.expect(l4[upstream.endpointKey(0, 0)] < 4);
+    try std.testing.expect(l7[test_keys.key(0, 0)] < 4);
+    try std.testing.expect(l4[test_keys.key(0, 0)] < 4);
 }
 
 test "balancer: capacity is judged over the endpoints health left" {
@@ -1162,24 +1254,26 @@ test "balancer: capacity is judged over the endpoints health left" {
     };
     const config = testConfig(&clusters);
 
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
     var balancer: Balancer = undefined;
-    balancer.init(&config);
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Endpoint 0 is ejected, so health leaves only endpoint 1 — which is
     // at its cap. The cap runs second and refuses: a cluster whose only
     // healthy endpoint is full must not be handed the request anyway.
     var healthy = test_healthy_all;
-    healthy[upstream.endpointKey(0, 0)] = false;
+    healthy[test_keys.key(0, 0)] = false;
     var l7 = [_]u16{0} ** test_counts_len;
-    l7[upstream.endpointKey(0, 1)] = 1;
+    l7[test_keys.key(0, 1)] = 1;
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
         balancer.pick(0, &testLoad(&l7), &healthy, &test_client),
     );
     // And when health fails open — every endpoint ejected — the caps
     // still apply to the whole set rather than being bypassed with it.
-    healthy[upstream.endpointKey(0, 1)] = false;
-    l7[upstream.endpointKey(0, 0)] = 1;
+    healthy[test_keys.key(0, 1)] = false;
+    l7[test_keys.key(0, 0)] = 1;
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
         balancer.pick(0, &testLoad(&l7), &healthy, &test_client),

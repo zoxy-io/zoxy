@@ -46,15 +46,15 @@ pub fn Checker(comptime IoType: type) type {
 
     return struct {
         server: *ServerType,
-        /// The §7 balancing mask, indexed by `upstream.endpointKey`. All
+        /// The §7 balancing mask, indexed by `upstream.EndpointKeys`. All
         /// true at start; only probed (checked) endpoints ever flip.
-        healthy: [upstream.endpoint_keys_max]bool,
+        healthy: []bool,
         /// Consecutive failed probes toward `health_probe_fall`; tracked
         /// only while the endpoint is healthy, reset by any pass.
-        fail_streaks: [upstream.endpoint_keys_max]u8,
+        fail_streaks: []u8,
         /// Consecutive passed probes toward `health_probe_rise`; tracked
         /// only while the endpoint is ejected, reset by any fail.
-        ok_streaks: [upstream.endpoint_keys_max]u8,
+        ok_streaks: []u8,
         /// Endpoints under checks — static after `init` (the sum of
         /// `endpoints.len` over every `check` cluster); zero leaves the
         /// prober `.off` forever.
@@ -143,11 +143,20 @@ pub fn Checker(comptime IoType: type) type {
             _pad: u2 = 0,
         };
 
-        pub fn init(checker: *Self, server: *ServerType) void {
+        pub fn init(
+            checker: *Self,
+            arena: std.mem.Allocator,
+            server: *ServerType,
+            keys: upstream.EndpointKeys,
+        ) error{OutOfMemory}!void {
+            assert(keys.count >= 1);
             checker.server = server;
-            @memset(&checker.healthy, true);
-            @memset(&checker.fail_streaks, 0);
-            @memset(&checker.ok_streaks, 0);
+            checker.healthy = try arena.alloc(bool, keys.count);
+            checker.fail_streaks = try arena.alloc(u8, keys.count);
+            checker.ok_streaks = try arena.alloc(u8, keys.count);
+            @memset(checker.healthy, true);
+            @memset(checker.fail_streaks, 0);
+            @memset(checker.ok_streaks, 0);
             checker.checked_count = 0;
             checker.unhealthy_count = 0;
             checker.state = .off;
@@ -169,13 +178,17 @@ pub fn Checker(comptime IoType: type) type {
             checker.op_cancel = .{};
             const clusters = server.config.clusters;
             assert(clusters.len >= 1);
-            assert(clusters.len <= constants.clusters_max);
+            // Same pairing check the balancer makes: `keys` must describe
+            // this config, or the mask is sized for one shape and indexed
+            // for another. `clusters.len <= healthy.len` does *not* say
+            // that — it holds for any `stride >= 1`.
+            assert(keys.count == @as(u32, @intCast(clusters.len)) * keys.stride);
             for (clusters) |cluster| {
                 if (cluster.check != null) {
                     checker.checked_count += @intCast(cluster.endpoints.len);
                 }
             }
-            assert(checker.checked_count <= upstream.endpoint_keys_max);
+            assert(checker.checked_count <= checker.healthy.len);
             assert(checker.armedCount() == 0);
         }
 
@@ -626,7 +639,7 @@ pub fn Checker(comptime IoType: type) type {
         fn witnessPass(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
             const rise = checker.checkOf(cluster_index).rise;
             assert(rise >= 1);
-            const key = upstream.endpointKey(cluster_index, endpoint_index);
+            const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
             checker.fail_streaks[key] = 0;
             if (checker.healthy[key]) {
                 assert(checker.ok_streaks[key] == 0);
@@ -646,7 +659,7 @@ pub fn Checker(comptime IoType: type) type {
             const fall = checker.checkOf(cluster_index).fall;
             assert(fall >= 1);
             checker.server.counters.increment("health_probes_failed");
-            const key = upstream.endpointKey(cluster_index, endpoint_index);
+            const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
             checker.ok_streaks[key] = 0;
             // Already ejected: nothing further to count — streaks resume
             // meaning only once a pass starts a recovery.
@@ -669,7 +682,7 @@ pub fn Checker(comptime IoType: type) type {
         fn closeParked(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
             // Only an ejection reaches here: the endpoint was just marked
             // unhealthy by the caller.
-            assert(!checker.healthy[upstream.endpointKey(cluster_index, endpoint_index)]);
+            assert(!checker.healthy[checker.server.upstreams.keys.key(cluster_index, endpoint_index)]);
             const server = checker.server;
             const capacity = server.upstreams.capacity();
             var reaped: u32 = 0;

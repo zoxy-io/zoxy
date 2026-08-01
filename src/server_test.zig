@@ -43,7 +43,7 @@ pub const Scenario = struct {
 
     fn sampleL4Charge(context: ?*anyopaque) void {
         const scenario: *Scenario = @ptrCast(@alignCast(context.?));
-        scenario.l4_sample = scenario.server.l4_inflight[upstream_module.endpointKey(0, 0)];
+        scenario.l4_sample = scenario.server.l4_inflight[scenario.server.upstreams.keys.key(0, 0)];
     }
 
     fn clientEnded(scenario: *Scenario) void {
@@ -1043,7 +1043,7 @@ test "relay: an L4 connection charges its endpoint, and gives it back" {
     // file and every sim seed (§9).
     try std.testing.expectEqual(
         @as(u16, 0),
-        bed.server.l4_inflight[upstream_module.endpointKey(0, 0)],
+        bed.server.l4_inflight[bed.server.upstreams.keys.key(0, 0)],
     );
     try bed.expectDrained();
 }

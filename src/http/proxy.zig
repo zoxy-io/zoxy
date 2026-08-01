@@ -502,7 +502,7 @@ pub fn Proxy(comptime IoType: type) type {
             return server.balancer.pick(
                 conn.cluster_index,
                 &server.endpointLoad(),
-                &server.health.healthy,
+                server.health.healthy,
                 &conn.client_address,
             ) orelse {
                 respond(server, conn, 503, "l7_shed_endpoint_inflight");

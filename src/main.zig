@@ -297,6 +297,7 @@ fn printBudgets(
         @intCast(config.listeners.len),
     );
     const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
+    const endpoint_stride = ServerXev.endpointKeysFor(config).stride;
     // §5's promise is that the printed total covers everything this
     // process holds for its life. The config arena qualifies — it is
     // never freed — so it joins the total even though it is the one term
@@ -309,6 +310,7 @@ fn printBudgets(
         .upstream_slots = limits.upstream_slots,
         .upstream_bytes = @sizeOf(UpstreamType),
         .access_log_bytes = access_log_bytes,
+        .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
     }) + config_arena_bytes;
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
@@ -320,6 +322,7 @@ fn printBudgets(
         \\budgets (closed-form, DESIGN.md §5/§8):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B + access log {d} KiB
+        \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + config arena {d} KiB (measured, not closed-form)
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
@@ -336,6 +339,9 @@ fn printBudgets(
         limits.upstream_slots,
         @sizeOf(UpstreamType),
         access_log_bytes / 1024,
+        ServerXev.endpointTableBytes(config),
+        config.clusters.len,
+        endpoint_stride,
         config_arena_bytes / 1024,
         fds_required,
         constants.ring_entries,

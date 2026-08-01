@@ -52,7 +52,7 @@ pub fn Server(comptime IoType: type) type {
         /// `u16` for the same reason `leased_counts` is: one charge per
         /// live conn slot bounds every entry by `conn_slots_max`, which
         /// `constants` asserts fits (`conn_slots_max - 1 <= maxInt(u16)`).
-        l4_inflight: [upstream_module.endpoint_keys_max]u16,
+        l4_inflight: []u16,
         listeners: []ListenerState,
         listeners_count: u16,
         /// The load-balancing policy: resolves a cluster to the endpoint to
@@ -147,6 +147,50 @@ pub fn Server(comptime IoType: type) type {
             accepting: bool,
         };
 
+        /// The endpoint index space this config needs (§7): one row per
+        /// cluster, each `stride` wide, where `stride` is the widest
+        /// cluster the operator declared. Derived from the loaded config
+        /// rather than from a compiled ceiling, so the tables cost what
+        /// this deployment uses.
+        pub fn endpointKeysFor(
+            config: *const config_module.Config,
+        ) upstream_module.EndpointKeys {
+            assert(config.clusters.len >= 1);
+            var stride: u16 = 1;
+            for (config.clusters) |cluster| {
+                assert(cluster.endpoints.len >= 1);
+                stride = @max(stride, @as(u16, @intCast(cluster.endpoints.len)));
+            }
+            assert(stride >= 1);
+            return .init(@intCast(config.clusters.len), stride);
+        }
+
+        /// What the endpoint-keyed tables take from the startup arena for
+        /// this config (§5) — closed-form in the config, like every pool
+        /// term, so the printed budget stays a prediction rather than a
+        /// measurement. Every width comes from the owning module's own
+        /// element type: a table that changes type changes this number
+        /// without anyone remembering to.
+        ///
+        /// `init` below allocates exactly these, in this order.
+        pub fn endpointTableBytes(config: *const config_module.Config) u64 {
+            const keys = endpointKeysFor(config);
+            const count: u64 = keys.count;
+            const per_key =
+                @sizeOf(u32) + // UpstreamPool.idle_heads
+                @sizeOf(u16) + // UpstreamPool.leased_counts
+                @sizeOf(u64) + // Balancer.endpoint_hashes
+                @sizeOf(u16) + // Server.l4_inflight
+                @sizeOf(bool) + // Checker.healthy
+                @sizeOf(u8) + // Checker.fail_streaks
+                @sizeOf(u8); // Checker.ok_streaks
+            const cursors = @as(u64, config.clusters.len) * @sizeOf(u64);
+            const scratch = @as(u64, keys.stride) * @sizeOf(u16);
+            const total = count * per_key + cursors + scratch;
+            assert(total > 0);
+            return total;
+        }
+
         pub fn init(
             server: *Self,
             arena: std.mem.Allocator,
@@ -180,11 +224,15 @@ pub fn Server(comptime IoType: type) type {
             server.config = config;
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
-            try server.upstreams.init(arena, options.upstream_slots);
-            @memset(&server.l4_inflight, 0);
+            // One index space, derived once and shared by every
+            // endpoint-keyed table so they cannot disagree about a key.
+            const keys = endpointKeysFor(config);
+            try server.upstreams.init(arena, options.upstream_slots, keys);
+            server.l4_inflight = try arena.alloc(u16, keys.count);
+            @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
-            server.balancer.init(config);
+            try server.balancer.init(arena, config, keys);
             server.counters = .{};
             server.draining = false;
             server.relay_pressure = false;
@@ -198,7 +246,7 @@ pub fn Server(comptime IoType: type) type {
             server.admin.init(server, config.admin_bind);
             server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
             try server.access_log.reserve(arena);
-            server.health.init(server);
+            try server.health.init(arena, server, keys);
         }
 
         /// Override the admin/metrics bind before `start` — the simulator
@@ -688,7 +736,7 @@ pub fn Server(comptime IoType: type) type {
             const pick = server.balancer.pick(
                 cluster_index,
                 &server.endpointLoad(),
-                &server.health.healthy,
+                server.health.healthy,
                 &conn.client_address,
             ) orelse {
                 // Every endpoint is at its §8 cap. An L4 listener has no
@@ -1086,8 +1134,8 @@ pub fn Server(comptime IoType: type) type {
         /// writer.
         pub fn endpointLoad(server: *const Self) upstream_module.Load {
             return .{
-                .l7 = &server.upstreams.leased_counts,
-                .l4 = &server.l4_inflight,
+                .l7 = server.upstreams.leased_counts,
+                .l4 = server.l4_inflight,
             };
         }
 
@@ -1098,7 +1146,7 @@ pub fn Server(comptime IoType: type) type {
         fn chargeL4(server: *Self, conn: *ConnType, cluster_index: u16, endpoint_index: u16) void {
             assert(conn.protocol == .l4);
             assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
-            const key = upstream_module.endpointKey(cluster_index, endpoint_index);
+            const key = server.upstreams.keys.key(cluster_index, endpoint_index);
             server.l4_inflight[key] += 1;
             // Every charge is held by a live conn slot, so one endpoint's
             // count can never pass the conn pool's own size — the same
@@ -1115,7 +1163,7 @@ pub fn Server(comptime IoType: type) type {
         /// its dial, or torn down twice, has nothing charged.
         fn releaseL4(server: *Self, conn: *ConnType) void {
             if (conn.charged_endpoint == conn_module.LogState.endpoint_none) return;
-            const key = upstream_module.endpointKey(conn.charged_cluster, conn.charged_endpoint);
+            const key = server.upstreams.keys.key(conn.charged_cluster, conn.charged_endpoint);
             assert(server.l4_inflight[key] >= 1);
             server.l4_inflight[key] -= 1;
             conn.charged_endpoint = conn_module.LogState.endpoint_none;

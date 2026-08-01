@@ -772,6 +772,17 @@ pub const PoolSizes = struct {
     /// holds for its life, and §5's promise is that the printed total
     /// covers all of that. `accessLogBytes` is the closed form.
     access_log_bytes: u64,
+    /// The endpoint-keyed tables (§7) — the pool's idle heads and lease
+    /// counts, the balancer's endpoint hashes, cursors and pick scratch,
+    /// the server's L4 charges, and the health checker's mask and two
+    /// streak counters. Startup arena memory held for the process's life,
+    /// so §5's promise covers it.
+    ///
+    /// Passed in rather than derived here because the per-entry widths
+    /// belong to those modules' element types, not to this file: computing
+    /// it from hardcoded widths would silently drift the moment one of
+    /// them changed. `Server.endpointTableBytes` is the closed form.
+    endpoint_table_bytes: u64,
 };
 
 /// What the access log reserves: nothing when it is off, both staging
@@ -808,7 +819,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
-        sizes.access_log_bytes;
+        sizes.access_log_bytes + sizes.endpoint_table_bytes;
     assert(total > 0);
     return total;
 }
@@ -838,6 +849,9 @@ test "budgets: memory total matches the closed form" {
     const conn_bytes: u64 = 10240;
     const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
     const upstream_bytes: u64 = head_bytes_max + 64;
+    // The endpoint-keyed tables (§7): like the access log, a reservation
+    // that must move the total by exactly its own size and nothing else.
+    const endpoint_tables: u64 = 4096;
     // At the ceilings and at a shrunken (config-limits) shape alike, with
     // the access log on at the ceiling and off below it — the term is a
     // fixed reservation, so it must move the total by exactly its own size
@@ -845,7 +859,7 @@ test "budgets: memory total matches the closed form" {
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes +
-        accessLogBytes(access_log_buffer_bytes_default);
+        accessLogBytes(access_log_buffer_bytes_default) + endpoint_tables;
     try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
@@ -854,6 +868,7 @@ test "budgets: memory total matches the closed form" {
         .upstream_slots = upstream_slots_max,
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(access_log_buffer_bytes_default),
+        .endpoint_table_bytes = endpoint_tables,
     }));
     const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
@@ -864,6 +879,7 @@ test "budgets: memory total matches the closed form" {
         .upstream_slots = 8,
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(0),
+        .endpoint_table_bytes = 0,
     }));
     // An unconfigured access log reserves nothing (§5), and a configured
     // one reserves both buffers at whatever size it was given — the term
