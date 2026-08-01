@@ -311,6 +311,14 @@ above are the defaults, written out. An explicit `0` disables the three
 caps; for `connect_ms` and `idle_ms` it is rejected, since a zero-length
 dial or idle budget is a mistake rather than a policy.
 
+`connect_ms` must also be **strictly below** `idle_ms`, or the config is
+rejected at load. A connection's first deadline is the dial budget and the
+dial's completion re-stores it to the idle one, but zoxy's single timer per
+connection never moves earlier once armed — so an idle budget that does not
+exceed the dial budget would not take effect at the handoff and would reap
+late instead. Note this bites when only *one* field is tuned: raising
+`connect_ms` past the default 60 s `idle_ms` is rejected just the same.
+
 | field | default | meaning |
 |---|---|---|
 | `connect_ms` | `5000` | per-try upstream connect budget |

@@ -296,6 +296,7 @@ pub const ValidationError = error{
     EndpointPortZero,
     TimeoutZero,
     TimeoutOverLimit,
+    TimeoutOrderInvalid,
     LimitConnSlotsOutOfRange,
     LimitRelayBuffersOutOfRange,
     LimitRelayBuffersOverConnSlots,
@@ -877,7 +878,9 @@ pub const TimeoutsJson = struct {
     /// stays rejected — it would fail every dial before it left.
     connect_ms: u32 = constants.connect_ms_default,
     /// Optional, same argument: nginx's `keepalive_timeout` is 75 s and
-    /// its `client_header_timeout` 60 s. Zero would reap on arrival.
+    /// its `client_header_timeout` 60 s. Zero would reap on arrival, and a
+    /// value at or below `connect_ms` is rejected — the dial's handoff
+    /// cannot shorten a timer that is already counting down (§4/§5).
     idle_ms: u32 = constants.idle_ms_default,
     /// Optional, and `0` means "no cap" — the drain waits for the last
     /// connection however long that takes (§8).
@@ -911,7 +914,7 @@ pub const TimeoutsJson = struct {
             .maximum = constants.timeout_ms_max,
         },
         .idle_ms = .{
-            .desc = "Idle / head-read deadline.",
+            .desc = "Idle / head-read deadline; must exceed connect_ms.",
             .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
@@ -1740,9 +1743,28 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
             return error.TimeoutOverLimit;
         }
     }
+    // The one ordering between two configured values this loader enforces,
+    // and it is a correctness bound rather than taste: a connection's first
+    // deadline is armed at `connect_ms` (`Server.entryTimeoutMs`) and the
+    // dial's completion re-stores it to `idle_ms`, but the physical timer
+    // never moves earlier — only the stored target does (§4). So a
+    // `connect_ms` at or above `idle_ms` is not shortened by the handoff:
+    // the idle deadline waits out the connect-phase timer still counting
+    // down, and fires late by up to `connect_ms - idle_ms`.
+    //
+    // Rejected rather than clamped. A clamp would answer a config zoxy
+    // cannot honor with a log line, and the shipped defaults are already
+    // ordered (`constants` asserts the same relation over the pair), so
+    // this only ever fires on a hand-written config that was going to
+    // behave differently than it reads.
+    if (timeouts.connect_ms >= timeouts.idle_ms) {
+        return error.TimeoutOrderInvalid;
+    }
     // Postconditions: reaching here means every bound a consumer reads
     // without checking is in range, and every optional one is at most the
-    // ceiling — zero included, which each consumer reads as "off".
+    // ceiling — zero included, which each consumer reads as "off" — and the
+    // pair the deadline handoff depends on is ordered, which is what
+    // `Server.init` asserts of any config however it was built.
     for (nonzero) |value| {
         assert(value >= 1);
         assert(value <= constants.timeout_ms_max);
@@ -1750,6 +1772,7 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
     for (optional) |value| {
         assert(value <= constants.timeout_ms_max);
     }
+    assert(timeouts.connect_ms < timeouts.idle_ms);
 }
 
 const example_json = @embedFile("example_config");
@@ -1798,7 +1821,7 @@ test "config: max_lifetime_ms is optional and defaults to disabled" {
     const parsed = try parse(arena_state.allocator(),
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
     // The shipped example names neither optional bound, so both must land
@@ -1818,7 +1841,7 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
         defer arena_state.deinit();
         const parsed = try parse(
             arena_state.allocator(),
-            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
         );
         try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
     }
@@ -1828,7 +1851,7 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
         defer arena_state.deinit();
         const parsed = try parse(
             arena_state.allocator(),
-            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1,\"request_ms\":0}}",
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"request_ms\":0}}",
         );
         try std.testing.expectEqual(@as(u32, 0), parsed.request_timeout_ms);
     }
@@ -1837,7 +1860,7 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
         defer arena_state.deinit();
         const parsed = try parse(
             arena_state.allocator(),
-            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1,\"request_ms\":250}}",
+            head ++ "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"request_ms\":250}}",
         );
         try std.testing.expectEqual(@as(u32, 250), parsed.request_timeout_ms);
     }
@@ -1848,7 +1871,7 @@ test "config: request_ms is optional, defaults off, and shares the timeout ceili
         defer arena_state.deinit();
         const json = try std.fmt.allocPrint(
             arena_state.allocator(),
-            "{s}\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1,\"request_ms\":{d}}}}}",
+            "{s}\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1,\"request_ms\":{d}}}}}",
             .{ head, @as(u64, constants.timeout_ms_max) + 1 },
         );
         try std.testing.expectError(error.TimeoutOverLimit, parse(arena_state.allocator(), json));
@@ -1911,6 +1934,57 @@ test "config: a zero drain deadline is no cap, but a zero connect or idle is sti
     }
 }
 
+test "config: the dial budget must sit below the idle one" {
+    // The §4 handoff, stated as a load-time rule: the first deadline is
+    // armed at `connect_ms` and the dial's completion re-stores it to
+    // `idle_ms`, but the armed timer never moves earlier — so an idle
+    // budget that does not exceed the dial budget fires late rather than
+    // shortening. Equal is rejected too: it is the boundary where the
+    // handoff already changes nothing.
+    const rejected = [_][]const u8{
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":90000,"idle_ms":60000}}
+        ,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":5000,"idle_ms":5000}}
+        ,
+        // One field is enough to break the pair: a dial budget raised past
+        // the *defaulted* idle one is the shape an operator reaches for
+        // first, and it reads as tuning one number rather than as ordering
+        // two.
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":90000}}
+        ,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"idle_ms":1000}}
+        ,
+    };
+    for (rejected) |json| {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        try std.testing.expectError(
+            error.TimeoutOrderInvalid,
+            parse(arena_state.allocator(), json),
+        );
+    }
+    // A single millisecond of ordering is all the rule asks for, and the
+    // shipped defaults clear it by an order of magnitude.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":5000,"idle_ms":5001}}
+    );
+    try std.testing.expectEqual(@as(u32, 5000), parsed.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 5001), parsed.idle_timeout_ms);
+    try std.testing.expect(constants.connect_ms_default < constants.idle_ms_default);
+}
+
 test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real values" {
     // Explicit 0 is legal — it is *not* a TimeoutZero, unlike the dial
     // and idle budgets (§6).
@@ -1920,7 +1994,7 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,"max_lifetime_ms":0}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":0}}
         );
         try std.testing.expectEqual(@as(u32, 0), parsed.max_lifetime_ms);
     }
@@ -1930,7 +2004,7 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,"max_lifetime_ms":1800000}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":1800000}}
         );
         try std.testing.expectEqual(@as(u32, 1_800_000), parsed.max_lifetime_ms);
     }
@@ -1944,7 +2018,7 @@ test "config: listener protocol defaults to l4 and accepts http" {
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         try std.testing.expectEqual(Config.Listener.Protocol.l4, parsed.listeners[0].protocol);
     }
@@ -1954,7 +2028,7 @@ test "config: listener protocol defaults to l4 and accepts http" {
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         try std.testing.expectEqual(Config.Listener.Protocol.http, parsed.listeners[0].protocol);
     }
@@ -1971,7 +2045,7 @@ test "config: explicit routes resolve, sorted longest-prefix-first" {
         \\ "clusters":{"root":{"endpoints":["127.0.0.1:2"]},
         \\   "api":{"endpoints":["127.0.0.1:3"]},
         \\   "v2":{"endpoints":["127.0.0.1:4"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     const routes = parsed.listeners[0].routes;
     try std.testing.expectEqual(@as(usize, 3), routes.len);
@@ -1993,7 +2067,7 @@ test "config: explicit routes resolve, sorted longest-prefix-first" {
 test "config: routing schema rejects malformed tables" {
     const base_clusters =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
     // Neither cluster nor routes.
     try expectParseError(error.ListenerClusterOrRoutes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"}]," ++ base_clusters);
@@ -2038,7 +2112,7 @@ test "config: host routes resolve, host-specific sorted before any-host" {
         \\ "clusters":{"root":{"endpoints":["127.0.0.1:2"]},
         \\   "api":{"endpoints":["127.0.0.1:3"]},
         \\   "v2":{"endpoints":["127.0.0.1:4"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     const routes = parsed.listeners[0].routes;
     try std.testing.expectEqual(@as(usize, 3), routes.len);
@@ -2071,7 +2145,7 @@ test "config: filters compile into rules with matches and actions" {
         \\    "actions":[{"header_set":{"name":"X-Via","value":"zoxy"}},
         \\               {"rewrite_prefix":{"from":"/old","to":"/new"}}]}]}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     const filters = parsed.listeners[0].filters;
     try std.testing.expectEqual(@as(usize, 2), filters.len);
@@ -2100,7 +2174,7 @@ test "config: filters compile into rules with matches and actions" {
 test "config: filter schema rejects malformed rules" {
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"filters\":[";
     // L4 listener may not carry filters.
@@ -2146,7 +2220,7 @@ test "config: filter schema rejects malformed rules" {
 test "config: a filter set over the header-edit budget is rejected" {
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
     // One header_edits_max+1 header edits spread one-per-rule (each rule
     // stays under actions_per_filter_max): the whole-table total is what
@@ -2175,7 +2249,7 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"rr"},
             \\   "b":{"endpoints":["127.0.0.1:3"],"pick":"p2c"},
             \\   "c":{"endpoints":["127.0.0.1:4"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         try std.testing.expectEqual(Config.Cluster.Pick.rr, parsed.clusters[0].pick);
         try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[1].pick);
@@ -2185,7 +2259,7 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
     try expectParseError(error.ClusterPickUnknown,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"pc2"}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
 }
 
@@ -2198,7 +2272,7 @@ test "config: a check block resolves its kind, thresholds and budget" {
         \\     "check":{"type":"tcp","fall":5,"rise":1,"timeout_ms":250}},
         \\   "b":{"endpoints":["127.0.0.1:3"],"check":{"type":"tcp"}},
         \\   "c":{"endpoints":["127.0.0.1:4"]}},
-        \\ "timeouts":{"connect_ms":7,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":7,"idle_ms":8,"drain_deadline_ms":1}}
     );
     const tuned = parsed.clusters[0].check.?;
     try std.testing.expectEqual(@as(u8, 5), tuned.fall);
@@ -2223,7 +2297,7 @@ test "config: an http check resolves its request and expected status" {
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
             \\     "check":{"type":"http","path":"/healthz","host":"api.example",
             \\       "expect_status":204}}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         const check = parsed.clusters[0].check.?;
         try std.testing.expectEqual(Config.Cluster.Check.Kind.http, check.kind);
@@ -2240,7 +2314,7 @@ test "config: an http check resolves its request and expected status" {
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
             \\     "check":{"type":"http","path":"/health"}}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         const http = parsed.clusters[0].check.?.http.?;
         try std.testing.expectEqual(@as(?[]const u8, null), http.host);
@@ -2255,7 +2329,7 @@ test "config: a check block rejects every shape it cannot run" {
     ;
     const tail =
         \\}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
     // A typo in the vocabulary must not silently probe as tcp.
     try expectParseError(error.ClusterCheckTypeUnknown, head ++ "{\"type\":\"htp\"}" ++ tail);
@@ -2313,7 +2387,7 @@ test "config: health interval parses, defaults to inter, rejects zero" {
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,
             \\   "health_interval_ms":250}}
         );
         try std.testing.expectEqual(@as(u32, 250), parsed.health_interval_ms);
@@ -2324,7 +2398,7 @@ test "config: health interval parses, defaults to inter, rejects zero" {
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         try std.testing.expectEqual(constants.health_interval_ms_default, parsed.health_interval_ms);
     }
@@ -2332,13 +2406,13 @@ test "config: health interval parses, defaults to inter, rejects zero" {
     try expectParseError(error.TimeoutZero,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,
         \\   "health_interval_ms":0}}
     );
     try expectParseError(error.TimeoutOverLimit,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,
         \\   "health_interval_ms":3600001}}
     );
 }
@@ -2351,7 +2425,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
             \\ "limits":{"conn_slots":64}}
         );
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
@@ -2371,7 +2445,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
             \\ "limits":{"conn_slots":64,"relay_buffers":8,"upstream_slots":8,"cq_fill_eighths":4}}
         );
         try std.testing.expectEqual(@as(u32, 64), parsed.limits.conn_slots);
@@ -2386,7 +2460,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         const parsed = try parse(arena_state.allocator(),
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         // An omitted `limits` block yields the lean defaults, not the
         // ceilings (§5): the out-of-box footprint is small, opt up to scale.
@@ -2397,7 +2471,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
     }
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
     ;
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
     // Zero and over-ceiling both fail loudly, each with its own error.
@@ -2445,7 +2519,7 @@ test "config: admin block resolves a bind literal, absent leaves it off" {
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}
     ;
     // Absent: the admin plane stays off.
     {
@@ -2478,7 +2552,7 @@ test "config: unknown listener protocol fails loudly" {
     try expectParseError(error.ListenerProtocolUnknown,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"htpp"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
 }
 
@@ -2486,7 +2560,7 @@ test "config: max_lifetime_ms still obeys the shared ceiling" {
     try expectParseError(error.TimeoutOverLimit,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1,"max_lifetime_ms":3600001}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":3600001}}
     );
 }
 
@@ -2500,21 +2574,21 @@ test "config: strictness rejects unknown and duplicate fields" {
     try expectParseError(error.UnknownField,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","nope":1}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.DuplicateField,
         \\{"listeners":[],"listeners":[],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ClusterNameDuplicate,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]},"a":{"endpoints":["127.0.0.1:3"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.MissingField,
         \\{"clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
 }
 
@@ -2529,7 +2603,7 @@ test "config: a `$schema` editor hint loads and is ignored" {
             \\{"$schema":"https://zoxy.io/schema/config.schema.json",
             \\ "listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         // Accepted, and it changed nothing about the resolved config.
         try std.testing.expectEqual(@as(usize, 1), parsed.listeners.len);
@@ -2541,12 +2615,12 @@ test "config: a `$schema` editor hint loads and is ignored" {
         \\{"$schemas":"x",
         \\ "listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.UnknownField,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","$schema":"x"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
 }
 
@@ -2554,29 +2628,29 @@ test "config: references and addresses are validated" {
     try expectParseError(error.ClusterUnknown,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"missing"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     // Hostnames are structurally unresolvable: static addresses only (§1).
     try expectParseError(error.EndpointInvalid,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["origin.internal:80"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.EndpointPortZero,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:0"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ListenerBindInvalid,
         \\{"listeners":[{"bind":"not-an-address","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ListenerBindDuplicate,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"},
         \\               {"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
 }
 
@@ -2584,17 +2658,17 @@ test "config: every emptiness and limit has its own error" {
     try expectParseError(error.ListenersEmpty,
         \\{"listeners":[],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ClustersEmpty,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.EndpointsEmpty,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
         \\ "clusters":{"a":{"endpoints":[]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.TimeoutZero,
         \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
@@ -2622,7 +2696,7 @@ test "config: listeners over the limit" {
         }
         over_limit_json = over_limit_json ++
             \\],"clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         ;
     }
     try expectParseError(error.ListenersOverLimit, over_limit_json);
@@ -2682,6 +2756,10 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
         // Success implies the resolved invariants hold — no third outcome.
         assert(parsed.listeners.len >= 1);
         assert(parsed.clusters.len >= 1);
+        // The deadline handoff's ordering (§4/§5) is a property of every
+        // config that loads, so the fuzzer checks it here rather than
+        // trusting that the one rejecting branch was reached.
+        assert(parsed.connect_timeout_ms < parsed.idle_timeout_ms);
         for (parsed.listeners) |listener| {
             assert(listener.routes.len >= 1);
             assert(listener.routes.len <= constants.routes_max);
@@ -2697,7 +2775,7 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
 test "config: the access-log block resolves a sink, absent leaves it off" {
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}
     ;
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
 
@@ -2785,7 +2863,7 @@ test "config: a cluster name is bounded, because the access log echoes it" {
             arena_state.allocator(),
             head ++ at_limit ++ "\"}],\"clusters\":{\"" ++ at_limit ++
                 "\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
-                "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+                "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
         );
         try std.testing.expectEqual(@as(usize, constants.cluster_name_bytes_max), parsed.clusters[0].name.len);
     }
@@ -2793,19 +2871,19 @@ test "config: a cluster name is bounded, because the access log echoes it" {
         error.ClusterNameTooLong,
         head ++ long_name ++ "\"}],\"clusters\":{\"" ++ long_name ++
             "\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
-            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
     // An empty name names nothing and would render as `"cluster":""`.
     try expectParseError(
         error.ClusterNameEmpty,
         head ++ "\"}],\"clusters\":{\"\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
-            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}",
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
 }
 
 test "config: the hash pick policy and its key resolve, or fail loudly" {
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],\"clusters\":{\"a\":{";
-    const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+    const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
     const endpoints = "\"endpoints\":[\"127.0.0.1:2\"]";
 
     // `pick: hash` with no `hash` block takes the default key, so the
@@ -2876,7 +2954,7 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
             \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"max_inflight":64},
             \\   "b":{"endpoints":["127.0.0.1:3"]}},
-            \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
         try std.testing.expectEqual(@as(?u32, 64), parsed.clusters[0].max_inflight);
         // Absent is uncapped, which is the only spelling of "no limit".
@@ -2891,7 +2969,7 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
     ;
     const tail =
         \\}},
-        \\ "timeouts":{"connect_ms":1,"idle_ms":1,"drain_deadline_ms":1}}
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
     try expectParseError(error.ClusterMaxInflightOutOfRange, head ++ "0" ++ tail);
     try expectParseError(error.ClusterMaxInflightOutOfRange, head ++ "4294967295" ++ tail);
@@ -2918,7 +2996,7 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
 test "config: the forwarded block resolves a mode, and is http-only" {
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
     const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
-        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
     // Absent: the header is untouched, which is what every config that
     // predates this feature must keep doing.
@@ -2971,7 +3049,7 @@ test "config: a filter may not name the header zoxy manages" {
     // only on listeners that set it, so one mechanism owns the header.
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"filters\":[";
     const tail = "]}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
-        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":1,\"drain_deadline_ms\":1}}";
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
     inline for (.{ "header_set", "header_add" }) |action| {
         try expectParseError(error.FilterHeaderNameReserved, head ++

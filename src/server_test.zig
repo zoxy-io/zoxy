@@ -335,7 +335,14 @@ test "relay: proxied echo is byte-exact under the adversary across seeds" {
 
 test "relay: idle timeout reaps a silent connection" {
     var bed: TestBed = undefined;
-    try bed.setUp(std.testing.allocator, .{ .sim = .{ .seed = 31 }, .idle_timeout_ms = 50 });
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 31 },
+        .idle_timeout_ms = 50,
+        // Under the idle budget, as every config must be (§5); the dial
+        // completes instantly here, so what it is set to is immaterial
+        // beyond clearing the ordering the loader enforces.
+        .connect_timeout_ms = 10,
+    });
     defer bed.tearDown();
 
     bed.startClients(1, false);
@@ -591,6 +598,7 @@ test "drain: a zero deadline waits for the straggler instead of reaping it" {
         // sibling test relies on: the point is that *this* is what ends
         // it, not a drain timer.
         .idle_timeout_ms = 50,
+        .connect_timeout_ms = 10,
         .drain_deadline_ms = 0,
     });
     defer bed.tearDown();
@@ -836,9 +844,11 @@ test "teardown: a drain racing its own upstream dial peaks at four armed ops" {
                 .adversary = .{ .partial_io = true, .connect_delay_ns_max = 5_000_000 },
             },
             // Connect and idle stay far out so the drain deadline — not a
-            // request deadline — is what tears the dialing conn down.
+            // request deadline — is what tears the dialing conn down. Both
+            // are minutes past this run; the gap between them is only the
+            // ordering the loader enforces (§5).
             .idle_timeout_ms = 60_000,
-            .connect_timeout_ms = 60_000,
+            .connect_timeout_ms = 30_000,
             .drain_deadline_ms = 1,
         });
         defer bed.tearDown();
@@ -909,6 +919,7 @@ test "relay: a connection reaped by the idle deadline is logged as aborted" {
     try bed.setUp(std.testing.allocator, .{
         .sim = .{ .seed = 4 },
         .idle_timeout_ms = 20,
+        .connect_timeout_ms = 10,
         .access_log = true,
     });
     defer bed.tearDown();

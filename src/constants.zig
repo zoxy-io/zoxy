@@ -665,9 +665,10 @@ comptime {
     // idle budget below the dial budget is not shortened by the
     // handoff; it waits out the connect-phase timer instead.
     //
-    // This guards the pair above and nothing else: `validateTimeouts`
-    // does not cross-check an operator's own two values, so the same
-    // ordering is unenforced for a hand-written config.
+    // This guards the pair above; `validateTimeouts` rejects the same
+    // relation in an operator's own two values, and `Server.init` asserts
+    // it of whatever config it is handed, so the ordering holds however a
+    // config was built rather than only for the defaults.
     assert(connect_ms_default < idle_ms_default);
     assert(accept_retry_delay_ms >= 1);
     assert(pressure_idle_divisor >= 2);
