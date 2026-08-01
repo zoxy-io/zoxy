@@ -156,6 +156,16 @@ pub fn Server(comptime IoType: type) type {
         ) error{OutOfMemory}!void {
             assert(config.listeners.len >= 1);
             assert(config.listeners.len <= constants.listeners_max);
+            // The deadline handoff depends on this ordering (§4/§5): a
+            // connection's first deadline is armed at the connect budget
+            // and `onConnect` re-stores it to the idle one, but the armed
+            // timer never moves earlier — so an idle budget at or below the
+            // dial budget fires late instead of shortening at the handoff.
+            // The loader rejects it (`TimeoutOrderInvalid`); asserted again
+            // here because the simulator and the tests build a `Config`
+            // directly and would otherwise be measuring a config production
+            // cannot load.
+            assert(config.connect_timeout_ms < config.idle_timeout_ms);
             // `Pool` permits an empty pool — that is how an unconfigured
             // feature reserves nothing (§5) — so the requirement that these
             // three are non-empty lives here, where it is true: a proxy with

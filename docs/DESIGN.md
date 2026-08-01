@@ -396,6 +396,21 @@ that sent the signal keeps the upper bound it already enforces with
 `SIGKILL`. Where a zero would break rather than disable — a 0 ms dial,
 idle, or probe interval — it stays rejected.
 
+One *ordering* is enforced alongside those zeroes, and it is the only
+cross-check between two configured values in the loader: `connect_ms`
+must sit strictly below `idle_ms`. A connection's first deadline is
+armed at the dial budget and the dial's completion re-stores it to the
+idle one, but the single lazy timer never moves *earlier* once armed
+(§4) — only the stored target does. So the reverse order does not
+shorten at the handoff: the idle window waits out the connect-phase
+timer still counting down and fires late, by up to
+`connect_ms - idle_ms`. Rejected at load, not clamped (the same choice
+the `limits` block makes): a clamp would answer a config zoxy cannot
+honor with a log line, and one this proxy will not honor should not
+start. The relation holds however a config was built — the loader
+rejects it, `Server.init` asserts it, and `constants` asserts it of the
+defaults the loader hands back when the block is absent.
+
 Sizing shape. The comptime constants are the hard, budget-asserted
 *ceilings*; the config `limits` block sizes the *effective* pools anywhere
 from 1 up to them. An omitted block takes the lean **defaults**, so the

@@ -401,7 +401,10 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         .listeners = &harness.listener_configs,
         .clusters = &harness.clusters,
         .connect_timeout_ms = connect_timeout_ms,
-        .idle_timeout_ms = 30 + random.uintAtMost(u32, 70),
+        // Drawn *above* the dial budget rather than independently: the
+        // loader rejects the other order (§5), so an independent draw would
+        // spend seeds on a config production cannot load.
+        .idle_timeout_ms = connect_timeout_ms + 10 + random.uintAtMost(u32, 70),
         .drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random),
         // The §6 age cap: measured from the connection's birth, so the
         // clamp sometimes reaps an actively-relaying connection.
