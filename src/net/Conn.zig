@@ -171,12 +171,19 @@ pub const LogState = struct {
     path: [constants.access_log_path_bytes_max]u8 = undefined,
 
     /// No endpoint has been picked. `maxInt` rather than a separate flag:
-    /// the pool's own ceiling is asserted below `maxInt(u16)`, so the
-    /// sentinel can never collide with a real index.
+    /// the loader rejects a cluster declaring more than `maxInt(u16)`
+    /// endpoints (`EndpointsOverLimit`), so a real index stops at
+    /// `maxInt(u16) - 1` and the sentinel can never collide with one.
+    /// That bound used to be `endpoints_per_cluster_max`; with the policy
+    /// ceiling gone, the index type is what is left holding it up.
     pub const endpoint_none: u16 = std.math.maxInt(u16);
 
     comptime {
-        assert(constants.endpoints_per_cluster_max < endpoint_none);
+        // A relationship, not a restatement: the loader bounds real
+        // indices by `endpoint_index_max`, and this is what makes that
+        // bound the right one. Widening either past the other is a
+        // compile error rather than a sentinel that means two things.
+        assert(constants.endpoint_index_max < endpoint_none);
     }
 
     /// Start a fresh request's accounting. Only the scalars: the three

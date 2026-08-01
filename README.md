@@ -123,7 +123,8 @@ escapes) are rejected with `400`; no matching route is a `404`.
 
 A cluster is a named set of endpoints — static `IP:port` literals, resolved
 once at load, since dynamic DNS is deliberately out of scope — plus how one
-is chosen. Up to 16 clusters, 64 endpoints each.
+is chosen. Cluster and endpoint counts are bounded by your config, not
+by a compiled ceiling — the startup banner prints what the endpoint tables cost.
 
 ```json
 "clusters": {
@@ -349,7 +350,7 @@ reserves nor demands the ceiling's resources.
 
 The defaults are deliberately lean — 1386 connection slots, 1386 relay buffer
 pairs, 1313 upstream slots, roughly 34 MiB of pools — sized to start under a
-stock 4096 `RLIMIT_NOFILE`. The ceiling is 11463 of each. Raising the pools
+stock 4096 `RLIMIT_NOFILE`. The ceiling is 11466 of each. Raising the pools
 raises the file-descriptor demand, which zoxy asserts against `RLIMIT_NOFILE`
 at startup rather than discovering as `EMFILE` later.
 

@@ -40,7 +40,18 @@ comptime {
     // silently loses the piecewise head arrival it covers today.
     assert(inbox_bytes_default < constants.head_bytes_max);
 }
-const pending_ops_max: u32 = constants.in_flight_ops_max;
+/// The simulator's own in-flight-op bound (§9), derived from *its*
+/// listener limit rather than production's — which no longer has one, so
+/// there is no `constants.in_flight_ops_max` left to borrow. SimIo
+/// already keeps a `listeners_max` of its own for the same reason: it is
+/// a test double whose bounds describe what the simulator drives, not
+/// what a deployment may configure. At the shared pool ceilings this is
+/// at least what any scenario can arm.
+const pending_ops_max: u32 = constants.inFlightOps(
+    constants.conn_slots_max,
+    constants.upstream_slots_max,
+    listeners_max,
+);
 const pending_signals_max: u8 = 8;
 /// The clock starts at one virtual second, not zero, so code that would
 /// misbehave at t=0 gets caught.

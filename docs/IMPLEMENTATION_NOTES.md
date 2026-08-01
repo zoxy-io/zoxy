@@ -78,15 +78,24 @@ infeasible pair at config load (`cqFillFits` already exists and already
 runs unconditionally — this would stop it being shadowed by a comptime
 pre-decision).
 
-The cost: `assert(in_flight_ops_max <= completion_queue_entries)` in §5
-(DESIGN.md) states a property of *the chosen point*; with independent
+The cost was: `assert(in_flight_ops_max <= completion_queue_entries)` in
+§5 (DESIGN.md) states a property of *the chosen point*; with independent
 ceilings there's no chosen point, so it becomes a startup rejection
 instead of a comptime assertion — a real narrowing of "budgets are
 comptime-asserted" to "comptime-asserted where a budget is a property of
 one constant, rejected at startup where it's a property of a
-combination." Nothing else moves: `SimIo`'s `ready_buffer` is already
-sized off `in_flight_ops_max` (the budget itself, not the ceilings'
-product), so it doesn't grow.
+combination."
+
+**That cost has since been paid in full, by a different change.**
+Removing `listeners_max` ("Config shape is the operator's to size",
+below) deleted `in_flight_ops_max` and `fds_max` outright and moved both
+checks to load — `cqFillFits` and `ensureFdBudget` — so the narrowing is
+shipped and DESIGN.md §5 and CLAUDE.md already say it. What is left of
+this question is only the conn/upstream pair itself, and it no longer has
+an invariant to spend: the wording above is the state of the code, not a
+price still to be paid. Two details there are now stale — the pair reads
+11466/11466, not 11464, and `SimIo` sizes its buffer from its own
+`listeners_max` rather than from the deleted `in_flight_ops_max`.
 
 Entry gate: demonstrate a workload that actually saturates the
 *current* conn-slot ceiling first (the c10k runs that motivated the
@@ -1192,6 +1201,82 @@ Raising the ceiling or lowering the offered rate would both have made it
 pass — by producing fewer RSTs, which is why neither was the fix.
 
 Verdict (settled): the stall gate holds `timeouts` alone, the one
+## Config shape is the operator's to size (2026-08-01)
+
+Eight compile-time ceilings removed across four slices: `routes_max`,
+`filters_per_listener_max`, `actions_per_filter_max`,
+`header_matches_per_filter_max` (7e194f6), `config_bytes_max` (5f81788),
+`clusters_max` and `endpoints_per_cluster_max` (10205eb, 77c8bb9), and
+`listeners_max` (a991db6). A config's shape is now bounded by what the
+operator writes and by what the ring and fd budgets admit at load, not by
+numbers chosen on their behalf at build time.
+
+**They were a capability ceiling, not a memory cost — that is the
+finding.** Measured with a `@sizeOf` probe against the pre-change tree:
+`Server` 36,160 -> 16,736 bytes, so **19,424 bytes per process** of state
+a deployment below the compile ceiling never used (`UpstreamPool` 6,184
+-> 80, `Balancer` 8,336 -> 72, `Checker` 12,320 -> 9,296). Against the
+35,060 KiB the binary prints, that is **0.055%**. It was real resident
+memory — `init` zeroed every one of those tables at startup, so the pages
+were faulted in — but anyone expecting this work to reclaim memory should
+read that number first. What it actually buys is that 16 clusters, 64
+endpoints, 32 routes, 32 filters and 8 listeners stop being walls no
+price could pass.
+
+The eight split into four classes, and the class decided the work:
+
+- **Bounded nothing** (routes, filters, actions, header matches). Already
+  `arena.alloc(..., json.len)`. Pure deletion of config-load gates and
+  JSON Schema `maxItems`.
+- **Sized something** (clusters x endpoints, whose product sized seven
+  endpoint-keyed tables). Needed `EndpointKeys{stride, count}` derived
+  from the loaded config, and `pick`'s stack array had to become
+  preallocated scratch — a runtime-length stack array is the dynamic
+  allocation §5 forbids.
+- **A budget input** (`listeners_max`). Not a config-shape cap at all: it
+  was a term in the derivation of `conn_slots_max`,
+  `completion_queue_entries`, `fds_max` and `in_flight_ops_max`. Removing
+  it is what spent the comptime invariant; see the Pool ceilings question
+  above.
+- **Type-width guards**, which stay. `Conn.endpoint_none` is
+  `maxInt(u16)`, so `constants.endpoint_index_max` bounds real indices
+  and `Conn` asserts the relationship. `header_edits_max` stays too, and
+  the rule it illustrates is the useful one: **a limit that sizes a fixed
+  buffer must precede the config; a limit that only gates a config need
+  not exist.**
+
+### What a ceiling was quietly holding up
+
+The recurring hazard, and the reason each slice took a review: a ceiling
+does load-bearing work far from where it is declared, and removing it
+exposes whatever was leaning on it.
+
+- **`keys_seen_max = 4096`**, a loop backstop sitting *above*
+  `clusters_max`. Left in place it would have become the new cluster
+  limit — an undocumented wall replacing a documented one.
+- **Two O(n^2) scans**, duplicate cluster names and duplicate listener
+  binds. Both were harmless at 16 and 8 (~120 and ~64 compares) and cost
+  ~2.1e9 and ~8e8 compares once the ceilings went — minutes of startup
+  for configs whose *memory* fits easily. Both are sorted-neighbour
+  compares now.
+- **The admin listener.** `XevIo`'s listener table was sized by
+  `listeners_max`, which silently covered `Admin.start` binding through
+  the same `listen`. Sizing it to the configured count instead made every
+  admin-enabled deployment fail at startup with `AddressUnavailable` — a
+  full table reported as a bad address. The suite could not catch it:
+  `Server(XevIo)` is instantiated only by main.zig and `admin_test` runs
+  over `SimIo`. `init` now folds in `admin_listeners` itself, and a
+  contract test locks it.
+- **The §5 budget promise, broken twice.** Removing `config_bytes_max`
+  left the config arena unbounded *and* unreported, so the startup total
+  understated what the process holds; the endpoint tables then did it
+  again by allocating after `printBudgets` ran. Both are now terms in the
+  printed budget — the arena measured, the tables closed-form via
+  `Server.endpointTableBytes`.
+
+Every one of these was found by `tiger-style-reviewer` on the slice's own
+diff, not by the gates: `zig build ci` was green for all of them.
+
 client-visible failure that belongs to *admitted* work. Every socket
 error in this band is a connection that was never admitted, already
 witnessed by the 5xx status gate and the accept-RST count. A genuine

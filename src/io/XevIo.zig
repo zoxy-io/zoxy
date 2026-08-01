@@ -70,7 +70,28 @@ const ListenerEntry = struct {
 /// `cq_entries` is the completion-queue depth to request for this
 /// deployment (`constants.completionQueueDepthFor` of the effective config,
 /// §8) — the io_uring backend sizes its ring to it; other backends ignore it.
-pub fn init(io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
+pub fn init(
+    io: *XevIo,
+    arena: std.mem.Allocator,
+    cq_entries: u32,
+    /// Configured data-path listeners — the config's own count, *not*
+    /// including the admin listener (§5). There is no compiled ceiling to
+    /// size this against any more.
+    ///
+    /// The admin reservation is added here rather than asked of the
+    /// caller, the same way `fdsRequired`, `inFlightOps` and
+    /// `completionQueueDepthFor` all fold in `admin_listeners`
+    /// internally. That is not tidiness: sizing this array to exactly the
+    /// configured count leaves `Admin.start` — which binds through this
+    /// same `listen` — with nowhere to go, and it fails as
+    /// `AddressUnavailable`, which reads as a bad bind rather than a full
+    /// table. Every admin-enabled deployment hits it, and nothing in the
+    /// test suite would: `Server(XevIo)` is instantiated only by main.
+    configured_listeners: u32,
+) !void {
+    assert(configured_listeners <= std.math.maxInt(u16) - constants.admin_listeners);
+    const listeners = configured_listeners + constants.admin_listeners;
+    assert(listeners >= 1);
     if (comptime needs_thread_pool) {
         io.thread_pool = xev.ThreadPool.init(.{});
     }
@@ -87,7 +108,7 @@ pub fn init(io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
     errdefer io.notifier.deinit();
     io.timer = try xev.Timer.init();
     errdefer io.timer.deinit();
-    io.listeners = try arena.alloc(ListenerEntry, constants.listeners_max);
+    io.listeners = try arena.alloc(ListenerEntry, listeners);
     io.listeners_count = 0;
     io.last_pressure = Io.Pressure.none;
     io.notifier_completion = .{};
@@ -176,8 +197,8 @@ pub fn deinit(io: *XevIo) void {
 }
 
 pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
-    assert(io.listeners_count <= constants.listeners_max);
-    if (io.listeners_count == constants.listeners_max) {
+    assert(io.listeners_count <= io.listeners.len);
+    if (io.listeners_count == io.listeners.len) {
         return error.AddressUnavailable;
     }
     const tcp = xev.TCP.init(address) catch return error.Unexpected;

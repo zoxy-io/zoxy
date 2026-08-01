@@ -600,7 +600,7 @@ fn readProcHead(io: Io, path: []const u8, out: []u8, scratch: []u8) ?[]const u8 
 /// too small.
 ///
 /// io_uring's fdinfo renders a line per pending SQE and CQE, ~89 and ~34
-/// bytes, and `constants.in_flight_ops_max` is what bounds how many there
+/// bytes, and the ring's own in-flight budget is what bounds how many there
 /// can be: ~57k ops at the compiled ceiling, so ~5 MB of text at the
 /// worst moment. The kernel appears to want the whole record to fit
 /// rather than handing back a prefix, which is why a 64 KiB buffer still

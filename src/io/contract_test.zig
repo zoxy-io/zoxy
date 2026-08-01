@@ -66,11 +66,16 @@ const init_attempts_max: u8 = 5;
 /// failed about half its runs at around the tenth. A bounded retry
 /// with a short pause is the honest answer to a transient; production
 /// creates one ring at startup and must keep failing loudly.
+/// `listeners_reserved` is what the old `listeners_max` used to supply
+/// implicitly: contract tests bind a handful of sockets, so a small fixed
+/// reservation covers every scenario here.
+const listeners_reserved: u32 = 8;
+
 fn initTestIo(xev_io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
     var attempt: u8 = 1;
     while (true) : (attempt += 1) {
         assert(attempt <= init_attempts_max);
-        if (XevIo.init(xev_io, arena, cq_entries)) |_| {
+        if (XevIo.init(xev_io, arena, cq_entries, listeners_reserved)) |_| {
             return;
         } else |err| {
             if (err != error.SystemResources) return err;
@@ -774,4 +779,31 @@ test "xevio: canceling a stuck dial delivers Canceled and releases the op" {
     try std.testing.expect(canceled);
     const result = outcome orelse return error.ConnectNeverCompleted;
     try std.testing.expectError(error.Canceled, result);
+}
+
+test "xevio: the listener table reserves a slot for the admin listener" {
+    // Regression for slice 4 of the operator-sized-limits change, which
+    // sized this table to exactly the *configured* listener count. The
+    // admin listener binds through the same `listen`, so every
+    // admin-enabled deployment failed to start with `AddressUnavailable`
+    // — a full table reported as a bad address. Nothing caught it:
+    // `Server(XevIo)` is instantiated only by main.zig, and admin_test
+    // runs over SimIo.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    // One configured listener; capacity must be that plus the admin slot.
+    try XevIo.init(&xev_io, arena_state.allocator(), 0, 1);
+    defer xev_io.deinit();
+
+    const loopback = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const configured = try xev_io.listen(loopback);
+    _ = configured;
+    // The admin listener: this is the bind that used to fail.
+    const admin = try xev_io.listen(loopback);
+    _ = admin;
+
+    // And the reservation is exactly one — not open-ended.
+    try std.testing.expectError(error.AddressUnavailable, xev_io.listen(loopback));
 }

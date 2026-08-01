@@ -20,22 +20,60 @@ const assert = std.debug.assert;
 /// `idle_next`/`idle_prev`/`idle_heads` value marking "no slot".
 const idle_none: u32 = std.math.maxInt(u32);
 
-/// Idle lists are indexed by the flattened endpoint key, so the head
-/// array covers the worst-case config shape.
-pub const endpoint_keys_max: u32 =
-    @as(u32, constants.clusters_max) * constants.endpoints_per_cluster_max;
+/// The flattened endpoint index space for one loaded config (§7).
+///
+/// Seven tables are keyed by it — the pool's idle heads and lease
+/// counts, the balancer's cursors-adjacent endpoint hashes, the server's
+/// L4 in-flight charges, and the health checker's mask and two streak
+/// counters. All were fixed 16 × 64 = 1024-entry
+/// arrays sized for the worst config any build could accept; they are
+/// now sized for the config this process actually loaded, so a
+/// two-endpoint deployment stops carrying a 1024-entry table.
+///
+/// `stride` is the widest cluster in the config rather than each
+/// cluster's own length, which wastes `stride - len` entries per
+/// cluster. That buys a multiply instead of a per-cluster offset lookup
+/// on the pick path, and the waste is bounded by the config the operator
+/// wrote — the same trade the fixed arrays made, minus the part that had
+/// nothing to do with this deployment.
+pub const EndpointKeys = struct {
+    /// Entries per cluster: the largest endpoint count any one cluster
+    /// declares. At least 1, so a key is always addressable.
+    stride: u16,
+    /// `clusters × stride` — the length every endpoint-keyed table has.
+    count: u32,
+
+    pub fn init(cluster_count: u16, stride: u16) EndpointKeys {
+        assert(cluster_count >= 1);
+        assert(stride >= 1);
+        const count = @as(u32, cluster_count) * stride;
+        assert(count >= 1);
+        return .{ .stride = stride, .count = count };
+    }
+
+    pub fn key(keys: EndpointKeys, cluster_index: u16, endpoint_index: u16) u32 {
+        assert(keys.stride >= 1);
+        assert(endpoint_index < keys.stride);
+        const flat = @as(u32, cluster_index) * keys.stride + endpoint_index;
+        assert(flat < keys.count);
+        return flat;
+    }
+};
 
 pub fn UpstreamPool(comptime IoType: type) type {
     return struct {
         slot_pool: Pool(Upstream),
-        idle_heads: [endpoint_keys_max]u32,
+        /// The config's endpoint index space; every table below has
+        /// `keys.count` entries.
+        keys: EndpointKeys,
+        idle_heads: []u32,
         /// Parked slots across all endpoints; leased = acquired − idle.
         idle_count: u32,
         /// Slots leased per endpoint — the §7 P2C load signal: a lease
         /// is a request in flight against that endpoint, so the balancer
         /// compares two candidates' counts and picks the calmer one.
         /// u16 holds the whole pool (`upstream_slots_max` ≤ 65535).
-        leased_counts: [endpoint_keys_max]u16,
+        leased_counts: []u16,
 
         const Self = @This();
 
@@ -73,13 +111,20 @@ pub fn UpstreamPool(comptime IoType: type) type {
             pool: *Self,
             arena: std.mem.Allocator,
             count: u32,
+            keys: EndpointKeys,
         ) error{OutOfMemory}!void {
             assert(count >= 1);
+            assert(keys.count >= 1);
             try pool.slot_pool.init(arena, count);
-            @memset(&pool.idle_heads, idle_none);
+            pool.keys = keys;
+            pool.idle_heads = try arena.alloc(u32, keys.count);
+            pool.leased_counts = try arena.alloc(u16, keys.count);
+            @memset(pool.idle_heads, idle_none);
             pool.idle_count = 0;
-            @memset(&pool.leased_counts, 0);
+            @memset(pool.leased_counts, 0);
             assert(pool.slot_pool.slots.len == count);
+            assert(pool.idle_heads.len == keys.count);
+            assert(pool.leased_counts.len == keys.count);
             assert(pool.leasedCount() == 0);
         }
 
@@ -87,8 +132,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
         /// pool is exhausted — the caller sheds (§8: 503). The socket is
         /// left undefined for the dialer to fill in.
         pub fn acquire(pool: *Self, cluster_index: u16, endpoint_index: u16) ?*Upstream {
-            assert(cluster_index < constants.clusters_max);
-            assert(endpoint_index < constants.endpoints_per_cluster_max);
+            assert(endpoint_index < pool.keys.stride);
             const upstream = pool.slot_pool.acquire() orelse return null;
             upstream.cluster_index = cluster_index;
             upstream.endpoint_index = endpoint_index;
@@ -97,7 +141,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.idle_prev = idle_none;
             upstream.head_len = 0;
             upstream.deadline_ns = 0;
-            const key = endpointKey(cluster_index, endpoint_index);
+            const key = pool.keys.key(cluster_index, endpoint_index);
             pool.leased_counts[key] += 1;
             assert(pool.leased_counts[key] <= pool.slot_pool.slots.len);
             assert(pool.idle_count < pool.slot_pool.acquired_count);
@@ -112,7 +156,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             assert(upstream.idle_next == idle_none);
             assert(upstream.idle_prev == idle_none);
             const index = pool.slot_pool.indexOf(upstream);
-            const key = endpointKey(upstream.cluster_index, upstream.endpoint_index);
+            const key = pool.keys.key(upstream.cluster_index, upstream.endpoint_index);
 
             upstream.idle_next = pool.idle_heads[key];
             if (upstream.idle_next != idle_none) {
@@ -131,9 +175,9 @@ pub fn UpstreamPool(comptime IoType: type) type {
         /// The most recently parked connection for the endpoint, leased
         /// again — or null, and the caller dials fresh via `acquire`.
         pub fn checkout(pool: *Self, cluster_index: u16, endpoint_index: u16) ?*Upstream {
-            assert(cluster_index < constants.clusters_max);
-            assert(endpoint_index < constants.endpoints_per_cluster_max);
-            const key = endpointKey(cluster_index, endpoint_index);
+            assert(endpoint_index < pool.keys.stride);
+
+            const key = pool.keys.key(cluster_index, endpoint_index);
             const head = pool.idle_heads[key];
             if (head == idle_none) {
                 return null;
@@ -153,7 +197,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             assert(upstream.parked);
             assert(pool.idle_count >= 1);
             const index = pool.slot_pool.indexOf(upstream);
-            const key = endpointKey(upstream.cluster_index, upstream.endpoint_index);
+            const key = pool.keys.key(upstream.cluster_index, upstream.endpoint_index);
 
             if (upstream.idle_prev == idle_none) {
                 assert(pool.idle_heads[key] == index);
@@ -181,7 +225,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             assert(!upstream.parked);
             assert(upstream.idle_next == idle_none);
             assert(upstream.idle_prev == idle_none);
-            const key = endpointKey(upstream.cluster_index, upstream.endpoint_index);
+            const key = pool.keys.key(upstream.cluster_index, upstream.endpoint_index);
             assert(pool.leased_counts[key] >= 1);
             pool.leased_counts[key] -= 1;
             pool.slot_pool.release(upstream);
@@ -216,14 +260,6 @@ pub fn UpstreamPool(comptime IoType: type) type {
     };
 }
 
-/// Flattened per-endpoint key into `idle_heads`/`leased_counts`. Public so
-/// the balancer indexes the same load table the pool maintains (§7 P2C).
-pub fn endpointKey(cluster_index: u16, endpoint_index: u16) u32 {
-    assert(cluster_index < constants.clusters_max);
-    assert(endpoint_index < constants.endpoints_per_cluster_max);
-    return @as(u32, cluster_index) * constants.endpoints_per_cluster_max + endpoint_index;
-}
-
 /// How much work an endpoint is carrying right now, across both
 /// protocols (§7). Two tables rather than one running total, because
 /// each has its own provable bound and its own single writer: the pool
@@ -243,14 +279,17 @@ pub fn endpointKey(cluster_index: u16, endpoint_index: u16) u32 {
 /// reached by both an `l4` and an `http` listener is representable, and
 /// there the total is that mixed unit.
 pub const Load = struct {
-    l7: *const [endpoint_keys_max]u16,
-    l4: *const [endpoint_keys_max]u16,
+    /// Both tables have `EndpointKeys.count` entries, which is why the
+    /// bound below is read off the slice rather than a constant.
+    l7: []const u16,
+    l4: []const u16,
 
     /// Total in-flight work against one endpoint. `u32` because the two
     /// ceilings sum past a `u16`'s range in principle, even though no
     /// single deployment reaches both at once.
     pub fn inFlight(load: *const Load, key: u32) u32 {
-        assert(key < endpoint_keys_max);
+        assert(load.l7.len == load.l4.len);
+        assert(key < load.l7.len);
         return @as(u32, load.l7[key]) + load.l4[key];
     }
 };
@@ -264,11 +303,16 @@ const TestIo = struct {
 
 const TestPool = UpstreamPool(TestIo);
 
+/// A deliberately ragged test index space — 4 clusters of up to 8
+/// endpoints — so a key is never accidentally equal to its endpoint
+/// index and a stride bug cannot pass unnoticed.
+const test_keys: EndpointKeys = .init(4, 8);
+
 test "upstream: dial-park-checkout-release keeps the same connection" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var pool: TestPool = undefined;
-    try pool.init(arena_state.allocator(), 4);
+    try pool.init(arena_state.allocator(), 4, test_keys);
 
     const dialed = pool.acquire(0, 0).?;
     dialed.socket = 77;
@@ -294,7 +338,7 @@ test "upstream: checkout is LIFO per endpoint" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var pool: TestPool = undefined;
-    try pool.init(arena_state.allocator(), 4);
+    try pool.init(arena_state.allocator(), 4, test_keys);
 
     const first = pool.acquire(0, 0).?;
     const second = pool.acquire(0, 0).?;
@@ -314,7 +358,7 @@ test "upstream: endpoints do not share idle connections" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var pool: TestPool = undefined;
-    try pool.init(arena_state.allocator(), 4);
+    try pool.init(arena_state.allocator(), 4, test_keys);
 
     const parked = pool.acquire(1, 2).?;
     pool.park(parked);
@@ -332,7 +376,7 @@ test "upstream: unpark removes from the middle of an idle list" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var pool: TestPool = undefined;
-    try pool.init(arena_state.allocator(), 4);
+    try pool.init(arena_state.allocator(), 4, test_keys);
 
     const first = pool.acquire(0, 0).?;
     const second = pool.acquire(0, 0).?;
@@ -360,7 +404,7 @@ test "upstream: exhaustion is a shed signal, parked slots stay counted" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var pool: TestPool = undefined;
-    try pool.init(arena_state.allocator(), 2);
+    try pool.init(arena_state.allocator(), 2, test_keys);
 
     const first = pool.acquire(0, 0).?;
     const second = pool.acquire(0, 1).?;
@@ -382,9 +426,9 @@ test "upstream: leased counts track every lease transition per endpoint" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var pool: TestPool = undefined;
-    try pool.init(arena_state.allocator(), 4);
-    const key_a = endpointKey(0, 0);
-    const key_b = endpointKey(0, 1);
+    try pool.init(arena_state.allocator(), 4, test_keys);
+    const key_a = test_keys.key(0, 0);
+    const key_b = test_keys.key(0, 1);
 
     // Fresh dials lease against their own endpoints.
     const first = pool.acquire(0, 0).?;
@@ -424,7 +468,7 @@ test "upstream: zero allocations after init" {
     var arena_state = std.heap.ArenaAllocator.init(failing.allocator());
     defer arena_state.deinit();
     var pool: TestPool = undefined;
-    try pool.init(arena_state.allocator(), 8);
+    try pool.init(arena_state.allocator(), 8, test_keys);
     const allocations_after_init = failing.allocations;
 
     var cycle: u32 = 0;

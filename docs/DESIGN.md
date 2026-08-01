@@ -423,9 +423,9 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 11463 | ~1.7 KiB state + 8 KiB head |
-| relay buffers | 1386 | 11463 | 2 × 4 KiB |
-| upstream slots | 1313 | 11463 | ~40 B state + 8 KiB head |
+| conn slots | 1386 | 11466 | ~1.7 KiB state + 8 KiB head |
+| relay buffers | 1386 | 11466 | 2 × 4 KiB |
+| upstream slots | 1313 | 11466 | ~40 B state + 8 KiB head |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
 
 The access log (§8) adds one fixed reservation beside the pools — two
@@ -437,10 +437,17 @@ is its per-request capture: the method, host and path a line reports live
 in the head buffer, which the response head renders over (§7), so they
 have to be copied out while they are still there.
 
+The config arena is in that total for the same reason — it is never
+freed — but it is the one term that is **measured rather than derived**,
+and the banner labels it so. There is no constant bounding a config
+file's size: what the operator writes is what it costs, so the only
+honest thing the budget can do is report it. Every other term is still
+closed-form in `src/constants.zig`.
+
 The ceilings sit on one completion-queue line — a conn slot costs
 `conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
 is **pinned to the conn ceiling**, so that line has a single divisor:
-`conn_ops_max + 1` ring ops per admitted connection, 11463 of them. On
+`conn_ops_max + 1` ring ops per admitted connection, 11466 of them. On
 the L7 path a connection that is mid-exchange holds an upstream slot as
 well as its conn slot, and at saturation every admitted connection can be
 mid-exchange at once — so an upstream ceiling below the conn ceiling is
@@ -468,10 +475,22 @@ deployment that means to fill its conn pool raises both together through
 Rules:
 
 - **Pools never grow.** Exhaustion is a shed signal (§8), never a realloc.
-- **Limit relationships are comptime-asserted** in `src/constants.zig`
-  (TIGER_STYLE): e.g. `relay_buffers_max ≤ conn_slots_max`, and the same
-  for the defaults. Note that `relay_buffers` — not conn slots — is the
-  true bound on concurrent L4 connections plus active L7 relays (§6).
+- **Limit relationships are comptime-asserted where they can be** in
+  `src/constants.zig` (TIGER_STYLE): e.g. `relay_buffers_max ≤
+  conn_slots_max`, and the same for the defaults. Note that
+  `relay_buffers` — not conn slots — is the true bound on concurrent L4
+  connections plus active L7 relays (§6).
+
+  "Where they can be" is a real qualifier, not hedging. A budget that is
+  a property of one constant is asserted at build time. A budget that is
+  a property of a *combination the config chooses* has no compile-time
+  point to assert — there is no listener, cluster or endpoint ceiling to
+  evaluate it at — so it is refused at load instead: `cqFillFits` for the
+  ring (`LimitConnSlotsOverCqFill`) and `ensureFdBudget` for the fds.
+  Same arithmetic, refused milliseconds later. The compiled ceilings
+  `conn_slots_max`/`upstream_slots_max` are therefore stated at *zero*
+  configured listeners, and each listener a config declares spends from
+  the same budget.
 - **The CQ fill is a headroom knob, not a pool shrink.**
   `limits.cq_fill_eighths` sets how many eighths of the completion queue
   the worst-case in-flight ops may fill: ⅞ (the default, the fill the c10k
@@ -593,8 +612,10 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   "/api", "cluster": "api" }, …]`; the existing `"cluster"` field stays
   as sugar for a single catch-all route). The table is resolved at
   config load into an immutable arena table sorted longest-prefix-first
-  — matching is a bounded linear scan, never an allocation — and
-  `routes_max` caps it. No route matches → static `404` (§8). Matching
+  — matching is a bounded linear scan, never an allocation. The scan's
+  bound is the table's own length, fixed once config load returns; there
+  is no constant capping it, because the table sizes nothing but its own
+  arena slice. No route matches → static `404` (§8). Matching
   consults only the **canonical path**, computed once in the trust
   boundary: the query splits off untouched (opaque to the proxy,
   forwarded verbatim); unreserved percent-escapes (RFC 3986 §2.3) are
@@ -681,8 +702,13 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   at config time* into bounded, immutable tables in the config arena
   (match programs over method/host/path/header slices; action lists drawn
   from a closed enum: reject-with-status, add/remove/set header, rewrite
-  path prefix), each with a static limit
-  (`rules_per_route_max`, `actions_per_rule_max`, `header_edits_max`).
+  path prefix). The rule table, a rule's action list and a rule's header
+  matches carry no static limit: each is an arena slice at exactly the
+  length the config asked for, and evaluation is a bounded loop over
+  that length. `header_edits_max` is the one static limit here, and the
+  difference is the rule — it bounds a *fixed buffer* the renderer
+  materializes the matched rules' edits into, so it must be known before
+  the config is read.
   Cluster selection is deliberately *not* a filter action: the route
   table (host + path) is the single mechanism that decides which backend
   serves a request, so there is one precedence rule, not two engines
@@ -766,9 +792,11 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   the eligible set the health mask already produced: no table, no
   rebuild, and only the clients of an ejected endpoint move (the 1/n
   optimum — measured at 13.1% of clients for a 1-of-8 ejection). The
-  cost is O(n) per pick instead of O(log n), which is why
-  `endpoints_per_cluster_max` matters: 71 ns at the 64 endpoints a
-  cluster may hold, against a request served in ~100 µs. Jump consistent
+  cost is O(n) per pick instead of O(log n), which is why a cluster's
+  endpoint count is a cost the operator chooses: 71 ns per pick at 64
+  endpoints, against a request served in ~100 µs, and linear in the
+  count from there. Nothing caps it — the pick simply gets slower, and
+  that trade is visible where it is made. Jump consistent
   hash is excluded outright — it can only add or remove the *last*
   bucket, and an ejection removes an arbitrary one.
   Two honest costs. Stickiness holds only while processes agree on the
