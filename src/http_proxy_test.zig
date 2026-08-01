@@ -487,6 +487,9 @@ const Http1Bed = struct {
         conn_slots: u32 = 4,
         relay_buffers: u32 = 2,
         upstream_slots: u32 = 2,
+        /// The §5 head-buffer ring; null follows conn_slots (never
+        /// sheds), a number drives the `l7_shed_head_buffers` rung.
+        head_buffers: ?u32 = null,
         /// The §6 absolute age cap; 0 (the default) disables it. A cap the
         /// exchange outlives clamps every stored deadline to it, so a
         /// re-based target can already be in the past.
@@ -536,7 +539,15 @@ const Http1Bed = struct {
         if (options.inbox_bytes) |bytes| {
             adversary.inbox_bytes = bytes;
         }
-        try bed.sim_io.init(arena, .{ .seed = options.seed, .adversary = adversary });
+        // One number on both sides (§5): the ring the sim registers is
+        // the limit the server accounts against — Server.init asserts
+        // the match, so a bed cannot drift them apart.
+        const head_buffers = options.head_buffers orelse options.conn_slots;
+        try bed.sim_io.init(arena, .{
+            .seed = options.seed,
+            .adversary = adversary,
+            .buffer_group_count = head_buffers,
+        });
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
@@ -562,6 +573,7 @@ const Http1Bed = struct {
             .conn_slots = options.conn_slots,
             .relay_buffers = options.relay_buffers,
             .upstream_slots = options.upstream_slots,
+            .head_buffers = head_buffers,
             .access_log_buffer_bytes = if (options.access_log)
                 constants.access_log_buffer_bytes_default
             else
@@ -1148,6 +1160,64 @@ test "l7: an upstream-slot shed keeps the connection, and the client's ask decid
     // the churn loop.
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("accepted"));
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("admitted"));
+    try bed.expectDrained();
+}
+
+test "l7: a head-ring shed answers 503 and always closes" {
+    // The §5 rung that precedes the parse: the client spoke while every
+    // ring buffer was bound. Unlike every other shed this one can never
+    // keep — the request's bytes were never read (no buffer was ever
+    // bound), so a kept connection would re-arm onto the same bytes and
+    // shed the same request forever. `respond` enforces the close at
+    // comptime; this pins the wire truth of both halves: the 503, and
+    // the announced close that follows it.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 61,
+        .head_buffers = 1,
+        .origin_mute = true,
+    });
+    defer bed.tearDown();
+
+    // client binds the single ring buffer and holds it (a mute origin
+    // keeps its exchange open); client2 arrives to an empty ring.
+    bed.client.drain_on_finish = false;
+    bed.client2.send_delay_ms = 100;
+    bed.client2.request = "GET /one HTTP/1.1\r\nHost: o\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /held HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client2.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_shed_head_buffers"));
+    try bed.expectDrained();
+}
+
+test "l7: keep-alive returns the head buffer between requests" {
+    // The §5 headline: an idle keep-alive connection holds no head
+    // bytes. Observed through the watermark counter rather than a
+    // mid-run probe: with a one-buffer ring every bind engages the
+    // pressure flag (the high watermark of capacity 1 is 1) and every
+    // return clears it, so two sequential keep-alive requests on one
+    // connection must count exactly two engages. A ring buffer held
+    // across the idle gap would count one — and shed the second
+    // request besides, which the zero shed count rules out.
+    const response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 62,
+        .origin_response = response,
+        .head_buffers = 1,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_head_buffers"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("head_pressure_engaged"));
     try bed.expectDrained();
 }
 

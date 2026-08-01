@@ -646,6 +646,12 @@ pub fn bufferGroupSlice(io: *SimIo, buffer_id: u16) []u8 {
     return io.group_slab[@as(usize, buffer_id) * io.group_bytes ..][0..io.group_bytes];
 }
 
+/// The group's capacity — what a caller's own in-use accounting must
+/// agree with, asserted at the composition site rather than trusted.
+pub fn bufferGroupCount(io: *const SimIo) u32 {
+    return io.group_count;
+}
+
 /// Give a selected buffer back to the group. Sync and syscall-free in
 /// production (a buf_ring tail bump); here it is the flag flip the sim's
 /// leak assertions watch.

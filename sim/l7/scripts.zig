@@ -247,24 +247,27 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
     },
     .malformed_head = .{
         // A bare LF terminating the request line (§7 smuggling shape).
-        // The parse verdict precedes routing, so no §8 rung or dial
-        // failure can precede the 400.
+        // The parse verdict precedes routing, so no post-parse rung or
+        // dial failure can precede the 400 — but the §5 head ring gates
+        // the read *before* the parse, so its 503 can.
         .request = "GET /sim HTTP/1.1\nHost: sim\r\n\r\n",
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 400,
         .method = .get,
-        .allowed_statuses = &.{400},
+        .allowed_statuses = &.{ 400, 503 },
     },
     .oversize_uri = .{
         // The request line alone must overflow the proxy's 8 KiB head
-        // buffer with no newline in sight: 414, not 431.
+        // buffer with no newline in sight: 414, not 431. The §5 head
+        // ring gates the read before any byte accumulates, so its 503
+        // can precede the verdict.
         .request = "GET /" ++ ("a" ** 8500) ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 414,
         .method = .get,
-        .allowed_statuses = &.{414},
+        .allowed_statuses = &.{ 414, 503 },
     },
     .connect_method = .{
         // The 501 verdict precedes routing. The method context maps to
@@ -276,7 +279,8 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 501,
         .method = .get,
-        .allowed_statuses = &.{501},
+        // Only the §5 head ring's 503 precedes the parse the 501 rides on.
+        .allowed_statuses = &.{ 501, 503 },
     },
     .keepalive_pair = .{
         // The second GET is appended at run time, only after the first
@@ -327,15 +331,17 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
     // §7 filter scripts: a distinct path per action so the listener's
     // rules fire only for these, never the others.
     .filter_reject = .{
-        // A reject is answered before any resource is acquired or origin
-        // dialed, so no §8 rung or dial failure can precede it — the
-        // only complete verdict is the 403.
+        // A reject is answered before any post-parse resource is
+        // acquired or origin dialed, so no such rung or dial failure can
+        // precede it — but the request must first be *read*, and the §5
+        // head ring gates that: its 503 is the one verdict that can
+        // arrive instead.
         .request = "GET /reject HTTP/1.1\r\nHost: sim\r\n\r\n",
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 403,
         .method = .get,
-        .allowed_statuses = &.{403},
+        .allowed_statuses = &.{ 403, 503 },
     },
     .filter_edit = .{
         // Routes and forwards like a plain GET, so the §8 rungs and a

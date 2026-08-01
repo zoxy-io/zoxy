@@ -681,6 +681,12 @@ fn sliceForId(io: *XevIo, buffer_id: u16) []u8 {
     return io.group_slab[@as(usize, buffer_id) * io.group_bytes ..][0..io.group_bytes];
 }
 
+/// The group's capacity — what a caller's own in-use accounting must
+/// agree with, asserted at the composition site rather than trusted.
+pub fn bufferGroupCount(io: *const XevIo) u32 {
+    return io.group_count;
+}
+
 /// Give a selected buffer back to the group: on io_uring two stores and an
 /// atomic tail bump — no syscall — republishing the id to the kernel; on
 /// the emulation, a push onto the free stack.

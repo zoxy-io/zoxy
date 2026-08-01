@@ -28,6 +28,12 @@ pub const Counters = struct {
     relay_pressure_engaged: Value = Value.init(0),
     conn_pressure_engaged: Value = Value.init(0),
     upstream_pressure_engaged: Value = Value.init(0),
+    /// The head-buffer ring's crossing (§5, §8). Unlike the other three
+    /// this bias drives nothing — an idle connection holds no head
+    /// buffer, so there is no idle occupancy a timeout could evict — and
+    /// the counter is the alert an operator sizes `limits.head_buffers`
+    /// by, before the wall (`l7_shed_head_buffers`) starts refusing.
+    head_pressure_engaged: Value = Value.init(0),
     /// §8 rung: request/idle deadline fired → teardown.
     deadline_expired: Value = Value.init(0),
     /// Upstream dial failed (refused/unreachable/canceled-by-teardown).
@@ -70,6 +76,12 @@ pub const Counters = struct {
     /// and the ratio to `accepted` is the churn signal.
     l7_shed_relay_buffers: Value = Value.init(0),
     l7_shed_upstream_slots: Value = Value.init(0),
+    /// §8 rung: a client spoke while the head-buffer ring was empty —
+    /// answered 503 and, uniquely among the sheds, *always* closed: the
+    /// request's bytes were never read (no buffer was ever bound), so a
+    /// kept connection would re-arm onto the same bytes and shed the same
+    /// request forever. `respond` enforces the close at comptime.
+    l7_shed_head_buffers: Value = Value.init(0),
     /// §8 requests answered 503 because every endpoint of their cluster
     /// was already carrying its configured `max_inflight`. Distinct from
     /// `l7_shed_upstream_slots` on purpose: that one says this proxy ran
@@ -269,6 +281,14 @@ pub const Counters = struct {
         /// in-use figure.
         upstream_slots_parked: u32,
         upstream_slots_capacity: u32,
+        /// Head-ring buffers bound to connections right now (§5). This is
+        /// the level whose wall answers `l7_shed_head_buffers`; with the
+        /// ring sized to its default (conn_slots) it cannot reach the
+        /// capacity, and the *gap* between this and `conn_slots_in_use`
+        /// is the density the ring buys — idle connections appear in the
+        /// conn level but not here.
+        head_buffers_in_use: u32,
+        head_buffers_capacity: u32,
         /// The raw errno of the most recent kernel-pressure failure, or 0
         /// for "none since start". A gauge, not a counter: the question is
         /// which errno is failing *now*, and the `kernel_pressure_*` cause
@@ -289,6 +309,7 @@ pub const Counters = struct {
         pub fn valid(gauges: *const Gauges) bool {
             if (gauges.conn_slots_in_use > gauges.conn_slots_capacity) return false;
             if (gauges.relay_buffers_in_use > gauges.relay_buffers_capacity) return false;
+            if (gauges.head_buffers_in_use > gauges.head_buffers_capacity) return false;
             if (gauges.health_endpoints_unhealthy > gauges.health_endpoints_checked) return false;
             const upstream_in_use = @as(u64, gauges.upstream_slots_leased) +
                 gauges.upstream_slots_parked;
@@ -541,6 +562,8 @@ const test_gauges: Counters.Gauges = .{
     .upstream_slots_leased = 5,
     .upstream_slots_parked = 11,
     .upstream_slots_capacity = 16,
+    .head_buffers_in_use = 2,
+    .head_buffers_capacity = 8,
     .kernel_pressure_last_errno = 105, // ENOBUFS on Linux
     .health_endpoints_checked = 4,
     .health_endpoints_unhealthy = 1,

@@ -112,9 +112,15 @@ pub fn main(init: std.process.Init) !void {
     try ensureFdBudget(fds_required);
     try printBudgets(init.io, &config, fds_required, cq_entries, config_arena_bytes);
 
-    // Buffer group zero until the head-buffer ring's limits knob lands:
-    // no group is registered and nothing arms against one.
-    try global_io.init(arena, cq_entries, listeners_count, 0, zoxy.constants.head_bytes_max);
+    // The ring is the config's to size (§5); Server.init asserts its own
+    // accounting against the same number.
+    try global_io.init(
+        arena,
+        cq_entries,
+        listeners_count,
+        config.limits.head_buffers,
+        zoxy.constants.head_bytes_max,
+    );
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
     try server.start();
@@ -313,6 +319,8 @@ fn printBudgets(
         .upstream_bytes = @sizeOf(UpstreamType),
         .access_log_bytes = access_log_bytes,
         .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
+        .head_buffers = limits.head_buffers,
+        .head_buffer_bytes = constants.head_bytes_max,
     }) + config_arena_bytes;
     var buffer: [1024]u8 = undefined;
     var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
@@ -323,7 +331,8 @@ fn printBudgets(
         \\zoxy {s}{s}
         \\budgets (DESIGN.md §5/§8; closed-form except where marked):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
-        \\          + upstream slots {d} x {d} B + access log {d} KiB
+        \\          + upstream slots {d} x {d} B + head buffers {d} x {d} B (+ ring {d} B)
+        \\          + access log {d} KiB
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + config arena {d} KiB (measured, not closed-form)
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
@@ -340,6 +349,11 @@ fn printBudgets(
         @sizeOf(zoxy.RelayBuffer),
         limits.upstream_slots,
         @sizeOf(UpstreamType),
+        limits.head_buffers,
+        // The +1 ownership byte stays out of the banner's per-unit figure;
+        // the closed-form total above carries it.
+        constants.head_bytes_max,
+        constants.bufferGroupDescriptorBytes(limits.head_buffers),
         access_log_bytes / 1024,
         ServerXev.endpointTableBytes(config),
         config.clusters.len,

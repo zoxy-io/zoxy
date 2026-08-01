@@ -242,7 +242,12 @@ pub const TestBed = struct {
         errdefer bed.arena_state.deinit();
         const arena = bed.arena_state.allocator();
 
-        try bed.sim_io.init(arena, options.sim);
+        // One number on both sides (§5): the ring the sim registers is
+        // the limit the server accounts against — Server.init asserts the
+        // match, so a bed cannot drift them apart.
+        var sim_options = options.sim;
+        sim_options.buffer_group_count = options.server.head_buffers;
+        try bed.sim_io.init(arena, sim_options);
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};

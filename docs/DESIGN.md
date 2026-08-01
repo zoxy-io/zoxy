@@ -115,7 +115,7 @@ not a resumed one.
   holds by construction — there is no second thread that could violate it.
 - **Minimal memory.** One shared pool sized for the global limit replaces
   N per-core pools each sized for a local worst case. Idle keep-alive
-  connections hold a slot and a head buffer, not relay buffers (§5) —
+  connections hold a slot — no relay buffers, no head buffer (§5) —
   memory follows *activity*, not connection count.
 - **Perfect connection reuse.** Pingora's headline win over NGINX was
   sharing upstream connections across all threads; the previous iteration
@@ -354,24 +354,41 @@ previous iteration paid that cost, and shared pools sized for concurrent
 *activity* rather than worst-case-per-core are the fix and the reason this
 iteration exists.
 
-Three shared pools, all owned and touched only by the loop thread:
+Three shared pools and one kernel-fronted ring, all owned and touched
+only by the loop thread:
 
 1. **Connection slots — `Pool(Conn)`.** One contiguous object per
    connection: state machine, embedded completions (one per overlappable
    op — the previous iteration grew a field per proven race — including
-   the timer-cancel completion, §4), the deadline timer, and a small
-   fixed **head buffer** (L7 request/response heads; idle on L4
-   connections, which relay through pool 2 only). Acquired at accept,
-   released at teardown once the slot's armed-op set is empty (release
-   rule below). Intrusive free list, LIFO reuse for cache warmth.
+   the timer-cancel completion, §4), and the deadline timer. Acquired at
+   accept, released at teardown once the slot's armed-op set is empty
+   (release rule below). Intrusive free list, LIFO reuse for cache
+   warmth.
 2. **Relay buffers — `Pool(RelayBuffer)`.** The large per-direction
    buffers for body/stream relaying, *decoupled from connection slots*.
    L7: acquired when a relay starts, **released when the connection goes
-   idle on keep-alive** — an idle connection costs a slot + head buffer
-   only. L4: acquired at accept, held for the connection's life (a recv
-   must always have a buffer posted). This decoupling is where shared
-   pools buy their memory win: buffers are sized for concurrent *relays*,
-   not for open connections.
+   idle on keep-alive** — an idle connection costs a slot only. L4:
+   acquired at accept, held for the connection's life (a relay recv must
+   always have a buffer posted). This decoupling is where shared pools
+   buy their memory win: buffers are sized for concurrent *relays*, not
+   for open connections.
+2b. **Head buffers — the provided-buffer ring (`limits.head_buffers`).**
+   The L7 request/response head buffers, decoupled from connection slots
+   by the same argument as the relay buffers — but where a relay recv
+   must carry a buffer, a head recv need not: the seam's `recvGroup`
+   (§4, single-shot buffer-select) arms with *no* buffer, and the kernel
+   binds one from the registered ring only when the client actually
+   speaks. Bound at the first byte of a request, returned at the
+   keep-alive turnaround, before a static response goes out, and at
+   teardown — so an idle connection holds no head bytes at all, an L4
+   connection never binds one, and the ring is sized for concurrent
+   *request heads*, not for open connections. Returning a buffer is a
+   tail bump, no syscall. The ring empty at a client's first byte is the
+   `l7_shed_head_buffers` rung (§8) — the one shed that always closes,
+   because the bytes it refused are still unread in the socket. The
+   server owns the in-use accounting (the kernel cannot report it) and
+   the lingering-close drain discards into one shared sink, aliasing on
+   purpose: recv targets nobody reads may.
 3. **Upstream connections — `Pool(Upstream)` + per-endpoint idle lists.**
    Checked out by any request, parked on keep-alive, one shared pool for
    the whole process (§3: the Pingora reuse win). **A parked upstream has
@@ -428,9 +445,10 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 11466 | ~1.7 KiB state + 8 KiB head |
+| conn slots | 1386 | 11466 | ~1.7 KiB state |
 | relay buffers | 1386 | 11466 | 2 × 4 KiB |
 | upstream slots | 1313 | 11466 | ~40 B state + 8 KiB head |
+| head buffers (ring) | = conn slots | 11466 | 8 KiB + 1 B |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
 
 The access log (§8) adds one fixed reservation beside the pools — two
@@ -439,8 +457,9 @@ is off. It is in the printed total, because §5's promise is that the
 total covers everything this process holds for its life, not only what is
 shaped like a pool. Roughly half a kilobyte of the conn-slot state above
 is its per-request capture: the method, host and path a line reports live
-in the head buffer, which the response head renders over (§7), so they
-have to be copied out while they are still there.
+in the head buffer, which the response head renders over (§7) and the
+turnaround returns to the ring, so they have to be copied out while they
+are still there.
 
 The config arena is in that total for the same reason — it is never
 freed — but it is the one term that is **measured rather than derived**,
@@ -561,7 +580,7 @@ accept → admit (slots? buffers?) → route by listener → connect upstream
 - Relay buffers (one per direction) are acquired at admission and held
   for the connection's life — a recv must always have a buffer posted —
   so `relay_buffers`, not connection slots, bounds concurrent L4
-  connections. The slot's head buffer is not used on the L4 path.
+  connections. An L4 connection never binds a head-ring buffer.
 - **Strict `recv → send → recv` per direction over one fixed buffer
   each.** The next chunk is never read until the current one is fully
   written, so a slow side stalls the fast side through TCP flow control
@@ -858,7 +877,8 @@ the loop thread.
 |---|---|---|
 | connection slots | accept completion | close immediately (SO_LINGER 0 → RST); accept stays armed |
 | relay buffers (L4) | accept admission | close immediately |
-| relay buffers (L7) | request admission on a kept-alive conn | static `503` from the head buffer, then keep or close per pressure |
+| head buffers | a client's first byte, before the parse | static `503`, then **always close** — the refused bytes are still unread in the socket, and a kept connection would shed them forever |
+| relay buffers (L7) | request admission on a kept-alive conn | static `503` from static memory, then keep or close per pressure |
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) |
 | **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
@@ -936,7 +956,12 @@ origin, not one this proxy can pick for them.
   pressure shortens parked-connection deadlines (and the sweep
   interval), reaping idle parked sockets so their slots free for fresh
   dials. Each bias sheds *idle* capacity before the wall must shed
-  *work*; each engage crossing has a counter.
+  *work*; each engage crossing has a counter. The head-buffer ring flips
+  the same flag on the same watermarks but drives no bias at all — an
+  idle connection holds no head buffer, so there is no idle occupancy a
+  timeout could evict; its flag and engage counter exist for the
+  operator, who sizes `limits.head_buffers` by the crossings before the
+  wall starts refusing.
 - **Metrics witness every shed.** Every rung has a counter, written only
   by the loop thread as a relaxed atomic — one writer, any number of
   readers. The admin plane reads them on the loop itself (§3: there is no

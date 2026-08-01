@@ -74,6 +74,27 @@ pub fn Server(comptime IoType: type) type {
         relay_pressure: bool,
         conn_pressure: bool,
         upstream_pressure: bool,
+        /// The head-buffer ring's watermark flag (§8). Unlike the other
+        /// three it drives no timeout or keep-alive bias: an idle
+        /// connection holds no head buffer, so there is no idle occupancy
+        /// to evict — the only remedy for ring pressure is the shed rung
+        /// itself, and the flag exists for the gauge and the engage
+        /// counter an operator alerts on.
+        head_pressure: bool,
+        /// Ring buffers currently bound to connections: incremented at the
+        /// delivery that binds one, decremented by `returnHeadBuffer` —
+        /// the seam's kernel side cannot count for us, so the server is
+        /// the one owner of this number (§5). `head_buffers_capacity`
+        /// mirrors `limits.head_buffers`, asserted at init to equal the
+        /// group the Io backend actually registered.
+        head_buffers_in_use: u32,
+        head_buffers_capacity: u32,
+        /// The one shared lingering-close discard sink (§7): every
+        /// draining connection recvs into it concurrently, which is sound
+        /// precisely because no path reads it — bytes land, interleave,
+        /// and die. Inline rather than arena so it is part of no budget
+        /// term and can never be under-counted.
+        drain_sink: [constants.drain_sink_bytes]u8,
         /// Highest armed-op count any one connection has reached (§8):
         /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and,
         /// under runtime safety only (never in the shipped ReleaseFast
@@ -220,6 +241,11 @@ pub fn Server(comptime IoType: type) type {
             assert(options.relay_buffers >= 1);
             assert(options.upstream_slots >= 1);
             assert(options.relay_buffers <= options.conn_slots);
+            assert(options.head_buffers <= options.conn_slots);
+            // The ring the backend registered and the limit this server
+            // accounts against must be the same number, or the shed rung
+            // fires at a size no config names. Zero is the L4-only shape.
+            assert(io.bufferGroupCount() == options.head_buffers);
             server.io = io;
             server.config = config;
             try server.conns.init(arena, options.conn_slots);
@@ -238,6 +264,12 @@ pub fn Server(comptime IoType: type) type {
             server.relay_pressure = false;
             server.conn_pressure = false;
             server.upstream_pressure = false;
+            server.head_pressure = false;
+            server.head_buffers_in_use = 0;
+            server.head_buffers_capacity = options.head_buffers;
+            // Deliberately not zeroed: a discard sink's contents are never
+            // read, the same argument the head buffers make (§5).
+            server.drain_sink = undefined;
             server.armed_ops_peak = 0;
             server.last_pressure_errno = 0;
             server.drain_deadline_completion = .{};
@@ -366,6 +398,9 @@ pub fn Server(comptime IoType: type) type {
             // beginDrain reaped every parked slot synchronously and no
             // conn is left to lease one, so the pool must be empty.
             assert(server.upstreams.isFullyReleased());
+            // Every conn released its ring buffer on the way out, so the
+            // in-use count the server owns must have followed to zero.
+            assert(server.head_buffers_in_use == 0);
             server.io.stop();
         }
 
@@ -436,6 +471,7 @@ pub fn Server(comptime IoType: type) type {
                 server.conns.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
+                server.head_buffers_in_use == 0 and
                 server.admin.isQuiescent() and
                 server.access_log.isQuiescent() and
                 server.health.isQuiescent();
@@ -722,6 +758,31 @@ pub fn Server(comptime IoType: type) type {
             server.updateRelayPressure();
         }
 
+        /// The ring pair (§5): the bind side is the seam's — the kernel
+        /// selects the buffer, `onHeadGroupRecv` reports it here — and the
+        /// return side hands the id back and clears the conn's claim, so a
+        /// double return dies in the seam's ownership assert rather than
+        /// as aliased receives. Both sides recompute the watermark.
+        pub fn noteHeadBufferBound(server: *Self) void {
+            assert(server.head_buffers_in_use < server.head_buffers_capacity);
+            server.head_buffers_in_use += 1;
+            server.updateHeadPressure();
+        }
+
+        pub fn returnHeadBuffer(server: *Self, conn: *ConnType) void {
+            assert(conn.head_buffer_id != ConnType.head_buffer_none);
+            assert(server.head_buffers_in_use >= 1);
+            server.io.bufferGroupReturn(conn.head_buffer_id);
+            conn.head_buffer_id = ConnType.head_buffer_none;
+            server.head_buffers_in_use -= 1;
+            server.updateHeadPressure();
+        }
+
+        /// The shared lingering-close discard target (§7) — see the field.
+        pub fn drainSink(server: *Self) []u8 {
+            return server.drain_sink[0..];
+        }
+
         /// The same pair for conn slots, with `admitConn` as its acquire
         /// side: pressure follows occupancy in both directions (§5, §8), so
         /// every slot return goes through here and the flag can never
@@ -861,6 +922,11 @@ pub fn Server(comptime IoType: type) type {
             if (conn.relay_buffer) |buffer| {
                 server.releaseRelayBuffer(buffer);
                 conn.relay_buffer = null;
+            }
+            // Same rule for the ring buffer: nothing armed references it
+            // (asserted above), so the return cannot race a landing recv.
+            if (conn.head_buffer_id != ConnType.head_buffer_none) {
+                server.returnHeadBuffer(conn);
             }
             // The leased upstream slot rides the same release rule: its
             // socket (if any) was closed just above, so the slot is
@@ -1059,6 +1125,19 @@ pub fn Server(comptime IoType: type) type {
             );
         }
 
+        fn updateHeadPressure(server: *Self) void {
+            // Reachable only through a bind or return, both of which imply
+            // a registered ring — so the capacity the watermark math needs
+            // to be nonzero always is.
+            assert(server.head_buffers_capacity >= 1);
+            server.updatePressureFlag(
+                &server.head_pressure,
+                server.head_buffers_in_use,
+                server.head_buffers_capacity,
+                "head_pressure_engaged",
+            );
+        }
+
         /// Any pressure an *idle* downstream connection holds capacity
         /// against (§8): it pins a conn slot, and its next body relay
         /// claims a relay buffer. Drives only the idle-timeout division —
@@ -1097,6 +1176,8 @@ pub fn Server(comptime IoType: type) type {
                 .upstream_slots_leased = server.upstreams.leasedCount(),
                 .upstream_slots_parked = server.upstreams.parkedCount(),
                 .upstream_slots_capacity = server.upstreams.capacity(),
+                .head_buffers_in_use = server.head_buffers_in_use,
+                .head_buffers_capacity = server.head_buffers_capacity,
                 .kernel_pressure_last_errno = server.last_pressure_errno,
                 .health_endpoints_checked = server.health.checked_count,
                 .health_endpoints_unhealthy = server.health.unhealthy_count,
