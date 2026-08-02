@@ -70,7 +70,7 @@ same listener with health checks and the access log turned on, and
 [**zoxy-io/benchmark**](https://github.com/zoxy-io/benchmark) runs unattended
 every night and publishes to
 [zoxy-io.github.io/benchmark](https://zoxy-io.github.io/benchmark/). It
-compares zoxy against **HAProxy**, **Pingora** and **Envoy** as HTTP/1.1
+compares zoxy against **HAProxy**, **Nginx**, **Pingora** and **Envoy** as HTTP/1.1
 reverse proxies doing the identical job — parse each request, forward it over
 a pooled keep-alive upstream, stream the response back — currently under the
 `c1k` profile. That repository documents the fairness rules and the fleet
