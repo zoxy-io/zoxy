@@ -10,11 +10,18 @@
 //! caught by it first, because each needed the shape to be known before it
 //! could be looked for.
 //!
-//! So this gate asserts *equalities on real output*, never thresholds: a
-//! shared runner's timing noise must not be able to move a verdict. N
-//! requests produce exactly N access-log lines. Anything whose verdict
-//! needs a run-to-run comparison is Tier 1's job (`zig build bench`) and
-//! would make a per-change gate that fails on noise.
+//! So this gate asserts *equalities on real output*: a shared runner's
+//! timing noise must not be able to move a verdict. N requests produce
+//! exactly N access-log lines. Anything whose verdict needs a
+//! run-to-run comparison is Tier 1's job (`zig build bench`) and would
+//! make a per-change gate that fails on noise.
+//!
+//! The health-probe rate is the one exception, and it is the exception
+//! that proves the rule: #130 was a bug *no* equality could see, because
+//! every verdict the prober reached was correct and only its rate was
+//! wrong. So that one check is a band — deliberately loose enough that
+//! scheduling cannot move it, and still decisive because what it is aimed
+//! at runs two orders of magnitude slow, not a little slow.
 //!
 //! The origin lives in this process (smoke/origin.zig) rather than being
 //! nginx; the load is this file's own client (smoke/client.zig) rather
@@ -107,6 +114,40 @@ comptime {
     assert(zoxy_limits.conn_slots >= connections_expected);
 }
 
+/// The health-check shape this run configures, and the window it is
+/// measured over (#130). Correctness proves nothing here: a prober that
+/// never cancels its probe deadline reports every verdict correctly and
+/// gets only the *rate* wrong, which a virtual clock hides behind "it
+/// still passed" and a wall clock cannot.
+///
+/// The band is deliberately loose — a shared runner's scheduling must not
+/// move a verdict — and still decisive, because the failure it is aimed
+/// at is not a slow prober but one running two orders of magnitude slower
+/// than configured.
+const health_interval_ms: u32 = 25;
+const health_probe_timeout_ms: u32 = 1000;
+const probe_window_ms: u32 = 500;
+const probe_window_ns: u64 = @as(u64, probe_window_ms) * std.time.ns_per_ms;
+/// Whole intervals the window holds — a partial one sends no probe.
+const probes_implied: u32 = @divFloor(probe_window_ms, health_interval_ms);
+/// A quarter of the implied rate: four times slower than configured is
+/// still working, and slower than that is not pacing at all.
+const probes_min: u32 = @divFloor(probes_implied, 4);
+const probes_max: u32 = probes_implied * 3;
+
+comptime {
+    assert(health_interval_ms >= 1);
+    assert(probe_window_ms >= 4 * health_interval_ms);
+    assert(probes_min >= 2);
+    assert(probes_min < probes_implied);
+    assert(probes_implied < probes_max);
+    // What makes the floor a gate rather than a preference: a probe that
+    // idles out its whole timeout instead of finishing (#130 exactly)
+    // cannot fit `probes_min` of itself into the window, so the shape is
+    // caught by arithmetic and not by taste.
+    assert(@divFloor(probe_window_ms, health_probe_timeout_ms) < probes_min);
+}
+
 /// The whole run's wall-clock budget. Fifty times what a run takes, so it
 /// is never a verdict on speed — it exists because every wait in this
 /// harness is a wait on the process under test, and the failure this gate
@@ -185,28 +226,29 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
 
     // Scraped before the drain: the admin listener closes with every
     // other one when SIGTERM lands (§8).
-    const counters_ok = try countersPassed(arena, io, ports.admin);
+    const counters = try countersPassed(arena, io, ports.admin);
     const drained_cleanly = try drain(io, &child, &running);
     const lines = try readAccessLog(arena, io);
     // Every check runs and prints; a run that fails two ways should say
     // both, not stop at the first.
     const log_ok = accessLogPassed(&lines);
     const drain_ok = drainPassed(drained_cleanly);
-    return report(io, &lines, log_ok and counters_ok and drain_ok);
+    return report(io, &lines, &counters, log_ok and counters.passed and drain_ok);
 }
 
 /// The run's one line of output when everything held, and the proxy's own
-/// output when something did not.
-fn report(io: Io, lines: *const LogCounts, passed: bool) u8 {
+/// output when something did not. The probe count is in it either way —
+/// a band nobody can see the margin of is a band nobody can watch.
+fn report(io: Io, lines: *const LogCounts, counters: *const CounterVerdict, passed: bool) u8 {
     assert(lines.http_ok <= lines.http);
     if (!passed) {
         printZoxyLog(io);
         return 1;
     }
     std.debug.print(
-        "smoke: {d} http + {d} l4 exchanges, {d} access-log lines, " ++
-            "counters reconcile, clean drain\n",
-        .{ lines.http, lines.l4, access_log_lines_expected },
+        "smoke: {d} http + {d} l4 exchanges, {d} access-log lines, counters reconcile, " ++
+            "{d} probes in {d}ms, clean drain\n",
+        .{ lines.http, lines.l4, access_log_lines_expected, counters.probes, probe_window_ms },
     );
     return 0;
 }
@@ -297,26 +339,102 @@ fn drainPassed(drained_cleanly: bool) bool {
     return false;
 }
 
+/// Two scrapes a measured window apart, and every counter verdict the
+/// gate holds. The window is what makes the probe band a wall-clock
+/// claim; the two scrapes are also what `admin_served` needs, since the
+/// first one's own witness is incremented when its last byte lands and
+/// can only be read by the next.
+fn countersPassed(arena: std.mem.Allocator, io: Io, port: u16) !CounterVerdict {
+    assert(port != 0);
+    const first = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
+    try io.sleep(Io.Duration.fromNanoseconds(probe_window_ns), .awake);
+    const second = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
+    const probes = probeDelta(&first, &second);
+    const identities_ok = identitiesPassed(&first);
+    const probes_ok = probesPassed(probes, &second);
+    const admin_ok = adminPassed(&second);
+    const passed = identities_ok and probes_ok and admin_ok;
+    // A verdict that passed read a probe count; the reported number is
+    // never the zero that stands in for a counter the scrape lacked.
+    if (passed) assert(probes != null);
+    return .{ .passed = passed, .probes = probes orelse 0 };
+}
+
+/// What the counter checks decided, and the one number worth printing
+/// whether or not they passed: a band whose margin is invisible until it
+/// fails cannot be watched across runs.
+const CounterVerdict = struct {
+    passed: bool,
+    probes: u32,
+};
+
+/// Probes sent across the measured window, or null when the scrape did
+/// not carry the counter at all.
+fn probeDelta(first: *const scrape_module.Scrape, second: *const scrape_module.Scrape) ?u32 {
+    const before = counterOf(first, "health_probes_sent") orelse return null;
+    const after = counterOf(second, "health_probes_sent") orelse return null;
+    // A counter only ever rises, and the window is the only thing between
+    // these two readings.
+    assert(after >= before);
+    assert(after - before <= std.math.maxInt(u32));
+    return @intCast(after - before);
+}
+
+/// The §7 prober, judged on its rate rather than its verdicts (#130).
+/// Both ends of the band are gates: the floor catches a prober that
+/// waits out something it should have cancelled, the ceiling one that
+/// stopped pacing and is spinning on the origin.
+///
+/// The verdicts are checked too, as invariants that read zero — this
+/// origin answers every probe, so a failure or an ejection here is the
+/// probe path being wrong about a healthy endpoint.
+fn probesPassed(sent: ?u32, second: *const scrape_module.Scrape) bool {
+    const failed = counterOf(second, "health_probes_failed") orelse return false;
+    const ejected = counterOf(second, "health_endpoint_down") orelse return false;
+    // An ejection needs a failed probe, which `reconcile` asserts inside
+    // the process; the same must be true of what came out of it.
+    assert(ejected <= failed);
+    if (sent == null) return false;
+    var passed = true;
+    if (sent.? < probes_min or sent.? > probes_max) {
+        std.debug.print(
+            "FAIL: {d} probes in {d}ms at a {d}ms interval — outside the {d}..{d} band\n",
+            .{ sent.?, probe_window_ms, health_interval_ms, probes_min, probes_max },
+        );
+        passed = false;
+    }
+    if (failed != 0 or ejected != 0) {
+        std.debug.print(
+            "FAIL: {d} probe(s) failed and {d} ejection(s) against an origin answering 200\n",
+            .{ failed, ejected },
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// The admin plane's own witness: the scrape that answered before this
+/// one, and no other. Exactly one, not "at least" — the plane serves one
+/// at a time (§8's reserved slot), so the second scrape is accepted only
+/// after the first has closed.
+fn adminPassed(second: *const scrape_module.Scrape) bool {
+    const served = counterOf(second, "admin_served") orelse return false;
+    if (served == 1) return true;
+    std.debug.print("FAIL: {d} admin scrapes served before the second, not 1\n", .{served});
+    return false;
+}
+
 /// Both of `reconcile`'s identities (§9), re-derived from a live scrape
 /// instead of from the struct — the numbers rendered, written to a
 /// socket, framed by a close and parsed back, so the whole admin plane is
 /// under the same verdict as the arithmetic.
-///
-/// Two scrapes, because the first one's own witness (`admin_served`) is
-/// incremented when its last byte lands and can only be read by the next.
-/// The plane serves one at a time (§8's reserved slot), so the second is
-/// accepted only after the first has closed: exactly one, not "at least".
-fn countersPassed(arena: std.mem.Allocator, io: Io, port: u16) !bool {
-    assert(port != 0);
-    const first = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
-    const second = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
-    const accepted = counterOf(&first, "accepted") orelse return false;
-    const admitted = counterOf(&first, "admitted") orelse return false;
-    const completed = counterOf(&first, "completed") orelse return false;
-    const in_use = counterOf(&first, "conn_slots_in_use") orelse return false;
-    const responses = counterOf(&first, "l7_responses") orelse return false;
-    const reused = counterOf(&first, "upstream_reused") orelse return false;
-    const served = counterOf(&second, "admin_served") orelse return false;
+fn identitiesPassed(first: *const scrape_module.Scrape) bool {
+    const accepted = counterOf(first, "accepted") orelse return false;
+    const admitted = counterOf(first, "admitted") orelse return false;
+    const completed = counterOf(first, "completed") orelse return false;
+    const in_use = counterOf(first, "conn_slots_in_use") orelse return false;
+    const responses = counterOf(first, "l7_responses") orelse return false;
+    const reused = counterOf(first, "upstream_reused") orelse return false;
     // The orderings `reconcile` asserts inside the process, asserted here
     // on the numbers that came back out of it: these are impossible
     // states, not failed verdicts, and a scrape that parsed the wrong
@@ -367,10 +485,6 @@ fn countersPassed(arena: std.mem.Allocator, io: Io, port: u16) !bool {
         std.debug.print("FAIL: no upstream connection was reused across {d} exchanges\n", .{
             http_exchanges,
         });
-        passed = false;
-    }
-    if (served != 1) {
-        std.debug.print("FAIL: {d} admin scrapes served before the second, not 1\n", .{served});
         passed = false;
     }
     return passed;
@@ -529,13 +643,17 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }}
         \\    ],
         \\    "clusters": {{
-        \\        "origin": {{ "endpoints": ["127.0.0.1:{d}"] }}
+        \\        "origin": {{
+        \\            "endpoints": ["127.0.0.1:{d}"],
+        \\            "check": {{ "type": "http", "path": "/health", "timeout_ms": {d} }}
+        \\        }}
         \\    }},
         \\    "admin": {{ "bind": "127.0.0.1:{d}" }},
         \\    "access_log": {{ "sink": "file", "path": "{s}" }},
         \\    "timeouts": {{
         \\        "connect_ms": 2000,
         \\        "idle_ms": 30000,
+        \\        "health_interval_ms": {d},
         \\        "drain_deadline_ms": {d}
         \\    }},
         \\    "limits": {{
@@ -549,8 +667,10 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         ports.http,
         ports.l4,
         origin_port,
+        health_probe_timeout_ms,
         ports.admin,
         access_log_path,
+        health_interval_ms,
         drain_deadline_ms,
         zoxy_limits.conn_slots,
         zoxy_limits.relay_buffers,
