@@ -162,6 +162,13 @@ pub const Config = struct {
         /// the same cluster may be reachable from an edge listener that
         /// must not trust an inbound chain and an internal one that must.
         forwarded: ?Forwarded = null,
+        /// Whether every connection on this listener must open with a
+        /// PROXY protocol header announcing the real client (§6, #142),
+        /// or null to treat first bytes as payload — the behavior of
+        /// every config predating this. Per listener, like `forwarded`
+        /// and for the same reason: it states what sits in front of this
+        /// socket. `l4` only until the L7 receive phase exists.
+        proxy_protocol: ?ProxyProtocol = null,
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
         /// `http` runs the HTTP/1.1 reverse-proxy state machine. The
@@ -187,6 +194,22 @@ pub const Config = struct {
             /// only where every hop in front is one you control —
             /// anywhere else it is the forgery above, appended to.
             append,
+        };
+
+        /// What a listener expecting PROXY protocol does about it
+        /// (#142). One arm today; a closed enum rather than a bool
+        /// (`HashKey`'s shape) so a CIDR-gated variant is a new arm
+        /// rather than a new mechanism. There is deliberately no arm
+        /// that *sniffs*: a listener accepting header-or-raw-bytes lets
+        /// any client choose the address that routing (`pick: hash`
+        /// keys on `client_address`, §7) and the access log then
+        /// believe, which is why the spec forbids it of receivers.
+        pub const ProxyProtocol = enum(u1) {
+            /// Every connection must open with a valid v1 or v2 header;
+            /// anything else is closed. This makes the listener
+            /// unusable by anything except the proxy configured in
+            /// front of it — that is the point.
+            require,
         };
     };
 
@@ -320,6 +343,8 @@ pub const ValidationError = error{
     ListenerL4Filters,
     ListenerL4Forwarded,
     ListenerForwardedModeUnknown,
+    ListenerHttpProxyProtocol,
+    ListenerProxyProtocolModeUnknown,
     FilterMethodEmpty,
     FilterMethodUnknown,
     FilterHeaderMatchKind,
@@ -790,6 +815,9 @@ pub const ListenerJson = struct {
     /// Optional §7 client-address forwarding; absent leaves the header
     /// untouched. HTTP-only — an l4 relay has no header to carry it.
     forwarded: ?ForwardedJson = null,
+    /// Optional PROXY protocol expectation (#142); absent treats first
+    /// bytes as payload. L4-only until the L7 receive phase exists.
+    proxy_protocol: ?ProxyProtocolJson = null,
 
     pub const schema_doc =
         "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
@@ -812,6 +840,11 @@ pub const ListenerJson = struct {
             .desc = "Tell the origin the client's address via X-Forwarded-For " ++
                 "(http listeners only); absent leaves the header untouched.",
         },
+        .proxy_protocol = .{
+            .desc = "Expect a PROXY protocol header (v1 or v2) ahead of every " ++
+                "connection's payload (l4 listeners only); absent treats first " ++
+                "bytes as payload.",
+        },
     };
 };
 
@@ -830,6 +863,26 @@ pub const ForwardedJson = struct {
                 "(use at the edge). append: extend the inbound chain with the observed " ++
                 "peer (use only when every hop in front is trusted).",
             .enum_type = Config.Listener.Forwarded,
+        },
+    };
+};
+
+pub const ProxyProtocolJson = struct {
+    mode: []const u8,
+
+    pub const schema_doc =
+        "Whether this listener expects the proxy in front of it to announce " ++
+        "each client with a PROXY protocol header. There is no sniffing mode " ++
+        "— accepting a header only when one shows up would let any client " ++
+        "pick the address that routing and logging then believe — and `mode` " ++
+        "is stated even with one value today, so future modes extend a " ++
+        "vocabulary rather than change what absence means.";
+    pub const schema_fields = .{
+        .mode = .{
+            .desc = "require: every connection must open with a valid v1 or v2 " ++
+                "header; anything else is closed. Only meaningful when the " ++
+                "listener is reachable exclusively through the fronting proxy.",
+            .enum_type = Config.Listener.ProxyProtocol,
         },
     };
 };
@@ -1251,11 +1304,11 @@ pub fn assert_meta_matches(comptime T: type) void {
 /// block below runs `assert_meta_matches` on each at comptime, so the
 /// metadata cannot drift from the fields whether or not the emitter builds.
 pub const dto_types = .{
-    ConfigJson,    ListenerJson,    RouteJson,    FilterJson,
-    MatchJson,     HeaderMatchJson, ActionJson,   HeaderEditJson,
-    RewriteJson,   ClusterJson,     TimeoutsJson, LimitsJson,
-    AdminJson,     AccessLogJson,   CheckJson,    ClusterHashJson,
-    ForwardedJson,
+    ConfigJson,    ListenerJson,      RouteJson,    FilterJson,
+    MatchJson,     HeaderMatchJson,   ActionJson,   HeaderEditJson,
+    RewriteJson,   ClusterJson,       TimeoutsJson, LimitsJson,
+    AdminJson,     AccessLogJson,     CheckJson,    ClusterHashJson,
+    ForwardedJson, ProxyProtocolJson,
 };
 
 comptime {
@@ -1392,6 +1445,7 @@ fn resolveListeners(
             .filters = try resolveFilters(arena, &listener_json, protocol, head_buffer_bytes),
             .protocol = protocol,
             .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
+            .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
         };
     }
 
@@ -1937,6 +1991,23 @@ fn resolveForwarded(
     }
     return std.meta.stringToEnum(Config.Listener.Forwarded, forwarded.mode) orelse
         error.ListenerForwardedModeUnknown;
+}
+
+/// Resolve a listener's PROXY protocol expectation (#142): absent is
+/// off, and a block on an `http` listener is rejected rather than
+/// ignored — the L7 path has no receive phase yet, so accepting the
+/// config would state a trust boundary nothing enforces, the exact
+/// silent hole the option exists to close.
+fn resolveProxyProtocol(
+    proxy_protocol_json: ?ProxyProtocolJson,
+    protocol: Config.Listener.Protocol,
+) ValidationError!?Config.Listener.ProxyProtocol {
+    const proxy_protocol = proxy_protocol_json orelse return null;
+    if (protocol == .http) {
+        return error.ListenerHttpProxyProtocol;
+    }
+    return std.meta.stringToEnum(Config.Listener.ProxyProtocol, proxy_protocol.mode) orelse
+        error.ListenerProxyProtocolModeUnknown;
 }
 
 /// The closed pick-policy vocabulary; anything else is its own error so
@@ -3491,6 +3562,50 @@ test "config: the forwarded block resolves a mode, and is http-only" {
     try expectParseError(
         error.MissingField,
         head ++ ",\"protocol\":\"http\",\"forwarded\":{}" ++ tail,
+    );
+}
+
+test "config: the proxy_protocol block resolves a mode, and is l4-only" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // Absent: first bytes are payload — every config predating this.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
+        try std.testing.expect(parsed.listeners[0].proxy_protocol == null);
+    }
+    // The one mode resolves, on the defaulted protocol and stated l4 alike.
+    inline for (.{ "", ",\"protocol\":\"l4\"" }) |protocol_field| {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ protocol_field ++ ",\"proxy_protocol\":{\"mode\":\"require\"}" ++ tail,
+        );
+        try std.testing.expectEqual(
+            Config.Listener.ProxyProtocol.require,
+            parsed.listeners[0].proxy_protocol.?,
+        );
+    }
+    // The L7 path has no receive phase yet, so a block there would state
+    // a trust boundary nothing enforces — rejected, not ignored.
+    try expectParseError(
+        error.ListenerHttpProxyProtocol,
+        head ++ ",\"protocol\":\"http\",\"proxy_protocol\":{\"mode\":\"require\"}" ++ tail,
+    );
+    // The mode vocabulary is closed and `mode` is required; sniffing
+    // ("optional") is deliberately not in it — a listener that accepts
+    // header-or-raw-bytes lets any client choose its own address.
+    try expectParseError(
+        error.ListenerProxyProtocolModeUnknown,
+        head ++ ",\"proxy_protocol\":{\"mode\":\"optional\"}" ++ tail,
+    );
+    try expectParseError(
+        error.MissingField,
+        head ++ ",\"proxy_protocol\":{}" ++ tail,
     );
 }
 
