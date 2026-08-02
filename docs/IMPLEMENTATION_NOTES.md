@@ -1429,6 +1429,49 @@ can only be the proxy's fault. The band now prints the refused/timed-out
 split every run: a threshold whose margin is invisible until it trips is
 how this one sat mis-specified for a week.
 
+## The live gate's measured numbers (2026-08-02, #144)
+
+Tier 0.5 (`zig build smoke`, DESIGN.md §9) landed with these readings on a
+loopback dev box; they are what its bands and equalities were set from,
+and a future tightening should start here rather than from taste.
+
+- **Whole run: 0.89 s**, of which the drain deadline is 0.3 s and the
+  probe window 0.5 s. The load itself — 136 L7 exchanges, 2 L4
+  connections, 15 accepted connections — is single-digit milliseconds.
+  The drain deadline is the *entire* shutdown cost: an idle keep-alive
+  connection is indistinguishable from one about to send a request, so
+  the drain waits for it and reaps at the deadline (§8). At the stock
+  2 s that alone made the gate a 2 s gate.
+- **Probes: 20 in a 500 ms window at a 25 ms interval**, run after run —
+  exactly what the interval implies, since a probe against a loopback
+  origin costs nothing against the pacing. With the deadline-cancel in
+  `health.zig`'s `settle` disabled (#130 itself), the same window
+  measures **0**. The 5..60 band therefore sits four times below and
+  three times above a number that has not once varied.
+- **Resident set: 0 KiB of growth** across two identical load passes,
+  measured at a zero-KiB tolerance before the shipped 64 KiB was chosen.
+  §5's promise is exact here, not approximate; the tolerance is headroom
+  for page granularity on some other kernel.
+- **Upstream reuse: 135 of the run's 136 L7 exchanges** — one dial and
+  135 reuses, read off the drain-time counter dump. The clients are
+  driven sequentially, so the pool hands the same parked connection back
+  every time; the gate itself only requires the count to be nonzero,
+  since which connection the pool picks is its business and not a claim
+  worth pinning.
+
+**The finding worth keeping: filling the head buffer is not enough to
+produce a response excess.** The bulk target's 32 KiB body does fill
+zoxy's 8 KiB upstream head buffer, and `l7_response_excess_sent` still
+read **0**. The excess rides the head write whenever
+`rendered.len + excess <= head_buffer_bytes`, and the rendered head is
+the origin's head *minus* hop-by-hop headers — so head plus excess comes
+to exactly the buffer size and fits, 8192 <= 8192. The branch needs the
+render to **grow** the head, and the only thing that grows it is the
+injected `Connection: close` (`render.zig`). The gate's bulk requests
+announce close for that reason alone, and the counter then reads exactly
+one per request. Anyone reaching for this path in a directed test needs
+both halves.
+
 ## Phase 0 baselines (2026-07-10/11)
 
 - Debug-build zoxy over loopback (`zig build bench`, nginx origin, rate

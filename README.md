@@ -88,9 +88,10 @@ automatically on `cd`:
 ```sh
 devenv shell                    # zig 0.16, zls, kcov
 zig build                       # build zig-out/bin/zoxy
-zig build ci                    # the per-change gate: tests + lint + simulation
+zig build ci                    # the per-change gate: tests + lint + simulation + smoke
 zig build test                  # unit tests
 zig build sim -- 0 500          # deterministic simulator: [seed] [iterations]
+zig build smoke                 # live gate: the real binary against a real origin
 zig build schema                # emit zig-out/config.schema.json
 zig build run -- config/example.json
 zig build bench                 # loopback bands: direct vs zoxy vs haproxy
@@ -101,6 +102,13 @@ against an I/O seam, so a seeded adversarial backend runs the *real* code
 against virtual sockets and a virtual clock — partial reads down to one byte,
 resets at every point in every exchange, delayed and black-holed connects. A
 failing seed prints itself and replays exactly.
+
+Beside it, a live gate runs the actual binary against an actual origin on every
+change, in under a second, and asserts equalities on what it wrote: N requests
+produce exactly N access-log lines, the counters scraped off `/metrics` reconcile
+with each other and with the log, memory does not move across two identical load
+passes, and SIGTERM drains cleanly. It is there because a virtual clock cannot
+catch a bug whose only symptom is a wrong *rate*.
 
 > [!NOTE]
 > The bench harness is always built ReleaseFast, but it measures the

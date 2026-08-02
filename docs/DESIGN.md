@@ -1181,17 +1181,23 @@ keep-alive connection from waiting on a request that will never come.
 The deterministic-simulation seam is the single highest-leverage testing
 decision the previous iteration made: the data path is written against an
 `Io` facade from the first commit (§4) so a seeded, adversarial,
-virtual-socket backend can run the *real* code, not a mock of it. All four
+virtual-socket backend can run the *real* code, not a mock of it. All
 gates exist as `build.zig` steps from the first commit; a
 feature without its gate is not done. The three deterministic gates
-(simulation, fuzz, zero-alloc) plus the fd-boundary lint run on every
-change as `zig build ci`. The benchmark gate (Tier 1) is **run at
-merge, not on every change**: its verdict is a *band comparison across
-runs* (§Tier 1 below), which a single shared-runner pass cannot make —
-so `zig build bench` is invoked deliberately against a real origin, and
-its hard invariants (RSS under the §5 banner ceiling, clean drain,
-sub-1% socket-error rate) are the pass/fail part. `zig build ci`
-deliberately excludes it.
+(simulation, fuzz, zero-alloc) plus the fd-boundary lint and the live
+gate (Tier 0.5) run on every change as `zig build ci`. The benchmark gate
+(Tier 1) is **run at merge, not on every change**: its verdict is a *band
+comparison across runs* (§Tier 1 below), which a single shared-runner
+pass cannot make — so `zig build bench` is invoked deliberately against a
+real origin, and its hard invariants (RSS under the §5 banner ceiling,
+clean drain, sub-1% socket-error rate) are the pass/fail part. `zig build
+ci` deliberately excludes it.
+
+What separates the live gate from the benchmark is not what it runs but
+what it *claims*. Both spawn the real binary against a real origin; Tier
+1 answers "how fast", which only a comparison across runs can say, while
+Tier 0.5 answers "what did it do", which a single run answers in
+equalities a shared runner's noise cannot move.
 
 1. **Deterministic simulation — `zig build sim -- [seed] [iterations]
    [keep-going]`.** `keep-going` names every failing seed in the range
@@ -1249,7 +1255,50 @@ deliberately excludes it.
    parser edge: HTTP/1.1 head parser, chunked decoder, config parser.
    Assertion: never panic, never overrun a bound, reject-or-parse with no
    third outcome.
-3. **Benchmarks — [zrk](https://github.com/zoxy-io/zrk), three tiers.**
+3. **The live gate (Tier 0.5) — `zig build smoke`.** The shipped binary,
+   on a real kernel, against a real origin, on every change, in under a
+   second. It exists because the deterministic gates are exhaustive
+   *within* a virtual socket table and a virtual clock, and two shipped
+   bugs were neither: a phantom access-log line per keep-alive connection
+   (#129) and health probes idling out their whole timeout (#130). Both
+   were afterwards teachable to the simulator; neither was caught by it
+   first, because each had to be *known* before it could be looked for.
+   The origin and the load generator are Zig inside the harness
+   (`smoke/`), not nginx and zrk: a per-change gate should add no CI
+   dependency, and owning the origin makes its deliveries shapeable,
+   which one of the verdicts below is a property of.
+   Every verdict is an equality on real output, so a shared runner's
+   timing cannot move one. N requests produce exactly N access-log lines,
+   with connections closed by the client and connections reaped by the
+   drain both witnessed writing nothing. Both of `reconcile`'s identities
+   are re-derived from a live `/metrics` scrape — rendered, written to a
+   socket, framed by a close, parsed back — which puts the whole admin
+   plane (§8's reserved slot, the tree's only asynchronous close op)
+   under the same verdict as the arithmetic. The counters must agree with
+   the log about the same exchanges. Upstream reuse (§3) must happen, and
+   an origin delivery that overruns the head buffer must leave its excess
+   in a second write (§7) — the one shape the sweep's census cannot
+   reach, and it needs an injected `Connection: close` besides, because a
+   rendered head that did not *grow* fits its excess exactly. The
+   proxy's resident set must not move across two identical load passes,
+   §5's promise witnessed from outside the process.
+   The one exception to "equalities" is the health-probe *rate*, and it
+   is the exception that proves the rule: #130 was a bug no equality
+   could see, because every verdict the prober reached was correct and
+   only its rate was wrong. That check is a band — loose enough that
+   scheduling cannot move it, decisive because what it is aimed at runs
+   two orders of magnitude slow rather than a little slow.
+   Every wait in the harness is a wait on the process under test, and
+   none can bound itself, so one wall-clock budget covers the run from
+   outside: a wedged proxy is killed and reported rather than left to
+   hang the build until CI's own timeout kills it with no diagnosis.
+   `zig build ci` runs it on Linux only for now: on its first CI run the
+   gate found that the macOS leg answers nothing at all to its first L7
+   request (#184), which is what a live gate is for and is also a
+   different piece of work from building one. `zig build smoke` runs
+   everywhere regardless, and restoring the `ci` wiring on macOS is that
+   issue's acceptance test.
+4. **Benchmarks — [zrk](https://github.com/zoxy-io/zrk), three tiers.**
    The load generator is zrk — a pure-Zig wrk2 rewrite: *constant-throughput*
    (open-loop) pacing with coordinated-omission-corrected HdrHistogram
    latency, so a stalling proxy accrues the stall instead of hiding it.
@@ -1291,7 +1340,7 @@ deliberately excludes it.
      multi-host cloud fleet (disjoint hosts, saturation self-checks,
      HAProxy/Envoy/Traefik/Caddy). Run per release, never per PR.
 
-4. **Zero-alloc gate.** The full serving path — including a drain — runs
+5. **Zero-alloc gate.** The full serving path — including a drain — runs
    in tests under a failing/counting allocator; baseline allocation count
    must equal the final count. Steady state also asserts zero allocating
    syscalls (no mmap/brk after init) via counters.
@@ -1333,6 +1382,7 @@ src/
   admin.zig           // admin/metrics listener: one reserved scrape slot (§8)
   access_log.zig      // JSON access log: double-buffered sink, drop rung (§8)
 sim/                  // simulator harness + invariants
+smoke/                // the live gate (Tier 0.5): origin + client + verdicts, §9
 bench/                // micro benches (poop) + loopback harness (zrk), §9
 ```
 

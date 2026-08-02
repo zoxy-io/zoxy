@@ -57,7 +57,7 @@ jobs:
 
       # zig-pkg (vendored, hash-pinned deps) is deliberately not checked.
       - name: Check formatting
-        run: devenv shell -- zig fmt --check build.zig src bench sim scripts
+        run: devenv shell -- zig fmt --check build.zig src bench sim smoke scripts
 
       - name: Build
         run: devenv shell -- zig build

@@ -131,6 +131,31 @@ pub fn build(b: *std.Build) void {
     const schema_step = b.step("schema", "Emit the config JSON Schema to zig-out/config.schema.json");
     schema_step.dependOn(&schema_install.step);
 
+    // §9 Tier 0.5: the live gate — the shipped binary, on a real kernel,
+    // against a real origin, on every change. It drives the *default*
+    // build (the one `zig build` installs) rather than the ReleaseFast
+    // one the bench uses: its verdicts are correctness equalities on real
+    // output, so what a Debug build's extra checks add is worth more here
+    // than the shipped binary's code generation, which Tier 1 is the gate
+    // for. The origin and the load generator both live inside the harness
+    // (smoke/), so the step needs nothing from the dev shell.
+    const smoke_exe = b.addExecutable(.{
+        .name = "zoxy-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("smoke/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const smoke_run = b.addRunArtifact(smoke_exe);
+    smoke_run.addArg("--zoxy");
+    smoke_run.addArtifactArg(exe);
+    if (b.args) |args| {
+        smoke_run.addArgs(args);
+    }
+    const smoke_step = b.step("smoke", "Tier-0.5 live gate: the real binary against a live origin");
+    smoke_step.dependOn(&smoke_run.step);
+
     // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash),
     // and the zoxy under test is a ReleaseFast build — matching the
     // shipped binary — whatever -Doptimize says. ReleaseFast selects the
@@ -261,14 +286,27 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint", "fd-boundary lint: raw syscalls only under src/io/");
     lint_step.dependOn(&lint_run.step);
 
-    // The deterministic per-change gates. The Tier-1 `bench` step is
-    // deliberately excluded (DESIGN.md §9): its verdict is a band
-    // comparison across runs, run at merge against a real origin, not a
-    // blind shared-runner pass.
-    const ci_step = b.step("ci", "Per-change gates: test + lint + sim (bench runs at merge)");
+    // The per-change gates. The Tier-1 `bench` step is deliberately
+    // excluded (DESIGN.md §9): its verdict is a band comparison across
+    // runs, run at merge against a real origin, not a blind shared-runner
+    // pass. Tier 0.5 is not excluded on those grounds and belongs here
+    // for the opposite reason — its verdicts are equalities on real
+    // output, which a shared runner cannot move, and it is the only gate
+    // in this list that runs the binary at all.
+    const ci_step = b.step("ci", "Per-change gates: test + lint + sim + smoke (bench runs at merge)");
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
     ci_step.dependOn(sim_step);
+    // Linux only, for now. On its first CI run the gate found that the
+    // macOS leg answers *nothing* to its first L7 request — accepted,
+    // then closed with no response and no diagnostic (#184). That is a
+    // finding, not a flake, and fixing zoxy's kqueue path is not this
+    // step's job; `zig build smoke` still runs everywhere, which is how
+    // that issue gets worked, and putting this line back is its
+    // acceptance test.
+    if (target.result.os.tag == .linux) {
+        ci_step.dependOn(smoke_step);
+    }
     // Compile — never run — every measurement binary. Their verdicts are
     // human-read A/Bs and profiles, so running them here would buy nothing
     // and cost minutes; but they call the same internal APIs the proxy
