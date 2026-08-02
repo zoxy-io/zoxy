@@ -87,11 +87,13 @@ without inspecting them; `http` runs the HTTP/1.1 reverse proxy.
 ]
 ```
 
-Up to 8 listeners. Each is bound with `SO_REUSEPORT`, so running several
-zoxy processes on the same port is the supported way to use more than one
-core. Every connection — accepted and upstream alike — gets `TCP_NODELAY`
-unconditionally: Nagle plus delayed ACK costs a reused keep-alive connection
-a hard 40 ms stall, which is not worth a config knob.
+Listener count is bounded by your config's own ring and fd budgets,
+checked at startup, not by a compiled ceiling. Each is bound with
+`SO_REUSEPORT`, so running several zoxy processes on the same port is
+the supported way to use more than one core. Every connection —
+accepted and upstream alike — gets `TCP_NODELAY` unconditionally:
+Nagle plus delayed ACK costs a reused keep-alive connection a hard
+40 ms stall, which is not worth a config knob.
 
 ### Routing
 
@@ -170,6 +172,12 @@ prefix of an IPv6 one, so stickiness survives privacy-address rotation.
 The tradeoff is inherent to hashing on client address: NAT hides many clients
 behind one address, and one heavy client cannot be split. Prefer `p2c` where
 even load matters more than stickiness.
+
+The key is the *observed* client address, so behind another proxy or LB
+every connection carries that machine's address and the whole cluster
+hashes to one endpoint. See
+[Learning who the client is](#learning-who-the-client-is-proxy-protocol)
+for how an `l4` listener recovers the real client.
 
 ### Health checks
 
@@ -257,6 +265,49 @@ isn't. `zoxy_forwarded_chain_dropped` counts that.
 Filters may not set `X-Forwarded-For`; the loader rejects it. A filter
 can only write a constant, so it would pin one fixed address to every
 client — which looks like forwarding and is the opposite of it.
+
+### Learning who the client is (PROXY protocol)
+
+The mirror problem: put a load balancer in front of zoxy and *zoxy* sees
+only the balancer. That breaks more than logging — `pick: "hash"` keys
+on the client address, so behind an LB every connection hashes alike and
+the whole fleet lands on one endpoint. An `l4` listener can instead
+require each connection to open with a PROXY protocol header (v1 or v2 —
+what AWS NLB, GCP and HAProxy emit) announcing the real client:
+
+```json
+{
+    "bind": "0.0.0.0:5432",
+    "protocol": "l4",
+    "cluster": "postgres",
+    "proxy_protocol": { "mode": "require" }
+}
+```
+
+**`require` is the only mode, on purpose.** A listener that accepted a
+header *when one happens to show up* would let any client that can reach
+it choose its own address — and with it its own sticky backend and its
+own access-log lines. The PROXY protocol spec forbids that of receivers,
+and HAProxy gates the same feature behind an explicit `accept-proxy` for
+the same reason. So a `require` listener closes any connection that does
+not open with a valid header: it is unusable by anything except the
+proxy configured in front of it, which is the point. Turn it on only
+where the listener is reachable exclusively through that proxy.
+
+What the header announces is what zoxy believes everywhere the client
+address is consumed: the hash pick, the access log's `client` field. A
+header that announces nothing — v1 `UNKNOWN`, v2 `LOCAL`, the shapes a
+balancer's own health checks arrive in — is accepted and keeps the
+observed peer. Headers are size-capped at 512 bytes (v2 TLVs within the
+cap are skipped; a declared length past it is refused at once), and
+header bytes never count toward the log's `bytes_in` — only payload
+does.
+
+`zoxy_l4_proxy_header_accepted` and `zoxy_l4_proxy_header_invalid`
+count the verdicts; a rising `invalid` means something that is not the
+configured proxy is reaching the listener — exactly what the mode
+exists to refuse. `http` listeners reject the block for now: the L7
+receive phase does not exist yet.
 
 ### Filters
 
