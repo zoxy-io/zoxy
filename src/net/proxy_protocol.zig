@@ -356,6 +356,140 @@ fn v2Address(family: u8, protocol: u8, block: []const u8) ?std.Io.net.IpAddress 
     }
 }
 
+// -- the send half (#142): composing the header this proxy announces ------
+//
+// The mirror of everything above: what zoxy writes on an upstream
+// connection so the *origin* learns the client, on a cluster whose config
+// says the origin expects it. Pure like the parser — bytes out, no I/O —
+// and pinned to it: every written header must parse back to the source it
+// announced (the round-trip tests below), so the two halves cannot drift.
+//
+// One shape decision lives here rather than in the caller: a v2 address
+// block (and a v1 line) is single-family, and a dual-stack listener can
+// observe an IPv4 client on a socket whose local address is IPv6. A
+// mixed pair promotes both addresses to INET6, the IPv4 one in its
+// mapped `::ffff:a.b.c.d` form — spec-legal, and receivers (this file's
+// own parser included) unwrap it back to the IPv4 address it is.
+
+/// The longest header either writer emits: the worst v1 TCP6 line —
+/// "PROXY TCP6 " + two uncompressed 39-char addresses + two 5-digit
+/// ports + separators + CRLF = 104 bytes (v2 tops out at 52). Bounded by
+/// the spec's own 107, and asserted under the receive cap so a chained
+/// zoxy always accepts what another zoxy sends.
+pub const send_bytes_max: u32 = 107;
+
+comptime {
+    assert(send_bytes_max <= constants.proxy_header_bytes_max);
+    // "PROXY TCP6 " + 39 + " " + 39 + " 65535 65535\r\n".
+    assert(11 + 39 + 1 + 39 + 14 == 104);
+    assert(104 <= send_bytes_max);
+    // The two v2 shapes land at fixed offsets; the writers' slices are
+    // these exact totals, both under the v1 worst case.
+    assert(v2_prelude_bytes + 12 == 28);
+    assert(v2_prelude_bytes + 36 == 52);
+    assert(v2_prelude_bytes + 36 <= send_bytes_max);
+}
+
+/// Compose a v1 line announcing `source` to a peer that reads text.
+pub fn writeV1(
+    buffer: *[send_bytes_max]u8,
+    source: *const std.Io.net.IpAddress,
+    destination: *const std.Io.net.IpAddress,
+) []const u8 {
+    const written = blk: {
+        if (source.* == .ip4 and destination.* == .ip4) {
+            const source_ip4 = source.ip4;
+            const destination_ip4 = destination.ip4;
+            break :blk std.fmt.bufPrint(
+                buffer,
+                "PROXY TCP4 {d}.{d}.{d}.{d} {d}.{d}.{d}.{d} {d} {d}\r\n",
+                .{
+                    source_ip4.bytes[0],      source_ip4.bytes[1],
+                    source_ip4.bytes[2],      source_ip4.bytes[3],
+                    destination_ip4.bytes[0], destination_ip4.bytes[1],
+                    destination_ip4.bytes[2], destination_ip4.bytes[3],
+                    source_ip4.port,          destination_ip4.port,
+                },
+            ) catch unreachable; // 56 bytes at most, under the 104 bound above.
+        }
+        var source_text: [39]u8 = undefined;
+        var destination_text: [39]u8 = undefined;
+        break :blk std.fmt.bufPrint(
+            buffer,
+            "PROXY TCP6 {s} {s} {d} {d}\r\n",
+            .{
+                v6Text(&source_text, &asV6Bytes(source)),
+                v6Text(&destination_text, &asV6Bytes(destination)),
+                source.getPort(),
+                destination.getPort(),
+            },
+        ) catch unreachable; // 104 bytes at most (comptime bound above).
+    };
+    assert(written.len >= header_bytes_min);
+    assert(written.len <= send_bytes_max);
+    return written;
+}
+
+/// Compose a v2 header announcing `source` to a peer that reads binary.
+pub fn writeV2(
+    buffer: *[send_bytes_max]u8,
+    source: *const std.Io.net.IpAddress,
+    destination: *const std.Io.net.IpAddress,
+) []const u8 {
+    @memcpy(buffer[0..v2_signature.len], v2_signature);
+    buffer[12] = 0x21; // Version 2, command PROXY.
+    if (source.* == .ip4 and destination.* == .ip4) {
+        buffer[13] = 0x11; // INET, STREAM.
+        std.mem.writeInt(u16, buffer[14..16], 12, .big);
+        buffer[16..20].* = source.ip4.bytes;
+        buffer[20..24].* = destination.ip4.bytes;
+        std.mem.writeInt(u16, buffer[24..26], source.ip4.port, .big);
+        std.mem.writeInt(u16, buffer[26..28], destination.ip4.port, .big);
+        assert(28 >= header_bytes_min);
+        assert(28 <= send_bytes_max);
+        return buffer[0..28];
+    }
+    buffer[13] = 0x21; // INET6, STREAM.
+    std.mem.writeInt(u16, buffer[14..16], 36, .big);
+    buffer[16..32].* = asV6Bytes(source);
+    buffer[32..48].* = asV6Bytes(destination);
+    std.mem.writeInt(u16, buffer[48..50], source.getPort(), .big);
+    std.mem.writeInt(u16, buffer[50..52], destination.getPort(), .big);
+    assert(52 >= header_bytes_min);
+    assert(52 <= send_bytes_max);
+    return buffer[0..52];
+}
+
+/// An address's 16 IPv6 bytes: its own, or the mapped form of an IPv4
+/// one — the promotion the module comment explains.
+fn asV6Bytes(address: *const std.Io.net.IpAddress) [16]u8 {
+    return switch (address.*) {
+        .ip4 => |v4| .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ v4.bytes,
+        .ip6 => |v6| v6.bytes,
+    };
+}
+
+/// Uncompressed lowercase-hex IPv6 text, eight groups: spec-legal
+/// (RFC 5952 compression is a *reader's* obligation, not a writer's
+/// here), fixed-shape, and exactly what `IpAddress.parse` round-trips.
+fn v6Text(buffer: *[39]u8, bytes: *const [16]u8) []const u8 {
+    var length: usize = 0;
+    var group: u8 = 0;
+    while (group < 8) : (group += 1) {
+        if (group >= 1) {
+            buffer[length] = ':';
+            length += 1;
+        }
+        const value = std.mem.readInt(u16, bytes[@as(usize, group) * 2 ..][0..2], .big);
+        const text = std.fmt.bufPrint(buffer[length..], "{x}", .{value}) catch
+            unreachable; // 4 hex digits at most into >= 4 remaining bytes.
+        length += text.len;
+    }
+    assert(length >= 15); // "0:0:0:0:0:0:0:0".
+    assert(length <= 39);
+    return buffer[0..length];
+}
+
 // -- tests ---------------------------------------------------------------
 
 const testing = std.testing;
@@ -562,6 +696,91 @@ test "proxy protocol v2: the declared length meets the cap at byte 16" {
     over_cap[13] = 0x00;
     std.mem.writeInt(u16, over_cap[14..16], @intCast(at_cap_len + 1), .big);
     try expectVerdict(&over_cap, .invalid);
+}
+
+/// The write-side property: whatever the writers emit, the parser must
+/// accept whole and hand back the announced source — the two halves of
+/// this file pinned to each other. The expected client is the source
+/// *normalized*: a mapped-IPv6 source unwraps, because the parser
+/// normalizes every mapped announcement (see `Header.client`).
+fn checkWrite(
+    source: std.Io.net.IpAddress,
+    destination: std.Io.net.IpAddress,
+) !void {
+    const expected: std.Io.net.IpAddress = switch (source) {
+        .ip4 => source,
+        .ip6 => |v6| std.Io.net.IpAddress.fromIp6(v6),
+    };
+    var buffer: [send_bytes_max]u8 = undefined;
+    inline for (.{ writeV1, writeV2 }) |write| {
+        const written = write(&buffer, &source, &destination);
+        checkParse(written);
+        const parsed = parse(written);
+        try testing.expect(parsed == .ok);
+        try testing.expectEqual(
+            @as(u32, @intCast(written.len)),
+            parsed.ok.bytes_len,
+        );
+        try testing.expect(clientEql(expected, parsed.ok.client));
+    }
+}
+
+const destination_v4: std.Io.net.IpAddress =
+    .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 9 }, .port = 443 } };
+const client_v6: std.Io.net.IpAddress = .{ .ip6 = .{
+    .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+    .port = 56324,
+    .flow = 0,
+    .interface = .none,
+} };
+
+test "proxy protocol send: pinned bytes, both versions" {
+    var buffer: [send_bytes_max]u8 = undefined;
+    // The v1 line is the spec's own example shape, byte for byte.
+    try testing.expectEqualStrings(
+        "PROXY TCP4 198.51.100.1 203.0.113.9 56324 443\r\n",
+        writeV1(&buffer, &client_v4, &destination_v4),
+    );
+    // The v2 form is the parser tests' own INET vector — one constant,
+    // two directions, so reader and writer cannot drift apart.
+    try testing.expectEqualStrings(
+        v2_proxy_inet,
+        writeV2(&buffer, &client_v4, &destination_v4),
+    );
+}
+
+test "proxy protocol send: every written header parses back to its source" {
+    const mapped_source: std.Io.net.IpAddress = .{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 198, 51, 100, 1 },
+        .port = 56324,
+        .flow = 0,
+        .interface = .none,
+    } };
+    try checkWrite(client_v4, destination_v4);
+    try checkWrite(client_v6, client_v6);
+    // Mixed families promote to INET6; the v4 side maps and unwraps.
+    try checkWrite(client_v4, client_v6);
+    try checkWrite(client_v6, destination_v4);
+    // A source that is itself a mapped address normalizes like any other.
+    try checkWrite(mapped_source, destination_v4);
+    // Port 0 is within range on both sides.
+    try checkWrite(
+        .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 0 } },
+        .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 9 }, .port = 0 } },
+    );
+}
+
+test "proxy protocol send: the worst case meets the bound exactly" {
+    const maximal: std.Io.net.IpAddress = .{ .ip6 = .{
+        .bytes = @splat(0xff),
+        .port = 65535,
+        .flow = 0,
+        .interface = .none,
+    } };
+    var buffer: [send_bytes_max]u8 = undefined;
+    try testing.expectEqual(@as(usize, 104), writeV1(&buffer, &maximal, &maximal).len);
+    try testing.expectEqual(@as(usize, 52), writeV2(&buffer, &maximal, &maximal).len);
+    try checkWrite(maximal, maximal);
 }
 
 const fuzz_corpus_v1 = "PROXY TCP4 198.51.100.1 203.0.113.9 56324 443\r\nGET /\r\n";
