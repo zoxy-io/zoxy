@@ -111,6 +111,17 @@ pub const relay_buffers_max: u32 = conn_slots_max;
 /// this proxy targets.
 pub const relay_buffer_bytes: u32 = 4 * 1024;
 
+/// Most bytes a PROXY protocol header may occupy before the listener
+/// rejects the peer (#142). The bound is ours, not the spec's: a v2
+/// header declares its own length in a u16, and that number is chosen by
+/// a peer whose trustworthiness is exactly what the header has not yet
+/// established. 512 admits every fixed address block the spec defines —
+/// the largest, AF_UNIX, is 216 bytes after the 16-byte prelude — plus
+/// the TLVs real senders append (AWS NLB's VPCE id); v1 bounds itself at
+/// 107. Must fit the relay buffer, where the receive phase stages the
+/// header and whatever payload arrived coalesced behind it.
+pub const proxy_header_bytes_max: u32 = 512;
+
 /// §8 "watermarks before walls": each pool flips a pressure flag before
 /// it hits the wall so the proxy sheds *idle* capacity before it must
 /// shed *work*: relay or conn pressure shortens idle timeouts, relay
@@ -730,6 +741,12 @@ comptime {
     assert(inFlightOps(conn_slots_max, upstream_slots_max, 0) <= completion_queue_entries);
     assert(conn_slots_max - 1 <= std.math.maxInt(u16));
     assert(relay_buffer_bytes >= 512);
+    // The PROXY header stages in the relay buffer's client→upstream half
+    // and must admit the largest header either spec version allows
+    // (v2's 16-byte prelude + AF_UNIX's 216-byte block; v1's 107 line).
+    assert(proxy_header_bytes_max <= relay_buffer_bytes);
+    assert(proxy_header_bytes_max >= 16 + 216);
+    assert(proxy_header_bytes_max >= 107);
     assert(clusters_min >= 1);
     // The §8 cap ceiling is the largest load one endpoint can carry: one
     // L7 lease per upstream slot plus one L4 charge per conn slot, since
