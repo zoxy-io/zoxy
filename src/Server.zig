@@ -427,6 +427,7 @@ pub fn Server(comptime IoType: type) type {
                     const snapshot = server.gauges();
                     server.counters.dump(&snapshot);
                 },
+                .reopen_log => server.access_log.requestReopen(),
             }
         }
 

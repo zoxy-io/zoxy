@@ -30,6 +30,8 @@
 //!   send(io, socket, bytes, c, U, u, cb(u, SendError!u32))
 //!   close(io, socket, c, U, u, cb(u))
 //!   logWrite(io, bytes, c, U, u, cb(u, LogWriteError!u32))   (§8 access log)
+//!   logReopen(io) LogReopenError!void                   (sync; §8 rotation,
+//!       file sink only — swap the sink fd between writes, never under one)
 //!   timerStart(io, c, delay_ns, U, u, cb(u, TimerError!void))
 //!   timerCancel(io, timer_c, cancel_c, U, u, cb(u))     (the one legal cancel)
 //!   signalWait(io, U, u, cb(u, Signal))                 (persistent waiter)
@@ -53,6 +55,11 @@ pub const XevIo = @import("XevIo.zig");
 pub const Signal = enum(u8) {
     terminate,
     dump_counters,
+    /// SIGHUP: reopen the access log's file sink (§8 rotation). This is
+    /// the *only* meaning SIGHUP carries — zoxy does not reload config
+    /// (§1 non-goal: the §5 pools are startup-fixed, so a config change
+    /// is a restart), and claiming the signal for the log says so.
+    reopen_log,
 };
 
 pub const ShutdownHow = enum(u8) {
@@ -139,6 +146,15 @@ pub const LogWriteError = error{
     Unexpected,
 };
 
+/// The file sink's reopen failing (§8 rotation). One error for the same
+/// reason `LogWriteError` has one: there is exactly one response — keep
+/// the old fd, count `access_log_reopen_failed`, and keep writing where
+/// the lines were already landing. A reopen can only be asked of a
+/// `file` sink; the backends assert that, they do not error on it.
+pub const LogReopenError = error{
+    Unexpected,
+};
+
 pub const SetOptionError = error{
     Unexpected,
 };
@@ -210,6 +226,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "send",
             "close",
             "logWrite",
+            "logReopen",
             "timerStart",
             "timerCancel",
             "signalWait",

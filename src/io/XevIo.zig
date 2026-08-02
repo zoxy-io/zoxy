@@ -47,9 +47,13 @@ loop: xev.Loop,
 timer: xev.Timer,
 notifier: xev.Async,
 /// Where `logWrite` sends its bytes (§8): `log_sink_stdout`, or the file
-/// fd the caller obtained from `openLogSink`. Held for the process's
-/// life, closed by exit like the stdio it stands beside.
+/// fd the caller obtained from `openLogSink`. Held until `logReopen`
+/// swaps it or the process exits — never closed under a write, which is
+/// what the access log's swap-between-completions discipline guarantees.
 log_sink_fd: posix.fd_t,
+/// The path behind a `file` sink, or null for stdout — what `logReopen`
+/// opens again at rotation (§8). Config-arena memory, process lifetime.
+log_sink_path: ?[]const u8,
 thread_pool: if (needs_thread_pool) xev.ThreadPool else void,
 notifier_completion: xev.Completion,
 signal_mask: std.atomic.Value(u8),
@@ -130,10 +134,16 @@ pub fn init(
     /// the fd `openLogSink` returned. A parameter rather than opened here
     /// so the caller owning the config error report also owns the path.
     log_sink_fd: posix.fd_t,
+    /// The path that fd came from — non-null exactly for a `file` sink —
+    /// kept so `logReopen` can open it again at rotation (§8).
+    log_sink_path: ?[]const u8,
 ) !void {
     assert(configured_listeners <= std.math.maxInt(u16) - constants.admin_listeners);
     // Stdout or a real opened file — never a sentinel, never closed-over.
     assert(log_sink_fd >= 0);
+    // The path travels with exactly the fd that came from it: a file
+    // sink's fd without its path would make `logReopen` unanswerable.
+    assert((log_sink_path != null) == (log_sink_fd != log_sink_stdout));
     const listeners = configured_listeners + constants.admin_listeners;
     assert(listeners >= 1);
     if (comptime needs_thread_pool) {
@@ -155,6 +165,7 @@ pub fn init(
     io.listeners = try arena.alloc(ListenerEntry, listeners);
     io.listeners_count = 0;
     io.log_sink_fd = log_sink_fd;
+    io.log_sink_path = log_sink_path;
     io.last_pressure = Io.Pressure.none;
     io.notifier_completion = .{};
     io.signal_mask = std.atomic.Value(u8).init(0);
@@ -798,6 +809,34 @@ pub fn openLogSink(path: []const u8) !posix.fd_t {
     }, 0o644);
 }
 
+/// Reopen the `file` sink at its configured path (§8 rotation): open the
+/// new fd *first* — on failure the old one stays and the caller keeps
+/// writing where lines were already landing — then close the old and
+/// swap. Legal only between log writes: the caller (the access log's
+/// swap-between-completions discipline) is what guarantees no in-flight
+/// op holds the fd being closed. Asking this of a stdout sink is
+/// asserted misuse — stdout has no path to reopen.
+///
+/// Deliberately synchronous on the live loop, unlike every data-path op
+/// and unlike the rule `logWrite` states below — a priced exception, not
+/// an oversight: rotation is operator-initiated and rare (per day, not
+/// per request), the pair costs two metadata syscalls on the filesystem
+/// the operator chose for their logs, and the async alternative is a
+/// fork op (`IORING_OP_OPENAT` — the op union is closed, §4 pin policy)
+/// plus a swap state machine, bought for an event that happens less
+/// often than a health probe. What the trade accepts: a log directory on
+/// a *hung* filesystem (NFS with a dead server) stalls the loop for the
+/// open's duration at rotation time. An operator whose log directory can
+/// hang has a deployment problem no proxy can absorb.
+pub fn logReopen(io: *XevIo) Io.LogReopenError!void {
+    const path = io.log_sink_path orelse unreachable;
+    assert(io.log_sink_fd != log_sink_stdout);
+    const new_fd = openLogSink(path) catch return error.Unexpected;
+    assert(new_fd >= 0);
+    closeFd(io.log_sink_fd);
+    io.log_sink_fd = new_fd;
+}
+
 /// Write one batch of access-log bytes to the sink (§8). A ring op, not a
 /// direct `write`: the sink is whatever the operator pointed stdout at, or
 /// a file on whatever filesystem they named, and a pipe whose reader has
@@ -1165,6 +1204,9 @@ fn onNotifierWake(
     }
     if (mask & signalBit(.dump_counters) != 0) {
         callback(io.signal_userdata, .dump_counters);
+    }
+    if (mask & signalBit(.reopen_log) != 0) {
+        callback(io.signal_userdata, .reopen_log);
     }
     // The internal signal wait is the one legitimate `.rearm`: an eventfd
     // read has no stale-time hazard, unlike timers.

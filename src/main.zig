@@ -102,6 +102,11 @@ pub fn main(init: std.process.Init) !void {
         config.limits.head_buffers,
         config.limits.head_buffer_bytes,
         log_sink_fd,
+        // The path rides beside its fd so SIGHUP can reopen it (§8).
+        if (config.access_log_sink) |sink| switch (sink) {
+            .stdout => null,
+            .file => |path| path,
+        } else null,
     );
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
@@ -267,6 +272,8 @@ const help_text =
     \\Signals:
     \\  SIGTERM, SIGINT   Drain in-flight connections, then exit 0.
     \\  SIGUSR1           Dump counters to stderr.
+    \\  SIGHUP            Reopen the access log's file sink (rotation).
+    \\                    No other meaning: config changes are a restart.
     \\
 ;
 
@@ -468,6 +475,7 @@ fn installSignalHandlers() void {
     std.posix.sigaction(.TERM, &action, null);
     std.posix.sigaction(.INT, &action, null);
     std.posix.sigaction(.USR1, &action, null);
+    std.posix.sigaction(.HUP, &action, null);
     // A proxy must not die because something downstream of it went away.
     // The access log writes to a pipe the operator owns (§8), and a `write`
     // to a pipe with no reader raises SIGPIPE, whose default action is to
@@ -491,6 +499,7 @@ fn onRawSignal(signal_number: std.posix.SIG) callconv(.c) void {
     const signal: zoxy.Io.Signal = switch (signal_number) {
         .TERM, .INT => .terminate,
         .USR1 => .dump_counters,
+        .HUP => .reopen_log,
         else => return,
     };
     global_io.notifySignalFromHandler(signal);

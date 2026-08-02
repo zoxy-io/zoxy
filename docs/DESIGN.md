@@ -62,6 +62,8 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
 - Config reload. Config is parse-once immutable (§5); a change is a
   process restart — consistent with process-per-port scale-out (§3). Hot
   restart / drain-to-successor is out of scope for the same reason.
+  SIGHUP is therefore free for the conventional log-rotation meaning and
+  carries only that (§8): reopen the access log's file sink.
 - Dynamic DNS for upstreams. Cluster endpoints are static socket
   addresses resolved once at config load (§7); re-resolution waits for a
   demonstrated need.
@@ -457,7 +459,7 @@ a raised `RLIMIT_NOFILE`:
 |---|---|---|---|
 | conn slots | 1386 | 11466 | ~1.7 KiB state |
 | relay buffers | 1386 | 11466 | 2 × 4 KiB |
-| upstream slots | 1312 | 11466 | ~48 B state |
+| upstream slots | 1311 | 11466 | ~48 B state |
 | head buffers (ring) | = conn slots | 11466 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11466 | `head_buffer_bytes` + 24 B |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
@@ -508,7 +510,7 @@ recorded there.
 The *defaults* are not pinned to each other, and deliberately: the
 out-of-box shape is bounded by the stock 4096 `RLIMIT_NOFILE` rather than
 by admission (matching 1386 would cost 4168 fds), so the upstream default
-sits at 1312 — the largest value that still stays strictly under that
+sits at 1311 — the largest value that still stays strictly under that
 line with the access log's possible file sink counted (§8; naming a log
 file is not tuning, so the lean promise holds with one) — rather than at
 the conn default. An L4 deployment never touches
@@ -1003,11 +1005,26 @@ origin, not one this proxy can pick for them.
   sink is `stdout` (inherited, no fd of its own, piped wherever the
   operator already sends this process's output) or `file` with a `path`:
   opened once at startup — append-only, created if absent, never
-  truncated, one fd in `fdsRequired`'s budget — and held for the
-  process's life. Append-only is what makes an external copy-truncate
+  truncated, two fds in `fdsRequired`'s budget (held + the reopen
+  transient below). Append-only is what makes an external copy-truncate
   rotation (logrotate) safe: every write lands at the current end,
-  wherever a rotation just put it. In-place reopen-on-SIGHUP is a
-  tracked issue, not a shipped feature. Whichever sink, it
+  wherever a rotation just put it. Move-based rotation is served by
+  **SIGHUP**, which reopens the configured path: the new fd opens
+  *first* — a rotation that cannot open its file keeps the old fd and
+  counts `access_log_reopen_failed`, because a failed rotation must not
+  destroy a working log — and the swap happens only between sink
+  writes, never under one (a pending reopen waits for the in-flight
+  write's completion, and every line accepted after the signal lands in
+  the new file). The reopen itself is two synchronous syscalls on the
+  loop — a priced exception to the never-block rule, accepted because
+  rotation is operator-paced and rare where the async alternative is a
+  fork op against a closed union (§4); a log directory that can *hang*
+  (dead NFS) stalls the loop at rotation time, which is a deployment
+  problem, not a proxy one. A successful reopen also heals a `broken`
+  sink: what broke was the fd the rotation just replaced. On a `stdout` sink — or
+  no log at all — SIGHUP is a no-op, and that is the signal's *only*
+  meaning: zoxy does not reload config (§1 non-goal — the §5 pools are
+  startup-fixed, so a config change is a restart). Whichever sink, it
   writes one JSON object per line: one per HTTP exchange (including every
   reject, request-level shed and verdict) and one per L4 connection,
   carrying the
