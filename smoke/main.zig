@@ -613,12 +613,12 @@ fn runLoad(
     for (&clients) |*client| {
         try client.connect(io, ports.http);
     }
-    try runPass(io, ports.http, host);
+    try runPass(io, ports.http, host, 0);
     // Read between the passes, not before the first: zoxy's pools are
     // lazily resident (§5), so a reading taken before any traffic would
     // climb for reasons that are not allocation.
     const before_kb = try readRssKb(arena, io, pid);
-    try runPass(io, ports.http, host);
+    try runPass(io, ports.http, host, 1);
     const after_kb = try readRssKb(arena, io, pid);
     for (clients[0..connections_closed_early]) |*client| {
         client.close();
@@ -631,13 +631,25 @@ fn runLoad(
 /// requests, then the bulk target runs on one of them. Both passes are
 /// identical, which is what makes the resident set between them a claim
 /// about allocation rather than about warmup.
-fn runPass(io: Io, port: u16, host: []const u8) !void {
+fn runPass(io: Io, port: u16, host: []const u8, pass: u32) !void {
     assert(host.len >= 1);
     assert(clients.len == keep_alive_connections);
-    for (&clients) |*client| {
+    assert(pass < load_passes);
+    for (&clients, 0..) |*client, connection| {
         var request: u32 = 0;
         while (request < requests_per_connection) : (request += 1) {
-            try expectResponse(try client.get(host, "/", .keep_alive), origin_module.body.len);
+            // Where a failure happened is most of what a failure means
+            // here: the same error from the first keep-alive request and
+            // from the hundredth are different bugs, and the second is
+            // not reproducible by staring at the first.
+            const response = client.get(host, "/", .keep_alive) catch |err| {
+                std.debug.print(
+                    "smoke: pass {d} keep-alive connection {d} request {d}: {t}\n",
+                    .{ pass, connection, request, err },
+                );
+                return err;
+            };
+            try expectResponse(response, origin_module.body.len);
         }
         assert(request == requests_per_connection);
     }
@@ -651,10 +663,11 @@ fn runPass(io: Io, port: u16, host: []const u8) !void {
     while (large < large_requests) : (large += 1) {
         try single_client.connect(io, port);
         defer single_client.close();
-        try expectResponse(
-            try single_client.get(host, origin_module.large_path, .close),
-            origin_module.large_body_bytes,
-        );
+        const response = single_client.get(host, origin_module.large_path, .close) catch |err| {
+            std.debug.print("smoke: pass {d} bulk request {d}: {t}\n", .{ pass, large, err });
+            return err;
+        };
+        try expectResponse(response, origin_module.large_body_bytes);
     }
     assert(large == large_requests);
 }
@@ -669,10 +682,11 @@ fn runL4Load(io: Io, port: u16, host: []const u8) !void {
     while (index < l4_connections) : (index += 1) {
         try single_client.connect(io, port);
         defer single_client.close();
-        try expectResponse(
-            try single_client.get(host, "/", .keep_alive),
-            origin_module.body.len,
-        );
+        const response = single_client.get(host, "/", .keep_alive) catch |err| {
+            std.debug.print("smoke: l4 connection {d}: {t}\n", .{ index, err });
+            return err;
+        };
+        try expectResponse(response, origin_module.body.len);
     }
     assert(index == l4_connections);
 }
