@@ -594,11 +594,15 @@ Rules:
 The minimal proxy:
 
 ```
-accept → admit (slots? buffers?) → route by listener → connect upstream
+accept → admit (slots? buffers?) → route by listener
+       → [require? read PROXY header] → connect upstream
        → bidirectional relay → teardown on either EOF/error/deadline
 ```
 
-- A listener is bound to a cluster in config; no parsing, no inspection.
+- A listener is bound to a cluster in config; no parsing, no inspection
+  *of the payload*. The one exception is opt-in and runs ahead of it: a
+  `proxy_protocol` listener consumes one bounded PROXY-protocol header
+  before the dial (below), and after that the relay is as blind as ever.
 - Relay buffers (one per direction) are acquired at admission and held
   for the connection's life — a recv must always have a buffer posted —
   so `relay_buffers`, not connection slots, bounds concurrent L4
@@ -612,6 +616,41 @@ accept → admit (slots? buffers?) → route by listener → connect upstream
 - Half-close is honored (`shutdown` propagates FIN); the connection ends
   when both directions have drained or the deadline fires.
 - Idle timeout and max-lifetime ride the single deadline timer.
+- **Receiving PROXY protocol** (`"proxy_protocol": { "mode": "require" }`,
+  #142). Behind another proxy the observed peer is that proxy, and the
+  client address is a *routing input* — §7's `hash` keys on it, so an LB
+  in front does not merely blur the logs, it collapses the whole fleet
+  onto one endpoint. A `require` listener demands every connection open
+  with a PROXY protocol header (v1 or v2 — what AWS NLB, GCP and HAProxy
+  emit) announcing the real client, parsed before the dial because the
+  dial consumes the address. The trust shape is `forwarded`'s (§7),
+  inverted to the receive side: per listener, no default, and **no
+  sniffing arm** — a listener that accepted a header only when one shows
+  up would let any client choose the address that routing, the access
+  log, and the origin then believe, which the spec forbids of receivers.
+  `require` therefore closes any connection that does not open with a
+  valid header, making the listener unusable by anything but the proxy
+  configured in front of it — that is the point. A header that announces
+  nothing (v1 `UNKNOWN`, v2 `LOCAL` — how a fronting balancer's own
+  health checks arrive) is accepted and keeps the observed peer.
+  Mechanically the phase costs nothing new: it stages in the relay
+  buffer's client→upstream half (held since admission, idle until the
+  relay starts), runs under the connect budget — the fronting proxy
+  speaks immediately after connecting, and the hand-over's fresh dial
+  deadline then only ever moves *later*, which the lazy timer absorbs
+  without a rebase (§4) — re-parses from byte 0 per delivery against a
+  parser whose verdicts are monotonic (a prefix of a valid header is
+  never `invalid`), and enters the relay with any coalesced payload
+  pre-staged as the first send. The header is bounded by
+  `proxy_header_bytes_max` (512: admits both specs' largest fixed
+  address blocks and real TLVs — the v2 length field is the peer's
+  number, the cap is ours) and never counts toward `bytes_in`; the
+  verdicts are `l4_proxy_header_accepted` / `l4_proxy_header_invalid`,
+  the latter deliberately outside the `shed_` gate identity because the
+  connection was admitted before it could be judged (§9). IPv4-mapped
+  IPv6 announcements unwrap to the IPv4 address they are — the accept
+  path's own normalization — so one client hashes one way however its
+  address was conveyed.
 
 ## 7. L7 data path — HTTP/1.1 reverse proxy
 
@@ -853,6 +892,11 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   clients of the flapping endpoint, who are already affected by it.
   And source-IP hashing balances by *client*, not by request: NAT puts
   many clients on one address, and one heavy client cannot be split.
+  It also balances by the *observed* client: behind another proxy every
+  connection carries that proxy's address, so the key is one value and
+  the whole cluster hashes to a single endpoint — stickiness inverted,
+  not degraded. `proxy_protocol` on the listener (§6) is what makes
+  `source_ip` mean the real client there.
 - **Active health checks** are per-cluster opt-in (a `check` block —
   HAProxy's model) so a request is not routed to an endpoint known to be
   down:
@@ -1253,6 +1297,7 @@ src/
     Pool.zig          // Pool(T): startup alloc, intrusive free list
   net/
     Conn.zig          // connection slot: state, completions, head-ring claim
+    proxy_protocol.zig // PROXY v1/v2 header parse: pure, total, monotonic (§6)
     relay.zig         // strict recv→send→recv relay (L4 + L7 bodies)
     upstream.zig      // shared upstream pool + endpoint idle lists + head pool
   http/
