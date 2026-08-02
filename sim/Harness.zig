@@ -33,6 +33,8 @@ const assert = std.debug.assert;
 const Harness = @This();
 
 const clients_max: u8 = 6;
+/// "203.0.113.255:65535" is 19 bytes; the slack is headroom, not hope.
+const announced_bytes_max: u8 = 32;
 /// Virtual time from scenario start after which stuck work is force-ended.
 const scenario_end_ns: u64 = 2_000_000_000;
 /// The slowest §7 probe pacing a non-outage seed may draw. Named so the
@@ -70,6 +72,14 @@ origin: Origin,
 origin_http: HttpOrigin,
 clients: [clients_max]EchoClient,
 l7_clients: [clients_max]HttpClient,
+/// The #142 gate drawn for the l4 listener; `populateClients` reads it
+/// to decide whether its clients open with headers.
+proxy_protocol_l4: ?zoxy.config.Config.Listener.ProxyProtocol,
+/// Per-L4-client address its header announced (len 0 = none): distinct
+/// per client, so `verifyAccessLog` can demand the log states each one
+/// on clean seeds — presence is attribution.
+l4_announced: [clients_max][announced_bytes_max]u8,
+l4_announced_len: [clients_max]u8,
 l4_count: u8,
 l7_count: u8,
 clients_count: u8,
@@ -417,6 +427,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     };
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
+    harness.proxy_protocol_l4 = deriveProxyProtocol(random);
     harness.wireListeners(deriveForwarded(random));
     harness.config = .{
         .listeners = &harness.listener_configs,
@@ -574,6 +585,21 @@ fn deriveForwarded(random: std.Random) ?zoxy.config.Config.Listener.Forwarded {
     };
 }
 
+/// The #142 receive gate on the l4 listener: a third of seeds require a
+/// PROXY header, clean seeds included — the phase is deterministic, so a
+/// clean seed's headers always complete and the golden oracles gain the
+/// accept path, while adversarial seeds split headers across deliveries
+/// and cut them mid-read. Like `deriveForwarded`, the mode alone is not
+/// coverage: what the clients *send* decides which verdict fires, and
+/// `deriveProxyHeader` scripts that spread — including no header at all,
+/// which is the refusal `require` exists to make.
+fn deriveProxyProtocol(random: std.Random) ?zoxy.config.Config.Listener.ProxyProtocol {
+    if (random.uintLessThan(u8, 3) == 0) {
+        return .require;
+    }
+    return null;
+}
+
 fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
     harness.filters_http = .{
         .{
@@ -590,7 +616,12 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
         },
     };
     harness.listener_configs = .{
-        .{ .bind_address = bindAddress(), .routes = &harness.routes_l4, .protocol = .l4 },
+        .{
+            .bind_address = bindAddress(),
+            .routes = &harness.routes_l4,
+            .protocol = .l4,
+            .proxy_protocol = harness.proxy_protocol_l4,
+        },
         .{
             .bind_address = httpBindAddress(),
             .routes = &harness.routes_http,
@@ -680,6 +711,7 @@ fn populateClients(harness: *Harness, random: std.Random) void {
     harness.ended_count = 0;
     harness.clients = @splat(.{});
     harness.l7_clients = @splat(.{});
+    harness.l4_announced_len = @splat(0);
     var index: u8 = 0;
     while (index < harness.clients_count) : (index += 1) {
         if (random.boolean()) {
@@ -695,17 +727,102 @@ fn populateClients(harness: *Harness, random: std.Random) void {
             client.context = harness;
         } else {
             const client = &harness.clients[harness.l4_count];
+            const l4_index = harness.l4_count;
             harness.l4_count += 1;
             var token: [l4.token_bytes_max]u8 = undefined;
             const token_len = 1 + random.uintLessThan(u8, l4.token_bytes_max);
             random.bytes(token[0..token_len]);
             const silent = random.uintLessThan(u8, 5) == 0;
-            client.prepare(&harness.io, bindAddress(), token[0..token_len], silent);
+            // A silent client sends nothing, header included: on a
+            // require-listener it is the connect-budget reap's fodder,
+            // and drawing it a header it would never send would teach
+            // `verifyAccessLog` to demand an announcement that never
+            // crossed the wire.
+            var prefix_buffer: [l4.prefix_bytes_max]u8 = undefined;
+            const prefix = if (silent)
+                ""
+            else
+                harness.deriveProxyHeader(random, l4_index, &prefix_buffer);
+            client.prepare(
+                &harness.io,
+                bindAddress(),
+                token[0..token_len],
+                prefix,
+                silent,
+            );
             client.on_ended = clientEndedHook;
             client.context = harness;
         }
     }
     assert(harness.l4_count + harness.l7_count == harness.clients_count);
+}
+
+/// The header an L4 client opens with when the listener requires one
+/// (#142), or "" — the gate off, or one draw in six sending nothing so
+/// the sweep reaches the refusal too (the random token then opens the
+/// stream, and `require` closes on its first byte; the rare token that
+/// happens to open like a header meets the connect-budget reap instead).
+/// The spread covers both spec versions and both verdict families:
+/// announcing headers (v1 TCP4, v2 INET) carry a per-client distinct
+/// address that is recorded for the clean-seed log oracle, and
+/// non-announcing ones (v1 UNKNOWN, v2 LOCAL) are the health-check shape
+/// that must keep the observed peer.
+fn deriveProxyHeader(
+    harness: *Harness,
+    random: std.Random,
+    l4_index: u8,
+    buffer: *[l4.prefix_bytes_max]u8,
+) []const u8 {
+    assert(l4_index < clients_max);
+    assert(harness.l4_announced_len[l4_index] == 0);
+    if (harness.proxy_protocol_l4 == null) {
+        return "";
+    }
+    const octet: u8 = l4_index + 1;
+    const port: u16 = 40_000 + @as(u16, l4_index);
+    switch (random.uintLessThan(u8, 6)) {
+        0 => return "",
+        1 => return "PROXY UNKNOWN\r\n",
+        2 => {
+            // v2 LOCAL: a fronting proxy's health check.
+            @memcpy(buffer[0..16], "\r\n\r\n\x00\r\nQUIT\n" ++ "\x20\x00\x00\x00");
+            return buffer[0..16];
+        },
+        3 => {
+            // v2 PROXY INET announcing 203.0.113.<octet>:<port>.
+            @memcpy(buffer[0..16], "\r\n\r\n\x00\r\nQUIT\n" ++ "\x21\x11\x00\x0c");
+            buffer[16..20].* = .{ 203, 0, 113, octet };
+            buffer[20..24].* = .{ 10, 0, 0, 1 };
+            std.mem.writeInt(u16, buffer[24..26], port, .big);
+            std.mem.writeInt(u16, buffer[26..28], 443, .big);
+            harness.recordAnnounced(l4_index, octet, port);
+            return buffer[0..28];
+        },
+        else => {
+            // v1 TCP4, the same announcement in text.
+            const line = std.fmt.bufPrint(
+                buffer,
+                "PROXY TCP4 203.0.113.{d} 10.0.0.1 {d} 443\r\n",
+                .{ octet, port },
+            ) catch unreachable; // 46 bytes at most, into 64.
+            harness.recordAnnounced(l4_index, octet, port);
+            return line;
+        },
+    }
+}
+
+fn recordAnnounced(harness: *Harness, l4_index: u8, octet: u8, port: u16) void {
+    assert(l4_index < clients_max);
+    const text = std.fmt.bufPrint(
+        &harness.l4_announced[l4_index],
+        "203.0.113.{d}:{d}",
+        .{ octet, port },
+    ) catch unreachable; // 19 bytes at most, into announced_bytes_max.
+    // The shortest form is "203.0.113.1:40000"; anything outside the
+    // template's range means the format string drifted from the record.
+    assert(text.len >= 17);
+    assert(text.len <= 19);
+    harness.l4_announced_len[l4_index] = @intCast(text.len);
 }
 
 pub fn startClients(harness: *Harness) void {
@@ -851,6 +968,35 @@ fn verifyAccessLog(harness: *Harness) !void {
         // silent clients (`sim/l4.zig` draws some) owe a line, theirs
         // reporting `bytes_in: 0`.
         if (tally.l4 != harness.l4_count) return error.AccessLogL4LinesDiverged;
+        try harness.verifyAnnouncedClients(sink);
+    }
+}
+
+/// #142, clean seeds only: a client that announced an address via its
+/// PROXY header must be logged *as* that address — the same field the §7
+/// hash pick keys on, so this is the sweep's witness that the header is
+/// believed, not merely consumed (reverting the one believe-the-header
+/// line fails seed 20 here). Adversarial seeds are excluded because a cut
+/// mid-header rightly logs the observed peer; that a clean seed's header
+/// always completes ahead of any drawn deadline is the same pacing
+/// argument the clean-abort check above rests on. The addresses are
+/// distinct per client, so presence is attribution.
+fn verifyAnnouncedClients(harness: *const Harness, sink: []const u8) !void {
+    assert(harness.clean);
+    assert(harness.l4_count <= clients_max);
+    var l4_index: u8 = 0;
+    while (l4_index < harness.l4_count) : (l4_index += 1) {
+        const announced_len = harness.l4_announced_len[l4_index];
+        if (announced_len == 0) continue;
+        var needle_buffer: [announced_bytes_max + 11]u8 = undefined;
+        const needle = std.fmt.bufPrint(
+            &needle_buffer,
+            "\"client\":\"{s}\"",
+            .{harness.l4_announced[l4_index][0..announced_len]},
+        ) catch unreachable; // The key wrapper is exactly 11 bytes.
+        if (std.mem.indexOf(u8, sink, needle) == null) {
+            return error.AccessLogAnnouncedClientMissing;
+        }
     }
 }
 

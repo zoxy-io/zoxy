@@ -5,6 +5,12 @@
 //! oracle). Integrity invariant: every byte received must be a prefix of
 //! the token sent — the proxy may cut a stream short, but it must never
 //! corrupt or reorder it.
+//!
+//! A client may open with a scripted prefix ahead of the token — the
+//! PROXY protocol header a `proxy_protocol` listener requires (#142).
+//! The prefix is never part of the echo expectation: a proxy that
+//! relayed header bytes to the origin fails the integrity oracle as an
+//! overrun or corruption, with no #142-specific check needed.
 
 const std = @import("std");
 
@@ -15,6 +21,9 @@ const Io = zoxy.Io;
 const assert = std.debug.assert;
 
 pub const token_bytes_max: u8 = 48;
+/// Fits every header shape the harness scripts (#142): the longest is a
+/// v1 TCP4 line at 46 bytes; v2 LOCAL and INET are 16 and 28.
+pub const prefix_bytes_max: u8 = 64;
 
 /// A verify-time verdict over everything the client received.
 pub const ClientError = error{
@@ -38,6 +47,11 @@ pub fn Client(comptime IoType: type) type {
         send_completion: IoType.Completion = .{},
         token: [token_bytes_max]u8 = undefined,
         token_len: u8 = 0,
+        /// Sent ahead of the token — a PROXY protocol header (#142) for
+        /// `proxy_protocol` scenarios; empty for everyone else.
+        prefix: [prefix_bytes_max]u8 = undefined,
+        prefix_len: u8 = 0,
+        prefix_sent: u8 = 0,
         receive_buffer: [token_bytes_max]u8 = undefined,
         /// Once the echo is complete, the recv waiting on the FIN lands
         /// here; any byte that arrives is an integrity violation.
@@ -63,15 +77,19 @@ pub fn Client(comptime IoType: type) type {
             io: *IoType,
             address: std.Io.net.IpAddress,
             token: []const u8,
+            prefix: []const u8,
             silent: bool,
         ) void {
             assert(token.len >= 1);
             assert(token.len <= token_bytes_max);
+            assert(prefix.len <= prefix_bytes_max);
             client.io = io;
             client.address = address;
             client.silent = silent;
             @memcpy(client.token[0..token.len], token);
             client.token_len = @intCast(token.len);
+            @memcpy(client.prefix[0..prefix.len], prefix);
+            client.prefix_len = @intCast(prefix.len);
         }
 
         pub fn begin(client: *Self) void {
@@ -99,12 +117,19 @@ pub fn Client(comptime IoType: type) type {
         }
 
         fn armSend(client: *Self) void {
-            assert(client.sent_len < client.token_len);
             assert(!client.send_pending);
             client.send_pending = true;
+            // The prefix goes first, then the token — two cursors, one
+            // send in flight, resumed from whichever is still short.
+            const bytes = if (client.prefix_sent < client.prefix_len)
+                client.prefix[client.prefix_sent..client.prefix_len]
+            else blk: {
+                assert(client.sent_len < client.token_len);
+                break :blk client.token[client.sent_len..client.token_len];
+            };
             client.io.send(
                 client.socket,
-                client.token[client.sent_len..client.token_len],
+                bytes,
                 &client.send_completion,
                 Self,
                 client,
@@ -119,11 +144,20 @@ pub fn Client(comptime IoType: type) type {
                 client.settleIfTerminal();
                 return;
             };
-            client.sent_len += sent;
-            assert(client.sent_len <= client.token_len);
+            if (client.prefix_sent < client.prefix_len) {
+                // A send never spans the cursor seam: it was armed on the
+                // prefix alone, so the credit is the prefix's.
+                client.prefix_sent += @intCast(sent);
+                assert(client.prefix_sent <= client.prefix_len);
+            } else {
+                client.sent_len += sent;
+                assert(client.sent_len <= client.token_len);
+            }
             if (client.recv_terminal) {
                 client.settleIfTerminal();
-            } else if (client.sent_len < client.token_len) {
+            } else if (client.prefix_sent < client.prefix_len or
+                client.sent_len < client.token_len)
+            {
                 client.armSend();
             }
         }
