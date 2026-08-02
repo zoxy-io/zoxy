@@ -329,6 +329,13 @@ const SocketEntry = struct {
     /// its peer may close first, and the log still has to name who
     /// connected.
     peer_address: std.Io.net.IpAddress,
+    /// What `localAddress` reports (§6 send: the header's destination
+    /// field): each end's local address is the other end's
+    /// `peer_address`, assigned at the same pair creation and held per
+    /// entry for the same reason — the peer may close first, and a
+    /// connection mid-dial still has to name the address its client
+    /// connected to.
+    local_address: std.Io.net.IpAddress,
     fin_received: bool,
     read_shutdown: bool,
     write_shutdown: bool,
@@ -749,6 +756,14 @@ pub fn logWrite(
 /// deterministically, so a seed's log lines are reproducible.
 pub fn peerAddress(io: *SimIo, socket: Socket) std.Io.net.IpAddress {
     return io.socketEntry(socket).peer_address;
+}
+
+/// This end of the pair. Held per entry like `peer_address` and for the
+/// same reason: the peer may already have closed — a client can hang up
+/// while the proxy is still dialing upstream — and deriving this through
+/// the peer index would turn that legal schedule into a panic.
+pub fn localAddress(io: *SimIo, socket: Socket) std.Io.net.IpAddress {
+    return io.socketEntry(socket).local_address;
 }
 
 /// The simulated wall clock (§8): the fixed epoch base plus however far
@@ -1306,6 +1321,10 @@ fn finishConnect(
         .bytes = client_ip_bytes,
         .port = io.next_client_port,
     } };
+    // Local addresses mirror the pair: each end's own address is what
+    // the other end names it (§6 send's destination field).
+    client_entry.local_address = server_entry.peer_address;
+    server_entry.local_address = address;
     io.next_client_port = if (io.next_client_port == std.math.maxInt(u16))
         client_port_base
     else
@@ -1607,6 +1626,7 @@ fn initSocketEntry(entry: *SocketEntry, inbox_capacity: u32) void {
     // the placeholder keeps a socket that somehow skipped that from
     // reporting another connection's peer out of a recycled slot.
     entry.peer_address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    entry.local_address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
 }
 
 fn closeEntry(io: *SimIo, socket: Socket) void {

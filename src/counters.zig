@@ -268,6 +268,12 @@ pub const Counters = struct {
     /// not — `LOCAL` and `UNKNOWN` keep the observed peer, and a
     /// fronting proxy's health checks arrive exactly that way (§6).
     l4_proxy_header_accepted: Value = Value.init(0),
+    /// Headers staged for a sending cluster's origin (#142 send), one
+    /// per dialed L4 connection there. Counted at the stage, not the
+    /// wire: a dial that fails tears the connection down whole, so the
+    /// difference is exactly the fates `upstream_connect_failed` and the
+    /// teardown counters already witness. Pure observability.
+    l4_proxy_header_sent: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).
