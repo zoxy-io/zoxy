@@ -2,8 +2,11 @@
 //! zrk load (coordinated-omission-corrected) against the origin directly,
 //! through zoxy, and through haproxy as the state-of-the-art reference,
 //! printed as comparable bands — never single numbers; compare bands
-//! across runs. Also witnesses the zero-alloc promise from the outside:
-//! zoxy's RSS must not grow across the measured run.
+//! across runs. Also witnesses the §5 closed form from the outside: the
+//! slabs are lazily resident (IMPLEMENTATION_NOTES "lazy fault-in"), a
+//! saturating warmup drives RSS toward its bound, and the measured run
+//! must hold RSS under the banner's memory total plus a fixed overhead
+//! slack — the budget as a machine-checked ceiling, every run.
 //!
 //! By default an nginx origin is spawned with a generated config (the dev
 //! shell provides nginx and haproxy); pass `--origin host:port` to reuse
@@ -65,6 +68,28 @@ comptime {
 /// path is served by the origin from a file of this size.
 const large_body_bytes: u32 = 256 * 1024;
 const large_body_target = "/large.bin";
+
+/// The saturating warmup's per-run length (§9 RSS gate). Long enough to
+/// fault every pool the scenario touches to the peak the measured bands
+/// will hold — that peak is O(connections), reached within the first
+/// second — while staying noise beside the ten-second bands. The
+/// keep-alive leg alone stretches past this when the offered rate is too
+/// low to cycle the whole head ring (see `saturate`).
+const saturate_duration_s: u64 = 2;
+
+/// Slack over the banner total for what a live process holds outside the
+/// §5 closed form: text+rodata, libc, thread stacks, and the io_uring
+/// SQ/CQ and buf_ring mappings (~2 MiB measured at the bench shape).
+/// Generous on purpose — the ceiling gate exists to catch a *breach of
+/// the closed form*, not to re-measure the runtime's overhead every run.
+const rss_ceiling_slack_kb: u64 = 8 * 1024;
+
+comptime {
+    assert(saturate_duration_s >= 1);
+    // The ceiling must stay meaningfully below the smallest §5 budget a
+    // bench shape prints (~31 MiB), or the gate gates nothing.
+    assert(rss_ceiling_slack_kb <= 16 * 1024);
+}
 
 /// The §9 rate floor, as a percentage of the offered rate. A band that
 /// cannot keep up is a finding, not a pass: the error gates check *how*
@@ -138,6 +163,9 @@ pub fn main(init: std.process.Init) !u8 {
     var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, origin_address);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
+    // The banner is the first thing zoxy prints, so a failed bind or a
+    // binary that does not speak §5 surfaces here, before any load runs.
+    const banner = try readBanner(io, &zoxy_child);
 
     var haproxy_child = try spawnHaproxy(arena, io, environ, origin_address);
     defer haproxy_child.kill(io);
@@ -150,43 +178,72 @@ pub fn main(init: std.process.Init) !u8 {
 
     const direct_port = originPortOf(origin_address);
     try warmUp(arena, io, direct_port);
+    try saturate(arena, io, &flags, banner.head_buffers);
 
-    const rss_before_kb = try readRssKb(arena, io, zoxy_child.id);
-    std.debug.print(
-        "bench: keep-alive {d}/s, close {d}/s, {d} connections, {d}s per run\n",
-        .{ flags.rate, flags.close_rate, flags.connections, flags.duration_s },
-    );
-    // Both modes on both zoxy protocols run inside the RSS window, so the
-    // zero-alloc witness covers reconnect-heavy close load too — not just
-    // steady keep-alive. The haproxy references share the window; zoxy is
-    // idle during them, so they cannot inflate its resident set.
-    const keep_alive = try runMode(arena, io, direct_port, &flags, .keep_alive);
-    const close_mode = try runMode(arena, io, direct_port, &flags, .close);
-    const large_body = try runMode(arena, io, direct_port, &flags, .large_body);
-    const rss_after_kb = try readRssKb(arena, io, zoxy_child.id);
-
-    printMode("keep-alive", &keep_alive, .keep_alive);
-    printMode("Connection: close", &close_mode, .close);
-    printMode("large body", &large_body, .large_body);
-    std.debug.print("zoxy RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
+    const modes =
+        try runMeasuredWindow(arena, io, direct_port, &flags, zoxy_child.id, banner.total_kb);
 
     // The §9 overload scenario runs against its own shrunken zoxy — the
     // primary is idle during it, so its RSS window stays clean.
     const overload_ok = try runOverload(arena, io, &flags, origin_address, proxy_cpu);
 
     const drained_cleanly = try drainChild(io, &zoxy_child, &zoxy_running, "zoxy");
-    const passed = benchPassed(
+    const passed = benchPassed(&modes, banner.total_kb, &flags, drained_cleanly) and overload_ok;
+    return if (passed) 0 else 1;
+}
+
+/// The three measured band matrices, plus the RSS reading that closed
+/// their shared window — what `benchPassed` gates on.
+const MeasuredModes = struct {
+    keep_alive: Runs,
+    close_mode: Runs,
+    large_body: Runs,
+    rss_after_kb: u64,
+};
+
+/// Run the full band matrix for every scenario inside one RSS window,
+/// then print the bands beside the window's climb toward the §5 budget.
+/// Both modes on both zoxy protocols run inside the window, so the
+/// ceiling is held across reconnect-heavy close load too — not just
+/// steady keep-alive. The haproxy references share the window; zoxy is
+/// idle during them, so they cannot inflate its resident set.
+fn runMeasuredWindow(
+    arena: std.mem.Allocator,
+    io: Io,
+    direct_port: u16,
+    flags: *const Flags,
+    zoxy_pid: ?std.process.Child.Id,
+    budget_kb: u64,
+) !MeasuredModes {
+    assert(direct_port != 0);
+    assert(budget_kb > 0);
+    const rss_before_kb = try readRssKb(arena, io, zoxy_pid);
+    // A live proxy always has resident pages; a zero reading means the
+    // RSS probe failed, not that the process shrank to nothing.
+    assert(rss_before_kb > 0);
+    std.debug.print(
+        "bench: keep-alive {d}/s, close {d}/s, {d} connections, {d}s per run\n",
+        .{ flags.rate, flags.close_rate, flags.connections, flags.duration_s },
+    );
+    const keep_alive = try runMode(arena, io, direct_port, flags, .keep_alive);
+    const close_mode = try runMode(arena, io, direct_port, flags, .close);
+    const large_body = try runMode(arena, io, direct_port, flags, .large_body);
+    const rss_after_kb = try readRssKb(arena, io, zoxy_pid);
+
+    printMode("keep-alive", &keep_alive, .keep_alive);
+    printMode("Connection: close", &close_mode, .close);
+    printMode("large body", &large_body, .large_body);
+    std.debug.print("zoxy RSS: {d} KiB -> {d} KiB (budget {d} KiB)\n", .{
         rss_before_kb,
         rss_after_kb,
-        &.{
-            .{ .label = "keep-alive", .scenario = .keep_alive, .runs = &keep_alive },
-            .{ .label = "close", .scenario = .close, .runs = &close_mode },
-            .{ .label = "large body", .scenario = .large_body, .runs = &large_body },
-        },
-        &flags,
-        drained_cleanly,
-    ) and overload_ok;
-    return if (passed) 0 else 1;
+        budget_kb,
+    });
+    return .{
+        .keep_alive = keep_alive,
+        .close_mode = close_mode,
+        .large_body = large_body,
+        .rss_after_kb = rss_after_kb,
+    };
 }
 
 /// Drain, not just death (§8): SIGTERM, wait for a clean exit, report.
@@ -231,8 +288,15 @@ fn runOverload(
     }
     _ = try awaitResponsive(arena, io, overload_http_port, "zoxy overload");
 
-    const rss_before_kb = try readRssKb(arena, io, child.id);
+    // The same saturate-then-measure discipline as the primary (§9): the
+    // shrunken pools are lazily resident too, and an overload burst is
+    // its own saturation — the walls this scenario exists to hit fault
+    // everything a longer run can touch.
     var config = benchConfig(overload_http_port, overload_connections, flags.rate, "/");
+    config.duration_ns = saturate_duration_s * std.time.ns_per_s;
+    _ = try zrk.runner.run(arena, io, &config, 0, null, null, null);
+
+    const rss_before_kb = try readRssKb(arena, io, child.id);
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
     const report = try zrk.runner.run(arena, io, &config, 0, null, null, null);
     const rss_after_kb = try readRssKb(arena, io, child.id);
@@ -280,6 +344,10 @@ fn overloadPassed(
     assert(rss_before_kb > 0);
     assert(rss_after_kb > 0);
     const counters = &report.snapshot.counters;
+    // Flatness is sound here where the primary window's gate is a
+    // ceiling instead (`benchPassed`): this zoxy's *entire* pool budget
+    // (~0.75 MiB at `overload_limits`) sits inside the tolerance, so
+    // lazy fault-in can never trip it — only an allocation can.
     const rss_flat = rss_after_kb <= rss_before_kb + 1024;
     if (!rss_flat) {
         std.debug.print("FAIL: overload zoxy RSS grew under overload\n", .{});
@@ -369,6 +437,117 @@ fn spawnOverloadZoxy(
     };
 }
 
+/// What the harness reads off the §5 banner, from the outside — no
+/// import of zoxy's constants, so the numbers gate what the binary
+/// *said*, not what the source says it should have.
+const Banner = struct {
+    /// The closed-form memory total: the RSS ceiling `benchPassed` holds.
+    total_kb: u64,
+    /// The head-ring entry count: the saturation floor — the kernel
+    /// consumes the ring FIFO, so only that many served requests prove
+    /// the ring's slab fully resident (`saturate`).
+    head_buffers: u64,
+};
+
+/// Read the banner off the child's piped stdout, forward it verbatim to
+/// the run log (bug reports paste the banner; the pipe must not eat it),
+/// and parse the two numbers the RSS gates need. Bounded by the banner's
+/// own shape — it ends at the "  config  " line — so a child that dies
+/// first or prints something else is a setup failure surfaced here.
+fn readBanner(io: Io, child: *const std.process.Child) !Banner {
+    assert(child.id != null);
+    assert(child.stdout != null);
+    const banner_lines_max: u32 = 32;
+    const total_prefix = "  memory  total ";
+    // "+ head buffers" cannot match the upstream line, which spells
+    // "+ upstream head buffers".
+    const ring_marker = "+ head buffers ";
+    const last_line_prefix = "  config  ";
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader = child.stdout.?.reader(io, &read_buffer);
+    const reader = &file_reader.interface;
+    var banner: Banner = .{ .total_kb = 0, .head_buffers = 0 };
+    var line_index: u32 = 0;
+    while (line_index < banner_lines_max) : (line_index += 1) {
+        // `takeDelimiter` advances past the newline (its Exclusive
+        // sibling stops *at* it and would yield empty lines forever);
+        // null is EOF — a child that died before finishing its banner.
+        const maybe_line = reader.takeDelimiter('\n') catch |err| {
+            std.debug.print("bench: zoxy banner unreadable ({t})\n", .{err});
+            return error.BannerUnreadable;
+        };
+        const line = maybe_line orelse {
+            std.debug.print("bench: zoxy banner ended early\n", .{});
+            return error.BannerUnreadable;
+        };
+        std.debug.print("{s}\n", .{line});
+        if (std.mem.startsWith(u8, line, total_prefix)) {
+            banner.total_kb = try leadingInteger(line[total_prefix.len..]);
+        }
+        if (std.mem.indexOf(u8, line, ring_marker)) |marker| {
+            banner.head_buffers = try leadingInteger(line[marker + ring_marker.len ..]);
+        }
+        if (std.mem.startsWith(u8, line, last_line_prefix)) {
+            // The banner's last line; both numbers must have preceded it.
+            // A zero-entry ring cannot happen here: the bench config
+            // always declares an http listener, which the loader answers
+            // with head_buffers >= 1.
+            if (banner.total_kb == 0 or banner.head_buffers == 0) {
+                std.debug.print("bench: banner is missing its §5 numbers\n", .{});
+                return error.BannerUnreadable;
+            }
+            return banner;
+        }
+    }
+    std.debug.print("bench: no banner end within {d} lines\n", .{banner_lines_max});
+    return error.BannerUnreadable;
+}
+
+/// The decimal integer a banner field starts with. A field with none —
+/// including an empty one, reachable from a version-skewed binary's
+/// output — is a banner this harness cannot trust, never a panic.
+fn leadingInteger(text: []const u8) !u64 {
+    const end = std.mem.indexOfNone(u8, text, "0123456789") orelse text.len;
+    assert(end <= text.len);
+    if (end == 0) return error.BannerUnreadable;
+    const value = try std.fmt.parseUnsigned(u64, text[0..end], 10);
+    assert(value > 0 or text[0] == '0');
+    return value;
+}
+
+/// Drive RSS toward its §5 bound before the window opens (§9). The
+/// pools are lazily resident, so an unwarmed window would hold the
+/// ceiling trivially at a fraction of the budget: every scenario runs
+/// briefly at the measured connection count on both zoxy ports, and the
+/// keep-alive leg runs long enough to cycle the whole head ring (FIFO
+/// selection walks every buffer). This makes the ceiling gate
+/// non-vacuous; it cannot make *flatness* sound — small heads fault
+/// only the first page of each buffer, so later traffic may legally
+/// fault pages no warmup provably reaches (`benchPassed`).
+fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers: u64) !void {
+    assert(flags.rate >= 1);
+    assert(flags.connections >= 1);
+    assert(head_buffers >= 1);
+    var warm_flags = flags.*;
+    // Three full ring cycles: margin over the exact count, since close
+    // responses and pipelined turnarounds can serve without a fresh bind.
+    const ring_seconds: u64 = (3 * head_buffers) / flags.rate + 1;
+    warm_flags.duration_s = @max(saturate_duration_s, ring_seconds);
+    std.debug.print(
+        "bench: saturating warmup — {d}s keep-alive + {d}s close + {d}s large-body, both zoxy ports\n",
+        .{ warm_flags.duration_s, saturate_duration_s, saturate_duration_s },
+    );
+    const zoxy_ports = [_]u16{ zoxy_port, zoxy_http_port };
+    for (zoxy_ports) |port| {
+        _ = try loadTest(arena, io, port, &warm_flags, .keep_alive);
+    }
+    warm_flags.duration_s = saturate_duration_s;
+    for (zoxy_ports) |port| {
+        _ = try loadTest(arena, io, port, &warm_flags, .close);
+        _ = try loadTest(arena, io, port, &warm_flags, .large_body);
+    }
+}
+
 /// Prove every path answers before measuring; the short probes double as
 /// warmup. A target that never responds is a setup failure, surfaced
 /// before any numbers are printed.
@@ -381,9 +560,6 @@ fn warmUp(arena: std.mem.Allocator, io: Io, direct_port: u16) !void {
     _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http");
 }
 
-/// The §9 pass/fail: flat RSS (the zero-alloc promise witnessed from
-/// outside), both baselines alive, both proxied modes healthy, and a
-/// clean drain. Prints each failure so a red run explains itself.
 /// One scenario's bands plus what they were asked to do, so the gates can
 /// name the failing band and compare its result against its own offer.
 const Band = struct {
@@ -392,22 +568,41 @@ const Band = struct {
     runs: *const Runs,
 };
 
+/// The §9 pass/fail: RSS under the banner ceiling (the §5 closed form
+/// witnessed from outside), both baselines alive, both proxied modes
+/// healthy, and a clean drain. Prints each failure so a red run
+/// explains itself.
 fn benchPassed(
-    rss_before_kb: u64,
-    rss_after_kb: u64,
-    bands: []const Band,
+    modes: *const MeasuredModes,
+    budget_kb: u64,
     flags: *const Flags,
     drained_cleanly: bool,
 ) bool {
+    const rss_after_kb = modes.rss_after_kb;
+    const bands = [_]Band{
+        .{ .label = "keep-alive", .scenario = .keep_alive, .runs = &modes.keep_alive },
+        .{ .label = "close", .scenario = .close, .runs = &modes.close_mode },
+        .{ .label = "large body", .scenario = .large_body, .runs = &modes.large_body },
+    };
     // A live proxy always has resident pages; a zero reading means the
     // RSS probe failed, not that the process shrank to nothing.
-    assert(rss_before_kb > 0);
     assert(rss_after_kb > 0);
-    // Serving both modes on both protocols must not grow the resident set
-    // beyond noise.
-    const rss_flat = rss_after_kb <= rss_before_kb + 1024;
-    if (!rss_flat) {
-        std.debug.print("FAIL: zoxy RSS grew under load\n", .{});
+    assert(budget_kb > 0);
+    // The §5 closed form, held from the outside: resident memory never
+    // exceeds what the banner promised plus the fixed overhead a live
+    // process carries beside its pools. This is the whole RSS gate —
+    // growth *inside* the budget is lazy fault-in working as designed
+    // (measured: small heads fault only the first page of an 8 KiB
+    // buffer, so which pages are resident depends on coalescing and
+    // delivery sizes no warmup can provably pre-cover), and `saturate`
+    // exists to push RSS toward this bound so holding it means
+    // something, not to make flatness sound.
+    const rss_bounded = rss_after_kb <= budget_kb + rss_ceiling_slack_kb;
+    if (!rss_bounded) {
+        std.debug.print(
+            "FAIL: zoxy RSS {d} KiB exceeds the §5 budget {d} KiB + {d} KiB slack\n",
+            .{ rss_after_kb, budget_kb, rss_ceiling_slack_kb },
+        );
     }
     var bands_ok = true;
     for (bands) |band| {
@@ -443,7 +638,7 @@ fn benchPassed(
             }
         }
     }
-    return rss_flat and bands_ok and drained_cleanly;
+    return rss_bounded and bands_ok and drained_cleanly;
 }
 
 fn parseFlags(args: []const [:0]const u8) !Flags {
@@ -585,9 +780,13 @@ fn spawnZoxy(
     , .{ zoxy_port, zoxy_http_port, origin_address });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
+    // stdout is piped so `readBanner` can gate on the §5 total. Only the
+    // banner ever crosses it: this config keeps the access log off, and
+    // the drain-time counter dump goes to stderr — a stdout sink here
+    // would eventually fill the pipe and block the proxy under test.
     return std.process.spawn(io, .{
         .argv = &.{ zoxy_path, config_path },
-        .stdout = .inherit,
+        .stdout = .pipe,
         .stderr = .inherit,
     }) catch |err| {
         std.debug.print("bench: could not spawn {s} ({t}); run `zig build` first\n", .{

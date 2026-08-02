@@ -162,12 +162,14 @@ fn initBufferGroup(io: *XevIo, arena: std.mem.Allocator, count: u32, bytes: u32)
     assert(bytes >= 1);
     assert(count <= constants.buffer_group_entries_max);
     io.group_slab = try arena.alloc(u8, @as(usize, count) * bytes);
-    // Fault the whole slab in now: the kernel consumes the ring FIFO, so
-    // under sustained load every registered buffer gets written — pages a
-    // LIFO pool would never touch. Zeroing at init makes RSS the printed
-    // §5 budget from the first tick instead of a load-dependent climb the
-    // bench's flat-RSS gate (rightly) refuses.
-    @memset(io.group_slab, 0);
+    // Deliberately not faulted in. The kernel consumes the ring FIFO, so
+    // sustained load cycles every registered buffer and the slab converges
+    // toward fully resident regardless — but it gets there by being
+    // *used* (a small head faults only its buffer's first page), and an
+    // idle or lightly loaded process keeps its pages unmapped. The
+    // printed §5 total is a ceiling RSS approaches, not a startup floor,
+    // and the bench holds it as one (IMPLEMENTATION_NOTES "lazy
+    // fault-in").
     io.group_checked_out = try arena.alloc(bool, count);
     @memset(io.group_checked_out, false);
     io.group_count = count;
