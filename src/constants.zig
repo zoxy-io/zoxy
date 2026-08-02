@@ -632,7 +632,9 @@ pub const completion_queue_entries: u32 =
 /// transient just-accepted fd an admission decision is pending on + one
 /// socket per in-flight admin scrape + one socket per parked upstream,
 /// which belongs to no connection + the one socket the in-flight health
-/// probe may hold while dialing (§7). Closed form so `ensureFdBudget` can
+/// probe may hold while dialing (§7) + the access log's file sink when the
+/// config names one (§8 — the `stdout` sink is one of the three stdio
+/// descriptors already counted). Closed form so `ensureFdBudget` can
 /// check the *effective* size against RLIMIT_NOFILE; the admin and
 /// health-probe reservations are fixed.
 ///
@@ -640,12 +642,20 @@ pub const completion_queue_entries: u32 =
 /// the listener term makes this a property of a config, not of this file.
 /// `ensureFdBudget` was always the real gate — it compares this against
 /// the actual RLIMIT_NOFILE — and it is now the only one.
-pub fn fdsRequired(conn_slots: u32, upstream_slots: u32, listeners: u32) u32 {
+pub fn fdsRequired(
+    conn_slots: u32,
+    upstream_slots: u32,
+    listeners: u32,
+    access_log_files: u32,
+) u32 {
     assert(conn_slots <= conn_slots_max);
     assert(upstream_slots <= upstream_slots_max);
     assert(listeners <= std.math.maxInt(u16));
+    // Zero or one: the config names at most one sink, and only its `file`
+    // arm opens anything.
+    assert(access_log_files <= 1);
     return 3 + 1 + 1 + (listeners + admin_listeners) +
-        2 * conn_slots + 1 + admin_conns + upstream_slots + 1;
+        2 * conn_slots + 1 + admin_conns + upstream_slots + 1 + access_log_files;
 }
 
 /// Default effective pool sizes when the config omits a `limits` block: a
@@ -675,19 +685,20 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 /// `conn_slots_max`), because the out-of-box shape is bounded by the
 /// stock 4096 `RLIMIT_NOFILE` rather than by admission: matching 1386
 /// would put the default at 4168 fds, over that line, for capacity an
-/// unconfigured proxy is not there to serve. 1313 is the largest value
-/// that still clears that line — `fdsRequired(conn_slots_default, x, 1)`
-/// is `2782 + x` (the health probe's reserved fd included), and that must
-/// stay strictly under 4096 (the out-of-box budget stays *under* the
-/// stock limit, not flush against it), so `4096 - 2782 - 1 = 1313` — the
-/// default leans as far toward
-/// `conn_slots_default` as the stock fd budget allows. An L4
+/// unconfigured proxy is not there to serve. 1312 is the largest value
+/// that still clears that line — `fdsRequired(conn_slots_default, x, 1, 1)`
+/// is `2783 + x` (the health probe's reserved fd and the access log's
+/// possible file sink both included: naming a log file is not *tuning*,
+/// so the lean promise must hold with one), and that must stay strictly
+/// under 4096 (the out-of-box budget stays *under* the stock limit, not
+/// flush against it), so `4096 - 2783 - 1 = 1312` — the default leans as
+/// far toward `conn_slots_default` as the stock fd budget allows. An L4
 /// deployment never leases from this pool at all — an L4 dial reads its
 /// `leased_counts` for the P2C draw and holds no slot. A deployment that
 /// means to fill its conn pool raises both together in `limits` — which
 /// is what the ceilings exist to permit and what the c10k benchmark
 /// configuration does.
-pub const upstream_slots_default: u32 = 1313;
+pub const upstream_slots_default: u32 = 1312;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
@@ -1052,8 +1063,16 @@ test "budgets: c10k ceiling fd count needs a raised NOFILE" {
     // the ceiling must raise RLIMIT_NOFILE (systemd LimitNOFILE / ulimit).
     // `ensureFdBudget` checks the *effective* size against the real limit
     // at startup (§8); this pins the ceiling closed form.
-    try std.testing.expectEqual(@as(u32, 34407), fdsRequired(conn_slots_max, upstream_slots_max, 0));
-    try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0) <= 65536);
+    try std.testing.expectEqual(
+        @as(u32, 34407),
+        fdsRequired(conn_slots_max, upstream_slots_max, 0, 0),
+    );
+    // A file sink is exactly one fd, at the ceiling as everywhere.
+    try std.testing.expectEqual(
+        @as(u32, 34408),
+        fdsRequired(conn_slots_max, upstream_slots_max, 0, 1),
+    );
+    try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0, 1) <= 65536);
     // The out-of-box side of this is pinned by "the default deployment is
     // lean" below, not restated here.
 }
@@ -1062,7 +1081,9 @@ test "budgets: the default deployment is lean" {
     // The out-of-box config (no `limits` block) starts under a routine
     // 4096 NOFILE and asks the kernel for a shallow ring, not the c10k
     // ceiling — operators opt up through `limits` (§5). One listener.
-    try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1) < 4096);
+    // With the one file sink a config can name included: the lean line
+    // holds whether or not the access log writes to a file.
+    try std.testing.expect(fdsRequired(conn_slots_default, upstream_slots_default, 1, 1) < 4096);
     try std.testing.expect(
         completionQueueDepthFor(conn_slots_default, upstream_slots_default, 1, cq_fill_eighths_default) <
             completion_queue_entries,

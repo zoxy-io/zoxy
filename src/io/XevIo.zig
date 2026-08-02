@@ -36,15 +36,20 @@ const uses_buf_ring = xev.backend == .io_uring;
 /// The one buffer group this backend registers (§5's head-buffer ring).
 const buffer_group_id: u16 = 0;
 
-/// The access-log sink (§8): the process's own stdout, inherited, never
-/// opened here. Config names the sink by enum and this is the only value
-/// it can name today, so the fd budget is unchanged — stdout is already
-/// one of the three stdio descriptors `fdsRequired` reserves.
-const log_sink_fd: posix.fd_t = 1;
+/// The access-log sink's `stdout` arm (§8): the process's own stdout,
+/// inherited, never opened and never closed — already one of the three
+/// stdio descriptors `fdsRequired` reserves, so it costs nothing. The
+/// `file` arm is `openLogSink`'s fd instead, counted by `fdsRequired`'s
+/// `access_log_files` term.
+pub const log_sink_stdout: posix.fd_t = 1;
 
 loop: xev.Loop,
 timer: xev.Timer,
 notifier: xev.Async,
+/// Where `logWrite` sends its bytes (§8): `log_sink_stdout`, or the file
+/// fd the caller obtained from `openLogSink`. Held for the process's
+/// life, closed by exit like the stdio it stands beside.
+log_sink_fd: posix.fd_t,
 thread_pool: if (needs_thread_pool) xev.ThreadPool else void,
 notifier_completion: xev.Completion,
 signal_mask: std.atomic.Value(u8),
@@ -121,8 +126,14 @@ pub fn init(
     /// against it is asserted misuse.
     buffer_group_count: u32,
     buffer_group_bytes: u32,
+    /// The §8 access-log sink `logWrite` targets: `log_sink_stdout`, or
+    /// the fd `openLogSink` returned. A parameter rather than opened here
+    /// so the caller owning the config error report also owns the path.
+    log_sink_fd: posix.fd_t,
 ) !void {
     assert(configured_listeners <= std.math.maxInt(u16) - constants.admin_listeners);
+    // Stdout or a real opened file — never a sentinel, never closed-over.
+    assert(log_sink_fd >= 0);
     const listeners = configured_listeners + constants.admin_listeners;
     assert(listeners >= 1);
     if (comptime needs_thread_pool) {
@@ -143,6 +154,7 @@ pub fn init(
     errdefer io.timer.deinit();
     io.listeners = try arena.alloc(ListenerEntry, listeners);
     io.listeners_count = 0;
+    io.log_sink_fd = log_sink_fd;
     io.last_pressure = Io.Pressure.none;
     io.notifier_completion = .{};
     io.signal_mask = std.atomic.Value(u8).init(0);
@@ -765,10 +777,32 @@ pub fn send(
     }).adapter);
 }
 
+/// Open the §8 access log's `file` sink: append-only, created if absent,
+/// never truncated. `O_APPEND` rather than a positioned write, for two
+/// reasons that both bite later if skipped: the ring's write op targets
+/// the fd's own position (the fork submits offset −1), and append-only is
+/// what makes an external copy-truncate rotation safe — every write lands
+/// at the current end, wherever a rotation just put it. Standalone and
+/// synchronous: one open at startup before the loop exists, under
+/// src/io/ because fds are made only here (§4's boundary); the caller
+/// owns the error report, since it owns the path the operator wrote.
+pub fn openLogSink(path: []const u8) !posix.fd_t {
+    assert(path.len >= 1);
+    // 0644: the operator's tooling reads the log; only this process
+    // writes it. The umask tightens it further if the deployment says so.
+    return posix.openat(posix.AT.FDCWD, path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    }, 0o644);
+}
+
 /// Write one batch of access-log bytes to the sink (§8). A ring op, not a
-/// direct `write`: the sink is whatever the operator pointed stdout at, and
-/// a pipe whose reader has stalled would block the whole loop for as long
-/// as it stays stalled — the one thing this proxy must never do. Through
+/// direct `write`: the sink is whatever the operator pointed stdout at, or
+/// a file on whatever filesystem they named, and a pipe whose reader has
+/// stalled — or a disk that is busy — would block the whole loop for as
+/// long as it stays stalled, the one thing this proxy must never do. Through
 /// the ring the kernel punts a would-block write to its own worker and the
 /// loop keeps serving; the caller's staging buffer absorbs the interval and
 /// drops when it cannot (§8's ladder, applied to logging).
@@ -784,7 +818,7 @@ pub fn logWrite(
     comptime callback: fn (*Userdata, Io.LogWriteError!u32) void,
 ) void {
     assert(bytes.len >= 1);
-    const file = xev.File.initFd(log_sink_fd);
+    const file = xev.File.initFd(io.log_sink_fd);
     file.write(&io.loop, completion, .{ .slice = bytes }, Userdata, userdata, (struct {
         fn adapter(
             context: ?*Userdata,
