@@ -257,11 +257,45 @@ fn drainChild(
     assert(label.len > 0);
     assert(running.*);
     try std.posix.kill(child.id.?, .TERM);
+    // A child whose stderr this harness piped (the banner gate) writes
+    // its drain-time counter dump there: forward it to the run log for
+    // the band review, reading to EOF *before* the reap — the read is
+    // what observes the exit, and `wait` may tear the pipe down.
+    if (child.stderr != null) forwardStderr(io, child);
     const term = try child.wait(io);
     running.* = false;
     const drained_cleanly = term == .exited and term.exited == 0;
     std.debug.print("{s} drain: {s}\n", .{ label, if (drained_cleanly) "clean exit" else "UNCLEAN" });
     return drained_cleanly;
+}
+
+/// Pump the child's piped stderr into this process's own until EOF. The
+/// child has been told to exit, so EOF is guaranteed; the cap is misuse
+/// insurance (a chatty child), not a liveness need.
+fn forwardStderr(io: Io, child: *const std.process.Child) void {
+    assert(child.stderr != null);
+    const chunks_max: u32 = 128;
+    var read_buffer: [8192]u8 = undefined;
+    var file_reader = child.stderr.?.reader(io, &read_buffer);
+    var forwarded: u64 = 0;
+    var chunk_index: u32 = 0;
+    while (chunk_index < chunks_max) : (chunk_index += 1) {
+        var chunk: [8192]u8 = undefined;
+        const read = file_reader.interface.readSliceShort(&chunk) catch |err| {
+            // Surfaced, not gated: the dump is band-review context, and a
+            // torn pipe must not turn a finished run red — but it must
+            // say so, or a missing dump reads as a zoxy bug.
+            std.debug.print("bench: child stderr unreadable ({t})\n", .{err});
+            return;
+        };
+        if (read == 0) return;
+        assert(read <= chunk.len);
+        forwarded += read;
+        std.debug.print("{s}", .{chunk[0..read]});
+    }
+    std.debug.print("bench: child stderr still open after {d} KiB forwarded; giving up\n", .{
+        forwarded / 1024,
+    });
 }
 
 /// The §9 overload scenario: offered load ≫ capacity against a zoxy
@@ -449,14 +483,14 @@ const Banner = struct {
     head_buffers: u64,
 };
 
-/// Read the banner off the child's piped stdout, forward it verbatim to
+/// Read the banner off the child's piped stderr, forward it verbatim to
 /// the run log (bug reports paste the banner; the pipe must not eat it),
 /// and parse the two numbers the RSS gates need. Bounded by the banner's
 /// own shape — it ends at the "  config  " line — so a child that dies
 /// first or prints something else is a setup failure surfaced here.
 fn readBanner(io: Io, child: *const std.process.Child) !Banner {
     assert(child.id != null);
-    assert(child.stdout != null);
+    assert(child.stderr != null);
     const banner_lines_max: u32 = 32;
     const total_prefix = "  memory  total ";
     // "+ head buffers" cannot match the upstream line, which spells
@@ -464,7 +498,7 @@ fn readBanner(io: Io, child: *const std.process.Child) !Banner {
     const ring_marker = "+ head buffers ";
     const last_line_prefix = "  config  ";
     var read_buffer: [4096]u8 = undefined;
-    var file_reader = child.stdout.?.reader(io, &read_buffer);
+    var file_reader = child.stderr.?.reader(io, &read_buffer);
     const reader = &file_reader.interface;
     var banner: Banner = .{ .total_kb = 0, .head_buffers = 0 };
     var line_index: u32 = 0;
@@ -780,14 +814,16 @@ fn spawnZoxy(
     , .{ zoxy_port, zoxy_http_port, origin_address });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
-    // stdout is piped so `readBanner` can gate on the §5 total. Only the
-    // banner ever crosses it: this config keeps the access log off, and
-    // the drain-time counter dump goes to stderr — a stdout sink here
-    // would eventually fill the pipe and block the proxy under test.
+    // stderr is piped so `readBanner` can gate on the §5 total (the
+    // banner is diagnostics, and zoxy keeps stdout for the access log's
+    // `stdout` sink). Between the banner and the drain nothing else
+    // lands there, and the drain-time counter dump — a few KiB against a
+    // 64 KiB pipe — is forwarded into the run log by `drainChild`, so
+    // the band review keeps it and the pipe can never fill.
     return std.process.spawn(io, .{
         .argv = &.{ zoxy_path, config_path },
-        .stdout = .pipe,
-        .stderr = .inherit,
+        .stdout = .inherit,
+        .stderr = .pipe,
     }) catch |err| {
         std.debug.print("bench: could not spawn {s} ({t}); run `zig build` first\n", .{
             zoxy_path,

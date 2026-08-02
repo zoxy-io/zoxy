@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
     const config = try readConfig(init.io, arena, config_path);
     const config_arena_bytes = init.arena.queryCapacity() - arena_before;
 
-    const cq_entries = try resolveBudgets(init.io, &config, config_arena_bytes);
+    const cq_entries = try resolveBudgets(&config, config_arena_bytes);
     const log_sink_fd = try openLogSinkFd(&config);
 
     // The ring is the config's to size (§5), count and unit both;
@@ -123,7 +123,6 @@ pub fn main(init: std.process.Init) !void {
 /// fd one, prints the banner, and returns the CQ depth the ring must be
 /// created with.
 fn resolveBudgets(
-    io: std.Io,
     config: *const zoxy.config.Config,
     config_arena_bytes: u64,
 ) !u32 {
@@ -149,7 +148,7 @@ fn resolveBudgets(
     // pools, the ring, and the fd demand all fit what the constants proved.
     assert(cq_entries <= zoxy.constants.completion_queue_entries);
     try ensureFdBudget(fds_required);
-    try printBudgets(io, config, fds_required, cq_entries, config_arena_bytes);
+    printBudgets(config, fds_required, cq_entries, config_arena_bytes);
     return cq_entries;
 }
 
@@ -267,7 +266,7 @@ const help_text =
     \\
     \\Signals:
     \\  SIGTERM, SIGINT   Drain in-flight connections, then exit 0.
-    \\  SIGUSR1           Dump counters to stdout.
+    \\  SIGUSR1           Dump counters to stderr.
     \\
 ;
 
@@ -354,8 +353,14 @@ fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
     };
 }
 
+/// The §5 banner, to **stderr**: the banner is diagnostics, and stdout
+/// belongs to the data an operator may point there — the access log's
+/// `stdout` sink must stay one uncontaminated JSON line per event.
+/// Stderr is where the counter dump already goes, and via the same
+/// `std.debug.print` plain-write path, so the two interleave whole-lines
+/// even when both land in one redirected file (a positional writer here
+/// would be silently overwritten by the dump's shared-offset writes).
 fn printBudgets(
-    io: std.Io,
     config: *const zoxy.config.Config,
     fds_required: u32,
     cq_entries: u32,
@@ -364,7 +369,7 @@ fn printBudgets(
     /// it is whatever the operator's config file needed — which is
     /// exactly why it is reported rather than derived.
     config_arena_bytes: u64,
-) !void {
+) void {
     const constants = zoxy.constants;
     // Every budget reflects the *effective* config (§5, §8): the config may
     // shrink the pools, the fd demand, and the requested ring below the
@@ -376,19 +381,49 @@ fn printBudgets(
         @intCast(config.listeners.len),
     );
     const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
-    const endpoint_stride = ServerXev.endpointKeysFor(config).stride;
     const sizes = poolSizesFor(config);
     // §5's promise is that the printed total covers everything this
     // process holds for its life. The config arena qualifies — it is
     // never freed — so it joins the total even though it is the one term
     // measured rather than derived from constants.
     const memory_total = constants.memoryBytesTotal(&sizes) + config_arena_bytes;
-    var buffer: [1024]u8 = undefined;
-    var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
-    const writer = &file_writer.interface;
+    // A banner that could print a zero total or zero fd demand would be
+    // reporting a proxy that reserved nothing — the closed form broke.
+    assert(memory_total > 0);
+    assert(fds_required > 0);
+    printMemoryBanner(config, &sizes, memory_total, access_log_bytes, config_arena_bytes);
+    std.debug.print(
+        \\  fds     {d} required (asserted against RLIMIT_NOFILE)
+        \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
+        \\  config  {d} listener(s), {d} cluster(s), access log {s}
+        \\
+    , .{
+        fds_required,
+        constants.ring_entries,
+        cq_entries,
+        in_flight,
+        config.listeners.len,
+        config.clusters.len,
+        if (config.access_log_sink) |sink| @tagName(sink) else "off",
+    });
+}
+
+/// The banner's version and memory lines — the §5 closed form itemized.
+/// Split from `printBudgets` for the length limit; the two prints are
+/// sequential same-thread writes to stderr, so nothing interleaves.
+fn printMemoryBanner(
+    config: *const zoxy.config.Config,
+    sizes: *const zoxy.constants.PoolSizes,
+    memory_total: u64,
+    access_log_bytes: u64,
+    config_arena_bytes: u64,
+) void {
+    assert(memory_total > 0);
+    assert(config.listeners.len >= 1);
+    const limits = config.limits;
     // The version leads, because this banner is what a bug report pastes
     // and `--version` is what it does not think to run.
-    try writer.print(
+    std.debug.print(
         \\zoxy {s}{s}
         \\budgets (DESIGN.md §5/§8; closed-form except where marked):
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
@@ -397,9 +432,6 @@ fn printBudgets(
         \\          + access log {d} KiB
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + config arena {d} KiB (measured, not closed-form)
-        \\  fds     {d} required (asserted against RLIMIT_NOFILE)
-        \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
-        \\  config  {d} listener(s), {d} cluster(s), access log {s}
         \\
     , .{
         build_options.version,
@@ -415,24 +447,16 @@ fn printBudgets(
         // The +1 ownership byte stays out of the banner's per-unit figure;
         // the closed-form total above carries it.
         limits.head_buffer_bytes,
-        constants.bufferGroupDescriptorBytes(limits.head_buffers),
+        zoxy.constants.bufferGroupDescriptorBytes(limits.head_buffers),
         limits.upstream_head_buffers,
         sizes.upstream_head_buffer_bytes,
         sizes.head_scratch_bytes,
         access_log_bytes / 1024,
         ServerXev.endpointTableBytes(config),
         config.clusters.len,
-        endpoint_stride,
+        ServerXev.endpointKeysFor(config).stride,
         config_arena_bytes / 1024,
-        fds_required,
-        constants.ring_entries,
-        cq_entries,
-        in_flight,
-        config.listeners.len,
-        config.clusters.len,
-        if (config.access_log_sink) |sink| @tagName(sink) else "off",
     });
-    try writer.flush();
 }
 
 fn installSignalHandlers() void {
