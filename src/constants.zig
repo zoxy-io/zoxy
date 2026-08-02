@@ -273,6 +273,17 @@ pub const endpoint_index_max: u16 = std.math.maxInt(u16) - 1;
 /// log line's width closed-form rather than a function of the config file.
 pub const cluster_name_bytes_max: u16 = 64;
 
+/// Upper bound on one endpoint's configured pick weight (#174) —
+/// HAProxy's own `weight` ceiling. 256 steps is a 1-in-257 canary
+/// granularity, finer than any signal an operator could act on, and the
+/// bound is load-bearing for the `hash` policy: a weighted rendezvous
+/// pick scores one hash per weight point, so this constant is what
+/// keeps that scan's cost a number an operator can read off their own
+/// config rather than an open-ended loop. Zero stays *below* the bound
+/// deliberately — it is the drain spelling (never picked, still probed),
+/// not a share.
+pub const endpoint_weight_max: u16 = 256;
+
 /// Lower bound on configured clusters: a config with no cluster can route
 /// nowhere, so the loader rejects an empty map and the config JSON Schema
 /// emits it as `minProperties`.
@@ -836,6 +847,9 @@ comptime {
     assert(access_log_path_bytes_max >= 16);
     assert(access_log_method_bytes_max >= 7); // "OPTIONS", the longest standard method.
     assert(cluster_name_bytes_max >= 1);
+    // A weight ceiling of zero would make every cluster all-drained and
+    // unloadable; one weight step is the degenerate-but-legal minimum.
+    assert(endpoint_weight_max >= 1);
     // The health prober's reservations and thresholds (§7): the op budget
     // covers dial + deadline + one cancel, a threshold of zero would eject
     // or restore on no evidence, and the default probe interval is a legal
