@@ -1292,6 +1292,12 @@ equalities a shared runner's noise cannot move.
    none can bound itself, so one wall-clock budget covers the run from
    outside: a wedged proxy is killed and reported rather than left to
    hang the build until CI's own timeout kills it with no diagnosis.
+   `zig build ci` runs it on Linux only for now: on its first CI run the
+   gate found that the macOS leg answers nothing at all to its first L7
+   request (#184), which is what a live gate is for and is also a
+   different piece of work from building one. `zig build smoke` runs
+   everywhere regardless, and restoring the `ci` wiring on macOS is that
+   issue's acceptance test.
 4. **Benchmarks — [zrk](https://github.com/zoxy-io/zrk), three tiers.**
    The load generator is zrk — a pure-Zig wrk2 rewrite: *constant-throughput*
    (open-loop) pacing with coordinated-omission-corrected HdrHistogram
