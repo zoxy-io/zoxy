@@ -179,6 +179,11 @@ pub fn Server(comptime IoType: type) type {
             /// handed over the same way: trust depends on what is in front
             /// of this socket, so it cannot live on the cluster.
             forwarded: ?config_module.Config.Listener.Forwarded,
+            /// The listener's PROXY protocol expectation (#142, null =
+            /// first bytes are payload). Read at admission only — the
+            /// receive phase is entered before the connection has any
+            /// state of its own — so nothing is copied onto the conn.
+            proxy_protocol: ?config_module.Config.Listener.ProxyProtocol,
             /// Copied from config so admission forks without reaching back
             /// through the listener index (§6, §7).
             protocol: config_module.Config.Listener.Protocol,
@@ -354,6 +359,7 @@ pub fn Server(comptime IoType: type) type {
                     .routes = listener_config.routes,
                     .filters = listener_config.filters,
                     .forwarded = listener_config.forwarded,
+                    .proxy_protocol = listener_config.proxy_protocol,
                     .protocol = listener_config.protocol,
                     .accepting = false,
                 };
