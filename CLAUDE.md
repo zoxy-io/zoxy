@@ -16,10 +16,13 @@ direnv activates the shell). Read before writing code:
 ## Gates — run before every commit
 
 - `zig build ci` — unit tests + fuzz corpus, boundary lint, deterministic
-  simulation. A sim failure prints its seed; `zig build sim -- <seed>`
-  replays the exact schedule.
-- `zig fmt --check src scripts build.zig build.zig.zon` — the format gate
-  (a PostToolUse hook auto-formats files as they are edited).
+  simulation, and the Tier-0.5 live gate. A sim failure prints its seed;
+  `zig build sim -- <seed>` replays the exact schedule. The live gate
+  (`zig build smoke` alone) runs the real binary against a real origin
+  and asserts equalities on what it wrote; a failing one prints the
+  proxy's own output from `.zig-cache/zoxy-smoke/`.
+- `zig fmt --check src scripts smoke build.zig build.zig.zon` — the format
+  gate (a PostToolUse hook auto-formats files as they are edited).
 - `zig build bench` (Tier 1: zrk against an nginx origin) runs at merge,
   not per change — compare bands across runs, never single numbers.
 

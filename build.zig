@@ -286,14 +286,18 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint", "fd-boundary lint: raw syscalls only under src/io/");
     lint_step.dependOn(&lint_run.step);
 
-    // The deterministic per-change gates. The Tier-1 `bench` step is
-    // deliberately excluded (DESIGN.md §9): its verdict is a band
-    // comparison across runs, run at merge against a real origin, not a
-    // blind shared-runner pass.
-    const ci_step = b.step("ci", "Per-change gates: test + lint + sim (bench runs at merge)");
+    // The per-change gates. The Tier-1 `bench` step is deliberately
+    // excluded (DESIGN.md §9): its verdict is a band comparison across
+    // runs, run at merge against a real origin, not a blind shared-runner
+    // pass. Tier 0.5 is not excluded on those grounds and belongs here
+    // for the opposite reason — its verdicts are equalities on real
+    // output, which a shared runner cannot move, and it is the only gate
+    // in this list that runs the binary at all.
+    const ci_step = b.step("ci", "Per-change gates: test + lint + sim + smoke (bench runs at merge)");
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
     ci_step.dependOn(sim_step);
+    ci_step.dependOn(smoke_step);
     // Compile — never run — every measurement binary. Their verdicts are
     // human-read A/Bs and profiles, so running them here would buy nothing
     // and cost minutes; but they call the same internal APIs the proxy

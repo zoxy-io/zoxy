@@ -153,13 +153,15 @@ const uncovered = [_]Uncovered{
         .why = .unreached,
         .reason = "no seed raises the adversary's recv cap to head_buffer_bytes_default, " ++
             "so no origin delivery fills the head buffer; " ++
-            "src/http_proxy_test.zig builds that delivery",
+            "src/http_proxy_test.zig builds that delivery, and the Tier-0.5 " ++
+            "live gate counts it against a real one",
     },
     .{
         .name = "admin_served",
         .why = .unreached,
         .reason = "the sweep configures no admin listener; " ++
-            "src/admin_test.zig covers the scrape",
+            "src/admin_test.zig covers the scrape, and the Tier-0.5 live " ++
+            "gate reads its counters through one",
     },
     .{
         .name = "admin_reaped",
@@ -237,7 +239,8 @@ const uncovered_ops = [_]struct { kind: SimIo.OpKind, reason: []const u8 }{
         .kind = .close,
         .reason = "src/admin.zig is the only asynchronous close in the tree — " ++
             "every serving path closes synchronously via closeNow — and the " ++
-            "sweep configures no admin listener; src/admin_test.zig covers it",
+            "sweep configures no admin listener; src/admin_test.zig covers it, " ++
+            "and the Tier-0.5 live gate delivers real ones through its scrapes",
     },
 };
 
