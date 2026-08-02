@@ -75,11 +75,19 @@ l7_clients: [clients_max]HttpClient,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
 proxy_protocol_l4: ?zoxy.config.Config.Listener.ProxyProtocol,
+/// The #142 send half drawn for the l4 cluster; the origin double then
+/// expects and strips a header on every connection, and `verify` holds
+/// what it heard against what the clients were (`verifyUpstreamIdentities`).
+proxy_protocol_send_l4: ?zoxy.config.Config.Cluster.ProxyProtocolSend,
 /// Per-L4-client address its header announced (len 0 = none): distinct
 /// per client, so `verifyAccessLog` can demand the log states each one
 /// on clean seeds — presence is attribution.
 l4_announced: [clients_max][announced_bytes_max]u8,
 l4_announced_len: [clients_max]u8,
+/// The same announcement as an address (valid where `l4_announced_len`
+/// is nonzero), for the #142 send-identity oracle — text serves the log
+/// needle, this serves `IpAddress.eql`.
+l4_announced_address: [clients_max]std.Io.net.IpAddress,
 l4_count: u8,
 l7_count: u8,
 clients_count: u8,
@@ -409,6 +417,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     const connect_timeout_ms: u32 = 20 + random.uintAtMost(u32, 40);
     const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms);
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
+    harness.proxy_protocol_send_l4 = deriveProxyProtocolSend(random);
     harness.clusters = .{
         .{
             .name = "origin-l4",
@@ -416,6 +425,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
             .pick = pick_l4,
             .check = health.check_l4,
             .max_inflight = deriveMaxInflight(harness.clean, random),
+            .proxy_protocol_send = harness.proxy_protocol_send_l4,
         },
         .{
             .name = "origin-http",
@@ -600,6 +610,22 @@ fn deriveProxyProtocol(random: std.Random) ?zoxy.config.Config.Listener.ProxyPro
     return null;
 }
 
+/// The #142 send half on the l4 cluster: half the announcing seeds speak
+/// v2 (what the writers' real receivers — cloud LBs, HAProxy — expect),
+/// the rest v1, and half send nothing at all. Drawn independently of the
+/// receive gate, so the sweep reaches all four quadrants — including the
+/// chain, where the identity announced in must be the identity announced
+/// out. The prober needs no carve-out: `check_l4` is always the
+/// dial-only tcp check, which gives a stripping origin no bytes to
+/// judge.
+fn deriveProxyProtocolSend(random: std.Random) ?zoxy.config.Config.Cluster.ProxyProtocolSend {
+    return switch (random.uintLessThan(u8, 6)) {
+        0 => .v1,
+        1, 2 => .v2,
+        else => null,
+    };
+}
+
 fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
     harness.filters_http = .{
         .{
@@ -693,6 +719,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     harness.origin = .{
         .mode_selector = pickOriginMode,
         .context = harness,
+        .expect_proxy_header = harness.proxy_protocol_send_l4 != null,
     };
     try harness.origin.start(&harness.io, Harness.originAddress());
     harness.origin_http = .{
@@ -823,6 +850,8 @@ fn recordAnnounced(harness: *Harness, l4_index: u8, octet: u8, port: u16) void {
     assert(text.len >= 17);
     assert(text.len <= 19);
     harness.l4_announced_len[l4_index] = @intCast(text.len);
+    harness.l4_announced_address[l4_index] =
+        .{ .ip4 = .{ .bytes = .{ 203, 0, 113, octet }, .port = port } };
 }
 
 pub fn startClients(harness: *Harness) void {
@@ -880,12 +909,54 @@ pub fn verify(harness: *Harness) !void {
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;
+    // #142 send: on any seed, garbage where a header belongs is zoxy's
+    // bug — the writers are pure and the adversary splits deliveries but
+    // never corrupts bytes, so a cut lands as EOF, not as a violation.
+    if (harness.origin.proxy_header_violations != 0) {
+        return error.OriginSawInvalidProxyHeader;
+    }
+    try harness.verifyUpstreamIdentities();
     try harness.verifyAccessLog();
     for (harness.clients[0..harness.l4_count]) |*client| {
         try client.verifyIntegrity();
     }
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         try client.verify();
+    }
+}
+
+/// #142 send, every seed: whatever identity the origin heard must be one
+/// some L4 client *was* — the announced-in address where the client
+/// carried one through the require listener, the observed peer
+/// otherwise. Inverted membership deliberately: origin conns whose drawn
+/// mode never parses (mute, frozen, reset) record nothing, and a cut
+/// header lands as EOF, so demanding every client be heard would fail
+/// legal schedules — but an identity heard that no client was is always
+/// a bug. Identities are per-client distinct (announced 203.0.113.N,
+/// synthetic ports climb), so a match is attribution, and a parsed
+/// header must always announce: zoxy's writers have no LOCAL/UNKNOWN
+/// arm. The completeness direction lives in the directed tests, where
+/// the origin's mode is pinned to echo.
+fn verifyUpstreamIdentities(harness: *const Harness) !void {
+    if (harness.proxy_protocol_send_l4 == null) {
+        assert(!harness.origin.expect_proxy_header);
+        return;
+    }
+    for (harness.origin.conns[0..harness.origin.conns_count]) |*conn| {
+        if (!conn.header_done) continue;
+        const announced = conn.announced orelse
+            return error.UpstreamHeaderAnnouncedNothing;
+        var matched = false;
+        var index: u8 = 0;
+        while (index < harness.l4_count) : (index += 1) {
+            const expected: std.Io.net.IpAddress =
+                if (harness.l4_announced_len[index] > 0)
+                    harness.l4_announced_address[index]
+                else
+                    harness.clients[index].observed_address orelse continue;
+            if (expected.eql(&announced)) matched = true;
+        }
+        if (!matched) return error.UpstreamHeardUnknownIdentity;
     }
 }
 
