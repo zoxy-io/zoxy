@@ -456,6 +456,8 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
         u8,
         @as(usize, options.buffer_group_count) * options.buffer_group_bytes,
     );
+    // Zeroed for symmetry with the kernel twin's init-time fault-in.
+    @memset(io.group_slab, 0);
     io.group_free = try arena.alloc(bool, options.buffer_group_count);
     @memset(io.group_free, true);
     io.group_count = options.buffer_group_count;

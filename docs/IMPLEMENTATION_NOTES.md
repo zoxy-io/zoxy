@@ -368,6 +368,21 @@ What the build actually taught, for the next pooling change:
   (reset and EOF outrank selection). The whole no-leak-at-teardown story
   rests on that fact, which is why it is a test and not a comment.
 
+Measured (2026-08-02, Tier-1 bands, three runs each side vs `842a3e1`):
+no hop-overhead regression — keep-alive L7 p50 [+20, +24] µs against
+main's [+22, +23], close and large-body bands overlapping likewise.
+The gate that did fire was **flat-RSS**: the kernel consumes a buf_ring
+FIFO, so sustained load cycles through *every* registered buffer and
+faults the whole slab (measured: RSS 10.0 → 21.2 MiB, the slab's size
+exactly), where the old inline heads rode the conn pool's LIFO reuse
+and only the hot slots' pages ever faulted. The fix faults both slabs
+in at init — RSS now starts at the printed §5 budget (~31 MiB at the
+bench shape) and stays flat, which is what the budget promise wanted
+anyway. Two standing implications of the FIFO cycling: the head-write
+working set is the whole ring rather than a LIFO hot set (a cache
+argument for trading `head_buffers` down on small deployments), and any
+future "warm buffer" reasoning about the ring is wrong by construction.
+
 Deferred, deliberately: fuzz buffers exercise the 8 KiB default, not the
 1 MiB `head_buffer_bytes_max` the parser's guards now formally span —
 a capacity change, not new parsing logic, but worth a fuzz shape if the
