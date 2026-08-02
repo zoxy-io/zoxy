@@ -87,6 +87,7 @@ fn initTestIo(xev_io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
             buffer_group_count,
             buffer_group_bytes,
             XevIo.log_sink_stdout,
+            null,
         )) |_| {
             return;
         } else |err| {
@@ -994,7 +995,7 @@ test "xevio: the listener table reserves a slot for the admin listener" {
     var xev_io: XevIo = undefined;
     // One configured listener; capacity must be that plus the admin slot.
     // No buffer group — the zero-count arm must also keep init working.
-    try XevIo.init(&xev_io, arena_state.allocator(), 0, 1, 0, 1, XevIo.log_sink_stdout);
+    try XevIo.init(&xev_io, arena_state.allocator(), 0, 1, 0, 1, XevIo.log_sink_stdout, null);
     defer xev_io.deinit();
 
     const loopback = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");

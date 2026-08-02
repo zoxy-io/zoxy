@@ -289,8 +289,15 @@ pub fn AccessLog(comptime IoType: type) type {
         /// a transient — the ring already absorbed every would-block — so
         /// retrying would spend a syscall per line forever to lose the
         /// same lines. Every subsequent record counts as dropped, so the
-        /// gap is visible in the metrics the log stopped narrating.
+        /// gap is visible in the metrics the log stopped narrating. The
+        /// one way back is a successful SIGHUP reopen (§8 rotation): the
+        /// broken thing was the *old* fd, and a fresh one is a fresh
+        /// verdict.
         broken: bool,
+        /// A SIGHUP arrived while a write was in flight (§8 rotation):
+        /// the swap happens at that write's completion, never under it —
+        /// the fd being closed must not be one the ring still holds.
+        reopen_pending: bool,
         completion: IoType.Completion,
 
         const Self = @This();
@@ -319,6 +326,7 @@ pub fn AccessLog(comptime IoType: type) type {
             log.flush_sent = 0;
             log.writing = false;
             log.broken = false;
+            log.reopen_pending = false;
             log.completion = .{};
             assert(log.isQuiescent());
         }
@@ -415,6 +423,10 @@ pub fn AccessLog(comptime IoType: type) type {
                 log.flush_len = 0;
                 log.flush_sent = 0;
                 log.staging_len = 0;
+                // A SIGHUP that raced the failing write still gets its
+                // rotation — and a successful one heals the break, since
+                // what broke was the fd it just replaced (§8).
+                if (log.reopen_pending) log.performReopen();
                 log.server.maybeStopAfterDrain();
                 return;
             };
@@ -427,10 +439,55 @@ pub fn AccessLog(comptime IoType: type) type {
             }
             log.flush_len = 0;
             log.flush_sent = 0;
+            // The deferred rotation happens before the next flush arms,
+            // so every line accepted after the SIGHUP lands in the new
+            // file — the boundary an operator's rotation tooling expects.
+            if (log.reopen_pending) log.performReopen();
             log.maybeFlush();
             // The drain stops the loop only once the sink is quiet, so the
             // completion that empties it is the one that has to re-check.
             log.server.maybeStopAfterDrain();
+        }
+
+        /// SIGHUP (§8 rotation): reopen the `file` sink at its configured
+        /// path. On any other sink — stdout, or no log at all — the
+        /// signal is a no-op, not an error: an operator's blanket
+        /// `killall -HUP` must not hurt a deployment that has nothing to
+        /// rotate. The swap itself waits for the in-flight write, if any.
+        pub fn requestReopen(log: *Self) void {
+            const sink = log.sink orelse return;
+            if (sink != .file) return;
+            // A configured sink always has staging (the loader's
+            // one-number rule) — the invariant that makes the reopen
+            // worth anything: lines have somewhere to wait out the swap.
+            assert(log.buffer_bytes >= 1);
+            log.reopen_pending = true;
+            if (log.writing) return;
+            log.performReopen();
+        }
+
+        /// The swap, between writes by construction (§8 rotation): open
+        /// new first, so failure keeps the old fd and the lines keep
+        /// landing where they already were — counted, not fatal. Success
+        /// also heals a `broken` sink: what broke was the old fd, and
+        /// the replacement gets its own verdict.
+        fn performReopen(log: *Self) void {
+            assert(!log.writing);
+            assert(log.reopen_pending);
+            assert(log.sink != null);
+            log.reopen_pending = false;
+            log.server.io.logReopen() catch {
+                log.server.counters.increment("access_log_reopen_failed");
+                return;
+            };
+            log.server.counters.increment("access_log_reopened");
+            if (log.broken) {
+                // Every line since the break was counted as a drop and
+                // nothing staged (`record` refuses while broken), so the
+                // fresh fd starts clean.
+                assert(log.staging_len == 0);
+                log.broken = false;
+            }
         }
 
         /// Quiescent for the drain-stop gate (§8): nothing in flight and

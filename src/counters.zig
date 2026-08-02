@@ -228,6 +228,17 @@ pub const Counters = struct {
     /// things at once: some already-accepted lines never reached the sink,
     /// and every line since has been counted as dropped.
     access_log_write_failed: Value = Value.init(0),
+    /// SIGHUP rotations of the `file` sink that took (§8): the old fd
+    /// closed between writes, the path reopened, and — when the sink had
+    /// been marked broken — the break healed, because what broke was the
+    /// fd this rotation just replaced.
+    access_log_reopened: Value = Value.init(0),
+    /// SIGHUP rotations that could not open the path (§8). The old fd is
+    /// kept and lines keep landing where they already were: a failed
+    /// rotation must not destroy a working log. Rising alongside a
+    /// rotation schedule means the log directory has a problem the
+    /// rotation tooling is not reporting.
+    access_log_reopen_failed: Value = Value.init(0),
     /// §8 L4 connections closed because every endpoint of their cluster
     /// was already carrying its configured `max_inflight`. An L4 listener
     /// has no way to say "try later", so the ladder's L4 answer applies:

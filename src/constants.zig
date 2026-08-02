@@ -652,10 +652,12 @@ pub fn fdsRequired(
     assert(upstream_slots <= upstream_slots_max);
     assert(listeners <= std.math.maxInt(u16));
     // Zero or one: the config names at most one sink, and only its `file`
-    // arm opens anything.
+    // arm opens anything. Each file sink costs its held fd plus one
+    // transient during a SIGHUP reopen — the new fd opens before the old
+    // one closes, so a failed rotation keeps a working log (§8).
     assert(access_log_files <= 1);
     return 3 + 1 + 1 + (listeners + admin_listeners) +
-        2 * conn_slots + 1 + admin_conns + upstream_slots + 1 + access_log_files;
+        2 * conn_slots + 1 + admin_conns + upstream_slots + 1 + 2 * access_log_files;
 }
 
 /// Default effective pool sizes when the config omits a `limits` block: a
@@ -685,20 +687,21 @@ pub const relay_buffers_default: u32 = conn_slots_default;
 /// `conn_slots_max`), because the out-of-box shape is bounded by the
 /// stock 4096 `RLIMIT_NOFILE` rather than by admission: matching 1386
 /// would put the default at 4168 fds, over that line, for capacity an
-/// unconfigured proxy is not there to serve. 1312 is the largest value
+/// unconfigured proxy is not there to serve. 1311 is the largest value
 /// that still clears that line — `fdsRequired(conn_slots_default, x, 1, 1)`
-/// is `2783 + x` (the health probe's reserved fd and the access log's
-/// possible file sink both included: naming a log file is not *tuning*,
-/// so the lean promise must hold with one), and that must stay strictly
-/// under 4096 (the out-of-box budget stays *under* the stock limit, not
-/// flush against it), so `4096 - 2783 - 1 = 1312` — the default leans as
-/// far toward `conn_slots_default` as the stock fd budget allows. An L4
+/// is `2784 + x` (the health probe's reserved fd and the access log's
+/// possible file sink both included, the sink at its SIGHUP-reopen worst
+/// of two fds: naming a log file is not *tuning*, so the lean promise
+/// must hold with one), and that must stay strictly under 4096 (the
+/// out-of-box budget stays *under* the stock limit, not flush against
+/// it), so `4096 - 2784 - 1 = 1311` — the default leans as far toward
+/// `conn_slots_default` as the stock fd budget allows. An L4
 /// deployment never leases from this pool at all — an L4 dial reads its
 /// `leased_counts` for the P2C draw and holds no slot. A deployment that
 /// means to fill its conn pool raises both together in `limits` — which
 /// is what the ceilings exist to permit and what the c10k benchmark
 /// configuration does.
-pub const upstream_slots_default: u32 = 1312;
+pub const upstream_slots_default: u32 = 1311;
 
 comptime {
     assert(std.math.isPowerOfTwo(ring_entries));
@@ -1067,9 +1070,10 @@ test "budgets: c10k ceiling fd count needs a raised NOFILE" {
         @as(u32, 34407),
         fdsRequired(conn_slots_max, upstream_slots_max, 0, 0),
     );
-    // A file sink is exactly one fd, at the ceiling as everywhere.
+    // A file sink is two fds — held plus the SIGHUP-reopen transient —
+    // at the ceiling as everywhere.
     try std.testing.expectEqual(
-        @as(u32, 34408),
+        @as(u32, 34409),
         fdsRequired(conn_slots_max, upstream_slots_max, 0, 1),
     );
     try std.testing.expect(fdsRequired(conn_slots_max, upstream_slots_max, 0, 1) <= 65536);

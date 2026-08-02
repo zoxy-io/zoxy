@@ -180,6 +180,19 @@ const uncovered = [_]Uncovered{
         .reason = "the harness never calls injectLogWriteError; " ++
             "src/access_log_test.zig covers the stop-and-witness",
     },
+    .{
+        .name = "access_log_reopened",
+        .why = .unreached,
+        .reason = "the sweep's sink is stdout and no script injects SIGHUP; " ++
+            "src/access_log_test.zig drives the rotation swap",
+    },
+    .{
+        .name = "access_log_reopen_failed",
+        .why = .unreached,
+        .reason = "same as access_log_reopened, plus injectLogReopenError " ++
+            "is a directed-test control; src/access_log_test.zig covers " ++
+            "the keep-the-old-sink arm",
+    },
 };
 
 comptime {

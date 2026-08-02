@@ -140,6 +140,10 @@ sink_overflow_bytes: u32,
 /// a real broken pipe takes, which a virtual sink would otherwise never
 /// exercise (§9) — the same argument `pending_set_option_errors` makes.
 pending_log_write_errors: u8,
+/// One-shot `logReopen` failures (§8 rotation), same shape as the write
+/// errors above; and how many reopens succeeded, for scenario oracles.
+pending_log_reopen_errors: u8,
+log_reopen_count: u32,
 /// The ephemeral port the next simulated client connects from.
 next_client_port: u16,
 /// The provided-buffer group (§5): one slab, a free flag per buffer, and
@@ -451,6 +455,8 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.sink_len = 0;
     io.sink_overflow_bytes = 0;
     io.pending_log_write_errors = 0;
+    io.pending_log_reopen_errors = 0;
+    io.log_reopen_count = 0;
     io.next_client_port = client_port_base;
     io.group_slab = try arena.alloc(
         u8,
@@ -760,6 +766,27 @@ pub fn nowWallNs(io: *const SimIo) u64 {
 pub fn injectLogWriteError(io: *SimIo) void {
     assert(io.pending_log_write_errors < std.math.maxInt(u8));
     io.pending_log_write_errors += 1;
+}
+
+/// Reopen the file sink (§8 rotation). The virtual sink has no inode to
+/// rotate, so success is a counted no-op — what the scenario observes is
+/// the *caller's* sequencing (swap only between writes, heal on success,
+/// keep-old on failure), which is the part worth simulating. Sync like
+/// the kernel twin.
+pub fn logReopen(io: *SimIo) Io.LogReopenError!void {
+    if (io.pending_log_reopen_errors >= 1) {
+        io.pending_log_reopen_errors -= 1;
+        return error.Unexpected;
+    }
+    assert(io.log_reopen_count < std.math.maxInt(u32));
+    io.log_reopen_count += 1;
+}
+
+/// Targeted scenario control: the next `logReopen` fails, driving the
+/// keep-the-old-sink path (§8 rotation).
+pub fn injectLogReopenError(io: *SimIo) void {
+    assert(io.pending_log_reopen_errors < std.math.maxInt(u8));
+    io.pending_log_reopen_errors += 1;
 }
 
 /// Everything the server wrote to the sink, for the §9 oracle.

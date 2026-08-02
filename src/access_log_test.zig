@@ -52,6 +52,18 @@ const Harness = struct {
         buffer_bytes: u32,
         stall_ns: u64,
     ) !void {
+        try harness.setUpWithSink(gpa, buffer_bytes, stall_ns, .stdout);
+    }
+
+    /// The reopen tests need the `file` arm — SIGHUP is a no-op on any
+    /// other sink. SimIo opens nothing, so the path is never touched.
+    fn setUpWithSink(
+        harness: *Harness,
+        gpa: std.mem.Allocator,
+        buffer_bytes: u32,
+        stall_ns: u64,
+        sink: config_module.Config.AccessLogSink,
+    ) !void {
         harness.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer harness.arena_state.deinit();
         const arena = harness.arena_state.allocator();
@@ -79,7 +91,7 @@ const Harness = struct {
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = 0,
             .request_timeout_ms = 0,
-            .access_log_sink = if (buffer_bytes == 0) null else .stdout,
+            .access_log_sink = if (buffer_bytes == 0) null else sink,
         };
         try harness.server.init(arena, &harness.sim_io, &harness.config, .{
             .conn_slots = 4,
@@ -285,4 +297,164 @@ test "access log: an unflushed line keeps the drain from stopping the loop" {
     try testing.expect(harness.server.access_log.isQuiescent());
     try testing.expect(harness.server.isIdle());
     try testing.expectEqual(@as(u64, 1), lineCount(harness.sim_io.sinkBytes()));
+}
+
+test "access log: SIGHUP reopens an idle file sink immediately" {
+    var harness: Harness = undefined;
+    try harness.setUpWithSink(
+        testing.allocator,
+        constants.access_log_buffer_bytes_min,
+        0,
+        .{ .file = "/virtual/access.log" },
+    );
+    defer harness.tearDown();
+
+    // Nothing in flight: the swap needs no completion to wait for.
+    harness.server.access_log.requestReopen();
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_reopened"));
+    try testing.expectEqual(@as(u32, 1), harness.sim_io.log_reopen_count);
+
+    // The sink still works after the swap.
+    harness.emit(0);
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), lineCount(harness.sim_io.sinkBytes()));
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_dropped"));
+}
+
+test "access log: SIGHUP under an in-flight write swaps at its completion" {
+    var harness: Harness = undefined;
+    try harness.setUpWithSink(
+        testing.allocator,
+        constants.access_log_buffer_bytes_min,
+        1_000_000, // The write stalls, so the signal races it.
+        .{ .file = "/virtual/access.log" },
+    );
+    defer harness.tearDown();
+
+    harness.emit(0);
+    try testing.expect(!harness.server.access_log.isQuiescent());
+    harness.server.access_log.requestReopen();
+    // Deferred: the fd under the armed write must not be closed (§8).
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_reopened"));
+    try testing.expectEqual(@as(u32, 0), harness.sim_io.log_reopen_count);
+
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_reopened"));
+    try testing.expectEqual(@as(u32, 1), harness.sim_io.log_reopen_count);
+    // The line that was in flight landed before the swap; nothing lost.
+    try testing.expectEqual(@as(u64, 1), lineCount(harness.sim_io.sinkBytes()));
+    try testing.expect(harness.server.access_log.isQuiescent());
+}
+
+test "access log: SIGHUP on a stdout sink is a no-op" {
+    var harness: Harness = undefined;
+    try harness.setUp(testing.allocator, constants.access_log_buffer_bytes_min, 0);
+    defer harness.tearDown();
+
+    harness.server.access_log.requestReopen();
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_reopened"));
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_reopen_failed"));
+    try testing.expectEqual(@as(u32, 0), harness.sim_io.log_reopen_count);
+}
+
+test "access log: a failed reopen keeps the old sink working" {
+    var harness: Harness = undefined;
+    try harness.setUpWithSink(
+        testing.allocator,
+        constants.access_log_buffer_bytes_min,
+        0,
+        .{ .file = "/virtual/access.log" },
+    );
+    defer harness.tearDown();
+
+    harness.sim_io.injectLogReopenError();
+    harness.server.access_log.requestReopen();
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_reopen_failed"));
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_reopened"));
+
+    // The old fd was never closed: lines keep landing where they were.
+    harness.emit(0);
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), lineCount(harness.sim_io.sinkBytes()));
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_dropped"));
+}
+
+test "access log: a successful reopen heals a broken sink" {
+    var harness: Harness = undefined;
+    try harness.setUpWithSink(
+        testing.allocator,
+        constants.access_log_buffer_bytes_min,
+        0,
+        .{ .file = "/virtual/access.log" },
+    );
+    defer harness.tearDown();
+
+    // Break the sink the §8 way: a write fails, the log stops, drops count.
+    harness.sim_io.injectLogWriteError();
+    harness.emit(0);
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_write_failed"));
+    harness.emit(1);
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_dropped"));
+
+    // Rotation replaces the broken fd; the replacement gets its own verdict.
+    harness.server.access_log.requestReopen();
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_reopened"));
+    harness.emit(2);
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), lineCount(harness.sim_io.sinkBytes()));
+    // The heal is exact: the drop count did not move again.
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_dropped"));
+    try testing.expect(harness.server.access_log.isQuiescent());
+}
+
+test "access log: SIGHUP racing the failing write still rotates and heals" {
+    var harness: Harness = undefined;
+    try harness.setUpWithSink(
+        testing.allocator,
+        constants.access_log_buffer_bytes_min,
+        1_000_000, // In flight when both the failure and the signal land.
+        .{ .file = "/virtual/access.log" },
+    );
+    defer harness.tearDown();
+
+    harness.sim_io.injectLogWriteError();
+    harness.emit(0);
+    harness.server.access_log.requestReopen();
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_reopened"));
+
+    // The write fails, marks the sink broken — and the pending rotation
+    // fires right there, healing it in the same completion (§8).
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_write_failed"));
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_reopened"));
+
+    harness.emit(1);
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), lineCount(harness.sim_io.sinkBytes()));
+    try testing.expectEqual(@as(u64, 0), harness.counter("access_log_dropped"));
+}
+
+test "access log: repeated SIGHUPs under one write collapse to one swap" {
+    var harness: Harness = undefined;
+    try harness.setUpWithSink(
+        testing.allocator,
+        constants.access_log_buffer_bytes_min,
+        1_000_000,
+        .{ .file = "/virtual/access.log" },
+    );
+    defer harness.tearDown();
+
+    harness.emit(0);
+    // An operator's rotation script and a stray `killall -HUP` in the
+    // same window: the flag is idempotent, so the write's completion
+    // performs exactly one swap — the file both signals meant.
+    harness.server.access_log.requestReopen();
+    harness.server.access_log.requestReopen();
+    try testing.expectEqual(@as(u32, 0), harness.sim_io.log_reopen_count);
+
+    try harness.drainSink();
+    try testing.expectEqual(@as(u64, 1), harness.counter("access_log_reopened"));
+    try testing.expectEqual(@as(u32, 1), harness.sim_io.log_reopen_count);
+    try testing.expect(harness.server.access_log.isQuiescent());
 }
