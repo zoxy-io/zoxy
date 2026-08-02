@@ -90,36 +90,18 @@ pub fn main(init: std.process.Init) !void {
     const config = try readConfig(init.io, arena, config_path);
     const config_arena_bytes = init.arena.queryCapacity() - arena_before;
 
-    // fds and the ring are sized to the *effective* config, not the
-    // compiled ceilings (§5, §8): a lean deployment neither demands the
-    // c10k RLIMIT_NOFILE nor asks the kernel for a 65536-deep ring.
-    const listeners_count: u32 = @intCast(config.listeners.len);
-    const fds_required = zoxy.constants.fdsRequired(
-        config.limits.conn_slots,
-        config.limits.upstream_slots,
-        listeners_count,
-    );
-    const cq_entries = zoxy.constants.completionQueueDepthFor(
-        config.limits.conn_slots,
-        config.limits.upstream_slots,
-        listeners_count,
-        config.limits.cq_fill_eighths,
-    );
-    // The effective config never exceeds the compiled ceilings (§8): the
-    // pools, the ring, and the fd demand all fit what the constants proved.
-
-    assert(cq_entries <= zoxy.constants.completion_queue_entries);
-    try ensureFdBudget(fds_required);
-    try printBudgets(init.io, &config, fds_required, cq_entries, config_arena_bytes);
+    const cq_entries = try resolveBudgets(init.io, &config, config_arena_bytes);
+    const log_sink_fd = try openLogSinkFd(&config);
 
     // The ring is the config's to size (§5), count and unit both;
     // Server.init asserts its own accounting against the same numbers.
     try global_io.init(
         arena,
         cq_entries,
-        listeners_count,
+        @intCast(config.listeners.len),
         config.limits.head_buffers,
         config.limits.head_buffer_bytes,
+        log_sink_fd,
     );
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
@@ -132,6 +114,65 @@ pub fn main(init: std.process.Init) !void {
     assert(server.isIdle());
     const gauges = server.gauges();
     server.counters.dump(&gauges);
+}
+
+/// The §5/§8 startup budget gauntlet: fds and the ring are sized to the
+/// *effective* config, not the compiled ceilings — a lean deployment
+/// neither demands the c10k RLIMIT_NOFILE nor asks the kernel for a
+/// 65536-deep ring. Derives both demands, raises RLIMIT_NOFILE to the
+/// fd one, prints the banner, and returns the CQ depth the ring must be
+/// created with.
+fn resolveBudgets(
+    io: std.Io,
+    config: *const zoxy.config.Config,
+    config_arena_bytes: u64,
+) !u32 {
+    const listeners_count: u32 = @intCast(config.listeners.len);
+    assert(listeners_count >= 1);
+    const access_log_files: u32 = if (config.access_log_sink) |sink|
+        @intFromBool(sink == .file)
+    else
+        0;
+    const fds_required = zoxy.constants.fdsRequired(
+        config.limits.conn_slots,
+        config.limits.upstream_slots,
+        listeners_count,
+        access_log_files,
+    );
+    const cq_entries = zoxy.constants.completionQueueDepthFor(
+        config.limits.conn_slots,
+        config.limits.upstream_slots,
+        listeners_count,
+        config.limits.cq_fill_eighths,
+    );
+    // The effective config never exceeds the compiled ceilings (§8): the
+    // pools, the ring, and the fd demand all fit what the constants proved.
+    assert(cq_entries <= zoxy.constants.completion_queue_entries);
+    try ensureFdBudget(fds_required);
+    try printBudgets(io, config, fds_required, cq_entries, config_arena_bytes);
+    return cq_entries;
+}
+
+/// The §8 access-log sink as the fd `XevIo` will write: the inherited
+/// stdout, or the file the config named — opened here, before the loop
+/// exists, so a path that cannot open stops the process while the banner
+/// above still names what it tried. The seam owns the syscall
+/// (`XevIo.openLogSink`); the error report is this caller's, because the
+/// path is the operator's own text.
+fn openLogSinkFd(config: *const zoxy.config.Config) !@TypeOf(XevIo.log_sink_stdout) {
+    const sink = config.access_log_sink orelse return XevIo.log_sink_stdout;
+    switch (sink) {
+        .stdout => return XevIo.log_sink_stdout,
+        .file => |path| {
+            // The loader rejected an empty path at parse (§8), so a
+            // failure here is the filesystem's answer, not a config shape.
+            assert(path.len >= 1);
+            return XevIo.openLogSink(path) catch |err| {
+                std.debug.print("zoxy: cannot open access log '{s}': {t}\n", .{ path, err });
+                return err;
+            };
+        },
+    }
 }
 
 /// Read and parse the config file, or say on stderr why it cannot be.

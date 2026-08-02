@@ -5,8 +5,9 @@
 //! entry, both closed-form in `constants.zig` like every other budget.
 //!
 //! **A log line never blocks the loop, and never queues without bound.**
-//! Those two rules are the whole design. The sink is a pipe the operator
-//! owns, so it can stall for arbitrarily long, and a proxy that waits for
+//! Those two rules are the whole design. The sink — stdout piped wherever
+//! the operator sends it, or the append-only file the config named (§8) —
+//! can stall for arbitrarily long, and a proxy that waits for
 //! it would hand every client's latency to whatever is reading its logs.
 //! So the write is a ring op with at most one in flight, lines accumulate
 //! in the *other* buffer while it is out, the buffers swap when it lands,

@@ -63,14 +63,28 @@ pub const Config = struct {
     /// is configured — the log stays off and reserves nothing.
     access_log_sink: ?AccessLogSink = null,
 
-    /// Where the access log writes (§8). An enum with one arm today
-    /// because there is one sink: the process's own stdout, inherited
-    /// rather than opened, so the log costs no file descriptor and carries
-    /// no rotation story of its own — an operator pipes it wherever they
-    /// already send this process's output. Named rather than made a bare
-    /// boolean so a second sink is a new arm, not a new field.
-    pub const AccessLogSink = enum(u1) {
+    /// Where the access log writes (§8). `stdout` is the process's own
+    /// standard output, inherited rather than opened, so it costs no file
+    /// descriptor and carries no rotation story of its own — an operator
+    /// pipes it wherever they already send this process's output. `file`
+    /// is a path the io backend opens once at startup — append-only,
+    /// created if absent, never truncated — costing exactly one fd
+    /// (`fdsRequired`); append-only is what keeps an external
+    /// copy-truncate rotation safe, every write landing at the current
+    /// end wherever a rotation just put it. A tagged union so the arm
+    /// that needs a parameter carries it, and the arms stay the closed
+    /// set the schema names (`AccessLogSinkKind`).
+    pub const AccessLogSink = union(AccessLogSinkKind) {
         stdout,
+        file: []const u8,
+    };
+
+    /// The sink names the config may spell — split from `AccessLogSink`
+    /// because the schema renders (and the parser matches) bare names,
+    /// and only the resolved union carries a payload.
+    pub const AccessLogSinkKind = enum(u1) {
+        stdout,
+        file,
     };
 
     pub const Limits = struct {
@@ -341,6 +355,8 @@ pub const ValidationError = error{
     LimitAccessLogBufferWithoutSink,
     AdminBindInvalid,
     AccessLogSinkUnknown,
+    AccessLogPathMissing,
+    AccessLogPathOnStdout,
 };
 
 pub const ParseError = std.json.ParseError(std.json.Scanner) || ValidationError;
@@ -403,13 +419,32 @@ pub fn parse(arena: std.mem.Allocator, json_bytes: []const u8) ParseError!Config
 /// Resolve the optional access log (§8): absent means off — no staging
 /// buffers reserved, no lines emitted. A present block names its sink from
 /// a closed set, so an unknown value fails at load rather than silently
-/// logging somewhere the operator did not ask for.
+/// logging somewhere the operator did not ask for; `path` is required by
+/// exactly the sink that uses it. Both mismatches are rejected, not
+/// ignored — the `ClusterCheckHttpFieldOnTcp` rule, one block over: a
+/// field the named sink cannot honor describes a config the operator
+/// misread, and this proxy does not start on those.
 fn resolveAccessLogSink(
     access_log_json: ?AccessLogJson,
 ) ValidationError!?Config.AccessLogSink {
     const access_log = access_log_json orelse return null;
-    return std.meta.stringToEnum(Config.AccessLogSink, access_log.sink) orelse
-        error.AccessLogSinkUnknown;
+    const kind = std.meta.stringToEnum(Config.AccessLogSinkKind, access_log.sink) orelse
+        return error.AccessLogSinkUnknown;
+    switch (kind) {
+        .stdout => {
+            if (access_log.path != null) return error.AccessLogPathOnStdout;
+            return .stdout;
+        },
+        .file => {
+            const path = access_log.path orelse return error.AccessLogPathMissing;
+            // Empty is missing, not "a file named nothing": openat would
+            // reject it later and worse — at startup's end, not load time.
+            if (path.len == 0) return error.AccessLogPathMissing;
+            // The postcondition `openLogSinkFd` (main) leans on.
+            assert(path.len >= 1);
+            return .{ .file = path };
+        },
+    }
 }
 
 /// Resolve the optional admin/metrics listener (§8):
@@ -639,6 +674,7 @@ pub const ConfigJson = struct {
 
 pub const AccessLogJson = struct {
     sink: []const u8,
+    path: ?[]const u8 = null,
 
     pub const schema_doc =
         "Optional access log. When present, zoxy writes one JSON object per " ++
@@ -647,8 +683,15 @@ pub const AccessLogJson = struct {
         "than allowed to block the event loop when the sink cannot keep up.";
     pub const schema_fields = .{
         .sink = .{
-            .desc = "Where lines are written. `stdout` is the process's own standard output.",
-            .enum_type = Config.AccessLogSink,
+            .desc = "Where lines are written. `stdout` is the process's own standard " ++
+                "output; `file` appends to `path`.",
+            .enum_type = Config.AccessLogSinkKind,
+        },
+        .path = .{
+            .desc = "File the `file` sink appends to: created if absent, opened " ++
+                "append-only at startup (one extra fd), never truncated — so a " ++
+                "copy-truncate rotation is safe. Required by `sink:\"file\"`, " ++
+                "rejected beside `stdout`, which cannot use it.",
         },
     };
 };
@@ -3102,8 +3145,12 @@ const fuzz_seed_json =
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
     \\ "limits":{"conn_slots":64,"relay_buffers":32,"upstream_slots":32},
-    \\ "access_log":{"sink":"stdout"},"admin":{"bind":"127.0.0.1:9901"}}
+    \\ "access_log":{"sink":"file","path":"/var/log/zoxy.log"},
+    \\ "admin":{"bind":"127.0.0.1:9901"}}
 ;
+// The `file` arm here, `stdout` in `example_json` beside it: between the
+// two corpus entries the mutator sees every sink spelling, including the
+// `path` key only one of them may carry.
 
 test "config: the fuzz seed carrying every block parses" {
     // It is a corpus entry, so it has to be a *valid* config — an
@@ -3172,7 +3219,25 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
             &arena_state,
             head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\"}}",
         );
-        try std.testing.expectEqual(Config.AccessLogSink.stdout, parsed.access_log_sink.?);
+        try std.testing.expect(parsed.access_log_sink.? == .stdout);
+        try std.testing.expectEqual(
+            constants.access_log_buffer_bytes_default,
+            parsed.limits.access_log_buffer_bytes,
+        );
+    }
+    // A file sink carries its path through to the resolved union.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ tail ++ ",\"access_log\":{\"sink\":\"file\",\"path\":\"/var/log/zoxy.log\"}}",
+        );
+        try std.testing.expect(parsed.access_log_sink.? == .file);
+        try std.testing.expectEqualStrings(
+            "/var/log/zoxy.log",
+            parsed.access_log_sink.?.file,
+        );
         try std.testing.expectEqual(
             constants.access_log_buffer_bytes_default,
             parsed.limits.access_log_buffer_bytes,
@@ -3198,9 +3263,21 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
     );
     // The block is strict like every other: `sink` required, extras rejected.
     try expectParseError(error.MissingField, head ++ tail ++ ",\"access_log\":{}}");
+    // `path` belongs to exactly the sink that uses it: beside `stdout` it
+    // describes something that cannot happen, and a `file` sink without
+    // one (or with an empty one) names no file at all. The
+    // `ClusterCheckHttpFieldOnTcp` rule, applied here.
     try expectParseError(
-        error.UnknownField,
+        error.AccessLogPathOnStdout,
         head ++ tail ++ ",\"access_log\":{\"sink\":\"stdout\",\"path\":\"/tmp/x\"}}",
+    );
+    try expectParseError(
+        error.AccessLogPathMissing,
+        head ++ tail ++ ",\"access_log\":{\"sink\":\"file\"}}",
+    );
+    try expectParseError(
+        error.AccessLogPathMissing,
+        head ++ tail ++ ",\"access_log\":{\"sink\":\"file\",\"path\":\"\"}}",
     );
     // A buffer below one worst-case line would drop lines it had room for,
     // which is the one thing a drop must never mean; above the ceiling is
