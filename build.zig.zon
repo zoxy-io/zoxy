@@ -43,11 +43,10 @@
         // Diff against that upstream commit to audit; the pin moves only
         // after re-audit.
         //
-        // Re-audit for 24da6d0 (§4, §5's head-buffer ring) — PENDING:
-        // zoxy-io/libxev#3 is open, and the PR that carries this pin stays
-        // a draft until that sign-off lands; what follows is the diff
-        // summary the audit reviews, not a record of one already done.
-        // One backend op
+        // Re-audit for 24da6d0 (§4, §5's head-buffer ring), signed off
+        // 2026-08-02 against zoxy-io/libxev#3 (standing open like the rest
+        // of the stack — the PR is the audit vehicle, the pin is the
+        // record). One backend op
         // (`recv_group`: prep mirrors std's buffer_selection recv arm), the
         // raw cqe flags kept on `Completion` beside `result_errno` with a
         // `bufferId` reader, and ENOBUFS surviving the recv mapping as
