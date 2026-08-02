@@ -24,6 +24,7 @@ const std = @import("std");
 
 const client_module = @import("client.zig");
 const origin_module = @import("origin.zig");
+const scrape_module = @import("scrape.zig");
 
 const Io = std.Io;
 
@@ -54,6 +55,19 @@ const l4_connections: u8 = 2;
 
 const http_exchanges: u32 = @as(u32, keep_alive_connections) * requests_per_connection;
 const access_log_lines_expected: u32 = http_exchanges + l4_connections;
+
+/// Every connection zoxy's data listeners accept in one run: the load's
+/// own, plus the readiness probe that connects and asks nothing. Admin
+/// scrapes are not among them — the admin plane sits outside the
+/// accepted/admitted/shed accounting entirely (§8), which is what lets
+/// this be an equality rather than a floor.
+///
+/// It is an equality on *ports the kernel just handed out*, so a stranger
+/// connecting to one between `reservePorts` and zoxy's bind would fail
+/// the run. That window is microseconds wide on a port nothing advertises,
+/// and the alternative — a floor — is satisfied by a proxy accepting
+/// connections nobody made.
+const connections_expected: u32 = keep_alive_connections + l4_connections + 1;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -87,6 +101,10 @@ comptime {
     // Every client connection needs a slot and a relay buffer at once.
     assert(zoxy_limits.relay_buffers >= keep_alive_connections + l4_connections);
     assert(zoxy_limits.conn_slots >= zoxy_limits.relay_buffers);
+    // And every connection this run opens must be admitted rather than
+    // shed, or `accepted == connections_expected` would be measuring the
+    // conn wall instead of the load.
+    assert(zoxy_limits.conn_slots >= connections_expected);
 }
 
 /// The whole run's wall-clock budget. Fifty times what a run takes, so it
@@ -119,6 +137,7 @@ const Flags = struct {
 const Ports = struct {
     http: u16,
     l4: u16,
+    admin: u16,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -133,6 +152,20 @@ pub fn main(init: std.process.Init) !u8 {
     try watchdog.concurrent(io, watchdogTask, .{io});
     defer watchdog.cancel(io);
 
+    // A setup failure — a refused scrape, a proxy that never listened —
+    // is reported the same way a failed verdict is, because to whoever is
+    // reading a red gate they are the same question: what did zoxy do?
+    // Answering it with a bare error trace and no log would be the one
+    // reply that helps least.
+    return run(arena, io, &flags) catch |err| {
+        std.debug.print("FAIL: the smoke run could not finish ({t})\n", .{err});
+        printZoxyLog(io);
+        return 1;
+    };
+}
+
+/// One whole run, from an empty work directory to a verdict.
+fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     try prepareWorkDirectory(io);
     try origin.start(io, origin_connections_peak);
     // Ordered against the child's own teardown below: defers unwind
@@ -150,9 +183,32 @@ pub fn main(init: std.process.Init) !u8 {
     try awaitListening(io, ports.http);
     try runLoad(io, &ports);
 
+    // Scraped before the drain: the admin listener closes with every
+    // other one when SIGTERM lands (§8).
+    const counters_ok = try countersPassed(arena, io, ports.admin);
     const drained_cleanly = try drain(io, &child, &running);
     const lines = try readAccessLog(arena, io);
-    return if (gatePassed(io, &lines, drained_cleanly)) 0 else 1;
+    // Every check runs and prints; a run that fails two ways should say
+    // both, not stop at the first.
+    const log_ok = accessLogPassed(&lines);
+    const drain_ok = drainPassed(drained_cleanly);
+    return report(io, &lines, log_ok and counters_ok and drain_ok);
+}
+
+/// The run's one line of output when everything held, and the proxy's own
+/// output when something did not.
+fn report(io: Io, lines: *const LogCounts, passed: bool) u8 {
+    assert(lines.http_ok <= lines.http);
+    if (!passed) {
+        printZoxyLog(io);
+        return 1;
+    }
+    std.debug.print(
+        "smoke: {d} http + {d} l4 exchanges, {d} access-log lines, " ++
+            "counters reconcile, clean drain\n",
+        .{ lines.http, lines.l4, access_log_lines_expected },
+    );
+    return 0;
 }
 
 /// The wall-clock backstop. Nothing in this harness can bound its own
@@ -197,10 +253,10 @@ const LogCounts = struct {
     http_ok: u32 = 0,
 };
 
-/// The §9 pass/fail, printed so a red run explains itself without a
+/// The access-log verdict, printed so a red run explains itself without a
 /// rerun. Every clause is an equality against a number this harness
 /// decided before the run started.
-fn gatePassed(io: Io, lines: *const LogCounts, drained_cleanly: bool) bool {
+fn accessLogPassed(lines: *const LogCounts) bool {
     // Both are counted off the same lines, in the same pass, so a total
     // below its own subset would mean the counter itself is wrong — which
     // no comparison below would otherwise notice.
@@ -232,19 +288,104 @@ fn gatePassed(io: Io, lines: *const LogCounts, drained_cleanly: bool) bool {
         );
         passed = false;
     }
-    if (!drained_cleanly) {
-        std.debug.print("FAIL: zoxy did not drain cleanly on SIGTERM\n", .{});
+    return passed;
+}
+
+fn drainPassed(drained_cleanly: bool) bool {
+    if (drained_cleanly) return true;
+    std.debug.print("FAIL: zoxy did not drain cleanly on SIGTERM\n", .{});
+    return false;
+}
+
+/// Both of `reconcile`'s identities (§9), re-derived from a live scrape
+/// instead of from the struct — the numbers rendered, written to a
+/// socket, framed by a close and parsed back, so the whole admin plane is
+/// under the same verdict as the arithmetic.
+///
+/// Two scrapes, because the first one's own witness (`admin_served`) is
+/// incremented when its last byte lands and can only be read by the next.
+/// The plane serves one at a time (§8's reserved slot), so the second is
+/// accepted only after the first has closed: exactly one, not "at least".
+fn countersPassed(arena: std.mem.Allocator, io: Io, port: u16) !bool {
+    assert(port != 0);
+    const first = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
+    const second = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
+    const accepted = counterOf(&first, "accepted") orelse return false;
+    const admitted = counterOf(&first, "admitted") orelse return false;
+    const completed = counterOf(&first, "completed") orelse return false;
+    const in_use = counterOf(&first, "conn_slots_in_use") orelse return false;
+    const responses = counterOf(&first, "l7_responses") orelse return false;
+    const reused = counterOf(&first, "upstream_reused") orelse return false;
+    const served = counterOf(&second, "admin_served") orelse return false;
+    // The orderings `reconcile` asserts inside the process, asserted here
+    // on the numbers that came back out of it: these are impossible
+    // states, not failed verdicts, and a scrape that parsed the wrong
+    // bytes into the right names would show up as one of them rather than
+    // as a plausible-looking mismatch below.
+    assert(admitted <= accepted);
+    assert(completed <= admitted);
+    assert(in_use <= admitted);
+    assert(reused <= responses);
+    var passed = true;
+    // The gate identity: an accepted connection was admitted or shed,
+    // with no third outcome.
+    if (accepted != admitted + first.shedTotal()) {
+        std.debug.print(
+            "FAIL: accepted {d} != admitted {d} + shed {d}\n",
+            .{ accepted, admitted, first.shedTotal() },
+        );
         passed = false;
     }
-    if (passed) {
+    // The flow identity: admitted work is completed or still active.
+    if (admitted != completed + in_use) {
         std.debug.print(
-            "smoke: {d} http + {d} l4 exchanges, {d} access-log lines, clean drain\n",
-            .{ lines.http, lines.l4, access_log_lines_expected },
+            "FAIL: admitted {d} != completed {d} + in use {d}\n",
+            .{ admitted, completed, in_use },
         );
-    } else {
-        printZoxyLog(io);
+        passed = false;
+    }
+    if (accepted != connections_expected) {
+        std.debug.print(
+            "FAIL: {d} connections accepted, not the {d} this run opened\n",
+            .{ accepted, connections_expected },
+        );
+        passed = false;
+    }
+    // The counter and the log describe the same exchanges, so a
+    // disagreement is one of the two lying about the same run.
+    if (responses != http_exchanges) {
+        std.debug.print(
+            "FAIL: {d} l7 responses counted for {d} requests\n",
+            .{ responses, http_exchanges },
+        );
+        passed = false;
+    }
+    // §3's reuse win, witnessed live: this load is one exchange after
+    // another against a keep-alive origin, so a proxy that parks nothing
+    // is the only way to reach zero here.
+    if (reused == 0) {
+        std.debug.print("FAIL: no upstream connection was reused across {d} exchanges\n", .{
+            http_exchanges,
+        });
+        passed = false;
+    }
+    if (served != 1) {
+        std.debug.print("FAIL: {d} admin scrapes served before the second, not 1\n", .{served});
+        passed = false;
     }
     return passed;
+}
+
+/// A counter the gate reads, or a printed failure and null. A missing
+/// name is its own finding — the scrape renders every field, so absence
+/// means a rename the harness has not followed, not a zero.
+fn counterOf(scrape: *const scrape_module.Scrape, name: []const u8) ?u64 {
+    assert(name.len >= 1);
+    const value = scrape.value(name);
+    if (value == null) {
+        std.debug.print("FAIL: the scrape carries no counter named {s}\n", .{name});
+    }
+    return value;
 }
 
 /// The load: every L7 connection serves its whole share before the next
@@ -357,15 +498,22 @@ fn reservePorts(io: Io) !Ports {
     var http_listener = try http_address.listen(io, .{ .mode = .stream });
     var l4_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var l4_listener = try l4_address.listen(io, .{ .mode = .stream });
+    var admin_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var admin_listener = try admin_address.listen(io, .{ .mode = .stream });
     const ports: Ports = .{
         .http = http_listener.socket.address.getPort(),
         .l4 = l4_listener.socket.address.getPort(),
+        .admin = admin_listener.socket.address.getPort(),
     };
     http_listener.deinit(io);
     l4_listener.deinit(io);
+    admin_listener.deinit(io);
     assert(ports.http != 0);
     assert(ports.l4 != 0);
+    assert(ports.admin != 0);
     assert(ports.http != ports.l4);
+    assert(ports.http != ports.admin);
+    assert(ports.l4 != ports.admin);
     return ports;
 }
 
@@ -383,6 +531,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\    "clusters": {{
         \\        "origin": {{ "endpoints": ["127.0.0.1:{d}"] }}
         \\    }},
+        \\    "admin": {{ "bind": "127.0.0.1:{d}" }},
         \\    "access_log": {{ "sink": "file", "path": "{s}" }},
         \\    "timeouts": {{
         \\        "connect_ms": 2000,
@@ -400,6 +549,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         ports.http,
         ports.l4,
         origin_port,
+        ports.admin,
         access_log_path,
         drain_deadline_ms,
         zoxy_limits.conn_slots,
