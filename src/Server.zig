@@ -67,6 +67,17 @@ pub fn Server(comptime IoType: type) type {
         /// hardcodes how an endpoint is chosen (§7).
         balancer: Balancer,
         counters: counters_module.Counters,
+        /// The #179 labeled breakdown beside the process totals: which
+        /// backend, per cluster and endpoint. Tables sized by the loaded
+        /// config's endpoint index space; every labeled witness site
+        /// also moves the matching bare counter, and `reconcile` holds
+        /// the partitions equal.
+        labeled: counters_module.Labeled,
+        /// Staging for the SIGUSR1/post-drain metrics dump (§8): the
+        /// full exposition — counters then labeled — no longer fits a
+        /// fixed stack buffer once its length is the config's, so it is
+        /// arena memory priced in the banner (`metricsBytes`).
+        dump_buffer: []u8,
         draining: bool,
         /// §8 watermark state, one flag per pool: set once a pool crosses
         /// its high watermark, cleared once it drains back below the low
@@ -235,6 +246,28 @@ pub fn Server(comptime IoType: type) type {
             return total;
         }
 
+        /// What the #179 labeled metrics take from the startup arena for
+        /// this config (§5): the tables and prebuilt label strings, plus
+        /// the two staging buffers sized to the full exposition — the
+        /// admin response (head + counters + labeled) and the dump. Its
+        /// own banner term rather than a fold into the endpoint tables,
+        /// because the issue's whole point is that the cost of labelling
+        /// your metrics should be visible next to everything else you
+        /// pay for. `init` allocates exactly this.
+        pub fn metricsBytes(config: *const config_module.Config) u64 {
+            assert(config.clusters.len >= 1);
+            const keys = endpointKeysFor(config);
+            const tables = counters_module.Labeled.tableBytes(config, keys);
+            const labeled_render = counters_module.Labeled.renderBytesMaxFor(config);
+            const admin_response = admin_module.response_head.len +
+                counters_module.Counters.render_bytes_max + labeled_render;
+            const dump_staging =
+                counters_module.Counters.render_bytes_max + labeled_render;
+            const total = tables + admin_response + dump_staging;
+            assert(total > 0);
+            return total;
+        }
+
         pub fn init(
             server: *Self,
             arena: std.mem.Allocator,
@@ -282,6 +315,29 @@ pub fn Server(comptime IoType: type) type {
             try server.upstreams.init(arena, options.upstream_slots, keys);
             assert(options.upstream_head_buffers <= options.upstream_slots);
             try server.upstream_head_buffers.init(arena, options.upstream_head_buffers);
+            try server.initHeadBuffers(arena, &options);
+            server.l4_inflight = try arena.alloc(u16, keys.count);
+            @memset(server.l4_inflight, 0);
+            server.listeners = try arena.alloc(ListenerState, config.listeners.len);
+            server.listeners_count = @intCast(config.listeners.len);
+            try server.balancer.init(arena, config, keys);
+            try server.initMetrics(arena, config, keys);
+            server.resetRuntimeState(&options);
+            try server.admin.init(server, config.admin_bind, arena);
+            server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
+            try server.access_log.reserve(arena);
+            try server.health.init(arena, server, keys, options.head_buffer_bytes);
+        }
+
+        /// The §5 upstream head slab wiring and the serving path's two
+        /// canonicalization scratches — split from `init` for the length
+        /// limit, called once right after the upstream head pool exists.
+        fn initHeadBuffers(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+        ) error{OutOfMemory}!void {
+            assert(server.upstream_head_buffers.slots.len == options.upstream_head_buffers);
             // The pool's slab, wired once: `Pool` never touches `data`,
             // so the wiring survives every acquire/release cycle.
             const upstream_head_slab = try arena.alloc(
@@ -307,13 +363,33 @@ pub fn Server(comptime IoType: type) type {
             server.target_scratch = try arena.alloc(u8, scratch_bytes);
             server.rewrite_scratch = try arena.alloc(u8, scratch_bytes);
             assert(server.target_scratch.len + server.rewrite_scratch.len +
-                options.head_buffer_bytes == headScratchBytes(options));
-            server.l4_inflight = try arena.alloc(u16, keys.count);
-            @memset(server.l4_inflight, 0);
-            server.listeners = try arena.alloc(ListenerState, config.listeners.len);
-            server.listeners_count = @intCast(config.listeners.len);
-            try server.balancer.init(arena, config, keys);
+                options.head_buffer_bytes == headScratchBytes(options.*));
+        }
+
+        /// The metrics state (§8, #179): the process totals, the labeled
+        /// tables, and the dump staging sized to the full exposition.
+        /// Split from `init` for the length limit; `admin.init` depends
+        /// on the labeled render bound this establishes.
+        fn initMetrics(
+            server: *Self,
+            arena: std.mem.Allocator,
+            config: *const config_module.Config,
+            keys: upstream_module.EndpointKeys,
+        ) error{OutOfMemory}!void {
+            assert(keys.count >= 1);
             server.counters = .{};
+            try server.labeled.init(arena, config, keys);
+            server.dump_buffer = try arena.alloc(
+                u8,
+                counters_module.Counters.render_bytes_max + server.labeled.render_bytes_max,
+            );
+            assert(server.dump_buffer.len > counters_module.Counters.render_bytes_max);
+        }
+
+        /// Every runtime scalar `init` owes a first value — the flags,
+        /// levels, peaks and embedded completions. Split from `init` for
+        /// the length limit; allocation-free by construction.
+        fn resetRuntimeState(server: *Self, options: *const InitOptions) void {
             server.draining = false;
             server.relay_pressure = false;
             server.conn_pressure = false;
@@ -330,10 +406,8 @@ pub fn Server(comptime IoType: type) type {
             server.drain_deadline_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
-            server.admin.init(server, config.admin_bind);
-            server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
-            try server.access_log.reserve(arena);
-            try server.health.init(arena, server, keys, options.head_buffer_bytes);
+            assert(!server.draining);
+            assert(server.head_buffers_in_use == 0);
         }
 
         /// Override the admin/metrics bind before `start` — the simulator
@@ -430,12 +504,38 @@ pub fn Server(comptime IoType: type) type {
         fn onSignal(server: *Self, signal: Io.Signal) void {
             switch (signal) {
                 .terminate => server.beginDrain(),
-                .dump_counters => {
-                    const snapshot = server.gauges();
-                    server.counters.dump(&snapshot);
-                },
+                .dump_counters => server.dumpMetrics(),
                 .reopen_log => server.access_log.requestReopen(),
             }
+        }
+
+        /// The SIGUSR1 / post-drain §8 dump: the exact exposition the
+        /// scrape serves — counters then the labeled breakdown — through
+        /// the same two renderers, so the dump and the endpoint can never
+        /// disagree on the wire format. Staged in the arena buffer sized
+        /// for both at init; one print, so the two halves cannot
+        /// interleave with other stderr writers.
+        pub fn dumpMetrics(server: *const Self) void {
+            assert(server.dump_buffer.len >= counters_module.Counters.render_bytes_max);
+            const snapshot = server.gauges();
+            const text = server.counters.render(&snapshot, server.dump_buffer);
+            const views = server.labeledViews();
+            const labeled_text =
+                server.labeled.render(&views, server.dump_buffer[text.len..]);
+            assert(text.len + labeled_text.len <= server.dump_buffer.len);
+            std.debug.print("{s}{s}", .{ text, labeled_text });
+        }
+
+        /// The live views the labeled gauges read at render time (§8,
+        /// #179): the same load view the balancer picks through and the
+        /// same mask the prober owns — borrowed at the moment of the
+        /// scrape, so a labeled level can never drift from the truth its
+        /// owner holds.
+        pub fn labeledViews(server: *const Self) counters_module.Labeled.LiveViews {
+            return .{
+                .load = server.endpointLoad(),
+                .healthy = server.health.healthy,
+            };
         }
 
         pub fn maybeStopAfterDrain(server: *Self) void {

@@ -117,8 +117,7 @@ pub fn main(init: std.process.Init) !void {
 
     // The loop only stops after a completed drain (§8).
     assert(server.isIdle());
-    const gauges = server.gauges();
-    server.counters.dump(&gauges);
+    server.dumpMetrics();
 }
 
 /// The §5/§8 startup budget gauntlet: fds and the ring are sized to the
@@ -350,6 +349,7 @@ fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
         .upstream_bytes = @sizeOf(UpstreamType),
         .access_log_bytes = zoxy.constants.accessLogBytes(limits.access_log_buffer_bytes),
         .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
+        .metrics_bytes = ServerXev.metricsBytes(config),
         .head_buffers = limits.head_buffers,
         .head_buffer_bytes = limits.head_buffer_bytes,
         .upstream_head_buffers = limits.upstream_head_buffers,
@@ -438,6 +438,7 @@ fn printMemoryBanner(
         \\          + upstream head buffers {d} x {d} B + head scratch {d} B
         \\          + access log {d} KiB
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
+        \\          + labeled metrics {d} B (tables, labels and render buffers)
         \\          + config arena {d} KiB (measured, not closed-form)
         \\
     , .{
@@ -462,6 +463,7 @@ fn printMemoryBanner(
         ServerXev.endpointTableBytes(config),
         config.clusters.len,
         ServerXev.endpointKeysFor(config).stride,
+        ServerXev.metricsBytes(config),
         config_arena_bytes / 1024,
     });
 }

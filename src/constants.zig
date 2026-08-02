@@ -914,6 +914,14 @@ pub const PoolSizes = struct {
     /// it from hardcoded widths would silently drift the moment one of
     /// them changed. `Server.endpointTableBytes` is the closed form.
     endpoint_table_bytes: u64,
+    /// The #179 labeled metrics (§8): the per-endpoint/per-cluster
+    /// counter tables and their prebuilt label strings, plus the two
+    /// render staging buffers — the admin response and the SIGUSR1 dump
+    /// — whose length became the config's when the exposition gained
+    /// labels. Its own term on the issue's own argument: the cost of
+    /// labelling your metrics should be visible next to everything else
+    /// you pay for. `Server.metricsBytes` is the closed form.
+    metrics_bytes: u64,
     /// The §5 head-buffer ring: how many buffers the deployment registered
     /// (`limits.head_buffers`; zero on an L4-only config) and the unit
     /// size of each. The total term is `count × (unit + 1)` — the slab
@@ -975,10 +983,14 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         sizes.upstream_head_buffer_bytes >= head_buffer_bytes_min);
     // At least the prober's one buffer, at least the smallest legal size.
     assert(sizes.head_scratch_bytes >= head_buffer_bytes_min);
+    // A config has at least one cluster with one endpoint, so the
+    // labeled tables and their buffers can never price at zero.
+    assert(sizes.metrics_bytes > 0);
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.endpoint_table_bytes +
+        sizes.metrics_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
         @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes +
@@ -1035,10 +1047,15 @@ test "budgets: memory total matches the closed form" {
     try std.testing.expectEqual(@as(u64, 0), bufferGroupDescriptorBytes(0));
     // The side buffers: two serving scratches plus the prober's one.
     const head_scratch: u64 = 3 * @as(u64, head_buffer_bytes_default);
+    // A stand-in for the labeled-metrics term: any nonzero figure works,
+    // since this test pins the *sum*, not the term's own closed form
+    // (`Server.metricsBytes` owns that).
+    const metrics: u64 = 4096;
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes +
         accessLogBytes(access_log_buffer_bytes_default) + endpoint_tables +
+        metrics +
         head_ring +
         @as(u64, upstream_slots_max) * upstream_head_bytes +
         head_scratch;
@@ -1051,15 +1068,17 @@ test "budgets: memory total matches the closed form" {
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(access_log_buffer_bytes_default),
         .endpoint_table_bytes = endpoint_tables,
+        .metrics_bytes = metrics,
         .head_buffers = conn_slots_max,
         .head_buffer_bytes = head_buffer_bytes_default,
         .upstream_head_buffers = upstream_slots_max,
         .upstream_head_buffer_bytes = upstream_head_bytes,
         .head_scratch_bytes = head_scratch,
     }));
-    // The L4-only shape still carries the prober's one response buffer.
+    // The L4-only shape still carries the prober's one response buffer —
+    // and the labeled metrics, which exist for every config (§8).
     const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes +
-        head_buffer_bytes_default;
+        metrics + head_buffer_bytes_default;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
         .conn_slots = 64,
         .conn_bytes = conn_bytes,
@@ -1069,6 +1088,7 @@ test "budgets: memory total matches the closed form" {
         .upstream_bytes = upstream_bytes,
         .access_log_bytes = accessLogBytes(0),
         .endpoint_table_bytes = 0,
+        .metrics_bytes = metrics,
         // The L4-only shape: no ring, no upstream head pool, no scratch
         // terms — but the prober's buffer is unconditional.
         .head_buffers = 0,

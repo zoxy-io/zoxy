@@ -109,13 +109,30 @@ const Harness = struct {
 /// snapshot keeps this expectation honest — a scrape that rendered stale or
 /// invented levels would fail here rather than quietly matching a
 /// hand-written constant.
-fn expectedResponse(gauges: *const counters_module.Counters.Gauges, buffer: []u8) []const u8 {
-    assert(buffer.len >= admin.response_bytes_max);
+fn expectedResponse(
+    server: *const ServerSim,
+    gauges: *const counters_module.Counters.Gauges,
+    buffer: []u8,
+) []const u8 {
+    assert(buffer.len >= server.admin.response.len);
     var zero: counters_module.Counters = .{};
     @memcpy(buffer[0..admin.response_head.len], admin.response_head);
     const body = zero.render(gauges, buffer[admin.response_head.len..]);
-    return buffer[0 .. admin.response_head.len + body.len];
+    // The labeled tail (#179): these scenarios move no labeled counter,
+    // so the server's own tables render the all-zero series — and the
+    // live views are as idle at compare time as they were at accept.
+    const views = server.labeledViews();
+    const labeled = server.labeled.render(
+        &views,
+        buffer[admin.response_head.len + body.len ..],
+    );
+    return buffer[0 .. admin.response_head.len + body.len + labeled.len];
 }
+
+/// Generous fixed size for the test-side response staging: the bed's
+/// one-cluster config renders far below this, and `expectedResponse`
+/// asserts it covers the server's real buffer.
+const response_scratch_bytes = 64 * 1024;
 
 /// A scripted scrape client. `.normal` sends the request and reads the
 /// response to EOF; `.drain_mid_scrape` begins the server drain the instant
@@ -132,7 +149,7 @@ const Scrape = struct {
     recv_completion: SimIo.Completion = .{},
     timer_completion: SimIo.Completion = .{},
     socket: SimIo.Socket = undefined,
-    recv_buffer: [admin.response_bytes_max]u8 = undefined,
+    recv_buffer: [response_scratch_bytes]u8 = undefined,
     received_len: u32 = 0,
     sent_len: u32 = 0,
     send_pending: bool = false,
@@ -313,11 +330,11 @@ test "admin: a scrape returns the counters as byte-exact Prometheus text" {
         try harness.sim_io.run();
 
         try testing.expectEqual(Scrape.Outcome.eof, harness.scrape.outcome);
-        var expected_buffer: [admin.response_bytes_max]u8 = undefined;
+        var expected_buffer: [response_scratch_bytes]u8 = undefined;
         // The data path is idle at scrape time, so the levels the scrape
         // rendered are the ones still live here.
         const gauges = harness.server.gauges();
-        const expected = expectedResponse(&gauges, &expected_buffer);
+        const expected = expectedResponse(&harness.server, &gauges, &expected_buffer);
         try testing.expectEqualStrings(
             expected,
             harness.scrape.recv_buffer[0..harness.scrape.received_len],
@@ -349,9 +366,9 @@ test "admin: a scrape stays intact and drains under resets" {
         harness.scrape.start();
         try harness.sim_io.run();
 
-        var expected_buffer: [admin.response_bytes_max]u8 = undefined;
+        var expected_buffer: [response_scratch_bytes]u8 = undefined;
         const gauges = harness.server.gauges();
-        const expected = expectedResponse(&gauges, &expected_buffer);
+        const expected = expectedResponse(&harness.server, &gauges, &expected_buffer);
         const got = harness.scrape.recv_buffer[0..harness.scrape.received_len];
         try testing.expect(std.mem.startsWith(u8, expected, got));
         try harness.expectDrained();

@@ -455,16 +455,6 @@ pub const Counters = struct {
         return buffer[0..cursor];
     }
 
-    /// Phase 0 exposure (§8): SIGUSR1 dumps the Prometheus rendering to
-    /// stderr through the signal seam. Shares `render` so the dump and the
-    /// scrape endpoint never disagree on the wire format.
-    pub fn dump(counters: *const Counters, gauges: *const Gauges) void {
-        var buffer: [render_bytes_max]u8 = undefined;
-        const text = counters.render(gauges, &buffer);
-        assert(text.len <= buffer.len);
-        std.debug.print("{s}", .{text});
-    }
-
     /// The §9 invariant: admitted work is completed or still active, and
     /// every accepted connection was admitted or shed — no third outcome.
     /// The prefix that makes a counter part of the gate identity below.
@@ -732,7 +722,7 @@ pub const Labeled = struct {
                     try endpointLabel(arena, cluster.name, address);
             }
         }
-        labeled.render_bytes_max = labeled.renderBytesBound();
+        labeled.render_bytes_max = renderBytesMaxFor(config);
         assert(labeled.render_bytes_max >= 1);
     }
 
@@ -757,16 +747,8 @@ pub const Labeled = struct {
         "\",endpoint=\"".len + endpoint_literal_bytes_max + "\"}".len;
 
     fn clusterLabel(arena: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]const u8 {
-        assert(name.len >= 1);
-        assert(name.len <= constants.cluster_name_bytes_max);
         var scratch: [label_scratch_bytes]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&scratch);
-        // The scratch is sized to the loader's own bounds just above, so
-        // the fixed writer cannot fill.
-        writer.writeAll("{cluster=\"") catch unreachable;
-        writeEscaped(&writer, name) catch unreachable;
-        writer.writeAll("\"}") catch unreachable;
-        return try arena.dupe(u8, writer.buffered());
+        return try arena.dupe(u8, renderClusterLabel(&scratch, name));
     }
 
     fn endpointLabel(
@@ -774,16 +756,73 @@ pub const Labeled = struct {
         name: []const u8,
         address: *const std.Io.net.IpAddress,
     ) error{OutOfMemory}![]const u8 {
+        var scratch: [label_scratch_bytes]u8 = undefined;
+        return try arena.dupe(u8, renderEndpointLabel(&scratch, name, address));
+    }
+
+    /// The label built in caller scratch — shared by `init`, which dupes
+    /// it into the arena, and the config-walking budget forms
+    /// (`tableBytes`, `renderBytesMaxFor`), which only measure it: one
+    /// renderer, so the banner cannot price a label init did not build.
+    fn renderClusterLabel(scratch: []u8, name: []const u8) []const u8 {
         assert(name.len >= 1);
         assert(name.len <= constants.cluster_name_bytes_max);
-        var scratch: [label_scratch_bytes]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&scratch);
-        // Same cannot-fill argument as `clusterLabel`; the address half
-        // is bounded by the bracketed-IPv6 term of the scratch.
+        assert(scratch.len >= label_scratch_bytes);
+        var writer = std.Io.Writer.fixed(scratch);
+        // The scratch is sized to the loader's own bounds just above, so
+        // the fixed writer cannot fill.
+        writer.writeAll("{cluster=\"") catch unreachable;
+        writeEscaped(&writer, name) catch unreachable;
+        writer.writeAll("\"}") catch unreachable;
+        return writer.buffered();
+    }
+
+    fn renderEndpointLabel(
+        scratch: []u8,
+        name: []const u8,
+        address: *const std.Io.net.IpAddress,
+    ) []const u8 {
+        assert(name.len >= 1);
+        assert(name.len <= constants.cluster_name_bytes_max);
+        assert(scratch.len >= label_scratch_bytes);
+        var writer = std.Io.Writer.fixed(scratch);
+        // Same cannot-fill argument as `renderClusterLabel`; the address
+        // half is bounded by the bracketed-IPv6 term of the scratch.
         writer.writeAll("{cluster=\"") catch unreachable;
         writeEscaped(&writer, name) catch unreachable;
         writer.print("\",endpoint=\"{f}\"}}", .{address.*}) catch unreachable;
-        return try arena.dupe(u8, writer.buffered());
+        return writer.buffered();
+    }
+
+    /// What `init` takes from the startup arena for this config (§5):
+    /// the six value tables, the label slice headers and the label bytes
+    /// themselves, and the two per-cluster scalars. Closed-form in the
+    /// config — it renders the same labels init dupes, through the same
+    /// renderer — so the banner's term is a prediction `init` then meets
+    /// exactly.
+    pub fn tableBytes(
+        config: *const config_module.Config,
+        keys: upstream_module.EndpointKeys,
+    ) u64 {
+        assert(config.clusters.len >= 1);
+        assert(keys.count >= 1);
+        const cluster_count: u64 = config.clusters.len;
+        var total: u64 = 0;
+        total += @as(u64, keys.count) * @sizeOf([]const u8); // endpoint_labels
+        total += cluster_count * @sizeOf([]const u8); // cluster_labels
+        total += cluster_count * @sizeOf(u16); // endpoint_counts
+        total += cluster_count * @sizeOf(bool); // cluster_checked
+        total += 4 * @as(u64, keys.count) * @sizeOf(Value); // endpoint families
+        total += 2 * cluster_count * @sizeOf(Value); // cluster families
+        var scratch: [label_scratch_bytes]u8 = undefined;
+        for (config.clusters) |*cluster| {
+            total += renderClusterLabel(&scratch, cluster.name).len;
+            for (cluster.endpoints) |*address| {
+                total += renderEndpointLabel(&scratch, cluster.name, address).len;
+            }
+        }
+        assert(total >= 1);
+        return total;
     }
 
     /// Prometheus label-value escaping: backslash, quote, newline. The
@@ -968,25 +1007,45 @@ pub const Labeled = struct {
         return count;
     }
 
-    /// The exact bound `render` is held to, walked over the same rows
-    /// render walks. Runtime because the label lengths are the config's;
-    /// exact because every term is — which is what lets the tightness
-    /// test prove it by filling the buffer to the last byte.
-    fn renderBytesBound(labeled: *const Labeled) usize {
+    /// The exact bound `render` is held to, priced over the same rows
+    /// render walks. A function of the *config* rather than of a built
+    /// `Labeled`, so the memory banner can state it before `Server.init`
+    /// runs — `init` stores the same number on the instance. Exact
+    /// because every term is, which is what lets the tightness test
+    /// prove it by filling the buffer to the last byte.
+    pub fn renderBytesMaxFor(config: *const config_module.Config) usize {
+        assert(config.clusters.len >= 1);
         var total: usize = 0;
         inline for (comptime std.enums.values(EndpointFamily)) |family| {
             total += typeLineLen(family.name(), "counter");
-            total += labeled.endpointRowsLen(family.name(), u64_digits_max, false);
         }
         inline for (comptime std.enums.values(ClusterFamily)) |family| {
             total += typeLineLen(family.name(), "counter");
-            total += labeled.clusterRowsLen(family.name(), u64_digits_max);
         }
         total += typeLineLen("endpoint_inflight", "gauge");
-        total += labeled.endpointRowsLen("endpoint_inflight", inflight_digits_max, false);
-        if (labeled.checkedClusterCount() >= 1) {
+        var checked_clusters: usize = 0;
+        var scratch: [label_scratch_bytes]u8 = undefined;
+        for (config.clusters) |*cluster| {
+            const cluster_label_len = renderClusterLabel(&scratch, cluster.name).len;
+            const cluster_checked = cluster.check != null;
+            inline for (comptime std.enums.values(ClusterFamily)) |family| {
+                total += rowLen(family.name(), cluster_label_len, u64_digits_max);
+            }
+            if (cluster_checked) checked_clusters += 1;
+            for (cluster.endpoints) |*address| {
+                const label_len =
+                    renderEndpointLabel(&scratch, cluster.name, address).len;
+                inline for (comptime std.enums.values(EndpointFamily)) |family| {
+                    total += rowLen(family.name(), label_len, u64_digits_max);
+                }
+                total += rowLen("endpoint_inflight", label_len, inflight_digits_max);
+                if (cluster_checked) {
+                    total += rowLen("endpoint_healthy", label_len, healthy_digits_max);
+                }
+            }
+        }
+        if (checked_clusters >= 1) {
             total += typeLineLen("endpoint_healthy", "gauge");
-            total += labeled.endpointRowsLen("endpoint_healthy", healthy_digits_max, true);
         }
         assert(total >= 1);
         return total;
@@ -998,36 +1057,11 @@ pub const Labeled = struct {
         return "# TYPE ".len + metric_prefix.len + name.len + " ".len + kind.len + "\n".len;
     }
 
-    fn endpointRowsLen(
-        labeled: *const Labeled,
-        name: []const u8,
-        digits: usize,
-        checked_only: bool,
-    ) usize {
+    fn rowLen(name: []const u8, label_len: usize, digits: usize) usize {
+        assert(name.len >= 1);
+        assert(label_len >= "{cluster=\"\"}".len);
         assert(digits >= 1);
-        var total: usize = 0;
-        for (0..labeled.endpoint_counts.len) |cluster_index| {
-            if (checked_only) {
-                if (!labeled.cluster_checked[cluster_index]) continue;
-            }
-            for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
-                const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
-                assert(labeled.endpoint_labels[key].len >= 1);
-                total += metric_prefix.len + name.len +
-                    labeled.endpoint_labels[key].len + " ".len + digits + "\n".len;
-            }
-        }
-        return total;
-    }
-
-    fn clusterRowsLen(labeled: *const Labeled, name: []const u8, digits: usize) usize {
-        assert(digits >= 1);
-        var total: usize = 0;
-        for (labeled.cluster_labels) |label| {
-            assert(label.len >= 1);
-            total += metric_prefix.len + name.len + label.len + " ".len + digits + "\n".len;
-        }
-        return total;
+        return metric_prefix.len + name.len + label_len + " ".len + digits + "\n".len;
     }
 
     fn tableTotal(values: []const Value) u64 {

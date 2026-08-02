@@ -35,9 +35,11 @@ pub const response_head =
     "Content-Type: text/plain; version=0.0.4\r\n" ++
     "Connection: close\r\n\r\n";
 
-/// A full response is the fixed head plus one rendering of every counter.
-pub const response_bytes_max = response_head.len + counters_module.Counters.render_bytes_max;
-
+/// A full response is the fixed head, one rendering of every counter,
+/// then the #179 labeled breakdown — whose length is the config's, so
+/// the buffer bound went from a comptime constant to a value `init`
+/// derives per server (`response.len`) and the memory banner prices
+/// (`Server.metricsBytes`).
 pub fn Admin(comptime IoType: type) type {
     const ServerType = @import("Server.zig").Server(IoType);
 
@@ -56,8 +58,13 @@ pub fn Admin(comptime IoType: type) type {
         /// it is due, then reaps (the §4 single-timer discipline).
         deadline_ns: u64,
         /// The rendered response and the send cursor over it (short sends
-        /// resume from `sent`).
-        response: [response_bytes_max]u8,
+        /// resume from `sent`). Arena-allocated at `init` — head plus
+        /// both renderings — because the labeled half's length is only
+        /// known once the config is (#179). Allocated whether or not a
+        /// bind is configured: the sim and tests set the bind after
+        /// `init` (`setBind`), and the admin plane's budgets are
+        /// reserved unconditionally everywhere else too (§8).
+        response: []u8,
         response_len: u32,
         sent: u32,
         drain_scratch: [constants.admin_drain_scratch_bytes]u8,
@@ -109,7 +116,15 @@ pub fn Admin(comptime IoType: type) type {
             admin: *Self,
             server: *ServerType,
             bind_address: ?std.Io.net.IpAddress,
-        ) void {
+            arena: std.mem.Allocator,
+        ) error{OutOfMemory}!void {
+            // The server's labeled tables are initialized first
+            // (`Server.init` orders it so): their render bound is a term
+            // of this buffer.
+            admin.response = try arena.alloc(u8, response_head.len +
+                counters_module.Counters.render_bytes_max +
+                server.labeled.render_bytes_max);
+            assert(admin.response.len <= std.math.maxInt(u32));
             admin.server = server;
             admin.bind_address = bind_address;
             admin.listening = false;
@@ -235,14 +250,21 @@ pub fn Admin(comptime IoType: type) type {
         }
 
         /// Build the full response once, into the fixed buffer: the static
-        /// head then the counters-and-gauges rendering (zero-alloc, §5).
-        /// The gauges are sampled here, at render time, so a scrape reports
-        /// the pool levels as of the response it is answering.
+        /// head, the counters-and-gauges rendering, then the #179 labeled
+        /// breakdown (zero-alloc, §5). The gauges and the labeled live
+        /// views are sampled here, at render time, so a scrape reports
+        /// the pool levels and per-endpoint state as of the response it
+        /// is answering.
         fn renderResponse(admin: *Self) void {
             @memcpy(admin.response[0..response_head.len], response_head);
             const gauges = admin.server.gauges();
             const body = admin.server.counters.render(&gauges, admin.response[response_head.len..]);
-            admin.response_len = @intCast(response_head.len + body.len);
+            const views = admin.server.labeledViews();
+            const labeled = admin.server.labeled.render(
+                &views,
+                admin.response[response_head.len + body.len ..],
+            );
+            admin.response_len = @intCast(response_head.len + body.len + labeled.len);
             admin.sent = 0;
             assert(admin.response_len >= response_head.len);
             assert(admin.response_len <= admin.response.len);
