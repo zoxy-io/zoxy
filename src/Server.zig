@@ -643,8 +643,12 @@ pub fn Server(comptime IoType: type) type {
 
         /// Counter reconciliation (§8/§9) supplying the in-flight term
         /// from the pool the server owns, so no caller has to guess it —
-        /// holds mid-scenario, not only when idle.
+        /// holds mid-scenario, not only when idle. The labeled partition
+        /// identities (#179) ride along: every labeled family must sum
+        /// to the process total it breaks down, under every seed the
+        /// simulator runs this on.
         pub fn reconcile(server: *const Self) bool {
+            server.labeled.reconciles(&server.counters);
             return server.counters.reconcile(server.activeCount());
         }
 
@@ -1161,8 +1165,11 @@ pub fn Server(comptime IoType: type) type {
                 // protocol to answer in — so the ladder's L4 answer
                 // applies: close. Counted outside the gate identity,
                 // because this connection was admitted before an endpoint
-                // was ever picked (§8).
+                // was ever picked (§8) — which is also why the labeled
+                // twin carries only the cluster: no endpoint was full,
+                // all of them were.
                 server.counters.increment("l4_shed_endpoint_inflight");
+                server.labeled.incrementCluster(.l4_shed_inflight, cluster_index);
                 // Nothing was armed for this dial yet — the arm below is
                 // the first — so teardown here cancels only the deadline
                 // admission left running (§5).
@@ -1204,6 +1211,15 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.state == .connecting);
             const socket = result catch |err| {
                 server.counters.increment("upstream_connect_failed");
+                // The labeled twin (#179): the pick did not survive the
+                // await, but the L4 charge did — `chargeL4` recorded the
+                // endpoint this dial was for, and the charge is released
+                // only at teardown, after this line.
+                assert(conn.charged_endpoint != conn_module.LogState.endpoint_none);
+                server.labeled.incrementEndpoint(
+                    .connect_failed,
+                    server.upstreams.keys.key(conn.charged_cluster, conn.charged_endpoint),
+                );
                 // Refused/timed-out/unreachable arrive typed and are the
                 // origin's verdict; anything else is resource pressure on
                 // our side — ephemeral ports and socket memory both land

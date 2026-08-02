@@ -660,6 +660,9 @@ pub fn Checker(comptime IoType: type) type {
             assert(checker.unhealthy_count >= 1);
             checker.unhealthy_count -= 1;
             checker.server.counters.increment("health_endpoint_up");
+            // The labeled twin (#179): a transition always knows its
+            // endpoint — the probe was addressed to it.
+            checker.server.labeled.incrementEndpoint(.health_up, key);
         }
 
         fn witnessFail(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
@@ -679,6 +682,8 @@ pub fn Checker(comptime IoType: type) type {
             checker.unhealthy_count += 1;
             assert(checker.unhealthy_count <= checker.checked_count);
             checker.server.counters.increment("health_endpoint_down");
+            // The labeled twin (#179), same key the mask just flipped.
+            checker.server.labeled.incrementEndpoint(.health_down, key);
             checker.closeParked(cluster_index, endpoint_index);
         }
 

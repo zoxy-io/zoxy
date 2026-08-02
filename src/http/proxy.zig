@@ -607,6 +607,11 @@ pub fn Proxy(comptime IoType: type) type {
                 server.health.healthy,
                 &conn.client_address,
             ) orelse {
+                // The labeled twin (#179) carries only the cluster: this
+                // fires precisely because no endpoint could be picked —
+                // all of them were full, so an endpoint label would be
+                // an invention.
+                server.labeled.incrementCluster(.l7_shed_inflight, conn.cluster_index);
                 respond(server, conn, 503, "l7_shed_endpoint_inflight");
                 return null;
             };
@@ -749,6 +754,15 @@ pub fn Proxy(comptime IoType: type) type {
             }
             const socket = result catch |err| {
                 server.counters.increment("upstream_connect_failed");
+                // The labeled twin (#179): the pick did not survive the
+                // await, but the leased slot did — it still names the
+                // endpoint this dial was for, and `respond`'s disposal
+                // releases it only after this line.
+                assert(conn.upstream != null);
+                server.labeled.incrementEndpoint(.connect_failed, server.upstreams.keys.key(
+                    conn.upstream.?.cluster_index,
+                    conn.upstream.?.endpoint_index,
+                ));
                 // Same split as the L4 dial: the origin's verdict arrives
                 // typed, our own resource exhaustion does not (§8).
                 server.witnessKernelPressure(.connect, err);
@@ -1610,6 +1624,14 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.response_started);
             conn.l7.response_leg = .done;
             server.counters.increment("l7_responses");
+            // The labeled twin (#179): the slot is still attached here —
+            // park and detach run below — and it names the endpoint that
+            // actually served, which is what "requests per backend" means.
+            assert(conn.upstream != null);
+            server.labeled.incrementEndpoint(.responses, server.upstreams.keys.key(
+                conn.upstream.?.cluster_index,
+                conn.upstream.?.endpoint_index,
+            ));
             // The whole response reached the client: the line goes out
             // now, before the turnaround below clears what it reports.
             // This is also the only place `ok` is earned — nothing between
