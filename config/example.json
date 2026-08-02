@@ -4,7 +4,7 @@
     ],
     "clusters": {
         "origin": {
-            "endpoints": ["127.0.0.1:9000"],
+            "endpoints": ["127.0.0.1:9000", { "address": "127.0.0.1:9001", "weight": 3 }],
             "check": { "type": "tcp", "fall": 3, "rise": 2 }
         }
     },

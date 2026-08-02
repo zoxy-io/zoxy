@@ -2351,6 +2351,10 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
     try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].getPort());
+    // The example carries both endpoint spellings (#174): a bare literal
+    // at weight 1 beside a weighted object.
+    try std.testing.expectEqual(@as(u16, 9001), parsed.clusters[0].endpoints[1].getPort());
+    try std.testing.expectEqualSlices(u16, &.{ 1, 3 }, parsed.clusters[0].weights.?);
     // The example's tcp check resolves with its thresholds, and its
     // omitted budget inherits the connect timeout.
     const example_check = parsed.clusters[0].check.?;

@@ -481,6 +481,18 @@ in the head buffer, which the response head renders over (§7) and the
 turnaround returns to the ring, so they have to be copied out while they
 are still there.
 
+The labeled metrics (§8, #179) add one more reservation on the same
+promise: the per-endpoint counter tables with their prebuilt label
+strings, and the two render staging buffers — the admin scrape response
+and the SIGUSR1 dump. The buffers stopped being comptime constants when
+the exposition gained labels: the rendered text's length depends on
+endpoint count, cluster-name length and address literals, none known
+before config load. The term stays closed-form — `Server.metricsBytes`
+prices the same labels `init` builds, through the same renderer, so the
+banner's prediction is met exactly — and it is deliberately its own
+line: the cost of labelling your metrics sits next to everything else
+you pay for.
+
 The config arena is in that total for the same reason — it is never
 freed — but it is the one term that is **measured rather than derived**,
 and the banner labels it so. There is no constant bounding a config
@@ -856,13 +868,15 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   the FIN-before-checkout race is overwhelmingly the real cause. The
   replay is spent before its try begins (no loop) and always dials
   fresh — the endpoint's whole idle list may be stale the same way. The
-  endpoint pick is per-cluster config: `p2c` (two uniform candidates
-  from a fixed-seed PRNG, the lower **in-flight total** wins — L7 leases
-  and live L4 connections summed, since both are work the origin is
-  carrying) by default, `rr`
-  for strict rotation, `hash` for stickiness. Cluster endpoints are
+  endpoint pick is per-cluster config: `p2c` (two weight-biased
+  candidates from a fixed-seed PRNG — uniform at the default weights —
+  the lower **in-flight total** wins: L7 leases and live L4 connections
+  summed, since both are work the origin is carrying) by default, `rr`
+  for smooth weighted rotation (strict rotation at equal weights),
+  `hash` for stickiness. Cluster endpoints are
   static socket addresses resolved once at config load, never on the
-  loop (dynamic DNS is a non-goal, §1).
+  loop (dynamic DNS is a non-goal, §1), each optionally weighted — two
+  bullets below.
 - **A pick chooses among the endpoints that are both healthy and under
   capacity**, in that order, and the two filters differ in what an empty
   result means. Health fails **open**: a cluster with every endpoint
@@ -875,6 +889,29 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   respects its caps. The in-flight total both this and `p2c` read counts
   L7 leases and live L4 connections alike, which is what lets an L4-only
   deployment be protected and load-balanced at all.
+- **Endpoints carry weights, and every policy honors them** (#174,
+  settled 2026-08-02). An endpoint is the bare `"IP:port"` string —
+  weight 1, the homogeneous common case — or `{ "address": …,
+  "weight": 3 }`, bounded by `endpoint_weight_max` (256, HAProxy's own
+  ceiling). Each policy absorbs the weight without changing character,
+  and each unit-weight path is bit-identical to the unweighted algorithm
+  it grew from, so existing clusters keep their draws, rotations and
+  client mappings. `rr` runs nginx's smooth weighted rotation — weight 3
+  beside weight 1 serves a,a,b,a, never three in a burst, and at unit
+  weights it is exactly the strict rotation it replaced. `p2c` draws its
+  two candidates in proportion to weight and leaves the in-flight
+  comparison untouched: a heavier endpoint is likelier to be
+  *considered*, and load still outranks share. `hash` scores one replica
+  hash per weight point and keeps the best — proportional by
+  construction, integer-only (no float log whose libm could re-home the
+  fleet across builds) — and re-weighting an endpoint disrupts only the
+  clients it gains or loses, so the 1/n property survives weighting.
+  A weight of `0` **drains** its endpoint: never picked, not even
+  through fail-open — a drain is an operator's statement where an
+  ejection is only a probe's verdict — while the prober keeps probing
+  it, so recovery is still observed. A cluster whose weights are all
+  zero is rejected at load (`EndpointWeightsAllZero`) rather than
+  accepted as one that can never answer.
 - **`hash` is rendezvous hashing, and it is stateless because it has to
   be.** Client-to-backend stickiness is normally a *table* — the proxy
   records which server a client went to. That mechanism cannot work
@@ -905,7 +942,10 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   endpoint count is a cost the operator chooses: 71 ns per pick at 64
   endpoints, against a request served in ~100 µs, and linear in the
   count from there. Nothing caps it — the pick simply gets slower, and
-  that trade is visible where it is made. Jump consistent
+  that trade is visible where it is made. Weights turn the same dial:
+  a weighted pick scores one hash per weight point, so the scan is
+  O(sum of weights), bounded per endpoint by `endpoint_weight_max` and,
+  like the count, priced by the operator's own config. Jump consistent
   hash is excluded outright — it can only add or remove the *last*
   bucket, and an ejection removes an arbitrary one.
   Two honest costs. Stickiness holds only while processes agree on the
@@ -1063,6 +1103,26 @@ origin, not one this proxy can pick for them.
   the admin/metrics listener's Prometheus rendering (`admin.zig`, one
   reserved scrape slot off the shared pools) plus a SIGUSR1 dump through
   the seam's `signal` primitive (§4).
+- **The exposition says which backend, not only how many** (#179,
+  settled 2026-08-02). Beside the process totals, labeled families:
+  per-endpoint counters for dial failures, responses served and health
+  transitions
+  (`zoxy_endpoint_connect_failed{cluster="api",endpoint="10.0.0.1:8080"}`),
+  per-*cluster* counters for the two inflight sheds — those fire
+  precisely because no endpoint could be picked, so an endpoint label
+  would be an invention — and two gauges read off the owners' live
+  state at render time: the per-endpoint in-flight level the balancer
+  compares, and the prober's healthy verdict for checked clusters
+  (unprobed endpoints render nothing rather than a constant 1 dressed
+  as a verdict). Each labeled family **partitions** the bare total it
+  breaks down — the contract the kernel-pressure counters already keep,
+  where the per-op and per-cause splits are two views of one total
+  (`counters.zig`) — and `reconcile` holds the views equal under every
+  simulator seed, so neither can drift. Label cardinality is bounded by config: there is
+  no user-controlled dimension — no per-path, no per-status — and
+  there must never be one. That bound is also what let the render
+  buffer move from a comptime constant to a config-derived arena term
+  with its own banner line (§5).
 - **The access log is a shed rung of its own.** Counters say how much and
   how often; an access log says *which request*, and that is what an
   operator needs when one client is being served badly and the aggregates
