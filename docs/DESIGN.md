@@ -651,6 +651,28 @@ accept → admit (slots? buffers?) → route by listener
   IPv6 announcements unwrap to the IPv4 address they are — the accept
   path's own normalization — so one client hashes one way however its
   address was conveyed.
+- **Sending PROXY protocol** (a cluster's
+  `"proxy_protocol": { "send": "v1"|"v2" }`, #142). The receive half's
+  mirror, and its machinery pays for the whole thing: the header —
+  composed by the same module's writers, pinned to the parser by
+  round-trip tests so a chained zoxy always accepts what another sends —
+  is prepended at the dial to the client→upstream direction's debt, and
+  the relay's pre-owed-debt entry sends it before any relayed byte. No
+  new state, no new op, no new memory beyond a stack buffer; the
+  destination field is the client socket's local address, asked through
+  the seam (`localAddress`) at the one moment it is needed. Per
+  *cluster* — HAProxy's `send-proxy` unit — because it states what the
+  origin reads, not who connects; and the identity it names is whatever
+  zoxy believes, so behind a `require` listener the announced-in client
+  is the announced-out client, one identity across the chain. The
+  restriction is *reachability*, enforced at load: an http listener may
+  not route to a sending cluster, because a pooled L7 upstream is shared
+  across clients (§3) and a per-connection header naming one client
+  would lie to every other. Two honest edges: a mixed-family pair
+  (an IPv4 client on an IPv6-local socket) promotes both addresses to
+  INET6 with the v4 side mapped, which receivers unwrap; and health
+  probes do not send the header — the dial-only tcp check is unaffected,
+  an http check against a sending cluster probes bare.
 
 ## 7. L7 data path — HTTP/1.1 reverse proxy
 
@@ -1297,7 +1319,7 @@ src/
     Pool.zig          // Pool(T): startup alloc, intrusive free list
   net/
     Conn.zig          // connection slot: state, completions, head-ring claim
-    proxy_protocol.zig // PROXY v1/v2 header parse: pure, total, monotonic (§6)
+    proxy_protocol.zig // PROXY v1/v2 parse + write: pure, round-trip-pinned (§6)
     relay.zig         // strict recv→send→recv relay (L4 + L7 bodies)
     upstream.zig      // shared upstream pool + endpoint idle lists + head pool
   http/
