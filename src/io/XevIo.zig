@@ -1167,15 +1167,21 @@ pub fn nowNs(io: *XevIo) u64 {
 /// call site keeps that a wrong number rather than a wrapped one.
 pub fn nowWallNs(io: *XevIo) u64 {
     _ = io;
-    var ts: linux.timespec = undefined;
+    var ts: posix.timespec = undefined;
     // The read stands on its own line, never inside the assert: an
     // assertion argument is not the place for the syscall the function
     // exists to make. CLOCK_REALTIME with a valid pointer has no failure
     // mode on a running kernel — EFAULT and EINVAL are both unreachable
     // from here — so the result is an invariant, asserted rather than
     // absorbed into a zero stamp that would date every line to 1970 and
-    // report a fifty-year duration. Same shape as `shutdown` and `closeFd`.
-    const rc = linux.clock_gettime(linux.CLOCK.REALTIME, &ts);
+    // report a fifty-year duration. Same shape as `shutdown` and `closeFd`:
+    // the read goes through `posix.system`, so its return convention matches
+    // the `posix.errno` that checks it — on kqueue that is libc's -1 sentinel,
+    // on io_uring the raw kernel value. A bare `linux.clock_gettime` here
+    // would pair a kernel-ABI return (a positive errno, never -1) with a
+    // libc-ABI `posix.errno`, which reads .SUCCESS and lets a garbage
+    // timespec through — the macOS live-gate panic of #184.
+    const rc = posix.system.clock_gettime(posix.CLOCK.REALTIME, &ts);
     assert(posix.errno(rc) == .SUCCESS);
     assert(ts.sec >= 0);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
