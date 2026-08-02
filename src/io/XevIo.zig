@@ -897,6 +897,15 @@ pub fn peerAddress(io: *XevIo, socket: Socket) std.Io.net.IpAddress {
     return addressOf(@intFromEnum(socket), posix.system.getpeername);
 }
 
+/// This end of the pair: the address the peer connected *to*, which is
+/// the destination a §6 send header states. Same syscall trade as
+/// `peerAddress`, and asked at the one site that needs it rather than
+/// stored — the socket is live for the whole call by construction.
+pub fn localAddress(io: *XevIo, socket: Socket) std.Io.net.IpAddress {
+    _ = io;
+    return addressOf(@intFromEnum(socket), posix.system.getsockname);
+}
+
 pub fn close(
     io: *XevIo,
     socket: Socket,

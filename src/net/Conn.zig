@@ -64,6 +64,19 @@ pub const DirectionState = struct {
         state.credited_len = 0;
     }
 
+    /// Grow the debt from the *front* (#142 send): `len` new bytes now
+    /// sit ahead of everything framed, nothing credited yet. Legal only
+    /// before the first credit — prepending to a partially-sent window
+    /// would resend bytes already gone — which in practice means at the
+    /// pre-relay staging sites, where the caller has just moved the
+    /// framed bytes over and written the new ones in front.
+    pub fn stageFront(state: *DirectionState, len: u32) void {
+        assert(len >= 1);
+        assert(state.credited_len == 0);
+        state.framed_len += len;
+        assert(state.owed() == state.framed_len);
+    }
+
     /// The target accepted `len` more of the debt.
     pub fn credit(state: *DirectionState, len: u32) void {
         assert(len >= 1);

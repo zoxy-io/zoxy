@@ -246,6 +246,9 @@ pub const TestBed = struct {
         /// The #142 receive gate on the one listener; null for everyone
         /// but the PROXY protocol scenarios.
         proxy_protocol: ?config_module.Config.Listener.ProxyProtocol = null,
+        /// The #142 send gate on the one cluster; when set, the origin
+        /// double expects and strips the header before echoing.
+        proxy_protocol_send: ?config_module.Config.Cluster.ProxyProtocolSend = null,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -268,7 +271,13 @@ pub const TestBed = struct {
         sim_options.buffer_group_count = options.server.head_buffers;
         try bed.sim_io.init(arena, sim_options);
         bed.endpoints = .{originAddress()};
-        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
+        bed.clusters = .{.{
+            .name = "origin",
+            .endpoints = &bed.endpoints,
+            .check = options.check,
+            .max_inflight = options.max_inflight,
+            .proxy_protocol_send = options.proxy_protocol_send,
+        }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         bed.listeners = .{.{
             .bind_address = bindAddress(),
@@ -306,6 +315,7 @@ pub const TestBed = struct {
         };
         bed.scenario.origin.on_accept = Scenario.startPendingRacer;
         bed.scenario.origin.context = &bed.scenario;
+        bed.scenario.origin.expect_proxy_header = options.proxy_protocol_send != null;
         if (options.origin_listens) {
             try bed.scenario.origin.start(&bed.sim_io, originAddress());
         }
@@ -1100,6 +1110,87 @@ test "proxy protocol: a silent peer is reaped on the connect budget" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_invalid"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_accepted"));
+}
+
+test "proxy protocol send: the origin hears who connected, and only the payload echoes" {
+    // The send half end to end: a sending cluster's upstream connection
+    // opens with a header naming the observed client, the origin double
+    // strips and records it, and the echo stays byte-exact — so a header
+    // that leaked into the payload, or payload that leaked into the
+    // header, cannot hide. Partial-io seeds split the header across
+    // deliveries on the origin's side of the wire.
+    inline for (.{
+        config_module.Config.Cluster.ProxyProtocolSend.v1,
+        config_module.Config.Cluster.ProxyProtocolSend.v2,
+    }) |version| {
+        var seed: u64 = 1;
+        while (seed <= 8) : (seed += 1) {
+            var bed: TestBed = undefined;
+            try bed.setUp(std.testing.allocator, .{
+                .sim = .{
+                    .seed = seed,
+                    .adversary = .{ .partial_io = true, .connect_delay_ns_max = 2_000_000 },
+                },
+                .proxy_protocol_send = version,
+            });
+            defer bed.tearDown();
+
+            bed.startClients(1, true);
+            try bed.sim_io.run();
+            try bed.expectDrained();
+
+            const client = &bed.scenario.clients[0];
+            try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+            try std.testing.expectEqualStrings(
+                echo_token,
+                client.receive_buffer[0..client.received_len],
+            );
+            try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_sent"));
+            try std.testing.expectEqual(@as(u32, 1), bed.scenario.origin.proxy_header_conns);
+            try std.testing.expectEqual(@as(u32, 0), bed.scenario.origin.proxy_header_violations);
+            // The announced client is the peer zoxy observed: SimIo's
+            // synthetic dialer address.
+            const observed: std.Io.net.IpAddress =
+                .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 50_000 } };
+            const announced = bed.scenario.origin.conns[0].announced.?;
+            try std.testing.expect(observed.eql(&announced));
+        }
+    }
+}
+
+test "proxy protocol: the received identity is the sent identity — the chain holds" {
+    // Both halves of #142 on one connection: the client announces
+    // 203.0.113.7:4711 through the require listener, and the sending
+    // cluster's origin must hear exactly that — zoxy in the middle of a
+    // PROXY protocol chain, believing inward and announcing outward.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 9, .adversary = .{ .partial_io = true } },
+        .proxy_protocol = .require,
+        .proxy_protocol_send = .v2,
+    });
+    defer bed.tearDown();
+
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = proxy_v1_line;
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.receive_buffer[0..client.received_len],
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_accepted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_sent"));
+    try std.testing.expectEqual(@as(u32, 0), bed.scenario.origin.proxy_header_violations);
+    const announced_in: std.Io.net.IpAddress =
+        .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 4711 } };
+    const announced_out = bed.scenario.origin.conns[0].announced.?;
+    try std.testing.expect(announced_in.eql(&announced_out));
 }
 
 test "health: probes against a listening origin keep the endpoint healthy" {

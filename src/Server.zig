@@ -997,6 +997,57 @@ pub fn Server(comptime IoType: type) type {
             server.startProtocol(conn, .l4);
         }
 
+        /// Stage the PROXY header a sending cluster's origin expects
+        /// (#142 send) as the client→upstream direction's front debt:
+        /// written ahead of whatever payload the receive phase already
+        /// framed, so `Relay.start`'s pre-owed-debt entry sends it before
+        /// any relayed byte with no new state and no new op. Runs at the
+        /// dial, the first moment the endpoint is settled and the last
+        /// where the client socket is guaranteed answerable for its
+        /// local address (the header's destination field).
+        fn stageProxySendHeader(
+            server: *Self,
+            conn: *ConnType,
+            version: config_module.Config.Cluster.ProxyProtocolSend,
+        ) void {
+            assert(conn.state == .connecting);
+            assert(conn.relay_buffer != null);
+            var header_buffer: [proxy_protocol.send_bytes_max]u8 = undefined;
+            const local_address = server.io.localAddress(conn.client_socket);
+            const header = switch (version) {
+                .v1 => proxy_protocol.writeV1(&header_buffer, &conn.client_address, &local_address),
+                .v2 => proxy_protocol.writeV2(&header_buffer, &conn.client_address, &local_address),
+            };
+            const direction = &conn.directions[
+                @intFromEnum(ConnType.Direction.client_to_upstream)
+            ];
+            const staging = &conn.relay_buffer.?.client_to_upstream;
+            const framed = direction.framed_len;
+            // Comptime-guaranteed in proxy_protocol: header + the largest
+            // receive leftover fit the buffer half together.
+            assert(header.len + framed <= staging.len);
+            if (framed >= 1) {
+                // Receive-phase payload sits at the front; move it over.
+                // Backwards copy: the regions overlap and the move is to
+                // the right.
+                assert(direction.phase == .receiving);
+                std.mem.copyBackwards(
+                    u8,
+                    staging[header.len..][0..framed],
+                    staging[0..framed],
+                );
+            } else {
+                assert(direction.phase == .idle);
+                direction.phase = .receiving;
+            }
+            @memcpy(staging[0..header.len], header);
+            direction.stageFront(@intCast(header.len));
+            // Counted at the stage: a dial that fails tears the whole
+            // connection down, so "staged" and "reached the wire" differ
+            // only by fates the dial counters already witness.
+            server.counters.increment("l4_proxy_header_sent");
+        }
+
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
             assert(conn.state == .connecting);
             const pick = server.balancer.pick(
@@ -1025,6 +1076,9 @@ pub fn Server(comptime IoType: type) type {
             // origin this connection is being relayed to (§8).
             conn.log.endpoint_index = pick.endpoint_index;
             server.chargeL4(conn, cluster_index, pick.endpoint_index);
+            if (server.config.clusters[cluster_index].proxy_protocol_send) |version| {
+                server.stageProxySendHeader(conn, version);
+            }
             server.io.connect(
                 pick.address,
                 &conn.op_connect.completion,

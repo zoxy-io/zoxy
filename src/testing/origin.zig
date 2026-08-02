@@ -11,6 +11,7 @@
 const std = @import("std");
 
 const Io = @import("../io/io.zig");
+const proxy_protocol = @import("../net/proxy_protocol.zig");
 
 const assert = std.debug.assert;
 
@@ -38,6 +39,20 @@ pub fn Origin(comptime IoType: type) type {
         mode: Mode = .echo,
         /// Optional per-accept mode picker (the sim randomizes modes).
         mode_selector: ?*const fn (?*anyopaque) Mode = null,
+        /// The #142 send half's receiving end: expect every connection to
+        /// open with a PROXY protocol header, consume it before echoing,
+        /// and record what it announced. An origin double must fail
+        /// loudly — garbage where a header belongs is a violation the
+        /// harness asserts on, never a tolerated shape.
+        expect_proxy_header: bool = false,
+        /// Connections whose header parsed. Echo-mode only: the
+        /// misbehaving modes never parse — `reset_on_first_chunk` acts
+        /// on the first delivery, `mute` reads without judging (its
+        /// `header_len` never advances, so its recv window never
+        /// shrinks), and `frozen` never reads.
+        proxy_header_conns: u32 = 0,
+        /// Connections whose opening bytes were not a valid header.
+        proxy_header_violations: u32 = 0,
         /// Optional hook fired after each accept (the drain-race test
         /// starts a client from here).
         on_accept: ?*const fn (?*anyopaque) void = null,
@@ -61,11 +76,27 @@ pub fn Origin(comptime IoType: type) type {
             sent_len: u32 = 0,
             mode: Mode = .echo,
             done: bool = false,
+            /// The #142 header accumulates here until it parses; any
+            /// payload that rode the same delivery follows it and is
+            /// moved to `buffer` for the echo.
+            header_buffer: [proxy_protocol.send_bytes_max]u8 = undefined,
+            header_len: u32 = 0,
+            header_done: bool = false,
+            /// What the header announced (null: LOCAL/UNKNOWN), for the
+            /// harness's identity oracles.
+            announced: ?std.Io.net.IpAddress = null,
 
             fn armRecv(conn: *Conn) void {
+                // While a header is owed, bytes land in its accumulator —
+                // the payload behind it is extracted on completion.
+                const target: []u8 =
+                    if (conn.origin.expect_proxy_header and !conn.header_done)
+                        conn.header_buffer[conn.header_len..]
+                    else
+                        conn.buffer[0..];
                 conn.origin.io.recv(
                     conn.socket,
-                    &conn.buffer,
+                    target,
                     &conn.recv_completion,
                     Conn,
                     conn,
@@ -83,6 +114,10 @@ pub fn Origin(comptime IoType: type) type {
                 assert(received >= 1);
                 switch (conn.mode) {
                     .echo => {
+                        if (conn.origin.expect_proxy_header and !conn.header_done) {
+                            conn.feedProxyHeader(received);
+                            return;
+                        }
                         conn.transfer_len = received;
                         conn.sent_len = 0;
                         conn.armSend();
@@ -101,6 +136,55 @@ pub fn Origin(comptime IoType: type) type {
                     .mute => conn.armRecv(),
                     .frozen => unreachable,
                 }
+            }
+
+            /// Accumulate and judge the #142 header. Monotonic verdicts
+            /// make the re-parse sound; a buffer that fills without one
+            /// is a violation too, since zoxy's own writers top out at
+            /// 104 bytes and anything longer was never a sent header.
+            fn feedProxyHeader(conn: *Conn, received: u32) void {
+                const origin = conn.origin;
+                assert(origin.expect_proxy_header);
+                assert(!conn.header_done);
+                conn.header_len += received;
+                assert(conn.header_len <= conn.header_buffer.len);
+                switch (proxy_protocol.parse(conn.header_buffer[0..conn.header_len])) {
+                    .need_more => {
+                        if (conn.header_len == conn.header_buffer.len) {
+                            conn.witnessHeaderViolation();
+                            return;
+                        }
+                        conn.armRecv();
+                    },
+                    .invalid => conn.witnessHeaderViolation(),
+                    .ok => |header| {
+                        conn.header_done = true;
+                        conn.announced = header.client;
+                        origin.proxy_header_conns += 1;
+                        const leftover_len = conn.header_len - header.bytes_len;
+                        if (leftover_len >= 1) {
+                            // Payload rode the same delivery: echo it
+                            // like any chunk, from the echo buffer.
+                            assert(leftover_len <= buffer_bytes);
+                            std.mem.copyForwards(
+                                u8,
+                                conn.buffer[0..leftover_len],
+                                conn.header_buffer[header.bytes_len..conn.header_len],
+                            );
+                            conn.transfer_len = leftover_len;
+                            conn.sent_len = 0;
+                            conn.armSend();
+                            return;
+                        }
+                        conn.armRecv();
+                    },
+                }
+            }
+
+            fn witnessHeaderViolation(conn: *Conn) void {
+                conn.origin.proxy_header_violations += 1;
+                conn.origin.io.closeNow(conn.socket);
+                conn.done = true;
             }
 
             fn armSend(conn: *Conn) void {

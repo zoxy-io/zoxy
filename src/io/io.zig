@@ -39,6 +39,8 @@
 //!   shutdown(io, socket, how) void                      (sync control op)
 //!   closeNow(io, socket) void                           (sync; un-admitted sheds)
 //!   peerAddress(io, socket) IpAddress                   (sync; who connected)
+//!   localAddress(io, socket) IpAddress                  (sync; this end —
+//!       what the peer connected *to*, §6's send-header destination)
 //!   lastPressure(io) Pressure                           (classified cause
 //!       of the op just delivered, §8)
 //!   nowNs(io) u64                                       (per-tick clock, §4)
@@ -235,6 +237,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "shutdown",
             "closeNow",
             "peerAddress",
+            "localAddress",
             "lastPressure",
             "nowNs",
             "nowWallNs",
