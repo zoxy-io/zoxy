@@ -60,6 +60,9 @@ pub fn Client(comptime IoType: type) type {
         socket: IoType.Socket = undefined,
         silent: bool = false,
         connected: bool = false,
+        /// This client's own address — the peer zoxy observes — captured
+        /// at connect for the harness's #142 send-identity oracle.
+        observed_address: ?std.Io.net.IpAddress = null,
         connect_settled: bool = false,
         cancel_requested: bool = false,
         fin_sent: bool = false,
@@ -110,6 +113,7 @@ pub fn Client(comptime IoType: type) type {
                 return;
             };
             client.connected = true;
+            client.observed_address = client.io.localAddress(client.socket);
             client.armRecv();
             if (!client.silent) {
                 client.armSend();

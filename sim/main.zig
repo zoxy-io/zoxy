@@ -193,13 +193,6 @@ const uncovered = [_]Uncovered{
             "is a directed-test control; src/access_log_test.zig covers " ++
             "the keep-the-old-sink arm",
     },
-    .{
-        .name = "l4_proxy_header_sent",
-        .why = .unreached,
-        .reason = "no sweep cluster sends PROXY protocol yet — the #142 " ++
-            "send scripts land with the next slice; " ++
-            "src/server_test.zig drives the staged header meanwhile",
-    },
 };
 
 comptime {
