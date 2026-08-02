@@ -367,6 +367,44 @@ configured proxy is reaching the listener — exactly what the mode
 exists to refuse. `http` listeners reject the block for now: the L7
 receive phase does not exist yet.
 
+### Telling an origin who the client is (PROXY protocol)
+
+The send direction: an origin behind an `l4` relay has no header to read
+an address from — the relay is the whole point — so the only way to tell
+it who connected is to open the upstream connection with a PROXY
+protocol header. A *cluster* opts in, because this states what its
+origins expect, not who connects (the same unit as HAProxy's
+`send-proxy`):
+
+```json
+"clusters": {
+    "postgres": {
+        "endpoints": ["10.0.0.1:5432"],
+        "proxy_protocol": { "send": "v2" }
+    }
+}
+```
+
+`send` is `v1` (text, readable in a tcpdump) or `v2` (binary, what cloud
+load balancers speak). The header names the client zoxy believes — which
+behind a `require` listener is the client the *fronting* proxy
+announced, so a chain of proxies carries one identity end to end.
+
+Two consequences of the header being per *connection*:
+
+- Only `l4` listeners may route to a sending cluster. A pooled HTTP
+  upstream is shared across clients, and a header naming one client
+  would lie to every other — the loader rejects the pairing outright.
+  For HTTP origins, use [`forwarded`](#telling-the-origin-who-the-client-is)
+  instead.
+- Health probes do not send the header. The dial-only `tcp` check is
+  unaffected (it proves the port accepts and sends nothing), but an
+  `http` check against a sending cluster probes bare — if the origin
+  strictly requires the header, prefer `tcp` checks there.
+
+`zoxy_l4_proxy_header_sent` counts headers staged, one per dialed
+connection to a sending cluster.
+
 ### Filters
 
 An `http` listener can carry a list of rules, evaluated top-down. Each has a
