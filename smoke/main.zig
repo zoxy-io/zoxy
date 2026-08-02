@@ -27,6 +27,7 @@
 //! nginx; the load is this file's own client (smoke/client.zig) rather
 //! than zrk. Both are deliberate — see those files.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
 const client_module = @import("client.zig");
@@ -50,6 +51,22 @@ const zoxy_log_path = work_directory ++ "/zoxy.log";
 const keep_alive_connections: u8 = 4;
 const requests_per_connection: u32 = 16;
 
+/// Requests per pass for the origin's bulk target, which arrives as one
+/// delivery large enough to overrun zoxy's head buffer — the §7 path
+/// where a response's coalesced body excess leaves in a second write
+/// (`l7_response_excess_sent`). The simulator's census exempts that
+/// counter for want of exactly this delivery.
+const large_requests: u32 = 4;
+
+/// The load runs twice over the same connections, with the process's
+/// resident set read between the passes. The first pass is what makes the
+/// second measurable: zoxy's pools are lazily resident, so an unwarmed
+/// reading would climb for reasons that are not allocation. Two identical
+/// passes mean any growth between the readings is work the second pass
+/// did that the first did not, which — under §5's zero-allocation-after-
+/// startup promise — is nothing.
+const load_passes: u32 = 2;
+
 /// Connections closed before the drain; the rest are still open when
 /// SIGTERM lands. Both teardown paths — a client that left and a drain
 /// that reaped — must write nothing, and only running both proves it.
@@ -60,8 +77,18 @@ const connections_closed_early: u8 = 2;
 /// other half of the line arithmetic.
 const l4_connections: u8 = 2;
 
-const http_exchanges: u32 = @as(u32, keep_alive_connections) * requests_per_connection;
+const exchanges_per_pass: u32 =
+    @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
+const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 = http_exchanges + l4_connections;
+
+/// What the resident set may grow by between the two passes. Measured at
+/// exactly zero, run after run — the tolerance is headroom for page
+/// granularity and a runtime's own bookkeeping on some other kernel, not
+/// a number anything is expected to spend. It still sits under what a
+/// per-request allocation of even a kilobyte would cost across a pass of
+/// this size, which is the only thing it is looking for.
+const rss_growth_kb_max: u64 = 64;
 
 /// Every connection zoxy's data listeners accept in one run: the load's
 /// own, plus the readiness probe that connects and asks nothing. Admin
@@ -74,7 +101,8 @@ const access_log_lines_expected: u32 = http_exchanges + l4_connections;
 /// the run. That window is microseconds wide on a port nothing advertises,
 /// and the alternative — a floor — is satisfied by a proxy accepting
 /// connections nobody made.
-const connections_expected: u32 = keep_alive_connections + l4_connections + 1;
+const connections_expected: u32 =
+    keep_alive_connections + load_passes * large_requests + l4_connections + 1;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -96,9 +124,27 @@ const drain_deadline_ms: u32 = 300;
 /// set a number a human can read at a glance.
 const zoxy_limits = .{ .conn_slots = 32, .relay_buffers = 16, .upstream_slots = 16 };
 
+/// The head buffer zoxy binds for this run — `limits.head_buffer_bytes`
+/// is not set, so this is `constants.head_buffer_bytes_default`, spelled
+/// again rather than imported. Duplicating it is safe *here* in a way it
+/// would not be elsewhere: the only thing that reads it is the
+/// bulk-response premise below, and a default that moved past the bulk
+/// body would fail this gate's excess equality outright rather than
+/// quietly stop exercising the branch.
+const zoxy_head_buffer_bytes: u32 = 8 * 1024;
+
 comptime {
     assert(keep_alive_connections >= 2);
     assert(requests_per_connection >= 2);
+    // The resident-set claim is "an identical pass costs nothing", and
+    // the reading sits *between* the two passes `runLoad` makes — so this
+    // constant names that shape for the arithmetic that depends on it
+    // rather than parameterizing a loop.
+    assert(load_passes == 2);
+    assert(large_requests >= 1);
+    // The bulk response's premise: its body has to overrun the head
+    // buffer, or the excess the gate counts never exists (§7).
+    assert(origin_module.large_body_bytes > zoxy_head_buffer_bytes);
     assert(connections_closed_early >= 1);
     assert(connections_closed_early < keep_alive_connections);
     assert(l4_connections >= 1);
@@ -161,8 +207,14 @@ const watchdog_budget_ns: u64 = 30 * std.time.ns_per_s;
 /// storage that outlives no scope and moves for no reason, which is what
 /// static means here (§5's discipline, applied to the harness).
 var origin: origin_module.Origin = undefined;
-var clients: [keep_alive_connections]client_module.Client = undefined;
-var l4_client: client_module.Client = undefined;
+/// The clients start *closed* rather than undefined, so `connect` can
+/// assert it is not overwriting a live connection — which is what makes
+/// one slot safely reusable below.
+var clients: [keep_alive_connections]client_module.Client = @splat(.{});
+/// The slot for connections that serve exactly one exchange and close —
+/// the bulk requests and the L4 leg. One at a time by construction: each
+/// is closed before the next is opened, and `connect` asserts it.
+var single_client: client_module.Client = .{};
 
 /// The proxy the watchdog kills if it fires, published by `spawnZoxy`.
 /// Zero until then — the watchdog can outlive the spawn failing.
@@ -222,7 +274,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     defer if (running) child.kill(io);
 
     try awaitListening(io, ports.http);
-    try runLoad(io, &ports);
+    const memory = try runLoad(arena, io, &ports, child.id);
 
     // Scraped before the drain: the admin listener closes with every
     // other one when SIGTERM lands (§8).
@@ -232,25 +284,54 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // Every check runs and prints; a run that fails two ways should say
     // both, not stop at the first.
     const log_ok = accessLogPassed(&lines);
+    const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
-    return report(io, &lines, &counters, log_ok and counters.passed and drain_ok);
+    const passed = log_ok and counters.passed and memory_ok and drain_ok;
+    return report(io, &lines, &counters, &memory, passed);
 }
 
 /// The run's one line of output when everything held, and the proxy's own
-/// output when something did not. The probe count is in it either way —
-/// a band nobody can see the margin of is a band nobody can watch.
-fn report(io: Io, lines: *const LogCounts, counters: *const CounterVerdict, passed: bool) u8 {
+/// output when something did not. The probe count and the resident set
+/// are in it either way — a margin nobody can see is a margin nobody can
+/// watch across runs.
+fn report(
+    io: Io,
+    lines: *const LogCounts,
+    counters: *const CounterVerdict,
+    memory: *const Memory,
+    passed: bool,
+) u8 {
     assert(lines.http_ok <= lines.http);
     if (!passed) {
         printZoxyLog(io);
         return 1;
     }
+    var memory_buffer: [64]u8 = undefined;
     std.debug.print(
         "smoke: {d} http + {d} l4 exchanges, {d} access-log lines, counters reconcile, " ++
-            "{d} probes in {d}ms, clean drain\n",
-        .{ lines.http, lines.l4, access_log_lines_expected, counters.probes, probe_window_ms },
+            "{d} probes in {d}ms, {s}, clean drain\n",
+        .{
+            lines.http,
+            lines.l4,
+            access_log_lines_expected,
+            counters.probes,
+            probe_window_ms,
+            memorySummary(memory, &memory_buffer),
+        },
     );
     return 0;
+}
+
+/// The two readings as text, printed rather than differenced: a resident
+/// set may legally *shrink* between them (the kernel reclaims pages when
+/// it likes), and `memoryPassed` treats that as a pass — so a delta here
+/// would be a subtraction that underflows on a run that was fine.
+fn memorySummary(memory: *const Memory, buffer: []u8) []const u8 {
+    assert(buffer.len >= 1);
+    const before = memory.before_kb orelse return "rss unread";
+    const after = memory.after_kb orelse return "rss unread";
+    return std.fmt.bufPrint(buffer, "rss {d} -> {d} KiB", .{ before, after }) catch
+        "rss unprintable";
 }
 
 /// The wall-clock backstop. Nothing in this harness can bound its own
@@ -435,6 +516,7 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
     const in_use = counterOf(first, "conn_slots_in_use") orelse return false;
     const responses = counterOf(first, "l7_responses") orelse return false;
     const reused = counterOf(first, "upstream_reused") orelse return false;
+    const excess = counterOf(first, "l7_response_excess_sent") orelse return false;
     // The orderings `reconcile` asserts inside the process, asserted here
     // on the numbers that came back out of it: these are impossible
     // states, not failed verdicts, and a scrape that parsed the wrong
@@ -444,6 +526,7 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
     assert(completed <= admitted);
     assert(in_use <= admitted);
     assert(reused <= responses);
+    assert(excess <= responses);
     var passed = true;
     // The gate identity: an accepted connection was admitted or shed,
     // with no third outcome.
@@ -487,6 +570,18 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
         });
         passed = false;
     }
+    // The §7 branch the simulator cannot reach: an origin delivery that
+    // filled the head buffer, so the body excess coalesced with the head
+    // had to leave in a write of its own. Every bulk request in this run
+    // is that delivery, which is why this is a count rather than a
+    // witness.
+    if (excess != large_requests * load_passes) {
+        std.debug.print(
+            "FAIL: {d} responses sent body excess, not the {d} bulk requests this run made\n",
+            .{ excess, large_requests * load_passes },
+        );
+        passed = false;
+    }
     return passed;
 }
 
@@ -502,25 +597,66 @@ fn counterOf(scrape: *const scrape_module.Scrape, name: []const u8) ?u64 {
     return value;
 }
 
-/// The load: every L7 connection serves its whole share before the next
-/// one opens, then some are closed and the rest are left for the drain.
-fn runLoad(io: Io, ports: *const Ports) !void {
+/// The load: two identical passes over the same keep-alive connections
+/// with the proxy's resident set read between them, then the L4 leg, then
+/// some connections closed and the rest left for the drain.
+fn runLoad(
+    arena: std.mem.Allocator,
+    io: Io,
+    ports: *const Ports,
+    pid: ?std.process.Child.Id,
+) !Memory {
     assert(ports.http != 0);
     assert(ports.l4 != 0);
     var host_buffer: [32]u8 = undefined;
     const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.http});
     for (&clients) |*client| {
         try client.connect(io, ports.http);
-        var request: u32 = 0;
-        while (request < requests_per_connection) : (request += 1) {
-            try expectOriginResponse(try client.get(host, "/"));
-        }
-        assert(client.requests == requests_per_connection);
     }
+    try runPass(io, ports.http, host);
+    // Read between the passes, not before the first: zoxy's pools are
+    // lazily resident (§5), so a reading taken before any traffic would
+    // climb for reasons that are not allocation.
+    const before_kb = try readRssKb(arena, io, pid);
+    try runPass(io, ports.http, host);
+    const after_kb = try readRssKb(arena, io, pid);
     for (clients[0..connections_closed_early]) |*client| {
         client.close();
     }
     try runL4Load(io, ports.l4, host);
+    return .{ .before_kb = before_kb, .after_kb = after_kb };
+}
+
+/// One pass: every open connection serves its whole share of ordinary
+/// requests, then the bulk target runs on one of them. Both passes are
+/// identical, which is what makes the resident set between them a claim
+/// about allocation rather than about warmup.
+fn runPass(io: Io, port: u16, host: []const u8) !void {
+    assert(host.len >= 1);
+    assert(clients.len == keep_alive_connections);
+    for (&clients) |*client| {
+        var request: u32 = 0;
+        while (request < requests_per_connection) : (request += 1) {
+            try expectResponse(try client.get(host, "/", .keep_alive), origin_module.body.len);
+        }
+        assert(request == requests_per_connection);
+    }
+    // The bulk requests announce close, on their own connections because
+    // that is what announcing close means. Both halves are load-bearing:
+    // the delivery fills the head buffer, and the injected
+    // `Connection: close` is what makes zoxy's rendered head longer than
+    // the origin's — without which the excess fits beside it exactly and
+    // the branch never runs (§7).
+    var large: u32 = 0;
+    while (large < large_requests) : (large += 1) {
+        try single_client.connect(io, port);
+        defer single_client.close();
+        try expectResponse(
+            try single_client.get(host, origin_module.large_path, .close),
+            origin_module.large_body_bytes,
+        );
+    }
+    assert(large == large_requests);
 }
 
 /// The L4 leg (§6): the same HTTP exchange through the byte relay, which
@@ -531,20 +667,21 @@ fn runL4Load(io: Io, port: u16, host: []const u8) !void {
     assert(host.len >= 1);
     var index: u8 = 0;
     while (index < l4_connections) : (index += 1) {
-        // One static slot reused across the loop, on the same terms as
-        // `clients`: a connection is closed before the next is opened, so
-        // there is never more than one of these alive.
-        try l4_client.connect(io, port);
-        defer l4_client.close();
-        try expectOriginResponse(try l4_client.get(host, "/"));
+        try single_client.connect(io, port);
+        defer single_client.close();
+        try expectResponse(
+            try single_client.get(host, "/", .keep_alive),
+            origin_module.body.len,
+        );
     }
     assert(index == l4_connections);
 }
 
-/// The response the origin sends, checked byte-count and all: a hop that
+/// The response the origin sent, checked byte-count and all: a hop that
 /// truncated or re-framed a body is a data-path bug this tier sees before
-/// any counter does.
-fn expectOriginResponse(response: client_module.Response) !void {
+/// any counter does — and the bulk target is where a hop is most likely
+/// to, since its body crosses the head buffer in more than one piece.
+fn expectResponse(response: client_module.Response, body_bytes: u32) !void {
     // The client parses both out of the wire and bounds them there; a
     // value outside those bounds reaching here would mean the two files
     // disagree about what a response is.
@@ -554,13 +691,66 @@ fn expectOriginResponse(response: client_module.Response) !void {
         std.debug.print("smoke: origin answered {d}, not 200\n", .{response.status});
         return error.UnexpectedStatus;
     }
-    if (response.body_bytes != origin_module.body.len) {
+    if (response.body_bytes != body_bytes) {
         std.debug.print(
             "smoke: body was {d} bytes, not {d}\n",
-            .{ response.body_bytes, origin_module.body.len },
+            .{ response.body_bytes, body_bytes },
         );
         return error.UnexpectedBody;
     }
+}
+
+/// The proxy's resident set across the measured pass. Null off Linux,
+/// where there is no procfs to read it from — the gate says so rather
+/// than pretending it checked.
+const Memory = struct {
+    before_kb: ?u64,
+    after_kb: ?u64,
+};
+
+/// §5's promise from outside the process: two identical passes, and the
+/// second one costs no memory. Growth *inside* a pass would be lazy
+/// fault-in working as designed, which is what the first pass is for.
+fn memoryPassed(memory: *const Memory) bool {
+    if (memory.before_kb == null or memory.after_kb == null) {
+        std.debug.print("smoke: resident set unread (no procfs here); memory check skipped\n", .{});
+        return true;
+    }
+    const before = memory.before_kb.?;
+    const after = memory.after_kb.?;
+    // A live process always has resident pages; zero would mean the
+    // reading failed rather than that the proxy shrank to nothing.
+    assert(before > 0);
+    assert(after > 0);
+    if (after <= before + rss_growth_kb_max) return true;
+    std.debug.print(
+        "FAIL: resident set grew {d} KiB across an identical second pass ({d} -> {d} KiB)\n",
+        .{ after - before, before, after },
+    );
+    return false;
+}
+
+/// The proxy's resident set, in KiB. procfs advertises size 0, so this
+/// streams rather than trusting a stat.
+fn readRssKb(arena: std.mem.Allocator, io: Io, pid: ?std.process.Child.Id) !?u64 {
+    if (builtin.os.tag != .linux) return null;
+    assert(pid != null);
+    const path = try std.fmt.allocPrint(arena, "/proc/{d}/status", .{pid.?});
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buffer);
+    var status: [8192]u8 = undefined;
+    const status_len = try file_reader.interface.readSliceShort(&status);
+    assert(status_len > 0);
+    var lines = std.mem.splitScalar(u8, status[0..status_len], '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "VmRSS:")) continue;
+        const digits_start = std.mem.indexOfAny(u8, line, "0123456789") orelse break;
+        const digits_end = std.mem.indexOfScalarPos(u8, line, digits_start, ' ') orelse break;
+        return try std.fmt.parseUnsigned(u64, line[digits_start..digits_end], 10);
+    }
+    return error.RssUnavailable;
 }
 
 /// Drain, not just death (§8): SIGTERM, then a wait that both reaps the

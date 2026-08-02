@@ -36,17 +36,34 @@ pub const Response = struct {
     body_bytes: u32,
 };
 
+/// What a request says about its connection's future. HTTP/1.1's default
+/// is keep-alive, so that arm sends nothing; the other says so.
+pub const Persistence = enum {
+    keep_alive,
+    close,
+
+    fn header(persistence: Persistence) []const u8 {
+        return switch (persistence) {
+            .keep_alive => "",
+            .close => "Connection: close\r\n",
+        };
+    }
+};
+
 pub const Client = struct {
-    io: Io,
-    stream: Io.net.Stream,
-    reader: Io.net.Stream.Reader,
-    writer: Io.net.Stream.Writer,
-    read_buffer: [response_head_bytes_max]u8,
-    write_buffer: [response_head_bytes_max]u8,
+    io: Io = undefined,
+    stream: Io.net.Stream = undefined,
+    reader: Io.net.Stream.Reader = undefined,
+    writer: Io.net.Stream.Writer = undefined,
+    read_buffer: [response_head_bytes_max]u8 = undefined,
+    write_buffer: [response_head_bytes_max]u8 = undefined,
     /// Requests issued on this connection, so a caller can assert its own
     /// keep-alive arithmetic against what actually went out.
-    requests: u32,
-    connected: bool,
+    requests: u32 = 0,
+    /// The one field with a real default, and the reason the rest have
+    /// one: a static slot starts closed, so `connect` can refuse to
+    /// overwrite a live connection instead of leaking its socket.
+    connected: bool = false,
 
     /// Open a connection to a loopback port. In-place through an
     /// out-pointer: both `Reader` and `Writer` hold pointers into the
@@ -54,6 +71,7 @@ pub const Client = struct {
     /// before either is built.
     pub fn connect(client: *Client, io: Io, port: u16) !void {
         assert(port != 0);
+        assert(!client.connected);
         var address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
         client.io = io;
         client.stream = try address.connect(io, .{ .mode = .stream });
@@ -73,13 +91,25 @@ pub const Client = struct {
     /// One request/response exchange, left on a message boundary so the
     /// next `get` on this connection is a keep-alive turnaround rather
     /// than a fresh guess about where the last response ended.
-    pub fn get(client: *Client, host: []const u8, target: []const u8) !Response {
+    ///
+    /// `persistence` is explicit at every call site because it decides
+    /// more than this connection's fate: announcing close makes zoxy
+    /// *inject* a `Connection: close` into the response head (§7), which
+    /// is the one thing that renders a head longer than the origin's —
+    /// and therefore the only way a coalesced body excess can fail to fit
+    /// beside it.
+    pub fn get(
+        client: *Client,
+        host: []const u8,
+        target: []const u8,
+        persistence: Persistence,
+    ) !Response {
         assert(client.connected);
         assert(target.len >= 1);
         assert(target[0] == '/');
         try client.writer.interface.print(
-            "GET {s} HTTP/1.1\r\nHost: {s}\r\n\r\n",
-            .{ target, host },
+            "GET {s} HTTP/1.1\r\nHost: {s}\r\n{s}\r\n",
+            .{ target, host, persistence.header() },
         );
         try client.writer.interface.flush();
         client.requests += 1;
