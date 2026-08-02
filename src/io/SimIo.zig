@@ -456,7 +456,10 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
         u8,
         @as(usize, options.buffer_group_count) * options.buffer_group_bytes,
     );
-    // Zeroed for symmetry with the kernel twin's init-time fault-in.
+    // Zeroed for determinism, not residency (the kernel twin faults
+    // lazily). No current path reads past what a scenario wrote; the
+    // zeroing is cheap insurance that any future such read replays
+    // identically instead of flaking on allocator-dependent garbage.
     @memset(io.group_slab, 0);
     io.group_free = try arena.alloc(bool, options.buffer_group_count);
     @memset(io.group_free, true);

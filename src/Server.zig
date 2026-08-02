@@ -282,10 +282,12 @@ pub fn Server(comptime IoType: type) type {
                 u8,
                 @as(usize, options.upstream_head_buffers) * options.head_buffer_bytes,
             );
-            // Faulted in at init like the client ring's slab (see
-            // XevIo.initBufferGroup): RSS is the printed §5 budget from
-            // the first tick, never a load-dependent climb.
-            @memset(upstream_head_slab, 0);
+            // Deliberately not faulted in: pages become resident as
+            // exchanges actually use them, so the printed §5 total is a
+            // ceiling RSS approaches under load, never a startup floor
+            // (IMPLEMENTATION_NOTES "lazy fault-in"). Nothing reads a
+            // buffer byte it did not first write, so the content of a
+            // fresh page is never observed.
             for (server.upstream_head_buffers.slots, 0..) |*head_buffer, index| {
                 head_buffer.data =
                     upstream_head_slab[index * options.head_buffer_bytes ..][0..options.head_buffer_bytes];
@@ -298,8 +300,6 @@ pub fn Server(comptime IoType: type) type {
                 if (options.head_buffers >= 1) options.head_buffer_bytes else 0;
             server.target_scratch = try arena.alloc(u8, scratch_bytes);
             server.rewrite_scratch = try arena.alloc(u8, scratch_bytes);
-            @memset(server.target_scratch, 0);
-            @memset(server.rewrite_scratch, 0);
             assert(server.target_scratch.len + server.rewrite_scratch.len +
                 options.head_buffer_bytes == headScratchBytes(options));
             server.l4_inflight = try arena.alloc(u16, keys.count);

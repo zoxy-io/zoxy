@@ -1096,8 +1096,9 @@ change as `zig build ci`. The benchmark gate (Tier 1) is **run at
 merge, not on every change**: its verdict is a *band comparison across
 runs* (§Tier 1 below), which a single shared-runner pass cannot make —
 so `zig build bench` is invoked deliberately against a real origin, and
-its hard invariants (flat RSS, clean drain, sub-1% socket-error rate)
-are the pass/fail part. `zig build ci` deliberately excludes it.
+its hard invariants (RSS under the §5 banner ceiling, clean drain,
+sub-1% socket-error rate) are the pass/fail part. `zig build ci`
+deliberately excludes it.
 
 1. **Deterministic simulation — `zig build sim -- [seed] [iterations]
    [keep-going]`.** `keep-going` names every failing seed in the range
@@ -1179,9 +1180,12 @@ are the pass/fail part. `zig build ci` deliberately excludes it.
      3× between identical back-to-back runs) — which is why this is not a
      blind per-change CI step. A PR that regresses the band explains
      itself or does not merge. The run's *hard* invariants are machine-
-     checked and exit non-zero: flat RSS (the zero-alloc promise from
-     outside), a clean SIGTERM drain, and a sub-1% proxied socket-error
-     rate.
+     checked and exit non-zero: RSS under the §5 banner total plus a
+     fixed slack (the closed form as a ceiling, witnessed from outside —
+     the pools are lazily resident, so a saturating warmup drives RSS
+     toward the bound first; the shrunken overload band still holds
+     *flat* RSS, its whole budget being smaller than the tolerance), a
+     clean SIGTERM drain, and a sub-1% proxied socket-error rate.
    - **Tier 2 (comparison, on demand) — same harness + HAProxy.** The dev
      shell provides `haproxy` as a Nix package; the script runs the
      identical scenario through it on the same pinned cores. No

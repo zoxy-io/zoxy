@@ -392,6 +392,47 @@ stays open: the LogState move was cut from #162's scope on measurement —
 its scalars are written unconditionally on both protocols, so moving
 them buys 40 B of stride for 14 hot-path guards.
 
+## Lazy fault-in — the floor became a ceiling (2026-08-02)
+
+The init-time fault-in above lasted a day: it made idle RSS the full §5
+total (~35 MiB at defaults), which reads as bloat in exactly the
+idle/light-load column most proxy comparisons publish, while what it
+protected was available more cheaply. Reversed deliberately, no knob:
+
+- The slabs (client ring, upstream heads, scratches) are no longer
+  zeroed at init. Pages fault in as exchanges use them, so the banner
+  total is a **ceiling RSS approaches under load, not a startup floor**.
+  Idle RSS is now dominated by what pool *headers* touch: the conn slab
+  wholly (1712 B stride — headers on every page), the relay slab about
+  half (8200 B stride), the separate byte slabs not at all.
+- The FIFO-cycling facts above stand, with one refinement the rebuild
+  measured: cycling walks every *buffer*, not every *page*. A small
+  request head faults only the first page of its 8 KiB buffer, so which
+  second pages are resident depends on coalescing and delivery sizes —
+  a loaded process converges toward the budget, asymptotically, not to
+  it on a schedule. Lazy changes when pages arrive, never whether.
+- The bench's flat-RSS gate **retired with the floor** — and not for
+  lack of trying: a saturating warmup (all three scenarios at the
+  measured connection count, keep-alive cycling the full ring) still
+  saw +2.3 MiB across the measured window, the partial-page tail above.
+  A tolerance wide enough to admit legal faulting is the ceiling gate
+  by another name, so the ceiling is the gate: the harness parses the
+  banner's memory total (and the ring count for the warmup — outside
+  view, nothing imported) and holds `RSS ≤ total + 8 MiB slack` every
+  run. The warmup stays, to push RSS toward the bound so holding it is
+  non-vacuous (measured at the bench shape: idle 9.8 MiB, after warmup
+  18.8, after the full window 21.2, budget 35.2). The overload band
+  keeps its flat check — that zoxy's whole pool budget sits inside the
+  1 MiB tolerance, so only an allocation can trip it (measured flat:
+  2044 → 2044 KiB).
+- The trade recorded honestly: under heuristic overcommit, a
+  memory-tight box now learns of a shortfall at its first traffic peak
+  (OOM kill mid-serving) instead of at startup. Accepted with eyes
+  open — an operator who needs the old guarantee can preallocate at the
+  OS level (cgroup memory.min); zoxy no longer does it for everyone.
+- SimIo keeps zeroing its slab — that was never residency, it is seed
+  determinism (a replayed schedule must see identical bytes).
+
 ## Pre-block spin — rejected (2026-07-12)
 
 Spinning before the loop blocks: p50 +15–25 µs *worse* and CPU ×2. The
