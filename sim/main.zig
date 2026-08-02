@@ -193,6 +193,20 @@ const uncovered = [_]Uncovered{
             "is a directed-test control; src/access_log_test.zig covers " ++
             "the keep-the-old-sink arm",
     },
+    .{
+        .name = "l4_proxy_header_accepted",
+        .why = .unreached,
+        .reason = "no sweep listener requires PROXY protocol yet — the #142 " ++
+            "receive-phase scripts are the next slice; " ++
+            "src/server_test.zig drives the accept path meanwhile",
+    },
+    .{
+        .name = "l4_proxy_header_invalid",
+        .why = .unreached,
+        .reason = "same gap as l4_proxy_header_accepted: no require-mode " ++
+            "listener in the sweep until the #142 scripts land; " ++
+            "src/server_test.zig drives the reject path meanwhile",
+    },
 };
 
 comptime {

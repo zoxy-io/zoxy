@@ -167,9 +167,23 @@ pub fn Relay(comptime IoType: type) type {
         pub fn start(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .relaying);
             assert(conn.upstream_socket != null);
-            assert(conn.directions[0].phase == .idle);
+            const client_to_upstream =
+                &conn.directions[@intFromEnum(Direction.client_to_upstream)];
+            if (client_to_upstream.owed() >= 1) {
+                // Payload that arrived coalesced behind a PROXY header
+                // (#142): the receive phase staged it at the buffer's
+                // start and framed it as this direction's debt, so the
+                // relay enters the pump mid-cycle — received, owed, not
+                // yet sent — exactly where `onRecv` would stand after
+                // framing. The send drains the debt, then rejoins the
+                // recv loop; no byte is read ahead of it (§6).
+                assert(client_to_upstream.phase == .receiving);
+                PumpClientToUpstream.armSend(server, conn);
+            } else {
+                assert(client_to_upstream.phase == .idle);
+                PumpClientToUpstream.armRecv(server, conn);
+            }
             assert(conn.directions[1].phase == .idle);
-            PumpClientToUpstream.armRecv(server, conn);
             PumpUpstreamToClient.armRecv(server, conn);
         }
 

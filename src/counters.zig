@@ -254,6 +254,20 @@ pub const Counters = struct {
     /// count means someone is sending chains no real topology produces,
     /// which is worth knowing.
     forwarded_chain_dropped: Value = Value.init(0),
+    /// §6 PROXY protocol receive (#142): connections a `proxy_protocol`
+    /// listener closed because the peer's opening bytes were not a valid
+    /// header — malformed, over `proxy_header_bytes_max`, or EOF
+    /// mid-header. Deliberately **not** `shed_`-prefixed, on
+    /// `l4_shed_endpoint_inflight`'s exact reasoning: the connection was
+    /// admitted before its header could be judged, so it counts in the
+    /// flow identity as an ordinary completion. A rising count means
+    /// something other than the configured fronting proxy is reaching a
+    /// listener whose mode exists to refuse exactly that.
+    l4_proxy_header_invalid: Value = Value.init(0),
+    /// Headers a `proxy_protocol` listener accepted, address-bearing or
+    /// not — `LOCAL` and `UNKNOWN` keep the observed peer, and a
+    /// fronting proxy's health checks arrive exactly that way (§6).
+    l4_proxy_header_accepted: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).
