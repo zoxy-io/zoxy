@@ -241,6 +241,15 @@ pub const Config = struct {
         /// beside any other policy rather than leaving it inert.
         hash_key: HashKey = .source_ip,
 
+        /// The PROXY protocol header this cluster's origins expect zoxy
+        /// to open every upstream connection with (#142 send), or null
+        /// for none. Per *cluster* — HAProxy's `send-proxy` unit — since
+        /// it states what the origin reads, not who connects. Only `l4`
+        /// listeners may route here: a pooled L7 upstream is shared
+        /// across clients (§3), and a per-connection header cannot name
+        /// one client — rejected at load, not silently ignored.
+        proxy_protocol_send: ?ProxyProtocolSend = null,
+
         pub const Pick = enum(u2) {
             rr,
             p2c,
@@ -261,6 +270,16 @@ pub const Config = struct {
             /// an L4 connection has nothing else, and an L7 request need
             /// not have been parsed yet.
             source_ip,
+        };
+
+        /// Which PROXY protocol version to write (#142): a closed
+        /// vocabulary rather than a bool because the wire formats differ
+        /// and the *origin's* parser — not zoxy — decides which it
+        /// reads. v2 is what cloud load balancers speak; v1 is
+        /// human-readable in a tcpdump.
+        pub const ProxyProtocolSend = enum(u1) {
+            v1,
+            v2,
         };
 
         /// One cluster's resolved check policy (§7). Every field is
@@ -345,6 +364,8 @@ pub const ValidationError = error{
     ListenerForwardedModeUnknown,
     ListenerHttpProxyProtocol,
     ListenerProxyProtocolModeUnknown,
+    ClusterProxyProtocolSendUnknown,
+    ClusterProxyProtocolOnHttpListener,
     FilterMethodEmpty,
     FilterMethodUnknown,
     FilterHeaderMatchKind,
@@ -1021,6 +1042,10 @@ pub const ClusterJson = struct {
     /// Optional §7 hash-policy detail; only valid beside `"pick": "hash"`,
     /// and absent there means the default key.
     hash: ?ClusterHashJson = null,
+    /// Optional PROXY protocol announcement on upstream connections
+    /// (#142); absent sends none. Only valid on clusters no http
+    /// listener routes to.
+    proxy_protocol: ?ClusterProxyProtocolJson = null,
 
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
@@ -1044,6 +1069,28 @@ pub const ClusterJson = struct {
             .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
             .minimum = 1,
             .maximum = constants.endpoint_inflight_max,
+        },
+        .proxy_protocol = .{
+            .desc = "Announce each client to this cluster's origins with a PROXY " ++
+                "protocol header on the upstream connection (l4-reachable " ++
+                "clusters only); absent sends none.",
+        },
+    };
+};
+
+pub const ClusterProxyProtocolJson = struct {
+    send: []const u8,
+
+    pub const schema_doc =
+        "What this cluster's origins expect ahead of the payload. The header " ++
+        "names the connection's client, so only l4 listeners may route to a " ++
+        "sending cluster — a pooled HTTP upstream is shared across clients " ++
+        "and cannot carry a per-client header.";
+    pub const schema_fields = .{
+        .send = .{
+            .desc = "PROXY protocol version to write: v1 (text) or v2 (binary — " ++
+                "what cloud load balancers speak).",
+            .enum_type = Config.Cluster.ProxyProtocolSend,
         },
     };
 };
@@ -1304,11 +1351,11 @@ pub fn assert_meta_matches(comptime T: type) void {
 /// block below runs `assert_meta_matches` on each at comptime, so the
 /// metadata cannot drift from the fields whether or not the emitter builds.
 pub const dto_types = .{
-    ConfigJson,    ListenerJson,      RouteJson,    FilterJson,
-    MatchJson,     HeaderMatchJson,   ActionJson,   HeaderEditJson,
-    RewriteJson,   ClusterJson,       TimeoutsJson, LimitsJson,
-    AdminJson,     AccessLogJson,     CheckJson,    ClusterHashJson,
-    ForwardedJson, ProxyProtocolJson,
+    ConfigJson,    ListenerJson,      RouteJson,                FilterJson,
+    MatchJson,     HeaderMatchJson,   ActionJson,               HeaderEditJson,
+    RewriteJson,   ClusterJson,       TimeoutsJson,             LimitsJson,
+    AdminJson,     AccessLogJson,     CheckJson,                ClusterHashJson,
+    ForwardedJson, ProxyProtocolJson, ClusterProxyProtocolJson,
 };
 
 comptime {
@@ -1379,6 +1426,7 @@ fn resolveClusters(
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
             .hash_key = try hashKeyOf(pick, entry.cluster.hash),
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
+            .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
         };
     }
     assert(clusters.len == count);
@@ -1447,6 +1495,9 @@ fn resolveListeners(
             .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
             .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
         };
+        if (protocol == .http) {
+            try rejectHttpClusterSend(listeners[index].routes, clusters);
+        }
     }
 
     // Duplicate binds in O(n log n), for the reason `resolveClusters`
@@ -2015,6 +2066,39 @@ fn resolveProxyProtocol(
 fn pickOf(literal: []const u8) error{ClusterPickUnknown}!Config.Cluster.Pick {
     return std.meta.stringToEnum(Config.Cluster.Pick, literal) orelse
         error.ClusterPickUnknown;
+}
+
+/// A cluster that sends PROXY protocol (#142) may only be reached by l4
+/// listeners: a pooled L7 upstream is shared across clients (§3), and
+/// the header is per *connection*, naming one client — so an http route
+/// to a sending cluster describes a header that would lie, rejected
+/// rather than silently not sent. Reachability, not exclusivity: the
+/// same cluster stays valid for every l4 listener beside it.
+fn rejectHttpClusterSend(
+    routes: []const router.Route,
+    clusters: []const Config.Cluster,
+) ValidationError!void {
+    assert(routes.len >= 1);
+    for (routes) |route| {
+        assert(route.cluster_index < clusters.len);
+        if (clusters[route.cluster_index].proxy_protocol_send != null) {
+            return error.ClusterProxyProtocolOnHttpListener;
+        }
+    }
+}
+
+/// Resolve a cluster's PROXY protocol announcement (#142): absent is
+/// off, and the version vocabulary is closed. The l4-only restriction is
+/// enforced where listeners resolve — reachability is a property of the
+/// listener/cluster *pair*, and only that side sees both.
+fn resolveClusterProxyProtocol(
+    proxy_protocol_json: ?ClusterProxyProtocolJson,
+) ValidationError!?Config.Cluster.ProxyProtocolSend {
+    const proxy_protocol = proxy_protocol_json orelse return null;
+    return std.meta.stringToEnum(
+        Config.Cluster.ProxyProtocolSend,
+        proxy_protocol.send,
+    ) orelse error.ClusterProxyProtocolSendUnknown;
 }
 
 /// The §7 hash key for a cluster: its `hash` block's, or the default when
@@ -3606,6 +3690,58 @@ test "config: the proxy_protocol block resolves a mode, and is l4-only" {
     try expectParseError(
         error.MissingField,
         head ++ ",\"proxy_protocol\":{}" ++ tail,
+    );
+}
+
+test "config: the cluster proxy_protocol block resolves a version, l4-reachable only" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    const middle = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]";
+    const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // Absent: no header is sent — every config predating this.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ middle ++ tail);
+        try std.testing.expect(parsed.clusters[0].proxy_protocol_send == null);
+    }
+    // Both versions resolve on an l4-reachable cluster; neither is a default.
+    inline for (.{ "v1", "v2" }) |version| {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ middle ++ ",\"proxy_protocol\":{\"send\":\"" ++ version ++ "\"}" ++ tail,
+        );
+        try std.testing.expectEqual(
+            std.meta.stringToEnum(Config.Cluster.ProxyProtocolSend, version).?,
+            parsed.clusters[0].proxy_protocol_send.?,
+        );
+    }
+    // An http listener routing to a sending cluster is rejected: a pooled
+    // L7 upstream is shared across clients, so the per-connection header
+    // would name one client and serve many.
+    try expectParseError(
+        error.ClusterProxyProtocolOnHttpListener,
+        head ++ ",\"protocol\":\"http\"" ++ middle ++
+            ",\"proxy_protocol\":{\"send\":\"v2\"}" ++ tail,
+    );
+    // The same cluster reached by an http listener *beside* the l4 one is
+    // just as rejected — reachability poisons, not exclusivity.
+    try expectParseError(
+        error.ClusterProxyProtocolOnHttpListener,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}," ++
+            "{\"bind\":\"127.0.0.1:3\",\"protocol\":\"http\",\"cluster\":\"a\"" ++ middle ++
+            ",\"proxy_protocol\":{\"send\":\"v2\"}" ++ tail,
+    );
+    // The version vocabulary is closed and `send` is required.
+    try expectParseError(
+        error.ClusterProxyProtocolSendUnknown,
+        head ++ middle ++ ",\"proxy_protocol\":{\"send\":\"v3\"}" ++ tail,
+    );
+    try expectParseError(
+        error.MissingField,
+        head ++ middle ++ ",\"proxy_protocol\":{}" ++ tail,
     );
 }
 
