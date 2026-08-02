@@ -224,13 +224,13 @@ pub fn Server(comptime IoType: type) type {
                 @sizeOf(u32) + // UpstreamPool.idle_heads
                 @sizeOf(u16) + // UpstreamPool.leased_counts
                 @sizeOf(u64) + // Balancer.endpoint_hashes
+                @sizeOf(i64) + // Balancer.rr_current
                 @sizeOf(u16) + // Server.l4_inflight
                 @sizeOf(bool) + // Checker.healthy
                 @sizeOf(u8) + // Checker.fail_streaks
                 @sizeOf(u8); // Checker.ok_streaks
-            const cursors = @as(u64, config.clusters.len) * @sizeOf(u64);
             const scratch = @as(u64, keys.stride) * @sizeOf(u16);
-            const total = count * per_key + cursors + scratch;
+            const total = count * per_key + scratch;
             assert(total > 0);
             return total;
         }

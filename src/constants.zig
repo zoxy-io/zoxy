@@ -904,10 +904,10 @@ pub const PoolSizes = struct {
     /// covers all of that. `accessLogBytes` is the closed form.
     access_log_bytes: u64,
     /// The endpoint-keyed tables (§7) — the pool's idle heads and lease
-    /// counts, the balancer's endpoint hashes, cursors and pick scratch,
-    /// the server's L4 charges, and the health checker's mask and two
-    /// streak counters. Startup arena memory held for the process's life,
-    /// so §5's promise covers it.
+    /// counts, the balancer's endpoint hashes, rotation state and pick
+    /// scratch, the server's L4 charges, and the health checker's mask
+    /// and two streak counters. Startup arena memory held for the
+    /// process's life, so §5's promise covers it.
     ///
     /// Passed in rather than derived here because the per-entry widths
     /// belong to those modules' element types, not to this file: computing

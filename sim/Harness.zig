@@ -62,6 +62,10 @@ io: SimIo,
 server: ServerSim,
 endpoints_l4: [1]std.Io.net.IpAddress,
 endpoints_http: [1]std.Io.net.IpAddress,
+/// The #174 weight tables the clusters may reference; single-entry like
+/// the endpoint lists they parallel.
+weights_l4: [1]u16,
+weights_http: [1]u16,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
@@ -418,10 +422,21 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     const health = deriveHealthChecks(harness.clean, random, connect_timeout_ms);
     harness.http_origin_stop_at_ns = health.http_origin_stop_at_ns;
     harness.proxy_protocol_send_l4 = deriveProxyProtocolSend(random);
+    // #174 weights on a single-endpoint topology: the share itself is
+    // moot (there is nobody to share against, and one endpoint at any
+    // nonzero weight routes identically), but drawing a table at all
+    // flows the weights contract — parallel lengths, the nonzero-sum
+    // init assertion, the eligibility filter's weight read — through
+    // every schedule the adversary can produce. The proportional
+    // properties are pinned by balancer.zig's own tests, exactly like
+    // `hash`'s stickiness above.
+    harness.weights_l4 = .{1 + random.uintAtMost(u16, 255)};
+    harness.weights_http = .{1 + random.uintAtMost(u16, 255)};
     harness.clusters = .{
         .{
             .name = "origin-l4",
             .endpoints = &harness.endpoints_l4,
+            .weights = if (random.boolean()) &harness.weights_l4 else null,
             .pick = pick_l4,
             .check = health.check_l4,
             .max_inflight = deriveMaxInflight(harness.clean, random),
@@ -430,6 +445,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         .{
             .name = "origin-http",
             .endpoints = &harness.endpoints_http,
+            .weights = if (random.boolean()) &harness.weights_http else null,
             .pick = pick_http,
             .check = health.check_http,
             .max_inflight = deriveMaxInflight(harness.clean, random),
