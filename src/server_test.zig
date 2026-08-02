@@ -88,6 +88,10 @@ pub const Client = struct {
     /// armed, so the accept "CQE" has already beaten the listener close:
     /// the §8 drain race, made deterministic.
     drain_on_connect: bool = false,
+    /// Bytes sent ahead of the token — a scripted PROXY protocol header
+    /// (#142) for `proxy_protocol` scenarios; empty for everyone else.
+    prefix: []const u8 = "",
+    prefix_sent: u32 = 0,
     sent_len: u32 = 0,
     received_len: u32 = 0,
     fin_sent: bool = false,
@@ -118,12 +122,19 @@ pub const Client = struct {
     }
 
     fn armSend(client: *Client) void {
-        assert(client.sent_len < echo_token.len);
         assert(!client.send_pending);
         client.send_pending = true;
+        // The scripted prefix goes first, then the token — two cursors,
+        // one send in flight at a time, resumed from whichever is short.
+        const bytes = if (client.prefix_sent < client.prefix.len)
+            client.prefix[client.prefix_sent..]
+        else blk: {
+            assert(client.sent_len < echo_token.len);
+            break :blk echo_token[client.sent_len..];
+        };
         client.scenario.io.send(
             client.socket,
-            echo_token[client.sent_len..],
+            bytes,
             &client.send_completion,
             Client,
             client,
@@ -140,11 +151,16 @@ pub const Client = struct {
             client.settleIfTerminal();
             return;
         };
-        client.sent_len += sent;
-        assert(client.sent_len <= echo_token.len);
+        if (client.prefix_sent < client.prefix.len) {
+            client.prefix_sent += sent;
+            assert(client.prefix_sent <= client.prefix.len);
+        } else {
+            client.sent_len += sent;
+            assert(client.sent_len <= echo_token.len);
+        }
         if (client.terminal_outcome != null) {
             client.settleIfTerminal();
-        } else if (client.sent_len < echo_token.len) {
+        } else if (client.prefix_sent < client.prefix.len or client.sent_len < echo_token.len) {
             client.armSend();
         }
     }
@@ -227,6 +243,9 @@ pub const TestBed = struct {
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 20,
+        /// The #142 receive gate on the one listener; null for everyone
+        /// but the PROXY protocol scenarios.
+        proxy_protocol: ?config_module.Config.Listener.ProxyProtocol = null,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -251,7 +270,12 @@ pub const TestBed = struct {
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
-        bed.listeners = .{.{ .bind_address = bindAddress(), .routes = &bed.routes, .protocol = .l4 }};
+        bed.listeners = .{.{
+            .bind_address = bindAddress(),
+            .routes = &bed.routes,
+            .protocol = .l4,
+            .proxy_protocol = options.proxy_protocol,
+        }};
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
@@ -942,6 +966,140 @@ test "relay: a connection reaped by the idle deadline is logged as aborted" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"bytes_in\":0,") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"bytes_out\":0,") != null);
+}
+
+// The announced client deliberately differs from `SimIo`'s observed peer
+// (198.51.100.1:5xxxx) in *both* address and port, so the log oracle
+// below cannot pass by accident.
+const proxy_v1_line = "PROXY TCP4 203.0.113.7 10.0.0.1 4711 443\r\n";
+
+test "proxy protocol: the header is consumed, the payload relays, the client is believed" {
+    // The slice-3 promise end to end: a require-listener consumes the
+    // header (the origin sees the token alone, byte-exact), any payload
+    // coalesced behind it relays, and `client_address` becomes the
+    // announced client — witnessed through the access log, the same
+    // field the §7 hash pick reads. Partial-io seeds split the header
+    // across deliveries, so the accumulate-and-retry loop is exercised
+    // and not just the one-recv happy path.
+    var seed: u64 = 1;
+    while (seed <= 15) : (seed += 1) {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{
+                .seed = seed,
+                .adversary = .{ .partial_io = true, .connect_delay_ns_max = 2_000_000 },
+            },
+            .proxy_protocol = .require,
+            .access_log = true,
+        });
+        defer bed.tearDown();
+
+        bed.scenario.clients_count = 1;
+        const client = &bed.scenario.clients[0];
+        client.exchange = true;
+        client.prefix = proxy_v1_line;
+        client.start(&bed.scenario, TestBed.bindAddress());
+        try bed.sim_io.run();
+        try bed.expectDrained();
+
+        try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+        try std.testing.expectEqualStrings(
+            echo_token,
+            client.receive_buffer[0..client.received_len],
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_accepted"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_invalid"));
+
+        const line = std.mem.trimEnd(u8, bed.sim_io.sinkBytes(), "\n");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"client\":\"203.0.113.7:4711\"") != null);
+        // `bytes_in` counts the payload alone: the header is metadata the
+        // origin never sees, whichever recv it arrived in.
+        var expected: [64]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            line,
+            try std.fmt.bufPrint(&expected, "\"bytes_in\":{d},", .{echo_token.len}),
+        ) != null);
+    }
+}
+
+test "proxy protocol: an UNKNOWN header is accepted and keeps the observed peer" {
+    // The fronting proxy's health checks arrive exactly this way (§6):
+    // a valid header that announces nothing. The relay must proceed and
+    // the log must state the peer the kernel saw.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 11 },
+        .proxy_protocol = .require,
+        .access_log = true,
+    });
+    defer bed.tearDown();
+
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = "PROXY UNKNOWN\r\n";
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(Client.Outcome.eof, client.outcome);
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.receive_buffer[0..client.received_len],
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_accepted"));
+    const line = std.mem.trimEnd(u8, bed.sim_io.sinkBytes(), "\n");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"client\":\"198.51.100.1:50000\"") != null);
+}
+
+test "proxy protocol: a peer that does not open with the header is refused" {
+    // `require`'s whole meaning: the raw token is a perfectly valid
+    // payload on any other listener, and this one closes on its first
+    // byte. Nothing reaches the origin; the counter names the verdict.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 7 },
+        .proxy_protocol = .require,
+    });
+    defer bed.tearDown();
+
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true; // Sends the raw token: no header anywhere.
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expect(client.outcome == .eof or client.outcome == .reset);
+    try std.testing.expectEqual(@as(u32, 0), client.received_len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_invalid"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_accepted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+}
+
+test "proxy protocol: a silent peer is reaped on the connect budget" {
+    // The phase runs under the connect clock, not the idle one: the
+    // fronting proxy speaks immediately after connecting, so a peer
+    // that says nothing is reaped on the dial-scale deadline.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 5 },
+        .connect_timeout_ms = 10,
+        .idle_timeout_ms = 20,
+        .proxy_protocol = .require,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, false); // Connects, then says nothing.
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    const client = &bed.scenario.clients[0];
+    try std.testing.expect(client.outcome == .eof or client.outcome == .reset);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_invalid"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_proxy_header_accepted"));
 }
 
 test "health: probes against a listening origin keep the endpoint healthy" {

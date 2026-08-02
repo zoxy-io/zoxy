@@ -270,7 +270,11 @@ pub fn Conn(comptime IoType: type) type {
         /// found by parsing, the body (or a pipelined next head) follows
         /// it. A count, not content: it survives the buffer's return at a
         /// static response, because the §7 resync rule still reads it to
-        /// decide keep-or-close; `beginNextRequest` zeroes it.
+        /// decide keep-or-close; `beginNextRequest` zeroes it. The
+        /// `l4_reading_proxy_header` phase (#142) counts the same way
+        /// over its own staging — the relay buffer's client→upstream
+        /// half — and zeroes it at hand-over, so the relay starts clean
+        /// and the L7 meaning is never mixed with the L4 one.
         head_len: u32,
         /// The client-directed write in flight, if any (§7, §8) — see
         /// `ClientWrite`. Idle on the L4 path, which relays through the pump.
@@ -345,6 +349,13 @@ pub fn Conn(comptime IoType: type) type {
 
         pub const State = enum(u8) {
             // L4 relay states.
+            /// Reading the PROXY protocol header a `proxy_protocol`
+            /// listener requires (#142), staged in the relay buffer's
+            /// client→upstream half and accumulated in `head_len`.
+            /// Runs *before* `.connecting`, necessarily: the dial
+            /// consumes `client_address` (the hash pick, §7), and the
+            /// header is what makes that address the real client's.
+            l4_reading_proxy_header,
             connecting,
             relaying,
             // L7 states (§7): `l7_reading_head` accumulates and re-parses
@@ -377,6 +388,7 @@ pub fn Conn(comptime IoType: type) type {
         /// `beginTeardown` is a legal transition.
         pub fn isLive(conn: *const Self) bool {
             return switch (conn.state) {
+                .l4_reading_proxy_header,
                 .connecting,
                 .relaying,
                 .l7_reading_head,

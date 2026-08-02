@@ -25,6 +25,7 @@ const Pool = @import("mem/Pool.zig").Pool;
 const proxy = @import("http/proxy.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
+const proxy_protocol = @import("net/proxy_protocol.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 const upstream_module = @import("net/upstream.zig");
@@ -632,7 +633,14 @@ pub fn Server(comptime IoType: type) type {
                 .http => null,
             };
             server.finishAdmission(conn, client_socket, buffer, state);
-            server.startProtocol(conn, state.protocol);
+            if (state.proxy_protocol != null) {
+                // The loader rejects the block on an http listener, so a
+                // non-null here can only be an l4 one (#142).
+                assert(state.protocol == .l4);
+                server.startProxyHeaderPhase(conn);
+            } else {
+                server.startProtocol(conn, state.protocol);
+            }
         }
 
         /// The state a protocol's connection starts serving in, in one
@@ -668,10 +676,10 @@ pub fn Server(comptime IoType: type) type {
         /// fork happens after the handshake rather than at accept.
         ///
         /// It takes the protocol as an argument rather than reading it off
-        /// the slot deliberately: on this branch the second caller does not
-        /// exist, and a field with one writer and one reader would be state
-        /// kept for a caller that is not here (§1). The phase that needs to
-        /// recall a connection's protocol is the one that should decide how.
+        /// the slot deliberately: a field with one writer and one reader
+        /// would be state kept for the caller's convenience (§1), and both
+        /// callers — admission, and the PROXY-header phase's hand-over
+        /// (#142) — know the protocol without asking.
         ///
         /// The state and deadline stores are idempotent at admission — the
         /// tail below set exactly these values from the same protocol, and
@@ -680,12 +688,17 @@ pub fn Server(comptime IoType: type) type {
         /// between the two writes — and they are load-bearing for a
         /// hand-over, which arrives in whatever state its phase ran in.
         /// Keeping them here is what makes both callers a single call.
+        ///
+        /// No `!draining` assert, deliberately: admission's path asserts
+        /// it at `admit`, but a hand-over may legally complete mid-drain —
+        /// an admitted connection finishing its work is exactly what the
+        /// drain waits for (§8), so the phase proceeds to the dial and the
+        /// drain timer bounds it like any other straggler.
         fn startProtocol(
             server: *Self,
             conn: *ConnType,
             protocol: config_module.Config.Listener.Protocol,
         ) void {
-            assert(!server.draining);
             assert(!conn.isTearingDown());
             // The one timer this connection ever arms is already armed
             // (§4: a state transition only ever *stores* a new deadline).
@@ -860,6 +873,128 @@ pub fn Server(comptime IoType: type) type {
         fn releaseConn(server: *Self, conn: *ConnType) void {
             server.conns.release(conn);
             server.updateConnPressure();
+        }
+
+        /// Enter the §6 PROXY-protocol receive phase (#142) on an admitted
+        /// L4 connection: read the fronting proxy's header before the dial,
+        /// because the dial consumes `client_address` (the hash pick, §7)
+        /// and the header is what makes that the real client. Runs under
+        /// the connect budget `finishAdmission` already stored — the
+        /// fronting proxy speaks immediately after connecting, so a silent
+        /// peer is reaped on a dial-scale clock, and the hand-over's fresh
+        /// connect deadline only ever moves *later*, which the lazily
+        /// re-armed timer absorbs without a rebase (§4).
+        fn startProxyHeaderPhase(server: *Self, conn: *ConnType) void {
+            assert(!conn.isTearingDown());
+            assert(conn.state == .connecting);
+            assert(conn.relay_buffer != null);
+            assert(conn.armed.deadline);
+            assert(conn.head_len == 0);
+            conn.state = .l4_reading_proxy_header;
+            server.armProxyHeaderRecv(conn);
+        }
+
+        /// One recv into the staging window past what has accumulated.
+        /// The window ends at the cap, not the buffer: a header the cap
+        /// rejects should be rejected by the parser's verdict, never by
+        /// outreading the staging the §5 budget assigned this phase.
+        fn armProxyHeaderRecv(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .l4_reading_proxy_header);
+            assert(conn.relay_buffer != null);
+            assert(conn.head_len < constants.proxy_header_bytes_max);
+            const staging = conn.relay_buffer.?
+                .client_to_upstream[0..constants.proxy_header_bytes_max];
+            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            server.io.recv(
+                conn.client_socket,
+                staging[conn.head_len..],
+                &conn.op_data_client_to_upstream.completion,
+                ConnType,
+                conn,
+                onProxyHeaderRecv,
+            );
+        }
+
+        /// Accumulate and re-judge from byte 0 (detect-and-retry, §7's
+        /// discipline): the parser's verdicts are monotonic, so a partial
+        /// header reads `need_more` until its last byte lands.
+        fn onProxyHeaderRecv(conn: *ConnType, result: Io.RecvError!u32) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .l4_reading_proxy_header);
+            const received = result catch |err| {
+                if (err == error.EndOfStream) {
+                    // A peer that hangs up mid-header was not the
+                    // configured proxy; same verdict as garbage bytes.
+                    server.counters.increment("l4_proxy_header_invalid");
+                } else {
+                    server.witnessKernelPressure(.recv, err);
+                }
+                server.beginTeardown(conn);
+                return;
+            };
+            assert(received >= 1);
+            conn.head_len += received;
+            assert(conn.head_len <= constants.proxy_header_bytes_max);
+            const staged = conn.relay_buffer.?.client_to_upstream[0..conn.head_len];
+            const parsed = proxy_protocol.parse(staged);
+            switch (parsed) {
+                .need_more => server.armProxyHeaderRecv(conn),
+                .invalid => {
+                    server.counters.increment("l4_proxy_header_invalid");
+                    server.beginTeardown(conn);
+                },
+                .ok => |*header| server.finishProxyHeader(conn, header),
+            }
+        }
+
+        /// The hand-over (#142): believe the header, stage any coalesced
+        /// payload as the relay's opening debt, and start the protocol —
+        /// `startProtocol`'s anticipated second caller.
+        fn finishProxyHeader(
+            server: *Self,
+            conn: *ConnType,
+            header: *const proxy_protocol.Header,
+        ) void {
+            assert(conn.state == .l4_reading_proxy_header);
+            assert(header.bytes_len >= 1);
+            assert(header.bytes_len <= conn.head_len);
+            server.counters.increment("l4_proxy_header_accepted");
+            // Null keeps the observed peer (LOCAL/UNKNOWN, §6): the
+            // fronting proxy's own health checks arrive that way.
+            if (header.client) |client| {
+                conn.client_address = client;
+            }
+            const leftover_len = conn.head_len - header.bytes_len;
+            if (leftover_len >= 1) {
+                // Payload the last recv delivered behind the header. Move
+                // it to the buffer's start and frame it as the client→
+                // upstream direction's debt; `Relay.start` enters the
+                // pump mid-cycle on exactly this state.
+                const staging = &conn.relay_buffer.?.client_to_upstream;
+                std.mem.copyForwards(
+                    u8,
+                    staging[0..leftover_len],
+                    staging[header.bytes_len..conn.head_len],
+                );
+                // The payload is client bytes that crossed the wire — the
+                // access log's `bytes_in` unit (§8) — which the relay's
+                // own counting will never see; the header is metadata the
+                // origin never receives, so it stays uncounted.
+                conn.log.bytes_in += leftover_len;
+                const direction = &conn.directions[
+                    @intFromEnum(ConnType.Direction.client_to_upstream)
+                ];
+                assert(direction.phase == .idle);
+                direction.phase = .receiving;
+                direction.owe(leftover_len);
+            }
+            conn.head_len = 0;
+            server.startProtocol(conn, .l4);
         }
 
         fn armConnect(server: *Self, conn: *ConnType, cluster_index: u16) void {
@@ -1569,8 +1704,9 @@ pub fn Server(comptime IoType: type) type {
         /// timely response from the upstream — a connect that never
         /// completes is exactly that) via the one connect cancel outside
         /// teardown; a refused dial keeps its prompt 502. Every other
-        /// state (L4, head read's slowloris, the static-response drain, a
-        /// pending verdict) tears down as before.
+        /// state (L4 — its PROXY-header read included, whose silent peer
+        /// this is the reaper for — head read's slowloris, the
+        /// static-response drain, a pending verdict) tears down as before.
         fn expireDeadline(server: *Self, conn: *ConnType) void {
             assert(!conn.isTearingDown());
             assert(!conn.armed.deadline); // Delivered; re-armed only below.
