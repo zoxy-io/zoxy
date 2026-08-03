@@ -483,6 +483,16 @@ pub fn Conn(comptime IoType: type) type {
             /// across by hand — a replay is the same request retrying, not
             /// a new one earning a fresh budget.
             request_deadline_ns: u64 = 0,
+            /// The endpoint identity this request's stickiness cookie
+            /// named (#178), or null when the cluster is not
+            /// cookie-keyed or the request carried nothing usable.
+            /// Recorded at routing — the head bytes are gone by the
+            /// response render (§7 buffer rotation), and the render is
+            /// exactly who asks: it compares this against the endpoint
+            /// that actually served, and stamps a Set-Cookie on any
+            /// mismatch. The replay rebuild re-derives it from its
+            /// re-parse, like the framing.
+            sticky_cookie: ?u64 = null,
             /// True once the request head has been forwarded off conn.head
             /// (head sent and any coalesced body excess drained), so the
             /// response head may render into conn.head (§7 buffer rotation).

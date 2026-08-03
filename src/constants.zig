@@ -366,6 +366,21 @@ pub const health_check_request_bytes_max: u32 =
 /// over this, so the render buffer can never overflow.
 pub const header_edits_max: u16 = 16;
 
+/// Upper bound on the header or cookie name a request-keyed `hash`
+/// cluster reads (#178) — the same fixed-buffer rule as
+/// `header_edits_max`: the response-side stamp composes
+/// `name=<tag>` plus attributes into a stack scratch, and this bound is
+/// what lets that scratch be sized at comptime. 64 covers every real
+/// cookie or header name with room over (`__Host-`-prefixed names
+/// included).
+pub const pick_name_bytes_max: u16 = 64;
+
+/// A response render's edit ceiling (#178): the configured filter edits
+/// plus the one slot the Set-Cookie stamp reserves. The renderer's
+/// asserts and the proxy's edit buffers all speak this name, so the
+/// reserved slot cannot drift out of any of them.
+pub const response_edits_max: u16 = header_edits_max + 1;
+
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
@@ -768,6 +783,11 @@ comptime {
     assert(endpoint_inflight_max >= conn_slots_max);
     assert(endpoint_inflight_max >= upstream_slots_max);
     assert(header_edits_max >= 1);
+    assert(response_edits_max == header_edits_max + 1);
+    assert(pick_name_bytes_max >= 1);
+    // A pick name is a header-adjacent identifier; keeping it under the
+    // host bound is the sanity relation "this is a name, not a payload".
+    assert(pick_name_bytes_max <= host_bytes_max);
     assert(loop_completions_per_tick_max >= 1);
     assert(timeout_ms_max >= 1000);
     // The two defaulted deadlines must themselves be configs the loader

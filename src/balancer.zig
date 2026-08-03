@@ -36,6 +36,21 @@
 //! same answer with nothing shared. Statelessness is what makes it correct
 //! under this process model, not just cheap.
 //!
+//! **Request-derived keys (#178).** A `hash` cluster names what it keys
+//! on. `source_ip` and a header value are true rendezvous keys — the
+//! mapping stays a pure function of key and eligible set. A cookie is
+//! not a hash at all: the client carries the *answer* — an endpoint tag
+//! in the spelling `formatEndpointTag` mints — so every process reaches
+//! the same endpoint by reading it, which is the table-free property
+//! above achieved a second way. When the keyed material is missing
+//! (first request of a cookie session, a request without the keyed
+//! header) the pick places by load instead, the same weighted two-choice
+//! draw `p2c` runs: cross-process agreement is not needed there, because
+//! #178's contract sends a cookie assignment back to the client on the
+//! response (the Set-Cookie stamp, the serving path's half of the
+//! feature), and a keyless header population has no identity to be
+//! sticky on in the first place.
+//!
 //! **Why rendezvous rather than a ring or Maglev.** Both of those answer
 //! a lookup from a precomputed table, and a table has to be *rebuilt*
 //! whenever membership changes — which here is every health-check
@@ -103,6 +118,24 @@ fn sourceKey(address: *const std.Io.net.IpAddress) u64 {
         .ip4 => |v4| mix64(std.mem.readInt(u32, &v4.bytes, .big)),
         .ip6 => |v6| mix64(std.mem.readInt(u64, v6.bytes[0..8], .big)),
     };
+}
+
+/// The §7 stickiness key for a request-carried byte string — a `hash`
+/// cluster keyed on a header value (#178). FNV-1a folded through
+/// `mix64`: FNV for the bytes because it is trivially pinned (two
+/// published constants), the finalizer because FNV's avalanche is weak
+/// and rendezvous compares whole words. Pinned for the same reason
+/// `mix64` is — this is part of the client-to-backend mapping, and a
+/// `std.hash` function makes no cross-version promise, which a rolling
+/// restart would turn into a silent re-shuffle.
+fn bytesKeyOf(bytes: []const u8) u64 {
+    assert(bytes.len >= 1); // An absent value is `.absent`, never hashed.
+    var hash: u64 = 0xCBF29CE484222325;
+    for (bytes) |byte| {
+        hash ^= byte;
+        hash *%= 0x100000001B3;
+    }
+    return mix64(hash);
 }
 
 /// An endpoint's stable identity for scoring: its address *and* port, so
@@ -190,6 +223,95 @@ pub const Balancer = struct {
     /// 64-bit golden-ratio constant, chosen for being recognizable.
     const pick_seed: u64 = 0x9E3779B97F4A7C15;
 
+    /// The request-derived half of a pick (#178): what the serving path
+    /// read off the parsed head for a request-keyed `hash` cluster. Both
+    /// data paths always pass the client address separately — it is the
+    /// whole key for `source_ip` and for every non-hash policy, which is
+    /// why those arms carry `.none` rather than an optional address.
+    pub const RequestKey = union(enum) {
+        /// No request-derived key applies: every non-hash policy, `hash`
+        /// on `source_ip`, and every L4 dial (the loader keeps the
+        /// request-keyed clusters off l4 listeners).
+        none,
+        /// `hash` on a header: the rendezvous key over the header value
+        /// (`bytesKey`).
+        key: u64,
+        /// `hash` on a cookie: the endpoint identity the cookie's tag
+        /// names (`parseEndpointTag`).
+        endpoint: u64,
+        /// The cluster is request-keyed but this request lacks usable
+        /// material — no such header, no cookie, a malformed tag: place
+        /// by load. On a cookie cluster the caller owes the client an
+        /// announcement of the assignment (#178's Set-Cookie stamp).
+        absent,
+    };
+
+    /// A cookie-borne endpoint tag (#178): the endpoint's rendezvous
+    /// identity, spelled as exactly 16 lowercase hex digits. Stable
+    /// across restarts, processes, and config reordering — it is
+    /// `endpointId`, a function of the address alone — and it leaks the
+    /// address's *hash* rather than the address, which is all a client
+    /// needs returned to it and nothing an operator minds it seeing.
+    pub const endpoint_tag_len: u16 = 16;
+
+    /// Spell `identity` as the tag a Set-Cookie carries.
+    pub fn formatEndpointTag(identity: u64, out: *[endpoint_tag_len]u8) void {
+        const spelled = std.fmt.bufPrint(out, "{x:0>16}", .{identity}) catch unreachable;
+        assert(spelled.len == endpoint_tag_len); // Zero-padded: every u64 fills the field.
+    }
+
+    /// The identity a tag spells, or null when the bytes are not exactly
+    /// the spelling `formatEndpointTag` mints — length and lowercase
+    /// both. The proxy never wrote a looser form, so accepting one would
+    /// give a forged cookie more grammar than a real one has; a mismatch
+    /// is a quiet re-pick, never an error, because a client can only
+    /// choose which backend serves *itself* (#178).
+    pub fn parseEndpointTag(bytes: []const u8) ?u64 {
+        if (bytes.len != endpoint_tag_len) {
+            return null;
+        }
+        assert(bytes.len == endpoint_tag_len);
+        var identity: u64 = 0;
+        for (bytes) |byte| {
+            const digit: u4 = switch (byte) {
+                '0'...'9' => @intCast(byte - '0'),
+                'a'...'f' => @intCast(byte - 'a' + 10),
+                else => return null,
+            };
+            identity = (identity << 4) | digit;
+        }
+        return identity;
+    }
+
+    /// The rendezvous key for a request-carried byte string — the
+    /// serving path's entry to `bytesKeyOf`, kept on the struct because
+    /// callers import `Balancer`, not this module.
+    pub fn bytesKey(bytes: []const u8) u64 {
+        return bytesKeyOf(bytes);
+    }
+
+    /// `endpointId` for one address, without an instance — what the §9
+    /// gates use to compute the tag an endpoint *must* be spelled as,
+    /// from nothing but its address, so an oracle can hold the running
+    /// proxy to it from outside.
+    pub fn addressIdentity(address: *const std.Io.net.IpAddress) u64 {
+        return endpointId(address);
+    }
+
+    /// The tag identity of one configured endpoint — what a cookie for
+    /// it spells (#178). Consumed by the response-side stamp, the
+    /// feature's serving half, once the exchange settles on an endpoint;
+    /// reading the init-computed table keeps mint and match one value.
+    pub fn endpointIdentity(
+        balancer: *const Balancer,
+        cluster_index: u16,
+        endpoint_index: u16,
+    ) u64 {
+        assert(cluster_index < balancer.config.clusters.len);
+        assert(endpoint_index < balancer.config.clusters[cluster_index].endpoints.len);
+        return balancer.endpoint_hashes[balancer.keys.key(cluster_index, endpoint_index)];
+    }
+
     pub fn init(
         balancer: *Balancer,
         arena: std.mem.Allocator,
@@ -236,6 +358,12 @@ pub const Balancer = struct {
                 weight_sum += weightOf(cluster, @intCast(endpoint_index));
             }
             assert(weight_sum >= 1);
+            // The loader's contract (#178): a hash key other than the
+            // default rides only beside `pick: hash` — `pickHash` is the
+            // one reader, so anywhere else it would be silently inert.
+            if (cluster.pick != .hash) {
+                assert(std.meta.activeTag(cluster.hash_key) == .source_ip);
+            }
             if (cluster.weights) |weights| {
                 assert(weights.len == cluster.endpoints.len);
             }
@@ -253,17 +381,21 @@ pub const Balancer = struct {
 
     /// Choose the endpoint to dial for `cluster_index` under the
     /// cluster's configured policy. `load` is the per-endpoint in-flight
-    /// view (indexed by `upstream.endpointKey`), consulted by p2c and
-    /// ignored by rr; `healthy` is the §7 health mask (same index) — the
-    /// prober owns that truth the way the pool and the server own the
-    /// load. Bounded work, no allocation, and a validated config
-    /// guarantees at least one endpoint.
+    /// view (indexed by `upstream.endpointKey`), consulted by p2c —
+    /// and by a request-keyed hash cluster placing a keyless request
+    /// (#178) — and ignored by rr; `healthy` is the §7 health mask (same
+    /// index) — the prober owns that truth the way the pool and the
+    /// server own the load. `request_key` is what the serving path read
+    /// off the parsed head for a request-keyed cluster, `.none`
+    /// everywhere else. Bounded work, no allocation, and a validated
+    /// config guarantees at least one endpoint.
     pub fn pick(
         balancer: *Balancer,
         cluster_index: u16,
         load: *const upstream.Load,
         healthy: []const bool,
         client_address: *const std.Io.net.IpAddress,
+        request_key: RequestKey,
     ) ?Pick {
         assert(cluster_index < balancer.config.clusters.len);
         const cluster = &balancer.config.clusters[cluster_index];
@@ -289,8 +421,14 @@ pub const Balancer = struct {
         }
         const chosen = switch (cluster.pick) {
             .rr => balancer.pickRoundRobin(cluster_index, eligible[0..count]),
-            .p2c => balancer.pickPowerOfTwo(cluster_index, eligible[0..count], load),
-            .hash => balancer.pickHash(cluster_index, eligible[0..count], client_address),
+            .p2c => balancer.placeByLoad(cluster_index, eligible[0..count], load),
+            .hash => balancer.pickHash(
+                cluster_index,
+                eligible[0..count],
+                load,
+                client_address,
+                request_key,
+            ),
         };
         assert(chosen < cluster.endpoints.len);
         return .{
@@ -414,14 +552,23 @@ pub const Balancer = struct {
     /// A mask narrowed to one endpoint skips the draw the way a
     /// one-endpoint cluster does — no candidates to compare, no PRNG
     /// state spent.
-    fn pickPowerOfTwo(
+    ///
+    /// This is the `.p2c` policy — and also where a request-keyed hash
+    /// cluster places a request whose key is missing or names nothing
+    /// eligible (#178). The shared spelling is deliberate: "healthy and
+    /// under-capacity, in that order" already narrowed the set, and
+    /// load-aware placement is the right first assignment for a session
+    /// the response is about to pin. A hash cluster therefore *can*
+    /// spend PRNG state — only on the keyless picks, where two
+    /// processes agreeing was never on the table.
+    fn placeByLoad(
         balancer: *Balancer,
         cluster_index: u16,
         eligible: []const u16,
         load: *const upstream.Load,
     ) u16 {
         const cluster = &balancer.config.clusters[cluster_index];
-        assert(cluster.pick == .p2c);
+        assert(cluster.pick == .p2c or cluster.pick == .hash);
         assert(eligible.len >= 1);
         if (eligible.len == 1) {
             return eligible[0];
@@ -482,6 +629,76 @@ pub const Balancer = struct {
         unreachable;
     }
 
+    /// Dispatch a `hash` cluster's pick by its configured key (§7,
+    /// #178). `source_ip` and `header` are rendezvous over different key
+    /// material; a `cookie` is not a hash of anything — the client
+    /// carries the answer, honoured when its tag names an eligible
+    /// endpoint. Keyless requests place by load (`placeByLoad`'s doc has
+    /// the argument). The `unreachable` arms are the caller reading the
+    /// wrong cluster: the L7 path derives the arm from this cluster's
+    /// own key, and the loader keeps request-keyed clusters off l4
+    /// listeners.
+    fn pickHash(
+        balancer: *Balancer,
+        cluster_index: u16,
+        eligible: []const u16,
+        load: *const upstream.Load,
+        client_address: *const std.Io.net.IpAddress,
+        request_key: RequestKey,
+    ) u16 {
+        assert(balancer.config.clusters[cluster_index].pick == .hash);
+        assert(eligible.len >= 1);
+        switch (balancer.config.clusters[cluster_index].hash_key) {
+            .source_ip => {
+                // Both data paths pass the address and pass nothing
+                // else: an L7 request need not have been parsed yet, an
+                // L4 connection has nothing to parse.
+                assert(std.meta.activeTag(request_key) == .none);
+                return balancer.rendezvous(cluster_index, eligible, sourceKey(client_address));
+            },
+            .header => switch (request_key) {
+                .key => |key| return balancer.rendezvous(cluster_index, eligible, key),
+                .absent => return balancer.placeByLoad(cluster_index, eligible, load),
+                .none, .endpoint => unreachable,
+            },
+            .cookie => switch (request_key) {
+                .endpoint => |identity| return balancer.pickTagged(
+                    cluster_index,
+                    eligible,
+                    load,
+                    identity,
+                ),
+                .absent => return balancer.placeByLoad(cluster_index, eligible, load),
+                .none, .key => unreachable,
+            },
+        }
+    }
+
+    /// The endpoint a cookie's tag names, when it is in the eligible set
+    /// — otherwise place by load: a tag naming an ejected, drained,
+    /// capped, or long-removed endpoint re-homes cleanly, and #178's
+    /// contract owes the client a re-announcement (the response-side
+    /// stamp). The scan is the eligible walk the pick already paid for;
+    /// matching by identity rather than index is what lets a config grow
+    /// or reorder without re-homing cookie holders, exactly
+    /// `endpointId`'s contract.
+    fn pickTagged(
+        balancer: *Balancer,
+        cluster_index: u16,
+        eligible: []const u16,
+        load: *const upstream.Load,
+        identity: u64,
+    ) u16 {
+        assert(std.meta.activeTag(balancer.config.clusters[cluster_index].hash_key) == .cookie);
+        assert(eligible.len >= 1);
+        for (eligible) |candidate| {
+            if (balancer.endpoint_hashes[balancer.keys.key(cluster_index, candidate)] == identity) {
+                return candidate;
+            }
+        }
+        return balancer.placeByLoad(cluster_index, eligible, load);
+    }
+
     /// Rendezvous hashing (§7): score every eligible endpoint against the
     /// client's key and take the highest. Two properties follow, and both
     /// are the point.
@@ -499,18 +716,15 @@ pub const Balancer = struct {
     /// computation, so this single pass is both.
     ///
     /// Spends no PRNG state: a draw would make two processes disagree,
-    /// which is the one thing this policy exists to prevent.
-    fn pickHash(
+    /// which is the one thing keyed stickiness exists to prevent.
+    fn rendezvous(
         balancer: *const Balancer,
         cluster_index: u16,
         eligible: []const u16,
-        client_address: *const std.Io.net.IpAddress,
+        key: u64,
     ) u16 {
         assert(balancer.config.clusters[cluster_index].pick == .hash);
         assert(eligible.len >= 1);
-        const key = switch (balancer.config.clusters[cluster_index].hash_key) {
-            .source_ip => sourceKey(client_address),
-        };
         var best = eligible[0];
         var best_score = balancer.score(key, cluster_index, best);
         for (eligible[1..]) |candidate| {
@@ -660,7 +874,7 @@ test "balancer: rr cycles endpoints and wraps per cluster" {
     counts[test_keys.key(0, 0)] = 100;
     const expected = [_]u16{ 0, 1, 2, 0, 1 };
     for (expected) |want_index| {
-        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
         try std.testing.expectEqual(trio[want_index], picked.address);
     }
@@ -683,7 +897,7 @@ test "balancer: a single-endpoint cluster short-circuits without a draw" {
     const counts = [_]u16{0} ** test_counts_len;
     var round: u32 = 0;
     while (round < 10) : (round += 1) {
-        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?;
         try std.testing.expectEqual(solo, picked.address);
         try std.testing.expectEqual(@as(u16, 0), picked.endpoint_index);
     }
@@ -713,7 +927,7 @@ test "balancer: p2c prefers the less-loaded of its two candidates" {
     counts[test_keys.key(0, 1)] = 100;
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
-        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?;
         try std.testing.expect(picked.endpoint_index != 1);
     }
 }
@@ -739,7 +953,7 @@ test "balancer: p2c spreads across endpoints under equal load" {
     var hits = [_]u32{0} ** 3;
     var round: u32 = 0;
     while (round < 300) : (round += 1) {
-        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?;
         hits[picked.endpoint_index] += 1;
     }
     for (hits) |hit_count| {
@@ -771,8 +985,8 @@ test "balancer: same seed, same picks — the p2c draw is deterministic" {
     var round: u32 = 0;
     while (round < 100) : (round += 1) {
         try std.testing.expectEqual(
-            left.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?.endpoint_index,
-            right.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?.endpoint_index,
+            left.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?.endpoint_index,
+            right.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?.endpoint_index,
         );
     }
 }
@@ -799,7 +1013,7 @@ test "balancer: rr rotates over the healthy endpoints only" {
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 2, 0, 2, 0 };
     for (expected) |want_index| {
-        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none).?;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
     }
 }
@@ -826,7 +1040,7 @@ test "balancer: rr honors weights, and the schedule is smooth" {
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 1, 0, 0, 1, 0 };
     for (expected) |want_index| {
-        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
     }
 }
@@ -852,7 +1066,7 @@ test "balancer: rr weight zero drains an endpoint, past fail-open" {
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 2, 0, 2 };
     for (expected) |want_index| {
-        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
     }
     // Fail-open re-admits the ejected, never the drained: a weight of 0
@@ -861,7 +1075,7 @@ test "balancer: rr weight zero drains an endpoint, past fail-open" {
     const none_healthy = [_]bool{false} ** test_keys.count;
     var round: u32 = 0;
     while (round < 20) : (round += 1) {
-        const picked = balancer.pick(0, &testLoad(&counts), &none_healthy, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &none_healthy, &test_client, .none).?;
         try std.testing.expect(picked.endpoint_index != 1);
     }
 }
@@ -890,7 +1104,7 @@ test "balancer: p2c candidacy follows weight" {
     var hits = [_]u32{0} ** 3;
     var round: u32 = 0;
     while (round < 400) : (round += 1) {
-        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?;
         hits[picked.endpoint_index] += 1;
     }
     try std.testing.expect(hits[0] > hits[1] + hits[2]);
@@ -930,8 +1144,8 @@ test "balancer: p2c at unit weights draws exactly as the unweighted form" {
     var round: u32 = 0;
     while (round < 100) : (round += 1) {
         try std.testing.expectEqual(
-            bare.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?.endpoint_index,
-            spelled.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?.endpoint_index,
+            bare.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?.endpoint_index,
+            spelled.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?.endpoint_index,
         );
     }
     try std.testing.expectEqual(bare.pick_state, spelled.pick_state);
@@ -961,7 +1175,7 @@ test "balancer: p2c never picks an ejected endpoint" {
     counts[test_keys.key(0, 2)] = 50;
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
-        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none).?;
         try std.testing.expect(picked.endpoint_index != 1);
     }
 }
@@ -988,7 +1202,7 @@ test "balancer: p2c narrowed to one healthy endpoint spends no draw" {
     const counts = [_]u16{0} ** test_counts_len;
     var round: u32 = 0;
     while (round < 10) : (round += 1) {
-        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none).?;
         try std.testing.expectEqual(@as(u16, 1), picked.endpoint_index);
     }
     try std.testing.expectEqual(state_before, balancer.pick_state);
@@ -1018,7 +1232,7 @@ test "balancer: a fully-ejected cluster fails open to every endpoint" {
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 1, 2, 0, 1 };
     for (expected) |want_index| {
-        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client).?;
+        const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none).?;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
     }
 }
@@ -1043,8 +1257,8 @@ test "balancer: policies keep independent state across clusters" {
     const counts = [_]u16{0} ** test_counts_len;
     const expected = [_]u16{ 0, 1, 0, 1, 0 };
     for (expected) |want_index| {
-        try std.testing.expectEqual(want_index, balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?.endpoint_index);
-        _ = balancer.pick(1, &testLoad(&counts), &test_healthy_all, &test_client);
+        try std.testing.expectEqual(want_index, balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none).?.endpoint_index);
+        _ = balancer.pick(1, &testLoad(&counts), &test_healthy_all, &test_client, .none);
     }
 }
 
@@ -1081,10 +1295,10 @@ test "balancer: hash sends one client to one endpoint, every time" {
 
     const counts = [_]u16{0} ** test_counts_len;
     const client = testAddress("203.0.113.9:51000");
-    const first = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index;
+    const first = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?.endpoint_index;
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
-        const again = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &client).?;
+        const again = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?;
         try std.testing.expectEqual(first, again.endpoint_index);
         try std.testing.expectEqual(endpoints[first], again.address);
     }
@@ -1094,7 +1308,7 @@ test "balancer: hash sends one client to one endpoint, every time" {
     loaded[test_keys.key(0, first)] = 10_000;
     try std.testing.expectEqual(
         first,
-        balancer.pick(0, &testLoad(&loaded), &test_healthy_all, &client).?.endpoint_index,
+        balancer.pick(0, &testLoad(&loaded), &test_healthy_all, &client, .none).?.endpoint_index,
     );
 }
 
@@ -1115,7 +1329,7 @@ test "balancer: hash spends no PRNG state and needs none" {
     const counts = [_]u16{0} ** test_counts_len;
     var index: u16 = 0;
     while (index < 500) : (index += 1) {
-        _ = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index));
+        _ = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none);
     }
     try std.testing.expectEqual(state_before, balancer.pick_state);
 }
@@ -1136,7 +1350,7 @@ test "balancer: hash spreads distinct clients across every endpoint" {
     var hits = [_]u32{0} ** 8;
     var index: u16 = 0;
     while (index < clients) : (index += 1) {
-        hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index)).?.endpoint_index] += 1;
+        hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none).?.endpoint_index] += 1;
     }
     // Rendezvous gives each client an independent uniform choice, so the
     // spread is a balls-in-bins one: loose bounds, but every endpoint must
@@ -1170,7 +1384,7 @@ test "balancer: ejecting an endpoint moves its clients and nobody else's" {
     var before: [clients]u16 = undefined;
     var index: u16 = 0;
     while (index < clients) : (index += 1) {
-        before[index] = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index)).?.endpoint_index;
+        before[index] = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none).?.endpoint_index;
     }
 
     const ejected: u16 = 3;
@@ -1180,7 +1394,7 @@ test "balancer: ejecting an endpoint moves its clients and nobody else's" {
     var moved: u32 = 0;
     index = 0;
     while (index < clients) : (index += 1) {
-        const after = balancer.pick(0, &testLoad(&counts), &healthy, &testClientAt(index)).?.endpoint_index;
+        const after = balancer.pick(0, &testLoad(&counts), &healthy, &testClientAt(index), .none).?.endpoint_index;
         try std.testing.expect(after != ejected);
         if (before[index] == ejected) {
             moved += 1;
@@ -1201,7 +1415,7 @@ test "balancer: ejecting an endpoint moves its clients and nobody else's" {
     while (index < clients) : (index += 1) {
         try std.testing.expectEqual(
             before[index],
-            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index)).?.endpoint_index,
+            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none).?.endpoint_index,
         );
     }
 }
@@ -1234,7 +1448,7 @@ test "balancer: hash spreads clients in proportion to weight" {
     var hits = [_]u32{0} ** 2;
     var index: u16 = 0;
     while (index < clients) : (index += 1) {
-        hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index)).?.endpoint_index] += 1;
+        hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none).?.endpoint_index] += 1;
     }
     const expected_heavy = clients * 3 / 4;
     try std.testing.expect(hits[0] > expected_heavy - 400);
@@ -1275,8 +1489,8 @@ test "balancer: re-weighting an endpoint disrupts only the clients it gains" {
     var index: u16 = 0;
     while (index < clients) : (index += 1) {
         const client = testClientAt(index);
-        const before = flat.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index;
-        const after = weighted.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index;
+        const before = flat.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?.endpoint_index;
+        const after = weighted.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?.endpoint_index;
         if (after != before) {
             try std.testing.expectEqual(@as(u16, 3), after);
             moved += 1;
@@ -1321,15 +1535,15 @@ test "balancer: hash weight zero drains an endpoint, past fail-open" {
     var index: u16 = 0;
     while (index < 500) : (index += 1) {
         const client = testClientAt(index);
-        const after = drained.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index;
+        const after = drained.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?.endpoint_index;
         try std.testing.expect(after != 3);
         try std.testing.expectEqual(
-            flat.pick(0, &testLoad(&counts), &ejected_mask, &client).?.endpoint_index,
+            flat.pick(0, &testLoad(&counts), &ejected_mask, &client, .none).?.endpoint_index,
             after,
         );
         // Fail-open re-admits the ejected, never the drained.
         try std.testing.expect(
-            drained.pick(0, &testLoad(&counts), &none_healthy, &client).?.endpoint_index != 3,
+            drained.pick(0, &testLoad(&counts), &none_healthy, &client, .none).?.endpoint_index != 3,
         );
     }
 }
@@ -1368,8 +1582,8 @@ test "balancer: two processes agree, and so do a config's reorderings" {
     var index: u16 = 0;
     while (index < 1000) : (index += 1) {
         const client = testClientAt(index);
-        const left_pick = left.pick(0, &testLoad(&counts), &test_healthy_all, &client).?;
-        const right_pick = right.pick(0, &testLoad(&counts), &test_healthy_all, &client).?;
+        const left_pick = left.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?;
+        const right_pick = right.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?;
         // The *address* must match; the index deliberately need not, the
         // lists being permutations of each other.
         try std.testing.expectEqual(left_pick.address, right_pick.address);
@@ -1394,8 +1608,8 @@ test "balancer: an IPv6 client keeps its endpoint when its /64 does" {
     const first = testAddress("[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:51000");
     const rotated = testAddress("[2001:db8:1:2:1111:2222:3333:4444]:52000");
     try std.testing.expectEqual(
-        balancer.pick(0, &testLoad(&counts), &test_healthy_all, &first).?.endpoint_index,
-        balancer.pick(0, &testLoad(&counts), &test_healthy_all, &rotated).?.endpoint_index,
+        balancer.pick(0, &testLoad(&counts), &test_healthy_all, &first, .none).?.endpoint_index,
+        balancer.pick(0, &testLoad(&counts), &test_healthy_all, &rotated, .none).?.endpoint_index,
     );
 
     // A different /64 is a different client and must be free to land
@@ -1406,8 +1620,8 @@ test "balancer: an IPv6 client keeps its endpoint when its /64 does" {
     while (prefix < 64) : (prefix += 1) {
         var other = first;
         other.ip6.bytes[7] = @intCast(prefix);
-        if (balancer.pick(0, &testLoad(&counts), &test_healthy_all, &other).?.endpoint_index !=
-            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &first).?.endpoint_index)
+        if (balancer.pick(0, &testLoad(&counts), &test_healthy_all, &other, .none).?.endpoint_index !=
+            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &first, .none).?.endpoint_index)
         {
             differs = true;
             break;
@@ -1480,8 +1694,8 @@ test "balancer: a fully ejected hash cluster still answers, deterministically" {
         // Fail-open restores the full set, so the answer is the same one
         // the healthy cluster gives.
         try std.testing.expectEqual(
-            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index,
-            balancer.pick(0, &testLoad(&counts), &none_healthy, &client).?.endpoint_index,
+            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none).?.endpoint_index,
+            balancer.pick(0, &testLoad(&counts), &none_healthy, &client, .none).?.endpoint_index,
         );
     }
 }
@@ -1497,6 +1711,204 @@ fn sourceKeyOf(comptime literal: []const u8) u64 {
 fn endpointIdOf(comptime literal: []const u8) u64 {
     const address = testAddress(literal);
     return endpointId(&address);
+}
+
+test "balancer: hash on a header keys on the value, not the client" {
+    const endpoints = testHashEndpoints(8);
+    const clusters = [_]config_module.Config.Cluster{
+        .{
+            .name = "sticky",
+            .endpoints = &endpoints,
+            .pick = .hash,
+            .hash_key = .{ .header = "x-tenant" },
+        },
+    };
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+    const state_before = balancer.pick_state;
+
+    const counts = [_]u16{0} ** test_counts_len;
+    const key: Balancer.RequestKey = .{ .key = Balancer.bytesKey("tenant-a") };
+    const first = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, key).?.endpoint_index;
+    // A different client with the same header value is the same tenant:
+    // the address must contribute nothing to a header-keyed pick.
+    const roaming = testAddress("198.51.100.200:41000");
+    try std.testing.expectEqual(
+        first,
+        balancer.pick(0, &testLoad(&counts), &test_healthy_all, &roaming, key).?.endpoint_index,
+    );
+    // Load on the winner must not move the tenant, and no PRNG state may
+    // be spent: a keyed pick is a pure function, like source_ip's.
+    var loaded = [_]u16{0} ** test_counts_len;
+    loaded[test_keys.key(0, first)] = 10_000;
+    try std.testing.expectEqual(
+        first,
+        balancer.pick(0, &testLoad(&loaded), &test_healthy_all, &test_client, key).?.endpoint_index,
+    );
+    try std.testing.expectEqual(state_before, balancer.pick_state);
+
+    // Distinct values are distinct tenants and must spread: a run of them
+    // has to reach several endpoints, or the value is not really keying.
+    var hits = [_]u32{0} ** 8;
+    var tenant: u16 = 0;
+    while (tenant < 64) : (tenant += 1) {
+        var name_buffer: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "tenant-{d}", .{tenant}) catch unreachable;
+        const tenant_key: Balancer.RequestKey = .{ .key = Balancer.bytesKey(name) };
+        hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, tenant_key).?.endpoint_index] += 1;
+    }
+    var reached: u32 = 0;
+    for (hits) |hit_count| {
+        if (hit_count >= 1) reached += 1;
+    }
+    try std.testing.expect(reached >= 4);
+}
+
+test "balancer: a request without its keyed material places by load" {
+    const endpoints = testHashEndpoints(3);
+    const clusters = [_]config_module.Config.Cluster{
+        .{
+            .name = "sticky",
+            .endpoints = &endpoints,
+            .pick = .hash,
+            .hash_key = .{ .header = "x-tenant" },
+        },
+    };
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    // Endpoint 1 is drowning. A keyless request takes the p2c placement:
+    // any candidate pair containing the drowning endpoint also contains
+    // a calmer one, so it must never win — and the idle endpoints must
+    // both be reached, or this is not placement but a constant.
+    var counts = [_]u16{0} ** test_counts_len;
+    counts[test_keys.key(0, 1)] = 100;
+    var hits = [_]u32{0} ** 3;
+    var round: u32 = 0;
+    while (round < 200) : (round += 1) {
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .absent).?;
+        hits[picked.endpoint_index] += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 0), hits[1]);
+    try std.testing.expect(hits[0] >= 1);
+    try std.testing.expect(hits[2] >= 1);
+}
+
+test "balancer: a cookie tag names its endpoint through any load" {
+    const endpoints = testHashEndpoints(8);
+    const clusters = [_]config_module.Config.Cluster{
+        .{
+            .name = "sticky",
+            .endpoints = &endpoints,
+            .pick = .hash,
+            .hash_key = .{ .cookie = "zoxy-srv" },
+        },
+    };
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+    const state_before = balancer.pick_state;
+
+    // The tag is honoured wherever the load sits — stickiness is the
+    // point, and load had its say when the session was placed — and the
+    // honoured path spends no PRNG state.
+    const wanted: u16 = 5;
+    const tagged: Balancer.RequestKey = .{ .endpoint = balancer.endpointIdentity(0, wanted) };
+    var loaded = [_]u16{0} ** test_counts_len;
+    loaded[test_keys.key(0, wanted)] = 10_000;
+    var round: u32 = 0;
+    while (round < 50) : (round += 1) {
+        const picked = balancer.pick(0, &testLoad(&loaded), &test_healthy_all, &test_client, tagged).?;
+        try std.testing.expectEqual(wanted, picked.endpoint_index);
+        try std.testing.expectEqual(endpoints[wanted], picked.address);
+    }
+    try std.testing.expectEqual(state_before, balancer.pick_state);
+}
+
+test "balancer: a tag naming nothing eligible re-homes by load" {
+    const endpoints = testHashEndpoints(3);
+    var weights = [_]u16{1} ** 3;
+    weights[2] = 0;
+    const clusters = [_]config_module.Config.Cluster{
+        .{
+            .name = "sticky",
+            .endpoints = &endpoints,
+            .pick = .hash,
+            .hash_key = .{ .cookie = "zoxy-srv" },
+            .weights = &weights,
+        },
+    };
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    // Three ways a tag can name nothing: the endpoint was ejected (§7),
+    // the endpoint was drained (#174), or the tag was forged whole. Each
+    // re-homes among the eligible — "healthy and under-capacity, in that
+    // order" — rather than erroring or honouring the dead letter.
+    const counts = [_]u16{0} ** test_counts_len;
+    var ejected_mask = test_healthy_all;
+    ejected_mask[test_keys.key(0, 0)] = false;
+    const ejected_tag: Balancer.RequestKey = .{ .endpoint = balancer.endpointIdentity(0, 0) };
+    const drained_tag: Balancer.RequestKey = .{ .endpoint = balancer.endpointIdentity(0, 2) };
+    const forged_tag: Balancer.RequestKey = .{ .endpoint = 0xDEADBEEFDEADBEEF };
+    var round: u32 = 0;
+    while (round < 100) : (round += 1) {
+        try std.testing.expectEqual(
+            @as(u16, 1),
+            balancer.pick(0, &testLoad(&counts), &ejected_mask, &test_client, ejected_tag).?.endpoint_index,
+        );
+        try std.testing.expect(
+            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, drained_tag).?.endpoint_index != 2,
+        );
+        try std.testing.expect(
+            balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, forged_tag).?.endpoint_index != 2,
+        );
+    }
+}
+
+test "balancer: endpoint tags round-trip, and only the minted spelling parses" {
+    const identities = [_]u64{ 0, 1, 0x0123456789ABCDEF, std.math.maxInt(u64) };
+    for (identities) |identity| {
+        var tag: [Balancer.endpoint_tag_len]u8 = undefined;
+        Balancer.formatEndpointTag(identity, &tag);
+        try std.testing.expectEqual(identity, Balancer.parseEndpointTag(&tag).?);
+    }
+    var spelled: [Balancer.endpoint_tag_len]u8 = undefined;
+    Balancer.formatEndpointTag(0x0123456789ABCDEF, &spelled);
+    try std.testing.expectEqualStrings("0123456789abcdef", &spelled);
+
+    // Only the exact minted spelling: the proxy never wrote the looser
+    // forms, so a parser accepting them would give a forged cookie more
+    // grammar than a real one has.
+    try std.testing.expectEqual(@as(?u64, null), Balancer.parseEndpointTag(""));
+    try std.testing.expectEqual(@as(?u64, null), Balancer.parseEndpointTag("0123456789abcde"));
+    try std.testing.expectEqual(@as(?u64, null), Balancer.parseEndpointTag("0123456789abcdef0"));
+    try std.testing.expectEqual(@as(?u64, null), Balancer.parseEndpointTag("0123456789ABCDEF"));
+    try std.testing.expectEqual(@as(?u64, null), Balancer.parseEndpointTag("0123456789abcdeg"));
+    try std.testing.expectEqual(@as(?u64, null), Balancer.parseEndpointTag("0x23456789abcdef"));
+}
+
+test "balancer: the header key is pinned, like every mapping hash here" {
+    // The FNV half is checked against the published FNV-1a vectors, the
+    // way `mix64` is checked against SplitMix64's published output — an
+    // external anchor, not a value read back off our own implementation.
+    try std.testing.expectEqual(mix64(0xAF63DC4C8601EC8C), bytesKeyOf("a"));
+    try std.testing.expectEqual(mix64(0x85944171F73967E8), bytesKeyOf("foobar"));
+    try std.testing.expect(bytesKeyOf("tenant-a") != bytesKeyOf("tenant-b"));
+    // Case matters: header *names* are case-insensitive, header values
+    // are not, and the key covers only the value.
+    try std.testing.expect(bytesKeyOf("Alice") != bytesKeyOf("alice"));
 }
 
 test "balancer: p2c weighs L4 connections, not only L7 leases" {
@@ -1525,7 +1937,7 @@ test "balancer: p2c weighs L4 connections, not only L7 leases" {
     const load: upstream.Load = .{ .l7 = &l7_idle, .l4 = &l4 };
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
-        try std.testing.expect(balancer.pick(0, &load, &test_healthy_all, &test_client).?.endpoint_index != 1);
+        try std.testing.expect(balancer.pick(0, &load, &test_healthy_all, &test_client, .none).?.endpoint_index != 1);
     }
 }
 
@@ -1559,7 +1971,7 @@ test "balancer: p2c compares the sum of both protocols" {
     while (round < 100) : (round += 1) {
         try std.testing.expectEqual(
             @as(u16, 0),
-            balancer.pick(0, &load, &test_healthy_all, &test_client).?.endpoint_index,
+            balancer.pick(0, &load, &test_healthy_all, &test_client, .none).?.endpoint_index,
         );
     }
 }
@@ -1588,7 +2000,7 @@ test "balancer: a capped endpoint is skipped while another has room" {
     while (round < 8) : (round += 1) {
         try std.testing.expectEqual(
             @as(u16, 1),
-            balancer.pick(0, &load, &test_healthy_all, &test_client).?.endpoint_index,
+            balancer.pick(0, &load, &test_healthy_all, &test_client, .none).?.endpoint_index,
         );
     }
 }
@@ -1616,13 +2028,13 @@ test "balancer: a fully capped cluster refuses rather than failing open" {
     l7[test_keys.key(0, 1)] = 3;
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
-        balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client),
+        balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none),
     );
     // One request completes on endpoint 1 and the cluster serves again.
     l7[test_keys.key(0, 1)] = 2;
     try std.testing.expectEqual(
         @as(u16, 1),
-        balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client).?.endpoint_index,
+        balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none).?.endpoint_index,
     );
 }
 
@@ -1649,7 +2061,7 @@ test "balancer: the cap counts both protocols, and covers one endpoint" {
     const load: upstream.Load = .{ .l7 = &l7, .l4 = &l4 };
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
-        balancer.pick(0, &load, &test_healthy_all, &test_client),
+        balancer.pick(0, &load, &test_healthy_all, &test_client, .none),
     );
     // Reading either table alone would leave room and dial anyway.
     try std.testing.expect(l7[test_keys.key(0, 0)] < 4);
@@ -1679,7 +2091,7 @@ test "balancer: capacity is judged over the endpoints health left" {
     l7[test_keys.key(0, 1)] = 1;
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
-        balancer.pick(0, &testLoad(&l7), &healthy, &test_client),
+        balancer.pick(0, &testLoad(&l7), &healthy, &test_client, .none),
     );
     // And when health fails open — every endpoint ejected — the caps
     // still apply to the whole set rather than being bypassed with it.
@@ -1687,6 +2099,6 @@ test "balancer: capacity is judged over the endpoints health left" {
     l7[test_keys.key(0, 0)] = 1;
     try std.testing.expectEqual(
         @as(?Balancer.Pick, null),
-        balancer.pick(0, &testLoad(&l7), &healthy, &test_client),
+        balancer.pick(0, &testLoad(&l7), &healthy, &test_client, .none),
     );
 }

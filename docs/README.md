@@ -195,7 +195,12 @@ by a compiled ceiling — the startup banner prints what the endpoint tables cos
 |---|---|
 | `p2c` *(default)* | two weight-biased candidates; the one carrying less in-flight work wins — HTTP requests and L4 connections both count |
 | `rr` | smooth weighted rotation — exact rotation at equal weights, predictable spread, useful for cache warming |
-| `hash` | the same client always reaches the same endpoint, with traffic split by weight |
+| `hash` | the same key always reaches the same endpoint — object form only, naming what the cluster is sticky on |
+
+`pick` is either a bare policy string or an object carrying the policy
+and its settings. `hash` takes only the object form — you name its key
+explicitly (`source_ip`, `header`, or `cookie`), because which identity
+a cluster is sticky on is a decision, not a default.
 
 Upstream connections are pooled process-wide and reusable by any request,
 which is the single largest throughput lever in this design.
@@ -219,14 +224,13 @@ must hold weight, or the config is rejected.
 
 ### Sticky sessions
 
-`pick: "hash"` is **rendezvous hashing over the healthy endpoints**, keyed on
-the client address:
+`pick: {"policy": "hash", ...}` keeps clients on one backend, and its
+`key` names what "one client" means:
 
 ```json
 "api": {
     "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080"],
-    "pick": "hash",
-    "hash": { "key": "source_ip" }
+    "pick": { "policy": "hash", "key": "source_ip" }
 }
 ```
 
@@ -241,14 +245,56 @@ it recovers. `source_ip` uses all four bytes of an IPv4 address and the /64
 prefix of an IPv6 one, so stickiness survives privacy-address rotation.
 
 The tradeoff is inherent to hashing on client address: NAT hides many clients
-behind one address, and one heavy client cannot be split. Prefer `p2c` where
-even load matters more than stickiness.
+behind one address, and one heavy client cannot be split. That is what the
+other two keys are for — and where even load matters more than stickiness,
+prefer `p2c`.
 
 The key is the *observed* client address, so behind another proxy or LB
 every connection carries that machine's address and the whole cluster
 hashes to one endpoint. See
 [Learning who the client is](#learning-who-the-client-is-proxy-protocol)
 for how an `l4` listener recovers the real client.
+
+#### Sticky on a header
+
+```json
+"pick": { "policy": "hash", "key": "header", "name": "x-tenant" }
+```
+
+Hashes the named header's value: stickiness on an identity the client
+*states* — a tenant, a user id, an API key — which survives NAT. A
+request without the header is placed by load like a `p2c` pick. Only
+`http` listeners can route to a header- or cookie-keyed cluster; an
+`l4` listener never parses a request to read one from.
+
+#### Sticky on a cookie
+
+```json
+"api": {
+    "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080"],
+    "pick": { "policy": "hash", "key": "cookie", "name": "srv_id" }
+}
+```
+
+The named cookie carries the assignment itself: a 16-hex **endpoint
+tag** zoxy mints from the endpoint's address, stable across restarts,
+processes, and config reordering. A request with no cookie is placed on
+the calmest backend and the response sets one
+(`Set-Cookie: srv_id=<tag>; Path=/; HttpOnly` — no expiry, a session
+cookie); a request whose tag names a healthy, under-capacity backend
+goes there and is **not** re-stamped; a tag naming an ejected, drained
+or removed backend is re-placed and the response re-announces. This is
+the strongest answer to NAT: every user behind one address carries
+their own assignment.
+
+Pick a cookie name your application does not use — zoxy adds its
+Set-Cookie beside the origin's, never in place of them. The tag is not
+signed: a forged cookie can only choose which of *your* backends serves
+that client, never one outside the eligible set.
+
+Three counters watch it: `zoxy_l7_sticky_followed`, `..._assigned`, and
+`..._repicked` partition a cookie cluster's responses. A rising repick
+rate means backends are flapping under a sticky population.
 
 ### Health checks
 
@@ -341,8 +387,8 @@ client — which looks like forwarding and is the opposite of it.
 ### Learning who the client is (PROXY protocol)
 
 The mirror problem: put a load balancer in front of zoxy and *zoxy* sees
-only the balancer. That breaks more than logging — `pick: "hash"` keys
-on the client address, so behind an LB every connection hashes alike and
+only the balancer. That breaks more than logging — a `source_ip`-keyed
+hash pick reads the client address, so behind an LB every connection hashes alike and
 the whole fleet lands on one endpoint. An `l4` listener can instead
 require each connection to open with a PROXY protocol header (v1 or v2 —
 what AWS NLB, GCP and HAProxy emit) announcing the real client:

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 
+const Balancer = @import("balancer.zig").Balancer;
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const router = @import("http/router.zig");
@@ -533,6 +534,12 @@ const Http1Bed = struct {
         /// §8 per-endpoint concurrency cap; null leaves the cluster
         /// uncapped, which is what every pre-existing scenario wants.
         max_inflight: ?u32 = null,
+        /// The one cluster's §7 pick policy; p2c, the config default,
+        /// for every pre-existing scenario.
+        pick: config_module.Config.Cluster.Pick = .p2c,
+        /// What a `hash` cluster keys on (#178); `source_ip` is inert
+        /// beside any other policy, matching the loader's contract.
+        hash_key: config_module.Config.Cluster.HashKey = .source_ip,
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 40,
@@ -558,7 +565,7 @@ const Http1Bed = struct {
             .buffer_group_bytes = options.head_buffer_bytes,
         });
         bed.endpoints = .{originAddress()};
-        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{
             .bind_address = bindAddress(),
@@ -2263,6 +2270,156 @@ test "l7: an origin head that no longer fits after response edits is 502 (#175)"
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+    try bed.expectDrained();
+}
+
+/// The #178 tag of the bed's one endpoint, spelled the way the stamp
+/// spells it — through the server's own balancer, so mint and
+/// expectation cannot drift.
+fn bedEndpointTag(bed: *const Http1Bed) [Balancer.endpoint_tag_len]u8 {
+    var tag: [Balancer.endpoint_tag_len]u8 = undefined;
+    Balancer.formatEndpointTag(bed.server.balancer.endpointIdentity(0, 0), &tag);
+    return tag;
+}
+
+test "l7: a cookieless request on a cookie cluster is assigned and stamped (#178)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 31,
+        // The origin sets its own cookie: the stamp is an `add`, so the
+        // application's Set-Cookie must ride through beside it.
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: app=1\r\n\r\nhi",
+        .pick = .hash,
+        .hash_key = .{ .cookie = "zoxy-srv" },
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    var expected_buffer: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: app=1\r\n" ++
+            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly\r\n" ++
+            "Connection: close\r\n\r\nhi",
+        .{&bedEndpointTag(&bed)},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(expected, bed.client.response());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_sticky_assigned"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_followed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_repicked"));
+    try bed.expectDrained();
+}
+
+test "l7: a request naming the endpoint it reaches is followed, not re-stamped (#178)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 32,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .pick = .hash,
+        .hash_key = .{ .cookie = "zoxy-srv" },
+    });
+    defer bed.tearDown();
+
+    var request_buffer: [256]u8 = undefined;
+    const request = std.fmt.bufPrint(
+        &request_buffer,
+        "GET / HTTP/1.1\r\nHost: o\r\nCookie: theme=dark; zoxy-srv={s}\r\n" ++
+            "Connection: close\r\n\r\n",
+        .{&bedEndpointTag(&bed)},
+    ) catch unreachable;
+    try bed.exchange(request);
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // Idempotent: the client already holds the right tag, so the
+    // response must not re-speak it — a stamp on every response would
+    // reset session-cookie expiry semantics the operator may layer on.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_sticky_followed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_assigned"));
+    try bed.expectDrained();
+}
+
+test "l7: a well-formed tag naming no endpoint is repicked and re-stamped (#178)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 33,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .pick = .hash,
+        .hash_key = .{ .cookie = "zoxy-srv" },
+    });
+    defer bed.tearDown();
+
+    // Sixteen lowercase hex — the minted grammar — but no endpoint of
+    // this cluster: a config that shrank, or a forgery. Either way the
+    // request is served and the response re-announces.
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n" ++
+        "Cookie: zoxy-srv=ffffffffffffffff\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    var expected_buffer: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
+            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly\r\n" ++
+            "Connection: close\r\n\r\nhi",
+        .{&bedEndpointTag(&bed)},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(expected, bed.client.response());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_sticky_repicked"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_assigned"));
+    try bed.expectDrained();
+}
+
+test "l7: a malformed tag is an absent one — assigned, not repicked (#178)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 34,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .pick = .hash,
+        .hash_key = .{ .cookie = "zoxy-srv" },
+    });
+    defer bed.tearDown();
+
+    // Not the minted grammar (wrong length): it names nothing, so the
+    // request is a first request, not a re-homing — the distinction the
+    // repicked counter exists to keep clean.
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n" ++
+        "Cookie: zoxy-srv=notatag\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_sticky_assigned"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_repicked"));
+    try bed.expectDrained();
+}
+
+test "l7: a header-keyed cluster stamps nothing (#178)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 35,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .pick = .hash,
+        .hash_key = .{ .header = "x-tenant" },
+    });
+    defer bed.tearDown();
+
+    // The keyed header present and absent: rendezvous and the load
+    // fallback both serve, and neither direction owes the client any
+    // announcement — a header key is the client's own statement.
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nX-Tenant: acme\r\n" ++
+        "Connection: close\r\n\r\n");
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_followed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_assigned"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_repicked"));
     try bed.expectDrained();
 }
 

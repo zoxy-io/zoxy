@@ -865,8 +865,8 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   client on a `proxy_protocol` listener — never an `X-Forwarded-For`
   chain, because an allowlist keyed on client-supplied text is not an
   allowlist. The prefix is mandatory and bounded per family — /32 for
-  IPv4, **/64 for IPv6**, the same client identity `hash.key:
-  source_ip` keys on, so two features cannot disagree about what a
+  IPv4, **/64 for IPv6**, the same client identity a `source_ip`-keyed
+  hash pick keys on, so two features cannot disagree about what a
   client is — and host bits past the prefix are refused: `10.0.0.1/8`
   is a typo for one of two different ranges, and the loader cannot know
   which. Containment is a masked-prefix compare over the compiled
@@ -910,7 +910,10 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   way out, and the loader refuses those arms by name rather than
   ignoring them. Edits apply during the downstream re-render through
   the same suppress-and-append machinery, under the same
-  `header_edits_max` bound on the table's total; the proxy-managed
+  `header_edits_max` bound on the table's total — the render accepts
+  one slot past it (`response_edits_max`), reserved for #178's
+  Set-Cookie stamp, which rides this machinery rather than owning a
+  second injection path; the proxy-managed
   names (framing, hop-by-hop, `X-Forwarded-For`) stay barred by the
   same validator, since a hand-written `Content-Length` would
   desynchronise the relay. A head that no longer fits after edits is
@@ -946,7 +949,13 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   the lower **in-flight total** wins: L7 leases and live L4 connections
   summed, since both are work the origin is carrying) by default, `rr`
   for smooth weighted rotation (strict rotation at equal weights),
-  `hash` for stickiness. Cluster endpoints are
+  `hash` for stickiness. `pick` takes two spellings (#178): the bare
+  policy string for the keyless policies, or an object —
+  `{ "policy": "hash", "key": …, "name": … }` — that names what a
+  `hash` cluster is sticky on. A bare `"hash"` is rejected at load:
+  the old source_ip default read as "sticky" and quietly was not
+  behind NAT, so the key is the operator's sentence to write.
+  Cluster endpoints are
   static socket addresses resolved once at config load, never on the
   loop (dynamic DNS is a non-goal, §1), each optionally weighted — two
   bullets below.
@@ -1000,10 +1009,23 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   So the endpoint is a *pure function* of the key and the eligible set:
   every process computes the same answer with nothing shared, which is
   what makes stickiness correct under this process model rather than
-  merely cheap. `hash.key` names the identity — `source_ip` today, all
-  four bytes of an IPv4 address and the **/64 prefix** of an IPv6 one,
-  since RFC 8981 privacy addressing rotates the interface identifier and
-  hashing it whole would re-home mobile clients on a timer.
+  merely cheap. The pick object's `key` names the identity. `source_ip`
+  is all four bytes of an IPv4 address and the **/64 prefix** of an
+  IPv6 one, since RFC 8981 privacy addressing rotates the interface
+  identifier and hashing it whole would re-home mobile clients on a
+  timer. `header` is rendezvous over the named header's value (a
+  pinned FNV-1a folded through the same pinned finalizer — `std.hash`
+  makes no cross-version promise, and a rolling restart runs two
+  builds side by side): stickiness on an identity the client *states*
+  — a tenant, a user id — which survives NAT, the exact place
+  `source_ip` fails. `cookie` is the third key and its own bullet
+  below. The request-derived keys read a parsed head, so the loader
+  rejects them on clusters any `l4` listener routes to — the
+  `proxy_protocol` reachability rule in the other direction — and a
+  request *missing* its keyed material (no such header, first request
+  of a cookie session) is placed by load instead, the same weighted
+  two-choice draw `p2c` runs: cross-process agreement is not needed
+  there, because a keyless population has no identity to be sticky on.
   Rendezvous rather than a ring or Maglev because both of those answer
   from a precomputed table, and a table must be *rebuilt* whenever
   membership changes — which here is every health-check ejection and
@@ -1026,12 +1048,47 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   opens a divergence window — confined, by the same 1/n property, to the
   clients of the flapping endpoint, who are already affected by it.
   And source-IP hashing balances by *client*, not by request: NAT puts
-  many clients on one address, and one heavy client cannot be split.
+  many clients on one address, and one heavy client cannot be split —
+  which is what the `cookie` key exists for, next bullet.
   It also balances by the *observed* client: behind another proxy every
   connection carries that proxy's address, so the key is one value and
   the whole cluster hashes to a single endpoint — stickiness inverted,
   not degraded. `proxy_protocol` on the listener (§6) is what makes
   `source_ip` mean the real client there.
+- **Cookie stickiness: the client holds the assignment** (#178, settled
+  2026-08-03). Where `source_ip` breaks — corporate NAT, CGNAT, mobile
+  carriers, exactly where stickiness is most wanted — the standard
+  answer is a cookie the proxy sets (HAProxy's `cookie SRV insert`),
+  and it fits this design unusually well: §3's argument against a
+  stickiness table is that no process can share one, and a cookie is
+  the client carrying the state instead, the table-free property
+  rendezvous has, achieved a second way. The named cookie holds an
+  **endpoint tag**: 16 lowercase hex of the endpoint's rendezvous
+  identity — a function of its address, so it is stable across
+  restarts, processes and config reordering, and leaks a hash rather
+  than the address. A request whose tag names a healthy,
+  under-capacity endpoint goes there, whatever the load says —
+  stickiness is the point, and load had its say at placement. A
+  request with no usable tag is placed by load (the first request of a
+  session deserves the calmest endpoint), and one naming an ejected,
+  drained, capped or removed endpoint re-homes the same way. Then the
+  response answers: `Set-Cookie: <name>=<tag>; Path=/; HttpOnly`, as
+  one `add` edit riding the #175 render machinery (an origin's own
+  Set-Cookie rides beside it), on every exchange whose request did not
+  already name the endpoint that served it — and *only* those, so a
+  settled session is never re-stamped. No `Secure` attribute: this
+  proxy does not terminate TLS (§1), so it cannot know the
+  client-facing scheme. Three counters partition a cookie cluster's
+  forwarded responses — `l7_sticky_followed` / `assigned` /
+  `repicked` — and a repick *rate* is the operational signal:
+  endpoints flapping under a sticky population. Forgery is priced
+  consciously: a tag is not signed, because a client can only choose
+  which backend serves *itself*, and only from the eligible set — a
+  keyed variant is a config knob for later if that ever matters. The
+  tag grammar is strict (exactly the minted spelling parses), the mint
+  is pinned by test vectors and re-proved by the simulator against a
+  frozen literal, and the live gate round-trips assignment, echo and
+  forgery against the shipped binary.
 - **Active health checks** are per-cluster opt-in (a `check` block —
   HAProxy's model) so a request is not routed to an endpoint known to be
   down:

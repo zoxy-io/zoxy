@@ -251,9 +251,12 @@ pub const Config = struct {
         /// L7 requests and live L4 connections alike (§7).
         max_inflight: ?u32 = null,
 
-        /// What a `hash` cluster keys its endpoint choice on (§7). Read
-        /// only when `pick == .hash`; the loader rejects a `hash` block
-        /// beside any other policy rather than leaving it inert.
+        /// What a `hash` cluster keys its endpoint choice on (§7, #178).
+        /// Read only when `pick == .hash`; the loader rejects key
+        /// settings beside any other policy rather than leaving them
+        /// inert — and rejects a bare `"pick": "hash"` outright, because
+        /// which identity a cluster is sticky on is a decision, not a
+        /// default.
         hash_key: HashKey = .source_ip,
 
         /// The PROXY protocol header this cluster's origins expect zoxy
@@ -277,14 +280,28 @@ pub const Config = struct {
             hash,
         };
 
-        /// The identity a `hash` cluster is sticky on. One arm today; a
-        /// closed enum rather than a bool so a request-derived key (a
-        /// header, a cookie) is a new arm rather than a new mechanism.
-        pub const HashKey = enum(u1) {
+        /// The identity a `hash` cluster is sticky on (#178). `header`
+        /// and `cookie` read the parsed request, so clusters carrying
+        /// them are unreachable from `l4` listeners — enforced where
+        /// listeners resolve, the `proxy_protocol_send` precedent in
+        /// the other direction.
+        pub const HashKey = union(enum) {
             /// The client's own address, which both data paths have —
             /// an L4 connection has nothing else, and an L7 request need
             /// not have been parsed yet.
             source_ip,
+            /// Rendezvous on the named header's value: stickiness on an
+            /// identity the client states (a tenant, an API key hash) —
+            /// which survives NAT, the exact place `source_ip` fails.
+            /// The payload is the validated header name.
+            header: []const u8,
+            /// The client holds the assignment itself (#178): the named
+            /// cookie carries an endpoint tag in the proxy's own minted
+            /// spelling, honoured when it names a healthy,
+            /// under-capacity endpoint — with the response-side stamp
+            /// owing the client a (re-)announcement everywhere else.
+            /// The payload is the validated cookie name.
+            cookie: []const u8,
         };
 
         /// Which PROXY protocol version to write (#142): a closed
@@ -366,8 +383,14 @@ pub const ValidationError = error{
     ClusterCheckHostInvalid,
     ClusterCheckStatusInvalid,
     ClusterMaxInflightOutOfRange,
-    ClusterHashKeyUnknown,
-    ClusterHashWithoutHashPick,
+    ClusterPickKeyMissing,
+    ClusterPickKeyUnknown,
+    ClusterPickKeyWithoutHash,
+    ClusterPickNameMissing,
+    ClusterPickNameUnexpected,
+    ClusterPickNameInvalid,
+    ClusterPickNameTooLong,
+    ListenerL4RequestKeyedHash,
     ListenerClusterOrRoutes,
     ListenerL4Routes,
     RoutesEmpty,
@@ -1169,16 +1192,16 @@ pub const RouteJson = struct {
 pub const ClusterJson = struct {
     endpoints: []const EndpointJson,
     /// Optional §7 pick policy; absent means `p2c` (the design's
-    /// trajectory), `rr` opts back into strict rotation.
-    pick: []const u8 = "p2c",
+    /// trajectory), `rr` opts back into strict rotation, and the object
+    /// form names a `hash` policy's key (#178) — a bare `"hash"` string
+    /// is rejected, because what the cluster is sticky on is the
+    /// operator's decision, not a default.
+    pick: PickJson = .{ .policy = "p2c" },
     /// Optional §7 active health checks; absent means off, so an
     /// unprobed cluster reserves nothing and is never skipped.
     check: ?CheckJson = null,
     /// Optional §8 per-endpoint concurrency cap; absent means uncapped.
     max_inflight: ?u32 = null,
-    /// Optional §7 hash-policy detail; only valid beside `"pick": "hash"`,
-    /// and absent there means the default key.
-    hash: ?ClusterHashJson = null,
     /// Optional PROXY protocol announcement on upstream connections
     /// (#142); absent sends none. Only valid on clusters no http
     /// listener routes to.
@@ -1192,16 +1215,12 @@ pub const ClusterJson = struct {
             .min_items = 1,
         },
         .pick = .{
-            .desc = "Endpoint-pick policy: p2c (power-of-two-choices), rr (strict " ++
-                "round-robin), or hash (rendezvous hashing on a stable key, for " ++
-                "client-to-backend stickiness).",
-            .enum_type = Config.Cluster.Pick,
+            .desc = "Endpoint-pick policy: p2c (power-of-two-choices) or rr " ++
+                "(strict round-robin) as a bare string, or an object choosing " ++
+                "hash (stickiness) and naming its key.",
         },
         .check = .{
             .desc = "Active health checks for every endpoint in this cluster; absent leaves them off.",
-        },
-        .hash = .{
-            .desc = "Hash-policy detail; only valid alongside \"pick\": \"hash\".",
         },
         .max_inflight = .{
             .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
@@ -1290,6 +1309,97 @@ pub const EndpointJson = struct {
     }
 };
 
+/// The pick policy's two spellings (#178): the bare policy string every
+/// stateless policy needs, or an object carrying the policy *and* its
+/// settings — today, a `hash` policy's key. The two parse to this one
+/// shape, `EndpointJson`'s pattern; a bare `"hash"` never resolves,
+/// because a hash policy without a named key was the misleading default
+/// this form replaced.
+pub const PickJson = struct {
+    policy: []const u8,
+    /// Required for `hash`, rejected elsewhere: what the cluster is
+    /// sticky on.
+    key: ?[]const u8 = null,
+    /// The header or cookie name a request-derived key reads; required
+    /// there, rejected for `source_ip`.
+    name: ?[]const u8 = null,
+
+    pub const schema_doc =
+        "Endpoint-pick policy: a bare policy string (p2c, rr), or an object " ++
+        "selecting hash and naming what it keys on. The same key always " ++
+        "selects the same endpoint, and the mapping is a pure function of " ++
+        "the key and the healthy endpoint set — so every zoxy process " ++
+        "behind SO_REUSEPORT agrees without sharing any state.";
+    pub const schema_fields = .{
+        .policy = .{
+            .desc = "Pick policy: p2c (power-of-two-choices), rr (strict " ++
+                "round-robin), or hash (stickiness on an explicit key).",
+            .enum_type = Config.Cluster.Pick,
+        },
+        .key = .{
+            .desc = "What a hash cluster is sticky on: source_ip (all four bytes " ++
+                "of an IPv4 address, the /64 prefix of an IPv6 one — RFC 8981 " ++
+                "rotation survives), header (rendezvous on the named header's " ++
+                "value), or cookie (the named cookie carries the endpoint " ++
+                "assignment itself, minted by zoxy — #178).",
+            .enum_type = std.meta.Tag(Config.Cluster.HashKey),
+        },
+        .name = .{
+            .desc = "The header or cookie name a request-derived key reads; " ++
+                "required for those keys, rejected for source_ip.",
+            .min_length = 1,
+        },
+    };
+
+    /// The object form as a plain struct, so `innerParse` reads it with
+    /// the loader's own strictness (unknown fields rejected) without
+    /// recursing back into `jsonParse` below.
+    const ObjectForm = struct {
+        policy: []const u8,
+        key: ?[]const u8 = null,
+        name: ?[]const u8 = null,
+    };
+
+    comptime {
+        // The two shapes are one contract: a field added to either and
+        // forgotten on the other would let the schema advertise a key
+        // the parser rejects, or the parser accept one the schema hides.
+        const outer = @typeInfo(PickJson).@"struct".fields;
+        const inner = @typeInfo(ObjectForm).@"struct".fields;
+        assert(outer.len == inner.len);
+        for (outer, inner) |a, b| {
+            assert(std.mem.eql(u8, a.name, b.name));
+            assert(a.type == b.type);
+        }
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !PickJson {
+        switch (try source.peekNextTokenType()) {
+            .string => {
+                const token = try source.nextAlloc(allocator, .alloc_if_needed);
+                const literal: []const u8 = switch (token) {
+                    .string, .allocated_string => |slice| slice,
+                    // The peek promised a string; anything else is the
+                    // scanner disagreeing with itself.
+                    else => unreachable,
+                };
+                return .{ .policy = literal };
+            },
+            .object_begin => {
+                const object = try std.json.innerParse(ObjectForm, allocator, source, options);
+                return .{ .policy = object.policy, .key = object.key, .name = object.name };
+            },
+            // A number, bool, null, or nested array can never name a
+            // policy; reject the token rather than coercing it.
+            else => return error.UnexpectedToken,
+        }
+    }
+};
+
 pub const ClusterProxyProtocolJson = struct {
     send: []const u8,
 
@@ -1357,24 +1467,6 @@ pub const CheckJson = struct {
             .desc = "The one response status an http probe accepts as healthy.",
             .minimum = 100,
             .maximum = 599,
-        },
-    };
-};
-
-pub const ClusterHashJson = struct {
-    key: []const u8 = "source_ip",
-
-    pub const schema_doc =
-        "How a `hash` cluster identifies a client. The same key always " ++
-        "selects the same endpoint, and the mapping is a pure function of " ++
-        "the key and the healthy endpoint set — so every zoxy process " ++
-        "behind SO_REUSEPORT agrees without sharing any state.";
-    pub const schema_fields = .{
-        .key = .{
-            .desc = "What to hash. `source_ip` uses the client address: all four " ++
-                "bytes of an IPv4 address, and the /64 prefix of an IPv6 one so " ++
-                "stickiness survives privacy-address rotation (RFC 8981).",
-            .enum_type = Config.Cluster.HashKey,
         },
     };
 };
@@ -1566,7 +1658,7 @@ pub const dto_types = .{
     ConfigJson,         ListenerJson,      RouteJson,                FilterJson,
     MatchJson,          HeaderMatchJson,   ActionJson,               HeaderEditJson,
     RewriteJson,        ClusterJson,       TimeoutsJson,             LimitsJson,
-    AdminJson,          AccessLogJson,     CheckJson,                ClusterHashJson,
+    AdminJson,          AccessLogJson,     CheckJson,                PickJson,
     ForwardedJson,      ProxyProtocolJson, ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson, RedirectJson,
 };
@@ -1606,15 +1698,15 @@ fn resolveClusters(
         if (entry.name.len > constants.cluster_name_bytes_max) {
             return error.ClusterNameTooLong;
         }
-        const pick = try pickOf(entry.cluster.pick);
+        const picked = try resolvePick(&entry.cluster.pick);
         const endpoints = try resolveEndpoints(arena, entry.cluster.endpoints);
         clusters[index] = .{
             .name = entry.name,
             .endpoints = endpoints.addresses,
             .weights = endpoints.weights,
-            .pick = pick,
+            .pick = picked.pick,
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
-            .hash_key = try hashKeyOf(pick, entry.cluster.hash),
+            .hash_key = picked.hash_key,
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
         };
@@ -2351,10 +2443,22 @@ fn resolveRoutes(
         return error.ListenerClusterOrRoutes; // Neither, or both.
     }
     if (has_cluster) {
+        const cluster_index = try clusterIndexOf(clusters, listener_json.cluster.?);
+        // A request-derived hash key reads the parsed head (#178), and
+        // an l4 listener never parses one: rejected as a pair, like an
+        // http route to a PROXY-sending cluster — reachability, not
+        // exclusivity, so the same cluster stays valid beside any http
+        // listener.
+        if (protocol == .l4) {
+            switch (clusters[cluster_index].hash_key) {
+                .source_ip => {},
+                .header, .cookie => return error.ListenerL4RequestKeyedHash,
+            }
+        }
         const routes = try arena.alloc(router.Route, 1);
         routes[0] = .{
             .prefix = "/",
-            .cluster_index = try clusterIndexOf(clusters, listener_json.cluster.?),
+            .cluster_index = cluster_index,
         };
         assert(routes.len == 1); // The sugar is always one catch-all route.
         return routes;
@@ -2588,11 +2692,72 @@ fn resolveProxyProtocol(
         error.ListenerProxyProtocolModeUnknown;
 }
 
-/// The closed pick-policy vocabulary; anything else is its own error so
-/// a typo ("pc2") fails loudly instead of silently balancing as p2c.
-fn pickOf(literal: []const u8) error{ClusterPickUnknown}!Config.Cluster.Pick {
-    return std.meta.stringToEnum(Config.Cluster.Pick, literal) orelse
-        error.ClusterPickUnknown;
+/// A cluster's resolved pick: the policy, and — for `hash` — the key it
+/// is sticky on, `.source_ip` (inert) everywhere else.
+const ResolvedPick = struct {
+    pick: Config.Cluster.Pick,
+    hash_key: Config.Cluster.HashKey,
+};
+
+/// Resolve either spelling of `pick` (#178). The policy vocabulary is
+/// closed — a typo ("pc2") fails loudly instead of silently balancing
+/// as p2c — and so is the key's. `hash` *requires* a key, in the object
+/// form: `source_ip` as a silent default was misleading (it reads as
+/// "sticky" and quietly is not, behind NAT), so what the cluster keys
+/// on is the operator's sentence to write. Key settings beside any
+/// other policy are rejected rather than left inert — they read as a
+/// request for stickiness the cluster would silently not provide.
+fn resolvePick(pick_json: *const PickJson) ParseError!ResolvedPick {
+    const pick = std.meta.stringToEnum(Config.Cluster.Pick, pick_json.policy) orelse
+        return error.ClusterPickUnknown;
+    if (pick != .hash) {
+        if (pick_json.key != null or pick_json.name != null) {
+            return error.ClusterPickKeyWithoutHash;
+        }
+        return .{ .pick = pick, .hash_key = .source_ip };
+    }
+    const key_literal = pick_json.key orelse return error.ClusterPickKeyMissing;
+    const key = std.meta.stringToEnum(std.meta.Tag(Config.Cluster.HashKey), key_literal) orelse
+        return error.ClusterPickKeyUnknown;
+    switch (key) {
+        .source_ip => {
+            if (pick_json.name != null) {
+                return error.ClusterPickNameUnexpected;
+            }
+            return .{ .pick = pick, .hash_key = .source_ip };
+        },
+        .header => return .{
+            .pick = pick,
+            .hash_key = .{ .header = try resolvePickName(pick_json.name) },
+        },
+        .cookie => return .{
+            .pick = pick,
+            .hash_key = .{ .cookie = try resolvePickName(pick_json.name) },
+        },
+    }
+}
+
+/// The header or cookie name a request-derived key reads (#178). One
+/// grammar for both: an RFC 9110 token, which is also RFC 6265's
+/// cookie-name grammar — and one bound, `pick_name_bytes_max`, whose
+/// job is the response-side stamp: every Set-Cookie a cookie cluster
+/// answers with re-speaks this name into a scratch sized by that
+/// constant.
+fn resolvePickName(name_json: ?[]const u8) ParseError![]const u8 {
+    const name = name_json orelse return error.ClusterPickNameMissing;
+    if (name.len == 0) {
+        return error.ClusterPickNameInvalid;
+    }
+    if (name.len > constants.pick_name_bytes_max) {
+        return error.ClusterPickNameTooLong;
+    }
+    assert(name.len >= 1);
+    for (name) |byte| {
+        if (!isTokenByte(byte)) {
+            return error.ClusterPickNameInvalid;
+        }
+    }
+    return name;
 }
 
 /// A cluster that sends PROXY protocol (#142) may only be reached by l4
@@ -2626,23 +2791,6 @@ fn resolveClusterProxyProtocol(
         Config.Cluster.ProxyProtocolSend,
         proxy_protocol.send,
     ) orelse error.ClusterProxyProtocolSendUnknown;
-}
-
-/// The §7 hash key for a cluster: its `hash` block's, or the default when
-/// the block is absent. A block beside any *other* policy is rejected
-/// rather than ignored — it reads as a request for stickiness that the
-/// cluster would silently not provide, which is exactly the mistake worth
-/// failing at load.
-fn hashKeyOf(
-    pick: Config.Cluster.Pick,
-    hash_json: ?ClusterHashJson,
-) ValidationError!Config.Cluster.HashKey {
-    const hash = hash_json orelse return .source_ip;
-    if (pick != .hash) {
-        return error.ClusterHashWithoutHashPick;
-    }
-    return std.meta.stringToEnum(Config.Cluster.HashKey, hash.key) orelse
-        error.ClusterHashKeyUnknown;
 }
 
 /// The closed protocol vocabulary; anything else is its own error so a
@@ -4122,7 +4270,8 @@ const fuzz_seed_json =
     \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]}],
     \\ "protocol":"http"}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
-    \\ {"address":"127.0.0.1:9001","weight":3}],"pick":"p2c","max_inflight":8,
+    \\ {"address":"127.0.0.1:9001","weight":3}],
+    \\ "pick":{"policy":"hash","key":"cookie","name":"zoxy-srv"},"max_inflight":8,
     \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}}},
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
@@ -4132,9 +4281,11 @@ const fuzz_seed_json =
 ;
 // The `file` arm here, `stdout` in `example_json` beside it: between the
 // two corpus entries the mutator sees every sink spelling, including the
-// `path` key only one of them may carry — and both endpoint spellings
-// (#174), so the `{address, weight}` grammar is a starting point rather
-// than a shape the mutator must blindly discover.
+// `path` key only one of them may carry — both endpoint spellings
+// (#174), and both pick spellings (#178: the object form with its
+// key/name grammar here, the bare string in the example), so each
+// grammar is a starting point rather than a shape the mutator must
+// blindly discover.
 
 test "config: the fuzz seed carrying every block parses" {
     // It is a corpus entry, so it has to be a *valid* config — an
@@ -4318,32 +4469,58 @@ test "config: a cluster name is bounded, because the access log echoes it" {
     );
 }
 
-test "config: the hash pick policy and its key resolve, or fail loudly" {
+test "config: pick resolves both spellings, and hash names its key" {
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],\"clusters\":{\"a\":{";
+    const head_http = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}],\"clusters\":{\"a\":{";
     const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
     const endpoints = "\"endpoints\":[\"127.0.0.1:2\"]";
 
-    // `pick: hash` with no `hash` block takes the default key, so the
-    // common case needs no second line of config.
+    // The object form names the key; `source_ip` stays legal on an l4
+    // listener, since both data paths carry the client address.
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ endpoints ++ ",\"pick\":\"hash\"" ++ tail,
+            head ++ endpoints ++ ",\"pick\":{\"policy\":\"hash\",\"key\":\"source_ip\"}" ++ tail,
         );
         try std.testing.expectEqual(Config.Cluster.Pick.hash, parsed.clusters[0].pick);
-        try std.testing.expectEqual(Config.Cluster.HashKey.source_ip, parsed.clusters[0].hash_key);
+        try std.testing.expectEqual(
+            @as(std.meta.Tag(Config.Cluster.HashKey), .source_ip),
+            std.meta.activeTag(parsed.clusters[0].hash_key),
+        );
     }
-    // Naming the key explicitly resolves to the same thing.
+    // The request-derived keys carry their name through (#178).
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"source_ip\"}" ++ tail,
+            head_http ++ endpoints ++
+                ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"zoxy-srv\"}" ++ tail,
         );
-        try std.testing.expectEqual(Config.Cluster.HashKey.source_ip, parsed.clusters[0].hash_key);
+        try std.testing.expectEqualStrings("zoxy-srv", parsed.clusters[0].hash_key.cookie);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head_http ++ endpoints ++
+                ",\"pick\":{\"policy\":\"hash\",\"key\":\"header\",\"name\":\"x-tenant\"}" ++ tail,
+        );
+        try std.testing.expectEqualStrings("x-tenant", parsed.clusters[0].hash_key.header);
+    }
+    // The keyless policies keep the bare-string spelling, and the object
+    // spelling of the same policy resolves identically.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ endpoints ++ ",\"pick\":{\"policy\":\"rr\"}" ++ tail,
+        );
+        try std.testing.expectEqual(Config.Cluster.Pick.rr, parsed.clusters[0].pick);
     }
     // A cluster that says nothing keeps the p2c default and the default
     // key, which is inert there.
@@ -4354,33 +4531,141 @@ test "config: the hash pick policy and its key resolve, or fail loudly" {
         try std.testing.expectEqual(Config.Cluster.Pick.p2c, parsed.clusters[0].pick);
     }
 
-    // A `hash` block beside another policy is a request for stickiness the
-    // cluster would silently not provide — the mistake most worth catching
-    // at load rather than in production.
+    // A bare `"hash"` is the misleading spelling this grammar replaced
+    // (#178): which identity the cluster is sticky on is a decision, so
+    // the loader demands the object form name it.
     try expectParseError(
-        error.ClusterHashWithoutHashPick,
-        head ++ endpoints ++ ",\"pick\":\"rr\",\"hash\":{\"key\":\"source_ip\"}" ++ tail,
+        error.ClusterPickKeyMissing,
+        head ++ endpoints ++ ",\"pick\":\"hash\"" ++ tail,
     );
     try expectParseError(
-        error.ClusterHashWithoutHashPick,
-        head ++ endpoints ++ ",\"hash\":{\"key\":\"source_ip\"}" ++ tail,
+        error.ClusterPickKeyMissing,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"hash\"}" ++ tail,
     );
-    // The key vocabulary is closed, and distinct from the policy's own
-    // error so a typo says which field it is in.
+    // Key settings beside another policy are a request for stickiness
+    // the cluster would silently not provide — the mistake most worth
+    // catching at load rather than in production.
     try expectParseError(
-        error.ClusterHashKeyUnknown,
-        head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"cookie\"}" ++ tail,
+        error.ClusterPickKeyWithoutHash,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"rr\",\"key\":\"source_ip\"}" ++ tail,
     );
+    try expectParseError(
+        error.ClusterPickKeyWithoutHash,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"p2c\",\"name\":\"zoxy-srv\"}" ++ tail,
+    );
+    // The vocabularies are closed, each with its own error so a typo
+    // says which field it is in.
     try expectParseError(
         error.ClusterPickUnknown,
         head ++ endpoints ++ ",\"pick\":\"hsah\"" ++ tail,
     );
-    // The block is strict like every other: unknown fields are rejected
-    // rather than ignored.
+    try expectParseError(
+        error.ClusterPickUnknown,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"hsah\",\"key\":\"source_ip\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterPickKeyUnknown,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"hash\",\"key\":\"session\"}" ++ tail,
+    );
+    // The object is strict like every other: unknown fields rejected.
     try expectParseError(
         error.UnknownField,
-        head ++ endpoints ++ ",\"pick\":\"hash\",\"hash\":{\"key\":\"source_ip\",\"mask\":24}" ++ tail,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"hash\",\"key\":\"source_ip\",\"mask\":24}" ++ tail,
     );
+    // And only strings or objects can name a policy.
+    try expectParseError(
+        error.UnexpectedToken,
+        head ++ endpoints ++ ",\"pick\":2" ++ tail,
+    );
+}
+
+test "config: a request-derived pick name is required, bounded, and a token" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}],\"clusters\":{\"a\":{";
+    const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const endpoints = "\"endpoints\":[\"127.0.0.1:2\"]";
+
+    // `source_ip` reads nothing, so a name beside it describes a config
+    // that is not what it says — rejected, not ignored.
+    try expectParseError(
+        error.ClusterPickNameUnexpected,
+        head ++ endpoints ++
+            ",\"pick\":{\"policy\":\"hash\",\"key\":\"source_ip\",\"name\":\"x\"}" ++ tail,
+    );
+    // `header` and `cookie` read the named field, so the name is theirs
+    // to state.
+    try expectParseError(
+        error.ClusterPickNameMissing,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterPickNameMissing,
+        head ++ endpoints ++ ",\"pick\":{\"policy\":\"hash\",\"key\":\"header\"}" ++ tail,
+    );
+    // One grammar for both names: an RFC 9110 token, which is also RFC
+    // 6265's cookie-name. A space or `=` inside a cookie name would
+    // corrupt every Set-Cookie a cookie cluster answers with.
+    try expectParseError(
+        error.ClusterPickNameInvalid,
+        head ++ endpoints ++
+            ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterPickNameInvalid,
+        head ++ endpoints ++
+            ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"a=b\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterPickNameInvalid,
+        head ++ endpoints ++
+            ",\"pick\":{\"policy\":\"hash\",\"key\":\"header\",\"name\":\"bad name\"}" ++ tail,
+    );
+    // The bound is exact: at `pick_name_bytes_max` the name loads, one
+    // past it fails — the stamp's Set-Cookie scratch is sized by it.
+    const at_limit = "x" ** constants.pick_name_bytes_max;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ endpoints ++
+                ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"" ++ at_limit ++ "\"}" ++ tail,
+        );
+        try std.testing.expectEqual(
+            @as(usize, constants.pick_name_bytes_max),
+            parsed.clusters[0].hash_key.cookie.len,
+        );
+    }
+    try expectParseError(
+        error.ClusterPickNameTooLong,
+        head ++ endpoints ++
+            ",\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"" ++ at_limit ++ "x\"}" ++ tail,
+    );
+}
+
+test "config: a request-keyed hash cluster is unreachable from l4" {
+    const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const cookie_cluster = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
+        "\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"zoxy-srv\"}";
+
+    // An l4 listener never parses a head, so a cookie there is a promise
+    // nothing would keep — rejected as a pair, the `proxy_protocol_send`
+    // rule in the other direction.
+    try expectParseError(
+        error.ListenerL4RequestKeyedHash,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}]," ++ cookie_cluster ++ tail,
+    );
+    // The same cluster behind an http listener is exactly what #178 asks
+    // for.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}]," ++
+                cookie_cluster ++ tail,
+        );
+        try std.testing.expectEqualStrings("zoxy-srv", parsed.clusters[0].hash_key.cookie);
+    }
 }
 
 test "config: max_inflight resolves, defaults to uncapped, rejects the useless" {

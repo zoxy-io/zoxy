@@ -103,6 +103,11 @@ ended_count: u8,
 /// Clean seeds run without the adversary and with a well-behaved
 /// origin, so the L7 oracles demand exact golden outcomes.
 clean: bool,
+/// The seed drew the #178 cookie-keyed http cluster: the pick is
+/// forced to `hash` on `canon.sticky_cookie_name`, every L7 client
+/// runs the stamp oracle, and `verify` holds the sticky counters to
+/// the responses they annotate.
+sticky_http: bool,
 /// Decided before `io.init` (the ring the sim registers must equal the
 /// limit the server accounts against — Server.init asserts the match),
 /// consumed by `startServerAndOrigins` for the rest of the pool shape.
@@ -414,7 +419,8 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // by `balancer.zig`'s own tests, which can hold thousands of distinct
     // clients against a multi-endpoint cluster as a scenario cannot.
     const pick_l4 = randomPick(random);
-    const pick_http = randomPick(random);
+    const http_hash_key = deriveSticky(harness, random);
+    const pick_http = if (harness.sticky_http) .hash else randomPick(random);
     // Each cluster draws §7 active health checks independently, so the
     // prober runs its whole lifecycle — sweeps, fall/rise transitions
     // under the adversary's connect fates, parked-close on ejection, and
@@ -451,6 +457,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
             .endpoints = &harness.endpoints_http,
             .weights = if (random.boolean()) &harness.weights_http else null,
             .pick = pick_http,
+            .hash_key = http_hash_key,
             .check = health.check_http,
             .max_inflight = deriveMaxInflight(harness.clean, random),
         },
@@ -459,6 +466,21 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
     harness.proxy_protocol_l4 = deriveProxyProtocol(random);
     harness.wireListeners(deriveForwarded(random));
+    harness.deriveServerConfig(random, connect_timeout_ms, health.interval_ms);
+}
+
+/// The top-level `Config` draw — the timeouts, the deadlines, and the
+/// access-log coin — split from `deriveTopology` when the #178 draw
+/// pushed that one past the length limit; the cluster and listener
+/// tables it points at are the caller's, already wired.
+fn deriveServerConfig(
+    harness: *Harness,
+    random: std.Random,
+    connect_timeout_ms: u32,
+    health_interval_ms: u32,
+) void {
+    assert(connect_timeout_ms >= 1);
+    assert(health_interval_ms >= 1);
     harness.config = .{
         .listeners = &harness.listener_configs,
         .clusters = &harness.clusters,
@@ -479,8 +501,33 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         // schedule fuzz; the fourth leaves it off, which is the shape
         // that must reserve nothing and read no clock (§5, §8).
         .access_log_sink = if (random.uintLessThan(u8, 4) == 0) null else .stdout,
-        .health_interval_ms = health.interval_ms,
+        .health_interval_ms = health_interval_ms,
     };
+}
+
+/// The #178 draw: a quarter of seeds key the http cluster on the sim
+/// cookie, forcing `hash` (a cookie key rides no other policy). The
+/// rest draw their pick freely, where `hash` means source_ip — so both
+/// hash keys, and every keyless policy, flow through the schedule fuzz.
+/// The sticky scripts run on every seed either way; on a non-sticky one
+/// their cookies are inert bytes, which is itself the oracle. Also
+/// re-proves the pinned tag: what the scripts send and the client
+/// oracle demands must be what the running mint spells for the one http
+/// endpoint, so a hash change fails the sweep loudly instead of quietly
+/// re-homing cookie holders.
+fn deriveSticky(harness: *Harness, random: std.Random) zoxy.config.Config.Cluster.HashKey {
+    harness.sticky_http = random.uintLessThan(u8, 4) == 0;
+    var minted_tag: [zoxy.balancer.Balancer.endpoint_tag_len]u8 = undefined;
+    zoxy.balancer.Balancer.formatEndpointTag(
+        zoxy.balancer.Balancer.addressIdentity(&harness.endpoints_http[0]),
+        &minted_tag,
+    );
+    assert(std.mem.eql(u8, &minted_tag, l7.canon.sticky_tag));
+    assert(l7.canon.sticky_cookie_name.len >= 1);
+    if (harness.sticky_http) {
+        return .{ .cookie = l7.canon.sticky_cookie_name };
+    }
+    return .source_ip;
 }
 
 /// The §8 per-endpoint cap for one cluster, or null for uncapped.
@@ -799,6 +846,7 @@ fn populateClients(harness: *Harness, random: std.Random) void {
                 httpBindAddress(),
                 random.enumValue(l7.Script),
                 harness.clean,
+                harness.sticky_http,
             );
             client.on_ended = clientEndedHook;
             client.context = harness;
@@ -966,6 +1014,7 @@ pub fn verify(harness: *Harness) !void {
         return error.OriginSawInvalidProxyHeader;
     }
     try harness.verifyUpstreamIdentities();
+    try harness.verifyStickyCounters();
     try harness.verifyAccessLog();
     for (harness.clients[0..harness.l4_count]) |*client| {
         try client.verifyIntegrity();
@@ -973,6 +1022,27 @@ pub fn verify(harness: *Harness) !void {
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         try client.verify();
     }
+}
+
+/// #178, every seed: the sticky verdicts move only when the cookie
+/// cluster was drawn, and then at least once per completed forwarded
+/// response — every `l7_responses` increment passed through the render
+/// commit that credits exactly one verdict. Not an equality: the credit
+/// lands at the render commit and `l7_responses` at the exchange's
+/// finish, so an adversary cutting between them legally leaves a
+/// credited verdict with no finished response. The exact-bytes demand
+/// lives in the client's per-response stamp oracle; this holds the
+/// *counters* to the responses they annotate.
+fn verifyStickyCounters(harness: *const Harness) !void {
+    const counters = &harness.server.counters;
+    const total = counters.get("l7_sticky_followed") +
+        counters.get("l7_sticky_assigned") +
+        counters.get("l7_sticky_repicked");
+    if (!harness.sticky_http) {
+        if (total != 0) return error.StickyCountersDiverged;
+        return;
+    }
+    if (total < counters.get("l7_responses")) return error.StickyCountersDiverged;
 }
 
 /// #142 send, every seed: whatever identity the origin heard must be one
