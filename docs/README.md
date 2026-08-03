@@ -778,6 +778,46 @@ events. It reads `ok`, `rejected`, `shed`, `timed_out`, `upstream_failed`,
 Logging never blocks the event loop, so a sink that stalls costs dropped
 lines rather than latency; `zoxy_access_log_dropped` counts them exactly.
 
+#### Joining this log to your origin's
+
+By default a zoxy line and your backend's line for the same request share
+no key, so a slow request cannot be attributed to a hop. Naming headers
+fixes that without changing a byte on the wire:
+
+```json
+"access_log": {
+    "sink": "stdout",
+    "request_headers": ["X-Request-ID", "User-Agent"],
+    "response_headers": ["X-Cache"]
+}
+```
+
+```json
+{"...":"...","status":200,"upstream_reused":true,"upstream_replayed":false,"request_headers":{"x-request-id":"7f3c…","user-agent":"curl/8.6.0"},"response_headers":{"x-cache":"HIT"},"duration_us":1873}
+```
+
+zoxy does not mint an identifier. It usually is not your outermost hop —
+a CDN, cloud LB or ingress in front almost always sets `X-Request-ID` or
+`traceparent`, and that header reaches your origin untouched — so logging
+it at both ends is the whole join. The same mechanism is why the feature
+is not trace-specific: `User-Agent` for traffic analysis, a tenant header
+for multi-tenant routing, the origin's `X-Cache` on the way out.
+
+Names are matched case-insensitively and logged lowercased, so a query
+does not have to guess the spelling. A header that did not arrive is
+omitted rather than logged as null. A repeated header logs its first
+value — the one zoxy itself read. Values are truncated at 256 bytes with
+a trailing `...`, and up to 8 headers may be named across both lists;
+`response_headers` is ignored for L4 lines, which have no response to
+read. Absent lists leave the line exactly as it was.
+
+The values are held per connection for the life of a request, so naming
+headers costs memory proportional to `conn_slots` — the startup banner
+prints it beside everything else. Naming a lot of headers on a large
+`conn_slots` is real memory, and a wider line also needs a staging
+buffer that can hold one: zoxy refuses to start rather than dropping
+every line that carries them.
+
 `sink` is either `stdout` — the process's own standard output, inherited
 rather than opened, so it costs no file descriptor and carries no rotation
 story of its own — or `file` with a `path`:

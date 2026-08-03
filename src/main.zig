@@ -388,6 +388,7 @@ fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
         .upstream_slots = limits.upstream_slots,
         .upstream_bytes = @sizeOf(UpstreamType),
         .access_log_bytes = zoxy.constants.accessLogBytes(limits.access_log_buffer_bytes),
+        .log_header_bytes = ServerXev.logHeaderBytes(config, limits.conn_slots),
         .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
         .metrics_bytes = ServerXev.metricsBytes(config),
         .head_buffers = limits.head_buffers,
@@ -480,7 +481,7 @@ fn printMemoryBanner(
         \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
         \\          + upstream slots {d} x {d} B + head buffers {d} x {d} B (+ ring {d} B)
         \\          + upstream head buffers {d} x {d} B + head scratch {d} B
-        \\          + access log {d} KiB
+        \\          + access log {d} KiB (+ logged headers {d} B)
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + labeled metrics {d} B (tables, labels and render buffers)
         \\          + config arena {d} KiB (measured, not closed-form)
@@ -504,6 +505,7 @@ fn printMemoryBanner(
         sizes.upstream_head_buffer_bytes,
         sizes.head_scratch_bytes,
         access_log_bytes / 1024,
+        sizes.log_header_bytes,
         ServerXev.endpointTableBytes(config),
         config.clusters.len,
         ServerXev.endpointKeysFor(config).stride,

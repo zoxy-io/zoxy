@@ -147,7 +147,17 @@ pub const Spec = struct {
 };
 
 const post_body = "request-body-24-bytes-ab";
-pub const get_request = "GET /sim HTTP/1.1\r\nHost: sim\r\n\r\n";
+/// The #140 trace header, on the two scripts that carry one: enough for
+/// the access-log verifier to see captured values under every schedule
+/// the adversary produces. The scripts that omit it are not an
+/// absent-case oracle — one canonical value is shared by every sender,
+/// so a stale capture bleeding it into a line that should carry none is
+/// indistinguishable from a fresh one here. That regression is the
+/// directed tests' (`http_proxy_test.zig` chains two connections
+/// through one pool slot); what the sweep adds is that no *other* value
+/// can ever appear.
+const trace_line = canon.log_request_header ++ ": " ++ canon.log_request_value ++ "\r\n";
+pub const get_request = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++ "\r\n";
 /// Deterministic 6000-byte body for `post_big`, cycled so the
 /// origin-side §7 oracle can spot any reordering.
 const big_body = blk: {
@@ -234,7 +244,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .allowed_statuses = statuses_routed,
     },
     .post_sized = .{
-        .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
+        .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++
             "Content-Length: 24\r\n\r\n" ++ post_body,
         .expected_responses = 1,
         .transcript_cap = 1,

@@ -22,6 +22,7 @@ const conn_module = @import("net/Conn.zig");
 const health_module = @import("net/health.zig");
 const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
+const parser = @import("http/parser.zig");
 const proxy = @import("http/proxy.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
@@ -124,6 +125,25 @@ pub fn Server(comptime IoType: type) type {
         /// Empty on an L4-only config, which never canonicalizes.
         target_scratch: []u8,
         rewrite_scratch: []u8,
+        /// The #140 capture table: one value slot per connection slot per
+        /// named header, and the length of each. A logged value is copied
+        /// out of the head buffer while it is still live (the response
+        /// render writes over it, §7 rotation) and read back when the
+        /// line is written, so it needs storage that survives the awaits
+        /// between — per connection, because that is the unit an
+        /// in-flight request belongs to.
+        ///
+        /// A side table rather than fields on `Conn`, and the reason is
+        /// the #179 precedent: sized by the config, so a deployment that
+        /// names no headers allocates nothing and every `Conn` stays the
+        /// width it was. Addressed by `conns.indexOf`, which is stable
+        /// across reuse.
+        log_header_values: []u8,
+        log_header_lens: []u16,
+        /// Named headers per connection — the config's two lists summed,
+        /// zero when it named none. Stored because every index into the
+        /// tables above is a multiple of it.
+        log_headers_per_conn: u32,
         /// Highest armed-op count any one connection has reached (§8):
         /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and,
         /// under runtime safety only (never in the shipped ReleaseFast
@@ -368,6 +388,31 @@ pub fn Server(comptime IoType: type) type {
             server.rewrite_scratch = try arena.alloc(u8, scratch_bytes);
             assert(server.target_scratch.len + server.rewrite_scratch.len +
                 options.head_buffer_bytes == headScratchBytes(options.*));
+            try server.initLogHeaders(arena, options);
+        }
+
+        /// The #140 capture table, sized by the config's named headers
+        /// times the connection slots that can each hold one request's
+        /// worth. Both allocations are empty when no header is named,
+        /// which is what makes the feature free to a deployment that
+        /// does not use it.
+        fn initLogHeaders(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+        ) error{OutOfMemory}!void {
+            const per_conn = logHeadersPerConn(server.config);
+            server.log_headers_per_conn = per_conn;
+            const slots: usize = @as(usize, options.conn_slots) * per_conn;
+            server.log_header_values = try arena.alloc(
+                u8,
+                slots * constants.access_log_header_bytes_max,
+            );
+            server.log_header_lens = try arena.alloc(u16, slots);
+            @memset(server.log_header_lens, 0);
+            assert(server.log_header_values.len ==
+                logHeaderBytes(server.config, options.conn_slots) -
+                    server.log_header_lens.len * @sizeOf(u16));
         }
 
         /// The metrics state (§8, #179): the process totals, the labeled
@@ -918,6 +963,13 @@ pub fn Server(comptime IoType: type) type {
             conn.request_filters = listener.request_filters;
             conn.response_filters = listener.response_filters;
             conn.forwarded = listener.forwarded;
+            // The #140 captures live in a side table addressed by pool
+            // slot, so a slot's bytes outlive the connection that wrote
+            // them. Clearing on acquire is what keeps them from being
+            // read as this client's: a head that never parses reaches no
+            // capture at all, and its line would otherwise report
+            // whatever the slot's *previous* occupant sent.
+            server.resetLogHeaders(conn);
             assert(conn.routes.len >= 1);
             server.storeDeadline(conn, server.entryTimeoutMs(listener.protocol));
             server.armDeadline(conn);
@@ -974,6 +1026,185 @@ pub fn Server(comptime IoType: type) type {
         pub fn headScratchBytes(options: InitOptions) u64 {
             const serving: u64 = if (options.head_buffers >= 1) 2 else 0;
             return (serving + 1) * options.head_buffer_bytes;
+        }
+
+        /// Named headers one connection can be holding values for (#140):
+        /// both configured lists, since a single exchange captures from
+        /// the request on the way in and the response on the way out.
+        pub fn logHeadersPerConn(config: *const config_module.Config) u32 {
+            const total = config.access_log_request_headers.len +
+                config.access_log_response_headers.len;
+            // The loader's shared cap, restated where every table sized
+            // by it is about to be allocated (§9: a hand-built config —
+            // a test, the simulator — never reaches the loader).
+            assert(total <= constants.access_log_headers_max);
+            return @intCast(total);
+        }
+
+        /// The #140 capture table's closed form — values plus their
+        /// lengths — for the banner and for `initLogHeaders` to assert
+        /// against. Zero for a config that names no headers.
+        pub fn logHeaderBytes(config: *const config_module.Config, conn_slots: u32) u64 {
+            const slots: u64 = @as(u64, conn_slots) * logHeadersPerConn(config);
+            return slots * constants.access_log_header_bytes_max + slots * @sizeOf(u16);
+        }
+
+        /// One connection's slice of the capture table: `per_conn` value
+        /// slots, addressed by the pool index — stable across reuse, and
+        /// the same index for the whole life of the connection holding
+        /// it. Split from the capture and the read so both speak one
+        /// piece of arithmetic.
+        fn logHeaderSlot(server: *Self, conn: *const ConnType, index: u32) []u8 {
+            assert(index < server.log_headers_per_conn);
+            const conn_index = server.conns.indexOf(conn);
+            const slot = conn_index * server.log_headers_per_conn + index;
+            assert(slot < server.log_header_lens.len);
+            const bytes = constants.access_log_header_bytes_max;
+            return server.log_header_values[slot * bytes ..][0..bytes];
+        }
+
+        fn logHeaderLen(server: *Self, conn: *const ConnType, index: u32) *u16 {
+            assert(index < server.log_headers_per_conn);
+            const conn_index = server.conns.indexOf(conn);
+            const slot = conn_index * server.log_headers_per_conn + index;
+            assert(slot < server.log_header_lens.len);
+            return &server.log_header_lens[slot];
+        }
+
+        /// Capture one direction's named headers out of a parsed head
+        /// (#140), while its zero-copy slices are still live. Values are
+        /// truncated to `access_log_header_bytes_max` on the same terms
+        /// as `path` — the prefix is what identifies a value — and an
+        /// absent header records nothing, which the render reads as
+        /// "omit this key".
+        ///
+        /// First occurrence wins, because `parser.headerValue`'s does:
+        /// what the line reports is then the same value zoxy itself read,
+        /// which is the property that makes a logged header worth
+        /// anything when the two disagree.
+        fn captureLogHeaders(
+            server: *Self,
+            conn: *ConnType,
+            headers: []const parser.Header,
+            names: []const []const u8,
+            first_index: u32,
+        ) void {
+            assert(first_index + names.len <= server.log_headers_per_conn);
+            for (names, 0..) |name, offset| {
+                const index = first_index + @as(u32, @intCast(offset));
+                const slot = server.logHeaderSlot(conn, index);
+                const value = parser.headerValue(headers, name) orelse {
+                    server.logHeaderLen(conn, index).* = 0;
+                    continue;
+                };
+                const captured = access_log_module.captureTruncated(slot, value);
+                server.logHeaderLen(conn, index).* = @intCast(captured.len);
+            }
+        }
+
+        /// One direction's captured values, paired with the names they
+        /// were captured for — what a `Record` carries. The values alias
+        /// the capture table, which the caller reads out before the next
+        /// request touches it (the `Record` contract).
+        fn loggedHeaders(
+            server: *Self,
+            conn: *const ConnType,
+            names: []const []const u8,
+            first_index: u32,
+            out: *[constants.access_log_headers_max][]const u8,
+        ) access_log_module.NamedHeaders {
+            assert(first_index + names.len <= server.log_headers_per_conn);
+            for (names, 0..) |_, offset| {
+                const index = first_index + @as(u32, @intCast(offset));
+                const len = server.logHeaderLen(conn, index).*;
+                assert(len <= constants.access_log_header_bytes_max);
+                out[offset] = server.logHeaderSlot(conn, index)[0..len];
+            }
+            return .{ .names = names, .values = out[0..names.len] };
+        }
+
+        /// The #140 request capture, called where the parsed head is
+        /// still live (§7 rotation writes over it). A no-op for a config
+        /// that names none, which is every config that did not ask.
+        pub fn captureRequestLogHeaders(
+            server: *Self,
+            conn: *ConnType,
+            headers: []const parser.Header,
+        ) void {
+            assert(conn.protocol == .http); // Only a parsed head has headers.
+            assert(headers.len <= constants.headers_max);
+            if (server.config.access_log_request_headers.len == 0) return;
+            server.captureLogHeaders(
+                conn,
+                headers,
+                server.config.access_log_request_headers,
+                0,
+            );
+        }
+
+        /// The response half, from the origin's parsed head — same
+        /// liveness rule, one direction over.
+        pub fn captureResponseLogHeaders(
+            server: *Self,
+            conn: *ConnType,
+            headers: []const parser.Header,
+        ) void {
+            assert(conn.protocol == .http); // An l4 relay parses no response.
+            assert(headers.len <= constants.headers_max);
+            if (server.config.access_log_response_headers.len == 0) return;
+            server.captureLogHeaders(
+                conn,
+                headers,
+                server.config.access_log_response_headers,
+                @intCast(server.config.access_log_request_headers.len),
+            );
+        }
+
+        /// A line's worth of #140 value slices, one array per direction
+        /// — the storage `loggedHeaderPair` fills and the `Record`
+        /// borrows for exactly as long as the render runs.
+        const LoggedHeaderValues = struct {
+            request: [constants.access_log_headers_max][]const u8,
+            response: [constants.access_log_headers_max][]const u8,
+        };
+
+        /// Both directions' logged headers for one line. L4 lines carry
+        /// none: they have no head to have read one from, and the
+        /// config's lists say nothing about relayed bytes.
+        fn loggedHeaderPair(
+            server: *Self,
+            conn: *const ConnType,
+            values: *LoggedHeaderValues,
+        ) struct {
+            request: access_log_module.NamedHeaders,
+            response: access_log_module.NamedHeaders,
+        } {
+            if (conn.protocol != .http) {
+                return .{ .request = .{}, .response = .{} };
+            }
+            const request_names = server.config.access_log_request_headers;
+            return .{
+                .request = server.loggedHeaders(conn, request_names, 0, &values.request),
+                .response = server.loggedHeaders(
+                    conn,
+                    server.config.access_log_response_headers,
+                    @intCast(request_names.len),
+                    &values.response,
+                ),
+            };
+        }
+
+        /// Forget this connection's captured values, so a kept-alive
+        /// turnaround cannot report the previous request's headers on
+        /// the next one's line — `LogState.reset`'s rule for the fields
+        /// that live in the side table instead of on the conn.
+        pub fn resetLogHeaders(server: *Self, conn: *const ConnType) void {
+            assert(server.log_header_lens.len ==
+                @as(usize, server.conns.capacity()) * server.log_headers_per_conn);
+            var index: u32 = 0;
+            while (index < server.log_headers_per_conn) : (index += 1) {
+                server.logHeaderLen(conn, index).* = 0;
+            }
         }
 
         /// The same pair for conn slots, with `admitConn` as its acquire
@@ -1378,6 +1609,8 @@ pub fn Server(comptime IoType: type) type {
             if (conn.log.endpoint_index != conn_module.LogState.endpoint_none) {
                 assert(conn.log.endpoint_index < cluster.endpoints.len);
             }
+            var values: LoggedHeaderValues = undefined;
+            const logged = server.loggedHeaderPair(conn, &values);
             const entry: access_log_module.Record = .{
                 .kind = switch (conn.protocol) {
                     .l4 => .l4,
@@ -1403,6 +1636,8 @@ pub fn Server(comptime IoType: type) type {
                 .status = conn.log.status,
                 .upstream_reused = conn.l7.upstream_was_reused,
                 .upstream_replayed = conn.l7.replay_used,
+                .request_headers = logged.request,
+                .response_headers = logged.response,
             };
             // A duration is never negative once saturated, and a line
             // always names a start: both are what `renderLine` prints

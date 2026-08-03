@@ -528,6 +528,12 @@ const Http1Bed = struct {
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
         access_log: bool = false,
+        /// The #140 headers each line records; empty for every
+        /// pre-existing scenario, so their lines stay byte-identical.
+        /// Names must already be lowercase — the loader lowercases, and
+        /// a bed builds its `Config` directly.
+        access_log_request_headers: []const []const u8 = &.{},
+        access_log_response_headers: []const []const u8 = &.{},
         /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
         check: ?config_module.Config.Cluster.Check = null,
@@ -589,6 +595,8 @@ const Http1Bed = struct {
             .access_log_sink = if (options.access_log) .stdout else null,
             .health_interval_ms = options.health_interval_ms,
             .error_pages = options.error_pages,
+            .access_log_request_headers = options.access_log_request_headers,
+            .access_log_response_headers = options.access_log_response_headers,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
@@ -3442,6 +3450,167 @@ fn accessLogLineFor(bed: *const Http1Bed, needle: []const u8) ![]const u8 {
         found = line;
     }
     return found orelse error.NoSuchAccessLogLine;
+}
+
+test "l7: a line reports the named headers from both directions (#140)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 46,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Cache: HIT\r\n\r\nhi",
+        .access_log = true,
+        .access_log_request_headers = &.{ "x-request-id", "user-agent" },
+        .access_log_response_headers = &.{"x-cache"},
+    });
+    defer bed.tearDown();
+
+    // The request carries the correlation header but no User-Agent: the
+    // join exists with nothing added to the wire, and the header that
+    // did not arrive is simply absent from the line.
+    try bed.exchange("GET /path HTTP/1.1\r\nHost: o\r\nX-Request-Id: abc-123\r\n" ++
+        "Connection: close\r\n\r\n");
+    try bed.expectDrained();
+
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(
+        std.mem.indexOf(u8, line, "\"request_headers\":{\"x-request-id\":\"abc-123\"}") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, line, "\"response_headers\":{\"x-cache\":\"HIT\"}") != null,
+    );
+    // Matched case-insensitively (the request wrote `X-Request-Id`) and
+    // logged under the one spelling the config resolved to.
+    try std.testing.expect(std.mem.indexOf(u8, line, "user-agent") == null);
+}
+
+test "l7: a keep-alive turnaround does not carry the last request's headers (#140)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 47,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .access_log = true,
+        .access_log_request_headers = &.{"x-request-id"},
+    });
+    defer bed.tearDown();
+
+    // The first request names an ID, the second does not. The capture
+    // lives in a side table the turnaround has to clear, so a stale
+    // value would show up as the second line reporting the first's ID —
+    // the worst possible failure for a correlation field.
+    bed.client.second_request = "GET /two HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\nX-Request-Id: first\r\n\r\n");
+    try bed.expectDrained();
+
+    const first = try accessLogLineFor(&bed, "\"path\":\"/one\"");
+    const second = try accessLogLineFor(&bed, "\"path\":\"/two\"");
+    try std.testing.expect(
+        std.mem.indexOf(u8, first, "\"request_headers\":{\"x-request-id\":\"first\"}") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"request_headers\":{}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "first") == null);
+}
+
+test "l7: a rejected request still reports its named headers (#140)" {
+    // The correlation header earns its keep exactly when something went
+    // wrong, so a line that reports a verdict must carry it too — which
+    // is why the capture sits with the other request facts, ahead of
+    // every rung, rather than on the path that reaches an origin.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 48,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .route_prefix = "/api",
+        .access_log = true,
+        .access_log_request_headers = &.{"x-request-id"},
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /nope HTTP/1.1\r\nHost: o\r\nX-Request-Id: traced\r\n" ++
+        "Connection: close\r\n\r\n");
+    try bed.expectDrained();
+
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"outcome\":\"rejected\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, line, "\"request_headers\":{\"x-request-id\":\"traced\"}") != null,
+    );
+    // No response reached this request, so its response object is the
+    // empty one the config asked for — never the previous exchange's.
+    try std.testing.expect(std.mem.indexOf(u8, line, "response_headers") == null);
+}
+
+test "l7: a reused conn slot reports no previous connection's headers (#140)" {
+    // The capture table is addressed by pool slot, so its bytes outlive
+    // the connection that wrote them. This is the shape that makes that
+    // dangerous: one connection logs a header, its slot is reused, and
+    // the next connection's head never parses — so nothing overwrites
+    // the slot and the reject's line would attribute one client's
+    // correlation ID to a different client's request.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 50,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .conn_slots = 1,
+        .relay_buffers = 1,
+        .access_log = true,
+        .access_log_request_headers = &.{"x-request-id"},
+    });
+    defer bed.tearDown();
+
+    // Chained, not concurrent: with one slot the second must arrive
+    // after the first released it, or it would be shed rather than
+    // reuse the slot. Its head is a bare-LF smuggling shape, so it is
+    // rejected 400 before any capture runs and nothing this client sent
+    // overwrites what the slot already held.
+    bed.client.drain_on_finish = false;
+    bed.client2.request = "GET /two HTTP/1.1\nHost: o\r\n\r\n";
+    bed.client.next = &bed.client2;
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\nX-Request-Id: leaked\r\n" ++
+        "Connection: close\r\n\r\n");
+    try bed.expectDrained();
+
+    const rejected = try accessLogLineFor(&bed, "\"outcome\":\"rejected\"");
+    try std.testing.expect(std.mem.indexOf(u8, rejected, "leaked") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected, "\"request_headers\":{}") != null);
+    // The first connection's own line still carries what it sent, so
+    // the fix is a clear-on-acquire and not a disabled feature.
+    const served = try accessLogLineFor(&bed, "\"path\":\"/one\"");
+    try std.testing.expect(
+        std.mem.indexOf(u8, served, "\"request_headers\":{\"x-request-id\":\"leaked\"}") != null,
+    );
+}
+
+test "l7: an oversize header value is truncated, not dropped (#140)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 49,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .access_log = true,
+        .access_log_request_headers = &.{"x-request-id"},
+    });
+    defer bed.tearDown();
+
+    var request_buffer: [2048]u8 = undefined;
+    var value_buffer: [constants.access_log_header_bytes_max + 64]u8 = undefined;
+    @memset(&value_buffer, 'v');
+    const request = std.fmt.bufPrint(
+        &request_buffer,
+        "GET / HTTP/1.1\r\nHost: o\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n",
+        .{value_buffer},
+    ) catch unreachable;
+    try bed.exchange(request);
+    try bed.expectDrained();
+
+    // The prefix identifies the value, and the ellipsis says the rest
+    // was there — `path`'s rule, one field over.
+    const line = try onlyAccessLogLine(&bed);
+    const marker = "\"x-request-id\":\"";
+    const start = std.mem.indexOf(u8, line, marker).? + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, line, start, '"').?;
+    try std.testing.expectEqual(
+        @as(usize, constants.access_log_header_bytes_max),
+        end - start,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, line[start..end], "..."));
 }
 
 test "l7: a proxied GET writes one access-log line naming the origin's status" {

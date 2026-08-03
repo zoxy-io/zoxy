@@ -471,7 +471,13 @@ pub const access_log_buffer_bytes_default: u32 = 32 * 1024;
 /// thing the drop counter must never mean. The simulator sizes down to it
 /// to force the drop rung, the same way it sizes the pools down to force
 /// theirs (§9).
-pub const access_log_buffer_bytes_min: u32 = access_log_line_bytes_max;
+///
+/// One line *of a config that names no headers* (#140). A config that
+/// names some has a wider line, and the loader holds its buffer to that
+/// wider bound (`LimitAccessLogBufferUnderLine`) — so the floor stays
+/// the price of the feature nobody asked for, and the rest is charged
+/// where it is chosen.
+pub const access_log_buffer_bytes_min: u32 = accessLogLineBytes(0);
 pub const access_log_buffer_bytes_max: u32 = 1024 * 1024;
 pub const access_log_buffers: u32 = 2;
 
@@ -495,14 +501,40 @@ pub const access_log_path_bytes_max: u16 = 256;
 /// without letting one widen a log line without limit.
 pub const access_log_method_bytes_max: u8 = 24;
 
+/// Raw bytes of one operator-named header value kept for its log line
+/// (#140). The value lives in a head buffer the render writes over (§7
+/// rotation), so it is copied out under this cap while it is still
+/// there — `access_log_path_bytes_max`'s rule, one field over —
+/// truncated with a trailing `...` rather than dropped.
+pub const access_log_header_bytes_max: u16 = 256;
+
+/// How many headers one `access_log` block may name, request and
+/// response lists summed (#140). The cap is what keeps the per-line
+/// bound and the per-connection capture table closed-form: both are
+/// this times a per-header term. Eight covers the correlation header
+/// plus the handful an operator routinely wants beside it.
+pub const access_log_headers_max: u8 = 8;
+
+/// Raw bytes of a named header's *name* — the key the line renders.
+/// Bounded because the key is config text that lands in every line.
+pub const access_log_header_name_bytes_max: u8 = 64;
+
 /// Upper bound on one rendered access-log line, including its newline
 /// (§5: the caller sizes a fixed buffer to it, so a line never has to be
 /// dropped for want of room in an *empty* buffer). Derived from the field
 /// caps rather than chosen, so raising one of them cannot silently make
-/// the bound a lie. The `6 *` on the two text fields is JSON's worst case:
+/// the bound a lie. The `6 *` on the text fields is JSON's worst case:
 /// a control byte escapes to `\u00XX`, and a percent-decoded path may
 /// legitimately contain one.
-pub const access_log_line_bytes_max: u32 = blk: {
+///
+/// A function of the config since #140: the named headers a line carries
+/// are the operator's list, so its maximum length is theirs too. The
+/// precedent is #179's metrics exposition, whose render buffer became a
+/// config-derived banner term for the same reason when labels arrived.
+/// `access_log_line_bytes_max` below is the compiled ceiling — the value
+/// at the header cap — and is what the comptime budget asserts speak.
+pub fn accessLogLineBytes(header_count: u32) u32 {
+    assert(header_count <= access_log_headers_max);
     // Every key, brace, comma, quote, and the trailing newline, with slack
     // for a field or two more before the bound has to be re-derived.
     const scaffolding = 320;
@@ -512,10 +544,21 @@ pub const access_log_line_bytes_max: u32 = blk: {
     const number = 20; // a u64 at its widest
     const addresses = 2; // client and upstream
     const numbers = 4; // duration, bytes in, bytes out, status
-    break :blk scaffolding + timestamp + addresses * address + numbers * number +
+    const fixed = scaffolding + timestamp + addresses * address + numbers * number +
         @as(u32, access_log_method_bytes_max) + @as(u32, cluster_name_bytes_max) +
         6 * @as(u32, host_bytes_max) + 6 * @as(u32, access_log_path_bytes_max);
-};
+    // Per named header: the quoted key, the escaped value at JSON's
+    // worst case, and the `"":,` punctuation between them — plus the two
+    // wrapper objects' own keys and braces, charged once per header so
+    // the term stays a single multiplication.
+    const per_header = @as(u32, access_log_header_name_bytes_max) +
+        6 * @as(u32, access_log_header_bytes_max) + 48;
+    return fixed + header_count * per_header;
+}
+
+/// The compiled ceiling: a line at the header cap. Every budget assert
+/// and every test buffer speaks this, so they cover any config.
+pub const access_log_line_bytes_max: u32 = accessLogLineBytes(access_log_headers_max);
 
 /// Worst-case in-flight ring ops (§8: the ring is pre-budgeted, not shed):
 /// every connection slot at its op peak (L7 slots hold armed ops with or
@@ -870,7 +913,15 @@ comptime {
     // lines it had room for — the bound exists precisely so a drop always
     // means backpressure, never arithmetic. The floor is that bound, so
     // no config can name a buffer that breaks it.
-    assert(access_log_buffer_bytes_min >= access_log_line_bytes_max);
+    // An empty staging buffer must always fit one line of a config that
+    // names no headers; the loader carries the same guarantee up to the
+    // wider bound a config with headers earns (#140).
+    assert(access_log_buffer_bytes_min >= accessLogLineBytes(0));
+    assert(access_log_line_bytes_max >= access_log_buffer_bytes_min);
+    assert(access_log_buffer_bytes_max >= access_log_line_bytes_max);
+    assert(access_log_headers_max >= 1);
+    assert(access_log_header_bytes_max >= 16);
+    assert(access_log_header_name_bytes_max >= 16);
     assert(access_log_buffer_bytes_default >= access_log_buffer_bytes_min);
     assert(access_log_buffer_bytes_default <= access_log_buffer_bytes_max);
     // Two buffers exactly: the swap is what lets appends continue during
@@ -944,6 +995,13 @@ pub const PoolSizes = struct {
     /// holds for its life, and §5's promise is that the printed total
     /// covers all of that. `accessLogBytes` is the closed form.
     access_log_bytes: u64,
+    /// The #140 per-connection capture table: the operator-named header
+    /// values a line reports, held from the head they were read out of
+    /// until the line is written. Zero when the config names none —
+    /// which is what keeps the feature free to a deployment that did
+    /// not ask for it. Config-derived like `metrics_bytes` beside it,
+    /// and priced the same way: next to everything else you pay for.
+    log_header_bytes: u64 = 0,
     /// The endpoint-keyed tables (§7) — the pool's idle heads and lease
     /// counts, the balancer's endpoint hashes, rotation state and pick
     /// scratch, the server's L4 charges, and the health checker's mask
@@ -1030,8 +1088,8 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
-        sizes.access_log_bytes + sizes.endpoint_table_bytes +
-        sizes.metrics_bytes +
+        sizes.access_log_bytes + sizes.log_header_bytes +
+        sizes.endpoint_table_bytes + sizes.metrics_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
         @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes +

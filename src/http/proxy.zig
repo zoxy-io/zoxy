@@ -488,7 +488,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// A malformed or oversize head never reaches here, so it never
         /// sets these: `request_head_len` staying 0 is exactly what marks a
         /// stream whose message boundary the parser could not find.
-        fn recordRequestFacts(conn: *ConnType, request: *const parser.RequestHead) void {
+        fn recordRequestFacts(server: *ServerType, conn: *ConnType, request: *const parser.RequestHead) void {
             assert(conn.state == .l7_reading_head);
             assert(request.head_len >= 1);
             // Once per request: `resetForNextRequest` and
@@ -503,6 +503,10 @@ pub fn Proxy(comptime IoType: type) type {
             // read later: the response head renders over it (§7 buffer
             // rotation), and by the exchange's settle these bytes are gone.
             conn.log.captureMethod(request.method_token);
+            // The #140 named headers, on the same terms and for the same
+            // reason — and here rather than deeper, so every line that
+            // reports a parsed request carries them, rejects included.
+            server.captureRequestLogHeaders(conn, request.headers);
         }
 
         /// Start this exchange's §8 deadline, if the deployment set one.
@@ -553,7 +557,7 @@ pub fn Proxy(comptime IoType: type) type {
         fn routeRequest(server: *ServerType, conn: *ConnType, request: *const parser.RequestHead) void {
             assert(conn.state == .l7_reading_head);
             assert(request.head_len <= conn.head_len);
-            recordRequestFacts(conn, request);
+            recordRequestFacts(server, conn, request);
             armRequestDeadline(server, conn);
             if (request.method == .connect) {
                 return respond(server, conn, 501, "l7_not_implemented");
@@ -1594,6 +1598,10 @@ pub fn Proxy(comptime IoType: type) type {
             // separate fact, and `outcome` stays `aborted` until
             // `finishExchange` earns `ok` (§8).
             conn.log.status = response.status;
+            // The #140 response headers, captured here for the same
+            // reason and at the same moment: the origin's head is live
+            // now, and this render is what writes over it.
+            server.captureResponseLogHeaders(conn, response.headers);
             armClientWrite(server, conn, headBytes(server, conn)[0..head_write_len], .response_excess);
         }
 
@@ -1965,6 +1973,10 @@ pub fn Proxy(comptime IoType: type) type {
             conn.head_len = 0;
             conn.l7 = .{};
             conn.log.reset();
+            // The #140 captures live in the server's side table, not on
+            // `log`, so they need clearing beside it — or the next
+            // request's line would report this one's headers.
+            server.resetLogHeaders(conn);
             conn.directions = .{ .{}, .{} };
             conn.state = .l7_reading_head;
             server.storeDeadline(conn, server.idleTimeoutMs());

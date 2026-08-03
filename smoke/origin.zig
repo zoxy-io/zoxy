@@ -78,10 +78,18 @@ const large_body: [large_body_bytes]u8 = blk: {
     break :blk bytes;
 };
 
+/// The header this origin tags every response with, so the live gate
+/// can name it in `access_log.response_headers` and then find its value
+/// in the written log (#140) — the response half of the join, from an
+/// origin that is not the proxy.
+pub const tag_header = "X-Origin-Tag";
+pub const tag_value = "smoke-origin";
+
 fn renderResponse(comptime payload: []const u8) []const u8 {
     return "HTTP/1.1 200 OK\r\n" ++
         std.fmt.comptimePrint("Content-Length: {d}\r\n", .{payload.len}) ++
         "Content-Type: application/octet-stream\r\n" ++
+        tag_header ++ ": " ++ tag_value ++ "\r\n" ++
         "\r\n" ++
         payload;
 }
