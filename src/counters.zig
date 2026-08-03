@@ -84,6 +84,15 @@ pub const Counters = struct {
     /// on a dashboard, and a redirect storm is a different diagnosis
     /// from a reject storm.
     l7_redirected: Value = Value.init(0),
+    /// A §7 filter rule answered the request from a configured body
+    /// (#159) — this proxy serving as the origin rather than refusing
+    /// or relocating. `l7_filtered`'s sibling like `l7_redirected`, and
+    /// outside `reconcile`'s shed sum for the same reason: the request
+    /// was admitted and answered. Kept apart from `l7_filtered` even
+    /// where the status matches one a reject could carry, because
+    /// "policy refused this" and "policy served this" are opposite
+    /// facts about the same traffic.
+    l7_responded: Value = Value.init(0),
     /// #178 cookie stickiness, counted once per forwarded response on a
     /// cookie-keyed cluster — at the response render, so a replayed try
     /// counts once and a torn-down exchange not at all. The three

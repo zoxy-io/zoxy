@@ -534,6 +534,9 @@ const Http1Bed = struct {
         /// §8 per-endpoint concurrency cap; null leaves the cluster
         /// uncapped, which is what every pre-existing scenario wants.
         max_inflight: ?u32 = null,
+        /// The #159 pre-rendered error pages; empty for every
+        /// pre-existing scenario, so the comptime statics keep serving.
+        error_pages: []const *const config_module.Config.StaticPage = &.{},
         /// The one cluster's §7 pick policy; p2c, the config default,
         /// for every pre-existing scenario.
         pick: config_module.Config.Cluster.Pick = .p2c,
@@ -585,6 +588,7 @@ const Http1Bed = struct {
             .request_timeout_ms = options.request_timeout_ms,
             .access_log_sink = if (options.access_log) .stdout else null,
             .health_interval_ms = options.health_interval_ms,
+            .error_pages = options.error_pages,
         };
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
@@ -2420,6 +2424,183 @@ test "l7: a header-keyed cluster stamps nothing (#178)" {
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_followed"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_assigned"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_sticky_repicked"));
+    try bed.expectDrained();
+}
+
+/// A hand-rendered #159 page for the directed tests: exactly what the
+/// loader's `renderStaticPage` produces for a 5-byte text body, so the
+/// serve path's output can be pinned byte-for-byte here without a
+/// loader round trip.
+const test_page_body = "gone\n";
+const test_not_found_keep = "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n" ++
+    "Content-Type: text/plain\r\n\r\n" ++ test_page_body;
+const test_not_found_close = "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n" ++
+    "Content-Type: text/plain\r\nConnection: close\r\n\r\n" ++ test_page_body;
+const test_not_found_page = config_module.Config.StaticPage{
+    .status = 404,
+    .keep = test_not_found_keep,
+    .close = test_not_found_close,
+    .keep_head_len = test_not_found_keep.len - test_page_body.len,
+    .close_head_len = test_not_found_close.len - test_page_body.len,
+};
+
+test "l7: a configured 404 page serves where the empty static did (#159)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 41,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .route_prefix = "/api",
+        .error_pages = &.{&test_not_found_page},
+    });
+    defer bed.tearDown();
+
+    // No route for /nope: the 404 rides the ordinary keep rule — the
+    // head parsed cleanly and announced close, so the close variant
+    // answers, body and all, from immutable memory.
+    try bed.exchange("GET /nope HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(test_not_found_page.close, bed.client.response());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
+    try bed.expectDrained();
+}
+
+test "l7: a keep-alive reject serves the page and keeps serving (#159)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 42,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .route_prefix = "/api",
+        .error_pages = &.{&test_not_found_page},
+    });
+    defer bed.tearDown();
+
+    // First request misses the route and earns the keep-variant page;
+    // the connection stays synchronized, so the second — sent only after
+    // the first response completes, sequential keep-alive rather than
+    // pipelining — is served by the origin: the page rode the same
+    // keep-or-close rules the empty static keeps.
+    bed.client.second_request = "GET /api HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /nope HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    var expected_buffer: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "{s}HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        .{test_not_found_page.keep},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(expected, bed.client.response());
+    try bed.expectDrained();
+}
+
+test "l7: a HEAD request gets a page's head and none of its body (#159)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 43,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .route_prefix = "/api",
+        .error_pages = &.{&test_not_found_page},
+    });
+    defer bed.tearDown();
+
+    // RFC 9110's HEAD rule on the configured page: the framing headers
+    // say what a GET would have carried, and no body follows — the
+    // prefix slice of the same rendered buffer.
+    try bed.exchange("HEAD /nope HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        test_not_found_page.close[0..test_not_found_page.close_head_len],
+        bed.client.response(),
+    );
+    try bed.expectDrained();
+}
+
+test "l7: a filter reject wears its configured page too (#159)" {
+    // `respondFilter` routes through the same `respond`, so a 403 page
+    // fires for policy rejects without any per-feature wiring — the
+    // point of pages living behind the one static path.
+    const forbidden_body = "no\n";
+    const forbidden_keep = "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++ forbidden_body;
+    const forbidden_close = "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n" ++
+        "Content-Type: text/plain\r\nConnection: close\r\n\r\n" ++ forbidden_body;
+    const page = config_module.Config.StaticPage{
+        .status = 403,
+        .keep = forbidden_keep,
+        .close = forbidden_close,
+        .keep_head_len = forbidden_keep.len - forbidden_body.len,
+        .close_head_len = forbidden_close.len - forbidden_body.len,
+    };
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/private" },
+        .actions = &.{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 44,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .request_filters = &rules,
+        .error_pages = &.{&page},
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /private HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(page.close, bed.client.response());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try bed.expectDrained();
+}
+
+test "l7: a respond action answers from memory and never dials (#159)" {
+    const robots_body = "User-agent: *\n";
+    const robots_keep = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++ robots_body;
+    const robots_close = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
+        "Content-Type: text/plain\r\nConnection: close\r\n\r\n" ++ robots_body;
+    const robots_page = config_module.Config.StaticPage{
+        .status = 200,
+        .keep = robots_keep,
+        .close = robots_close,
+        .keep_head_len = robots_keep.len - robots_body.len,
+        .close_head_len = robots_close.len - robots_body.len,
+    };
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/robots.txt" },
+        .actions = &.{.{ .respond = &robots_page }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 45,
+        // The origin listens and would answer, so a dial that happened
+        // would show up as this body instead of the configured one.
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .request_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    // Two requests on one connection: the first is answered from the
+    // page and the connection keeps serving, the second proves the
+    // origin was reachable all along — so the first not reaching it was
+    // the verdict, not a broken upstream.
+    bed.client.second_request = "GET /api HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /robots.txt HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    var expected_buffer: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "{s}HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        .{robots_keep},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(expected, bed.client.response());
+    // Answered as the origin, counted apart from refusals — and only
+    // the second request ever reached an upstream.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responded"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_filtered"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
     try bed.expectDrained();
 }
 

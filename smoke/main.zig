@@ -43,6 +43,23 @@ const config_path = work_directory ++ "/zoxy.json";
 const access_log_path = work_directory ++ "/access.log";
 const zoxy_log_path = work_directory ++ "/zoxy.log";
 
+/// The #159 bodies this run configures. `robots_body` goes through the
+/// **file** arm — written here, read by the real binary at startup — so
+/// this tier covers the one path the deterministic gates cannot: an
+/// actual `open`/`read` of an operator's file. `not_found_body` rides
+/// the inline arm beside it, and both are asserted byte-for-byte on the
+/// wire (their lengths are the equality; the exact bytes are pinned by
+/// the sim and the directed tests).
+const robots_path = work_directory ++ "/robots.txt";
+const robots_body = "User-agent: *\nDisallow: /private\n";
+const not_found_body = "no such route";
+
+/// The Host a request must carry to match the main route, and one that
+/// deliberately does not — the run's only way to reach a `404`, since
+/// every other request is routed by design.
+const routed_host_suffix = "127.0.0.1";
+const unrouted_host = "not-this-proxy.invalid";
+
 /// The L7 load: keep-alive connections, each serving the same count. Both
 /// numbers are above one on purpose — the access-log equality this gate
 /// exists for is a per-*request* claim that a per-*connection* bug
@@ -84,11 +101,18 @@ const l4_connections: u8 = 2;
 /// only the `origin` cluster has served.
 const sticky_exchanges: u32 = 3;
 
+/// The #159 leg: two exchanges on one connection — a request no route
+/// matches, answered by the configured `404` page, and one the
+/// `respond` action answers from the file-backed body. Like the sticky
+/// leg it runs after the counter scrapes, so those scrapes keep
+/// describing a run whose every request was routed.
+const body_exchanges: u32 = 2;
+
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 =
-    http_exchanges + sticky_exchanges + l4_connections;
+    http_exchanges + sticky_exchanges + body_exchanges + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -110,10 +134,11 @@ const rss_growth_kb_max: u64 = 64;
 /// and the alternative — a floor — is satisfied by a proxy accepting
 /// connections nobody made.
 const sticky_connections: u32 = 1;
+const body_connections: u32 = 1;
 const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
-    readiness_probes;
+    body_connections + readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -296,6 +321,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // The #178 leg runs after the scrapes above on purpose — see
     // `sticky_exchanges` — and brings its own scrape.
     const sticky_ok = try stickyPassed(arena, io, &ports);
+    const bodies_ok = try bodiesPassed(arena, io, &ports);
     const drained_cleanly = try drain(io, &child, &running);
     const lines = try readAccessLog(arena, io);
     // Every check runs and prints; a run that fails two ways should say
@@ -303,7 +329,8 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const log_ok = accessLogPassed(&lines);
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
-    const passed = log_ok and counters.passed and sticky_ok and memory_ok and drain_ok;
+    const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
+        memory_ok and drain_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -391,6 +418,11 @@ const LogCounts = struct {
     /// HTTP lines that both completed and carried the origin's status —
     /// the outcome every request in this load is owed.
     http_ok: u32 = 0,
+    /// The #159 leg's lines: one page-wearing `404` and one `respond`
+    /// answer. Neither is `ok` — no origin served them — so they are
+    /// counted apart rather than weakening the ok-equality.
+    http_rejected: u32 = 0,
+    http_responded: u32 = 0,
 };
 
 /// The access-log verdict, printed so a red run explains itself without a
@@ -401,12 +433,13 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // below its own subset would mean the counter itself is wrong — which
     // no comparison below would otherwise notice.
     assert(lines.http_ok <= lines.http);
-    assert(access_log_lines_expected == http_exchanges + sticky_exchanges + l4_connections);
+    const http_lines_expected = http_exchanges + sticky_exchanges + body_exchanges;
+    assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
-    if (lines.http != http_exchanges + sticky_exchanges) {
+    if (lines.http != http_lines_expected) {
         std.debug.print(
             "FAIL: {d} http access-log lines for {d} requests (#129 is exactly this)\n",
-            .{ lines.http, http_exchanges + sticky_exchanges },
+            .{ lines.http, http_lines_expected },
         );
         passed = false;
     }
@@ -421,10 +454,20 @@ fn accessLogPassed(lines: *const LogCounts) bool {
         std.debug.print("FAIL: {d} access-log lines of no known kind\n", .{lines.other});
         passed = false;
     }
-    if (lines.http_ok != lines.http) {
+    // Every line but the #159 leg's two carries the origin's 200; those
+    // two carry the outcomes only a configured page produces, so the
+    // three counts partition the http lines exactly.
+    if (lines.http_ok + body_exchanges != lines.http) {
         std.debug.print(
             "FAIL: {d} of {d} http lines did not complete with the origin's 200\n",
             .{ lines.http - lines.http_ok, lines.http },
+        );
+        passed = false;
+    }
+    if (lines.http_rejected != 1 or lines.http_responded != 1) {
+        std.debug.print(
+            "FAIL: {d} rejected and {d} responded lines, not 1 each (#159)\n",
+            .{ lines.http_rejected, lines.http_responded },
         );
         passed = false;
     }
@@ -625,13 +668,14 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
         );
         passed = false;
     }
-    // Minus the #178 leg, which deliberately runs after this scrape (see
-    // `sticky_exchanges`); the whole-run equality is asserted on the
-    // sticky verdict's own later scrape.
-    if (accepted != connections_expected - sticky_connections) {
+    // Minus the two legs that deliberately run after this scrape (see
+    // `sticky_exchanges` and `body_exchanges`); the whole-run equality
+    // is asserted on the last of their scrapes.
+    const opened_so_far = connections_expected - sticky_connections - body_connections;
+    if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
-            .{ accepted, connections_expected - sticky_connections },
+            .{ accepted, opened_so_far },
         );
         passed = false;
     }
@@ -892,9 +936,59 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
             passed = false;
         }
     }
-    // The whole-run accept equality, deferred from `identitiesPassed`:
-    // with the sticky connection in, every accepted connection is
-    // accounted for again.
+    // The accept count with this leg in, but still short the #159
+    // leg's connection — the whole-run equality lands there, on the
+    // last scrape of the run.
+    const accepted = counterOf(&scrape, "accepted") orelse return false;
+    if (accepted != connections_expected - body_connections) {
+        std.debug.print(
+            "FAIL: {d} connections accepted, not the {d} opened by here\n",
+            .{ accepted, connections_expected - body_connections },
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// The #159 leg against the live binary: a request no route matches,
+/// answered by the configured `404` page, and one the `respond` action
+/// answers from the file-backed body — both on one connection, both
+/// judged on their exact framing, then the counters on a scrape. Runs
+/// after `countersPassed` so those scrapes still describe a run whose
+/// every request routed.
+fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.http != 0);
+    assert(ports.admin != 0);
+    var host_buffer: [32]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.http});
+    try single_client.connect(io, ports.http);
+    defer single_client.close();
+
+    // No route for this Host, so the router's 404 — wearing the inline
+    // page rather than the empty static it would have been.
+    const not_found = try single_client.get(unrouted_host, "/", .keep_alive, null);
+    var passed = expectBodyResponse(not_found, 404, not_found_body.len, "error page");
+
+    // The respond action, off the file arm: the body zoxy read at
+    // startup, byte count and all, on a request that never reached an
+    // origin.
+    const robots = try single_client.get(host, "/robots.txt", .close, null);
+    if (!expectBodyResponse(robots, 200, robots_body.len, "respond")) passed = false;
+
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const responded = counterOf(&scrape, "l7_responded") orelse return false;
+    if (responded != 1) {
+        std.debug.print("FAIL: l7_responded reads {d}, not 1\n", .{responded});
+        passed = false;
+    }
+    const no_route = counterOf(&scrape, "l7_no_route") orelse return false;
+    if (no_route != 1) {
+        std.debug.print("FAIL: l7_no_route reads {d}, not 1\n", .{no_route});
+        passed = false;
+    }
+    // The whole-run accept equality, deferred through both late legs:
+    // this is the last scrape, so every connection the run opened is
+    // accounted for here or nowhere.
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != connections_expected) {
         std.debug.print(
@@ -904,6 +998,43 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         passed = false;
     }
     return passed;
+}
+
+/// One #159 response: the status the config asked for, and a body of
+/// exactly the configured length. The length is the equality this tier
+/// can hold — that the *bytes* are the operator's is pinned by the
+/// simulator's oracle and the directed tests — and it is enough to
+/// catch a page served empty, truncated, or from the wrong body.
+fn expectBodyResponse(
+    response: client_module.Response,
+    status: u16,
+    body_bytes: usize,
+    role: []const u8,
+) bool {
+    assert(role.len >= 1);
+    assert(body_bytes >= 1);
+    if (response.status != status) {
+        std.debug.print(
+            "FAIL: the {s} exchange answered {d}, not {d}\n",
+            .{ role, response.status, status },
+        );
+        return false;
+    }
+    if (response.body_bytes != body_bytes) {
+        std.debug.print(
+            "FAIL: the {s} body was {d} bytes, not the configured {d}\n",
+            .{ role, response.body_bytes, body_bytes },
+        );
+        return false;
+    }
+    // A configured page is a static: it never crosses the response
+    // render, so the listener's #175 stamp must not be on it — the same
+    // boundary the simulator's oracle holds from outside.
+    if (response.edited) {
+        std.debug.print("FAIL: the {s} response carried the response-filter stamp\n", .{role});
+        return false;
+    }
+    return true;
 }
 
 /// One sticky response: the ordinary http-leg checks, then the #178
@@ -1019,6 +1150,16 @@ fn readAccessLog(arena: std.mem.Allocator, io: Io) !LogCounts {
             const completed = std.mem.indexOf(u8, line, "\"outcome\":\"ok\"") != null;
             const answered = std.mem.indexOf(u8, line, "\"status\":200") != null;
             if (completed and answered) counts.http_ok += 1;
+            // The #159 leg's two lines, told apart by the outcomes only
+            // it produces: a page the router's 404 wore, and a body the
+            // proxy answered with itself. Counting them here is what
+            // lets the ok-equality below stay an equality.
+            if (std.mem.indexOf(u8, line, "\"outcome\":\"rejected\"") != null) {
+                counts.http_rejected += 1;
+            }
+            if (std.mem.indexOf(u8, line, "\"outcome\":\"responded\"") != null) {
+                counts.http_responded += 1;
+            }
         } else {
             if (std.mem.indexOf(u8, line, "\"kind\":\"l4\"") != null) {
                 counts.l4 += 1;
@@ -1069,8 +1210,12 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\    "listeners": [
         \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
         \\          "routes": [
-        \\              {{ "prefix": "/", "cluster": "origin" }},
-        \\              {{ "prefix": "/sticky", "cluster": "sticky" }}
+        \\              {{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }},
+        \\              {{ "host": "127.0.0.1", "prefix": "/sticky", "cluster": "sticky" }}
+        \\          ],
+        \\          "request_filters": [
+        \\              {{ "match": {{ "path_prefix": "/robots.txt" }},
+        \\                "actions": [{{ "respond": {{ "status": 200, "body": "robots" }} }}] }}
         \\          ],
         \\          "response_filters": [
         \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
@@ -1087,6 +1232,11 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
         \\        }}
         \\    }},
+        \\    "bodies": {{
+        \\        "gone": {{ "inline": "{s}", "content_type": "text/plain" }},
+        \\        "robots": {{ "file": "{s}", "content_type": "text/plain" }}
+        \\    }},
+        \\    "error_pages": {{ "404": "gone" }},
         \\    "admin": {{ "bind": "127.0.0.1:{d}" }},
         \\    "access_log": {{ "sink": "file", "path": "{s}" }},
         \\    "timeouts": {{
@@ -1108,6 +1258,8 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         origin_port,
         health_probe_timeout_ms,
         origin_port,
+        not_found_body,
+        robots_path,
         ports.admin,
         access_log_path,
         health_interval_ms,
@@ -1128,6 +1280,10 @@ fn prepareWorkDirectory(io: Io) !void {
         error.FileNotFound => {},
         else => return err,
     };
+    // The #159 file arm's input, written before zoxy starts because it
+    // is read once at startup (parse-once, §1) — the one thing in this
+    // config that comes off the filesystem rather than out of the JSON.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = robots_path, .data = robots_body });
 }
 
 /// zoxy's own output goes to a file rather than this process's stderr:

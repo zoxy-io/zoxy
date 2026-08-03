@@ -47,6 +47,16 @@ pub const sticky_tag = "b4a7ea22f14bfcac";
 pub const sticky_set_cookie_value =
     sticky_cookie_name ++ "=" ++ sticky_tag ++ "; Path=/; HttpOnly";
 
+/// The #159 configured bodies. `error_page_body` is the harness's page
+/// for `403` — the one status a script earns from a filter reject — so
+/// every 403 in the sweep must carry exactly these bytes; `respond_body`
+/// is what the `/respond` rule answers `200` with. Both are served from
+/// immutable memory by the static path, which is what lets the client
+/// demand them under every schedule the adversary produces.
+pub const error_page_body = "sim-403-page\n";
+pub const respond_body = "sim-respond-body\n";
+pub const page_content_type = "text/plain";
+
 /// A parseable head that cannot survive the render: 8190 bytes fits the
 /// proxy's 8 KiB response buffer, but no Content-Length and no
 /// Transfer-Encoding makes it until-close framing, which forces a
