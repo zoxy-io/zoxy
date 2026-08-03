@@ -46,6 +46,13 @@ pub const Response = struct {
     sticky_tag: ?[16]u8,
 };
 
+/// The #140 correlation header every request carries, and the one value
+/// it ever holds — spelled here rather than imported, like the counter
+/// names: the gate reads what the binary *wrote*, so a drift must fail
+/// loudly rather than agree with itself.
+pub const request_id_header = "X-Request-ID";
+pub const request_id_value = "smoke-req-1";
+
 /// What a request says about its connection's future. HTTP/1.1's default
 /// is keep-alive, so that arm sends nothing; the other says so.
 pub const Persistence = enum {
@@ -121,15 +128,21 @@ pub const Client = struct {
         assert(client.connected);
         assert(target.len >= 1);
         assert(target[0] == '/');
+        // The #140 request header rides every request: the gate names it
+        // in the config and then finds this exact value in the written
+        // log, which is the join an operator would make between this log
+        // and the origin's.
         if (cookie) |crumb| {
             assert(crumb.len >= 1);
             try client.writer.interface.print(
-                "GET {s} HTTP/1.1\r\nHost: {s}\r\nCookie: {s}\r\n{s}\r\n",
+                "GET {s} HTTP/1.1\r\nHost: {s}\r\nCookie: {s}\r\n" ++
+                    request_id_header ++ ": " ++ request_id_value ++ "\r\n{s}\r\n",
                 .{ target, host, crumb, persistence.header() },
             );
         } else {
             try client.writer.interface.print(
-                "GET {s} HTTP/1.1\r\nHost: {s}\r\n{s}\r\n",
+                "GET {s} HTTP/1.1\r\nHost: {s}\r\n" ++
+                    request_id_header ++ ": " ++ request_id_value ++ "\r\n{s}\r\n",
                 .{ target, host, persistence.header() },
             );
         }

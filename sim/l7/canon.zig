@@ -8,8 +8,20 @@ const std = @import("std");
 
 const assert = std.debug.assert;
 
+/// The #140 logged headers: a request header two scripts send and a
+/// response header the sized origin answers with, plus the one value
+/// each may ever carry. The access-log verifier demands that any value
+/// appearing under either name is exactly this one — a truncated,
+/// corrupted, or stale-from-another-request capture is then a failure
+/// under every schedule the adversary produces.
+pub const log_request_header = "x-sim-trace";
+pub const log_request_value = "sim-trace-1";
+pub const log_response_header = "x-sim-origin";
+pub const log_response_value = "sized";
+
 pub const sized_body = "canonical-sized-response-body-00";
-pub const sized_head = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n";
+pub const sized_head = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n" ++
+    log_response_header ++ ": " ++ log_response_value ++ "\r\n\r\n";
 pub const sized_response = sized_head ++ sized_body;
 pub const chunked_wire = "10\r\nchunked-body-16b\r\n0\r\n\r\n";
 pub const chunked_head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";

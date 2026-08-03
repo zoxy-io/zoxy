@@ -501,6 +501,14 @@ fn deriveServerConfig(
         // schedule fuzz; the fourth leaves it off, which is the shape
         // that must reserve nothing and read no clock (§5, §8).
         .access_log_sink = if (random.uintLessThan(u8, 4) == 0) null else .stdout,
+        // #140, on every seed: two scripts send the request header and
+        // the sized origin answers with the response one, so both
+        // captures run under the whole schedule fuzz. What the sweep
+        // proves is shape and value — the objects on exactly the http
+        // lines, and never a value the scripts did not send; staleness
+        // needs distinguishable values and is the directed tests'.
+        .access_log_request_headers = &log_request_headers,
+        .access_log_response_headers = &log_response_headers,
         .health_interval_ms = health_interval_ms,
         // #159: a page for `403` on every seed — the one status a
         // script earns from a filter reject — so the configured-page
@@ -717,6 +725,12 @@ const error_page: zoxy.config.Config.StaticPage = renderSimPage(403, l7.canon.er
 const respond_page: zoxy.config.Config.StaticPage = renderSimPage(200, l7.canon.respond_body);
 const error_pages = [_]*const zoxy.config.Config.StaticPage{&error_page};
 
+/// The #140 names every seed's config logs, already lowercased the way
+/// the loader would leave them (the simulator builds its `Config` by
+/// hand, so it owes that spelling itself).
+const log_request_headers = [_][]const u8{l7.canon.log_request_header};
+const log_response_headers = [_][]const u8{l7.canon.log_response_header};
+
 fn renderSimPage(comptime status: u16, comptime body: []const u8) zoxy.config.Config.StaticPage {
     // The loader's own preconditions, restated where the loader is
     // being stood in for: a status a page may carry, and a body the
@@ -812,26 +826,45 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
     };
 }
 
+/// The staging size this seed runs with (§8, §9). Adversarial seeds sit
+/// at the floor — one worst-case line each — so the buffer swap runs
+/// constantly and every line meets a nearly-full buffer, against the
+/// default's hundred-line headroom where the swap fires once a
+/// scenario. The *drop* rung itself stays out of reach here: a scenario
+/// emits a handful of lines and filling even the floor takes dozens, so
+/// it is pinned by a directed test (`access_log_test.zig`) rather than
+/// left to a seed that cannot generate the volume.
+///
+/// The floor is one line of *this* config, not the static minimum:
+/// #140's named headers widen a line, and the loader holds a real
+/// config to the wider bound — a hand-built one owes itself the same,
+/// or the drop rung would fire on arithmetic rather than on the
+/// backpressure it is there to force.
+fn deriveAccessLogBuffer(harness: *const Harness) u32 {
+    if (harness.config.access_log_sink == null) {
+        return 0;
+    }
+    if (harness.clean) {
+        return zoxy.constants.access_log_buffer_bytes_default;
+    }
+    const floor = @max(
+        zoxy.constants.access_log_buffer_bytes_min,
+        zoxy.constants.accessLogLineBytes(
+            log_request_headers.len + log_response_headers.len,
+        ),
+    );
+    assert(floor >= zoxy.constants.access_log_buffer_bytes_min);
+    assert(floor <= zoxy.constants.access_log_buffer_bytes_max);
+    return floor;
+}
+
 fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
     // A quarter of adversarial seeds shrink the pools to force the
     // §8 rungs; clean seeds keep ample pools so golden outcomes
     // never meet a shed. Decided in `setUp` (see `force_exhaustion`)
     // because the ring size had to precede `io.init`.
     const force_exhaustion = harness.force_exhaustion;
-    // Adversarial seeds size the staging buffers at the floor — one
-    // worst-case line each — so the buffer swap runs constantly and every
-    // line meets a nearly-full buffer, against the default's hundred-line
-    // headroom where the swap fires once a scenario. The *drop* rung
-    // itself stays out of reach here: a scenario emits a handful of lines
-    // and filling even the floor takes dozens, so it is pinned by a
-    // directed test (`access_log_test.zig`) rather than left to a seed
-    // that cannot generate the volume.
-    const access_log_buffer_bytes: u32 = if (harness.config.access_log_sink == null)
-        0
-    else if (harness.clean)
-        zoxy.constants.access_log_buffer_bytes_default
-    else
-        zoxy.constants.access_log_buffer_bytes_min;
+    const access_log_buffer_bytes = harness.deriveAccessLogBuffer();
     const options: ServerSim.InitOptions = if (force_exhaustion)
         .{
             // head_buffers ≤ conn_slots is a Server.init precondition, so
@@ -1337,6 +1370,52 @@ fn verifyAccessLogLine(line: []const u8) !void {
     const is_http = std.mem.indexOf(u8, line, "\"kind\":\"http\"") != null;
     const has_status = std.mem.indexOf(u8, line, "\"status\":") != null;
     if (is_http != has_status) return error.AccessLogLineWrongShape;
+    try verifyLoggedHeaders(line, is_http);
+}
+
+/// The #140 objects (§9). Every seed names one header each way, so an
+/// http line must carry both objects and an l4 line neither — a
+/// connection has no head to have read one from. Within them, the only
+/// value that may ever appear is the one the scripts and the origin
+/// send: a capture that truncated or corrupted fails here under every
+/// schedule. A capture that went *stale* does not, since every sender
+/// shares one value — the directed tests own that one.
+fn verifyLoggedHeaders(line: []const u8, is_http: bool) !void {
+    const request_key = "\"request_headers\":";
+    const response_key = "\"response_headers\":";
+    const has_request = std.mem.indexOf(u8, line, request_key) != null;
+    const has_response = std.mem.indexOf(u8, line, response_key) != null;
+    if (has_request != is_http) return error.AccessLogHeadersWrongShape;
+    if (has_response != is_http) return error.AccessLogHeadersWrongShape;
+    if (!is_http) return;
+    try verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_value);
+    try verifyLoggedValue(line, l7.canon.log_response_header, l7.canon.log_response_value);
+}
+
+/// One logged name carries the canonical value or does not appear.
+fn verifyLoggedValue(line: []const u8, name: []const u8, value: []const u8) !void {
+    assert(name.len >= 1);
+    assert(name.len <= zoxy.constants.access_log_header_name_bytes_max);
+    assert(value.len >= 1);
+    assert(value.len <= zoxy.constants.access_log_header_bytes_max);
+    // Sized from the caps the loader enforces, so this helper stays
+    // sound for any name and value a config could legally hold — the
+    // `catch unreachable`s below are what rest on that.
+    var needle_buffer: [zoxy.constants.access_log_header_name_bytes_max + 4]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buffer, "\"{s}\":", .{name}) catch unreachable;
+    const at = std.mem.indexOf(u8, line, needle) orelse return;
+    var expected_buffer: [
+        zoxy.constants.access_log_header_name_bytes_max +
+            zoxy.constants.access_log_header_bytes_max + 8
+    ]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "\"{s}\":\"{s}\"",
+        .{ name, value },
+    ) catch unreachable;
+    if (!std.mem.startsWith(u8, line[at..], expected)) {
+        return error.AccessLogHeaderValueWrong;
+    }
 }
 
 /// Both clients' ended hook: type-erased because the client files cannot

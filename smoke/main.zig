@@ -54,6 +54,29 @@ const robots_path = work_directory ++ "/robots.txt";
 const robots_body = "User-agent: *\nDisallow: /private\n";
 const not_found_body = "no such route";
 
+/// The #140 fields as they must appear in a written line: the client's
+/// header lowercased under `request_headers`, the origin's under
+/// `response_headers`. Built from the same constants the two ends send,
+/// so a rename cannot leave this gate agreeing with itself.
+const logged_request_id = "\"request_headers\":{\"" ++
+    lowerAscii(client_module.request_id_header) ++ "\":\"" ++
+    client_module.request_id_value ++ "\"}";
+const logged_origin_tag = "\"response_headers\":{\"" ++
+    lowerAscii(origin_module.tag_header) ++ "\":\"" ++
+    origin_module.tag_value ++ "\"}";
+
+/// Lowercase a comptime header name — the spelling zoxy logs a named
+/// header under, whatever the config wrote.
+fn lowerAscii(comptime name: []const u8) *const [name.len]u8 {
+    comptime {
+        assert(name.len >= 1);
+        var lowered: [name.len]u8 = undefined;
+        for (name, &lowered) |byte, *slot| slot.* = std.ascii.toLower(byte);
+        const frozen = lowered;
+        return &frozen;
+    }
+}
+
 /// The Host a request must carry to match the main route, and one that
 /// deliberately does not — the run's only way to reach a `404`, since
 /// every other request is routed by design.
@@ -423,6 +446,9 @@ const LogCounts = struct {
     /// counted apart rather than weakening the ok-equality.
     http_rejected: u32 = 0,
     http_responded: u32 = 0,
+    /// The #140 headers as the log actually spelled them.
+    http_with_request_id: u32 = 0,
+    http_with_origin_tag: u32 = 0,
 };
 
 /// The access-log verdict, printed so a red run explains itself without a
@@ -468,6 +494,29 @@ fn accessLogPassed(lines: *const LogCounts) bool {
         std.debug.print(
             "FAIL: {d} rejected and {d} responded lines, not 1 each (#159)\n",
             .{ lines.http_rejected, lines.http_responded },
+        );
+        passed = false;
+    }
+    // Every http request this gate sends carries the correlation
+    // header, so every http line must report it — including the two
+    // the proxy answered itself, which is exactly when a join matters.
+    if (lines.http_with_request_id != lines.http) {
+        std.debug.print(
+            "FAIL: {d} of {d} http lines carried the logged X-Request-ID (#140)\n",
+            .{ lines.http_with_request_id, lines.http },
+        );
+        passed = false;
+    }
+    // The origin's tag rides only the lines whose exchange reached it —
+    // never the page or the respond answer, which no origin served.
+    // Asserted rather than assumed: a near-empty log would otherwise
+    // underflow this subtraction into a panic, where the whole point of
+    // this function is to print a verdict.
+    assert(lines.http >= body_exchanges);
+    if (lines.http_with_origin_tag != lines.http - body_exchanges) {
+        std.debug.print(
+            "FAIL: {d} of {d} origin-served lines carried the logged X-Origin-Tag (#140)\n",
+            .{ lines.http_with_origin_tag, lines.http - body_exchanges },
         );
         passed = false;
     }
@@ -1160,6 +1209,18 @@ fn readAccessLog(arena: std.mem.Allocator, io: Io) !LogCounts {
             if (std.mem.indexOf(u8, line, "\"outcome\":\"responded\"") != null) {
                 counts.http_responded += 1;
             }
+            // The #140 join, on the real wire: every http line must
+            // carry the client's correlation header, and every line
+            // whose exchange reached the origin must carry the origin's
+            // tag. Spelled out rather than counted loosely — a value
+            // that truncated or came from another request is the one
+            // failure a correlation field must never have.
+            if (std.mem.indexOf(u8, line, logged_request_id) != null) {
+                counts.http_with_request_id += 1;
+            }
+            if (std.mem.indexOf(u8, line, logged_origin_tag) != null) {
+                counts.http_with_origin_tag += 1;
+            }
         } else {
             if (std.mem.indexOf(u8, line, "\"kind\":\"l4\"") != null) {
                 counts.l4 += 1;
@@ -1238,7 +1299,8 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\    }},
         \\    "error_pages": {{ "404": "gone" }},
         \\    "admin": {{ "bind": "127.0.0.1:{d}" }},
-        \\    "access_log": {{ "sink": "file", "path": "{s}" }},
+        \\    "access_log": {{ "sink": "file", "path": "{s}",
+        \\        "request_headers": ["X-Request-ID"], "response_headers": ["X-Origin-Tag"] }},
         \\    "timeouts": {{
         \\        "connect_ms": 2000,
         \\        "idle_ms": 30000,
