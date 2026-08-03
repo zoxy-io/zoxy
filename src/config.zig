@@ -67,7 +67,11 @@ pub const Config = struct {
     /// error page whose delivery needed a pool would fail exactly when
     /// it is needed. Configuring a status is also the opt-in for bodies
     /// on its sheds; absent, shedding costs what it does today.
-    error_pages: []const StaticPage = &.{},
+    ///
+    /// By pointer into the load-time render cache: a body serving a
+    /// page here and a `respond` action there is rendered once and
+    /// pointed at twice — #159's one-body-one-buffer contract.
+    error_pages: []const *const StaticPage = &.{},
     /// Where access-log lines go (§8), or null when no `access_log` block
     /// is configured — the log stays off and reserves nothing.
     access_log_sink: ?AccessLogSink = null,
@@ -88,17 +92,10 @@ pub const Config = struct {
         file: []const u8,
     };
 
-    /// One pre-rendered #159 page: both persistence variants of the
-    /// complete response, with each head's length recorded so a HEAD
-    /// request sends the prefix of the same buffer — still one send,
-    /// no third copy.
-    pub const StaticPage = struct {
-        status: u16,
-        keep: []const u8,
-        close: []const u8,
-        keep_head_len: u32,
-        close_head_len: u32,
-    };
+    /// One pre-rendered #159 page, defined beside the static-response
+    /// machinery it joins (`shed.StaticPage`) because the filter table
+    /// carries these too and cannot import this module.
+    pub const StaticPage = shed.StaticPage;
 
     /// The sink names the config may spell — split from `AccessLogSink`
     /// because the schema renders (and the parser matches) bare names,
@@ -422,6 +419,8 @@ pub const ValidationError = error{
     BodyFileUnreadable,
     BodyOverLimit,
     BodyUnknown,
+    FilterRespondStatus,
+    ResponseFilterRespond,
     ErrorPagesOverLimit,
     ErrorPageStatusInvalid,
     ErrorPageStatusUnknown,
@@ -575,9 +574,21 @@ pub fn parseWithFiles(
         http_listeners_count,
         access_log_sink != null,
     );
-    const listeners = try resolveListeners(arena, parsed.listeners, clusters, limits.head_buffer_bytes);
-    const admin_bind = try resolveAdminBind(parsed.admin);
+    // Bodies before listeners (#159): a `respond` action names one, and
+    // both consumers render through the same load-time cache — so the
+    // table has to exist before any rule compiles. A body's own errors
+    // therefore outrank a listener's, which is the honest order anyway:
+    // an unreadable file is a fact about the deployment, where a bad
+    // filter is a fact about a rule that may never have loaded.
     const bodies = try resolveBodies(arena, parsed.bodies, files);
+    const listeners = try resolveListeners(
+        arena,
+        parsed.listeners,
+        clusters,
+        limits.head_buffer_bytes,
+        bodies,
+    );
+    const admin_bind = try resolveAdminBind(parsed.admin);
     const error_pages = try resolveErrorPages(arena, parsed.error_pages, bodies);
 
     assert(listeners.len >= 1);
@@ -598,12 +609,22 @@ pub fn parseWithFiles(
     };
 }
 
-/// A resolved #159 body: load-time only — consumers embed pre-rendered
-/// responses, so nothing at serve time ever walks this table.
+/// A resolved #159 body: load-time only — consumers hold pointers to
+/// pre-rendered responses, so nothing at serve time ever walks this
+/// table.
+///
+/// `rendered` is the one-body-one-buffer contract made real: one slot
+/// per page status, filled on first use, so a body named by an error
+/// page and by three `respond` actions is read once, capped once, and
+/// rendered once per (status, persistence) pair however many places
+/// serve it. Pointers into it stay valid because every page is its own
+/// arena allocation — the cache holds pointers, never inline structs
+/// that a growing table could move.
 const ResolvedBody = struct {
     name: []const u8,
     bytes: []const u8,
     content_type: []const u8,
+    rendered: [shed.page_statuses.len]?*const Config.StaticPage = @splat(null),
 };
 
 /// Resolve the #159 `bodies` map: names bounded and unique, exactly one
@@ -614,7 +635,7 @@ fn resolveBodies(
     arena: std.mem.Allocator,
     bodies_json: ?BodiesJson,
     files: FileSource,
-) ParseError![]const ResolvedBody {
+) ParseError![]ResolvedBody {
     const parsed = bodies_json orelse return &.{};
     if (parsed.entries.len > std.math.maxInt(u16)) {
         return error.BodiesOverLimit;
@@ -710,8 +731,8 @@ fn resolveContentType(content_type: []const u8) ParseError![]const u8 {
 fn resolveErrorPages(
     arena: std.mem.Allocator,
     error_pages_json: ?ErrorPagesJson,
-    bodies: []const ResolvedBody,
-) ParseError![]const Config.StaticPage {
+    bodies: []ResolvedBody,
+) ParseError![]const *const Config.StaticPage {
     const parsed = error_pages_json orelse return &.{};
     // The closed status set bounds what can survive validation, so a
     // longer map always fails below — on an unknown status or on a
@@ -723,10 +744,13 @@ fn resolveErrorPages(
     if (parsed.entries.len > shed.static_statuses.len) {
         return error.ErrorPagesOverLimit;
     }
-    const pages = try arena.alloc(Config.StaticPage, parsed.entries.len);
+    const pages = try arena.alloc(*const Config.StaticPage, parsed.entries.len);
     for (parsed.entries, 0..) |entry, index| {
         const status = std.fmt.parseUnsigned(u16, entry.status, 10) catch
             return error.ErrorPageStatusInvalid;
+        // The error set, not the wider page set: `200` is a `respond`
+        // action's status, and no rung raises it — a page here for one
+        // would never serve.
         if (!shed.isStaticStatus(status)) {
             return error.ErrorPageStatusUnknown;
         }
@@ -737,16 +761,7 @@ fn resolveErrorPages(
                 return error.ErrorPageDuplicate;
             }
         }
-        const body = bodyNamed(bodies, entry.body) orelse return error.BodyUnknown;
-        const keep = try renderStaticPage(arena, status, body, .keep);
-        const close = try renderStaticPage(arena, status, body, .close);
-        pages[index] = .{
-            .status = status,
-            .keep = keep.bytes,
-            .close = close.bytes,
-            .keep_head_len = keep.head_len,
-            .close_head_len = close.head_len,
-        };
+        pages[index] = try pageFor(arena, bodies, entry.body, status);
         // What the serve path reads back (`configuredPage`): a head
         // that is a prefix of its own response, on both variants.
         assert(pages[index].keep_head_len <= pages[index].keep.len);
@@ -757,7 +772,43 @@ fn resolveErrorPages(
     return pages;
 }
 
-fn bodyNamed(bodies: []const ResolvedBody, name: []const u8) ?*const ResolvedBody {
+/// The page for one (body name, status) pair (#159), rendered on first
+/// use and reused after — so a body named by an error page and by any
+/// number of `respond` actions costs one pair of buffers, not one per
+/// reference. Every consumer of a configured body comes through here.
+fn pageFor(
+    arena: std.mem.Allocator,
+    bodies: []ResolvedBody,
+    name: []const u8,
+    status: u16,
+) ParseError!*const Config.StaticPage {
+    assert(shed.isPageStatus(status));
+    const slot = shed.pageStatusIndex(status).?;
+    const body = bodyNamed(bodies, name) orelse return error.BodyUnknown;
+    if (body.rendered[slot]) |cached| {
+        assert(cached.status == status);
+        return cached;
+    }
+    const keep = try renderStaticPage(arena, status, body, .keep);
+    const close = try renderStaticPage(arena, status, body, .close);
+    const page = try arena.create(Config.StaticPage);
+    page.* = .{
+        .status = status,
+        .keep = keep.bytes,
+        .close = close.bytes,
+        .keep_head_len = keep.head_len,
+        .close_head_len = close.head_len,
+    };
+    // What every consumer of a page relies on, stated where every page
+    // is made rather than at one call site: the head is a prefix of its
+    // own response, on both variants (the serve path's HEAD slice).
+    assert(page.keep_head_len <= page.keep.len);
+    assert(page.close_head_len <= page.close.len);
+    body.rendered[slot] = page;
+    return page;
+}
+
+fn bodyNamed(bodies: []ResolvedBody, name: []const u8) ?*ResolvedBody {
     assert(bodies.len <= std.math.maxInt(u16)); // `BodiesOverLimit`'s bound.
     for (bodies) |*body| {
         assert(body.name.len >= 1); // resolveBodies rejected empty names.
@@ -779,7 +830,7 @@ fn renderStaticPage(
     body: *const ResolvedBody,
     persistence: shed.Persistence,
 ) ParseError!struct { bytes: []const u8, head_len: u32 } {
-    assert(shed.isStaticStatus(status));
+    assert(shed.isPageStatus(status));
     assert(body.content_type.len >= 1);
     const rendered = try std.fmt.allocPrint(
         arena,
@@ -1348,6 +1399,7 @@ pub const HeaderMatchJson = struct {
 pub const ActionJson = struct {
     reject: ?u16 = null,
     redirect: ?RedirectJson = null,
+    respond: ?RespondJson = null,
     header_set: ?HeaderEditJson = null,
     header_add: ?HeaderEditJson = null,
     header_remove: ?[]const u8 = null,
@@ -1364,10 +1416,39 @@ pub const ActionJson = struct {
         .redirect = .{
             .desc = "Answer the request with a redirect instead of forwarding it.",
         },
+        .respond = .{
+            .desc = "Answer the request from a configured body instead of " ++
+                "forwarding it — this proxy as the origin.",
+        },
         .header_set = .{ .desc = "Set (replace) a request header." },
         .header_add = .{ .desc = "Append a request header." },
         .header_remove = .{ .desc = "Remove a request header by name." },
         .rewrite_prefix = .{ .desc = "Rewrite the request path prefix before proxying." },
+    };
+};
+
+/// A `respond` action (#159): the proxy answers from a named body
+/// instead of forwarding. The status defaults to `200` — the common
+/// case is serving content, and the error statuses are reachable for a
+/// policy page that wants a body without a matching `error_pages`
+/// entry.
+pub const RespondJson = struct {
+    status: u16 = 200,
+    body: []const u8,
+
+    pub const schema_doc =
+        "Answer the matched request from a configured body, with the status " ++
+        "given — the proxy responding as the origin, from memory.";
+    pub const schema_fields = .{
+        .status = .{
+            .desc = "Status to answer with: 200, or one of the error statuses " ++
+                "this proxy sends.",
+            .int_values = &shed.page_statuses,
+        },
+        .body = .{
+            .desc = "Name of the body to serve, from the top-level `bodies` map.",
+            .min_length = 1,
+        },
     };
 };
 
@@ -2231,6 +2312,7 @@ fn resolveListeners(
     listeners_json: []const ListenerJson,
     clusters: []const Config.Cluster,
     head_buffer_bytes: u32,
+    bodies: []ResolvedBody,
 ) ParseError![]const Config.Listener {
     assert(clusters.len >= 1);
     if (listeners_json.len == 0) {
@@ -2245,23 +2327,14 @@ fn resolveListeners(
     }
 
     const listeners = try arena.alloc(Config.Listener, listeners_json.len);
-    for (listeners_json, 0..) |listener_json, index| {
-        const bind_address = std.Io.net.IpAddress.parseLiteral(listener_json.bind) catch {
-            return error.ListenerBindInvalid;
-        };
-        const protocol = try protocolOf(listener_json.protocol);
-        listeners[index] = .{
-            .bind_address = bind_address,
-            .routes = try resolveRoutes(arena, &listener_json, clusters, protocol, head_buffer_bytes),
-            .request_filters = try resolveRequestFilters(arena, &listener_json, protocol, head_buffer_bytes),
-            .response_filters = try resolveResponseFilters(arena, &listener_json, protocol),
-            .protocol = protocol,
-            .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
-            .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
-        };
-        if (protocol == .http) {
-            try rejectHttpClusterSend(listeners[index].routes, clusters);
-        }
+    for (listeners_json, listeners) |listener_json, *listener| {
+        listener.* = try resolveListener(
+            arena,
+            &listener_json,
+            clusters,
+            head_buffer_bytes,
+            bodies,
+        );
     }
 
     // Duplicate binds in O(n log n), for the reason `resolveClusters`
@@ -2293,6 +2366,46 @@ fn resolveListeners(
     return listeners;
 }
 
+/// One listener's whole resolution — split from `resolveListeners`
+/// when #159 threaded the bodies table through it and the loop body
+/// pushed that function past the length limit. The duplicate-bind pass
+/// stays with the caller: it is a property of the set, not of one
+/// entry.
+fn resolveListener(
+    arena: std.mem.Allocator,
+    listener_json: *const ListenerJson,
+    clusters: []const Config.Cluster,
+    head_buffer_bytes: u32,
+    bodies: []ResolvedBody,
+) ParseError!Config.Listener {
+    assert(clusters.len >= 1);
+    assert(head_buffer_bytes >= 1);
+    const bind_address = std.Io.net.IpAddress.parseLiteral(listener_json.bind) catch {
+        return error.ListenerBindInvalid;
+    };
+    const protocol = try protocolOf(listener_json.protocol);
+    const listener: Config.Listener = .{
+        .bind_address = bind_address,
+        .routes = try resolveRoutes(arena, listener_json, clusters, protocol, head_buffer_bytes),
+        .request_filters = try resolveRequestFilters(
+            arena,
+            listener_json,
+            protocol,
+            head_buffer_bytes,
+            bodies,
+        ),
+        .response_filters = try resolveResponseFilters(arena, listener_json, protocol),
+        .protocol = protocol,
+        .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
+        .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
+    };
+    if (protocol == .http) {
+        try rejectHttpClusterSend(listener.routes, clusters);
+    }
+    assert(listener.routes.len >= 1);
+    return listener;
+}
+
 /// A total order over bind addresses, for the duplicate sort above. Only
 /// the ordering matters, never the value: equal keys are re-checked with
 /// `std.meta.eql`, so a collision costs a comparison rather than a wrong
@@ -2316,6 +2429,7 @@ fn resolveRequestFilters(
     listener_json: *const ListenerJson,
     protocol: Config.Listener.Protocol,
     head_buffer_bytes: u32,
+    bodies: []ResolvedBody,
 ) ParseError![]const filter.Rule {
     const filters_json = listener_json.request_filters orelse return &.{};
     // Any `request_filters` key on an l4 listener is a mistake — l4 relays bytes,
@@ -2332,7 +2446,7 @@ fn resolveRequestFilters(
     for (filters_json, rules) |rule_json, *rule| {
         rule.* = .{
             .match = try resolveMatch(arena, &rule_json.match, head_buffer_bytes),
-            .actions = try resolveActions(arena, rule_json.actions, head_buffer_bytes),
+            .actions = try resolveActions(arena, rule_json.actions, head_buffer_bytes, bodies),
         };
         header_edits += countHeaderEdits(rule.actions);
     }
@@ -2360,7 +2474,7 @@ fn countHeaderEdits(actions: []const filter.Action) u32 {
     for (actions) |action| {
         switch (action) {
             .header_set, .header_add, .header_remove => count += 1,
-            .reject, .redirect, .rewrite_prefix => {},
+            .reject, .redirect, .respond, .rewrite_prefix => {},
         }
     }
     assert(count <= actions.len); // Edits are a subset of the actions.
@@ -2479,6 +2593,13 @@ fn resolveResponseEdit(action_json: *const ActionJson) ParseError!filter.Applied
         // and is sent elsewhere. An origin response already exists by
         // the time these rules run.
         return error.ResponseFilterRedirect;
+    }
+    if (action_json.respond != null) {
+        // Also a request-side answer (#159): a response rule runs when
+        // the origin has already answered, and replacing that answer is
+        // not an *edit* — it is a different feature, and one this table
+        // deliberately does not have.
+        return error.ResponseFilterRespond;
     }
     if (action_json.rewrite_prefix != null) {
         return error.ResponseFilterRewrite;
@@ -2665,6 +2786,7 @@ fn resolveActions(
     arena: std.mem.Allocator,
     actions_json: []const ActionJson,
     head_buffer_bytes: u32,
+    bodies: []ResolvedBody,
 ) ParseError![]const filter.Action {
     if (actions_json.len == 0) {
         return error.FilterActionsEmpty;
@@ -2672,7 +2794,7 @@ fn resolveActions(
     assert(actions_json.len >= 1); // Past the empty guard.
     const actions = try arena.alloc(filter.Action, actions_json.len);
     for (actions_json, actions) |action_json, *action| {
-        action.* = try resolveAction(&action_json, head_buffer_bytes);
+        action.* = try resolveAction(arena, &action_json, head_buffer_bytes, bodies);
     }
     assert(actions.len == actions_json.len);
     return actions;
@@ -2684,18 +2806,24 @@ fn resolveActions(
 fn requireOneActionKind(action_json: *const ActionJson) ParseError!void {
     const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
         @intFromBool(action_json.redirect != null) +
+        @intFromBool(action_json.respond != null) +
         @intFromBool(action_json.header_set != null) +
         @intFromBool(action_json.header_add != null) +
         @intFromBool(action_json.header_remove != null) +
         @intFromBool(action_json.rewrite_prefix != null);
-    assert(set <= 6); // The action object has six kind fields.
+    assert(set <= 7); // The action object has seven kind fields.
     if (set != 1) {
         return error.FilterActionKind;
     }
     assert(set == 1);
 }
 
-fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseError!filter.Action {
+fn resolveAction(
+    arena: std.mem.Allocator,
+    action_json: *const ActionJson,
+    head_buffer_bytes: u32,
+    bodies: []ResolvedBody,
+) ParseError!filter.Action {
     try requireOneActionKind(action_json);
     if (action_json.reject) |status| {
         if (!filter.isRejectStatus(status)) {
@@ -2705,6 +2833,20 @@ fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseEr
     }
     if (action_json.redirect) |redirect_json| {
         return .{ .redirect = try resolveRedirect(&redirect_json) };
+    }
+    if (action_json.respond) |respond_json| {
+        // The page set, not the reject set: `200` is the point of this
+        // action, and an error status here is a policy page that wants
+        // a body without an `error_pages` entry to match.
+        if (!shed.isPageStatus(respond_json.status)) {
+            return error.FilterRespondStatus;
+        }
+        const page = try pageFor(arena, bodies, respond_json.body, respond_json.status);
+        // The precondition `firstVerdict` asserts on the far side, so
+        // the compiled action and the interpreter agree at load rather
+        // than on the serving path.
+        assert(shed.isPageStatus(page.status));
+        return .{ .respond = page };
     }
     if (action_json.header_set) |edit| {
         return .{ .header_set = try resolveHeaderEdit(&edit) };
@@ -4686,7 +4828,9 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 /// `drain_deadline_ms` gives it no path to that branch of the parser.
 const fuzz_seed_json =
     \\{"listeners":[{"bind":"127.0.0.1:8080","routes":[{"prefix":"/","cluster":"o"}],
-    \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]}],
+    \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]},
+    \\ {"match":{"path_prefix":"/old"},"actions":[{"redirect":{"status":301,"scheme":"https"}}]},
+    \\ {"match":{"path_prefix":"/robots.txt"},"actions":[{"respond":{"status":200,"body":"oops"}}]}],
     \\ "protocol":"http"}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],
@@ -4703,10 +4847,13 @@ const fuzz_seed_json =
 // The `file` arm here, `stdout` in `example_json` beside it: between the
 // two corpus entries the mutator sees every sink spelling, including the
 // `path` key only one of them may carry — both endpoint spellings
-// (#174), and both pick spellings (#178: the object form with its
-// key/name grammar here, the bare string in the example), so each
+// (#174), both pick spellings (#178: the object form with its key/name
+// grammar here, the bare string in the example), and every terminal
+// filter action (`reject`, `redirect` #176, `respond` #159) — so each
 // grammar is a starting point rather than a shape the mutator must
-// blindly discover.
+// blindly discover. The `inline` body arm is the one it can reach:
+// `parse` refuses `file` sources outright, since the fuzzer has no
+// filesystem.
 
 test "config: the fuzz seed carrying every block parses" {
     // It is a corpus entry, so it has to be a *valid* config — an
@@ -4719,9 +4866,15 @@ test "config: the fuzz seed carrying every block parses" {
     try std.testing.expectEqual(@as(u32, 30000), parsed.request_timeout_ms);
     try std.testing.expectEqualSlices(u16, &.{ 1, 3 }, parsed.clusters[0].weights.?);
     // The #159 grammar rides the corpus through its `inline` arm — the
-    // fuzzer's `parse` has no filesystem, deliberately.
+    // fuzzer's `parse` has no filesystem, deliberately — and every
+    // terminal action is in the seed's rule table.
     try std.testing.expectEqual(@as(usize, 1), parsed.error_pages.len);
     try std.testing.expectEqual(@as(u16, 503), parsed.error_pages[0].status);
+    const rules = parsed.listeners[0].request_filters;
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    try std.testing.expectEqual(@as(u16, 403), rules[0].actions[0].reject);
+    try std.testing.expectEqual(@as(u16, 301), rules[1].actions[0].redirect.status);
+    try std.testing.expectEqual(@as(u16, 200), rules[2].actions[0].respond.status);
 }
 
 test "fuzz: parse never panics — parse or reject, no third outcome" {
@@ -5267,6 +5420,96 @@ test "config: error pages take only known statuses naming known bodies" {
         bodies_head ++
             "\"bodies\":{\"x\":{\"inline\":\"a\",\"content_type\":\"t/p\"}," ++
             "\"x\":{\"inline\":\"b\",\"content_type\":\"t/p\"}}," ++ bodies_tail,
+    );
+}
+
+test "config: a respond action compiles to a page, sharing one buffer (#159)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parse(arena_state.allocator(),
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
+        \\ "request_filters":[
+        \\   {"match":{"path_prefix":"/robots.txt"},
+        \\    "actions":[{"respond":{"status":200,"body":"robots"}}]},
+        \\   {"match":{"path_prefix":"/down"},
+        \\    "actions":[{"respond":{"status":503,"body":"maint"}}]},
+        \\   {"match":{"path_prefix":"/also-down"},
+        \\    "actions":[{"respond":{"status":503,"body":"maint"}}]}]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "bodies":{"robots":{"inline":"User-agent: *\n","content_type":"text/plain"},
+        \\   "maint":{"inline":"back soon","content_type":"text/plain"}},
+        \\ "error_pages":{"503":"maint"},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const rules = parsed.listeners[0].request_filters;
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+
+    // The 200 page: the action's own status, the body's content type,
+    // and the complete response rendered once.
+    const robots = rules[0].actions[0].respond;
+    try std.testing.expectEqual(@as(u16, 200), robots.status);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
+            "Content-Type: text/plain\r\n\r\nUser-agent: *\n",
+        robots.keep,
+    );
+
+    // One body, one buffer: two actions and an error page naming the
+    // same (body, status) all point at the *same* rendered page — the
+    // load-time cache, not three copies of "back soon".
+    const first_maint = rules[1].actions[0].respond;
+    const second_maint = rules[2].actions[0].respond;
+    try std.testing.expectEqual(first_maint, second_maint);
+    try std.testing.expectEqual(first_maint, parsed.error_pages[0]);
+    // A different status off the same body is a different page, and
+    // shares nothing but the bytes it embeds.
+    try std.testing.expect(robots != first_maint);
+}
+
+test "config: the respond action's vocabulary is closed, and request-side only" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"," ++
+        "\"request_filters\":[{\"match\":{},\"actions\":[";
+    const mid = "]}]}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"bodies\":{\"x\":{\"inline\":\"a\",\"content_type\":\"t/p\"}},";
+    const tail = "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // 200 and the error statuses load; a status this proxy has no
+    // reason phrase for does not.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ "{\"respond\":{\"status\":404,\"body\":\"x\"}}" ++ mid ++ tail,
+        );
+        try std.testing.expectEqual(
+            @as(u16, 404),
+            parsed.listeners[0].request_filters[0].actions[0].respond.status,
+        );
+    }
+    try expectParseError(
+        error.FilterRespondStatus,
+        head ++ "{\"respond\":{\"status\":418,\"body\":\"x\"}}" ++ mid ++ tail,
+    );
+    // A dangling body name fails the same way an error page's does.
+    try expectParseError(
+        error.BodyUnknown,
+        head ++ "{\"respond\":{\"status\":200,\"body\":\"nope\"}}" ++ mid ++ tail,
+    );
+    // Still exactly one action kind, with the new arm counted.
+    try expectParseError(
+        error.FilterActionKind,
+        head ++ "{\"respond\":{\"body\":\"x\"},\"reject\":403}" ++ mid ++ tail,
+    );
+    // And it is a request-side answer: a response rule runs when the
+    // origin has already answered, so replacing that answer is not an
+    // edit this table has.
+    try expectParseError(
+        error.ResponseFilterRespond,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"," ++
+            "\"response_filters\":[{\"actions\":[{\"respond\":{\"body\":\"x\"}}]}]}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"bodies\":{\"x\":{\"inline\":\"a\",\"content_type\":\"t/p\"}}," ++ tail,
     );
 }
 

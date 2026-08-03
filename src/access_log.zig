@@ -59,6 +59,11 @@ pub const Outcome = enum(u8) {
     /// traffic must not fish redirects out of it, and one grepping for
     /// redirect volume must not see refusals.
     redirected,
+    /// A filter rule answered the request from a configured body
+    /// (#159). Its own outcome for `redirected`'s reason: an operator
+    /// counting what the origins served must not find these in it, and
+    /// one counting what policy answered must not have to subtract.
+    responded,
     /// zoxy ran out of a resource and answered `503` (§8) — a relay buffer
     /// or an upstream slot the request needed.
     shed,

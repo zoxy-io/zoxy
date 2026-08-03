@@ -593,6 +593,7 @@ pub fn Proxy(comptime IoType: type) type {
                     .redirect => |redirect| {
                         return respondRedirect(server, conn, redirect, keys.host, keys.views.forward);
                     },
+                    .respond => |page| return respondWithPage(server, conn, page),
                 }
             }
             conn.cluster_index = router.route(conn.routes, keys.host, keys.views.match) orelse {
@@ -2338,15 +2339,7 @@ pub fn Proxy(comptime IoType: type) type {
                 assert(conn.l7.request_head_len >= 1);
             }
             if (configuredPage(server, status)) |page| {
-                const head_only = conn.l7.request_method == .head;
-                const bytes = if (keep)
-                    (if (head_only) page.keep[0..page.keep_head_len] else page.keep)
-                else
-                    (if (head_only) page.close[0..page.close_head_len] else page.close);
-                const then: conn_module.ClientWrite.Then =
-                    if (keep) .next_request else .lingering_close;
-                armClientWrite(server, conn, bytes, then);
-                return;
+                return armPageWrite(server, conn, page, keep);
             }
             if (keep) {
                 armClientWrite(server, conn, shed.staticResponse(status, .keep), .next_request);
@@ -2355,12 +2348,81 @@ pub fn Proxy(comptime IoType: type) type {
             }
         }
 
+        /// Send one pre-rendered #159 page: the persistence variant the
+        /// caller decided, whole for a GET and head-only for a HEAD —
+        /// the prefix of that same buffer, so the framing headers still
+        /// describe what a GET would have carried (RFC 9110) and the
+        /// send count is unchanged. Shared by the configured statics
+        /// and the `respond` action, so the two cannot drift on the
+        /// HEAD rule or on the continuation.
+        fn armPageWrite(
+            server: *ServerType,
+            conn: *ConnType,
+            page: *const config_module.Config.StaticPage,
+            keep: bool,
+        ) void {
+            assert(conn.state == .l7_responding);
+            assert(page.keep_head_len <= page.keep.len);
+            assert(page.close_head_len <= page.close.len);
+            const head_only = conn.l7.request_method == .head;
+            const bytes = if (keep)
+                (if (head_only) page.keep[0..page.keep_head_len] else page.keep)
+            else
+                (if (head_only) page.close[0..page.close_head_len] else page.close);
+            assert(bytes.len >= 1);
+            const then: conn_module.ClientWrite.Then =
+                if (keep) .next_request else .lingering_close;
+            armClientWrite(server, conn, bytes, then);
+        }
+
+        /// Answer a matched `respond` action from its configured body
+        /// (#159): this proxy as the origin, not a refusal. Reached
+        /// from routing like the other terminal verdicts, so nothing is
+        /// acquired yet and the answer is the static path's one send.
+        fn respondWithPage(
+            server: *ServerType,
+            conn: *ConnType,
+            page: *const config_module.Config.StaticPage,
+        ) void {
+            assert(conn.state == .l7_reading_head);
+            // `respond`'s own contract: both data ops free, so the send
+            // and any lingering drain have their completions.
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.l7.response_started);
+            // A terminal verdict runs before routing acquires anything,
+            // which is what keeps it clear of every rung past the head
+            // ring (the redirect's precondition, same phase).
+            assert(conn.relay_buffer == null);
+            assert(conn.upstream == null);
+            // The page is immutable arena memory, never the connection's
+            // head buffer — so this answer releases before the send like
+            // every other static one, rather than holding through it the
+            // way the #176 redirect must (it renders into that buffer).
+            // The continuations below are the plain static pair for the
+            // same reason, and they assert the buffer is already gone.
+            releaseForStaticResponse(server, conn);
+            ServerType.clearRequestDeadline(conn);
+            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.counters.increment("l7_responded");
+            conn.log.status = page.status;
+            conn.log.outcome = .responded;
+            // The same three brakes every static answer honors (§7, §8):
+            // the client's own ask, the drain, and relay pressure.
+            const keep = staticResponseResyncable(conn) and
+                conn.l7.client_keep_alive and
+                !server.draining and
+                !server.keepAliveSuppressed();
+            conn.state = .l7_responding;
+            armPageWrite(server, conn, page, keep);
+        }
+
         /// The #159 page configured for `status`, or null for the
         /// comptime default. A linear scan: the table is bounded by the
         /// closed static-status set (ten), and this runs only on the
         /// verdict paths — never per proxied byte.
         fn configuredPage(server: *const ServerType, status: u16) ?*const config_module.Config.StaticPage {
-            for (server.config.error_pages) |*page| {
+            for (server.config.error_pages) |page| {
                 assert(page.keep_head_len <= page.keep.len);
                 assert(page.close_head_len <= page.close.len);
                 if (page.status == status) {

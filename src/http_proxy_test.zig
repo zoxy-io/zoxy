@@ -536,7 +536,7 @@ const Http1Bed = struct {
         max_inflight: ?u32 = null,
         /// The #159 pre-rendered error pages; empty for every
         /// pre-existing scenario, so the comptime statics keep serving.
-        error_pages: []const config_module.Config.StaticPage = &.{},
+        error_pages: []const *const config_module.Config.StaticPage = &.{},
         /// The one cluster's §7 pick policy; p2c, the config default,
         /// for every pre-existing scenario.
         pick: config_module.Config.Cluster.Pick = .p2c,
@@ -2450,7 +2450,7 @@ test "l7: a configured 404 page serves where the empty static did (#159)" {
         .seed = 41,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .route_prefix = "/api",
-        .error_pages = &.{test_not_found_page},
+        .error_pages = &.{&test_not_found_page},
     });
     defer bed.tearDown();
 
@@ -2471,7 +2471,7 @@ test "l7: a keep-alive reject serves the page and keeps serving (#159)" {
         .seed = 42,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .route_prefix = "/api",
-        .error_pages = &.{test_not_found_page},
+        .error_pages = &.{&test_not_found_page},
     });
     defer bed.tearDown();
 
@@ -2500,7 +2500,7 @@ test "l7: a HEAD request gets a page's head and none of its body (#159)" {
         .seed = 43,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .route_prefix = "/api",
-        .error_pages = &.{test_not_found_page},
+        .error_pages = &.{&test_not_found_page},
     });
     defer bed.tearDown();
 
@@ -2542,7 +2542,7 @@ test "l7: a filter reject wears its configured page too (#159)" {
         .seed = 44,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .request_filters = &rules,
-        .error_pages = &.{page},
+        .error_pages = &.{&page},
     });
     defer bed.tearDown();
 
@@ -2551,6 +2551,56 @@ test "l7: a filter reject wears its configured page too (#159)" {
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(page.close, bed.client.response());
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try bed.expectDrained();
+}
+
+test "l7: a respond action answers from memory and never dials (#159)" {
+    const robots_body = "User-agent: *\n";
+    const robots_keep = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++ robots_body;
+    const robots_close = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
+        "Content-Type: text/plain\r\nConnection: close\r\n\r\n" ++ robots_body;
+    const robots_page = config_module.Config.StaticPage{
+        .status = 200,
+        .keep = robots_keep,
+        .close = robots_close,
+        .keep_head_len = robots_keep.len - robots_body.len,
+        .close_head_len = robots_close.len - robots_body.len,
+    };
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/robots.txt" },
+        .actions = &.{.{ .respond = &robots_page }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 45,
+        // The origin listens and would answer, so a dial that happened
+        // would show up as this body instead of the configured one.
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .request_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    // Two requests on one connection: the first is answered from the
+    // page and the connection keeps serving, the second proves the
+    // origin was reachable all along — so the first not reaching it was
+    // the verdict, not a broken upstream.
+    bed.client.second_request = "GET /api HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /robots.txt HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    var expected_buffer: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "{s}HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        .{robots_keep},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(expected, bed.client.response());
+    // Answered as the origin, counted apart from refusals — and only
+    // the second request ever reached an upstream.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responded"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_filtered"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
     try bed.expectDrained();
 }
 

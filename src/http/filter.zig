@@ -14,6 +14,7 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const parser = @import("parser.zig");
 const router = @import("router.zig");
+const shed = @import("../shed.zig");
 
 const assert = std.debug.assert;
 
@@ -180,6 +181,12 @@ pub const Action = union(enum) {
     /// Answer a redirect and stop (#176): rendered per request, since
     /// its `Location` may carry the request's own path.
     redirect: Redirect,
+    /// Answer a configured body and stop (#159): this proxy responding
+    /// as the origin — a maintenance page, a `robots.txt`, a health
+    /// target. The page is pre-rendered at load and shared with every
+    /// other reference to the same body and status, so the action
+    /// carries a pointer, and serving it is the static path's one send.
+    respond: *const shed.StaticPage,
     /// Set (replacing any existing), add (append), or remove a header on
     /// the forwarded request, applied during the head render.
     header_set: HeaderEdit,
@@ -350,6 +357,11 @@ pub const RequestView = struct {
 pub const Verdict = union(enum) {
     reject: u16,
     redirect: *const Redirect,
+    /// A configured body answers (#159). Distinct from `reject` even
+    /// where the status is one a reject could carry: a reject is policy
+    /// refusing traffic, a respond is this proxy *being* the origin,
+    /// and the counters and access-log outcomes stay separable for it.
+    respond: *const shed.StaticPage,
 };
 
 /// The verdict of the first matching rule that carries a terminal
@@ -375,6 +387,10 @@ pub fn firstVerdict(rules: []const Rule, view: RequestView) ?Verdict {
                 .redirect => |*redirect| {
                     assert(isRedirectStatus(redirect.status));
                     return .{ .redirect = redirect };
+                },
+                .respond => |page| {
+                    assert(shed.isPageStatus(page.status));
+                    return .{ .respond = page };
                 },
                 // Edits apply at the render, only when the request
                 // forwards; a terminal anywhere in a matched rule stops it.
@@ -436,7 +452,7 @@ pub fn collectForward(
                     rewrite = candidate;
                 }
             },
-            .reject, .redirect => {},
+            .reject, .redirect, .respond => {},
         };
     }
     assert(count <= out.len);
@@ -450,7 +466,7 @@ fn appliedEdit(action: Action) AppliedHeaderEdit {
         .header_set => |e| .{ .kind = .set, .name = e.name, .value = e.value },
         .header_add => |e| .{ .kind = .add, .name = e.name, .value = e.value },
         .header_remove => |name| .{ .kind = .remove, .name = name, .value = "" },
-        .reject, .redirect, .rewrite_prefix => unreachable,
+        .reject, .redirect, .respond, .rewrite_prefix => unreachable,
     };
 }
 
@@ -1004,9 +1020,9 @@ test "filter: response rules match on status, class and headers" {
     try std.testing.expectEqualStrings("Server", ok[0].name);
 
     // A 503 gathers the unconditional and the class rule, in rule order.
-    const shed = collectResponseEdits(&rules, .{ .status = 503, .headers = &.{} }, &out);
-    try std.testing.expectEqual(@as(usize, 2), shed.len);
-    try std.testing.expectEqualStrings("Retry-After", shed[1].name);
+    const shed_edits = collectResponseEdits(&rules, .{ .status = 503, .headers = &.{} }, &out);
+    try std.testing.expectEqual(@as(usize, 2), shed_edits.len);
+    try std.testing.expectEqualStrings("Retry-After", shed_edits[1].name);
     // The class boundaries are the RFC's: 499 is not a 5xx, 599 is.
     try std.testing.expectEqual(
         @as(usize, 1),

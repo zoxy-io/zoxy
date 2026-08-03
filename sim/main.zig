@@ -157,6 +157,13 @@ const uncovered = [_]Uncovered{
             "live gate counts it against a real one",
     },
     .{
+        .name = "l7_responded",
+        .why = .unreached,
+        .reason = "the sweep configures no respond action yet (#159 — the " ++
+            "scripts and the body-carrying listener are the next slice); " ++
+            "src/http_proxy_test.zig covers the answer and its counter",
+    },
+    .{
         .name = "admin_served",
         .why = .unreached,
         .reason = "the sweep configures no admin listener; " ++
