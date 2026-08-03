@@ -72,6 +72,14 @@ pub const Config = struct {
     /// page here and a `respond` action there is rendered once and
     /// pointed at twice — #159's one-body-one-buffer contract.
     error_pages: []const *const StaticPage = &.{},
+    /// The headers each access-log line records (#140), lowercased and
+    /// deduplicated at load, empty when none are named. Read on the
+    /// capture paths, so the request list is what an http line's
+    /// `request_headers` object carries and the response list its
+    /// `response_headers` — and their summed length is what widens the
+    /// line bound this config's staging buffer was checked against.
+    access_log_request_headers: []const []const u8 = &.{},
+    access_log_response_headers: []const []const u8 = &.{},
     /// Where access-log lines go (§8), or null when no `access_log` block
     /// is configured — the log stays off and reserves nothing.
     access_log_sink: ?AccessLogSink = null,
@@ -419,6 +427,11 @@ pub const ValidationError = error{
     BodyFileUnreadable,
     BodyOverLimit,
     BodyUnknown,
+    AccessLogHeadersOverLimit,
+    AccessLogHeaderNameInvalid,
+    AccessLogHeaderNameTooLong,
+    AccessLogHeaderDuplicate,
+    LimitAccessLogBufferUnderLine,
     FilterRespondStatus,
     ResponseFilterRespond,
     ErrorPagesOverLimit,
@@ -568,11 +581,15 @@ pub fn parseWithFiles(
         if (try protocolOf(listener_json.protocol) == .http) http_listeners_count += 1;
     }
     const access_log_sink = try resolveAccessLogSink(parsed.access_log);
+    // Before the limits, because the named headers widen the line the
+    // staging buffer has to be able to hold (#140).
+    const log_headers = try resolveLogHeaders(arena, parsed.access_log);
     const limits = try resolveLimits(
         &parsed.limits,
         @intCast(parsed.listeners.len),
         http_listeners_count,
         access_log_sink != null,
+        log_headers.count(),
     );
     // Bodies before listeners (#159): a `respond` action names one, and
     // both consumers render through the same load-time cache — so the
@@ -605,8 +622,80 @@ pub fn parseWithFiles(
         .limits = limits,
         .admin_bind = admin_bind,
         .access_log_sink = access_log_sink,
+        .access_log_request_headers = log_headers.request,
+        .access_log_response_headers = log_headers.response,
         .error_pages = error_pages,
     };
+}
+
+/// The #140 header lists, resolved: lowercased so the logged key is one
+/// stable spelling a query need not guess at, deduplicated so a name
+/// written twice renders one field, and bounded together — the two
+/// lists share `access_log_headers_max`, because what the cap protects
+/// (the line bound, the per-connection capture table) is the total.
+const ResolvedLogHeaders = struct {
+    request: []const []const u8,
+    response: []const []const u8,
+
+    fn count(headers: *const ResolvedLogHeaders) u32 {
+        return @intCast(headers.request.len + headers.response.len);
+    }
+};
+
+fn resolveLogHeaders(
+    arena: std.mem.Allocator,
+    access_log_json: ?AccessLogJson,
+) ParseError!ResolvedLogHeaders {
+    const access_log = access_log_json orelse return .{ .request = &.{}, .response = &.{} };
+    const request_json = access_log.request_headers orelse &.{};
+    const response_json = access_log.response_headers orelse &.{};
+    if (request_json.len + response_json.len > constants.access_log_headers_max) {
+        return error.AccessLogHeadersOverLimit;
+    }
+    const request = try resolveLogHeaderNames(arena, request_json);
+    const response = try resolveLogHeaderNames(arena, response_json);
+    // Deduplicated per direction, not across: the same name on both
+    // sides is two different facts — what the client sent and what the
+    // origin answered — and they land in different objects.
+    assert(request.len == request_json.len);
+    assert(response.len == response_json.len);
+    return .{ .request = request, .response = response };
+}
+
+fn resolveLogHeaderNames(
+    arena: std.mem.Allocator,
+    names_json: []const []const u8,
+) ParseError![]const []const u8 {
+    if (names_json.len == 0) {
+        return &.{};
+    }
+    const names = try arena.alloc([]const u8, names_json.len);
+    for (names_json, 0..) |raw, index| {
+        if (raw.len == 0) {
+            return error.AccessLogHeaderNameInvalid;
+        }
+        if (raw.len > constants.access_log_header_name_bytes_max) {
+            return error.AccessLogHeaderNameTooLong;
+        }
+        // An RFC 9110 token, like every other header name this config
+        // spells — a name with a space or a colon could never match a
+        // parsed header, and would render a key nothing produces.
+        for (raw) |byte| {
+            if (!isTokenByte(byte)) {
+                return error.AccessLogHeaderNameInvalid;
+            }
+        }
+        const lowered = try arena.alloc(u8, raw.len);
+        for (raw, lowered) |byte, *slot| slot.* = std.ascii.toLower(byte);
+        for (names[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, lowered)) {
+                return error.AccessLogHeaderDuplicate;
+            }
+        }
+        names[index] = lowered;
+    }
+    assert(names.len == names_json.len);
+    return names;
 }
 
 /// A resolved #159 body: load-time only — consumers hold pointers to
@@ -904,6 +993,7 @@ fn resolveLimits(
     listeners_count: u32,
     http_listeners_count: u32,
     access_log_on: bool,
+    log_header_count: u32,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     assert(http_listeners_count <= listeners_count);
@@ -958,6 +1048,7 @@ fn resolveLimits(
     const access_log_buffer_bytes = try resolveAccessLogBuffer(
         limits_json.access_log_buffer_bytes,
         access_log_on,
+        log_header_count,
     );
     assert(relay_buffers <= conn_slots);
     assert(head_buffers <= conn_slots);
@@ -1044,6 +1135,7 @@ fn resolveHeadBufferBytes(requested: ?u32) ValidationError!u32 {
 fn resolveAccessLogBuffer(
     requested: ?u32,
     access_log_on: bool,
+    log_header_count: u32,
 ) ValidationError!u32 {
     if (!access_log_on) {
         if (requested != null) return error.LimitAccessLogBufferWithoutSink;
@@ -1055,6 +1147,16 @@ fn resolveAccessLogBuffer(
     {
         return error.LimitAccessLogBufferOutOfRange;
     }
+    // The static floor covers a line with no named headers; this config's
+    // own line may be wider (#140), and a buffer that cannot hold one
+    // would drop every line carrying its headers — a drop that means
+    // arithmetic rather than backpressure, which is the one thing the
+    // counter must never mean.
+    const line_bytes = constants.accessLogLineBytes(log_header_count);
+    if (bytes < line_bytes) {
+        return error.LimitAccessLogBufferUnderLine;
+    }
+    assert(bytes >= line_bytes);
     return bytes;
 }
 
@@ -1129,6 +1231,11 @@ pub const ConfigJson = struct {
 pub const AccessLogJson = struct {
     sink: []const u8,
     path: ?[]const u8 = null,
+    /// Headers to log (#140), absent meaning none — so a deployment
+    /// that does not ask pays nothing, the same shape as `access_log`
+    /// itself being absent.
+    request_headers: ?[]const []const u8 = null,
+    response_headers: ?[]const []const u8 = null,
 
     pub const schema_doc =
         "Optional access log. When present, zoxy writes one JSON object per " ++
@@ -1146,6 +1253,20 @@ pub const AccessLogJson = struct {
                 "append-only at startup (one extra fd), never truncated — so a " ++
                 "copy-truncate rotation is safe. Required by `sink:\"file\"`, " ++
                 "rejected beside `stdout`, which cannot use it.",
+        },
+        .request_headers = .{
+            .desc = "Request headers to record under `request_headers` on each " ++
+                "http line — an upstream's X-Request-ID or traceparent is what " ++
+                "joins this log to the origin's. Names are matched " ++
+                "case-insensitively and logged lowercased; absent headers are " ++
+                "omitted from the line.",
+            .max_items = constants.access_log_headers_max,
+        },
+        .response_headers = .{
+            .desc = "Response headers to record under `response_headers`, on the " ++
+                "same terms — the origin's X-Cache, say. Ignored for l4 lines, " ++
+                "which have no response to read.",
+            .max_items = constants.access_log_headers_max,
         },
     };
 };
@@ -5421,6 +5542,115 @@ test "config: error pages take only known statuses naming known bodies" {
             "\"bodies\":{\"x\":{\"inline\":\"a\",\"content_type\":\"t/p\"}," ++
             "\"x\":{\"inline\":\"b\",\"content_type\":\"t/p\"}}," ++ bodies_tail,
     );
+}
+
+test "config: logged header names are lowercased, deduped and bounded (#140)" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}]," ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}},\"access_log\":{\"sink\":\"stdout\"";
+    const tail = "},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // The logged key is one stable spelling whatever the config wrote,
+    // so a query does not have to guess at the casing.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ ",\"request_headers\":[\"X-Request-ID\",\"User-Agent\"]," ++
+                "\"response_headers\":[\"X-Cache\"]" ++ tail,
+        );
+        try std.testing.expectEqual(@as(usize, 2), parsed.access_log_request_headers.len);
+        try std.testing.expectEqualStrings("x-request-id", parsed.access_log_request_headers[0]);
+        try std.testing.expectEqualStrings("user-agent", parsed.access_log_request_headers[1]);
+        try std.testing.expectEqualStrings("x-cache", parsed.access_log_response_headers[0]);
+    }
+    // Absent lists leave the line exactly as it was.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(arena_state.allocator(), head ++ tail);
+        try std.testing.expectEqual(@as(usize, 0), parsed.access_log_request_headers.len);
+        try std.testing.expectEqual(@as(usize, 0), parsed.access_log_response_headers.len);
+    }
+    // The same name twice renders one field, so the config saying it
+    // twice is a mistake worth reporting — case-insensitively, since
+    // the two spellings are the same header.
+    try expectParseError(
+        error.AccessLogHeaderDuplicate,
+        head ++ ",\"request_headers\":[\"X-Request-ID\",\"x-request-id\"]" ++ tail,
+    );
+    // The same name on both sides is *not* a duplicate: they are two
+    // different facts, and they land in different objects.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parse(
+            arena_state.allocator(),
+            head ++ ",\"request_headers\":[\"x-trace\"],\"response_headers\":[\"x-trace\"]" ++ tail,
+        );
+        try std.testing.expectEqualStrings("x-trace", parsed.access_log_request_headers[0]);
+        try std.testing.expectEqualStrings("x-trace", parsed.access_log_response_headers[0]);
+    }
+    // A name that is not a token could never match a parsed header.
+    try expectParseError(
+        error.AccessLogHeaderNameInvalid,
+        head ++ ",\"request_headers\":[\"bad name\"]" ++ tail,
+    );
+    try expectParseError(
+        error.AccessLogHeaderNameInvalid,
+        head ++ ",\"request_headers\":[\"\"]" ++ tail,
+    );
+    try expectParseError(
+        error.AccessLogHeaderNameTooLong,
+        head ++ ",\"request_headers\":[\"" ++
+            ("x" ** (constants.access_log_header_name_bytes_max + 1)) ++ "\"]" ++ tail,
+    );
+}
+
+test "config: the two header lists share one cap, and widen the line (#140)" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}]," ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}},\"access_log\":{\"sink\":\"stdout\"";
+    const tail = "},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // The cap is the total, because what it protects — the line bound
+    // and the capture table — is the total. At the cap it loads; one
+    // past it does not, whichever list carries the extra.
+    const gpa = std.testing.allocator;
+    for ([_]u8{ constants.access_log_headers_max, constants.access_log_headers_max + 1 }) |count| {
+        var json: std.ArrayList(u8) = .empty;
+        defer json.deinit(gpa);
+        try json.appendSlice(gpa, head ++ ",\"request_headers\":[");
+        for (0..count) |index| {
+            if (index > 0) try json.append(gpa, ',');
+            var name_buffer: [16]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buffer, "\"x-h{d}\"", .{index}) catch unreachable;
+            try json.appendSlice(gpa, name);
+        }
+        try json.appendSlice(gpa, "]" ++ tail);
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const outcome = parse(arena_state.allocator(), json.items);
+        if (count > constants.access_log_headers_max) {
+            try std.testing.expectError(error.AccessLogHeadersOverLimit, outcome);
+        } else {
+            const parsed = try outcome;
+            try std.testing.expectEqual(@as(usize, count), parsed.access_log_request_headers.len);
+        }
+    }
+
+    // A staging buffer that clears the static floor but not this
+    // config's own line is refused: it would drop every line carrying
+    // the headers, which is a drop that means arithmetic.
+    const narrow = constants.access_log_buffer_bytes_min;
+    try std.testing.expect(narrow < constants.accessLogLineBytes(1));
+    var buffer_json: [512]u8 = undefined;
+    const with_narrow_buffer = std.fmt.bufPrint(
+        &buffer_json,
+        "{s},\"request_headers\":[\"x-request-id\"]}},\"limits\":{{\"access_log_buffer_bytes\":{d}}}," ++
+            "\"timeouts\":{{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}}}",
+        .{ head, narrow },
+    ) catch unreachable;
+    try expectParseError(error.LimitAccessLogBufferUnderLine, with_narrow_buffer);
 }
 
 test "config: a respond action compiles to a page, sharing one buffer (#159)" {

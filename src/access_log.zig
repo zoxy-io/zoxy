@@ -134,6 +134,32 @@ pub const Record = struct {
     /// first.
     upstream_reused: bool = false,
     upstream_replayed: bool = false,
+    /// The operator-named headers this line reports (#140), paired with
+    /// the values captured for them — the request's on the way in, the
+    /// response's on the way out. Empty on an L4 line and on any config
+    /// that names none, which is what keeps the line byte-identical to
+    /// what it was for a deployment that did not ask.
+    request_headers: NamedHeaders = .{},
+    response_headers: NamedHeaders = .{},
+};
+
+/// One direction's logged headers: the configured names and the values
+/// captured for them, parallel and equal-length. A value is empty when
+/// the request or response carried no such header, and the render omits
+/// those keys rather than emitting nulls — a line says what was there.
+///
+/// The two slices come from different places on purpose: the names are
+/// the config's arena and live forever, the values are the connection's
+/// capture table and live until the next request. Pairing them here
+/// keeps the render from having to know either.
+pub const NamedHeaders = struct {
+    names: []const []const u8 = &.{},
+    values: []const []const u8 = &.{},
+
+    pub fn len(headers: NamedHeaders) usize {
+        assert(headers.names.len == headers.values.len);
+        return headers.names.len;
+    }
 };
 
 /// Render `record` as one JSON object plus its newline into `buffer`,
@@ -217,6 +243,51 @@ fn renderHttpFields(record: *const Record, writer: *std.Io.Writer) std.Io.Writer
         record.upstream_reused,
         record.upstream_replayed,
     });
+    try writeNamedHeaders(writer, "request_headers", &record.request_headers);
+    try writeNamedHeaders(writer, "response_headers", &record.response_headers);
+}
+
+/// One direction's #140 headers as a nested object, omitted entirely
+/// when the config named none. Nested rather than flattened so a header
+/// called `status` cannot shadow the real field — and so "what the
+/// client sent" stays visibly apart from "what zoxy observed".
+///
+/// A configured-but-absent header is omitted rather than emitted as
+/// null: the object then says what arrived, and a consumer asking
+/// whether a header was present gets the same answer from the line as
+/// from the wire. Values ride the same escaper `path` and `host` use —
+/// these are client-controlled bytes, and the log is often the one
+/// component parsing untrusted text.
+fn writeNamedHeaders(
+    writer: *std.Io.Writer,
+    key: []const u8,
+    headers: *const NamedHeaders,
+) std.Io.Writer.Error!void {
+    assert(key.len >= 1);
+    if (headers.len() == 0) {
+        return;
+    }
+    assert(headers.len() <= constants.access_log_headers_max);
+    try writer.print(",\"{s}\":{{", .{key});
+    var written: u32 = 0;
+    for (headers.names, headers.values) |name, value| {
+        // Both bounds are load-bearing for `accessLogLineBytes`, so both
+        // are stated where the bytes are actually written.
+        assert(name.len >= 1);
+        assert(name.len <= constants.access_log_header_name_bytes_max);
+        assert(value.len <= constants.access_log_header_bytes_max);
+        if (value.len == 0) {
+            continue;
+        }
+        if (written >= 1) {
+            try writer.writeAll(",");
+        }
+        try std.json.Stringify.encodeJsonString(name, .{}, writer);
+        try writer.writeAll(":");
+        try std.json.Stringify.encodeJsonString(value, .{}, writer);
+        written += 1;
+    }
+    try writer.writeAll("}");
 }
 
 /// RFC 3339 UTC to the millisecond, the spelling every log pipeline reads
@@ -375,7 +446,15 @@ pub fn AccessLog(comptime IoType: type) type {
                 log.server.counters.increment("access_log_dropped");
                 return;
             };
-            assert(line.len <= constants.access_log_line_bytes_max);
+            // The config's own bound, not the compiled ceiling (#140):
+            // the loader sized this buffer to hold one line of exactly
+            // this shape, so a line past it would mean the two
+            // arithmetics disagree — the drop below would then be
+            // arithmetic wearing backpressure's name.
+            assert(line.len <= constants.accessLogLineBytes(
+                @intCast(log.server.config.access_log_request_headers.len +
+                    log.server.config.access_log_response_headers.len),
+            ));
             log.staging_len += @intCast(line.len);
             assert(log.staging_len <= buffer.len);
             log.server.counters.increment("access_log_lines");
@@ -569,6 +648,124 @@ test "access log: an L4 line omits the request fields and names no status" {
     // `kind` must not find a `status` on an L4 line at all.
     try testing.expect(std.mem.indexOf(u8, line, "status") == null);
     try testing.expect(std.mem.indexOf(u8, line, "method") == null);
+}
+
+test "access log: named headers ride nested objects, absent ones omitted (#140)" {
+    var buffer: [constants.access_log_line_bytes_max]u8 = undefined;
+    var entry = testRecord();
+    const request_names = [_][]const u8{ "x-request-id", "user-agent" };
+    // The second header was not on the request: an empty value is how a
+    // capture says "absent", and the key must not appear at all.
+    const request_values = [_][]const u8{ "abc-123", "" };
+    const response_names = [_][]const u8{"x-cache"};
+    const response_values = [_][]const u8{"HIT"};
+    entry.request_headers = .{ .names = &request_names, .values = &request_values };
+    entry.response_headers = .{ .names = &response_names, .values = &response_values };
+    const line = try renderLine(&entry, &buffer);
+
+    try testing.expectEqualStrings(
+        "{\"time\":\"2026-07-31T09:14:22.481Z\",\"kind\":\"http\",\"outcome\":\"ok\"," ++
+            "\"client\":\"10.1.2.3:52344\",\"method\":\"GET\",\"host\":\"api.example.com\"," ++
+            "\"path\":\"/v1/items\",\"status\":200,\"upstream_reused\":true," ++
+            "\"upstream_replayed\":false,\"request_headers\":{\"x-request-id\":\"abc-123\"}," ++
+            "\"response_headers\":{\"x-cache\":\"HIT\"},\"duration_us\":1873," ++
+            "\"bytes_in\":142,\"bytes_out\":4096,\"cluster\":\"api\"," ++
+            "\"upstream\":\"10.0.0.7:8080\"}\n",
+        line,
+    );
+    // Nesting is what keeps a header from shadowing a real field: a
+    // header literally called `status` lands inside the object, and the
+    // line's own `status` is still the one zoxy answered with.
+    const shadow_names = [_][]const u8{"status"};
+    const shadow_values = [_][]const u8{"not-a-status"};
+    entry.request_headers = .{ .names = &shadow_names, .values = &shadow_values };
+    entry.response_headers = .{};
+    const shadowed = try renderLine(&entry, &buffer);
+    try testing.expect(std.mem.indexOf(u8, shadowed, "\"status\":200") != null);
+    try testing.expect(
+        std.mem.indexOf(u8, shadowed, "{\"status\":\"not-a-status\"}") != null,
+    );
+    // A direction whose every configured header was absent renders an
+    // empty object, not a missing one: the config said to report it.
+    const absent_values = [_][]const u8{""};
+    entry.request_headers = .{ .names = &shadow_names, .values = &absent_values };
+    const empty = try renderLine(&entry, &buffer);
+    try testing.expect(std.mem.indexOf(u8, empty, "\"request_headers\":{}") != null);
+    try testing.expect(std.mem.indexOf(u8, empty, "response_headers") == null);
+}
+
+test "access log: a logged header value is escaped like every other text (#140)" {
+    // These are client-controlled bytes — the one field on the line an
+    // attacker writes directly — so a quote or a newline must land as
+    // an escape rather than as a forged second line.
+    var buffer: [constants.access_log_line_bytes_max]u8 = undefined;
+    var entry = testRecord();
+    const names = [_][]const u8{"x-evil"};
+    const values = [_][]const u8{"a\"b\n{\"kind\":\"http\"}"};
+    entry.request_headers = .{ .names = &names, .values = &values };
+    const line = try renderLine(&entry, &buffer);
+
+    // Exactly one line, and the injected object is inert text inside a
+    // JSON string.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    try testing.expect(std.mem.indexOf(u8, line, "a\\\"b\\n") != null);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        line,
+        .{},
+    );
+    defer parsed.deinit();
+    const logged = parsed.value.object.get("request_headers").?.object.get("x-evil").?;
+    try testing.expectEqualStrings("a\"b\n{\"kind\":\"http\"}", logged.string);
+}
+
+test "access log: a line at every cap still fits the bound (#140)" {
+    // The bound is derived, so the worst case has to actually be
+    // measured against it: every field at its cap, every named header
+    // present and at its own — the shape the loader sized the staging
+    // buffer for.
+    const gpa = testing.allocator;
+    const value = try gpa.alloc(u8, constants.access_log_header_bytes_max);
+    defer gpa.free(value);
+    // Control bytes: JSON's 6x worst case, which is what the per-header
+    // term budgets for.
+    @memset(value, 0x01);
+    const name = "x" ** constants.access_log_header_name_bytes_max;
+
+    var names: [constants.access_log_headers_max][]const u8 = undefined;
+    var values: [constants.access_log_headers_max][]const u8 = undefined;
+    for (&names, &values) |*name_slot, *value_slot| {
+        name_slot.* = name;
+        value_slot.* = value;
+    }
+    const path = try gpa.alloc(u8, constants.access_log_path_bytes_max);
+    defer gpa.free(path);
+    @memset(path, 0x01);
+    const host = try gpa.alloc(u8, constants.host_bytes_max);
+    defer gpa.free(host);
+    @memset(host, 0x01);
+
+    var entry = testRecord();
+    entry.path = path;
+    entry.host = host;
+    entry.method = "M" ** constants.access_log_method_bytes_max;
+    entry.cluster = "c" ** constants.cluster_name_bytes_max;
+    entry.client = try std.Io.net.IpAddress.parseLiteral("[2001:db8::1]:65535");
+    entry.upstream = try std.Io.net.IpAddress.parseLiteral("[2001:db8::2]:65535");
+    entry.duration_ns = std.math.maxInt(u64);
+    entry.bytes_in = std.math.maxInt(u64);
+    entry.bytes_out = std.math.maxInt(u64);
+    // Split across the directions the way a config's two lists are, so
+    // the wrapper objects are both paid for.
+    const split = constants.access_log_headers_max / 2;
+    entry.request_headers = .{ .names = names[0..split], .values = values[0..split] };
+    entry.response_headers = .{ .names = names[split..], .values = values[split..] };
+
+    const buffer = try gpa.alloc(u8, constants.access_log_line_bytes_max);
+    defer gpa.free(buffer);
+    const line = try renderLine(&entry, buffer);
+    try testing.expect(line.len <= constants.access_log_line_bytes_max);
 }
 
 test "access log: every line is valid JSON, including hostile paths" {
