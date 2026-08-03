@@ -604,16 +604,58 @@ pub fn Proxy(comptime IoType: type) type {
             beginUpstream(server, conn, request, &keys.views);
         }
 
+        /// The request-derived half of this exchange's pick (#178): what
+        /// the routed cluster's hash key reads off the parsed head —
+        /// `.none` for every cluster that keys on nothing or on the
+        /// address. Derived while the head is live: at routing on the
+        /// first try, and from the replay's re-parse on the second, the
+        /// same source-of-truth rule the replay applies to the framing.
+        fn requestKeyFor(
+            server: *const ServerType,
+            conn: *const ConnType,
+            request: *const parser.RequestHead,
+        ) Balancer.RequestKey {
+            assert(conn.cluster_index < server.config.clusters.len);
+            assert(request.head_len >= 1);
+            const cluster = &server.config.clusters[conn.cluster_index];
+            if (cluster.pick != .hash) {
+                return .none;
+            }
+            switch (cluster.hash_key) {
+                .source_ip => return .none,
+                .header => |name| {
+                    const value = parser.headerValue(request.headers, name) orelse
+                        return .absent;
+                    if (value.len == 0) {
+                        return .absent;
+                    }
+                    return .{ .key = Balancer.bytesKey(value) };
+                },
+                .cookie => |name| {
+                    const value = parser.cookieValue(request.headers, name) orelse
+                        return .absent;
+                    const identity = Balancer.parseEndpointTag(value) orelse
+                        return .absent;
+                    return .{ .endpoint = identity };
+                },
+            }
+        }
+
         /// Picks a live endpoint under the §8 per-endpoint inflight cap, or
         /// sheds 503 and returns null when every endpoint of this cluster
         /// is already at it. Shared by the first-try and replay dial paths
         /// so the cap and its shed counter cannot drift between them.
-        fn pickEndpointOrShed(server: *ServerType, conn: *ConnType) ?Balancer.Pick {
+        fn pickEndpointOrShed(
+            server: *ServerType,
+            conn: *ConnType,
+            request_key: Balancer.RequestKey,
+        ) ?Balancer.Pick {
             return server.balancer.pick(
                 conn.cluster_index,
                 &server.endpointLoad(),
                 server.health.healthy,
                 &conn.client_address,
+                request_key,
             ) orelse {
                 // The labeled twin (#179) carries only the cluster: this
                 // fires precisely because no endpoint could be picked —
@@ -648,7 +690,7 @@ pub fn Proxy(comptime IoType: type) type {
             // out a parked connection starts a request the origin has to
             // serve, which is the thing being bounded — the saved
             // handshake does not make it free.
-            const pick = pickEndpointOrShed(server, conn) orelse return;
+            const pick = pickEndpointOrShed(server, conn, requestKeyFor(server, conn, request)) orelse return;
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
@@ -1955,8 +1997,10 @@ pub fn Proxy(comptime IoType: type) type {
             //
             // The replay is a fresh try against the same cluster, so it
             // meets the same §8 cap; its budget is already spent (§7), so
-            // a cap hit here answers rather than replaying again.
-            const pick = pickEndpointOrShed(server, conn) orelse return;
+            // a cap hit here answers rather than replaying again — and
+            // the same request key (#178), re-derived from the re-parse
+            // exactly like the framing: same bytes, same key.
+            const pick = pickEndpointOrShed(server, conn, requestKeyFor(server, conn, &request)) orelse return;
             dialUpstream(server, conn, pick);
         }
 

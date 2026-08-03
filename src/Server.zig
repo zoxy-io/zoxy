@@ -1165,6 +1165,11 @@ pub fn Server(comptime IoType: type) type {
                 &server.endpointLoad(),
                 server.health.healthy,
                 &conn.client_address,
+                // L4 parses no head, so there is nothing request-derived
+                // to key on — and the loader keeps request-keyed clusters
+                // off l4 listeners (#178), so `.none` is exact, not a
+                // shrug.
+                .none,
             ) orelse {
                 // Every endpoint is at its §8 cap. An L4 listener has no
                 // way to say so — it relays bytes, and there is no

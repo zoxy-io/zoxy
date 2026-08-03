@@ -660,6 +660,37 @@ pub fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The value of the named cookie in the request's Cookie header, or null
+/// when the request carries none (#178). Reads the first Cookie header
+/// only — RFC 6265 has user agents send exactly one — and scans its
+/// `name=value` crumbs. The *name* compare is byte-exact, unlike
+/// `headerValue`'s: cookie names are case-sensitive, and the only names
+/// asked about are ones this proxy's own config spelled. A crumb's value
+/// runs to the next `;`, so a value may contain `=` (base64 does).
+pub fn cookieValue(headers: []const Header, name: []const u8) ?[]const u8 {
+    assert(name.len >= 1);
+    // A validated pick name is a token, so `=` cannot sit inside it and
+    // split the crumb somewhere other than where this scan splits it.
+    assert(std.mem.indexOfScalar(u8, name, '=') == null);
+    const header = headerValue(headers, "cookie") orelse return null;
+    var crumbs = std.mem.splitScalar(u8, header, ';');
+    // Bounded: the iterator yields at most header.len + 1 pieces.
+    while (crumbs.next()) |raw_crumb| {
+        const crumb = std.mem.trim(u8, raw_crumb, " \t");
+        if (crumb.len <= name.len) {
+            continue;
+        }
+        if (crumb[name.len] != '=') {
+            continue;
+        }
+        if (!std.mem.eql(u8, crumb[0..name.len], name)) {
+            continue;
+        }
+        return crumb[name.len + 1 ..];
+    }
+    return null;
+}
+
 /// True if a comma-separated token list (Connection, TE, ...) contains
 /// `token`, case-insensitively, with optional whitespace around tokens.
 pub fn tokenListHas(value: []const u8, token: []const u8) bool {
@@ -1510,6 +1541,38 @@ test "http parser: header helpers are case-insensitive" {
     try testing.expect(tokenListHas("close", "CLOSE"));
     try testing.expect(!tokenListHas("closed", "close"));
     try testing.expect(!tokenListHas("", "close"));
+}
+
+test "http parser: cookieValue finds its crumb, byte-exactly" {
+    const headers = [_]Header{
+        Header.init("Host", "example"),
+        Header.init("Cookie", "theme=dark; zoxy-srv=0123456789abcdef; b=1"),
+    };
+    try testing.expectEqualStrings(
+        "0123456789abcdef",
+        cookieValue(&headers, "zoxy-srv").?,
+    );
+    try testing.expectEqualStrings("dark", cookieValue(&headers, "theme").?);
+    try testing.expectEqualStrings("1", cookieValue(&headers, "b").?);
+    // Cookie *names* are case-sensitive (the header name is not): a
+    // differently-cased crumb is a different cookie, RFC 6265's rule.
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "ZOXY-SRV"));
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "zoxy"));
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&headers, "srv"));
+
+    // A value may contain `=` (base64 padding does); the crumb runs to
+    // the `;`, so only the first `=` after the name splits.
+    const padded = [_]Header{Header.init("cookie", "s=YWJjZA==;t=x")};
+    try testing.expectEqualStrings("YWJjZA==", cookieValue(&padded, "s").?);
+    try testing.expectEqualStrings("x", cookieValue(&padded, "t").?);
+
+    // No Cookie header, an empty value, and a value-less crumb.
+    const bare = [_]Header{Header.init("Host", "example")};
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&bare, "zoxy-srv"));
+    const empty = [_]Header{Header.init("Cookie", "zoxy-srv=; other=1")};
+    try testing.expectEqualStrings("", cookieValue(&empty, "zoxy-srv").?);
+    const nameless = [_]Header{Header.init("Cookie", "zoxy-srv")};
+    try testing.expectEqual(@as(?[]const u8, null), cookieValue(&nameless, "zoxy-srv"));
 }
 
 // Chunked-scanner tests drive `feed` through `chunkedOutcome`, the same

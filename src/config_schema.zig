@@ -110,11 +110,16 @@ fn writeFieldSchema(
     try out.write(meta.desc);
 
     switch (@typeInfo(Base)) {
-        .@"struct" => if (Base == config.ClustersJson)
-            try writeClustersMap(out)
-        else
-            // Nested object; its description is the field's, written above.
-            try writeObjectBody(out, Base, false),
+        .@"struct" => if (Base == config.ClustersJson) {
+            try writeClustersMap(out);
+        } else {
+            if (Base == config.PickJson) {
+                try writePickField(out);
+            } else {
+                // Nested object; its description is the field's, written above.
+                try writeObjectBody(out, Base, false);
+            }
+        },
         else => try writeShape(out, Base, meta),
     }
 
@@ -268,6 +273,34 @@ fn writeEndpointItems(out: *Stringify) Writer.Error!void {
     try out.endObject();
     try out.beginObject();
     try writeObjectBody(out, config.EndpointJson, true);
+    try out.endObject();
+    try out.endArray();
+}
+
+/// A cluster's pick accepts two spellings (#178) — the bare policy string
+/// (`p2c`, `rr`; a bare `hash` is rejected because its key must be named)
+/// or the `{policy, key, name}` object — so its schema is an `anyOf`,
+/// emitted by hand for the same reason `writeEndpointItems` is: the
+/// resolved DTO (`PickJson`) hides the string form inside its custom
+/// `jsonParse`. The string arm's vocabulary is deliberately narrower than
+/// `Pick`: hash without a key never resolves, so the schema must not
+/// advertise it.
+fn writePickField(out: *Stringify) Writer.Error!void {
+    try out.objectField("anyOf");
+    try out.beginArray();
+    try out.beginObject();
+    try out.objectField("type");
+    try out.write("string");
+    try out.objectField("enum");
+    try out.beginArray();
+    try out.write("p2c");
+    try out.write("rr");
+    try out.endArray();
+    try out.objectField("description");
+    try out.write("A keyless pick policy; hash takes the object form, which names its key.");
+    try out.endObject();
+    try out.beginObject();
+    try writeObjectBody(out, config.PickJson, true);
     try out.endObject();
     try out.endArray();
 }
@@ -442,6 +475,48 @@ test "config_schema: endpoint items accept both spellings" {
         weight.get("maximum").?.integer,
     );
     try std.testing.expectEqual(@as(i64, 0), weight.get("minimum").?.integer);
+}
+
+test "config_schema: pick accepts both spellings, and only the object names hash" {
+    var buffer: [64 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+
+    const clusters = parsed.value.object.get("properties").?.object.get("clusters").?.object;
+    const cluster_schema = clusters.get("additionalProperties").?.object;
+    const pick = cluster_schema.get("properties").?.object.get("pick").?.object;
+    const arms = pick.get("anyOf").?.array;
+    try std.testing.expectEqual(@as(usize, 2), arms.items.len);
+
+    // The string arm must not advertise `hash`: a bare hash never
+    // resolves (#178 — its key is the operator's to name).
+    const string_arm = arms.items[0].object;
+    try std.testing.expectEqualStrings("string", string_arm.get("type").?.string);
+    const literals = string_arm.get("enum").?.array;
+    try std.testing.expectEqual(@as(usize, 2), literals.items.len);
+    for (literals.items) |literal| {
+        try std.testing.expect(!std.mem.eql(u8, literal.string, "hash"));
+    }
+
+    // The object arm requires exactly `policy` and closes both
+    // vocabularies: every `Pick` policy, every `HashKey` key.
+    const object_arm = arms.items[1].object;
+    try std.testing.expectEqualStrings("object", object_arm.get("type").?.string);
+    const required = object_arm.get("required").?.array;
+    try std.testing.expectEqual(@as(usize, 1), required.items.len);
+    try std.testing.expectEqualStrings("policy", required.items[0].string);
+    const properties = object_arm.get("properties").?.object;
+    const policies = properties.get("policy").?.object.get("enum").?.array;
+    try std.testing.expectEqual(
+        @typeInfo(config.Config.Cluster.Pick).@"enum".fields.len,
+        policies.items.len,
+    );
+    const keys = properties.get("key").?.object.get("enum").?.array;
+    try std.testing.expectEqual(
+        @typeInfo(std.meta.Tag(config.Config.Cluster.HashKey)).@"enum".fields.len,
+        keys.items.len,
+    );
 }
 
 test "config_schema: response filter status bounds and class vocabulary" {
