@@ -69,7 +69,7 @@ weights_http: [1]u16,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
-request_filters_http: [4]zoxy.http.filter.Rule,
+request_filters_http: [5]zoxy.http.filter.Rule,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
@@ -502,6 +502,13 @@ fn deriveServerConfig(
         // that must reserve nothing and read no clock (§5, §8).
         .access_log_sink = if (random.uintLessThan(u8, 4) == 0) null else .stdout,
         .health_interval_ms = health_interval_ms,
+        // #159: a page for `403` on every seed — the one status a
+        // script earns from a filter reject — so the configured-page
+        // arm of the static path runs under the whole schedule fuzz,
+        // and the client can demand its bytes on every 403. `503` is
+        // deliberately left out: the sheds keep their empty bodies,
+        // which is the opt-in rule stated as a property.
+        .error_pages = &error_pages,
     };
 }
 
@@ -693,6 +700,48 @@ fn deriveProxyProtocolSend(random: std.Random) ?zoxy.config.Config.Cluster.Proxy
     };
 }
 
+/// The two #159 pages the sweep serves, rendered here exactly as
+/// `config.zig`'s loader renders one — the simulator builds its
+/// `Config` by hand (no filesystem, no parse), so the shape is spelled
+/// out rather than loaded. The client oracle demands these bodies
+/// byte-for-byte on every seed.
+///
+/// The duplication is deliberate but not free: this spelling and the
+/// loader's could drift, and nothing here would notice, because what
+/// the serving path consumes is the `StaticPage` *fields* — it never
+/// re-reads the head it was handed. What that costs is coverage of the
+/// loader's exact byte layout, which `config.zig`'s own tests pin
+/// instead (`bodies render into complete pages`). Same trade, same
+/// reason, as `src/http_proxy_test.zig`'s hand-spelled page.
+const error_page: zoxy.config.Config.StaticPage = renderSimPage(403, l7.canon.error_page_body);
+const respond_page: zoxy.config.Config.StaticPage = renderSimPage(200, l7.canon.respond_body);
+const error_pages = [_]*const zoxy.config.Config.StaticPage{&error_page};
+
+fn renderSimPage(comptime status: u16, comptime body: []const u8) zoxy.config.Config.StaticPage {
+    // The loader's own preconditions, restated where the loader is
+    // being stood in for: a status a page may carry, and a body the
+    // client oracle can demand.
+    comptime assert(zoxy.shed.isPageStatus(status));
+    comptime assert(body.len >= 1);
+    const head = std.fmt.comptimePrint(
+        "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\n",
+        .{ status, zoxy.shed.reasonPhrase(status), body.len, l7.canon.page_content_type },
+    );
+    const keep = head ++ "\r\n" ++ body;
+    const close = head ++ "Connection: close\r\n\r\n" ++ body;
+    // `renderStaticPage`'s postcondition: the head is a real prefix, so
+    // the HEAD slice the serve path takes is never the whole response.
+    comptime assert(keep.len > body.len);
+    comptime assert(close.len > keep.len);
+    return .{
+        .status = status,
+        .keep = keep,
+        .close = close,
+        .keep_head_len = keep.len - body.len,
+        .close_head_len = close.len - body.len,
+    };
+}
+
 fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
     harness.request_filters_http = .{
         .{
@@ -707,6 +756,14 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .actions = &.{.{ .redirect = .{ .status = 301, .target = .{ .composed = .{
                 .scheme = .https,
             } } } }},
+        },
+        .{
+            // #159: answered from a configured body, before any
+            // post-parse resource is acquired and without reaching an
+            // origin. The page is pre-rendered like the loader's, so
+            // the sweep exercises the static path's body-carrying arm.
+            .match = .{ .path_prefix = "/respond" },
+            .actions = &.{.{ .respond = &respond_page }},
         },
         .{
             .match = .{ .path_prefix = "/edit" },
@@ -1234,6 +1291,7 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_no_route",
         "l7_filtered",
         "l7_redirected",
+        "l7_responded",
         "l7_shed_relay_buffers",
         "l7_shed_upstream_slots",
         "l7_shed_endpoint_inflight",

@@ -70,6 +70,14 @@ pub const Script = enum(u8) {
     /// with the one response this proxy renders per request instead of
     /// serving from static memory.
     filter_redirect,
+    /// A GET under `/respond`: a §7 filter answers `200` from a
+    /// configured body (#159) — this proxy as the origin. Timed like
+    /// `filter_reject`: answered before any post-parse resource is
+    /// acquired or origin dialed. The client demands the exact body,
+    /// and — because a configured page is a static — that it carries
+    /// *neither* response-side stamp, which is how the sweep proves
+    /// from outside that a page bypasses the response render.
+    filter_respond,
     /// A GET under `/edit`: a §7 filter adds a header to the forwarded
     /// request. It routes and succeeds (200); the origin's §7 oracle proves
     /// the edited head still forwards canonical.
@@ -373,6 +381,17 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 301,
         .method = .get,
         .allowed_statuses = &.{ 301, 503 },
+    },
+    .filter_respond = .{
+        // `filter_reject`'s timing exactly — the answer precedes every
+        // post-parse resource — so the §5 head ring's 503 is again the
+        // one verdict that can arrive instead.
+        .request = "GET /respond HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = &.{ 200, 503 },
     },
     .filter_edit = .{
         // Routes and forwards like a plain GET, so the §8 rungs and a

@@ -409,7 +409,7 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = ClientError.ResponseStatusUnexpected;
                     return walk;
                 }
-                if (responseEditViolation(&response)) |violation| {
+                if (responseEditViolation(script, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
                 }
@@ -428,7 +428,7 @@ pub fn Client(comptime IoType: type) type {
                     }
                 }
                 const body = bytes[walk.offset + response.head_len ..];
-                const verdict = walkBody(response, body) orelse return walk;
+                const verdict = walkBody(response, body, script) orelse return walk;
                 if (verdict.violation) |violation| {
                     walk.violation = violation;
                     return walk;
@@ -456,7 +456,7 @@ pub fn Client(comptime IoType: type) type {
         /// means the class predicate fired on a class the origin never
         /// answers. Distinguishes the two render paths from outside the
         /// process, under every schedule the adversary produces.
-        fn responseEditViolation(response: *const parser.ResponseHead) ?ClientError {
+        fn responseEditViolation(script: Script, response: *const parser.ResponseHead) ?ClientError {
             assert(response.status >= 100);
             assert(response.headers.len <= zoxy.constants.headers_max);
             const stamped = headerEquals(
@@ -464,7 +464,12 @@ pub fn Client(comptime IoType: type) type {
                 canon.response_edit_name,
                 canon.response_edit_value,
             );
-            if (response.status == 200) {
+            // A #159 page is a static however good its status looks: it
+            // is sent from immutable memory and never crosses the
+            // response render, so the stamp on one would mean a
+            // configured body had grown filter edits.
+            const from_memory = pageBodyFor(script, response.status) != null;
+            if (response.status == 200 and !from_memory) {
                 if (!stamped) {
                     return ClientError.ResponseEditMissing;
                 }
@@ -502,7 +507,11 @@ pub fn Client(comptime IoType: type) type {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
-            if (response.status != 200) {
+            // Same rule as the #175 stamp, one mechanism over: a page
+            // reaches no origin and runs no response render, so a
+            // cookie on one would be the stamp path firing for an
+            // exchange that never happened.
+            if (response.status != 200 or pageBodyFor(script, response.status) != null) {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
@@ -560,6 +569,35 @@ pub fn Client(comptime IoType: type) type {
             return std.mem.eql(u8, tail[0..check_len], anchor[0..check_len]);
         }
 
+        /// The #159 body a configured page carries for this (script,
+        /// status), or null when the response is not one. Two pages are
+        /// configured by the harness: `403` — the status a filter
+        /// reject earns, so every 403 in the sweep is one — and the
+        /// `200` the `/respond` rule answers, which reaches no origin.
+        ///
+        /// This doubles as "answered from memory": a page is a static,
+        /// so it bypasses the response render and therefore *both*
+        /// response-side mechanisms — the #175 stamp and the #178
+        /// cookie. The three oracles below all key off this one
+        /// predicate, so the sweep cannot come to disagree with itself
+        /// about which responses were rendered.
+        fn pageBodyFor(script: Script, status: u16) ?[]const u8 {
+            assert(status >= 100);
+            assert(status <= 599);
+            if (status == 403) {
+                // Blanket by status, mirroring the server: a configured
+                // page answers *any* path that raises 403, not only the
+                // `/reject` rule that raises one today.
+                assert(canon.error_page_body.len >= 1);
+                return canon.error_page_body;
+            }
+            if (status == 200 and script == .filter_respond) {
+                assert(canon.respond_body.len >= 1);
+                return canon.respond_body;
+            }
+            return null;
+        }
+
         const BodyVerdict = struct {
             body_len: u32,
             violation: ?ClientError,
@@ -572,9 +610,19 @@ pub fn Client(comptime IoType: type) type {
         /// framing (the proxy relays body wire bytes verbatim), and
         /// every legal non-200 is a static with Content-Length 0 — so a
         /// corrupted length fails even before its body arrives.
-        fn walkBody(response: parser.ResponseHead, body: []const u8) ?BodyVerdict {
+        fn walkBody(response: parser.ResponseHead, body: []const u8, script: Script) ?BodyVerdict {
+            const page_body = pageBodyFor(script, response.status);
             switch (response.framing) {
                 .content_length => |length| {
+                    // A configured page's body, byte-exact (#159): it is
+                    // rendered once at load, so any drift here is the
+                    // static path corrupting immutable memory.
+                    if (page_body) |expected| {
+                        if (length != expected.len) {
+                            return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
+                        }
+                        return prefixVerdict(body, expected, @intCast(length));
+                    }
                     if (response.status == 200) {
                         if (length != canon.sized_body.len) {
                             return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
@@ -586,14 +634,17 @@ pub fn Client(comptime IoType: type) type {
                     }
                     return .{ .body_len = 0, .violation = null };
                 },
+                // A page is always Content-Length framed — the loader
+                // renders it that way — so either streaming framing on
+                // one is the render inventing a shape.
                 .chunked => {
-                    if (response.status != 200) {
+                    if (response.status != 200 or page_body != null) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
                     }
                     return prefixVerdict(body, canon.chunked_wire, canon.chunked_wire.len);
                 },
                 .until_close => {
-                    if (response.status != 200) {
+                    if (response.status != 200 or page_body != null) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
                     }
                     // The FIN delimits this body, so it is transcript-
