@@ -148,10 +148,10 @@ pub const Config = struct {
         /// listeners always have exactly that one route (no path to
         /// match). Matched by `http/router.zig`.
         routes: []const router.Route,
-        /// The §7 filter rules, in config order (evaluated top-down).
-        /// Empty on the L4 path and whenever no `"filters"` were given.
+        /// The §7 request filter rules, in config order (evaluated top-down).
+        /// Empty on the L4 path and whenever no `"request_filters"` were given.
         /// Compiled and interpreted by `http/filter.zig`.
-        filters: []const filter.Rule = &.{},
+        request_filters: []const filter.Rule = &.{},
         protocol: Protocol,
         /// How this listener tells the origin who the client is (§7), or
         /// null to leave `X-Forwarded-For` exactly as it arrived — the
@@ -367,7 +367,7 @@ pub const ValidationError = error{
     RoutePrefixNotCanonical,
     RouteHostNotCanonical,
     RouteDuplicate,
-    ListenerL4Filters,
+    ListenerL4RequestFilters,
     ListenerL4Forwarded,
     ListenerForwardedModeUnknown,
     ListenerHttpProxyProtocol,
@@ -839,8 +839,8 @@ pub const ListenerJson = struct {
     /// `routes` (an explicit §7 path table) must be present.
     cluster: ?[]const u8 = null,
     routes: ?[]const RouteJson = null,
-    /// Optional §7 filter rules; absent means none. HTTP-only.
-    filters: ?[]const FilterJson = null,
+    /// Optional §7 request filter rules; absent means none. HTTP-only.
+    request_filters: ?[]const FilterJson = null,
     /// Optional: absent means `l4`, keeping pre-L7 configs valid.
     protocol: []const u8 = "l4",
     /// Optional §7 client-address forwarding; absent leaves the header
@@ -860,7 +860,7 @@ pub const ListenerJson = struct {
             .desc = "Explicit longest-prefix route table (http listeners only).",
             .min_items = 1,
         },
-        .filters = .{
+        .request_filters = .{
             .desc = "Request filter rules, evaluated top-down (http listeners only).",
         },
         .protocol = .{
@@ -1614,7 +1614,7 @@ fn resolveListeners(
         listeners[index] = .{
             .bind_address = bind_address,
             .routes = try resolveRoutes(arena, &listener_json, clusters, protocol, head_buffer_bytes),
-            .filters = try resolveFilters(arena, &listener_json, protocol, head_buffer_bytes),
+            .request_filters = try resolveRequestFilters(arena, &listener_json, protocol, head_buffer_bytes),
             .protocol = protocol,
             .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
             .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
@@ -1671,18 +1671,18 @@ fn bindOrder(address: std.Io.net.IpAddress) u160 {
 /// keys are validated canonical so a filter and the router agree
 /// byte-for-byte, and each action is validated at load, so the request-
 /// time interpreter is bounded loops over trusted data.
-fn resolveFilters(
+fn resolveRequestFilters(
     arena: std.mem.Allocator,
     listener_json: *const ListenerJson,
     protocol: Config.Listener.Protocol,
     head_buffer_bytes: u32,
 ) ParseError![]const filter.Rule {
-    const filters_json = listener_json.filters orelse return &.{};
-    // Any `filters` key on an l4 listener is a mistake — l4 relays bytes,
+    const filters_json = listener_json.request_filters orelse return &.{};
+    // Any `request_filters` key on an l4 listener is a mistake — l4 relays bytes,
     // there is no head to match on — so reject it whether the array is
     // populated or (vacuously) empty, before the empty-array shortcut.
     if (protocol == .l4) {
-        return error.ListenerL4Filters;
+        return error.ListenerL4RequestFilters;
     }
     if (filters_json.len == 0) {
         return &.{};
@@ -2155,7 +2155,7 @@ fn resolveMaxInflight(max_inflight: ?u32) ParseError!?u32 {
 /// a `forwarded` block on an `l4` listener is rejected rather than
 /// ignored — a byte relay has no header to carry an address, so asking
 /// for one there describes a proxy that is not running, exactly like
-/// `filters` and `routes` on the same listener.
+/// `request_filters` and `routes` on the same listener.
 fn resolveForwarded(
     forwarded_json: ?ForwardedJson,
     protocol: Config.Listener.Protocol,
@@ -2692,7 +2692,7 @@ test "config: filters compile into rules with matches and actions" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","filters":[
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","request_filters":[
         \\   {"match":{"method":["GET","POST"],"path_prefix":"/admin",
         \\             "headers":[{"name":"X-Env","equals":"prod"}]},
         \\    "actions":[{"reject":403}]},
@@ -2702,7 +2702,7 @@ test "config: filters compile into rules with matches and actions" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
-    const filters = parsed.listeners[0].filters;
+    const filters = parsed.listeners[0].request_filters;
     try std.testing.expectEqual(@as(usize, 2), filters.len);
 
     // Rule 0: method set + path prefix + one header-equals match, reject 403.
@@ -2731,14 +2731,14 @@ test "config: filter schema rejects malformed rules" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"filters\":[";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
     // L4 listener may not carry filters.
-    try expectParseError(error.ListenerL4Filters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
-        "\"filters\":[{\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.ListenerL4RequestFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
+        "\"request_filters\":[{\"actions\":[{\"reject\":403}]}]}]," ++ tail);
     // Even a vacuously empty filters array on l4 is a mistake — the key is
     // meaningless there, and an empty array must not slip past the guard.
-    try expectParseError(error.ListenerL4Filters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
-        "\"filters\":[]}]," ++ tail);
+    try expectParseError(error.ListenerL4RequestFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
+        "\"request_filters\":[]}]," ++ tail);
     // A rule with no actions.
     try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}]," ++ tail);
     // An action object with no kind set.
@@ -2791,7 +2791,7 @@ test "config: a filter set over the header-edit budget is rejected" {
         break :blk s;
     };
     const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"cluster\":\"a\",\"filters\":[" ++ rules ++ "]}]," ++ tail;
+        "\"cluster\":\"a\",\"request_filters\":[" ++ rules ++ "]}]," ++ tail;
     try expectParseError(error.FilterHeaderEditsOverLimit, json);
 }
 
@@ -3239,7 +3239,7 @@ test "config: a table far past the old caps parses, and is bounded only by itsel
                 "\"actions\":[{\"reject\":404}]}";
         }
         break :blk "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-            "\"routes\":[" ++ routes ++ "],\"filters\":[" ++ filters ++ "]}]," ++
+            "\"routes\":[" ++ routes ++ "],\"request_filters\":[" ++ filters ++ "]}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
     };
@@ -3247,7 +3247,7 @@ test "config: a table far past the old caps parses, and is bounded only by itsel
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state, json);
     try std.testing.expectEqual(@as(usize, route_count), parsed.listeners[0].routes.len);
-    try std.testing.expectEqual(@as(usize, route_count), parsed.listeners[0].filters.len);
+    try std.testing.expectEqual(@as(usize, route_count), parsed.listeners[0].request_filters.len);
 }
 
 test "config: strictness rejects unknown and duplicate fields" {
@@ -3851,7 +3851,7 @@ test "config: the forwarded block resolves a mode, and is http-only" {
     }
 
     // An l4 listener has no header to carry an address, so asking for one
-    // describes a proxy that is not running — rejected, like `filters`.
+    // describes a proxy that is not running — rejected, like `request_filters`.
     try expectParseError(
         error.ListenerL4Forwarded,
         head ++ ",\"forwarded\":{\"mode\":\"replace\"}" ++ tail,
@@ -3973,7 +3973,7 @@ test "config: a filter may not name the header zoxy manages" {
     // encodes one fixed address for every client — it looks like client
     // forwarding and is the opposite of it. Reserved unconditionally, not
     // only on listeners that set it, so one mechanism owns the header.
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"filters\":[";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
     const tail = "]}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
@@ -3992,6 +3992,6 @@ test "config: a filter may not name the header zoxy manages" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state, head ++
             "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-Proto\",\"value\":\"https\"}}]}" ++ tail);
-        try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].filters.len);
+        try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].request_filters.len);
     }
 }

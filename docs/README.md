@@ -424,12 +424,13 @@ connection to a sending cluster.
 
 ### Filters
 
-An `http` listener can carry a list of rules, evaluated top-down. Each has a
-match predicate — absent fields match anything — and actions applied in order.
-As with routes, nothing caps the list but the file you write.
+An `http` listener can carry `request_filters` — a list of rules evaluated
+top-down against each request. Each has a match predicate — absent fields
+match anything — and actions applied in order. As with routes, nothing caps
+the list but the file you write.
 
 ```json
-"filters": [
+"request_filters": [
     {
         "match": {
             "path_prefix": "/admin",

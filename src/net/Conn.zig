@@ -303,7 +303,7 @@ pub fn Conn(comptime IoType: type) type {
         routes: []const router.Route,
         /// The listener's §7 filter rules, same lifetime as `routes`
         /// (empty on L4 and when no filters are configured).
-        filters: []const filter.Rule,
+        request_filters: []const filter.Rule,
         /// The listener's §7 client-address forwarding mode, same lifetime
         /// as `routes`; null leaves `X-Forwarded-For` untouched.
         forwarded: ?config_module.Config.Listener.Forwarded,
@@ -594,7 +594,7 @@ pub fn Conn(comptime IoType: type) type {
             // Placeholders until the admission tail installs the
             // listener's real tables (§7); L4 never reads them.
             conn.routes = &.{};
-            conn.filters = &.{};
+            conn.request_filters = &.{};
             conn.forwarded = null;
             conn.upstream = null;
             conn.charged_endpoint = LogState.endpoint_none;

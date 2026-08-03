@@ -69,7 +69,7 @@ weights_http: [1]u16,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
-filters_http: [3]zoxy.http.filter.Rule,
+request_filters_http: [3]zoxy.http.filter.Rule,
 listener_configs: [2]zoxy.config.Config.Listener,
 config: zoxy.config.Config,
 origin: Origin,
@@ -643,7 +643,7 @@ fn deriveProxyProtocolSend(random: std.Random) ?zoxy.config.Config.Cluster.Proxy
 }
 
 fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
-    harness.filters_http = .{
+    harness.request_filters_http = .{
         .{
             .match = .{ .path_prefix = "/reject" },
             .actions = &.{.{ .reject = 403 }},
@@ -667,7 +667,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
         .{
             .bind_address = httpBindAddress(),
             .routes = &harness.routes_http,
-            .filters = &harness.filters_http,
+            .request_filters = &harness.request_filters_http,
             .protocol = .http,
             .forwarded = forwarded,
         },

@@ -435,7 +435,7 @@ pub fn Proxy(comptime IoType: type) type {
         ) error{Oversize}!Forwarded {
             const base = views.forward;
             assert(base.path.len >= 1);
-            if (conn.filters.len == 0) {
+            if (conn.request_filters.len == 0) {
                 return .{ .target = base, .edits = &.{} };
             }
             // The canonical *host* is still recomputed here, unlike the
@@ -460,7 +460,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .headers = request.headers,
             };
             // One scan yields both the rewrite and the header edits (§7).
-            const forward = filter.collectForward(conn.filters, view, edit_buffer);
+            const forward = filter.collectForward(conn.request_filters, view, edit_buffer);
             // Rewrite only origin-form targets; asterisk-form names no path.
             var target = base;
             if (views.origin_form) {
@@ -578,7 +578,7 @@ pub fn Proxy(comptime IoType: type) type {
             captureTarget(conn, keys.host, keys.views.match);
             // §7 filters run before routing: a policy reject stops the
             // request whether or not it would have routed.
-            if (filter.firstReject(conn.filters, .{
+            if (filter.firstReject(conn.request_filters, .{
                 .method = request.method,
                 .host = keys.host,
                 .path = keys.views.match,

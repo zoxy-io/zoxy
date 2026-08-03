@@ -515,7 +515,7 @@ const Http1Bed = struct {
         /// The listener's §7 filter rules; empty by default so existing
         /// scenarios are unfiltered. A test supplies compiled rules to
         /// drive the filter reject/edit paths.
-        filters: []const filter.Rule = &.{},
+        request_filters: []const filter.Rule = &.{},
         /// The §7 client-address forwarding mode; null (the default)
         /// leaves `X-Forwarded-For` untouched, as every pre-existing
         /// scenario expects.
@@ -560,7 +560,7 @@ const Http1Bed = struct {
         bed.listeners = .{.{
             .bind_address = bindAddress(),
             .routes = &bed.routes,
-            .filters = options.filters,
+            .request_filters = options.request_filters,
             .protocol = .http,
             .forwarded = options.forwarded,
         }};
@@ -793,7 +793,7 @@ test "l7: a head that fits on arrival but not after forwarding is 431" {
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{
             .seed = 5,
-            .filters = &rules,
+            .request_filters = &rules,
             .route_prefix = "/api",
             .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         });
@@ -817,7 +817,7 @@ test "l7: a head that fits on arrival but not after forwarding is 431" {
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{
             .seed = 11,
-            .filters = &rules,
+            .request_filters = &rules,
             .route_prefix = "/r",
             .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         });
@@ -1048,7 +1048,7 @@ test "l7: a filter reject answers its policy status before the origin is dialed"
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 27,
-        .filters = &rules,
+        .request_filters = &rules,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
     });
     defer bed.tearDown();
@@ -1079,7 +1079,7 @@ test "l7: a request the filter does not match is proxied untouched" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 28,
-        .filters = &rules,
+        .request_filters = &rules,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
     });
     defer bed.tearDown();
@@ -1107,7 +1107,7 @@ test "l7: a filter reject survives 1-byte adversarial delivery across seeds" {
         try bed.setUp(std.testing.allocator, .{
             .seed = seed,
             .partial_io = true,
-            .filters = &rules,
+            .request_filters = &rules,
             .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         });
         defer bed.tearDown();
@@ -1374,7 +1374,7 @@ test "l7: a reject closes when the client pipelined the next request" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 62,
-        .filters = &rules,
+        .request_filters = &rules,
         .inbox_bytes = 4096,
     });
     defer bed.tearDown();
@@ -1411,7 +1411,7 @@ test "l7: a reject closes when the body has not arrived with the head" {
         try bed.setUp(std.testing.allocator, .{
             .seed = seed,
             .partial_io = true,
-            .filters = &rules,
+            .request_filters = &rules,
         });
         defer bed.tearDown();
 
@@ -1441,7 +1441,7 @@ test "l7: a drain closes a reject that would otherwise be kept" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 69,
-        .filters = &rules,
+        .request_filters = &rules,
         .send_delay_ms = 100,
     });
     defer bed.tearDown();
@@ -1479,7 +1479,7 @@ test "l7: relay pressure closes a reject that would otherwise be kept" {
         .seed = 68,
         .relay_buffers = 1,
         .origin_mute = true,
-        .filters = &rules,
+        .request_filters = &rules,
     });
     defer bed.tearDown();
 
@@ -1513,7 +1513,7 @@ test "l7: a reject closes when the request carries a body" {
         .actions = &.{.{ .reject = 403 }},
     }};
     var bed: Http1Bed = undefined;
-    try bed.setUp(std.testing.allocator, .{ .seed = 61, .filters = &rules });
+    try bed.setUp(std.testing.allocator, .{ .seed = 61, .request_filters = &rules });
     defer bed.tearDown();
 
     try bed.exchange("POST /admin HTTP/1.1\r\nHost: o\r\nContent-Length: 4\r\n\r\nbody");
@@ -1542,7 +1542,7 @@ test "l7: filter header edits reach the origin, applied once" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 29,
-        .filters = &rules,
+        .request_filters = &rules,
         .route_prefix = "/api",
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
     });
@@ -1581,7 +1581,7 @@ test "l7: a filter rewrite changes only the forwarded path, not the route" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 30,
-        .filters = &rules,
+        .request_filters = &rules,
         .route_prefix = "/old",
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
     });
@@ -1614,7 +1614,7 @@ test "l7: a header edit reaches the origin exactly once under adversarial delive
         try bed.setUp(std.testing.allocator, .{
             .seed = seed,
             .partial_io = true,
-            .filters = &rules,
+            .request_filters = &rules,
             .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         });
         defer bed.tearDown();
@@ -1644,7 +1644,7 @@ test "l7: a path rewrite forwards the rewritten path under adversarial delivery"
         try bed.setUp(std.testing.allocator, .{
             .seed = seed,
             .partial_io = true,
-            .filters = &rules,
+            .request_filters = &rules,
             .route_prefix = "/old",
             .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         });
