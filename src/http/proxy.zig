@@ -690,7 +690,15 @@ pub fn Proxy(comptime IoType: type) type {
             // out a parked connection starts a request the origin has to
             // serve, which is the thing being bounded — the saved
             // handshake does not make it free.
-            const pick = pickEndpointOrShed(server, conn, requestKeyFor(server, conn, request)) orelse return;
+            const request_key = requestKeyFor(server, conn, request);
+            // The head bytes are gone by the response render (§7 buffer
+            // rotation), so the render's half of #178 — "did the request
+            // already name the endpoint it got?" — is recorded now.
+            conn.l7.sticky_cookie = switch (request_key) {
+                .endpoint => |identity| identity,
+                else => null,
+            };
+            const pick = pickEndpointOrShed(server, conn, request_key) orelse return;
             if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
@@ -1411,6 +1419,109 @@ pub fn Proxy(comptime IoType: type) type {
             }, out);
         }
 
+        /// The #178 verdict for this exchange, decided at the response
+        /// render — the one moment that knows both what the request's
+        /// cookie named (`sticky_cookie`, recorded at routing) and which
+        /// endpoint actually served (a replay may have moved it since
+        /// the pick). `.none` on every cluster that is not cookie-keyed.
+        const StickyVerdict = enum(u2) { none, followed, assigned, repicked };
+
+        fn stickyVerdict(server: *const ServerType, conn: *const ConnType) StickyVerdict {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.cluster_index < server.config.clusters.len);
+            const cluster = &server.config.clusters[conn.cluster_index];
+            switch (cluster.hash_key) {
+                .source_ip, .header => return .none,
+                .cookie => {},
+            }
+            // An exchange rendering a response holds an upstream, so the
+            // endpoint was recorded when its slot was (§8).
+            assert(conn.log.endpoint_index != conn_module.LogState.endpoint_none);
+            const served = server.balancer.endpointIdentity(
+                conn.cluster_index,
+                conn.log.endpoint_index,
+            );
+            const carried = conn.l7.sticky_cookie orelse return .assigned;
+            if (carried == served) {
+                return .followed;
+            }
+            return .repicked;
+        }
+
+        /// The Set-Cookie attributes every #178 stamp carries. `Path=/`
+        /// because the assignment is per *backend*, not per resource;
+        /// `HttpOnly` because no script has business reading a routing
+        /// tag. No `Max-Age`: a session cookie, HAProxy's default for
+        /// the same feature. No `Secure`: this proxy does not terminate
+        /// TLS (#125), so it cannot know the client-facing scheme.
+        const sticky_attributes = "; Path=/; HttpOnly";
+        const sticky_value_bytes_max = constants.pick_name_bytes_max + 1 +
+            Balancer.endpoint_tag_len + sticky_attributes.len;
+
+        /// This render's full edit set: the #175 filter edits, plus —
+        /// when the verdict owes the client an announcement — the #178
+        /// stamp in the one buffer slot reserved past the filter budget.
+        /// The stamp is an `add`, so an origin's own Set-Cookie lines
+        /// ride beside it untouched. The composed value lives in the
+        /// caller's scratch: it must survive exactly until the render
+        /// consumes it, in the same frame.
+        fn responseEditsWithStamp(
+            server: *const ServerType,
+            conn: *const ConnType,
+            response: *const parser.ResponseHead,
+            verdict: StickyVerdict,
+            buffer: *[constants.response_edits_max]filter.AppliedHeaderEdit,
+            scratch: *[sticky_value_bytes_max]u8,
+        ) []const filter.AppliedHeaderEdit {
+            const edits = responseEdits(conn, response, buffer[0..constants.header_edits_max]);
+            assert(edits.len <= constants.header_edits_max);
+            switch (verdict) {
+                .none, .followed => return edits,
+                .assigned, .repicked => {},
+            }
+            const name = switch (server.config.clusters[conn.cluster_index].hash_key) {
+                .cookie => |name| name,
+                // The verdict said cookie cluster; the config cannot
+                // have changed under it (§5 parse-once).
+                .source_ip, .header => unreachable,
+            };
+            assert(name.len >= 1);
+            assert(name.len <= constants.pick_name_bytes_max);
+            var len: u32 = 0;
+            @memcpy(scratch[0..name.len], name);
+            len += @intCast(name.len);
+            scratch[len] = '=';
+            len += 1;
+            // Through the one mint (`formatEndpointTag`), so the tag the
+            // stamp announces is byte-identical to the tag the next
+            // request's parse will match.
+            Balancer.formatEndpointTag(
+                server.balancer.endpointIdentity(conn.cluster_index, conn.log.endpoint_index),
+                scratch[len..][0..Balancer.endpoint_tag_len],
+            );
+            len += Balancer.endpoint_tag_len;
+            @memcpy(scratch[len..][0..sticky_attributes.len], sticky_attributes);
+            len += sticky_attributes.len;
+            // Exactly the four pieces, no gaps: the value the render
+            // emits is the whole composition.
+            assert(len == name.len + 1 + Balancer.endpoint_tag_len + sticky_attributes.len);
+            buffer[edits.len] = .{ .kind = .add, .name = "Set-Cookie", .value = scratch[0..len] };
+            return buffer[0 .. edits.len + 1];
+        }
+
+        /// Count the #178 verdict — only after the render commits, so a
+        /// 502'd or replayed render try cannot double-count, and the
+        /// three counters partition exactly the forwarded responses of
+        /// cookie clusters (their doc's contract).
+        fn creditSticky(server: *ServerType, verdict: StickyVerdict) void {
+            switch (verdict) {
+                .none => {},
+                .followed => server.counters.increment("l7_sticky_followed"),
+                .assigned => server.counters.increment("l7_sticky_assigned"),
+                .repicked => server.counters.increment("l7_sticky_repicked"),
+            }
+        }
+
         fn renderResponse(
             server: *ServerType,
             conn: *ConnType,
@@ -1424,17 +1535,19 @@ pub fn Proxy(comptime IoType: type) type {
             const keep_downstream = downstreamKeepAlive(server, conn, response);
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
-            var edit_buffer: [constants.header_edits_max]filter.AppliedHeaderEdit = undefined;
+            const verdict = stickyVerdict(server, conn);
+            var edit_buffer: [constants.response_edits_max]filter.AppliedHeaderEdit = undefined;
+            var cookie_scratch: [sticky_value_bytes_max]u8 = undefined;
             const rendered = render.renderResponseHead(
                 response,
                 !keep_downstream,
-                responseEdits(conn, response, &edit_buffer),
+                responseEditsWithStamp(server, conn, response, verdict, &edit_buffer, &cookie_scratch),
                 headBytes(server, conn),
             ) catch {
-                // The head no longer fits — after the #175 edits, or
-                // never did: an origin response the proxy cannot
-                // re-render is not the client's fault, so 502, the
-                // same verdict an unparseable origin head earns.
+                // The head no longer fits — after the #175 edits or the
+                // #178 stamp, or never did: an origin response the proxy
+                // cannot re-render is not the client's fault, so 502,
+                // the same verdict an unparseable origin head earns.
                 upstreamFailed(server, conn);
                 return;
             };
@@ -1469,6 +1582,11 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.response_leg = .sending_head;
             // Committed to answering: no verdict may intervene from here (§7).
             conn.l7.response_started = true;
+            // Credited only here, at the point of no return — the
+            // malformed-excess bail above can still discard a rendered
+            // head, and a discarded try must not count (`l7_redirected`'s
+            // placement rule).
+            creditSticky(server, verdict);
             // What the origin said, so a line can report it even if the
             // exchange never finishes. Whether the client *got* it is a
             // separate fact, and `outcome` stays `aborted` until
@@ -2000,7 +2118,12 @@ pub fn Proxy(comptime IoType: type) type {
             // a cap hit here answers rather than replaying again — and
             // the same request key (#178), re-derived from the re-parse
             // exactly like the framing: same bytes, same key.
-            const pick = pickEndpointOrShed(server, conn, requestKeyFor(server, conn, &request)) orelse return;
+            const request_key = requestKeyFor(server, conn, &request);
+            conn.l7.sticky_cookie = switch (request_key) {
+                .endpoint => |identity| identity,
+                else => null,
+            };
+            const pick = pickEndpointOrShed(server, conn, request_key) orelse return;
             dialUpstream(server, conn, pick);
         }
 

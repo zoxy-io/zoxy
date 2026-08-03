@@ -149,9 +149,11 @@ pub fn renderRequestHead(
 /// connection after this response (§7). `edits` are the matched
 /// response filters' header edits (#175), applied by the same
 /// suppress-and-append machinery the request render uses — empty when
-/// the listener configured none, which is most listeners. Overflow is
-/// the caller's 502: an origin response that cannot be re-rendered
-/// after edits is not the client's fault.
+/// the listener configured none, which is most listeners; the one slot
+/// past `header_edits_max` is the #178 Set-Cookie stamp, which rides
+/// this same machinery rather than owning a second injection path.
+/// Overflow is the caller's 502: an origin response that cannot be
+/// re-rendered after edits is not the client's fault.
 pub fn renderResponseHead(
     response: *const parser.ResponseHead,
     inject_close: bool,
@@ -160,7 +162,7 @@ pub fn renderResponseHead(
 ) error{Oversize}![]const u8 {
     assert(response.status >= 100);
     assert(response.status <= 599);
-    assert(edits.len <= constants.header_edits_max);
+    assert(edits.len <= constants.response_edits_max);
     assert(buffer.len <= std.math.maxInt(u32));
 
     var staging = Staging{ .buffer = buffer };
@@ -305,7 +307,8 @@ fn appendEndToEndHeaders(
     suppress_forwarded_for: bool,
 ) error{Oversize}!void {
     assert(headers.len <= constants.headers_max);
-    assert(edits.len <= constants.header_edits_max);
+    // One slot past the filter budget: the #178 Set-Cookie stamp.
+    assert(edits.len <= constants.response_edits_max);
     // Collect the Connection header value(s) once (usually zero or one).
     // Re-finding them inside the per-header hop-by-hop test made the walk
     // O(headers²) — the render's top user-CPU cost under load (§9).
@@ -391,7 +394,8 @@ fn collectNominations(
 /// copies must not be forwarded (`add` never suppresses — it appends).
 fn suppressedByEdit(name: []const u8, edits: []const filter.AppliedHeaderEdit) bool {
     assert(name.len >= 1);
-    assert(edits.len <= constants.header_edits_max);
+    // One slot past the filter budget: the #178 Set-Cookie stamp.
+    assert(edits.len <= constants.response_edits_max);
     for (edits) |edit| {
         switch (edit.kind) {
             .set, .remove => if (std.ascii.eqlIgnoreCase(name, edit.name)) return true,

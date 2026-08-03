@@ -375,6 +375,12 @@ pub const header_edits_max: u16 = 16;
 /// included).
 pub const pick_name_bytes_max: u16 = 64;
 
+/// A response render's edit ceiling (#178): the configured filter edits
+/// plus the one slot the Set-Cookie stamp reserves. The renderer's
+/// asserts and the proxy's edit buffers all speak this name, so the
+/// reserved slot cannot drift out of any of them.
+pub const response_edits_max: u16 = header_edits_max + 1;
+
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
@@ -777,6 +783,7 @@ comptime {
     assert(endpoint_inflight_max >= conn_slots_max);
     assert(endpoint_inflight_max >= upstream_slots_max);
     assert(header_edits_max >= 1);
+    assert(response_edits_max == header_edits_max + 1);
     assert(pick_name_bytes_max >= 1);
     // A pick name is a header-adjacent identifier; keeping it under the
     // host bound is the sanity relation "this is a name, not a payload".

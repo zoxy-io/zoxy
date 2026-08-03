@@ -157,6 +157,25 @@ const uncovered = [_]Uncovered{
             "live gate counts it against a real one",
     },
     .{
+        .name = "l7_sticky_followed",
+        .why = .unreached,
+        .reason = "the sweep draws no cookie-keyed cluster yet (#178 — the draw " ++
+            "and its echoing scripts are the next slice); " ++
+            "src/http_proxy_test.zig covers all three verdicts",
+    },
+    .{
+        .name = "l7_sticky_assigned",
+        .why = .unreached,
+        .reason = "same as l7_sticky_followed: no cookie-keyed cluster in the " ++
+            "sweep yet (#178); src/http_proxy_test.zig covers the stamp",
+    },
+    .{
+        .name = "l7_sticky_repicked",
+        .why = .unreached,
+        .reason = "same as l7_sticky_followed: no cookie-keyed cluster in the " ++
+            "sweep yet (#178); src/http_proxy_test.zig covers the forged tag",
+    },
+    .{
         .name = "admin_served",
         .why = .unreached,
         .reason = "the sweep configures no admin listener; " ++

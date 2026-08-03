@@ -84,6 +84,20 @@ pub const Counters = struct {
     /// on a dashboard, and a redirect storm is a different diagnosis
     /// from a reject storm.
     l7_redirected: Value = Value.init(0),
+    /// #178 cookie stickiness, counted once per forwarded response on a
+    /// cookie-keyed cluster — at the response render, so a replayed try
+    /// counts once and a torn-down exchange not at all. The three
+    /// partition those responses. `followed`: the request's tag named
+    /// the endpoint that served it, nothing to announce. `assigned`: the
+    /// request carried no usable tag — a session's first request — and
+    /// the response announces one (the Set-Cookie stamp). `repicked`:
+    /// the request named an endpoint it did not get (ejected, drained,
+    /// capped, config-removed, or forged) and the response re-announces;
+    /// a *rate* of these is the interesting signal — endpoints flapping
+    /// under a sticky population.
+    l7_sticky_followed: Value = Value.init(0),
+    l7_sticky_assigned: Value = Value.init(0),
+    l7_sticky_repicked: Value = Value.init(0),
     /// §8 rungs at the L7 request level, answered 503: relay buffers or
     /// upstream slots exhausted when a valid request needed them. Like the
     /// reject counters, the connection was admitted, so these stay out of
