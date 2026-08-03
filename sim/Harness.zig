@@ -69,7 +69,7 @@ weights_http: [1]u16,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
-request_filters_http: [3]zoxy.http.filter.Rule,
+request_filters_http: [4]zoxy.http.filter.Rule,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
@@ -653,6 +653,15 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .actions = &.{.{ .reject = 403 }},
         },
         .{
+            // #176: composed target, no host override — the Location the
+            // client oracle demands is scheme + the request's own host +
+            // its canonical path, `l7.canon.redirect_location` exactly.
+            .match = .{ .path_prefix = "/redirect" },
+            .actions = &.{.{ .redirect = .{ .status = 301, .target = .{ .composed = .{
+                .scheme = .https,
+            } } } }},
+        },
+        .{
             .match = .{ .path_prefix = "/edit" },
             .actions = &.{.{ .header_set = .{ .name = "X-Sim-Filter", .value = "on" } }},
         },
@@ -1154,6 +1163,7 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_not_implemented",
         "l7_no_route",
         "l7_filtered",
+        "l7_redirected",
         "l7_shed_relay_buffers",
         "l7_shed_upstream_slots",
         "l7_shed_endpoint_inflight",

@@ -577,16 +577,22 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 400, "l7_bad_request");
             };
             captureTarget(conn, keys.host, keys.views.match);
-            // §7 filters run before routing: a policy reject stops the
-            // request whether or not it would have routed.
-            if (filter.firstReject(conn.request_filters, .{
+            // §7 filters run before routing: a terminal verdict — reject
+            // or redirect (#176) — stops the request whether or not it
+            // would have routed.
+            if (filter.firstVerdict(conn.request_filters, .{
                 .method = request.method,
                 .host = keys.host,
                 .path = keys.views.match,
                 .headers = request.headers,
                 .client = &conn.client_address,
-            })) |status| {
-                return respondFilter(server, conn, status);
+            })) |verdict| {
+                switch (verdict) {
+                    .reject => |status| return respondFilter(server, conn, status),
+                    .redirect => |redirect| {
+                        return respondRedirect(server, conn, redirect, keys.host, keys.views.forward);
+                    },
+                }
             }
             conn.cluster_index = router.route(conn.routes, keys.host, keys.views.match) orelse {
                 return respond(server, conn, 404, "l7_no_route");
@@ -1502,6 +1508,12 @@ pub fn Proxy(comptime IoType: type) type {
                 // The two static-response endings share one state: `respond`
                 // is the only writer of either, and it always sets it.
                 .lingering_close, .next_request => assert(conn.state == .l7_responding),
+                // The redirect pair likewise — and the buffer it rendered
+                // into is still bound, which is the pair's whole reason.
+                .redirect_next_request, .redirect_lingering_close => {
+                    assert(conn.state == .l7_responding);
+                    assert(conn.head_buffer_id != ConnType.head_buffer_none);
+                },
             }
             switch (write.then) {
                 .response_excess => sendResponseExcess(server, conn),
@@ -1519,6 +1531,20 @@ pub fn Proxy(comptime IoType: type) type {
                     beginLingeringClose(server, conn);
                 },
                 .next_request => {
+                    server.logExchange(conn);
+                    resumeAfterStaticResponse(server, conn);
+                },
+                // A #176 redirect is fully delivered: return the head
+                // buffer it rendered into — held through the send, unlike
+                // a static answer's — then the static pair's own endings,
+                // whose continuations assert the buffer is gone.
+                .redirect_lingering_close => {
+                    server.returnHeadBuffer(conn);
+                    server.logExchange(conn);
+                    beginLingeringClose(server, conn);
+                },
+                .redirect_next_request => {
+                    server.returnHeadBuffer(conn);
                     server.logExchange(conn);
                     resumeAfterStaticResponse(server, conn);
                 },
@@ -2115,6 +2141,120 @@ pub fn Proxy(comptime IoType: type) type {
                 armClientWrite(server, conn, shed.staticResponse(status, .keep), .next_request);
             } else {
                 armClientWrite(server, conn, shed.staticResponse(status, .close), .lingering_close);
+            }
+        }
+
+        /// The #176 Location for a redirect verdict. A literal target is
+        /// the config's own arena slice; a composed one is built in the
+        /// rewrite scratch — free at routing time, and consumed before
+        /// this frame returns, the same single-threaded no-suspend
+        /// argument the canonicalization scratches make (§7) — from the
+        /// configured scheme, the replacement or request host, and the
+        /// request's canonical path with its verbatim query.
+        fn composeLocation(
+            server: *ServerType,
+            redirect: *const filter.Redirect,
+            request_host: ?[]const u8,
+            forward: parser.CanonicalTarget,
+        ) error{ Oversize, NoHost }![]const u8 {
+            assert(filter.isRedirectStatus(redirect.status));
+            switch (redirect.target) {
+                .location => |literal| {
+                    assert(literal.len >= 1); // Config rejects an empty literal.
+                    return literal;
+                },
+                .composed => |composed| {
+                    const host = composed.host orelse request_host orelse {
+                        // No replacement host and the request carried no
+                        // usable authority: there is nothing to compose
+                        // the target from.
+                        return error.NoHost;
+                    };
+                    assert(host.len >= 1);
+                    const scheme = composed.scheme.prefix();
+                    const out = server.rewrite_scratch;
+                    const total = scheme.len + host.len + forward.path.len + forward.query.len;
+                    if (total > out.len) {
+                        return error.Oversize;
+                    }
+                    var cursor: usize = 0;
+                    @memcpy(out[cursor..][0..scheme.len], scheme);
+                    cursor += scheme.len;
+                    @memcpy(out[cursor..][0..host.len], host);
+                    cursor += host.len;
+                    @memcpy(out[cursor..][0..forward.path.len], forward.path);
+                    cursor += forward.path.len;
+                    @memcpy(out[cursor..][0..forward.query.len], forward.query);
+                    cursor += forward.query.len;
+                    assert(cursor == total);
+                    return out[0..total];
+                },
+            }
+        }
+
+        /// Answer a #176 redirect verdict. `respond`'s discipline with
+        /// one structural difference: the bytes cannot come from static
+        /// memory — the Location may carry the request's own path — so
+        /// the response is rendered into the connection's head buffer,
+        /// whose request bytes are done being read once the Location is
+        /// composed (into the rewrite scratch, never aliasing what it
+        /// copies). The buffer is therefore *held* through the send,
+        /// unlike a static answer, and returned by the redirect write
+        /// continuations before the connection resumes or drains.
+        fn respondRedirect(
+            server: *ServerType,
+            conn: *ConnType,
+            redirect: *const filter.Redirect,
+            request_host: ?[]const u8,
+            forward: parser.CanonicalTarget,
+        ) void {
+            assert(conn.state == .l7_reading_head);
+            // The same contract `respond` states: both data ops free, so
+            // the send and any lingering drain have their completions.
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.l7.response_started);
+            // Routing has acquired nothing yet: a redirect never touches
+            // the relay or upstream pools, which is what keeps it out of
+            // every shed rung past the head ring.
+            assert(conn.relay_buffer == null);
+            assert(conn.upstream == null);
+            const location = composeLocation(server, redirect, request_host, forward) catch |err|
+                switch (err) {
+                    // The request's own target made the Location too long
+                    // to carry: the URI's fault, the URI's status.
+                    error.Oversize => return respond(server, conn, 414, "l7_uri_too_long"),
+                    // A composed target with no authority to compose from
+                    // (HTTP/1.0 without Host): the request lacks what the
+                    // answer requires.
+                    error.NoHost => return respond(server, conn, 400, "l7_bad_request"),
+                };
+            // The same three brakes `respond` honors, decided before the
+            // render because the close is announced inside it (§7).
+            const keep = staticResponseResyncable(conn) and
+                conn.l7.client_keep_alive and
+                !server.draining and
+                !server.keepAliveSuppressed();
+            const rendered = render.renderRedirectHead(
+                redirect.status,
+                location,
+                !keep,
+                headBytes(server, conn),
+            ) catch {
+                // The Location fit the scratch but head + Location does
+                // not fit the buffer: same fault, same status.
+                return respond(server, conn, 414, "l7_uri_too_long");
+            };
+            ServerType.clearRequestDeadline(conn);
+            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.counters.increment("l7_redirected");
+            conn.log.status = redirect.status;
+            conn.log.outcome = .redirected;
+            conn.state = .l7_responding;
+            if (keep) {
+                armClientWrite(server, conn, rendered, .redirect_next_request);
+            } else {
+                armClientWrite(server, conn, rendered, .redirect_lingering_close);
             }
         }
 

@@ -43,6 +43,9 @@ pub const ClientError = error{
     /// A proxied 200 arrived without the #175 response-filter stamp the
     /// harness configures unconditionally: the edit path did not run.
     ResponseEditMissing,
+    /// A 301 without the exact Location the harness's one redirect rule
+    /// composes (#176): the per-request render carried the wrong target.
+    RedirectLocationWrong,
     /// A response carried an edit it must not: the stamp on a static
     /// (which bypasses the response render), or the 5xx rule's edit
     /// anywhere (the scripted origin answers no 5xx) — either way a
@@ -393,6 +396,16 @@ pub fn Client(comptime IoType: type) type {
                 if (responseEditViolation(&response)) |violation| {
                     walk.violation = violation;
                     return walk;
+                }
+                // The #176 oracle: `filter_redirect` is the only script
+                // that earns a 301, its rule composes from the request's
+                // own host and canonical path, and both are fixed — so
+                // every 301 must carry exactly the canonical Location.
+                if (response.status == 301) {
+                    if (!headerEquals(response.headers, "Location", canon.redirect_location)) {
+                        walk.violation = ClientError.RedirectLocationWrong;
+                        return walk;
+                    }
                 }
                 const body = bytes[walk.offset + response.head_len ..];
                 const verdict = walkBody(response, body) orelse return walk;

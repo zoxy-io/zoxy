@@ -134,6 +134,14 @@ pub const ClientWrite = struct {
         /// pressure" — see `proxy.staticResponseResyncable` for what
         /// earns it.
         next_request,
+        /// A #176 redirect is out. The two arms mirror the static pair
+        /// above with one extra obligation: the redirect rendered into
+        /// the connection's head buffer and *held* it through the send
+        /// — a static answer returns it before arming — so the buffer
+        /// goes back to the ring here, before the continuation whose
+        /// asserts require it gone.
+        redirect_next_request,
+        redirect_lingering_close,
     };
 };
 

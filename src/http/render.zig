@@ -189,6 +189,50 @@ pub fn renderResponseHead(
     return staging.buffer[0..staging.len];
 }
 
+/// Renders a #176 redirect response head into `buffer`: the status
+/// line, the Location, an explicit zero length, and the close
+/// announcement when the connection will not be kept. The one response
+/// this proxy *originates* whose bytes are not comptime-static — the
+/// Location may carry the request's own path — which is why it renders
+/// here beside the other two heads rather than living in `shed.zig`.
+pub fn renderRedirectHead(
+    status: u16,
+    location: []const u8,
+    inject_close: bool,
+    buffer: []u8,
+) error{Oversize}![]const u8 {
+    assert(filter.isRedirectStatus(status));
+    assert(location.len >= 1);
+    assert(buffer.len <= std.math.maxInt(u32));
+    var staging = Staging{ .buffer = buffer };
+    try staging.append("HTTP/1.1 ");
+    try staging.append(&statusDigits(status));
+    try staging.append(" ");
+    try staging.append(redirectReason(status));
+    try staging.append("\r\nLocation: ");
+    try staging.append(location);
+    try staging.append("\r\nContent-Length: 0\r\n");
+    if (inject_close) {
+        try staging.append("Connection: close\r\n");
+    }
+    try staging.append("\r\n");
+    assert(staging.len >= 1);
+    return staging.buffer[0..staging.len];
+}
+
+/// The reason phrases for `filter.redirect_statuses` — a closed switch
+/// on `shed.reasonPhrase`'s terms: an unlisted status is a bug at the
+/// call site, not a phrase to invent.
+fn redirectReason(status: u16) []const u8 {
+    return switch (status) {
+        301 => "Moved Permanently",
+        302 => "Found",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        else => unreachable, // isRedirectStatus gates every caller.
+    };
+}
+
 /// Bounded append cursor over the caller's staging buffer; overflowing
 /// it is the `Oversize` verdict, never a wider write.
 const Staging = struct {

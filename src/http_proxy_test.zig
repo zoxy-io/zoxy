@@ -2017,6 +2017,147 @@ test "l7: an origin head that no longer fits once the close is injected is 502" 
     try bed.expectDrained();
 }
 
+test "l7: a redirect composes Location from the request and keeps serving (#176)" {
+    // Scheme-only composed target: the Location is the configured
+    // scheme plus the request's own host, canonical path and verbatim
+    // query. Keep-alive holds — a redirect is an answer, not a fault —
+    // so the same connection's next request reaches the origin.
+    const rules = [_]filter.Rule{
+        .{ .match = .{ .path_prefix = "/old" }, .actions = &.{
+            .{ .redirect = .{ .status = 301, .target = .{ .composed = .{ .scheme = .https } } } },
+        } },
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 31,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .request_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /fresh HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /old/path?q=1 HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 301 Moved Permanently\r\n" ++
+            "Location: https://o/old/path?q=1\r\n" ++
+            "Content-Length: 0\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_redirected"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    // The redirected request never reached the origin; the second did.
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    try bed.expectDrained();
+}
+
+test "l7: a redirect can replace the host, or name a fixed target (#176)" {
+    const rules = [_]filter.Rule{
+        .{ .match = .{ .path_prefix = "/www" }, .actions = &.{
+            .{ .redirect = .{ .status = 308, .target = .{ .composed = .{
+                .scheme = .https,
+                .host = "example.com",
+            } } } },
+        } },
+        .{ .match = .{ .path_prefix = "/gone" }, .actions = &.{
+            .{ .redirect = .{ .status = 302, .target = .{
+                .location = "https://status.example.com/",
+            } } },
+        } },
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 32, .request_filters = &rules });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /gone HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /www?keep=1 HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // The composed host replaces the request's; the literal is sent
+    // verbatim, carrying nothing of the request.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 308 Permanent Redirect\r\n" ++
+            "Location: https://example.com/www?keep=1\r\n" ++
+            "Content-Length: 0\r\n\r\n" ++
+            "HTTP/1.1 302 Found\r\n" ++
+            "Location: https://status.example.com/\r\n" ++
+            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_redirected"));
+    // Neither request touched the origin.
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+    try bed.expectDrained();
+}
+
+test "l7: a composed redirect with no authority to compose from is 400 (#176)" {
+    const rules = [_]filter.Rule{
+        .{ .match = .{}, .actions = &.{
+            .{ .redirect = .{ .status = 301, .target = .{ .composed = .{ .scheme = .https } } } },
+        } },
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 33, .request_filters = &rules });
+    defer bed.tearDown();
+
+    // HTTP/1.0 without Host: no replacement host on the rule and no
+    // authority on the request — nothing to compose the target from.
+    try bed.exchange("GET /anything HTTP/1.0\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_redirected"));
+    try bed.expectDrained();
+}
+
+test "l7: a redirect whose Location cannot be carried is 414 (#176)" {
+    // The request's own target is what makes the composed Location too
+    // long for the head buffer: the URI's fault, the URI's status.
+    const rules = [_]filter.Rule{
+        .{ .match = .{}, .actions = &.{
+            .{ .redirect = .{ .status = 301, .target = .{ .composed = .{ .scheme = .https } } } },
+        } },
+    };
+    const head_buffer_bytes: u32 = 1024;
+    const prefix = "GET /";
+    const suffix = " HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    // A path long enough that the response head overflows the buffer,
+    // while the request itself still fits it. Announcing close keeps
+    // the assertion on the close spelling of the 414 — unlike the
+    // parse-time 414 this one arrives on a clean message boundary, so
+    // a keep-alive request would legitimately be kept.
+    var request: [prefix.len + 960 + suffix.len]u8 = undefined;
+    @memcpy(request[0..prefix.len], prefix);
+    @memset(request[prefix.len..][0..960], 'p');
+    @memcpy(request[prefix.len + 960 ..][0..suffix.len], suffix);
+    comptime assert(prefix.len + 960 + suffix.len <= head_buffer_bytes);
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 34,
+        .request_filters = &rules,
+        .head_buffer_bytes = head_buffer_bytes,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(&request);
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_uri_too_long"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_redirected"));
+    try bed.expectDrained();
+}
+
 test "l7: response filters edit the origin's head on the way out (#175)" {
     // An unconditional rule sheds the Server banner and adds HSTS; a
     // 5xx-scoped rule must stay silent on this 200. The whole rendered

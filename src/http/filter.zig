@@ -6,7 +6,7 @@
 //! ordered action list drawn from a closed enum. Cluster selection is NOT
 //! an action: the route table owns the backend decision (§7), so filters
 //! never compete with routing. This module holds the compiled shapes and
-//! the interpreter (`firstReject`, `collectForward`); the config-load
+//! the interpreter (`firstVerdict`, `collectForward`); the config-load
 //! compiler lives in `config.zig`.
 
 const std = @import("std");
@@ -116,12 +116,70 @@ pub const Rewrite = struct {
     to: []const u8,
 };
 
+/// A redirect verdict (#176): a closed status and where to send the
+/// client. Terminal like `reject` — the request is answered, never
+/// forwarded — but unlike a reject its response is rendered per
+/// request: the `Location` may depend on what was asked.
+pub const Redirect = struct {
+    status: u16,
+    target: Target,
+
+    pub const Target = union(enum) {
+        /// A fixed `Location` value, sent verbatim — for targets that do
+        /// not depend on the request.
+        location: []const u8,
+        /// Scheme (and optionally host) replaced; the request's own
+        /// canonical path and query are carried through, so the config
+        /// never restates what §7 already computed.
+        composed: Composed,
+    };
+
+    pub const Composed = struct {
+        /// Required, never guessed: behind a TLS terminator "keep the
+        /// request's scheme" is wrong exactly when it matters, since
+        /// every hop this proxy sees is plaintext (§1).
+        scheme: Scheme,
+        /// Replacement canonical host, or null to keep the request's.
+        host: ?[]const u8 = null,
+    };
+
+    pub const Scheme = enum(u1) {
+        http,
+        https,
+
+        pub fn prefix(scheme: Scheme) []const u8 {
+            return switch (scheme) {
+                .http => "http://",
+                .https => "https://",
+            };
+        }
+    };
+};
+
+/// The statuses a `redirect` action may name — the four with distinct
+/// proxy-meaningful semantics (permanent/temporary × method-preserving),
+/// on `reject_statuses`' single-source rule: config rejects any other
+/// value at load and the responder renders exactly this set.
+pub const redirect_statuses = [_]u16{ 301, 302, 307, 308 };
+
+pub fn isRedirectStatus(status: u16) bool {
+    for (redirect_statuses) |candidate| {
+        if (candidate == status) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// The closed action enum (§7): no `pick cluster` (routing owns the
 /// backend), no scripting. Anything past this is a Zig function in the
 /// owning phase module, added at compile time.
 pub const Action = union(enum) {
     /// Answer a static status and stop (§8 static-response machinery).
     reject: u16,
+    /// Answer a redirect and stop (#176): rendered per request, since
+    /// its `Location` may carry the request's own path.
+    redirect: Redirect,
     /// Set (replacing any existing), add (append), or remove a header on
     /// the forwarded request, applied during the head render.
     header_set: HeaderEdit,
@@ -286,27 +344,40 @@ pub const RequestView = struct {
     client: *const std.Io.net.IpAddress,
 };
 
-/// The reject status of the first matching rule that carries a `reject`
-/// action, or null to proceed (§7). Rules are evaluated top-down and
-/// actions in order, so the first reject reached wins — and because a
-/// matched rule's reject stops the request, any header/rewrite edits are
-/// then moot (they apply only to a request that forwards, handled at the
-/// render). Bounded loops over immutable arena data; no allocation.
-pub fn firstReject(rules: []const Rule, view: RequestView) ?u16 {
+/// A terminal filter answer: the request is responded to here and never
+/// forwarded. The redirect rides by pointer — it lives in the rule's
+/// arena and outlives the scan, and copying its slices buys nothing.
+pub const Verdict = union(enum) {
+    reject: u16,
+    redirect: *const Redirect,
+};
+
+/// The verdict of the first matching rule that carries a terminal
+/// action — `reject` or `redirect` (#176) — or null to proceed (§7).
+/// Rules are evaluated top-down and actions in order, so the first
+/// terminal reached wins — and because it stops the request, any
+/// header/rewrite edits are then moot (they apply only to a request
+/// that forwards, handled at the render). Bounded loops over immutable
+/// arena data; no allocation.
+pub fn firstVerdict(rules: []const Rule, view: RequestView) ?Verdict {
     assert(view.path.len >= 1);
     assert(view.path[0] == '/');
     for (rules) |rule| {
         if (!matches(rule.match, view)) {
             continue;
         }
-        for (rule.actions) |action| {
-            switch (action) {
+        for (rule.actions) |*action| {
+            switch (action.*) {
                 .reject => |status| {
                     assert(isRejectStatus(status));
-                    return status;
+                    return .{ .reject = status };
+                },
+                .redirect => |*redirect| {
+                    assert(isRedirectStatus(redirect.status));
+                    return .{ .redirect = redirect };
                 },
                 // Edits apply at the render, only when the request
-                // forwards; a reject anywhere in a matched rule stops it.
+                // forwards; a terminal anywhere in a matched rule stops it.
                 .header_set, .header_add, .header_remove, .rewrite_prefix => {},
             }
         }
@@ -365,7 +436,7 @@ pub fn collectForward(
                     rewrite = candidate;
                 }
             },
-            .reject => {},
+            .reject, .redirect => {},
         };
     }
     assert(count <= out.len);
@@ -379,7 +450,7 @@ fn appliedEdit(action: Action) AppliedHeaderEdit {
         .header_set => |e| .{ .kind = .set, .name = e.name, .value = e.value },
         .header_add => |e| .{ .kind = .add, .name = e.name, .value = e.value },
         .header_remove => |name| .{ .kind = .remove, .name = name, .value = "" },
-        .reject, .rewrite_prefix => unreachable,
+        .reject, .redirect, .rewrite_prefix => unreachable,
     };
 }
 
@@ -529,7 +600,7 @@ test "filter: isRejectStatus admits exactly the reject_statuses set" {
     try std.testing.expectEqualSlices(u16, &.{ 400, 403, 404, 429 }, &reject_statuses);
 }
 
-test "filter: firstReject matches on method, host, path, header" {
+test "filter: firstVerdict matches on method, host, path, header" {
     const H = parser.Header;
     const rules = [_]Rule{
         // Reject a POST to /admin from a specific host with a header set.
@@ -551,36 +622,36 @@ test "filter: firstReject matches on method, host, path, header" {
     const dev = [_]H{H.init("X-Env", "dev")};
 
     // Full match → 403.
-    try std.testing.expectEqual(@as(?u16, 403), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(u16, 403), firstVerdict(&rules, .{
         .method = .post,
         .host = "api.example",
         .path = "/admin/users",
         .headers = &prod,
         .client = &test_view_client,
-    }));
+    }).?.reject);
     // Wrong method, host, path, or header value → no reject.
-    try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
         .method = .get, // not POST
         .host = "api.example",
         .path = "/admin",
         .headers = &prod,
         .client = &test_view_client,
     }));
-    try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
         .method = .post,
         .host = "other.example", // wrong host
         .path = "/admin",
         .headers = &prod,
         .client = &test_view_client,
     }));
-    try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
         .method = .post,
         .host = "api.example",
         .path = "/public", // not under /admin
         .headers = &prod,
         .client = &test_view_client,
     }));
-    try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
         .method = .post,
         .host = "api.example",
         .path = "/admin",
@@ -588,7 +659,7 @@ test "filter: firstReject matches on method, host, path, header" {
         .client = &test_view_client,
     }));
     // A segment-splitting path must not match the /admin prefix.
-    try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
         .method = .post,
         .host = "api.example",
         .path = "/administrator",
@@ -606,7 +677,7 @@ test "filter: an all-any match is unconditional; edit-only rules never reject" {
     };
     const empty: []const parser.Header = &.{};
     // The edit-only rule matches everything but does not reject.
-    try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
         .method = .get,
         .host = null,
         .path = "/anything",
@@ -614,13 +685,59 @@ test "filter: an all-any match is unconditional; edit-only rules never reject" {
         .client = &test_view_client,
     }));
     // The second rule rejects its prefix.
-    try std.testing.expectEqual(@as(?u16, 404), firstReject(&rules, .{
+    try std.testing.expectEqual(@as(u16, 404), firstVerdict(&rules, .{
         .method = .get,
         .host = null,
         .path = "/blocked/x",
         .headers = empty,
         .client = &test_view_client,
+    }).?.reject);
+}
+
+test "filter: a redirect is a terminal verdict, first one wins" {
+    const rules = [_]Rule{
+        // An edit-only rule matches first and must not terminate.
+        .{ .match = .{}, .actions = &.{
+            .{ .header_set = .{ .name = "X-Via", .value = "zoxy" } },
+        } },
+        .{ .match = .{ .host = "www.example" }, .actions = &.{
+            .{ .redirect = .{ .status = 301, .target = .{ .composed = .{
+                .scheme = .https,
+                .host = "example",
+            } } } },
+        } },
+        // A later reject on the same host must never be reached.
+        .{ .match = .{ .host = "www.example" }, .actions = &.{.{ .reject = 403 }} },
+    };
+    const empty: []const parser.Header = &.{};
+    const verdict = firstVerdict(&rules, .{
+        .method = .get,
+        .host = "www.example",
+        .path = "/",
+        .headers = empty,
+        .client = &test_view_client,
+    }).?;
+    try std.testing.expectEqual(@as(u16, 301), verdict.redirect.status);
+    try std.testing.expectEqualStrings("example", verdict.redirect.target.composed.host.?);
+    // Another host sails past both terminal rules.
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = "api.example",
+        .path = "/",
+        .headers = empty,
+        .client = &test_view_client,
     }));
+}
+
+test "filter: isRedirectStatus admits exactly the redirect_statuses set" {
+    for (redirect_statuses) |status| {
+        try std.testing.expect(isRedirectStatus(status));
+    }
+    try std.testing.expect(!isRedirectStatus(200));
+    try std.testing.expect(!isRedirectStatus(303)); // See Other: no proxy semantics here.
+    try std.testing.expect(!isRedirectStatus(403));
+    // Pin the documented set, `reject_statuses`' own rule.
+    try std.testing.expectEqualSlices(u16, &.{ 301, 302, 307, 308 }, &redirect_statuses);
 }
 
 test "filter: collectForward gathers matching rules' edits in order" {

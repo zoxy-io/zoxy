@@ -63,6 +63,12 @@ pub const Script = enum(u8) {
     /// resource is acquired or origin dialed. The golden outcome is exactly
     /// that 403, and the origin must never see the request.
     filter_reject,
+    /// A GET under `/redirect`: a §7 filter answers 301 with a Location
+    /// composed from the request's own host and path (#176), before any
+    /// resource is acquired or origin dialed — `filter_reject`'s shape
+    /// with the one response this proxy renders per request instead of
+    /// serving from static memory.
+    filter_redirect,
     /// A GET under `/edit`: a §7 filter adds a header to the forwarded
     /// request. It routes and succeeds (200); the origin's §7 oracle proves
     /// the edited head still forwards canonical.
@@ -342,6 +348,19 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 403,
         .method = .get,
         .allowed_statuses = &.{ 403, 503 },
+    },
+    .filter_redirect = .{
+        // `filter_reject`'s timing exactly — answered before any
+        // post-parse resource — so the same one preemption applies: the
+        // §5 head ring's 503. The 301's Location is asserted by the
+        // client's own walk (#176), composed from this request's host
+        // and path.
+        .request = "GET /redirect HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 301,
+        .method = .get,
+        .allowed_statuses = &.{ 301, 503 },
     },
     .filter_edit = .{
         // Routes and forwards like a plain GET, so the §8 rungs and a

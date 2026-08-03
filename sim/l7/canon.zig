@@ -27,6 +27,12 @@ pub const response_edit_name = "X-Sim-Response";
 pub const response_edit_value = "on";
 pub const response_never_name = "X-Sim-Never";
 
+/// The one Location a sim 301 may carry (#176): the harness's redirect
+/// rule composes scheme + the request's own host and canonical path,
+/// and `filter_redirect` is the only script that earns a 301 — so the
+/// client oracle demands this exact value on every one it parses.
+pub const redirect_location = "https://sim/redirect";
+
 /// A parseable head that cannot survive the render: 8190 bytes fits the
 /// proxy's 8 KiB response buffer, but no Content-Length and no
 /// Transfer-Encoding makes it until-close framing, which forces a

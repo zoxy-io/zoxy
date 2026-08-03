@@ -52,9 +52,12 @@ pub const Counters = struct {
     /// sum; these are pure observability.
     ///
     /// They do not share one persistence rule, because they do not share
-    /// one cause. `l7_uri_too_long` and `l7_headers_too_large` always
-    /// close: the parser could not find the message boundary, so neither
-    /// can the turnaround. `l7_not_implemented` answers a head that parsed
+    /// one cause. `l7_uri_too_long` and `l7_headers_too_large` close
+    /// when the parser could not find the message boundary — their
+    /// original spelling — with one #176 exception on the first: a
+    /// redirect whose composed Location cannot be carried answers 414
+    /// from a request that *did* parse, a clean boundary the ordinary
+    /// keep-or-close decision then reads (§8). `l7_not_implemented` answers a head that parsed
     /// cleanly and follows the general keep rule (§8). `l7_bad_request`
     /// covers both — a parser-rejected head, which closes, and a head that
     /// parsed but whose target would not canonicalize, which keeps. The
@@ -73,6 +76,14 @@ pub const Counters = struct {
     /// (403/404/429/400). A reject, not a shed; same persistence rule as
     /// `l7_no_route`.
     l7_filtered: Value = Value.init(0),
+    /// A §7 filter rule answered the request with a redirect (#176):
+    /// one of the closed statuses plus a Location rendered per request.
+    /// `l7_filtered`'s sibling — admitted and answered, so outside
+    /// `reconcile`'s shed sum — but not folded into it: "policy refused
+    /// this" and "policy sent this elsewhere" are opposite directions
+    /// on a dashboard, and a redirect storm is a different diagnosis
+    /// from a reject storm.
+    l7_redirected: Value = Value.init(0),
     /// §8 rungs at the L7 request level, answered 503: relay buffers or
     /// upstream slots exhausted when a valid request needed them. Like the
     /// reject counters, the connection was admitted, so these stay out of

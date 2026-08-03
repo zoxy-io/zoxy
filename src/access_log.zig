@@ -54,6 +54,11 @@ pub const Outcome = enum(u8) {
     /// zoxy refused the request itself (§7): malformed, oversize,
     /// unroutable, unsupported, or stopped by a filter rule.
     rejected,
+    /// A filter rule answered the request with a redirect (#176). Not
+    /// `rejected`, deliberately: an operator grepping for refused
+    /// traffic must not fish redirects out of it, and one grepping for
+    /// redirect volume must not see refusals.
+    redirected,
     /// zoxy ran out of a resource and answered `503` (§8) — a relay buffer
     /// or an upstream slot the request needed.
     shed,
