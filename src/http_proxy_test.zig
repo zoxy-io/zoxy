@@ -512,10 +512,13 @@ const Http1Bed = struct {
         /// The single route's host scope; null is any-host. A canonical
         /// host lets a test drive host routing and its 404 (§7).
         route_host: ?[]const u8 = null,
-        /// The listener's §7 filter rules; empty by default so existing
-        /// scenarios are unfiltered. A test supplies compiled rules to
-        /// drive the filter reject/edit paths.
+        /// The listener's §7 request filter rules; empty by default so
+        /// existing scenarios are unfiltered. A test supplies compiled
+        /// rules to drive the filter reject/edit paths.
         request_filters: []const filter.Rule = &.{},
+        /// The listener's #175 response filter rules; empty by default
+        /// on the same terms.
+        response_filters: []const filter.ResponseRule = &.{},
         /// The §7 client-address forwarding mode; null (the default)
         /// leaves `X-Forwarded-For` untouched, as every pre-existing
         /// scenario expects.
@@ -561,6 +564,7 @@ const Http1Bed = struct {
             .bind_address = bindAddress(),
             .routes = &bed.routes,
             .request_filters = options.request_filters,
+            .response_filters = options.response_filters,
             .protocol = .http,
             .forwarded = options.forwarded,
         }};
@@ -2010,6 +2014,114 @@ test "l7: an origin head that no longer fits once the close is injected is 502" 
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
     try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    try bed.expectDrained();
+}
+
+test "l7: response filters edit the origin's head on the way out (#175)" {
+    // An unconditional rule sheds the Server banner and adds HSTS; a
+    // 5xx-scoped rule must stay silent on this 200. The whole rendered
+    // head is pinned byte-exact: origin order minus the removed header,
+    // the appended edit, then the close the request announced — proving
+    // the edits land between the origin's headers and the injection.
+    const rules = [_]filter.ResponseRule{
+        .{ .match = .{}, .edits = &.{
+            .{ .kind = .remove, .name = "Server", .value = "" },
+            .{ .kind = .add, .name = "Strict-Transport-Security", .value = "max-age=63072000" },
+        } },
+        .{ .match = .{ .status_class = 5 }, .edits = &.{
+            .{ .kind = .set, .name = "Retry-After", .value = "1" },
+        } },
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 21,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nServer: origin/1\r\n\r\nhi",
+        .response_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
+            "Strict-Transport-Security: max-age=63072000\r\n" ++
+            "Connection: close\r\n\r\nhi",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
+}
+
+test "l7: a 5xx-scoped response filter fires on the status that names it (#175)" {
+    // The issue's own deciding case: `header_set` on 5xx only. The same
+    // rule set as above, against an origin answering 503.
+    const rules = [_]filter.ResponseRule{
+        .{ .match = .{ .status_class = 5 }, .edits = &.{
+            .{ .kind = .set, .name = "Retry-After", .value = "1" },
+        } },
+    };
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 22,
+        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        .response_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // The origin's 503 forwards — a response filter edits, never
+    // rewrites the verdict — and the edit rides along.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
+            "Retry-After: 1\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try bed.expectDrained();
+}
+
+test "l7: an origin head that no longer fits after response edits is 502 (#175)" {
+    // The origin's head is legal and would render as-is; the configured
+    // edit adds bytes the buffer does not have. An origin response the
+    // proxy cannot re-render is not the client's fault — 502, the same
+    // verdict the close-injection overflow earns (#87).
+    const rules = [_]filter.ResponseRule{
+        .{ .match = .{}, .edits = &.{
+            .{ .kind = .add, .name = "Strict-Transport-Security", .value = "max-age=63072000" },
+        } },
+    };
+    const prefix = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Pad: ";
+    const suffix = "\r\n\r\n";
+    // Ten bytes of slack: enough for the head itself, nowhere near the
+    // ~46 the edit appends.
+    var response_bytes: [constants.head_buffer_bytes_default - 10]u8 = undefined;
+    @memcpy(response_bytes[0..prefix.len], prefix);
+    @memset(
+        response_bytes[prefix.len..][0 .. response_bytes.len - prefix.len - suffix.len],
+        'p',
+    );
+    @memcpy(response_bytes[response_bytes.len - suffix.len ..][0..suffix.len], suffix);
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 23,
+        .origin_response = &response_bytes,
+        .response_filters = &rules,
+    });
+    defer bed.tearDown();
+
+    // Keep-alive request: no close injection, so the overflow is the
+    // edit's alone.
+    try bed.exchange("GET /pad HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
     try bed.expectDrained();
 }
 

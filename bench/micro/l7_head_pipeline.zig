@@ -58,7 +58,7 @@ pub fn main() void {
         // suppression test is pure overhead.
         const upstream = render.renderRequestHead(&request, target, no_edits, false, null, &upstream_head) catch unreachable;
         const response = parser.parseResponseHead(response_head, false, &response_storage, request.method) catch unreachable;
-        const downstream = render.renderResponseHead(&response, true, &downstream_head) catch unreachable;
+        const downstream = render.renderResponseHead(&response, true, no_edits, &downstream_head) catch unreachable;
 
         // Consume the outputs so nothing is dead-code-eliminated.
         checksum +%= upstream[upstream.len - 1];

@@ -184,9 +184,13 @@ pub fn Server(comptime IoType: type) type {
             /// The listener's §7 route table, handed to each admitted L7
             /// connection so `routeRequest` can pick a cluster by path.
             routes: []const router.Route,
-            /// The listener's §7 filter rules, handed to each admitted L7
-            /// connection so `routeRequest` can evaluate policy.
+            /// The listener's §7 request filter rules, handed to each
+            /// admitted L7 connection so `routeRequest` can evaluate
+            /// policy.
             request_filters: []const filter.Rule,
+            /// The listener's #175 response filter rules, handed over the
+            /// same way so the response re-render can apply its edits.
+            response_filters: []const filter.ResponseRule,
             /// The listener's §7 client-address forwarding mode (null = off),
             /// handed over the same way: trust depends on what is in front
             /// of this socket, so it cannot live on the cluster.
@@ -433,6 +437,7 @@ pub fn Server(comptime IoType: type) type {
                     .cluster_index = listener_config.routes[0].cluster_index,
                     .routes = listener_config.routes,
                     .request_filters = listener_config.request_filters,
+                    .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
                     .proxy_protocol = listener_config.proxy_protocol,
                     .protocol = listener_config.protocol,
@@ -911,6 +916,7 @@ pub fn Server(comptime IoType: type) type {
             // rule rather than a third fork.
             conn.routes = listener.routes;
             conn.request_filters = listener.request_filters;
+            conn.response_filters = listener.response_filters;
             conn.forwarded = listener.forwarded;
             assert(conn.routes.len >= 1);
             server.storeDeadline(conn, server.entryTimeoutMs(listener.protocol));
