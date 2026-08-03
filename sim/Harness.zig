@@ -70,6 +70,10 @@ clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
 request_filters_http: [3]zoxy.http.filter.Rule,
+/// The #175 response rules beside them: the always-on stamp the client
+/// oracle requires on every proxied 200, and the 5xx rule whose edit
+/// must never appear (the scripted origin answers no 5xx).
+response_filters_http: [2]zoxy.http.filter.ResponseRule,
 listener_configs: [2]zoxy.config.Config.Listener,
 config: zoxy.config.Config,
 origin: Origin,
@@ -657,6 +661,26 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .actions = &.{.{ .rewrite_prefix = .{ .from = "/rewrite", .to = "/sim" } }},
         },
     };
+    // #175 response rules, always on: every response the render forwards
+    // gains the stamp — so the client can require it on every 200 and
+    // refuse it on every static, which is what separates the two render
+    // paths from outside — and the 5xx rule matches a class the scripted
+    // origin never answers, so its edit appearing anywhere is the class
+    // predicate misfiring under some schedule.
+    harness.response_filters_http = .{
+        .{
+            .match = .{},
+            .edits = &.{.{
+                .kind = .set,
+                .name = l7.canon.response_edit_name,
+                .value = l7.canon.response_edit_value,
+            }},
+        },
+        .{
+            .match = .{ .status_class = 5 },
+            .edits = &.{.{ .kind = .set, .name = l7.canon.response_never_name, .value = "1" }},
+        },
+    };
     harness.listener_configs = .{
         .{
             .bind_address = bindAddress(),
@@ -668,6 +692,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .bind_address = httpBindAddress(),
             .routes = &harness.routes_http,
             .request_filters = &harness.request_filters_http,
+            .response_filters = &harness.response_filters_http,
             .protocol = .http,
             .forwarded = forwarded,
         },

@@ -852,6 +852,38 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   with unbounded fuel or an embedded allocator cannot satisfy the gate);
   anything beyond the closed action enum is a Zig function added to the
   owning phase module at compile time.
+- **Response filters are a second table, not a scope marker** (#175,
+  settled 2026-08-03). `request_filters` (né `filters`, hard-renamed
+  while no deployed config existed to break) runs before routing;
+  `response_filters` runs after the origin's head parses — and its
+  deciding predicate, the response's own status (`header_set` on 5xx
+  only), is temporally impossible in a table evaluated before any
+  response exists. That is what settled the shape: a shared table with
+  a scope field would carry match fields that cannot be evaluated at
+  their own application point, the exact conditionally-dead-fields
+  hole this loader refuses everywhere else. A response match is a
+  conjunction over exact statuses, a status class (`"1xx"`..`"5xx"`)
+  and response-header predicates — the request side's own header
+  vocabulary, evaluated by the same code — and the actions are exactly
+  the three header verbs: reject and rewrite have no meaning on the
+  way out, and the loader refuses those arms by name rather than
+  ignoring them. Edits apply during the downstream re-render through
+  the same suppress-and-append machinery, under the same
+  `header_edits_max` bound on the table's total; the proxy-managed
+  names (framing, hop-by-hop, `X-Forwarded-For`) stay barred by the
+  same validator, since a hand-written `Content-Length` would
+  desynchronise the relay. A head that no longer fits after edits is
+  the response side's oversize verdict: **502, not 431** — an origin
+  response the proxy cannot re-render is not the client's fault, and
+  it takes the exact path the close-injection overflow already took.
+  Response edits carry no counter of their own, deliberately: they
+  reject nothing and shed nothing, and the render they ride is already
+  witnessed by `l7_responses`. Static responses (§8's sheds and
+  rejects) bypass the response render and therefore the edits — the
+  simulator's client oracle holds that boundary from outside, and the
+  live gate holds both directions per listener: the http leg must
+  carry a configured stamp, the l4 leg must not, because byte
+  transparency is that leg's whole claim.
 - **Resilience is minimal by design:** per-request and per-try deadlines
   (head-read gets its own deadline, so a slowloris meets the clock or
   `limits.head_buffer_bytes`, whichever comes first; each dial — the

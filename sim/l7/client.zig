@@ -40,6 +40,14 @@ pub const ClientError = error{
     ResponseOverrun,
     /// A clean seed did not produce the script's exact golden outcome.
     GoldenOutcomeMissed,
+    /// A proxied 200 arrived without the #175 response-filter stamp the
+    /// harness configures unconditionally: the edit path did not run.
+    ResponseEditMissing,
+    /// A response carried an edit it must not: the stamp on a static
+    /// (which bypasses the response render), or the 5xx rule's edit
+    /// anywhere (the scripted origin answers no 5xx) — either way a
+    /// predicate fired where it could not have.
+    ResponseEditForged,
 };
 
 pub fn Client(comptime IoType: type) type {
@@ -382,6 +390,10 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = ClientError.ResponseStatusUnexpected;
                     return walk;
                 }
+                if (responseEditViolation(&response)) |violation| {
+                    walk.violation = violation;
+                    return walk;
+                }
                 const body = bytes[walk.offset + response.head_len ..];
                 const verdict = walkBody(response, body) orelse return walk;
                 if (verdict.violation) |violation| {
@@ -401,6 +413,56 @@ pub fn Client(comptime IoType: type) type {
                 }
             }
             return walk;
+        }
+
+        /// The #175 oracle over one parsed response head: every 200 is
+        /// proxied through the response render, so it must carry the
+        /// harness's unconditional stamp; every legal non-200 here is a
+        /// static that bypasses that render, so the stamp on one means a
+        /// static grew filter edits; and the 5xx rule's edit anywhere
+        /// means the class predicate fired on a class the origin never
+        /// answers. Distinguishes the two render paths from outside the
+        /// process, under every schedule the adversary produces.
+        fn responseEditViolation(response: *const parser.ResponseHead) ?ClientError {
+            assert(response.status >= 100);
+            assert(response.headers.len <= zoxy.constants.headers_max);
+            const stamped = headerEquals(
+                response.headers,
+                canon.response_edit_name,
+                canon.response_edit_value,
+            );
+            if (response.status == 200) {
+                if (!stamped) {
+                    return ClientError.ResponseEditMissing;
+                }
+            } else {
+                if (stamped) {
+                    return ClientError.ResponseEditForged;
+                }
+            }
+            if (headerPresent(response.headers, canon.response_never_name)) {
+                return ClientError.ResponseEditForged;
+            }
+            return null;
+        }
+
+        fn headerEquals(headers: []const parser.Header, name: []const u8, value: []const u8) bool {
+            assert(name.len >= 1);
+            assert(headers.len <= zoxy.constants.headers_max);
+            for (headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, name)) continue;
+                if (std.mem.eql(u8, header.value, value)) return true;
+            }
+            return false;
+        }
+
+        fn headerPresent(headers: []const parser.Header, name: []const u8) bool {
+            assert(name.len >= 1);
+            assert(headers.len <= zoxy.constants.headers_max);
+            for (headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+            }
+            return false;
         }
 
         /// Every legal response starts "HTTP/1."; a partial tail that
