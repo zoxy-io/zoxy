@@ -389,6 +389,11 @@ pub const ValidationError = error{
     FilterHeaderNameInvalid,
     FilterHeaderNameReserved,
     FilterHeaderValueInvalid,
+    FilterClientEmpty,
+    FilterClientCidrInvalid,
+    FilterClientPrefixInvalid,
+    FilterClientPrefixTooNarrow,
+    FilterClientCidrHostBits,
     FilterActionsEmpty,
     FilterActionKind,
     FilterRejectStatus,
@@ -959,6 +964,8 @@ pub const MatchJson = struct {
     host: ?[]const u8 = null,
     path_prefix: ?[]const u8 = null,
     headers: ?[]const HeaderMatchJson = null,
+    /// Optional #177 client-address predicate: CIDR literals, any-of.
+    client: ?[]const []const u8 = null,
 
     pub const schema_doc = "Request-match predicate; every absent field matches anything.";
     pub const schema_fields = .{
@@ -971,6 +978,14 @@ pub const MatchJson = struct {
         .path_prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
         .headers = .{
             .desc = "Header predicates; all must match.",
+        },
+        .client = .{
+            .desc = "CIDR prefixes the connection's client address must fall inside " ++
+                "(any-of): \"10.0.0.0/8\", up to /32 for IPv4 and /64 for IPv6 — a " ++
+                "client's IPv6 identity is its /64, like hash source_ip. Matched " ++
+                "against the observed peer (the PROXY-announced client on a " ++
+                "proxy_protocol listener), never an X-Forwarded-For chain.",
+            .min_items = 1,
         },
     };
 };
@@ -1946,7 +1961,101 @@ fn resolveMatch(
     if (match_json.headers) |headers_json| {
         match.headers = try resolveHeaderMatches(arena, headers_json);
     }
+    if (match_json.client) |cidr_literals| {
+        match.clients = try resolveClientCidrs(arena, cidr_literals);
+    }
     return match;
+}
+
+/// Compile a `client` predicate's CIDR list (#177). An explicitly empty
+/// list is a mistake — absence already says "any client", unambiguously
+/// (the `FilterMethodEmpty` rule).
+fn resolveClientCidrs(
+    arena: std.mem.Allocator,
+    literals: []const []const u8,
+) ParseError![]const filter.Cidr {
+    if (literals.len == 0) {
+        return error.FilterClientEmpty;
+    }
+    assert(literals.len >= 1); // Past the empty guard.
+    const cidrs = try arena.alloc(filter.Cidr, literals.len);
+    for (literals, cidrs) |literal, *cidr| {
+        cidr.* = try resolveClientCidr(literal);
+    }
+    assert(cidrs.len == literals.len);
+    return cidrs;
+}
+
+/// One CIDR literal to its compiled prefix. The `/len` is mandatory — a
+/// bare address has no single meaning across families (an exact IPv4
+/// host is /32, but an exact IPv6 *client* is its /64), so the spelling
+/// that would need per-family folklore is refused instead. Host bits
+/// past the prefix must be zero: `10.0.0.1/8` is a typo for either
+/// `10.0.0.0/8` or `10.0.0.1/32`, and the loader cannot know which.
+fn resolveClientCidr(literal: []const u8) ParseError!filter.Cidr {
+    const slash = std.mem.indexOfScalar(u8, literal, '/') orelse
+        return error.FilterClientCidrInvalid;
+    const address_text = literal[0..slash];
+    const prefix_text = literal[slash + 1 ..];
+    if (prefix_text.len == 0) {
+        return error.FilterClientPrefixInvalid;
+    }
+    const prefix_len = std.fmt.parseUnsigned(u8, prefix_text, 10) catch
+        return error.FilterClientPrefixInvalid;
+    const address = std.Io.net.IpAddress.parse(address_text, 0) catch
+        return error.FilterClientCidrInvalid;
+    switch (address) {
+        .ip4 => |v4| {
+            if (prefix_len > 32) {
+                return error.FilterClientPrefixTooNarrow;
+            }
+            assert(prefix_len <= 32);
+            const bits = std.mem.readInt(u32, &v4.bytes, .big);
+            if (hostBitsSet(u32, bits, prefix_len)) {
+                return error.FilterClientCidrHostBits;
+            }
+        },
+        .ip6 => |v6| {
+            // A client's IPv6 identity is its /64 (`hash.key:
+            // source_ip`, §7): RFC 8981 rotates the interface half on a
+            // timer, so a narrower prefix names bits that will not mean
+            // the same client in an hour.
+            if (prefix_len > 64) {
+                return error.FilterClientPrefixTooNarrow;
+            }
+            assert(prefix_len <= 64);
+            const high = std.mem.readInt(u64, v6.bytes[0..8], .big);
+            const low = std.mem.readInt(u64, v6.bytes[8..16], .big);
+            if (low != 0) {
+                return error.FilterClientCidrHostBits;
+            }
+            assert(low == 0);
+            if (hostBitsSet(u64, high, prefix_len)) {
+                return error.FilterClientCidrHostBits;
+            }
+        },
+    }
+    // The compiled prefix `Cidr.contains` and `clientMatches` assert on
+    // their side of the seam, proven where it is produced.
+    assert(prefix_len <= 64 or address == .ip4);
+    return .{ .address = address, .prefix_len = prefix_len };
+}
+
+/// Whether any bit below the prefix is set — the host half that a
+/// canonical CIDR keeps zero.
+fn hostBitsSet(comptime T: type, bits: T, prefix_len: u8) bool {
+    const width = @bitSizeOf(T);
+    assert(prefix_len <= width);
+    if (prefix_len == 0) {
+        return bits != 0;
+    }
+    if (prefix_len == width) {
+        return false;
+    }
+    assert(prefix_len >= 1);
+    const shift: std.math.Log2Int(T) = @intCast(prefix_len);
+    const host_mask = (@as(T, std.math.maxInt(T)) >> shift);
+    return (bits & host_mask) != 0;
 }
 
 fn resolveHeaderMatches(
@@ -2994,6 +3103,62 @@ test "config: a filter set over the header-edit budget is rejected" {
     try expectParseError(error.FilterHeaderEditsOverLimit, json);
 }
 
+test "config: client CIDR predicates compile with their prefixes" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","request_filters":[
+        \\   {"match":{"path_prefix":"/admin","client":["10.0.0.0/8","192.168.1.0/24","2001:db8::/32"]},
+        \\    "actions":[{"reject":403}]},
+        \\   {"match":{"client":["0.0.0.0/0","::/0"]},
+        \\    "actions":[{"header_set":{"name":"X-Any","value":"1"}}]}
+        \\ ]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const clients = parsed.listeners[0].request_filters[0].match.clients;
+    try std.testing.expectEqual(@as(usize, 3), clients.len);
+    try std.testing.expectEqual(@as(u8, 8), clients[0].prefix_len);
+    try std.testing.expectEqual(@as(u8, 24), clients[1].prefix_len);
+    try std.testing.expectEqual(@as(u8, 32), clients[2].prefix_len);
+    // The /0 edge parses in both families: an explicit everyone, whose
+    // host-bits rule still demands an all-zero address.
+    const any = parsed.listeners[0].request_filters[1].match.clients;
+    try std.testing.expectEqual(@as(u8, 0), any[0].prefix_len);
+    try std.testing.expectEqual(@as(u8, 0), any[1].prefix_len);
+    // The compiled prefixes admit and refuse — proving address bytes
+    // survived the parse, not only the lengths.
+    const office = std.Io.net.IpAddress.parseLiteral("10.9.8.7:1") catch unreachable;
+    const stranger = std.Io.net.IpAddress.parseLiteral("11.0.0.1:1") catch unreachable;
+    try std.testing.expect(clients[0].contains(&office));
+    try std.testing.expect(!clients[0].contains(&stranger));
+}
+
+test "config: client CIDR validation has its own errors" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
+    // An explicitly empty list: absence already says "any client".
+    try expectParseError(error.FilterClientEmpty, head ++ "{\"match\":{\"client\":[]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A bare address has no single meaning across families (an exact
+    // IPv4 host is /32, an exact IPv6 client is its /64): the prefix is
+    // mandatory.
+    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.1\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"office/8\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/eight\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // Past the family's bound: /32 for v4; /64 for v6, where the low
+    // half is interface identity that rotates (RFC 8981).
+    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"10.0.0.0/33\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"2001:db8::/65\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // Host bits set past the prefix: a typo for one of two different
+    // ranges, and the loader cannot know which.
+    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"10.0.0.1/8\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"2001:db8::1/48\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+}
+
 test "config: response filters compile into rules with matches and edits" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
@@ -3803,6 +3968,7 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 /// `drain_deadline_ms` gives it no path to that branch of the parser.
 const fuzz_seed_json =
     \\{"listeners":[{"bind":"127.0.0.1:8080","routes":[{"prefix":"/","cluster":"o"}],
+    \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]}],
     \\ "protocol":"http"}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],"pick":"p2c","max_inflight":8,

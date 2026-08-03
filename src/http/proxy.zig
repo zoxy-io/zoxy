@@ -458,6 +458,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .host = host,
                 .path = views.match,
                 .headers = request.headers,
+                .client = &conn.client_address,
             };
             // One scan yields both the rewrite and the header edits (§7).
             const forward = filter.collectForward(conn.request_filters, view, edit_buffer);
@@ -583,6 +584,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .host = keys.host,
                 .path = keys.views.match,
                 .headers = request.headers,
+                .client = &conn.client_address,
             })) |status| {
                 return respondFilter(server, conn, status);
             }

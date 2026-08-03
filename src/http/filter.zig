@@ -28,6 +28,60 @@ pub const HeaderMatch = struct {
     pub const Kind = enum(u8) { present, equals, contains };
 };
 
+/// One CIDR prefix a `client` predicate admits (#177). The address is
+/// canonical for its prefix — host bits are rejected at load — so
+/// containment is a masked-prefix compare, never a normalization.
+pub const Cidr = struct {
+    address: std.Io.net.IpAddress,
+    /// Prefix bits: 0..32 for IPv4, 0..64 for IPv6 — a client's IPv6
+    /// identity is its /64, the same rule `hash.key: source_ip` keys on
+    /// (§7): RFC 8981 rotates the low bits on a timer, and two features
+    /// must not disagree about what a client is. The loader enforces
+    /// both bounds.
+    prefix_len: u8,
+
+    /// Whether `client` falls inside this prefix. Family-strict: a v4
+    /// client never matches a v6 prefix or vice versa — the accept path
+    /// produces no mapped forms.
+    pub fn contains(cidr: *const Cidr, client: *const std.Io.net.IpAddress) bool {
+        return switch (cidr.address) {
+            .ip4 => |prefix| switch (client.*) {
+                .ip4 => |candidate| prefixBitsMatch(
+                    u32,
+                    std.mem.readInt(u32, &prefix.bytes, .big),
+                    std.mem.readInt(u32, &candidate.bytes, .big),
+                    cidr.prefix_len,
+                ),
+                .ip6 => false,
+            },
+            .ip6 => |prefix| switch (client.*) {
+                .ip4 => false,
+                .ip6 => |candidate| prefixBitsMatch(
+                    u64,
+                    std.mem.readInt(u64, prefix.bytes[0..8], .big),
+                    std.mem.readInt(u64, candidate.bytes[0..8], .big),
+                    cidr.prefix_len,
+                ),
+            },
+        };
+    }
+};
+
+/// The top `prefix_len` bits of two addresses compare equal. A zero
+/// prefix admits everything — handled before the shift, whose amount
+/// would otherwise be the type's whole width (illegal in Zig, and the
+/// mathematical answer is "no bits compared" anyway).
+fn prefixBitsMatch(comptime T: type, prefix: T, candidate: T, prefix_len: u8) bool {
+    const width = @bitSizeOf(T);
+    assert(prefix_len <= width);
+    if (prefix_len == 0) {
+        return true;
+    }
+    assert(prefix_len >= 1);
+    const shift: std.math.Log2Int(T) = @intCast(width - prefix_len);
+    return (prefix >> shift) == (candidate >> shift);
+}
+
 /// A rule's match: every present predicate must hold (a conjunction). A
 /// null/empty field is "any", so an all-null match is an unconditional
 /// rule. Host and path prefix are already canonical (§7), compared
@@ -38,6 +92,13 @@ pub const Match = struct {
     host: ?[]const u8 = null,
     path_prefix: ?[]const u8 = null,
     headers: []const HeaderMatch = &.{},
+    /// CIDR prefixes the connection's client address must fall inside —
+    /// any-of across the list, conjoined with the rest (#177). Empty =
+    /// any client. Matched against the same address every other
+    /// consumer reads (§6): the observed peer, or the PROXY-announced
+    /// client on a `proxy_protocol` listener — never an
+    /// `X-Forwarded-For` chain, which is client-supplied text.
+    clients: []const Cidr = &.{},
 };
 
 /// One header edit's name and value (value unused for a remove).
@@ -218,6 +279,11 @@ pub const RequestView = struct {
     host: ?[]const u8,
     path: []const u8,
     headers: []const parser.Header,
+    /// The connection's client address (#177), by pointer like every
+    /// address here (32 bytes, past TIGER_STYLE's by-value threshold).
+    /// No default: a site that forgot to wire it must not compile, or a
+    /// `client` allowlist would silently judge a zero address.
+    client: *const std.Io.net.IpAddress,
 };
 
 /// The reject status of the first matching rule that carries a `reject`
@@ -398,7 +464,26 @@ fn matches(match: Match, view: RequestView) bool {
             return false;
         }
     }
+    if (match.clients.len >= 1) {
+        if (!clientMatches(match.clients, view.client)) {
+            return false;
+        }
+    }
     return true;
+}
+
+/// Whether any prefix admits the client (#177) — the one any-of among
+/// the conjunction's predicates, because a `client` list reads as "from
+/// these ranges" and a client holds exactly one address.
+fn clientMatches(cidrs: []const Cidr, client: *const std.Io.net.IpAddress) bool {
+    assert(cidrs.len >= 1);
+    for (cidrs) |*cidr| {
+        assert(cidr.prefix_len <= 64);
+        if (cidr.contains(client)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Whether some header satisfies the predicate. Name comparison is
@@ -425,6 +510,11 @@ fn headerMatches(header_match: HeaderMatch, headers: []const parser.Header) bool
     }
     return false;
 }
+
+/// The client address the pre-#177 view tests pass and ignore — no rule
+/// in them carries a `clients` list, so nothing reads it. The CIDR tests
+/// build their own.
+const test_view_client = std.Io.net.IpAddress.parseLiteral("203.0.113.9:50000") catch unreachable;
 
 test "filter: isRejectStatus admits exactly the reject_statuses set" {
     // Every member of the single-source-of-truth set is admitted.
@@ -466,6 +556,7 @@ test "filter: firstReject matches on method, host, path, header" {
         .host = "api.example",
         .path = "/admin/users",
         .headers = &prod,
+        .client = &test_view_client,
     }));
     // Wrong method, host, path, or header value → no reject.
     try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
@@ -473,24 +564,28 @@ test "filter: firstReject matches on method, host, path, header" {
         .host = "api.example",
         .path = "/admin",
         .headers = &prod,
+        .client = &test_view_client,
     }));
     try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
         .method = .post,
         .host = "other.example", // wrong host
         .path = "/admin",
         .headers = &prod,
+        .client = &test_view_client,
     }));
     try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
         .method = .post,
         .host = "api.example",
         .path = "/public", // not under /admin
         .headers = &prod,
+        .client = &test_view_client,
     }));
     try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
         .method = .post,
         .host = "api.example",
         .path = "/admin",
         .headers = &dev, // header value mismatch
+        .client = &test_view_client,
     }));
     // A segment-splitting path must not match the /admin prefix.
     try std.testing.expectEqual(@as(?u16, null), firstReject(&rules, .{
@@ -498,6 +593,7 @@ test "filter: firstReject matches on method, host, path, header" {
         .host = "api.example",
         .path = "/administrator",
         .headers = &prod,
+        .client = &test_view_client,
     }));
 }
 
@@ -515,6 +611,7 @@ test "filter: an all-any match is unconditional; edit-only rules never reject" {
         .host = null,
         .path = "/anything",
         .headers = empty,
+        .client = &test_view_client,
     }));
     // The second rule rejects its prefix.
     try std.testing.expectEqual(@as(?u16, 404), firstReject(&rules, .{
@@ -522,6 +619,7 @@ test "filter: an all-any match is unconditional; edit-only rules never reject" {
         .host = null,
         .path = "/blocked/x",
         .headers = empty,
+        .client = &test_view_client,
     }));
 }
 
@@ -548,6 +646,7 @@ test "filter: collectForward gathers matching rules' edits in order" {
         .host = null,
         .path = "/public",
         .headers = empty,
+        .client = &test_view_client,
     }, &buffer);
     try std.testing.expectEqual(@as(?Rewrite, null), public.rewrite);
     try std.testing.expectEqual(@as(usize, 2), public.edits.len);
@@ -563,6 +662,7 @@ test "filter: collectForward gathers matching rules' edits in order" {
         .host = null,
         .path = "/api/v1",
         .headers = empty,
+        .client = &test_view_client,
     }, &buffer);
     try std.testing.expectEqual(@as(usize, 3), api.edits.len);
     try std.testing.expectEqualStrings("X-Via", api.edits[0].name);
@@ -594,6 +694,7 @@ test "filter: collectForward picks the first applicable rewrite only" {
         .host = null,
         .path = "/api/users",
         .headers = empty,
+        .client = &test_view_client,
     }, &buffer);
     try std.testing.expect(hit.rewrite != null);
     try std.testing.expectEqualStrings("/api", hit.rewrite.?.from);
@@ -606,6 +707,7 @@ test "filter: collectForward picks the first applicable rewrite only" {
         .host = null,
         .path = "/public",
         .headers = empty,
+        .client = &test_view_client,
     }, &buffer);
     try std.testing.expectEqual(@as(?Rewrite, null), miss.rewrite);
 }
@@ -650,6 +752,112 @@ test "filter: rewritePath is a segment-correct prefix replacement" {
         const recanon = try parser.canonicalTarget(got, &canon);
         try std.testing.expectEqualStrings(got, recanon.path);
     }
+}
+
+test "filter: cidr containment is a masked prefix compare, family-strict" {
+    const office: Cidr = .{
+        .address = std.Io.net.IpAddress.parse("10.0.0.0", 0) catch unreachable,
+        .prefix_len = 8,
+    };
+    const exact: Cidr = .{
+        .address = std.Io.net.IpAddress.parse("192.168.1.7", 0) catch unreachable,
+        .prefix_len = 32,
+    };
+    const any4: Cidr = .{
+        .address = std.Io.net.IpAddress.parse("0.0.0.0", 0) catch unreachable,
+        .prefix_len = 0,
+    };
+    const site6: Cidr = .{
+        .address = std.Io.net.IpAddress.parse("2001:db8:1::", 0) catch unreachable,
+        .prefix_len = 48,
+    };
+
+    const inside = std.Io.net.IpAddress.parseLiteral("10.255.0.1:1") catch unreachable;
+    const outside = std.Io.net.IpAddress.parseLiteral("11.0.0.1:1") catch unreachable;
+    const the_host = std.Io.net.IpAddress.parseLiteral("192.168.1.7:9") catch unreachable;
+    const neighbor = std.Io.net.IpAddress.parseLiteral("192.168.1.8:9") catch unreachable;
+    const v6_inside = std.Io.net.IpAddress.parseLiteral("[2001:db8:1:2::5]:1") catch unreachable;
+    const v6_outside = std.Io.net.IpAddress.parseLiteral("[2001:db8:2::5]:1") catch unreachable;
+
+    // The /8 boundary: the top byte decides, the rest is host space.
+    try std.testing.expect(office.contains(&inside));
+    try std.testing.expect(!office.contains(&outside));
+    // /32 is one host exactly.
+    try std.testing.expect(exact.contains(&the_host));
+    try std.testing.expect(!exact.contains(&neighbor));
+    // /0 admits every address of its family — and only its family:
+    // the port is irrelevant and a v6 client is not a v4 one.
+    try std.testing.expect(any4.contains(&inside));
+    try std.testing.expect(any4.contains(&neighbor));
+    try std.testing.expect(!any4.contains(&v6_inside));
+    // A v6 site prefix, judged on the upper 64 bits.
+    try std.testing.expect(site6.contains(&v6_inside));
+    try std.testing.expect(!site6.contains(&v6_outside));
+    try std.testing.expect(!site6.contains(&inside));
+}
+
+test "filter: a client predicate is any-of, conjoined with the rest" {
+    const office: Cidr = .{
+        .address = std.Io.net.IpAddress.parse("10.0.0.0", 0) catch unreachable,
+        .prefix_len = 8,
+    };
+    const lab: Cidr = .{
+        .address = std.Io.net.IpAddress.parse("192.168.1.0", 0) catch unreachable,
+        .prefix_len = 24,
+    };
+    // The issue's own rule: /admin from the office ranges and nowhere
+    // else — spelled as a reject of everything the allowlist misses,
+    // conjoined with the path.
+    const rules = [_]Rule{
+        .{
+            .match = .{ .path_prefix = "/admin", .clients = &.{ office, lab } },
+            .actions = &.{.{ .header_set = .{ .name = "X-Office", .value = "1" } }},
+        },
+        .{ .match = .{ .path_prefix = "/admin" }, .actions = &.{.{ .reject = 403 }} },
+    };
+    const empty: []const parser.Header = &.{};
+    const office_client = std.Io.net.IpAddress.parseLiteral("10.1.2.3:40000") catch unreachable;
+    const lab_client = std.Io.net.IpAddress.parseLiteral("192.168.1.9:40000") catch unreachable;
+    const stranger = std.Io.net.IpAddress.parseLiteral("203.0.113.9:40000") catch unreachable;
+
+    // Everyone hits the 403 rule on /admin — it carries no client list —
+    // so the reject-first scan reads it for all three; what the CIDR
+    // predicate decides is whether the *first* rule matched too, visible
+    // through its edit below.
+    var buffer: [constants.header_edits_max]AppliedHeaderEdit = undefined;
+    const from_office = collectForward(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = empty,
+        .client = &office_client,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), from_office.edits.len);
+    const from_lab = collectForward(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = empty,
+        .client = &lab_client,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), from_lab.edits.len);
+    const from_stranger = collectForward(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = empty,
+        .client = &stranger,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 0), from_stranger.edits.len);
+    // Off the path, the client list alone matches nothing: conjunction.
+    const off_path = collectForward(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/public",
+        .headers = empty,
+        .client = &office_client,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 0), off_path.edits.len);
 }
 
 test "filter: response rules match on status, class and headers" {
