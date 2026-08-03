@@ -738,7 +738,7 @@ a wall is *hit*, while `zoxy_conn_slots_in_use` against
 
 The scrape also says **which backend**, per cluster and endpoint:
 
-```
+```text
 zoxy_endpoint_responses{cluster="api",endpoint="10.0.0.1:8080"} 4182
 zoxy_endpoint_connect_failed{cluster="api",endpoint="10.0.0.2:8080"} 17
 zoxy_endpoint_health_down{cluster="api",endpoint="10.0.0.2:8080"} 2
