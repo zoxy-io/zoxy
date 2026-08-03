@@ -381,8 +381,12 @@ only by the loop thread:
    (§4, single-shot buffer-select) arms with *no* buffer, and the kernel
    binds one from the registered ring only when the client actually
    speaks. Bound at the first byte of a request, returned at the
-   keep-alive turnaround, before a static response goes out, and at
-   teardown — so an idle connection holds no head bytes at all, an L4
+   keep-alive turnaround, before a static response goes out, at
+   teardown — and, the one held-through-a-send case, after a #176
+   redirect delivers: its response renders *into* the buffer (the
+   Location may carry the request's own path), so the buffer goes back
+   in the write continuation instead of before the arm — so an idle
+   connection holds no head bytes at all, an L4
    connection never binds one, and the ring is sized for concurrent
    *request heads*, not for open connections. Returning a buffer is a
    tail bump, no syscall. The ring empty at a client's first byte is the
@@ -852,6 +856,43 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   with unbounded fuel or an embedded allocator cannot satisfy the gate);
   anything beyond the closed action enum is a Zig function added to the
   owning phase module at compile time.
+- **A filter can match on who is connecting** (#177, settled
+  2026-08-03). `match.client` is a CIDR list, any-of across the list
+  and conjoined with the rest — "/admin from the office range and
+  nowhere else" is one rule with a reject beneath it. It matches the
+  connection's client address, which is §6's settled principle rather
+  than a new trust decision: the observed peer, or the PROXY-announced
+  client on a `proxy_protocol` listener — never an `X-Forwarded-For`
+  chain, because an allowlist keyed on client-supplied text is not an
+  allowlist. The prefix is mandatory and bounded per family — /32 for
+  IPv4, **/64 for IPv6**, the same client identity `hash.key:
+  source_ip` keys on, so two features cannot disagree about what a
+  client is — and host bits past the prefix are refused: `10.0.0.1/8`
+  is a typo for one of two different ranges, and the loader cannot know
+  which. Containment is a masked-prefix compare over the compiled
+  table, family-strict; the accept and PROXY paths both normalize
+  mapped v6 forms before storage.
+- **A filter can answer with a redirect** (#176, settled 2026-08-03).
+  `redirect` beside `reject`, closed status set `301/302/307/308` —
+  the four with distinct permanent/temporary × method-preserving
+  semantics — and a target in one of two forms: a fixed `location`
+  sent verbatim, or a composed one, `scheme` (required) and optionally
+  `host` replaced with the request's own canonical path and query
+  carried through, so `www` → apex and HTTP → HTTPS are one rule each
+  and the config never restates the path. The scheme is never guessed:
+  behind a TLS terminator every hop this proxy sees is plaintext, and
+  a guess is wrong exactly when it matters. The first terminal action
+  — reject or redirect — wins, top-down. The redirect is the one
+  response this proxy originates whose bytes are not comptime-static,
+  so it renders into the connection's own head buffer (§5, §8) and
+  holds it through the send; a composed Location the buffer cannot
+  carry is `414` — the URI's own fault, answered on a clean message
+  boundary the ordinary keep rule then reads — and a composed target
+  on a request with no authority (HTTP/1.0, no Host) is `400`.
+  `l7_redirected` counts it and the access log says `redirected`,
+  deliberately apart from `l7_filtered`/`rejected`: "policy refused
+  this" and "policy relocated this" are opposite directions on a
+  dashboard.
 - **Response filters are a second table, not a scope marker** (#175,
   settled 2026-08-03). `request_filters` (né `filters`, hard-renamed
   while no deployed config existed to break) runs before routing;
@@ -1080,7 +1121,11 @@ origin, not one this proxy can pick for them.
   staged through
   the connection's head buffer, whose bytes the parsed head's zero-copy
   slices may still reference (§7). Shedding costs one send, no
-  allocation, no copy.
+  allocation, no copy. The #176 redirect is the one proxy-originated
+  response that *does* stage through the head buffer — its Location is
+  per-request — and it may do so only because its render runs after
+  every read of those bytes: the Location is composed first, into the
+  rewrite scratch, so nothing aliases what the render overwrites (§7).
 - **A shed keeps the connection when it can.** Closing is not free: it
   costs the client a handshake and this proxy an accept, a conn slot and
   an admission — so an always-closing shed is *more* expensive per
