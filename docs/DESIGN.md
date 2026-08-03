@@ -1345,6 +1345,52 @@ origin, not one this proxy can pick for them.
   reached the client" and is earned only when the last byte does. An exchange cut off mid-response logs its origin's status
   with outcome `aborted`; exactly one `ok` line per `zoxy_l7_responses`
   is what the §9 oracle asserts.
+  **A line can also carry headers the operator names** (#140, settled
+  2026-08-03), and that is what joins this log to the origin's. Nothing
+  here mints an identifier: zoxy is usually not the outermost hop, a
+  CDN or ingress in front almost always sets `X-Request-ID` or
+  `traceparent`, and that header passes through untouched and reaches
+  the backend — so logging it at both ends builds the join with nothing
+  added to the wire. Minting one is postponed rather than dropped, and
+  the reason it is a separate question is concrete: generating an ID
+  needs entropy, this proxy has no randomness source in production, and
+  obtaining one is a §4 seam decision with a §9 determinism constraint
+  attached. It is also the more general feature — `User-Agent`, a
+  tenant header, a CDN's ray ID, the origin's `X-Cache` — none of which
+  is a correlation ID.
+  `access_log.request_headers` and `response_headers` name them, absent
+  lists leaving the line byte-identical to what it was. The values are
+  **copied** at capture, not borrowed: the head buffer's zero-copy
+  slices do not survive the awaits before the line is written (§7
+  rotation), so they land in a per-connection table under
+  `access_log_header_bytes_max`, truncated with a trailing `...` on
+  `path`'s terms. That table is addressed by connection *slot*, so it
+  is cleared when a slot is acquired as well as on each keep-alive
+  turnaround — a head that never parses reaches no capture, and its
+  line would otherwise report the slot's previous occupant's header,
+  which is one client's correlation ID on another client's request.
+  Four decisions worth stating. The fields are **nested** objects, one
+  per direction: flattening would let a header called `status` shadow
+  the real one, and the nesting keeps "what the client sent" visibly
+  apart from "what zoxy observed". A configured header that did not
+  arrive is **omitted** rather than emitted as null, so the object says
+  what was there. Names are matched case-insensitively and logged
+  **lowercased**, one spelling a downstream query need not guess at.
+  And a repeated header logs its **first** value, because
+  `parser.headerValue`'s does — what the line reports is then the value
+  zoxy itself read, which is the property worth having when the two
+  disagree.
+  The structural consequence is that `access_log_line_bytes_max` stops
+  being a comptime sum over a fixed field set: the named headers are
+  the operator's list, so a line's maximum length is theirs too. It
+  becomes `accessLogLineBytes(count)` — with the compiled ceiling kept
+  for the budget asserts, the header-free bound kept as the staging
+  floor, and the loader refusing a staging buffer that could not hold
+  *this* config's line, since that drop would mean arithmetic rather
+  than backpressure. That move is #179's, already argued and already
+  landed: the metrics exposition's render buffer became a config-derived
+  banner term for exactly this reason when labels arrived, and the
+  capture table is priced in the banner the same way.
   **The unit is an admitted connection**, which is what draws the line
   between the two kinds of shed in the table above. A request-level shed
   — a `503` for relay buffers or upstream slots — belongs to a connection
@@ -1620,7 +1666,7 @@ src/
   shed.zig            // exhaustion ladder: decisions + static responses (incl. configured pages, #159)
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
   admin.zig           // admin/metrics listener: one reserved scrape slot (§8)
-  access_log.zig      // JSON access log: double-buffered sink, drop rung (§8)
+  access_log.zig      // JSON access log: double-buffered sink, drop rung, named headers (§8)
 sim/                  // simulator harness + invariants
 smoke/                // the live gate (Tier 0.5): origin + client + verdicts, §9
 bench/                // micro benches (poop) + loopback harness (zrk), §9
