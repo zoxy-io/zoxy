@@ -38,6 +38,12 @@ pub const Response = struct {
     /// config sets unconditionally (`X-Zoxy-Smoke: 1`) — the live gate's
     /// witness that the response edit path ran on this very hop.
     edited: bool,
+    /// The #178 endpoint tag the head's Set-Cookie announced, or null
+    /// when no line claimed the smoke cookie's name. The reader enforces
+    /// the whole minted grammar — sixteen tag bytes and the exact
+    /// attributes — so a present-but-mangled stamp fails the read
+    /// instead of passing as either presence or absence.
+    sticky_tag: ?[16]u8,
 };
 
 /// What a request says about its connection's future. HTTP/1.1's default
@@ -107,14 +113,26 @@ pub const Client = struct {
         host: []const u8,
         target: []const u8,
         persistence: Persistence,
+        /// A whole `name=value` Cookie line to send, or null for none —
+        /// the #178 leg's echo half. Explicit at every call site, like
+        /// `persistence`, so a request's bytes are readable off it.
+        cookie: ?[]const u8,
     ) !Response {
         assert(client.connected);
         assert(target.len >= 1);
         assert(target[0] == '/');
-        try client.writer.interface.print(
-            "GET {s} HTTP/1.1\r\nHost: {s}\r\n{s}\r\n",
-            .{ target, host, persistence.header() },
-        );
+        if (cookie) |crumb| {
+            assert(crumb.len >= 1);
+            try client.writer.interface.print(
+                "GET {s} HTTP/1.1\r\nHost: {s}\r\nCookie: {s}\r\n{s}\r\n",
+                .{ target, host, crumb, persistence.header() },
+            );
+        } else {
+            try client.writer.interface.print(
+                "GET {s} HTTP/1.1\r\nHost: {s}\r\n{s}\r\n",
+                .{ target, host, persistence.header() },
+            );
+        }
         try client.writer.interface.flush();
         client.requests += 1;
         const response = try readResponse(&client.reader.interface);
@@ -130,7 +148,12 @@ fn readResponse(reader: *Io.Reader) !Response {
     const head = try readHeaders(reader);
     assert(head.body_bytes <= response_body_bytes_max);
     try reader.discardAll(head.body_bytes);
-    return .{ .status = status, .body_bytes = head.body_bytes, .edited = head.edited };
+    return .{
+        .status = status,
+        .body_bytes = head.body_bytes,
+        .edited = head.edited,
+        .sticky_tag = head.sticky_tag,
+    };
 }
 
 /// The three-digit status off the status line. A response that does not
@@ -149,25 +172,27 @@ fn readStatus(reader: *Io.Reader) !u16 {
     return status;
 }
 
-/// What the header walk found: the framing, and whether the #175 stamp
-/// was among the lines.
+/// What the header walk found: the framing, whether the #175 stamp was
+/// among the lines, and the #178 tag if a Set-Cookie announced one.
 const Head = struct {
     body_bytes: u32,
     edited: bool,
+    sticky_tag: ?[16]u8,
 };
 
 /// Header lines up to the blank one, returning the body length they
 /// framed. A head with no `Content-Length` is an error: the origin always
 /// sends one, so its absence means the hop reframed the response, which
 /// is exactly the kind of thing this tier exists to notice. The #175
-/// stamp is scanned for on the same walk — spelled here rather than
-/// imported, like the counter names: the gate reads what the binary
-/// *wrote*, so a drift must fail loudly.
+/// stamp and the #178 cookie are scanned for on the same walk — spelled
+/// here rather than imported, like the counter names: the gate reads
+/// what the binary *wrote*, so a drift must fail loudly.
 fn readHeaders(reader: *Io.Reader) !Head {
     const length_name = "content-length:";
     const stamp = "x-zoxy-smoke: 1";
     var body_bytes: ?u32 = null;
     var edited = false;
+    var sticky_tag: ?[16]u8 = null;
     var lines: u32 = 0;
     while (lines < response_headers_max) : (lines += 1) {
         const taken = try reader.takeDelimiter('\n');
@@ -175,10 +200,17 @@ fn readHeaders(reader: *Io.Reader) !Head {
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) {
             const framed = body_bytes orelse return error.ResponseUnframed;
-            return .{ .body_bytes = framed, .edited = edited };
+            return .{ .body_bytes = framed, .edited = edited, .sticky_tag = sticky_tag };
         }
         if (std.ascii.eqlIgnoreCase(trimmed, stamp)) {
             edited = true;
+            continue;
+        }
+        if (try stickyTagOf(trimmed)) |tag| {
+            // One announcement per response: a second line naming the
+            // cookie would be the stamp path running twice.
+            if (sticky_tag != null) return error.ResponseMalformed;
+            sticky_tag = tag;
             continue;
         }
         if (trimmed.len <= length_name.len) continue;
@@ -191,4 +223,26 @@ fn readHeaders(reader: *Io.Reader) !Head {
     }
     assert(lines == response_headers_max);
     return error.ResponseMalformed;
+}
+
+/// The #178 tag a header line announces, null when the line is not a
+/// Set-Cookie for the smoke cookie — and an error when it is one but
+/// not in the whole minted grammar (`name=` plus sixteen tag bytes plus
+/// the exact attributes), because a mangled stamp must fail the gate,
+/// not read as present or absent. The header name is case-insensitive;
+/// the cookie name is not (RFC 6265), and zoxy forwards what it minted.
+fn stickyTagOf(line: []const u8) !?[16]u8 {
+    const header_name = "set-cookie:";
+    const cookie_prefix = "zoxy-smoke-srv=";
+    const attributes = "; Path=/; HttpOnly";
+    if (line.len <= header_name.len) return null;
+    if (!std.ascii.startsWithIgnoreCase(line, header_name)) return null;
+    const value = std.mem.trim(u8, line[header_name.len..], " \t");
+    if (!std.mem.startsWith(u8, value, cookie_prefix)) return null;
+    const rest = value[cookie_prefix.len..];
+    if (rest.len != 16 + attributes.len) return error.ResponseMalformed;
+    if (!std.mem.eql(u8, rest[16..], attributes)) return error.ResponseMalformed;
+    var tag: [16]u8 = undefined;
+    @memcpy(&tag, rest[0..16]);
+    return tag;
 }

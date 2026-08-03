@@ -11,6 +11,7 @@ const std = @import("std");
 
 const zoxy = @import("zoxy");
 
+const canon = @import("canon.zig");
 const constants = zoxy.constants;
 const parser = zoxy.http.parser;
 
@@ -92,6 +93,17 @@ pub const Script = enum(u8) {
     /// (§7). Only seeds that drew `append` reach the rung, and
     /// `forwarded_chain_dropped` witnesses it.
     forwarded_oversize,
+    /// A GET carrying the pinned #178 tag of the one http endpoint. On
+    /// a sticky seed it is *followed* — the client oracle demands the
+    /// response carry no re-stamp, the idempotence half — and
+    /// `l7_sticky_followed` fires. On any other seed the cookie is
+    /// inert bytes the origin sees verbatim.
+    sticky_follow,
+    /// A GET carrying a well-formed tag (the minted grammar) that names
+    /// no endpoint of any cluster. Served like any GET; on a sticky
+    /// seed the response must re-announce (`l7_sticky_repicked`) — the
+    /// forged-cookie / shrunk-config shape.
+    sticky_repick,
 };
 
 /// Everything the client's oracles need to know about one script. The
@@ -398,6 +410,30 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
     },
     .forwarded_oversize = .{
         .request = forwarded_oversize_head,
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = statuses_routed,
+    },
+    // #178: both route and forward like a plain GET, so the §8 rungs and
+    // a killed dial can precede the 200. What they change is the sticky
+    // verdict, which the client's stamp oracle reads off every response
+    // head — and on non-sticky seeds they degrade to `get` with inert
+    // cookie bytes, which is itself worth sweeping (a cookie must never
+    // do anything on a cluster that is not keyed on it).
+    .sticky_follow = .{
+        .request = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++
+            "Cookie: " ++ canon.sticky_cookie_name ++ "=" ++ canon.sticky_tag ++ "\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = statuses_routed,
+    },
+    .sticky_repick = .{
+        .request = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++
+            "Cookie: " ++ canon.sticky_cookie_name ++ "=ffffffffffffffff\r\n\r\n",
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 200,

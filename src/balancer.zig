@@ -290,6 +290,14 @@ pub const Balancer = struct {
         return bytesKeyOf(bytes);
     }
 
+    /// `endpointId` for one address, without an instance — what the §9
+    /// gates use to compute the tag an endpoint *must* be spelled as,
+    /// from nothing but its address, so an oracle can hold the running
+    /// proxy to it from outside.
+    pub fn addressIdentity(address: *const std.Io.net.IpAddress) u64 {
+        return endpointId(address);
+    }
+
     /// The tag identity of one configured endpoint — what a cookie for
     /// it spells (#178). Consumed by the response-side stamp, the
     /// feature's serving half, once the exchange settles on an endpoint;

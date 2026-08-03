@@ -33,6 +33,20 @@ pub const response_never_name = "X-Sim-Never";
 /// client oracle demands this exact value on every one it parses.
 pub const redirect_location = "https://sim/redirect";
 
+/// The #178 cookie name a sticky seed's http cluster is keyed on, and
+/// the exact tag of the one http endpoint (127.0.0.1:9001). The tag is
+/// *pinned* — computed once from `endpointId`'s published formula and
+/// frozen here, with the harness asserting the running balancer still
+/// mints it at every setup — so the client oracle demands the stamp's
+/// bytes the way it demands `redirect_location`'s, and a silent remap
+/// of the mint fails the sweep instead of quietly re-homing a fleet.
+pub const sticky_cookie_name = "zoxy-sim-srv";
+pub const sticky_tag = "b4a7ea22f14bfcac";
+/// The whole Set-Cookie value a sticky stamp carries, attributes
+/// included — one spelling shared by the oracle so it cannot drift.
+pub const sticky_set_cookie_value =
+    sticky_cookie_name ++ "=" ++ sticky_tag ++ "; Path=/; HttpOnly";
+
 /// A parseable head that cannot survive the render: 8190 bytes fits the
 /// proxy's 8 KiB response buffer, but no Content-Length and no
 /// Transfer-Encoding makes it until-close framing, which forces a
@@ -43,6 +57,7 @@ pub const redirect_location = "https://sim/redirect";
 pub const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ ("p" ** 8162) ++ "\r\n\r\n";
 
 comptime {
+    assert(sticky_tag.len == 16);
     assert(sized_body.len == 32);
     assert(chunked_wire[0] == '1' and chunked_wire[1] == '0');
     assert(chunked_wire.len == 4 + 16 + 2 + 5);

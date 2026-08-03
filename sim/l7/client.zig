@@ -51,6 +51,16 @@ pub const ClientError = error{
     /// anywhere (the scripted origin answers no 5xx) — either way a
     /// predicate fired where it could not have.
     ResponseEditForged,
+    /// A sticky seed's proxied 200 arrived without the exact #178
+    /// Set-Cookie stamp the drawn cookie cluster owes it — every routed
+    /// request but `sticky_follow`'s is assigned or repicked, and the
+    /// one endpoint's tag is pinned, so the whole value is demanded.
+    StickyStampMissing,
+    /// The #178 stamp where it must not be: on `sticky_follow`'s 200
+    /// (the request already named the endpoint — idempotence is the
+    /// contract), on a static, or on any response of a seed that never
+    /// drew a cookie cluster.
+    StickyStampForged,
 };
 
 pub fn Client(comptime IoType: type) type {
@@ -63,6 +73,9 @@ pub fn Client(comptime IoType: type) type {
         /// Clean seeds harden the prefix oracle to the exact golden
         /// outcome — nothing may be cut, shed, or silently torn down.
         clean: bool = false,
+        /// The seed drew the #178 cookie-keyed http cluster, so the
+        /// stamp oracle runs over every parsed response head.
+        sticky: bool = false,
         connect_completion: IoType.Completion = .{},
         connect_cancel_completion: IoType.Completion = .{},
         recv_completion: IoType.Completion = .{},
@@ -115,11 +128,13 @@ pub fn Client(comptime IoType: type) type {
             address: std.Io.net.IpAddress,
             script: Script,
             clean: bool,
+            sticky: bool,
         ) void {
             client.io = io;
             client.address = address;
             client.script = script;
             client.clean = clean;
+            client.sticky = sticky;
             const bytes = scripts.spec(script).request;
             assert(bytes.len <= client.request.len);
             @memcpy(client.request[0..bytes.len], bytes);
@@ -216,6 +231,7 @@ pub fn Client(comptime IoType: type) type {
             const walk = walkResponses(
                 client.receive_buffer[0..client.received_len],
                 client.script,
+                client.sticky,
             );
             client.maybeSendSecondRequest(&walk);
             if (walk.violation == null and walk.complete_count >= responsesTarget(client.script, &walk)) {
@@ -324,7 +340,7 @@ pub fn Client(comptime IoType: type) type {
             assert(client.received_len <= client.receive_buffer.len);
             if (client.overrun) return ClientError.ResponseOverrun;
             const bytes = client.receive_buffer[0..client.received_len];
-            const walk = walkResponses(bytes, client.script);
+            const walk = walkResponses(bytes, client.script, client.sticky);
             if (walk.violation) |violation| return violation;
             assert(walk.offset <= client.received_len);
             if (client.clean) {
@@ -364,7 +380,7 @@ pub fn Client(comptime IoType: type) type {
         /// a legal prefix (the adversary cuts mid-anything); bytes that
         /// can never extend to a legal transcript — or one complete
         /// response more than the transcript contains — are a violation.
-        fn walkResponses(bytes: []const u8, script: Script) Walk {
+        fn walkResponses(bytes: []const u8, script: Script, sticky: bool) Walk {
             const entry = scripts.spec(script);
             var walk = Walk{
                 .complete_count = 0,
@@ -394,6 +410,10 @@ pub fn Client(comptime IoType: type) type {
                     return walk;
                 }
                 if (responseEditViolation(&response)) |violation| {
+                    walk.violation = violation;
+                    return walk;
+                }
+                if (stickyViolation(sticky, script, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
                 }
@@ -457,6 +477,58 @@ pub fn Client(comptime IoType: type) type {
                 return ClientError.ResponseEditForged;
             }
             return null;
+        }
+
+        /// The #178 oracle over one parsed head. On a sticky seed the
+        /// drawn cookie cluster serves every routed request, so every
+        /// proxied 200 owes the client the exact pinned stamp — except
+        /// `sticky_follow`'s, whose request already named the endpoint
+        /// (idempotence is the contract). A non-200 here is a static or
+        /// a per-request redirect, neither of which runs the response
+        /// render's stamp path, so the cookie's *name* appearing at all
+        /// is forged — and on a seed that drew no cookie cluster, so is
+        /// any appearance anywhere. Like `responseEditViolation`, this
+        /// distinguishes the render paths from outside the process,
+        /// under every schedule the adversary produces.
+        fn stickyViolation(
+            sticky: bool,
+            script: Script,
+            response: *const parser.ResponseHead,
+        ) ?ClientError {
+            assert(response.status >= 100);
+            assert(response.headers.len <= zoxy.constants.headers_max);
+            const named = stickyNamePresent(response.headers);
+            if (!sticky) {
+                if (named) return ClientError.StickyStampForged;
+                return null;
+            }
+            if (response.status != 200) {
+                if (named) return ClientError.StickyStampForged;
+                return null;
+            }
+            switch (script) {
+                .sticky_follow => if (named) return ClientError.StickyStampForged,
+                else => if (!headerEquals(
+                    response.headers,
+                    "set-cookie",
+                    canon.sticky_set_cookie_value,
+                )) return ClientError.StickyStampMissing,
+            }
+            return null;
+        }
+
+        /// Any Set-Cookie line claiming the #178 name, whatever its
+        /// value — the must-not-appear direction's test, looser than
+        /// the exact-value demand so a wrong-tag stamp cannot pass as
+        /// absent.
+        fn stickyNamePresent(headers: []const parser.Header) bool {
+            assert(headers.len <= zoxy.constants.headers_max);
+            const prefix = canon.sticky_cookie_name ++ "=";
+            for (headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, "set-cookie")) continue;
+                if (std.mem.startsWith(u8, header.value, prefix)) return true;
+            }
+            return false;
         }
 
         fn headerEquals(headers: []const parser.Header, name: []const u8, value: []const u8) bool {

@@ -77,10 +77,18 @@ const connections_closed_early: u8 = 2;
 /// other half of the line arithmetic.
 const l4_connections: u8 = 2;
 
+/// The #178 leg: three exchanges on one connection against the
+/// cookie-keyed cluster — assigned (no cookie), followed (the echo),
+/// repicked (a forged tag). Run *after* the counter scrapes, so the
+/// labeled-partition equality those assert still describes a run where
+/// only the `origin` cluster has served.
+const sticky_exchanges: u32 = 3;
+
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
-const access_log_lines_expected: u32 = http_exchanges + l4_connections;
+const access_log_lines_expected: u32 =
+    http_exchanges + sticky_exchanges + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -101,13 +109,19 @@ const rss_growth_kb_max: u64 = 64;
 /// the run. That window is microseconds wide on a port nothing advertises,
 /// and the alternative — a floor — is satisfied by a proxy accepting
 /// connections nobody made.
-const connections_expected: u32 =
-    keep_alive_connections + load_passes * large_requests + l4_connections + 1;
+const sticky_connections: u32 = 1;
+const readiness_probes: u32 = 1;
+const connections_expected: u32 = keep_alive_connections +
+    load_passes * large_requests + l4_connections + sticky_connections +
+    readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
-/// leased, plus the odd straggler mid-teardown.
-const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2;
+/// leased, plus the odd straggler mid-teardown — and one more for the
+/// sticky cluster, whose pool parks its own upstream connection (§5
+/// pools key by cluster, so the origin cluster's parked one is not
+/// reused for it).
+const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 + 1;
 
 /// The drain's cap on waiting for the connections left open above. A
 /// drain cannot tell an idle keep-alive connection from one about to send
@@ -279,6 +293,9 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // Scraped before the drain: the admin listener closes with every
     // other one when SIGTERM lands (§8).
     const counters = try countersPassed(arena, io, ports.admin, origin.port);
+    // The #178 leg runs after the scrapes above on purpose — see
+    // `sticky_exchanges` — and brings its own scrape.
+    const sticky_ok = try stickyPassed(arena, io, &ports);
     const drained_cleanly = try drain(io, &child, &running);
     const lines = try readAccessLog(arena, io);
     // Every check runs and prints; a run that fails two ways should say
@@ -286,7 +303,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const log_ok = accessLogPassed(&lines);
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
-    const passed = log_ok and counters.passed and memory_ok and drain_ok;
+    const passed = log_ok and counters.passed and sticky_ok and memory_ok and drain_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -384,12 +401,12 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // below its own subset would mean the counter itself is wrong — which
     // no comparison below would otherwise notice.
     assert(lines.http_ok <= lines.http);
-    assert(access_log_lines_expected == http_exchanges + l4_connections);
+    assert(access_log_lines_expected == http_exchanges + sticky_exchanges + l4_connections);
     var passed = true;
-    if (lines.http != http_exchanges) {
+    if (lines.http != http_exchanges + sticky_exchanges) {
         std.debug.print(
             "FAIL: {d} http access-log lines for {d} requests (#129 is exactly this)\n",
-            .{ lines.http, http_exchanges },
+            .{ lines.http, http_exchanges + sticky_exchanges },
         );
         passed = false;
     }
@@ -608,13 +625,24 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
         );
         passed = false;
     }
-    if (accepted != connections_expected) {
+    // Minus the #178 leg, which deliberately runs after this scrape (see
+    // `sticky_exchanges`); the whole-run equality is asserted on the
+    // sticky verdict's own later scrape.
+    if (accepted != connections_expected - sticky_connections) {
         std.debug.print(
-            "FAIL: {d} connections accepted, not the {d} this run opened\n",
-            .{ accepted, connections_expected },
+            "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
+            .{ accepted, connections_expected - sticky_connections },
         );
         passed = false;
     }
+    return loadShapePassed(responses, reused, excess) and passed;
+}
+
+/// The load's own shape, read back off the same first scrape — split
+/// from `identitiesPassed` when the #178 deferral note pushed that one
+/// past the length limit.
+fn loadShapePassed(responses: u64, reused: u64, excess: u64) bool {
+    var passed = true;
     // The counter and the log describe the same exchanges, so a
     // disagreement is one of the two lying about the same run.
     if (responses != http_exchanges) {
@@ -705,7 +733,7 @@ fn runPass(io: Io, port: u16, host: []const u8, pass: u32) !void {
             // here: the same error from the first keep-alive request and
             // from the hundredth are different bugs, and the second is
             // not reproducible by staring at the first.
-            const response = client.get(host, "/", .keep_alive) catch |err| {
+            const response = client.get(host, "/", .keep_alive, null) catch |err| {
                 std.debug.print(
                     "smoke: pass {d} keep-alive connection {d} request {d}: {t}\n",
                     .{ pass, connection, request, err },
@@ -726,7 +754,7 @@ fn runPass(io: Io, port: u16, host: []const u8, pass: u32) !void {
     while (large < large_requests) : (large += 1) {
         try single_client.connect(io, port);
         defer single_client.close();
-        const response = single_client.get(host, origin_module.large_path, .close) catch |err| {
+        const response = single_client.get(host, origin_module.large_path, .close, null) catch |err| {
             std.debug.print("smoke: pass {d} bulk request {d}: {t}\n", .{ pass, large, err });
             return err;
         };
@@ -745,7 +773,7 @@ fn runL4Load(io: Io, port: u16, host: []const u8) !void {
     while (index < l4_connections) : (index += 1) {
         try single_client.connect(io, port);
         defer single_client.close();
-        const response = single_client.get(host, "/", .keep_alive) catch |err| {
+        const response = single_client.get(host, "/", .keep_alive, null) catch |err| {
             std.debug.print("smoke: l4 connection {d}: {t}\n", .{ index, err });
             return err;
         };
@@ -793,6 +821,120 @@ fn expectResponse(response: client_module.Response, body_bytes: u32, leg: Leg) !
             std.debug.print("smoke: l4-relayed response gained the X-Zoxy-Smoke stamp\n", .{});
             return error.ResponseEditForged;
         },
+    }
+    // The #178 cookie belongs to the sticky cluster alone: the `origin`
+    // cluster is not cookie-keyed, and the l4 leg is a byte relay — a
+    // tag on either means the stamp path fired for a cluster that never
+    // asked for it.
+    if (response.sticky_tag != null) {
+        std.debug.print("smoke: a non-sticky response announced an endpoint tag\n", .{});
+        return error.StickyStampForged;
+    }
+}
+
+/// The #178 live round trip: three exchanges on one keep-alive
+/// connection against the cookie-keyed cluster, each response judged on
+/// the spot, then the counters on a scrape of their own. Runs after
+/// `countersPassed` so the partition identities that scrape asserts
+/// still describe a one-cluster run.
+fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.http != 0);
+    assert(ports.admin != 0);
+    var host_buffer: [32]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.http});
+    try single_client.connect(io, ports.http);
+    defer single_client.close();
+
+    // Cookieless: assigned, and the response must announce a tag (the
+    // reader enforced the whole grammar before handing it over).
+    const assigned = try single_client.get(host, "/sticky", .keep_alive, null);
+    try expectStickyResponse(assigned, "assigned", true);
+    const tag = assigned.sticky_tag.?;
+
+    // The echo: followed, and no re-stamp — idempotence on the wire.
+    var cookie_buffer: [64]u8 = undefined;
+    const echo = try std.fmt.bufPrint(&cookie_buffer, "zoxy-smoke-srv={s}", .{&tag});
+    const followed = try single_client.get(host, "/sticky", .keep_alive, echo);
+    try expectStickyResponse(followed, "followed", false);
+
+    // A forged well-formed tag: repicked, and the re-announcement must
+    // name the same endpoint the first exchange was assigned — there is
+    // only one, and its tag does not drift within a run.
+    const repicked = try single_client.get(
+        host,
+        "/sticky",
+        .close,
+        "zoxy-smoke-srv=ffffffffffffffff",
+    );
+    try expectStickyResponse(repicked, "repicked", true);
+    if (!std.mem.eql(u8, &repicked.sticky_tag.?, &tag)) {
+        std.debug.print("smoke: the re-announced tag differs from the assigned one\n", .{});
+        return false;
+    }
+
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    var passed = true;
+    const verdicts = [_]struct { name: []const u8, expected: u64 }{
+        .{ .name = "l7_sticky_assigned", .expected = 1 },
+        .{ .name = "l7_sticky_followed", .expected = 1 },
+        .{ .name = "l7_sticky_repicked", .expected = 1 },
+    };
+    for (verdicts) |verdict| {
+        const value = counterOf(&scrape, verdict.name) orelse {
+            passed = false;
+            continue;
+        };
+        if (value != verdict.expected) {
+            std.debug.print(
+                "FAIL: {s} reads {d}, not {d}, after the three sticky exchanges\n",
+                .{ verdict.name, value, verdict.expected },
+            );
+            passed = false;
+        }
+    }
+    // The whole-run accept equality, deferred from `identitiesPassed`:
+    // with the sticky connection in, every accepted connection is
+    // accounted for again.
+    const accepted = counterOf(&scrape, "accepted") orelse return false;
+    if (accepted != connections_expected) {
+        std.debug.print(
+            "FAIL: {d} connections accepted, not the {d} this run opened\n",
+            .{ accepted, connections_expected },
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// One sticky response: the ordinary http-leg checks, then the #178
+/// announcement judged present or absent by the exchange's role.
+fn expectStickyResponse(
+    response: client_module.Response,
+    role: []const u8,
+    expect_tag: bool,
+) !void {
+    assert(role.len >= 1);
+    if (response.status != 200) {
+        std.debug.print("smoke: sticky {s} exchange answered {d}, not 200\n", .{ role, response.status });
+        return error.UnexpectedStatus;
+    }
+    if (response.body_bytes != origin_module.body.len) {
+        std.debug.print("smoke: sticky {s} exchange body was {d} bytes\n", .{ role, response.body_bytes });
+        return error.UnexpectedBody;
+    }
+    // The listener's #175 stamp applies to this leg like any other —
+    // the two response-side mechanisms must coexist on one head.
+    if (!response.edited) {
+        std.debug.print("smoke: sticky {s} response carried no X-Zoxy-Smoke stamp\n", .{role});
+        return error.ResponseEditMissing;
+    }
+    if (expect_tag and response.sticky_tag == null) {
+        std.debug.print("smoke: sticky {s} response announced no tag\n", .{role});
+        return error.StickyStampMissing;
+    }
+    if (!expect_tag and response.sticky_tag != null) {
+        std.debug.print("smoke: sticky {s} response re-announced a tag it must not\n", .{role});
+        return error.StickyStampForged;
     }
 }
 
@@ -925,7 +1067,11 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
         \\    "listeners": [
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http",
+        \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
+        \\          "routes": [
+        \\              {{ "prefix": "/", "cluster": "origin" }},
+        \\              {{ "prefix": "/sticky", "cluster": "sticky" }}
+        \\          ],
         \\          "response_filters": [
         \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
         \\          ] }},
@@ -935,6 +1081,10 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\        "origin": {{
         \\            "endpoints": ["127.0.0.1:{d}"],
         \\            "check": {{ "type": "http", "path": "/health", "timeout_ms": {d} }}
+        \\        }},
+        \\        "sticky": {{
+        \\            "endpoints": ["127.0.0.1:{d}"],
+        \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
         \\        }}
         \\    }},
         \\    "admin": {{ "bind": "127.0.0.1:{d}" }},
@@ -957,6 +1107,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         ports.l4,
         origin_port,
         health_probe_timeout_ms,
+        origin_port,
         ports.admin,
         access_log_path,
         health_interval_ms,
