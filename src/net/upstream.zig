@@ -22,10 +22,10 @@ const idle_none: u32 = std.math.maxInt(u32);
 
 /// The flattened endpoint index space for one loaded config (§7).
 ///
-/// Seven tables are keyed by it — the pool's idle heads and lease
-/// counts, the balancer's cursors-adjacent endpoint hashes, the server's
-/// L4 in-flight charges, and the health checker's mask and two streak
-/// counters. All were fixed 16 × 64 = 1024-entry
+/// Eight tables are keyed by it — the pool's idle heads and lease
+/// counts, the balancer's endpoint hashes and rotation state, the
+/// server's L4 in-flight charges, and the health checker's mask and two
+/// streak counters. All were fixed 16 × 64 = 1024-entry
 /// arrays sized for the worst config any build could accept; they are
 /// now sized for the config this process actually loaded, so a
 /// two-endpoint deployment stops carrying a 1024-entry table.

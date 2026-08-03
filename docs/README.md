@@ -193,12 +193,29 @@ by a compiled ceiling — the startup banner prints what the endpoint tables cos
 
 | `pick` | behavior |
 |---|---|
-| `p2c` *(default)* | two uniform candidates; the one carrying less in-flight work wins — HTTP requests and L4 connections both count |
-| `rr` | strict rotation — predictable spread, useful for cache warming |
-| `hash` | the same client always reaches the same endpoint |
+| `p2c` *(default)* | two weight-biased candidates; the one carrying less in-flight work wins — HTTP requests and L4 connections both count |
+| `rr` | smooth weighted rotation — exact rotation at equal weights, predictable spread, useful for cache warming |
+| `hash` | the same client always reaches the same endpoint, with traffic split by weight |
 
 Upstream connections are pooled process-wide and reusable by any request,
 which is the single largest throughput lever in this design.
+
+#### Weights
+
+An endpoint is a bare `"IP:port"` string — weight 1 — or an object adding
+a relative share, up to 256:
+
+```json
+"endpoints": ["10.0.0.1:8080", { "address": "10.0.0.2:8080", "weight": 3 }]
+```
+
+Every policy honors it: a 16-core box can take four times a 4-core box's
+share, a canary can start at 1-in-20 and move by editing one number, and
+a pool can be drained gradually by shifting weight instead of ejecting
+hosts. A weight of `0` **drains** the endpoint — still health-checked,
+never picked, not even when everything else is ejected — so taking a
+backend out of rotation no longer needs a restart. At least one endpoint
+must hold weight, or the config is rejected.
 
 ### Sticky sessions
 
@@ -537,6 +554,27 @@ the same rendering to stderr, which needs no listener at all.
 The gauges matter as much as the counters: a `shed_*` counter only moves once
 a wall is *hit*, while `zoxy_conn_slots_in_use` against
 `zoxy_conn_slots_capacity` shows the approach.
+
+The scrape also says **which backend**, per cluster and endpoint:
+
+```
+zoxy_endpoint_responses{cluster="api",endpoint="10.0.0.1:8080"} 4182
+zoxy_endpoint_connect_failed{cluster="api",endpoint="10.0.0.2:8080"} 17
+zoxy_endpoint_health_down{cluster="api",endpoint="10.0.0.2:8080"} 2
+zoxy_endpoint_healthy{cluster="api",endpoint="10.0.0.2:8080"} 0
+```
+
+Dial failures, responses served and the health transitions
+(`endpoint_health_down`/`_up`) carry both labels; the "every endpoint
+was full" sheds carry only `cluster` (no single endpoint was full — all
+of them were). Two gauges read live state: `zoxy_endpoint_inflight` is
+the level the balancer compares, and `zoxy_endpoint_healthy` is the
+prober's current verdict, rendered for health-checked clusters only.
+Each labeled family sums to the bare process total it breaks down — an
+identity the simulator asserts on every seed and the smoke gate
+re-derives from a live scrape. Label cardinality is bounded by your
+config — endpoints and cluster names, never request data — and the
+startup banner prices what the labels and their render buffers cost.
 
 ### Access log
 

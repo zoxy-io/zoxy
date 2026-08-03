@@ -216,6 +216,14 @@ pub const Config = struct {
     pub const Cluster = struct {
         name: []const u8,
         endpoints: []const std.Io.net.IpAddress,
+        /// Per-endpoint §7 pick weights, parallel to `endpoints` — or
+        /// null when every endpoint carries the default weight of 1,
+        /// which is what the bare-string config form says and what most
+        /// clusters are, so the loader only materializes the table when
+        /// some weight differs. A weight of `0` drains its endpoint:
+        /// still probed (§7), never picked — the balancer treats it as
+        /// administratively out, so not even fail-open reaches it.
+        weights: ?[]const u16 = null,
         /// The §7 endpoint-pick policy the balancer runs for this
         /// cluster. The JSON field is optional and defaults to `p2c`
         /// (the §7 default), with `rr` kept for strict rotation
@@ -381,6 +389,8 @@ pub const ValidationError = error{
     EndpointsOverLimit,
     EndpointInvalid,
     EndpointPortZero,
+    EndpointWeightOverLimit,
+    EndpointWeightsAllZero,
     TimeoutZero,
     TimeoutOverLimit,
     TimeoutOrderInvalid,
@@ -1030,7 +1040,7 @@ pub const RouteJson = struct {
 };
 
 pub const ClusterJson = struct {
-    endpoints: []const []const u8,
+    endpoints: []const EndpointJson,
     /// Optional §7 pick policy; absent means `p2c` (the design's
     /// trajectory), `rr` opts back into strict rotation.
     pick: []const u8 = "p2c",
@@ -1050,7 +1060,8 @@ pub const ClusterJson = struct {
     pub const schema_doc = "One upstream cluster: its endpoints, pick policy and health checks.";
     pub const schema_fields = .{
         .endpoints = .{
-            .desc = "IP:port endpoint literals (port must be non-zero).",
+            .desc = "Endpoints: IP:port literals (port must be non-zero), each " ++
+                "optionally an object adding a pick weight (#174).",
             .min_items = 1,
         },
         .pick = .{
@@ -1076,6 +1087,80 @@ pub const ClusterJson = struct {
                 "clusters only); absent sends none.",
         },
     };
+};
+
+/// One cluster endpoint (#174): the bare `"IP:port"` string every config
+/// has always written, or an object naming the same literal plus a pick
+/// weight. Both spellings parse to this one shape — a bare string is
+/// weight 1 — so the homogeneous cluster, which is most clusters, keeps
+/// the cheap form and a canary is one endpoint's worth of ceremony.
+pub const EndpointJson = struct {
+    address: []const u8,
+    weight: u32 = 1,
+
+    pub const schema_doc =
+        "One endpoint: an IP:port literal, or an object carrying the " ++
+        "literal and a relative pick weight.";
+    pub const schema_fields = .{
+        .address = .{
+            .desc = "IP:port endpoint literal (port must be non-zero).",
+            .min_length = 1,
+        },
+        .weight = .{
+            .desc = "Relative share of the cluster's traffic under every pick " ++
+                "policy; endpoints default to equal (1). 0 drains the endpoint: " ++
+                "still health-checked, never picked.",
+            .minimum = 0,
+            .maximum = constants.endpoint_weight_max,
+        },
+    };
+
+    /// The object form as a plain struct, so `innerParse` reads it with
+    /// the loader's own strictness (unknown fields rejected) without
+    /// recursing back into `jsonParse` below.
+    const ObjectForm = struct {
+        address: []const u8,
+        weight: u32 = 1,
+    };
+
+    comptime {
+        // The two shapes are one contract: a field added to either and
+        // forgotten on the other would let the schema advertise a key
+        // the parser rejects, or the parser accept one the schema hides.
+        const outer = @typeInfo(EndpointJson).@"struct".fields;
+        const inner = @typeInfo(ObjectForm).@"struct".fields;
+        assert(outer.len == inner.len);
+        for (outer, inner) |a, b| {
+            assert(std.mem.eql(u8, a.name, b.name));
+            assert(a.type == b.type);
+        }
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !EndpointJson {
+        switch (try source.peekNextTokenType()) {
+            .string => {
+                const token = try source.nextAlloc(allocator, .alloc_if_needed);
+                const literal: []const u8 = switch (token) {
+                    .string, .allocated_string => |slice| slice,
+                    // The peek promised a string; anything else is the
+                    // scanner disagreeing with itself.
+                    else => unreachable,
+                };
+                return .{ .address = literal, .weight = 1 };
+            },
+            .object_begin => {
+                const object = try std.json.innerParse(ObjectForm, allocator, source, options);
+                return .{ .address = object.address, .weight = object.weight };
+            },
+            // A number, bool, null, or nested array can never name an
+            // endpoint; reject the token rather than coercing it.
+            else => return error.UnexpectedToken,
+        }
+    }
 };
 
 pub const ClusterProxyProtocolJson = struct {
@@ -1355,7 +1440,7 @@ pub const dto_types = .{
     MatchJson,     HeaderMatchJson,   ActionJson,               HeaderEditJson,
     RewriteJson,   ClusterJson,       TimeoutsJson,             LimitsJson,
     AdminJson,     AccessLogJson,     CheckJson,                ClusterHashJson,
-    ForwardedJson, ProxyProtocolJson, ClusterProxyProtocolJson,
+    ForwardedJson, ProxyProtocolJson, ClusterProxyProtocolJson, EndpointJson,
 };
 
 comptime {
@@ -1381,32 +1466,7 @@ fn resolveClusters(
 
     const count: u16 = @intCast(clusters_json.entries.len);
     const clusters = try arena.alloc(Config.Cluster, count);
-
-    // Duplicate names in O(n log n), by sorting an index permutation and
-    // comparing neighbours. It was a nested scan over the entries, which
-    // the 16-cluster ceiling kept to ~120 compares; with the ceiling gone
-    // that same scan would cost ~2.1e9 string compares on a config at the
-    // index type's edge — minutes of startup for a config whose memory
-    // fits easily. Which name is reported first changes, and nothing
-    // reads it: the error carries no payload.
-    const order = try arena.alloc(u16, count);
-    for (order, 0..) |*slot, index| slot.* = @intCast(index);
-    const ByName = struct {
-        entries: []const ClustersJson.Entry,
-        fn lessThan(ctx: @This(), a: u16, b: u16) bool {
-            return std.mem.lessThan(u8, ctx.entries[a].name, ctx.entries[b].name);
-        }
-    };
-    std.mem.sort(u16, order, ByName{ .entries = clusters_json.entries }, ByName.lessThan);
-    for (order[1..], order[0 .. order.len - 1]) |current, previous| {
-        if (std.mem.eql(
-            u8,
-            clusters_json.entries[current].name,
-            clusters_json.entries[previous].name,
-        )) {
-            return error.ClusterNameDuplicate;
-        }
-    }
+    try rejectDuplicateClusterNames(arena, clusters_json.entries);
 
     for (clusters_json.entries, 0..) |entry, index| {
         // A name is an identifier an operator writes and the access log
@@ -1419,9 +1479,11 @@ fn resolveClusters(
             return error.ClusterNameTooLong;
         }
         const pick = try pickOf(entry.cluster.pick);
+        const endpoints = try resolveEndpoints(arena, entry.cluster.endpoints);
         clusters[index] = .{
             .name = entry.name,
-            .endpoints = try resolveEndpoints(arena, entry.cluster.endpoints),
+            .endpoints = endpoints.addresses,
+            .weights = endpoints.weights,
             .pick = pick,
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
             .hash_key = try hashKeyOf(pick, entry.cluster.hash),
@@ -1433,11 +1495,49 @@ fn resolveClusters(
     return clusters;
 }
 
+/// Duplicate names in O(n log n), by sorting an index permutation and
+/// comparing neighbours. It was a nested scan over the entries, which
+/// the 16-cluster ceiling kept to ~120 compares; with the ceiling gone
+/// that same scan would cost ~2.1e9 string compares on a config at the
+/// index type's edge — minutes of startup for a config whose memory
+/// fits easily. Which name is reported first changes, and nothing
+/// reads it: the error carries no payload.
+fn rejectDuplicateClusterNames(
+    arena: std.mem.Allocator,
+    entries: []const ClustersJson.Entry,
+) ParseError!void {
+    assert(entries.len >= 1);
+    assert(entries.len <= std.math.maxInt(u16));
+    const order = try arena.alloc(u16, entries.len);
+    for (order, 0..) |*slot, index| slot.* = @intCast(index);
+    const ByName = struct {
+        entries: []const ClustersJson.Entry,
+        fn lessThan(ctx: @This(), a: u16, b: u16) bool {
+            return std.mem.lessThan(u8, ctx.entries[a].name, ctx.entries[b].name);
+        }
+    };
+    std.mem.sort(u16, order, ByName{ .entries = entries }, ByName.lessThan);
+    for (order[1..], order[0 .. order.len - 1]) |current, previous| {
+        if (std.mem.eql(u8, entries[current].name, entries[previous].name)) {
+            return error.ClusterNameDuplicate;
+        }
+    }
+}
+
+/// A cluster's resolved endpoint list, in the two parallel halves
+/// `Config.Cluster` stores: the addresses, and the weights — null when
+/// every endpoint carries weight 1, so the unweighted common case
+/// allocates nothing beyond the addresses it always did.
+const ResolvedEndpoints = struct {
+    addresses: []const std.Io.net.IpAddress,
+    weights: ?[]const u16,
+};
+
 fn resolveEndpoints(
     arena: std.mem.Allocator,
-    endpoint_literals: []const []const u8,
-) ParseError![]const std.Io.net.IpAddress {
-    if (endpoint_literals.len == 0) {
+    endpoints_json: []const EndpointJson,
+) ParseError!ResolvedEndpoints {
+    if (endpoints_json.len == 0) {
         return error.EndpointsEmpty;
     }
     // No policy bound: endpoints cost an arena address each and a column
@@ -1446,21 +1546,45 @@ fn resolveEndpoints(
     // `0..n-1`, and the largest of those must stay inside
     // `endpoint_index_max`, which `Conn` asserts sits below its
     // no-endpoint sentinel.
-    if (endpoint_literals.len > @as(usize, constants.endpoint_index_max) + 1) {
+    if (endpoints_json.len > @as(usize, constants.endpoint_index_max) + 1) {
         return error.EndpointsOverLimit;
     }
 
-    const endpoints = try arena.alloc(std.Io.net.IpAddress, endpoint_literals.len);
-    for (endpoint_literals, endpoints) |literal, *endpoint| {
-        endpoint.* = std.Io.net.IpAddress.parseLiteral(literal) catch {
+    const addresses = try arena.alloc(std.Io.net.IpAddress, endpoints_json.len);
+    var weighted = false;
+    var weight_sum: u64 = 0;
+    for (endpoints_json, addresses) |entry, *address| {
+        address.* = std.Io.net.IpAddress.parseLiteral(entry.address) catch {
             return error.EndpointInvalid;
         };
-        if (endpoint.getPort() == 0) {
+        if (address.getPort() == 0) {
             return error.EndpointPortZero;
         }
+        if (entry.weight > constants.endpoint_weight_max) {
+            return error.EndpointWeightOverLimit;
+        }
+        weighted = weighted or entry.weight != 1;
+        weight_sum += entry.weight;
     }
-    assert(endpoints.len == endpoint_literals.len);
-    return endpoints;
+    if (weight_sum == 0) {
+        // Every endpoint at weight 0 is a cluster drained to nowhere.
+        // Unlike an all-ejected cluster this does not fail open — a
+        // drain is a statement, not a verdict — so the config is
+        // rejected like an empty endpoint list rather than accepted as
+        // one that can never answer.
+        return error.EndpointWeightsAllZero;
+    }
+    assert(addresses.len == endpoints_json.len);
+    if (!weighted) {
+        return .{ .addresses = addresses, .weights = null };
+    }
+    const weights = try arena.alloc(u16, endpoints_json.len);
+    for (endpoints_json, weights) |entry, *weight| {
+        assert(entry.weight <= constants.endpoint_weight_max);
+        weight.* = @intCast(entry.weight);
+    }
+    assert(weights.len == addresses.len);
+    return .{ .addresses = addresses, .weights = weights };
 }
 
 fn resolveListeners(
@@ -2227,6 +2351,10 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
     try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].getPort());
+    // The example carries both endpoint spellings (#174): a bare literal
+    // at weight 1 beside a weighted object.
+    try std.testing.expectEqual(@as(u16, 9001), parsed.clusters[0].endpoints[1].getPort());
+    try std.testing.expectEqualSlices(u16, &.{ 1, 3 }, parsed.clusters[0].weights.?);
     // The example's tcp check resolves with its thresholds, and its
     // omitted budget inherits the connect timeout.
     const example_check = parsed.clusters[0].check.?;
@@ -3206,6 +3334,97 @@ test "config: references and addresses are validated" {
     );
 }
 
+test "config: endpoint weights parse in both spellings" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["10.0.0.1:8080",
+        \\   {"address":"10.0.0.2:8080","weight":3},
+        \\   {"address":"10.0.0.3:8080"},
+        \\   {"address":"10.0.0.4:8080","weight":0}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const cluster = parsed.clusters[0];
+    // The two spellings resolve to one shape: a bare string and an
+    // object with no weight are both weight 1, and zero — the drain
+    // spelling — is carried, not rejected, while a sibling holds weight.
+    try std.testing.expectEqual(@as(usize, 4), cluster.endpoints.len);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 3, 1, 0 }, cluster.weights.?);
+    try std.testing.expectEqual(@as(u16, 8080), cluster.endpoints[1].getPort());
+}
+
+test "config: unweighted endpoints leave the weights table null" {
+    // The bare form and an object spelling the default out loud say the
+    // same thing, so neither materializes a table: null is the loader's
+    // statement that every endpoint shares alike, and the balancer's
+    // license to skip weighted arithmetic for the common case.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2",
+        \\   {"address":"127.0.0.1:3","weight":1}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try std.testing.expect(parsed.clusters[0].weights == null);
+}
+
+test "config: the weight ceiling itself is a legal share" {
+    // The bound is inclusive — `endpoint_weight_max` parses, one past it
+    // is the error — matching the at-limit convention the name-length
+    // bound establishes below.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weight":256}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try std.testing.expectEqual(constants.endpoint_weight_max, parsed.clusters[0].weights.?[0]);
+}
+
+test "config: endpoint weight validation has its own errors" {
+    try expectParseError(error.EndpointWeightOverLimit,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weight":257}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // Every weight zero is a cluster drained to nowhere — rejected like
+    // an empty endpoint list, not accepted as one that can never answer.
+    try expectParseError(error.EndpointWeightsAllZero,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weight":0},
+        \\   {"address":"127.0.0.1:3","weight":0}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // The object form validates its address exactly like the bare one.
+    try expectParseError(error.EndpointInvalid,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"origin.internal:80","weight":2}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try expectParseError(error.EndpointPortZero,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:0","weight":2}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // Strictness reaches inside the object form: a typo'd key is an
+    // unknown field, not a silently-dropped weight.
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weigth":2}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // An endpoint is a string or an object; any other token is refused
+    // rather than coerced.
+    try expectParseError(error.UnexpectedToken,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":[42]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+}
+
 test "config: every emptiness and limit has its own error" {
     try expectParseError(error.ListenersEmpty,
         \\{"listeners":[],
@@ -3295,7 +3514,8 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 const fuzz_seed_json =
     \\{"listeners":[{"bind":"127.0.0.1:8080","routes":[{"prefix":"/","cluster":"o"}],
     \\ "protocol":"http"}],
-    \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000"],"pick":"p2c","max_inflight":8,
+    \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
+    \\ {"address":"127.0.0.1:9001","weight":3}],"pick":"p2c","max_inflight":8,
     \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}}},
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
@@ -3305,7 +3525,9 @@ const fuzz_seed_json =
 ;
 // The `file` arm here, `stdout` in `example_json` beside it: between the
 // two corpus entries the mutator sees every sink spelling, including the
-// `path` key only one of them may carry.
+// `path` key only one of them may carry — and both endpoint spellings
+// (#174), so the `{address, weight}` grammar is a starting point rather
+// than a shape the mutator must blindly discover.
 
 test "config: the fuzz seed carrying every block parses" {
     // It is a corpus entry, so it has to be a *valid* config — an
@@ -3316,6 +3538,7 @@ test "config: the fuzz seed carrying every block parses" {
     const parsed = try expectParseOk(&arena_state, fuzz_seed_json);
     try std.testing.expectEqual(@as(u32, 10000), parsed.drain_deadline_ms);
     try std.testing.expectEqual(@as(u32, 30000), parsed.request_timeout_ms);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 3 }, parsed.clusters[0].weights.?);
 }
 
 test "fuzz: parse never panics — parse or reject, no third outcome" {

@@ -2,13 +2,24 @@
 //! kept behind a seam so the serving path never hardcodes *how* an
 //! endpoint is chosen — it only asks "which endpoint for this cluster?".
 //! Three policies, selected per cluster in the config (§5 parse-once):
-//! `rr` rotates a per-cluster cursor, `p2c` draws two distinct candidates
-//! uniformly and leases the calmer one, `hash` sends a given client to a
-//! given endpoint every time. P2C's load is the per-endpoint in-flight
-//! total across both protocols — the pool's L7 leases plus the server's
-//! live L4 connections — passed in by the caller as a view: the balancer
-//! owns the draw, the pool and the server own the truth. A single-endpoint
-//! cluster short-circuits every policy without touching its state.
+//! `rr` runs a smooth weighted rotation, `p2c` draws two distinct
+//! weight-biased candidates and leases the calmer one, `hash` sends a
+//! given client to a given endpoint every time. P2C's load is the
+//! per-endpoint in-flight total across both protocols — the pool's L7
+//! leases plus the server's live L4 connections — passed in by the caller
+//! as a view: the balancer owns the draw, the pool and the server own the
+//! truth. A single-endpoint cluster short-circuits every policy without
+//! touching its state.
+//!
+//! **Weights (#174).** Every policy honors `Config.Cluster.weights` —
+//! null means every endpoint at 1, and each unit-weight path below is
+//! *bit-identical* to the unweighted algorithm it grew from, so existing
+//! clusters keep their draws, their rotations and their client-to-endpoint
+//! mappings. A weight of 0 drains its endpoint: it never enters the
+//! eligible set, not even through fail-open — a drain is an operator's
+//! statement, where an ejection is only a probe's verdict — while the
+//! prober keeps probing it, so a drained endpoint's recovery is still
+//! observed (§7).
 //!
 //! **Why `hash` is stateless, and why that is not merely a simplification.**
 //! Stickiness is usually a *table*: HAProxy records client → server as
@@ -34,13 +45,18 @@
 //! it scans the eligible set the health mask already produced. It costs
 //! O(n) instead of O(log n), which is why a cluster's endpoint count is a
 //! cost the operator chooses: measured at 71 ns per pick at 64 endpoints,
-//! against a request this proxy serves in ~100 µs. Jump consistent hash is
-//! excluded outright: it can only add or remove the *last* bucket, and an
-//! ejection removes an arbitrary one.
+//! against a request this proxy serves in ~100 µs. Weights scale that
+//! same dial — a weighted pick scores one hash per weight point (§7,
+//! `score`), so the scan is O(sum of weights), bounded per endpoint by
+//! `endpoint_weight_max` and, like the endpoint count, priced by the
+//! operator's own config. Jump consistent hash is excluded outright: it
+//! can only add or remove the *last* bucket, and an ejection removes an
+//! arbitrary one.
 
 const std = @import("std");
 
 const config_module = @import("config.zig");
+const constants = @import("constants.zig");
 const upstream = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -107,13 +123,44 @@ fn endpointId(address: *const std.Io.net.IpAddress) u64 {
     };
 }
 
+/// One endpoint's §7 pick weight: the configured table's entry, or 1 —
+/// the `Config.Cluster.weights` contract, read through one helper so
+/// "null means unit weights" is spelled exactly once.
+fn weightOf(cluster: *const config_module.Config.Cluster, endpoint_index: u16) u16 {
+    assert(endpoint_index < cluster.endpoints.len);
+    const weights = cluster.weights orelse return 1;
+    assert(weights.len == cluster.endpoints.len);
+    return weights[endpoint_index];
+}
+
+/// The weight sum over the eligible set — one weighted draw's modulus.
+/// u32 room to spare: 65535 endpoints at weight 256 stays under 2²⁵.
+fn totalWeight(cluster: *const config_module.Config.Cluster, eligible: []const u16) u32 {
+    assert(eligible.len >= 1);
+    var total: u32 = 0;
+    for (eligible) |endpoint_index| {
+        total += weightOf(cluster, endpoint_index);
+    }
+    // Every eligible endpoint weighs at least 1 — weight 0 never enters
+    // the set — so the total covers the set.
+    assert(total >= eligible.len);
+    return total;
+}
+
 pub const Balancer = struct {
     config: *const config_module.Config,
-    /// Per-cluster round-robin cursors, used by `.rr` clusters only.
-    /// u64 so a cursor never wraps in any realistic process lifetime — a
-    /// u16 wrap reset the rotation phase and double-picked one endpoint
-    /// for non-power-of-two cluster sizes. One per configured cluster.
-    cursors: []u64,
+    /// Per-endpoint smooth-WRR running totals, used by `.rr` clusters
+    /// only (§7, #174). Replaced the per-cluster cursor when weights
+    /// arrived, because a weighted rotation is a property of each
+    /// endpoint's credit rather than of one shared position: a pick
+    /// raises every eligible endpoint's entry by its weight, takes the
+    /// largest, and the winner repays the round's whole sum — nginx's
+    /// smooth algorithm, so weight 3 is `a,a,b,a` and never three
+    /// consecutive hits. At unit weights the schedule it produces is
+    /// exactly the strict rotation the cursor produced. i64 because
+    /// totals dip negative by design (the winner pays the round), with
+    /// magnitude bounded by one cluster's weight sum.
+    rr_current: []i64,
     /// xorshift64* draw state, used by `.p2c` clusters only. Seeded from
     /// a fixed named constant, never the clock: the simulator replays
     /// every seed twice and demands byte-identical traces (§9), and load
@@ -159,10 +206,10 @@ pub const Balancer = struct {
         assert(keys.count == @as(u32, @intCast(config.clusters.len)) * keys.stride);
         balancer.config = config;
         balancer.keys = keys;
-        balancer.cursors = try arena.alloc(u64, config.clusters.len);
+        balancer.rr_current = try arena.alloc(i64, keys.count);
         balancer.endpoint_hashes = try arena.alloc(u64, keys.count);
         balancer.eligible_scratch = try arena.alloc(u16, keys.stride);
-        @memset(balancer.cursors, 0);
+        @memset(balancer.rr_current, 0);
         balancer.pick_state = pick_seed;
         assert(balancer.pick_state != 0); // xorshift64* cycles on nonzero state.
         // Every key, not only the configured ones: a ragged config leaves
@@ -170,18 +217,30 @@ pub const Balancer = struct {
         // the whole table keeps "what did init leave here" a question with
         // one answer.
         @memset(balancer.endpoint_hashes, 0);
-        for (config.clusters, 0..) |cluster, cluster_index| {
+        for (config.clusters, 0..) |*cluster, cluster_index| {
             // Re-checked here rather than trusted from the loader, the
             // same defense `pick` and `eligibleEndpoints` keep: this loop
             // indexes a table sized by that stride.
             assert(cluster.endpoints.len >= 1);
             assert(cluster.endpoints.len <= keys.stride);
+            // The #174 weights contract: parallel to the endpoints, and
+            // at least one endpoint routable. The loader rejects both
+            // breaches (`EndpointWeightsAllZero`); a config built by
+            // hand — tests, the simulator — re-proves them here, since
+            // an all-drained cluster would fail `eligibleEndpoints`'s
+            // count assertion on its first pick instead of at startup.
+            var weight_sum: u32 = 0;
             for (cluster.endpoints, 0..) |*address, endpoint_index| {
                 const key = keys.key(@intCast(cluster_index), @intCast(endpoint_index));
                 balancer.endpoint_hashes[key] = endpointId(address);
+                weight_sum += weightOf(cluster, @intCast(endpoint_index));
+            }
+            assert(weight_sum >= 1);
+            if (cluster.weights) |weights| {
+                assert(weights.len == cluster.endpoints.len);
             }
         }
-        assert(balancer.cursors.len == config.clusters.len);
+        assert(balancer.rr_current.len == keys.count);
         assert(balancer.endpoint_hashes.len == keys.count);
     }
 
@@ -240,13 +299,20 @@ pub const Balancer = struct {
         };
     }
 
-    /// The endpoints a pick may choose between, in two passes.
+    /// The endpoints a pick may choose between, in three passes.
     ///
-    /// First §7 health: the healthy ones — or, the fail-open rule, every
-    /// endpoint when the whole cluster is ejected. Dialing a maybe-dead
-    /// endpoint reports the outage the way it always did; routing
-    /// nowhere would turn a probe verdict into an outage of its own, and
-    /// a same-port TCP probe cannot know better than the dial.
+    /// First the #174 drain: a weight-0 endpoint never enters the set.
+    /// Unlike the health mask this is not a verdict to fail open past —
+    /// it is the operator saying *stop sending here*, and the whole
+    /// point of the spelling is that it holds while everything else
+    /// flaps.
+    ///
+    /// Then §7 health over the routable set: the healthy ones — or, the
+    /// fail-open rule, every routable endpoint when all of them are
+    /// ejected. Dialing a maybe-dead endpoint reports the outage the way
+    /// it always did; routing nowhere would turn a probe verdict into an
+    /// outage of its own, and a same-port TCP probe cannot know better
+    /// than the dial.
     ///
     /// Then §8 capacity, over whatever survived: an endpoint already
     /// carrying its `max_inflight` is dropped. This pass **may return
@@ -267,6 +333,7 @@ pub const Balancer = struct {
         var count: u16 = 0;
         for (0..cluster.endpoints.len) |endpoint_index| {
             const index: u16 = @intCast(endpoint_index);
+            if (weightOf(cluster, index) == 0) continue;
             if (healthy[keys.key(cluster_index, index)]) {
                 eligible[count] = index;
                 count += 1;
@@ -274,10 +341,15 @@ pub const Balancer = struct {
         }
         if (count == 0) {
             for (0..cluster.endpoints.len) |endpoint_index| {
-                eligible[endpoint_index] = @intCast(endpoint_index);
+                const index: u16 = @intCast(endpoint_index);
+                if (weightOf(cluster, index) == 0) continue;
+                eligible[count] = index;
+                count += 1;
             }
-            count = @intCast(cluster.endpoints.len);
         }
+        // At least one endpoint holds weight — the loader rejects an
+        // all-zero cluster and `init` re-proves it — so the drain filter
+        // alone can never empty the set.
         assert(count >= 1);
         if (cluster.max_inflight) |cap| {
             assert(cap >= 1);
@@ -294,45 +366,79 @@ pub const Balancer = struct {
         return count;
     }
 
-    /// Strict rotation over the eligible set: the cursor modulo its
-    /// size, then incremented — every eligible endpoint sees its share,
-    /// in order. Ejections shift the rotation phase; the share stays
-    /// exact for whatever set is eligible at each pick.
+    /// Smooth weighted rotation over the eligible set (nginx's SWRR):
+    /// every eligible endpoint's running total rises by its weight, the
+    /// largest total wins — a tie keeps the lowest index — and the
+    /// winner repays the round's whole weight sum. "Smooth" is the
+    /// property the issue asks for by name: weight 3 beside weight 1
+    /// serves a,a,b,a, never three consecutive hits, because the winner
+    /// goes to the back of the queue by exactly what the round was
+    /// worth. At unit weights the schedule is strict rotation, in order.
+    /// State survives eligibility changes: an ejected endpoint's total
+    /// freezes, so a flap neither owes it rounds nor forgives them.
     fn pickRoundRobin(
         balancer: *Balancer,
         cluster_index: u16,
         eligible: []const u16,
     ) u16 {
-        assert(balancer.config.clusters[cluster_index].pick == .rr);
+        const cluster = &balancer.config.clusters[cluster_index];
+        assert(cluster.pick == .rr);
         assert(eligible.len >= 1);
-        const slot: u16 = @intCast(balancer.cursors[cluster_index] % eligible.len);
-        balancer.cursors[cluster_index] += 1;
-        assert(slot < eligible.len);
-        return eligible[slot];
+        var round_total: i64 = 0;
+        var best_slot: usize = 0;
+        var best_current: i64 = std.math.minInt(i64);
+        for (eligible, 0..) |endpoint_index, slot| {
+            const key = balancer.keys.key(cluster_index, endpoint_index);
+            const weight: i64 = weightOf(cluster, endpoint_index);
+            assert(weight >= 1); // weight 0 never enters the eligible set
+            balancer.rr_current[key] += weight;
+            round_total += weight;
+            if (balancer.rr_current[key] > best_current) {
+                best_current = balancer.rr_current[key];
+                best_slot = slot;
+            }
+        }
+        assert(round_total >= @as(i64, @intCast(eligible.len)));
+        const chosen = eligible[best_slot];
+        balancer.rr_current[balancer.keys.key(cluster_index, chosen)] -= round_total;
+        return chosen;
     }
 
-    /// P2C over the eligible set: two distinct uniform candidates, the
-    /// lower in-flight total wins, a tie goes to the first. A mask narrowed
-    /// to one endpoint skips the draw the way a one-endpoint cluster
-    /// does — no candidates to compare, no PRNG state spent.
+    /// P2C over the eligible set: two distinct candidates drawn with
+    /// probability proportional to weight (#174) — a heavier endpoint is
+    /// likelier to be *considered*; the in-flight comparison that decides
+    /// the winner is untouched, so load still outranks share. A tie goes
+    /// to the first. At unit weights both draws are bit-identical to the
+    /// uniform ones this grew from — the same PRNG values land on the
+    /// same slots — so an unweighted cluster's §9 traces are unchanged.
+    /// A mask narrowed to one endpoint skips the draw the way a
+    /// one-endpoint cluster does — no candidates to compare, no PRNG
+    /// state spent.
     fn pickPowerOfTwo(
         balancer: *Balancer,
         cluster_index: u16,
         eligible: []const u16,
         load: *const upstream.Load,
     ) u16 {
-        assert(balancer.config.clusters[cluster_index].pick == .p2c);
+        const cluster = &balancer.config.clusters[cluster_index];
+        assert(cluster.pick == .p2c);
         assert(eligible.len >= 1);
         if (eligible.len == 1) {
             return eligible[0];
         }
-        const first_slot: u16 = @intCast(balancer.next() % eligible.len);
-        var second_slot: u16 = @intCast(balancer.next() % (eligible.len - 1));
-        // Skip past `first_slot`, mapping the (n-1)-range draw onto the
-        // other n-1 eligible slots uniformly.
-        if (second_slot >= first_slot) {
-            second_slot += 1;
-        }
+        const total = totalWeight(cluster, eligible);
+        const first_slot = weightedSlot(cluster, eligible, balancer.next() % total, null);
+        // The second draw runs over the weight that remains once the
+        // first candidate steps out, mapping onto the other n-1 slots —
+        // still proportional, and never a duplicate.
+        const remaining = total - weightOf(cluster, eligible[first_slot]);
+        assert(remaining >= 1); // n >= 2 eligible, each weighing >= 1
+        const second_slot = weightedSlot(
+            cluster,
+            eligible,
+            balancer.next() % remaining,
+            first_slot,
+        );
         assert(first_slot != second_slot);
         assert(second_slot < eligible.len);
         const first = eligible[first_slot];
@@ -344,6 +450,36 @@ pub const Balancer = struct {
         const first_load = load.inFlight(balancer.keys.key(cluster_index, first));
         const second_load = load.inFlight(balancer.keys.key(cluster_index, second));
         return if (second_load < first_load) second else first;
+    }
+
+    /// The eligible slot a cumulative-weight draw lands on, skipping
+    /// `exclude` — one weighted candidacy (#174). `draw` must sit below
+    /// the participating weight total, and every participant weighs at
+    /// least 1, so the walk always lands; at unit weights slot k is
+    /// exactly draw k (with the post-exclude slots shifted by one), which
+    /// is the uniform mapping the unweighted draw used.
+    fn weightedSlot(
+        cluster: *const config_module.Config.Cluster,
+        eligible: []const u16,
+        draw: u64,
+        exclude: ?u16,
+    ) u16 {
+        assert(eligible.len >= 1);
+        var remaining = draw;
+        for (eligible, 0..) |endpoint_index, slot| {
+            if (exclude) |excluded| {
+                if (excluded == slot) continue;
+            }
+            const weight = weightOf(cluster, endpoint_index);
+            assert(weight >= 1);
+            if (remaining < weight) {
+                return @intCast(slot);
+            }
+            remaining -= weight;
+        }
+        // The caller drew modulo the participating total, so the walk
+        // cannot run off the end.
+        unreachable;
     }
 
     /// Rendezvous hashing (§7): score every eligible endpoint against the
@@ -405,12 +541,34 @@ pub const Balancer = struct {
         // zeroed slot — a real endpoint losing to one that does not exist.
         assert(cluster_index < balancer.config.clusters.len);
         assert(endpoint_index < balancer.config.clusters[cluster_index].endpoints.len);
+        const cluster = &balancer.config.clusters[cluster_index];
         const endpoint_hash =
             balancer.endpoint_hashes[balancer.keys.key(cluster_index, endpoint_index)];
-        // Both operands are already avalanched, so the xor combines them
-        // without structure and the final mix restores it to a uniform
-        // 64-bit score.
-        return mix64(key ^ endpoint_hash);
+        // Weighted rendezvous by replication (#174): the endpoint's score
+        // is the best of `weight` independent scores, one per replica, so
+        // it holds the argmax for exactly weight/total of the key space —
+        // proportional by construction, integer-only, and pinned like the
+        // rest of the mapping (no float log whose libm could re-home the
+        // fleet across builds). Replica 0 mixes in `mix64(0) == 0`, so a
+        // weight-1 endpoint's score is byte-identical to the unweighted
+        // form and existing clusters keep their client mappings. The scan
+        // is bounded by `endpoint_weight_max` per endpoint; like the O(n)
+        // eligible walk, its cost is chosen by the operator's own config.
+        //
+        // Both xor operands are already avalanched, so each combine is
+        // structureless and the final mix restores uniformity.
+        const weight = weightOf(cluster, endpoint_index);
+        assert(weight >= 1); // weight 0 never enters the eligible set
+        assert(weight <= constants.endpoint_weight_max);
+        var best: u64 = 0;
+        var replica: u32 = 0;
+        while (replica < weight) : (replica += 1) {
+            const candidate = mix64(key ^ endpoint_hash ^ mix64(replica));
+            if (candidate > best) {
+                best = candidate;
+            }
+        }
+        return best;
     }
 
     /// xorshift64* (Vigna): the full-period 64-bit shift generator with a
@@ -644,6 +802,139 @@ test "balancer: rr rotates over the healthy endpoints only" {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client).?;
         try std.testing.expectEqual(want_index, picked.endpoint_index);
     }
+}
+
+test "balancer: rr honors weights, and the schedule is smooth" {
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const weights = [_]u16{ 2, 1 };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "canary", .endpoints = &pair, .pick = .rr, .weights = &weights },
+    };
+    const config = testConfig(&clusters);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    // Two shares for endpoint 0, one for endpoint 1 — and the heavier
+    // endpoint's hits are spread through the cycle (0,1,0), not bunched
+    // (0,0,1): the "smooth" in smooth WRR, which is what keeps a weight-3
+    // backend from taking three consecutive requests as one burst.
+    const counts = [_]u16{0} ** test_counts_len;
+    const expected = [_]u16{ 0, 1, 0, 0, 1, 0 };
+    for (expected) |want_index| {
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        try std.testing.expectEqual(want_index, picked.endpoint_index);
+    }
+}
+
+test "balancer: rr weight zero drains an endpoint, past fail-open" {
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
+    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const weights = [_]u16{ 1, 0, 1 };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "draining", .endpoints = &trio, .pick = .rr, .weights = &weights },
+    };
+    const config = testConfig(&clusters);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    // The drained endpoint never rotates in: the survivors alternate as
+    // if the cluster had two endpoints.
+    const counts = [_]u16{0} ** test_counts_len;
+    const expected = [_]u16{ 0, 2, 0, 2 };
+    for (expected) |want_index| {
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        try std.testing.expectEqual(want_index, picked.endpoint_index);
+    }
+    // Fail-open re-admits the ejected, never the drained: a weight of 0
+    // is the operator's statement, not a probe's verdict, so even a
+    // fully-ejected cluster keeps routing around it.
+    const none_healthy = [_]bool{false} ** test_keys.count;
+    var round: u32 = 0;
+    while (round < 20) : (round += 1) {
+        const picked = balancer.pick(0, &testLoad(&counts), &none_healthy, &test_client).?;
+        try std.testing.expect(picked.endpoint_index != 1);
+    }
+}
+
+test "balancer: p2c candidacy follows weight" {
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
+    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const weights = [_]u16{ 8, 1, 1 };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "weighted", .endpoints = &trio, .pick = .p2c, .weights = &weights },
+    };
+    const config = testConfig(&clusters);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    // Under equal load the tie rule keeps the first candidate, so the
+    // pick distribution is the candidacy distribution — and candidacy is
+    // the weighted draw. The 8-weight endpoint must dominate, and the
+    // 1-weight endpoints must still appear: bias, not exclusion.
+    const counts = [_]u16{0} ** test_counts_len;
+    var hits = [_]u32{0} ** 3;
+    var round: u32 = 0;
+    while (round < 400) : (round += 1) {
+        const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?;
+        hits[picked.endpoint_index] += 1;
+    }
+    try std.testing.expect(hits[0] > hits[1] + hits[2]);
+    try std.testing.expect(hits[1] >= 1);
+    try std.testing.expect(hits[2] >= 1);
+}
+
+test "balancer: p2c at unit weights draws exactly as the unweighted form" {
+    // An explicit all-ones table and no table at all must be the same
+    // policy, draw for draw: the weighted path's unit case is the
+    // uniform draw this grew from, which is what keeps unweighted §9
+    // traces byte-stable across the change.
+    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
+    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
+    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const unit_weights = [_]u16{ 1, 1, 1 };
+    const bare_clusters = [_]config_module.Config.Cluster{
+        .{ .name = "bare", .endpoints = &trio, .pick = .p2c },
+    };
+    const spelled_clusters = [_]config_module.Config.Cluster{
+        .{ .name = "spelled", .endpoints = &trio, .pick = .p2c, .weights = &unit_weights },
+    };
+    const bare_config = testConfig(&bare_clusters);
+    const spelled_config = testConfig(&spelled_clusters);
+
+    var bare_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer bare_arena.deinit();
+    var bare: Balancer = undefined;
+    try bare.init(bare_arena.allocator(), &bare_config, testKeysFor(&bare_config));
+    var spelled_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer spelled_arena.deinit();
+    var spelled: Balancer = undefined;
+    try spelled.init(spelled_arena.allocator(), &spelled_config, testKeysFor(&spelled_config));
+
+    const counts = [_]u16{0} ** test_counts_len;
+    var round: u32 = 0;
+    while (round < 100) : (round += 1) {
+        try std.testing.expectEqual(
+            bare.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?.endpoint_index,
+            spelled.pick(0, &testLoad(&counts), &test_healthy_all, &test_client).?.endpoint_index,
+        );
+    }
+    try std.testing.expectEqual(bare.pick_state, spelled.pick_state);
 }
 
 test "balancer: p2c never picks an ejected endpoint" {
@@ -921,6 +1212,126 @@ fn countOf(picks: []const u16, wanted: u16) u32 {
         if (pick_index == wanted) total += 1;
     }
     return total;
+}
+
+test "balancer: hash spreads clients in proportion to weight" {
+    const endpoints = testHashEndpoints(2);
+    const weights = [_]u16{ 3, 1 };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash, .weights = &weights },
+    };
+    const config = testConfig(&clusters);
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
+
+    // Replica-max scoring holds the argmax for weight/total of the key
+    // space, so a 3:1 pair splits clients ~3:1 — not the ~3.4:1 that
+    // naive score *scaling* gives, which is why the replicas exist.
+    const counts = [_]u16{0} ** test_counts_len;
+    const clients: u16 = 4000;
+    var hits = [_]u32{0} ** 2;
+    var index: u16 = 0;
+    while (index < clients) : (index += 1) {
+        hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index)).?.endpoint_index] += 1;
+    }
+    const expected_heavy = clients * 3 / 4;
+    try std.testing.expect(hits[0] > expected_heavy - 400);
+    try std.testing.expect(hits[0] < expected_heavy + 400);
+    try std.testing.expectEqual(clients, hits[0] + hits[1]);
+}
+
+test "balancer: re-weighting an endpoint disrupts only the clients it gains" {
+    // The #174 issue's open question, answered: the disruption property
+    // survives weighting. Raising one endpoint's weight adds replicas to
+    // its score and touches nobody else's, so the only clients who move
+    // are the ones the new replicas now win — every move lands on the
+    // re-weighted endpoint, and every other assignment is untouched.
+    const endpoints = testHashEndpoints(8);
+    const flat_clusters = [_]config_module.Config.Cluster{
+        .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
+    };
+    var weights = [_]u16{1} ** 8;
+    weights[3] = 2;
+    const weighted_clusters = [_]config_module.Config.Cluster{
+        .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash, .weights = &weights },
+    };
+    const flat_config = testConfig(&flat_clusters);
+    const weighted_config = testConfig(&weighted_clusters);
+
+    var flat_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer flat_arena.deinit();
+    var flat: Balancer = undefined;
+    try flat.init(flat_arena.allocator(), &flat_config, testKeysFor(&flat_config));
+    var weighted_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer weighted_arena.deinit();
+    var weighted: Balancer = undefined;
+    try weighted.init(weighted_arena.allocator(), &weighted_config, testKeysFor(&weighted_config));
+
+    const counts = [_]u16{0} ** test_counts_len;
+    const clients: u16 = 4000;
+    var moved: u32 = 0;
+    var index: u16 = 0;
+    while (index < clients) : (index += 1) {
+        const client = testClientAt(index);
+        const before = flat.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index;
+        const after = weighted.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index;
+        if (after != before) {
+            try std.testing.expectEqual(@as(u16, 3), after);
+            moved += 1;
+        }
+    }
+    // The gained share is 2/9 - 1/8 ≈ 9.7% of clients: real movement,
+    // nowhere near a reshuffle.
+    try std.testing.expect(moved > 0);
+    try std.testing.expect(moved < clients / 4);
+}
+
+test "balancer: hash weight zero drains an endpoint, past fail-open" {
+    const endpoints = testHashEndpoints(8);
+    const flat_clusters = [_]config_module.Config.Cluster{
+        .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
+    };
+    var weights = [_]u16{1} ** 8;
+    weights[3] = 0;
+    const drained_clusters = [_]config_module.Config.Cluster{
+        .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash, .weights = &weights },
+    };
+    const flat_config = testConfig(&flat_clusters);
+    const drained_config = testConfig(&drained_clusters);
+
+    var flat_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer flat_arena.deinit();
+    var flat: Balancer = undefined;
+    try flat.init(flat_arena.allocator(), &flat_config, testKeysFor(&flat_config));
+    var drained_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer drained_arena.deinit();
+    var drained: Balancer = undefined;
+    try drained.init(drained_arena.allocator(), &drained_config, testKeysFor(&drained_config));
+
+    // Draining by weight is the ejection disruption, chosen: only the
+    // drained endpoint's clients move, and the mapping is what the
+    // healthy-mask ejection of the same endpoint produces — the next
+    // replica down the same preference order.
+    const counts = [_]u16{0} ** test_counts_len;
+    const none_healthy = [_]bool{false} ** test_keys.count;
+    var ejected_mask = test_healthy_all;
+    ejected_mask[test_keys.key(0, 3)] = false;
+    var index: u16 = 0;
+    while (index < 500) : (index += 1) {
+        const client = testClientAt(index);
+        const after = drained.pick(0, &testLoad(&counts), &test_healthy_all, &client).?.endpoint_index;
+        try std.testing.expect(after != 3);
+        try std.testing.expectEqual(
+            flat.pick(0, &testLoad(&counts), &ejected_mask, &client).?.endpoint_index,
+            after,
+        );
+        // Fail-open re-admits the ejected, never the drained.
+        try std.testing.expect(
+            drained.pick(0, &testLoad(&counts), &none_healthy, &client).?.endpoint_index != 3,
+        );
+    }
 }
 
 test "balancer: two processes agree, and so do a config's reorderings" {

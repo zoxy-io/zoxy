@@ -6,7 +6,10 @@
 
 const std = @import("std");
 
+const config_module = @import("config.zig");
+const constants = @import("constants.zig");
 const io_module = @import("io/io.zig");
+const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
 
@@ -452,16 +455,6 @@ pub const Counters = struct {
         return buffer[0..cursor];
     }
 
-    /// Phase 0 exposure (§8): SIGUSR1 dumps the Prometheus rendering to
-    /// stderr through the signal seam. Shares `render` so the dump and the
-    /// scrape endpoint never disagree on the wire format.
-    pub fn dump(counters: *const Counters, gauges: *const Gauges) void {
-        var buffer: [render_bytes_max]u8 = undefined;
-        const text = counters.render(gauges, &buffer);
-        assert(text.len <= buffer.len);
-        std.debug.print("{s}", .{text});
-    }
-
     /// The §9 invariant: admitted work is completed or still active, and
     /// every accepted connection was admitted or shed — no third outcome.
     /// The prefix that makes a counter part of the gate identity below.
@@ -582,6 +575,519 @@ pub const Counters = struct {
         const flow_holds = admitted == completed + active_count;
         const gate_holds = accepted == admitted + shed;
         return flow_holds and gate_holds;
+    }
+};
+
+/// The per-cluster and per-endpoint breakdown of the exposition (§8,
+/// #179): which backend, not only how many. Same single-writer
+/// relaxed-atomic discipline as `Counters`, in tables sized by the loaded
+/// config's endpoint index space (`EndpointKeys`) rather than by a field
+/// list — the first counter tables among the §7 endpoint-keyed state.
+///
+/// Each labeled family **partitions** one process total above, the
+/// kernel-pressure op/cause precedent: the bare counter stays the total a
+/// dashboard already reads, the labeled series say *where*, and
+/// `reconciles` holds the two views equal so neither can drift — a
+/// witness that moves one side without the other is a bug the simulator
+/// trips on every seed, not a state.
+///
+/// Label cardinality is bounded by config, and that property is what
+/// makes labelling safe at all: there is no user-controlled dimension —
+/// no per-path, no per-status — and there must never be one. The label
+/// strings are prebuilt here at init, so a scrape renders them with the
+/// same zero-allocation discipline as everything else (§5).
+pub const Labeled = struct {
+    keys: upstream_module.EndpointKeys,
+    /// Rendered `{cluster="…",endpoint="…"}` per key — empty at the
+    /// ragged holes between clusters, which no render row ever reads.
+    /// Cluster names are escaped (an operator identifier may hold any
+    /// byte); the endpoint half is an address literal and cannot need it.
+    endpoint_labels: [][]const u8,
+    /// Rendered `{cluster="…"}` per cluster, for the families whose
+    /// witness site cannot know an endpoint.
+    cluster_labels: [][]const u8,
+    /// Endpoints per cluster — the row bound every walk below shares, so
+    /// a ragged config's holes are skipped by construction.
+    endpoint_counts: []u16,
+    /// Which clusters run §7 checks: the healthy gauge renders only
+    /// where a prober actually writes a verdict.
+    cluster_checked: []bool,
+    /// Per-endpoint counters (`EndpointKeys`-keyed). Each partitions the
+    /// like-named process total — see `reconciles`.
+    connect_failed: []Value,
+    responses: []Value,
+    health_down: []Value,
+    health_up: []Value,
+    /// Per-cluster counters: the inflight sheds fire precisely because
+    /// *no* endpoint could be picked, so a per-endpoint label would be an
+    /// invention — the cluster is everything the witness knows.
+    l7_shed_inflight: []Value,
+    l4_shed_inflight: []Value,
+    /// Exact byte bound on one `render` of this config — the runtime
+    /// sibling of `Counters.render_bytes_max`, tight the same way, and
+    /// the term the caller sizes its buffer (and the memory banner its
+    /// budget) from.
+    render_bytes_max: usize,
+
+    const Value = Counters.Value;
+    const metric_prefix = Counters.metric_prefix;
+
+    const u64_digits_max = 20; // len("18446744073709551615")
+    /// The inflight gauge sums two u16 tables, so its reachable maximum
+    /// is 131070 — six digits, and the tightness test fills the buffer
+    /// exactly because this is the true ceiling rather than a u32's.
+    const inflight_digits_max = 6;
+    const inflight_max: u32 = 2 * @as(u32, std.math.maxInt(u16));
+    comptime {
+        assert(inflight_max >= 100_000);
+        assert(inflight_max < 1_000_000);
+    }
+    /// Healthy is a 0/1 gauge: one digit is its widest rendering.
+    const healthy_digits_max = 1;
+
+    /// The per-endpoint families, tag names matching the field they
+    /// count into — `incrementEndpoint` resolves the table by tag, so a
+    /// rename that split the two would not compile.
+    pub const EndpointFamily = enum {
+        connect_failed,
+        responses,
+        health_down,
+        health_up,
+
+        /// The exposition name (behind `zoxy_`). A switch, not
+        /// concatenation, so the rendered vocabulary reads in one place.
+        fn name(family: EndpointFamily) []const u8 {
+            return switch (family) {
+                .connect_failed => "endpoint_connect_failed",
+                .responses => "endpoint_responses",
+                .health_down => "endpoint_health_down",
+                .health_up => "endpoint_health_up",
+            };
+        }
+    };
+
+    pub const ClusterFamily = enum {
+        l7_shed_inflight,
+        l4_shed_inflight,
+
+        fn name(family: ClusterFamily) []const u8 {
+            return switch (family) {
+                .l7_shed_inflight => "cluster_l7_shed_inflight",
+                .l4_shed_inflight => "cluster_l4_shed_inflight",
+            };
+        }
+    };
+
+    /// What the gauges read at render time, borrowed from their owners
+    /// exactly as the balancer borrows them (§7): the pool and the
+    /// server own the load, the prober owns the mask, and reading live
+    /// beats mirroring — a mirror is one missed release from lying.
+    pub const LiveViews = struct {
+        load: upstream_module.Load,
+        healthy: []const bool,
+    };
+
+    pub fn init(
+        labeled: *Labeled,
+        arena: std.mem.Allocator,
+        config: *const config_module.Config,
+        keys: upstream_module.EndpointKeys,
+    ) error{OutOfMemory}!void {
+        assert(config.clusters.len >= 1);
+        assert(keys.count == @as(u32, @intCast(config.clusters.len)) * keys.stride);
+        labeled.keys = keys;
+        const cluster_count = config.clusters.len;
+        labeled.endpoint_labels = try arena.alloc([]const u8, keys.count);
+        labeled.cluster_labels = try arena.alloc([]const u8, cluster_count);
+        labeled.endpoint_counts = try arena.alloc(u16, cluster_count);
+        labeled.cluster_checked = try arena.alloc(bool, cluster_count);
+        labeled.connect_failed = try allocValues(arena, keys.count);
+        labeled.responses = try allocValues(arena, keys.count);
+        labeled.health_down = try allocValues(arena, keys.count);
+        labeled.health_up = try allocValues(arena, keys.count);
+        labeled.l7_shed_inflight = try allocValues(arena, cluster_count);
+        labeled.l4_shed_inflight = try allocValues(arena, cluster_count);
+        // Holes stay empty — the one answer to "what did init leave
+        // here", and the tripwire `incrementEndpoint` asserts against.
+        @memset(labeled.endpoint_labels, "");
+        for (config.clusters, 0..) |*cluster, cluster_index| {
+            assert(cluster.endpoints.len >= 1);
+            assert(cluster.endpoints.len <= keys.stride);
+            labeled.endpoint_counts[cluster_index] = @intCast(cluster.endpoints.len);
+            labeled.cluster_checked[cluster_index] = cluster.check != null;
+            labeled.cluster_labels[cluster_index] = try clusterLabel(arena, cluster.name);
+            for (cluster.endpoints, 0..) |*address, endpoint_index| {
+                const key = keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                labeled.endpoint_labels[key] =
+                    try endpointLabel(arena, cluster.name, address);
+            }
+        }
+        labeled.render_bytes_max = renderBytesMaxFor(config);
+        assert(labeled.render_bytes_max >= 1);
+    }
+
+    fn allocValues(arena: std.mem.Allocator, count: usize) error{OutOfMemory}![]Value {
+        assert(count >= 1);
+        const values = try arena.alloc(Value, count);
+        for (values) |*value| value.* = Value.init(0);
+        return values;
+    }
+
+    /// Widest rendered endpoint literal: a bracketed IPv6 address with
+    /// its port — 47 bytes, and truly the widest, since `parseLiteral`
+    /// cannot carry a scope id and the `{f}` render omits scopes anyway.
+    /// 64 is round headroom over that, not a scope allowance.
+    const endpoint_literal_bytes_max = 64;
+
+    /// Scratch wide enough for any label this config could produce: the
+    /// grammar, a fully-escaped cluster name (every byte doubling), and
+    /// the widest endpoint literal.
+    const label_scratch_bytes = "{cluster=\"".len +
+        2 * @as(usize, constants.cluster_name_bytes_max) +
+        "\",endpoint=\"".len + endpoint_literal_bytes_max + "\"}".len;
+
+    fn clusterLabel(arena: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]const u8 {
+        var scratch: [label_scratch_bytes]u8 = undefined;
+        return try arena.dupe(u8, renderClusterLabel(&scratch, name));
+    }
+
+    fn endpointLabel(
+        arena: std.mem.Allocator,
+        name: []const u8,
+        address: *const std.Io.net.IpAddress,
+    ) error{OutOfMemory}![]const u8 {
+        var scratch: [label_scratch_bytes]u8 = undefined;
+        return try arena.dupe(u8, renderEndpointLabel(&scratch, name, address));
+    }
+
+    /// The label built in caller scratch — shared by `init`, which dupes
+    /// it into the arena, and the config-walking budget forms
+    /// (`tableBytes`, `renderBytesMaxFor`), which only measure it: one
+    /// renderer, so the banner cannot price a label init did not build.
+    fn renderClusterLabel(scratch: []u8, name: []const u8) []const u8 {
+        assert(name.len >= 1);
+        assert(name.len <= constants.cluster_name_bytes_max);
+        assert(scratch.len >= label_scratch_bytes);
+        var writer = std.Io.Writer.fixed(scratch);
+        // The scratch is sized to the loader's own bounds just above, so
+        // the fixed writer cannot fill.
+        writer.writeAll("{cluster=\"") catch unreachable;
+        writeEscaped(&writer, name) catch unreachable;
+        writer.writeAll("\"}") catch unreachable;
+        return writer.buffered();
+    }
+
+    fn renderEndpointLabel(
+        scratch: []u8,
+        name: []const u8,
+        address: *const std.Io.net.IpAddress,
+    ) []const u8 {
+        assert(name.len >= 1);
+        assert(name.len <= constants.cluster_name_bytes_max);
+        assert(scratch.len >= label_scratch_bytes);
+        var writer = std.Io.Writer.fixed(scratch);
+        // Same cannot-fill argument as `renderClusterLabel`; the address
+        // half is bounded by the bracketed-IPv6 term of the scratch.
+        writer.writeAll("{cluster=\"") catch unreachable;
+        writeEscaped(&writer, name) catch unreachable;
+        writer.print("\",endpoint=\"{f}\"}}", .{address.*}) catch unreachable;
+        return writer.buffered();
+    }
+
+    /// What `init` takes from the startup arena for this config (§5):
+    /// the six value tables, the label slice headers and the label bytes
+    /// themselves, and the two per-cluster scalars. Closed-form in the
+    /// config — it renders the same labels init dupes, through the same
+    /// renderer — so the banner's term is a prediction `init` then meets
+    /// exactly.
+    pub fn tableBytes(
+        config: *const config_module.Config,
+        keys: upstream_module.EndpointKeys,
+    ) u64 {
+        assert(config.clusters.len >= 1);
+        assert(keys.count >= 1);
+        const cluster_count: u64 = config.clusters.len;
+        var total: u64 = 0;
+        total += @as(u64, keys.count) * @sizeOf([]const u8); // endpoint_labels
+        total += cluster_count * @sizeOf([]const u8); // cluster_labels
+        total += cluster_count * @sizeOf(u16); // endpoint_counts
+        total += cluster_count * @sizeOf(bool); // cluster_checked
+        total += 4 * @as(u64, keys.count) * @sizeOf(Value); // endpoint families
+        total += 2 * cluster_count * @sizeOf(Value); // cluster families
+        var scratch: [label_scratch_bytes]u8 = undefined;
+        for (config.clusters) |*cluster| {
+            total += renderClusterLabel(&scratch, cluster.name).len;
+            for (cluster.endpoints) |*address| {
+                total += renderEndpointLabel(&scratch, cluster.name, address).len;
+            }
+        }
+        assert(total >= 1);
+        return total;
+    }
+
+    /// Prometheus label-value escaping: backslash, quote, newline. The
+    /// loader bounds a cluster name's *length*, not its bytes, and a
+    /// label that broke the exposition grammar would corrupt the whole
+    /// scrape, not one line.
+    fn writeEscaped(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
+        for (value) |byte| {
+            switch (byte) {
+                '\\' => try writer.writeAll("\\\\"),
+                '"' => try writer.writeAll("\\\""),
+                '\n' => try writer.writeAll("\\n"),
+                else => try writer.writeByte(byte),
+            }
+        }
+    }
+
+    /// Loop thread only — the single writer (§8), like `Counters`.
+    /// `key` must name a configured endpoint: the empty-label assert is
+    /// what turns "charged a hole" from a silent lost count into a bug.
+    pub fn incrementEndpoint(
+        labeled: *Labeled,
+        comptime family: EndpointFamily,
+        key: u32,
+    ) void {
+        assert(key < labeled.keys.count);
+        assert(labeled.endpoint_labels[key].len >= 1);
+        const table = @field(labeled, @tagName(family));
+        const previous = table[key].fetchAdd(1, .monotonic);
+        assert(previous < std.math.maxInt(u64));
+    }
+
+    pub fn incrementCluster(
+        labeled: *Labeled,
+        comptime family: ClusterFamily,
+        cluster_index: u16,
+    ) void {
+        assert(cluster_index < labeled.cluster_labels.len);
+        const table = @field(labeled, @tagName(family));
+        const previous = table[cluster_index].fetchAdd(1, .monotonic);
+        assert(previous < std.math.maxInt(u64));
+    }
+
+    /// Render every labeled family as Prometheus exposition text —
+    /// `Counters.render`'s dialect, appended after it by the callers
+    /// that serve both. Zero-alloc into a caller-owned buffer of at
+    /// least `render_bytes_max`, a bound that is exact for the same
+    /// reason the comptime one is: every row is priced at its type's
+    /// widest rendering.
+    pub fn render(labeled: *const Labeled, views: *const LiveViews, buffer: []u8) []const u8 {
+        assert(buffer.len >= labeled.render_bytes_max);
+        assert(views.load.l7.len == labeled.keys.count);
+        assert(views.load.l4.len == labeled.keys.count);
+        assert(views.healthy.len == labeled.keys.count);
+        var writer = std.Io.Writer.fixed(buffer);
+        inline for (comptime std.enums.values(EndpointFamily)) |family| {
+            labeled.renderEndpointFamily(&writer, family);
+        }
+        inline for (comptime std.enums.values(ClusterFamily)) |family| {
+            labeled.renderClusterFamily(&writer, family);
+        }
+        labeled.renderInflight(&writer, views);
+        labeled.renderHealthy(&writer, views);
+        const text = writer.buffered();
+        assert(text.len >= 1);
+        assert(text.len <= labeled.render_bytes_max);
+        return text;
+    }
+
+    fn renderEndpointFamily(
+        labeled: *const Labeled,
+        writer: *std.Io.Writer,
+        comptime family: EndpointFamily,
+    ) void {
+        const table = @field(labeled, @tagName(family));
+        assert(table.len == labeled.keys.count);
+        // Every write below is inside `render_bytes_max`, which `init`
+        // computed over exactly these rows — the cannot-fail argument
+        // `Counters.render` makes against its comptime bound.
+        writer.print(
+            "# TYPE {s}{s} counter\n",
+            .{ metric_prefix, comptime family.name() },
+        ) catch unreachable;
+        for (0..labeled.endpoint_counts.len) |cluster_index| {
+            for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
+                const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                writer.print("{s}{s}{s} {d}\n", .{
+                    metric_prefix,
+                    comptime family.name(),
+                    labeled.endpoint_labels[key],
+                    table[key].load(.monotonic),
+                }) catch unreachable;
+            }
+        }
+    }
+
+    fn renderClusterFamily(
+        labeled: *const Labeled,
+        writer: *std.Io.Writer,
+        comptime family: ClusterFamily,
+    ) void {
+        const table = @field(labeled, @tagName(family));
+        assert(table.len == labeled.cluster_labels.len);
+        writer.print(
+            "# TYPE {s}{s} counter\n",
+            .{ metric_prefix, comptime family.name() },
+        ) catch unreachable;
+        for (labeled.cluster_labels, table) |label, *value| {
+            writer.print("{s}{s}{s} {d}\n", .{
+                metric_prefix,
+                comptime family.name(),
+                label,
+                value.load(.monotonic),
+            }) catch unreachable;
+        }
+    }
+
+    /// The per-endpoint in-flight level — the §7 total the balancer
+    /// compares and `max_inflight` caps, seen from the scrape. Read off
+    /// the owners' live tables at render time, never mirrored.
+    fn renderInflight(
+        labeled: *const Labeled,
+        writer: *std.Io.Writer,
+        views: *const LiveViews,
+    ) void {
+        assert(views.load.l7.len == labeled.keys.count);
+        writer.print(
+            "# TYPE {s}endpoint_inflight gauge\n",
+            .{metric_prefix},
+        ) catch unreachable;
+        for (0..labeled.endpoint_counts.len) |cluster_index| {
+            for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
+                const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                const level = views.load.inFlight(key);
+                assert(level <= inflight_max);
+                writer.print("{s}endpoint_inflight{s} {d}\n", .{
+                    metric_prefix,
+                    labeled.endpoint_labels[key],
+                    level,
+                }) catch unreachable;
+            }
+        }
+    }
+
+    /// The §7 verdict per checked endpoint, 1 healthy / 0 ejected. Only
+    /// for clusters with a `check` block: an unprobed endpoint has no
+    /// verdict, and rendering a constant 1 for it would dress "unknown"
+    /// as "known good".
+    fn renderHealthy(
+        labeled: *const Labeled,
+        writer: *std.Io.Writer,
+        views: *const LiveViews,
+    ) void {
+        assert(views.healthy.len == labeled.keys.count);
+        if (labeled.checkedClusterCount() == 0) {
+            return;
+        }
+        assert(labeled.checkedClusterCount() >= 1);
+        writer.print(
+            "# TYPE {s}endpoint_healthy gauge\n",
+            .{metric_prefix},
+        ) catch unreachable;
+        for (0..labeled.endpoint_counts.len) |cluster_index| {
+            if (!labeled.cluster_checked[cluster_index]) continue;
+            for (0..labeled.endpoint_counts[cluster_index]) |endpoint_index| {
+                const key = labeled.keys.key(@intCast(cluster_index), @intCast(endpoint_index));
+                writer.print("{s}endpoint_healthy{s} {d}\n", .{
+                    metric_prefix,
+                    labeled.endpoint_labels[key],
+                    @intFromBool(views.healthy[key]),
+                }) catch unreachable;
+            }
+        }
+    }
+
+    fn checkedClusterCount(labeled: *const Labeled) u16 {
+        var count: u16 = 0;
+        for (labeled.cluster_checked) |checked| {
+            if (checked) count += 1;
+        }
+        assert(count <= labeled.cluster_checked.len);
+        return count;
+    }
+
+    /// The exact bound `render` is held to, priced over the same rows
+    /// render walks. A function of the *config* rather than of a built
+    /// `Labeled`, so the memory banner can state it before `Server.init`
+    /// runs — `init` stores the same number on the instance. Exact
+    /// because every term is, which is what lets the tightness test
+    /// prove it by filling the buffer to the last byte.
+    pub fn renderBytesMaxFor(config: *const config_module.Config) usize {
+        assert(config.clusters.len >= 1);
+        var total: usize = 0;
+        inline for (comptime std.enums.values(EndpointFamily)) |family| {
+            total += typeLineLen(family.name(), "counter");
+        }
+        inline for (comptime std.enums.values(ClusterFamily)) |family| {
+            total += typeLineLen(family.name(), "counter");
+        }
+        total += typeLineLen("endpoint_inflight", "gauge");
+        var checked_clusters: usize = 0;
+        var scratch: [label_scratch_bytes]u8 = undefined;
+        for (config.clusters) |*cluster| {
+            const cluster_label_len = renderClusterLabel(&scratch, cluster.name).len;
+            const cluster_checked = cluster.check != null;
+            inline for (comptime std.enums.values(ClusterFamily)) |family| {
+                total += rowLen(family.name(), cluster_label_len, u64_digits_max);
+            }
+            if (cluster_checked) checked_clusters += 1;
+            for (cluster.endpoints) |*address| {
+                const label_len =
+                    renderEndpointLabel(&scratch, cluster.name, address).len;
+                inline for (comptime std.enums.values(EndpointFamily)) |family| {
+                    total += rowLen(family.name(), label_len, u64_digits_max);
+                }
+                total += rowLen("endpoint_inflight", label_len, inflight_digits_max);
+                if (cluster_checked) {
+                    total += rowLen("endpoint_healthy", label_len, healthy_digits_max);
+                }
+            }
+        }
+        if (checked_clusters >= 1) {
+            total += typeLineLen("endpoint_healthy", "gauge");
+        }
+        assert(total >= 1);
+        return total;
+    }
+
+    fn typeLineLen(name: []const u8, kind: []const u8) usize {
+        assert(name.len >= 1);
+        assert(kind.len >= 1);
+        return "# TYPE ".len + metric_prefix.len + name.len + " ".len + kind.len + "\n".len;
+    }
+
+    fn rowLen(name: []const u8, label_len: usize, digits: usize) usize {
+        assert(name.len >= 1);
+        assert(label_len >= "{cluster=\"\"}".len);
+        assert(digits >= 1);
+        return metric_prefix.len + name.len + label_len + " ".len + digits + "\n".len;
+    }
+
+    fn tableTotal(values: []const Value) u64 {
+        assert(values.len >= 1);
+        var total: u64 = 0;
+        for (values) |*value| {
+            total += value.load(.monotonic);
+        }
+        return total;
+    }
+
+    /// The #179 partition identities: each labeled family sums to the
+    /// process total it breaks down — two views of one number, the
+    /// kernel-pressure op/cause contract. Asserted rather than returned,
+    /// exactly like `reconcile`'s inequalities: a witness that moved one
+    /// side without the other is a bug for the simulator to trip on, not
+    /// a state to report — which is why there is no `false` to return.
+    pub fn reconciles(labeled: *const Labeled, counters: *const Counters) void {
+        assert(tableTotal(labeled.connect_failed) == counters.get("upstream_connect_failed"));
+        assert(tableTotal(labeled.responses) == counters.get("l7_responses"));
+        assert(tableTotal(labeled.health_down) == counters.get("health_endpoint_down"));
+        assert(tableTotal(labeled.health_up) == counters.get("health_endpoint_up"));
+        assert(tableTotal(labeled.l7_shed_inflight) ==
+            counters.get("l7_shed_endpoint_inflight"));
+        assert(tableTotal(labeled.l4_shed_inflight) ==
+            counters.get("l4_shed_endpoint_inflight"));
     }
 };
 
@@ -797,4 +1303,244 @@ test "counters: an admission shed and an L7 reject land on opposite sides" {
     try std.testing.expect(!counters.reconcile(0));
     counters.increment("completed");
     try std.testing.expect(counters.reconcile(0));
+}
+
+/// A two-cluster, deliberately ragged shape for the `Labeled` tests:
+/// "api" (checked, two endpoints) beside "solo" (unchecked, one), under
+/// a stride of 2 — so key (1,1) is a hole, and a walk that forgot the
+/// per-cluster row bound would read it.
+fn labeledTestConfig(clusters: []const config_module.Config.Cluster) config_module.Config {
+    return .{
+        .listeners = &.{},
+        .clusters = clusters,
+        .connect_timeout_ms = 1,
+        .idle_timeout_ms = 1,
+        .drain_deadline_ms = 1,
+        .max_lifetime_ms = 0,
+        .request_timeout_ms = 0,
+    };
+}
+
+fn labeledTestAddress(comptime literal: []const u8) std.Io.net.IpAddress {
+    return std.Io.net.IpAddress.parseLiteral(literal) catch unreachable;
+}
+
+const labeled_test_keys: upstream_module.EndpointKeys = .init(2, 2);
+
+fn labeledTestClusters() [2]config_module.Config.Cluster {
+    const api_endpoints = struct {
+        const list = [_]std.Io.net.IpAddress{
+            labeledTestAddress("10.0.0.1:8080"),
+            labeledTestAddress("10.0.0.2:8080"),
+        };
+    };
+    const solo_endpoints = struct {
+        const list = [_]std.Io.net.IpAddress{
+            labeledTestAddress("[2001:db8::1]:9000"),
+        };
+    };
+    return .{
+        .{
+            .name = "api",
+            .endpoints = &api_endpoints.list,
+            .check = .{ .timeout_ms = 50 },
+        },
+        .{
+            .name = "solo",
+            .endpoints = &solo_endpoints.list,
+        },
+    };
+}
+
+test "counters: labeled init builds one label per configured endpoint" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const clusters = labeledTestClusters();
+    const config = labeledTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+
+    try std.testing.expectEqualStrings(
+        "{cluster=\"api\",endpoint=\"10.0.0.1:8080\"}",
+        labeled.endpoint_labels[labeled_test_keys.key(0, 0)],
+    );
+    try std.testing.expectEqualStrings(
+        "{cluster=\"api\",endpoint=\"10.0.0.2:8080\"}",
+        labeled.endpoint_labels[labeled_test_keys.key(0, 1)],
+    );
+    try std.testing.expectEqualStrings("{cluster=\"solo\"}", labeled.cluster_labels[1]);
+    // The IPv6 literal renders bracketed, port attached — the exact text
+    // an operator grep for their own config's endpoint will match.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        labeled.endpoint_labels[labeled_test_keys.key(1, 0)],
+        "[2001:db8::1]:9000",
+    ) != null);
+    // The ragged hole carries no label — and `incrementEndpoint` asserts
+    // on that emptiness, so charging a hole is a crash, not a lost count.
+    try std.testing.expectEqual(@as(usize, 0), labeled.endpoint_labels[labeled_test_keys.key(1, 1)].len);
+    try std.testing.expectEqual(true, labeled.cluster_checked[0]);
+    try std.testing.expectEqual(false, labeled.cluster_checked[1]);
+}
+
+test "counters: labeled labels escape what the exposition grammar reserves" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const endpoints = struct {
+        const list = [_]std.Io.net.IpAddress{labeledTestAddress("127.0.0.1:1")};
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "we\"ird\\name", .endpoints = &endpoints.list },
+    };
+    const config = labeledTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, .init(1, 1));
+
+    // A quote or backslash in a cluster name must not break the label
+    // grammar: the loader bounds a name's length, never its bytes.
+    try std.testing.expectEqualStrings(
+        "{cluster=\"we\\\"ird\\\\name\"}",
+        labeled.cluster_labels[0],
+    );
+}
+
+test "counters: labeled render speaks the exposition dialect" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const clusters = labeledTestClusters();
+    const config = labeledTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+
+    labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
+    labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
+    labeled.incrementCluster(.l7_shed_inflight, 1);
+
+    var l7 = [_]u16{0} ** labeled_test_keys.count;
+    var l4 = [_]u16{0} ** labeled_test_keys.count;
+    l7[labeled_test_keys.key(0, 0)] = 3;
+    l4[labeled_test_keys.key(0, 0)] = 2;
+    var healthy = [_]bool{true} ** labeled_test_keys.count;
+    healthy[labeled_test_keys.key(0, 1)] = false;
+    const views: Labeled.LiveViews = .{
+        .load = .{ .l7 = &l7, .l4 = &l4 },
+        .healthy = &healthy,
+    };
+
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+
+    // Counters carry their values, and untouched series render at zero —
+    // a scrape sees the whole configured set, exactly like `Counters`.
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_endpoint_responses counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_responses{cluster=\"api\",endpoint=\"10.0.0.2:8080\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_connect_failed{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_cluster_l7_shed_inflight{cluster=\"solo\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_cluster_l4_shed_inflight{cluster=\"api\"} 0\n") != null);
+    // The inflight gauge reads the live view: both protocols summed.
+    try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_endpoint_inflight gauge\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_inflight{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 5\n") != null);
+    // Healthy renders the prober's verdict for checked endpoints only:
+    // an unprobed endpoint has no verdict to dress up as a 1.
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"api\",endpoint=\"10.0.0.2:8080\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"solo\"") == null);
+
+    // One TYPE line per family: four endpoint counters, two cluster
+    // counters, the inflight gauge, and healthy (a checked cluster exists).
+    var type_lines: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search, "# TYPE ")) |at| {
+        type_lines += 1;
+        search = at + "# TYPE ".len;
+    }
+    try std.testing.expectEqual(@as(usize, 8), type_lines);
+}
+
+test "counters: labeled render bound is exact at the maximum values" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const clusters = labeledTestClusters();
+    const config = labeledTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+
+    for ([_][]Counters.Value{
+        labeled.connect_failed,   labeled.responses,
+        labeled.health_down,      labeled.health_up,
+        labeled.l7_shed_inflight, labeled.l4_shed_inflight,
+    }) |table| {
+        for (table) |*value| value.store(std.math.maxInt(u64), .monotonic);
+    }
+    // The widest live view either owner can produce: both u16 tables
+    // saturated (the inflight bound is their sum, not a u32's), and a
+    // healthy verdict — "1" — on every checked endpoint.
+    var l7 = [_]u16{std.math.maxInt(u16)} ** labeled_test_keys.count;
+    var l4 = [_]u16{std.math.maxInt(u16)} ** labeled_test_keys.count;
+    const healthy = [_]bool{true} ** labeled_test_keys.count;
+    const views: Labeled.LiveViews = .{
+        .load = .{ .l7 = &l7, .l4 = &l4 },
+        .healthy = &healthy,
+    };
+
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+    // Every value at its type's reachable maximum fills the buffer
+    // exactly: the bound is tight, not merely sufficient — the same
+    // claim `Counters.render_bytes_max` proves at comptime.
+    try std.testing.expectEqual(labeled.render_bytes_max, text.len);
+    try std.testing.expect(std.mem.indexOf(u8, text, "18446744073709551615\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, " 131070\n") != null);
+}
+
+test "counters: labeled render drops the healthy family with nothing checked" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const endpoints = struct {
+        const list = [_]std.Io.net.IpAddress{labeledTestAddress("127.0.0.1:1")};
+    };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "quiet", .endpoints = &endpoints.list },
+    };
+    const config = labeledTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, .init(1, 1));
+
+    var l7 = [_]u16{0};
+    var l4 = [_]u16{0};
+    const healthy = [_]bool{true};
+    const views: Labeled.LiveViews = .{
+        .load = .{ .l7 = &l7, .l4 = &l4 },
+        .healthy = &healthy,
+    };
+    const buffer = try arena_state.allocator().alloc(u8, labeled.render_bytes_max);
+    const text = labeled.render(&views, buffer);
+    // No prober, no verdicts: the whole family is absent, TYPE line and
+    // all, rather than a page of constant 1s meaning "unknown".
+    try std.testing.expect(std.mem.indexOf(u8, text, "endpoint_healthy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_inflight{cluster=\"quiet\"") != null);
+}
+
+test "counters: the labeled families partition their process totals" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const clusters = labeledTestClusters();
+    const config = labeledTestConfig(&clusters);
+    var labeled: Labeled = undefined;
+    try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
+    var counters: Counters = .{};
+
+    // Every witness moves both views of its total: the bare counter and
+    // one labeled cell. The sums then agree, whatever the distribution.
+    counters.increment("upstream_connect_failed");
+    labeled.incrementEndpoint(.connect_failed, labeled_test_keys.key(0, 0));
+    counters.increment("l7_responses");
+    counters.increment("l7_responses");
+    labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
+    labeled.incrementEndpoint(.responses, labeled_test_keys.key(1, 0));
+    counters.increment("health_endpoint_down");
+    labeled.incrementEndpoint(.health_down, labeled_test_keys.key(0, 0));
+    counters.increment("l4_shed_endpoint_inflight");
+    labeled.incrementCluster(.l4_shed_inflight, 0);
+    labeled.reconciles(&counters);
 }

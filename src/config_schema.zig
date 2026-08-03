@@ -221,7 +221,10 @@ fn writeArrayShape(out: *Stringify, comptime Child: type, comptime meta: anytype
 /// metadata marks it, or a plain string otherwise.
 fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Writer.Error!void {
     switch (@typeInfo(Child)) {
-        .@"struct" => try writeObjectBody(out, Child, true),
+        .@"struct" => if (Child == config.EndpointJson)
+            try writeEndpointItems(out)
+        else
+            try writeObjectBody(out, Child, true),
         .pointer => |ptr| {
             comptime assert(ptr.child == u8);
             if (comptime @hasField(@TypeOf(meta), "items")) {
@@ -234,6 +237,27 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
         },
         else => comptime unreachable,
     }
+}
+
+/// A cluster endpoint accepts two spellings (#174) — the bare `IP:port`
+/// string every existing config writes, or the `{address, weight}` object
+/// — so its items schema is the document's one `anyOf`. Emitted here
+/// rather than reflected because reflection sees only the resolved DTO
+/// (`EndpointJson`), whose custom `jsonParse` is where the string form
+/// lives; the two arms below mirror that parser exactly.
+fn writeEndpointItems(out: *Stringify) Writer.Error!void {
+    try out.objectField("anyOf");
+    try out.beginArray();
+    try out.beginObject();
+    try out.objectField("type");
+    try out.write("string");
+    try out.objectField("description");
+    try out.write("IP:port endpoint literal (port must be non-zero) — weight 1.");
+    try out.endObject();
+    try out.beginObject();
+    try writeObjectBody(out, config.EndpointJson, true);
+    try out.endObject();
+    try out.endArray();
 }
 
 /// An `"enum"` array of an enum type's field names — the same closed
@@ -376,6 +400,36 @@ test "config_schema: the shipped example's top-level keys are all declared" {
     while (it.next()) |entry| {
         try std.testing.expect(properties.get(entry.key_ptr.*) != null);
     }
+}
+
+test "config_schema: endpoint items accept both spellings" {
+    var buffer: [64 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+
+    const clusters = parsed.value.object.get("properties").?.object.get("clusters").?.object;
+    const cluster_schema = clusters.get("additionalProperties").?.object;
+    const endpoints = cluster_schema.get("properties").?.object.get("endpoints").?.object;
+    const arms = endpoints.get("items").?.object.get("anyOf").?.array;
+
+    // Exactly the loader's two spellings: a bare literal, or the object.
+    try std.testing.expectEqual(@as(usize, 2), arms.items.len);
+    try std.testing.expectEqualStrings("string", arms.items[0].object.get("type").?.string);
+    const object_arm = arms.items[1].object;
+    try std.testing.expectEqualStrings("object", object_arm.get("type").?.string);
+    // `address` is the one required key — `weight` defaults — and the
+    // emitted weight ceiling is the loader's own constant, so the schema
+    // cannot promise a weight the loader would then reject.
+    const required = object_arm.get("required").?.array;
+    try std.testing.expectEqual(@as(usize, 1), required.items.len);
+    try std.testing.expectEqualStrings("address", required.items[0].string);
+    const weight = object_arm.get("properties").?.object.get("weight").?.object;
+    try std.testing.expectEqual(
+        @as(i64, constants.endpoint_weight_max),
+        weight.get("maximum").?.integer,
+    );
+    try std.testing.expectEqual(@as(i64, 0), weight.get("minimum").?.integer);
 }
 
 test "config_schema: the method enum matches what the parser accepts" {

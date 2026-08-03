@@ -278,7 +278,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
 
     // Scraped before the drain: the admin listener closes with every
     // other one when SIGTERM lands (§8).
-    const counters = try countersPassed(arena, io, ports.admin);
+    const counters = try countersPassed(arena, io, ports.admin, origin.port);
     const drained_cleanly = try drain(io, &child, &running);
     const lines = try readAccessLog(arena, io);
     // Every check runs and prints; a run that fails two ways should say
@@ -425,8 +425,14 @@ fn drainPassed(drained_cleanly: bool) bool {
 /// claim; the two scrapes are also what `admin_served` needs, since the
 /// first one's own witness is incremented when its last byte lands and
 /// can only be read by the next.
-fn countersPassed(arena: std.mem.Allocator, io: Io, port: u16) !CounterVerdict {
+fn countersPassed(
+    arena: std.mem.Allocator,
+    io: Io,
+    port: u16,
+    origin_port: u16,
+) !CounterVerdict {
     assert(port != 0);
+    assert(origin_port != 0);
     const first = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
     try io.sleep(Io.Duration.fromNanoseconds(probe_window_ns), .awake);
     const second = try scrape_module.parse(try scrape_module.fetch(arena, io, port));
@@ -434,11 +440,68 @@ fn countersPassed(arena: std.mem.Allocator, io: Io, port: u16) !CounterVerdict {
     const identities_ok = identitiesPassed(&first);
     const probes_ok = probesPassed(probes, &second);
     const admin_ok = adminPassed(&second);
-    const passed = identities_ok and probes_ok and admin_ok;
+    const labeled_ok = try labeledPassed(arena, &first, origin_port);
+    const passed = identities_ok and probes_ok and admin_ok and labeled_ok;
     // A verdict that passed read a probe count; the reported number is
     // never the zero that stands in for a counter the scrape lacked.
     if (passed) assert(probes != null);
     return .{ .passed = passed, .probes = probes orelse 0 };
+}
+
+/// The #179 labeled families, judged on the wire like the identities
+/// above. This config has one cluster with one endpoint, so every
+/// labeled series must carry its whole process total — the partition
+/// identities `reconcile` asserts inside the process, re-derived from
+/// the rendered text — and the two gauges must be present, with the
+/// prober's verdict reading healthy against an origin answering 200.
+fn labeledPassed(
+    arena: std.mem.Allocator,
+    first: *const scrape_module.Scrape,
+    origin_port: u16,
+) !bool {
+    assert(origin_port != 0);
+    const endpoint_label = try std.fmt.allocPrint(
+        arena,
+        "{{cluster=\"origin\",endpoint=\"127.0.0.1:{d}\"}}",
+        .{origin_port},
+    );
+    var passed = true;
+    const partitions = [_]struct { family: []const u8, total: []const u8, labeled: bool }{
+        .{ .family = "endpoint_responses", .total = "l7_responses", .labeled = true },
+        .{ .family = "endpoint_connect_failed", .total = "upstream_connect_failed", .labeled = true },
+        .{ .family = "endpoint_health_down", .total = "health_endpoint_down", .labeled = true },
+        .{ .family = "endpoint_health_up", .total = "health_endpoint_up", .labeled = true },
+        .{ .family = "cluster_l7_shed_inflight", .total = "l7_shed_endpoint_inflight", .labeled = false },
+        .{ .family = "cluster_l4_shed_inflight", .total = "l4_shed_endpoint_inflight", .labeled = false },
+    };
+    for (partitions) |partition| {
+        const label = if (partition.labeled) endpoint_label else "{cluster=\"origin\"}";
+        const series = try std.fmt.allocPrint(arena, "{s}{s}", .{ partition.family, label });
+        const series_value = counterOf(first, series) orelse {
+            passed = false;
+            continue;
+        };
+        const total = counterOf(first, partition.total) orelse {
+            passed = false;
+            continue;
+        };
+        if (series_value != total) {
+            std.debug.print(
+                "FAIL: {s} reads {d} but {s} reads {d} — the one endpoint must hold its whole partition\n",
+                .{ series, series_value, partition.total, total },
+            );
+            passed = false;
+        }
+    }
+    const healthy_series = try std.fmt.allocPrint(arena, "endpoint_healthy{s}", .{endpoint_label});
+    const healthy = counterOf(first, healthy_series) orelse return false;
+    if (healthy != 1) {
+        std.debug.print("FAIL: {s} reads {d} against an origin answering 200\n", .{ healthy_series, healthy });
+        passed = false;
+    }
+    const inflight_series = try std.fmt.allocPrint(arena, "endpoint_inflight{s}", .{endpoint_label});
+    if (counterOf(first, inflight_series) == null) passed = false;
+    return passed;
 }
 
 /// What the counter checks decided, and the one number worth printing
