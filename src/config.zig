@@ -152,6 +152,13 @@ pub const Config = struct {
         /// Empty on the L4 path and whenever no `"request_filters"` were given.
         /// Compiled and interpreted by `http/filter.zig`.
         request_filters: []const filter.Rule = &.{},
+        /// The #175 response filter rules, same discipline on the way
+        /// out: empty on the L4 path and whenever no `"response_filters"`
+        /// were given. Compiled by this loader, matched by
+        /// `http/filter.zig`; the response re-render's application is
+        /// #175's next slice — until it lands, a compiled table is
+        /// carried but consulted by nothing.
+        response_filters: []const filter.ResponseRule = &.{},
         protocol: Protocol,
         /// How this listener tells the origin who the client is (§7), or
         /// null to leave `X-Forwarded-For` exactly as it arrived — the
@@ -368,6 +375,7 @@ pub const ValidationError = error{
     RouteHostNotCanonical,
     RouteDuplicate,
     ListenerL4RequestFilters,
+    ListenerL4ResponseFilters,
     ListenerL4Forwarded,
     ListenerForwardedModeUnknown,
     ListenerHttpProxyProtocol,
@@ -385,6 +393,12 @@ pub const ValidationError = error{
     FilterActionKind,
     FilterRejectStatus,
     FilterHeaderEditsOverLimit,
+    ResponseFilterReject,
+    ResponseFilterRewrite,
+    ResponseFilterStatusInvalid,
+    ResponseFilterStatusClassUnknown,
+    ResponseFilterStatusEmpty,
+    ResponseFilterHeaderEditsOverLimit,
     EndpointsEmpty,
     EndpointsOverLimit,
     EndpointInvalid,
@@ -841,6 +855,9 @@ pub const ListenerJson = struct {
     routes: ?[]const RouteJson = null,
     /// Optional §7 request filter rules; absent means none. HTTP-only.
     request_filters: ?[]const FilterJson = null,
+    /// Optional #175 response filter rules; absent means none. HTTP-only,
+    /// like everything with a head to match on.
+    response_filters: ?[]const ResponseFilterJson = null,
     /// Optional: absent means `l4`, keeping pre-L7 configs valid.
     protocol: []const u8 = "l4",
     /// Optional §7 client-address forwarding; absent leaves the header
@@ -862,6 +879,10 @@ pub const ListenerJson = struct {
         },
         .request_filters = .{
             .desc = "Request filter rules, evaluated top-down (http listeners only).",
+        },
+        .response_filters = .{
+            .desc = "Response filter rules — header edits on the origin's response, " ++
+                "evaluated top-down (http listeners only).",
         },
         .protocol = .{
             .desc = "What the listener speaks: l4 relays bytes blindly, http runs the reverse-proxy state machine.",
@@ -1000,6 +1021,52 @@ pub const ActionJson = struct {
         .header_add = .{ .desc = "Append a request header." },
         .header_remove = .{ .desc = "Remove a request header by name." },
         .rewrite_prefix = .{ .desc = "Rewrite the request path prefix before proxying." },
+    };
+};
+
+/// One response filter rule (#175): a match over the origin's response —
+/// status and response headers; the request's facts are gone by the time
+/// a response exists, which is the reason this is its own table rather
+/// than a scope marker on `FilterJson` — and the header edits applied
+/// when it matches. Reject and rewrite are request-side ideas, rejected
+/// here by their own names.
+pub const ResponseFilterJson = struct {
+    match: ResponseMatchJson = .{},
+    actions: []const ActionJson,
+
+    pub const schema_doc =
+        "One response filter rule: a match over the origin's response and " ++
+        "the header edits applied when it matches.";
+    pub const schema_fields = .{
+        .match = .{ .desc = "Response-match predicate; absent fields match anything." },
+        .actions = .{
+            .desc = "Header edits (header_set / header_add / header_remove) applied " ++
+                "in order when the rule matches; reject and rewrite_prefix are " ++
+                "request-side only.",
+            .min_items = 1,
+        },
+    };
+};
+
+pub const ResponseMatchJson = struct {
+    status: ?[]const u16 = null,
+    status_class: ?[]const u8 = null,
+    headers: ?[]const HeaderMatchJson = null,
+
+    pub const schema_doc = "Response-match predicate; every absent field matches anything.";
+    pub const schema_fields = .{
+        .status = .{
+            .desc = "Exact response status codes to match; absent matches any status.",
+            .min_items = 1,
+            .minimum = 100,
+            .maximum = 599,
+        },
+        .status_class = .{
+            .desc = "Response status class to match (\"1xx\" through \"5xx\"); " ++
+                "absent matches any class.",
+            .enum_type = filter.StatusClass,
+        },
+        .headers = .{ .desc = "Response-header predicates; all must match." },
     };
 };
 
@@ -1436,11 +1503,12 @@ pub fn assert_meta_matches(comptime T: type) void {
 /// block below runs `assert_meta_matches` on each at comptime, so the
 /// metadata cannot drift from the fields whether or not the emitter builds.
 pub const dto_types = .{
-    ConfigJson,    ListenerJson,      RouteJson,                FilterJson,
-    MatchJson,     HeaderMatchJson,   ActionJson,               HeaderEditJson,
-    RewriteJson,   ClusterJson,       TimeoutsJson,             LimitsJson,
-    AdminJson,     AccessLogJson,     CheckJson,                ClusterHashJson,
-    ForwardedJson, ProxyProtocolJson, ClusterProxyProtocolJson, EndpointJson,
+    ConfigJson,         ListenerJson,      RouteJson,                FilterJson,
+    MatchJson,          HeaderMatchJson,   ActionJson,               HeaderEditJson,
+    RewriteJson,        ClusterJson,       TimeoutsJson,             LimitsJson,
+    AdminJson,          AccessLogJson,     CheckJson,                ClusterHashJson,
+    ForwardedJson,      ProxyProtocolJson, ClusterProxyProtocolJson, EndpointJson,
+    ResponseFilterJson, ResponseMatchJson,
 };
 
 comptime {
@@ -1615,6 +1683,7 @@ fn resolveListeners(
             .bind_address = bind_address,
             .routes = try resolveRoutes(arena, &listener_json, clusters, protocol, head_buffer_bytes),
             .request_filters = try resolveRequestFilters(arena, &listener_json, protocol, head_buffer_bytes),
+            .response_filters = try resolveResponseFilters(arena, &listener_json, protocol),
             .protocol = protocol,
             .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
             .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
@@ -1727,6 +1796,129 @@ fn countHeaderEdits(actions: []const filter.Action) u32 {
     return count;
 }
 
+/// Compile a listener's `response_filters` (#175): matches over the
+/// origin's response, actions restricted to the three header verbs.
+/// The edits compile straight to the renderer's flattened
+/// `AppliedHeaderEdit` contract — there is no reject to interleave, so
+/// the `Action` union has nothing to carry — and the whole table's edit
+/// count is capped like the request side's, since one response applies
+/// every matched rule's edits from a single fixed buffer.
+fn resolveResponseFilters(
+    arena: std.mem.Allocator,
+    listener_json: *const ListenerJson,
+    protocol: Config.Listener.Protocol,
+) ParseError![]const filter.ResponseRule {
+    const rules_json = listener_json.response_filters orelse return &.{};
+    // The same rejection as `request_filters`: an l4 relay has no
+    // response head to edit, so the key — populated or vacuously empty —
+    // describes a proxy that is not running.
+    if (protocol == .l4) {
+        return error.ListenerL4ResponseFilters;
+    }
+    if (rules_json.len == 0) {
+        return &.{};
+    }
+    const rules = try arena.alloc(filter.ResponseRule, rules_json.len);
+    var header_edits: u32 = 0;
+    for (rules_json, rules) |rule_json, *rule| {
+        rule.* = .{
+            .match = try resolveResponseMatch(arena, &rule_json.match),
+            .edits = try resolveResponseEdits(arena, rule_json.actions),
+        };
+        header_edits += @intCast(rule.edits.len);
+    }
+    if (header_edits > constants.header_edits_max) {
+        return error.ResponseFilterHeaderEditsOverLimit;
+    }
+    assert(header_edits <= constants.header_edits_max);
+    assert(rules.len == rules_json.len);
+    return rules;
+}
+
+fn resolveResponseMatch(
+    arena: std.mem.Allocator,
+    match_json: *const ResponseMatchJson,
+) ParseError!filter.ResponseMatch {
+    var match: filter.ResponseMatch = .{};
+    if (match_json.status) |statuses_json| {
+        // An explicitly empty list is a mistake, not "any" — absence
+        // already says that, unambiguously (the `FilterMethodEmpty`
+        // rule).
+        if (statuses_json.len == 0) {
+            return error.ResponseFilterStatusEmpty;
+        }
+        const statuses = try arena.alloc(u16, statuses_json.len);
+        for (statuses_json, statuses) |status, *slot| {
+            // The parser only ever produces 100..599 (§7), so a value
+            // outside it is a rule that can never fire — a typo, told at
+            // load rather than left silently inert.
+            if (status < 100 or status > 599) {
+                return error.ResponseFilterStatusInvalid;
+            }
+            slot.* = status;
+        }
+        match.statuses = statuses;
+    }
+    if (match_json.status_class) |literal| {
+        const class = std.meta.stringToEnum(filter.StatusClass, literal) orelse
+            return error.ResponseFilterStatusClassUnknown;
+        match.status_class = @intFromEnum(class);
+        // The digit contract `responseMatches` asserts on its side of
+        // the seam, proven where it is produced.
+        assert(match.status_class.? >= 1);
+        assert(match.status_class.? <= 5);
+    }
+    if (match_json.headers) |headers_json| {
+        match.headers = try resolveHeaderMatches(arena, headers_json);
+    }
+    return match;
+}
+
+/// Resolve a response rule's actions: the same `ActionJson` vocabulary
+/// the request side reads — one muscle memory — with the two arms that
+/// have no meaning on the way out rejected by their own names, so an
+/// operator reaching for `reject` on a response is told which idea does
+/// not transfer rather than handed a generic kind error.
+fn resolveResponseEdits(
+    arena: std.mem.Allocator,
+    actions_json: []const ActionJson,
+) ParseError![]const filter.AppliedHeaderEdit {
+    if (actions_json.len == 0) {
+        return error.FilterActionsEmpty;
+    }
+    assert(actions_json.len >= 1); // Past the empty guard.
+    const edits = try arena.alloc(filter.AppliedHeaderEdit, actions_json.len);
+    for (actions_json, edits) |action_json, *edit| {
+        edit.* = try resolveResponseEdit(&action_json);
+    }
+    assert(edits.len == actions_json.len);
+    return edits;
+}
+
+fn resolveResponseEdit(action_json: *const ActionJson) ParseError!filter.AppliedHeaderEdit {
+    // The shared kind fork runs before the arm rejections, so a
+    // two-kind object is a kind error here too, never a misleading
+    // arm one.
+    try requireOneActionKind(action_json);
+    if (action_json.reject != null) {
+        return error.ResponseFilterReject;
+    }
+    if (action_json.rewrite_prefix != null) {
+        return error.ResponseFilterRewrite;
+    }
+    if (action_json.header_set) |edit| {
+        const resolved = try resolveHeaderEdit(&edit);
+        return .{ .kind = .set, .name = resolved.name, .value = resolved.value };
+    }
+    if (action_json.header_add) |edit| {
+        const resolved = try resolveHeaderEdit(&edit);
+        return .{ .kind = .add, .name = resolved.name, .value = resolved.value };
+    }
+    const name = action_json.header_remove.?;
+    try validateEditableHeaderName(name);
+    return .{ .kind = .remove, .name = name, .value = "" };
+}
+
 fn resolveMatch(
     arena: std.mem.Allocator,
     match_json: *const MatchJson,
@@ -1815,8 +2007,10 @@ fn resolveActions(
     return actions;
 }
 
-fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseError!filter.Action {
-    // Exactly one action field carries the kind.
+/// Exactly one action field may carry the kind — the "exactly one of"
+/// fork both action resolvers share, so a sixth kind cannot be counted
+/// in one table and forgotten in the other.
+fn requireOneActionKind(action_json: *const ActionJson) ParseError!void {
     const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
         @intFromBool(action_json.header_set != null) +
         @intFromBool(action_json.header_add != null) +
@@ -1826,6 +2020,11 @@ fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseEr
     if (set != 1) {
         return error.FilterActionKind;
     }
+    assert(set == 1);
+}
+
+fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseError!filter.Action {
+    try requireOneActionKind(action_json);
     if (action_json.reject) |status| {
         if (!filter.isRejectStatus(status)) {
             return error.FilterRejectStatus;
@@ -2793,6 +2992,97 @@ test "config: a filter set over the header-edit budget is rejected" {
     const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
         "\"cluster\":\"a\",\"request_filters\":[" ++ rules ++ "]}]," ++ tail;
     try expectParseError(error.FilterHeaderEditsOverLimit, json);
+}
+
+test "config: response filters compile into rules with matches and edits" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","response_filters":[
+        \\   {"actions":[{"header_remove":"Server"},
+        \\               {"header_set":{"name":"Strict-Transport-Security","value":"max-age=63072000"}}]},
+        \\   {"match":{"status_class":"5xx"},
+        \\    "actions":[{"header_set":{"name":"Retry-After","value":"1"}}]},
+        \\   {"match":{"status":[301,302],"headers":[{"name":"Location","contains":"http:"}]},
+        \\    "actions":[{"header_add":{"name":"X-Insecure-Redirect","value":"1"}}]}
+        \\ ]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const rules = parsed.listeners[0].response_filters;
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    // The unconditional rule: an all-empty match, edits flattened to the
+    // renderer's contract in action order — no `Action` union on the way
+    // out, because there is no reject to interleave.
+    try std.testing.expectEqual(@as(usize, 0), rules[0].match.statuses.len);
+    try std.testing.expectEqual(@as(?u8, null), rules[0].match.status_class);
+    try std.testing.expectEqual(@as(usize, 2), rules[0].edits.len);
+    try std.testing.expectEqual(filter.AppliedHeaderEdit.Kind.remove, rules[0].edits[0].kind);
+    try std.testing.expectEqualStrings("Server", rules[0].edits[0].name);
+    try std.testing.expectEqual(filter.AppliedHeaderEdit.Kind.set, rules[0].edits[1].kind);
+    // The class spelling compiles to its digit.
+    try std.testing.expectEqual(@as(?u8, 5), rules[1].match.status_class);
+    // Exact statuses and response-header predicates ride the request
+    // side's own vocabularies.
+    try std.testing.expectEqualSlices(u16, &.{ 301, 302 }, rules[2].match.statuses);
+    try std.testing.expectEqual(filter.HeaderMatch.Kind.contains, rules[2].match.headers[0].kind);
+    try std.testing.expectEqual(filter.AppliedHeaderEdit.Kind.add, rules[2].edits[0].kind);
+    // The request-side table stays independent: none was configured.
+    try std.testing.expectEqual(@as(usize, 0), parsed.listeners[0].request_filters.len);
+}
+
+test "config: response filter schema rejects what has no meaning on the way out" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"response_filters\":[";
+    // The two request-side arms are rejected by their own names, so an
+    // operator is told which idea does not transfer.
+    try expectParseError(error.ResponseFilterReject, head ++ "{\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.ResponseFilterRewrite, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b\"}}]}]}]," ++ tail);
+    // A two-kind action is still a kind error, never a misleading arm one.
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}]," ++ tail);
+    try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}]," ++ tail);
+    // A status the parser can never produce is a rule that can never
+    // fire — a typo, told at load.
+    try expectParseError(error.ResponseFilterStatusInvalid, head ++ "{\"match\":{\"status\":[99]},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
+    try expectParseError(error.ResponseFilterStatusInvalid, head ++ "{\"match\":{\"status\":[600]},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
+    // An explicitly empty status list is a mistake — absence already
+    // says "any", unambiguously.
+    try expectParseError(error.ResponseFilterStatusEmpty, head ++ "{\"match\":{\"status\":[]},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
+    try expectParseError(error.ResponseFilterStatusClassUnknown, head ++ "{\"match\":{\"status_class\":\"6xx\"},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
+    // The proxy-managed names hold on the way out too: hand-written
+    // framing would desynchronise the relay.
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Content-Length\",\"value\":\"0\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_remove\":\"connection\"}]}]}]," ++ tail);
+    // L4 listeners may not carry the key, populated or vacuously empty.
+    try expectParseError(error.ListenerL4ResponseFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
+        "\"response_filters\":[{\"actions\":[{\"header_remove\":\"Server\"}]}]}]," ++ tail);
+    try expectParseError(error.ListenerL4ResponseFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
+        "\"response_filters\":[]}]," ++ tail);
+}
+
+test "config: a response filter set over the header-edit budget is rejected" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // Same whole-table cap as the request side, on its own error name:
+    // one response applies every matched rule's edits from one fixed
+    // buffer, so the total is what must fit.
+    const rules = comptime blk: {
+        var s: []const u8 = "";
+        var edit: u16 = 0;
+        while (edit < constants.header_edits_max + 1) : (edit += 1) {
+            if (edit != 0) s = s ++ ",";
+            s = s ++ "{\"actions\":[{\"header_remove\":\"X-Drop\"}]}";
+        }
+        break :blk s;
+    };
+    const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+        "\"cluster\":\"a\",\"response_filters\":[" ++ rules ++ "]}]," ++ tail;
+    try expectParseError(error.ResponseFilterHeaderEditsOverLimit, json);
 }
 
 test "config: cluster pick policy parses, defaults to p2c, rejects typos" {

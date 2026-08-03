@@ -90,6 +90,109 @@ pub const AppliedHeaderEdit = struct {
     pub const Kind = enum(u8) { set, add, remove };
 };
 
+/// A response rule's match (#175): a conjunction over the origin's
+/// response, mirroring `Match`'s "every present predicate must hold" —
+/// an all-empty match is an unconditional rule. There is no method, host
+/// or path here: those are request facts, and a response rule runs after
+/// an await against the parsed *response* head only.
+pub const ResponseMatch = struct {
+    /// Exact statuses the rule applies to; empty = any status.
+    statuses: []const u16 = &.{},
+    /// A status class (the "5xx" spelling), or null for any. Compiled to
+    /// the class digit so the check is one integer divide.
+    status_class: ?u8 = null,
+    headers: []const HeaderMatch = &.{},
+};
+
+/// The `status_class` vocabulary (#175): the five RFC 9110 classes, field
+/// names being the JSON tokens exactly as `Pick`'s are. The loader
+/// resolves one to its digit; the schema emits the closed set.
+pub const StatusClass = enum(u8) {
+    @"1xx" = 1,
+    @"2xx" = 2,
+    @"3xx" = 3,
+    @"4xx" = 4,
+    @"5xx" = 5,
+};
+
+/// One compiled response rule (#175). The actions compile straight to
+/// the renderer's `AppliedHeaderEdit` contract rather than to `Action`:
+/// reject and rewrite have no meaning on the way out, so the response
+/// action set is exactly the three header verbs, and the load-time
+/// rejection of the other arms is what lets this skip the union.
+pub const ResponseRule = struct {
+    match: ResponseMatch,
+    edits: []const AppliedHeaderEdit,
+};
+
+/// The parsed response head a response rule matches against: the status
+/// the origin answered and its headers (zero-copy slices, the request
+/// side's own `parser.Header` shape).
+pub const ResponseView = struct {
+    status: u16,
+    headers: []const parser.Header,
+};
+
+/// One pass over the response rules (#175), gathering every matched
+/// rule's edits in rule-then-action order — `collectForward`'s shape
+/// minus the concerns that do not exist on the way out (no reject: it
+/// ran request-side; no rewrite: there is no path). The caller sizes
+/// `out` at `header_edits_max`, which config caps a listener's response
+/// edits at, so a matching subset always fits. Bounded loops over
+/// immutable arena data; no allocation.
+pub fn collectResponseEdits(
+    rules: []const ResponseRule,
+    view: ResponseView,
+    out: []AppliedHeaderEdit,
+) []const AppliedHeaderEdit {
+    assert(out.len <= constants.header_edits_max);
+    var count: usize = 0;
+    for (rules) |rule| {
+        if (!responseMatches(rule.match, view)) {
+            continue;
+        }
+        for (rule.edits) |edit| {
+            assert(count < out.len);
+            out[count] = edit;
+            count += 1;
+        }
+    }
+    assert(count <= out.len);
+    return out[0..count];
+}
+
+/// Whether a response rule's conjunction holds. No assertion on the
+/// status's range: it is the origin's byte sequence, and a 999 from a
+/// misbehaving origin must fail predicates, not the proxy — 999/100 is
+/// 9, which equals no class.
+fn responseMatches(match: ResponseMatch, view: ResponseView) bool {
+    assert(view.headers.len <= constants.headers_max);
+    if (match.statuses.len >= 1) {
+        var found = false;
+        for (match.statuses) |status| {
+            if (status == view.status) {
+                found = true;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    if (match.status_class) |class| {
+        assert(class >= 1);
+        assert(class <= 5);
+        if (view.status / 100 != class) {
+            return false;
+        }
+    }
+    for (match.headers) |header_match| {
+        if (!headerMatches(header_match, view.headers)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// The statuses a `reject` action may name — a subset of the §8 static
 /// responses that make sense as a policy verdict. This array is the single
 /// source of truth: config rejects any other value at load, the proxy's
@@ -547,6 +650,76 @@ test "filter: rewritePath is a segment-correct prefix replacement" {
         const recanon = try parser.canonicalTarget(got, &canon);
         try std.testing.expectEqualStrings(got, recanon.path);
     }
+}
+
+test "filter: response rules match on status, class and headers" {
+    const H = parser.Header;
+    const rules = [_]ResponseRule{
+        // Unconditional: every response sheds its Server header.
+        .{ .match = .{}, .edits = &.{
+            .{ .kind = .remove, .name = "Server", .value = "" },
+        } },
+        // Class-scoped: 5xx answers advertise a retry.
+        .{ .match = .{ .status_class = 5 }, .edits = &.{
+            .{ .kind = .set, .name = "Retry-After", .value = "1" },
+        } },
+        // Exact statuses and a header predicate, conjoined.
+        .{ .match = .{
+            .statuses = &.{ 301, 302 },
+            .headers = &.{.{ .name = "Location", .kind = .contains, .value = "http:" }},
+        }, .edits = &.{
+            .{ .kind = .add, .name = "X-Insecure-Redirect", .value = "1" },
+        } },
+    };
+    var out: [constants.header_edits_max]AppliedHeaderEdit = undefined;
+
+    // A 200 matches only the unconditional rule.
+    const ok = collectResponseEdits(&rules, .{ .status = 200, .headers = &.{} }, &out);
+    try std.testing.expectEqual(@as(usize, 1), ok.len);
+    try std.testing.expectEqualStrings("Server", ok[0].name);
+
+    // A 503 gathers the unconditional and the class rule, in rule order.
+    const shed = collectResponseEdits(&rules, .{ .status = 503, .headers = &.{} }, &out);
+    try std.testing.expectEqual(@as(usize, 2), shed.len);
+    try std.testing.expectEqualStrings("Retry-After", shed[1].name);
+    // The class boundaries are the RFC's: 499 is not a 5xx, 599 is.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        collectResponseEdits(&rules, .{ .status = 499, .headers = &.{} }, &out).len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        collectResponseEdits(&rules, .{ .status = 599, .headers = &.{} }, &out).len,
+    );
+
+    // The third rule's conjunction: status in the exact list AND the
+    // header predicate. An https redirect keeps only the unconditional
+    // edit; an http one gains the marker; a 303 is off the list.
+    const insecure = [_]H{H.init("location", "http://x/")};
+    const secure = [_]H{H.init("Location", "https://x/")};
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        collectResponseEdits(&rules, .{ .status = 301, .headers = &insecure }, &out).len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        collectResponseEdits(&rules, .{ .status = 301, .headers = &secure }, &out).len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        collectResponseEdits(&rules, .{ .status = 303, .headers = &insecure }, &out).len,
+    );
+}
+
+test "filter: the status-class vocabulary maps each token to its digit" {
+    // The enum's field names ARE the JSON tokens and its values the
+    // class digits — the loader leans on both, so pin the pairing.
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(StatusClass.@"1xx"));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(StatusClass.@"2xx"));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(StatusClass.@"3xx"));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(StatusClass.@"4xx"));
+    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(StatusClass.@"5xx"));
+    try std.testing.expectEqual(@as(usize, 5), @typeInfo(StatusClass).@"enum".fields.len);
 }
 
 test "filter: rewritePath reports Oversize when the result would not fit" {
