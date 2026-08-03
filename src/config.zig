@@ -389,11 +389,20 @@ pub const ValidationError = error{
     FilterHeaderNameInvalid,
     FilterHeaderNameReserved,
     FilterHeaderValueInvalid,
+    FilterClientEmpty,
+    FilterClientCidrInvalid,
+    FilterClientPrefixInvalid,
+    FilterClientPrefixTooNarrow,
+    FilterClientCidrHostBits,
     FilterActionsEmpty,
     FilterActionKind,
     FilterRejectStatus,
+    FilterRedirectStatus,
+    FilterRedirectTarget,
+    FilterRedirectSchemeUnknown,
     FilterHeaderEditsOverLimit,
     ResponseFilterReject,
+    ResponseFilterRedirect,
     ResponseFilterRewrite,
     ResponseFilterStatusInvalid,
     ResponseFilterStatusClassUnknown,
@@ -959,6 +968,8 @@ pub const MatchJson = struct {
     host: ?[]const u8 = null,
     path_prefix: ?[]const u8 = null,
     headers: ?[]const HeaderMatchJson = null,
+    /// Optional #177 client-address predicate: CIDR literals, any-of.
+    client: ?[]const []const u8 = null,
 
     pub const schema_doc = "Request-match predicate; every absent field matches anything.";
     pub const schema_fields = .{
@@ -971,6 +982,14 @@ pub const MatchJson = struct {
         .path_prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
         .headers = .{
             .desc = "Header predicates; all must match.",
+        },
+        .client = .{
+            .desc = "CIDR prefixes the connection's client address must fall inside " ++
+                "(any-of): \"10.0.0.0/8\", up to /32 for IPv4 and /64 for IPv6 — a " ++
+                "client's IPv6 identity is its /64, like hash source_ip. Matched " ++
+                "against the observed peer (the PROXY-announced client on a " ++
+                "proxy_protocol listener), never an X-Forwarded-For chain.",
+            .min_items = 1,
         },
     };
 };
@@ -1004,6 +1023,7 @@ pub const HeaderMatchJson = struct {
 /// cluster/routes fork uses — no JSON union parsing.
 pub const ActionJson = struct {
     reject: ?u16 = null,
+    redirect: ?RedirectJson = null,
     header_set: ?HeaderEditJson = null,
     header_add: ?HeaderEditJson = null,
     header_remove: ?[]const u8 = null,
@@ -1017,10 +1037,50 @@ pub const ActionJson = struct {
             .desc = "Reject the request with this status code.",
             .int_values = &filter.reject_statuses,
         },
+        .redirect = .{
+            .desc = "Answer the request with a redirect instead of forwarding it.",
+        },
         .header_set = .{ .desc = "Set (replace) a request header." },
         .header_add = .{ .desc = "Append a request header." },
         .header_remove = .{ .desc = "Remove a request header by name." },
         .rewrite_prefix = .{ .desc = "Rewrite the request path prefix before proxying." },
+    };
+};
+
+/// A `redirect` action's target (#176): a fixed `location` sent
+/// verbatim, or a composed one — scheme (required) and optionally host
+/// replaced, the request's own canonical path and query carried through
+/// so the config never restates them. Exactly one form.
+pub const RedirectJson = struct {
+    status: u16 = 301,
+    location: ?[]const u8 = null,
+    scheme: ?[]const u8 = null,
+    host: ?[]const u8 = null,
+
+    pub const schema_doc =
+        "Where a redirect sends the client: a fixed `location`, or a " ++
+        "composed target (`scheme` and optionally `host`) that carries the " ++
+        "request's own path and query through.";
+    pub const schema_fields = .{
+        .status = .{
+            .desc = "Redirect status: permanent/temporary x method-preserving.",
+            .int_values = &filter.redirect_statuses,
+        },
+        .location = .{
+            .desc = "Fixed Location value, sent verbatim; mutually exclusive " ++
+                "with scheme/host.",
+            .min_length = 1,
+        },
+        .scheme = .{
+            .desc = "Replacement scheme for a composed target. Required there — " ++
+                "never guessed, since behind a TLS terminator every hop this " ++
+                "proxy sees is plaintext.",
+            .enum_type = filter.Redirect.Scheme,
+        },
+        .host = .{
+            .desc = "Replacement canonical host for a composed target; absent " ++
+                "keeps the request's own.",
+        },
     };
 };
 
@@ -1508,7 +1568,7 @@ pub const dto_types = .{
     RewriteJson,        ClusterJson,       TimeoutsJson,             LimitsJson,
     AdminJson,          AccessLogJson,     CheckJson,                ClusterHashJson,
     ForwardedJson,      ProxyProtocolJson, ClusterProxyProtocolJson, EndpointJson,
-    ResponseFilterJson, ResponseMatchJson,
+    ResponseFilterJson, ResponseMatchJson, RedirectJson,
 };
 
 comptime {
@@ -1789,7 +1849,7 @@ fn countHeaderEdits(actions: []const filter.Action) u32 {
     for (actions) |action| {
         switch (action) {
             .header_set, .header_add, .header_remove => count += 1,
-            .reject, .rewrite_prefix => {},
+            .reject, .redirect, .rewrite_prefix => {},
         }
     }
     assert(count <= actions.len); // Edits are a subset of the actions.
@@ -1903,6 +1963,12 @@ fn resolveResponseEdit(action_json: *const ActionJson) ParseError!filter.Applied
     if (action_json.reject != null) {
         return error.ResponseFilterReject;
     }
+    if (action_json.redirect != null) {
+        // A redirect is a request-side answer (#176): the client asked
+        // and is sent elsewhere. An origin response already exists by
+        // the time these rules run.
+        return error.ResponseFilterRedirect;
+    }
     if (action_json.rewrite_prefix != null) {
         return error.ResponseFilterRewrite;
     }
@@ -1946,7 +2012,101 @@ fn resolveMatch(
     if (match_json.headers) |headers_json| {
         match.headers = try resolveHeaderMatches(arena, headers_json);
     }
+    if (match_json.client) |cidr_literals| {
+        match.clients = try resolveClientCidrs(arena, cidr_literals);
+    }
     return match;
+}
+
+/// Compile a `client` predicate's CIDR list (#177). An explicitly empty
+/// list is a mistake — absence already says "any client", unambiguously
+/// (the `FilterMethodEmpty` rule).
+fn resolveClientCidrs(
+    arena: std.mem.Allocator,
+    literals: []const []const u8,
+) ParseError![]const filter.Cidr {
+    if (literals.len == 0) {
+        return error.FilterClientEmpty;
+    }
+    assert(literals.len >= 1); // Past the empty guard.
+    const cidrs = try arena.alloc(filter.Cidr, literals.len);
+    for (literals, cidrs) |literal, *cidr| {
+        cidr.* = try resolveClientCidr(literal);
+    }
+    assert(cidrs.len == literals.len);
+    return cidrs;
+}
+
+/// One CIDR literal to its compiled prefix. The `/len` is mandatory — a
+/// bare address has no single meaning across families (an exact IPv4
+/// host is /32, but an exact IPv6 *client* is its /64), so the spelling
+/// that would need per-family folklore is refused instead. Host bits
+/// past the prefix must be zero: `10.0.0.1/8` is a typo for either
+/// `10.0.0.0/8` or `10.0.0.1/32`, and the loader cannot know which.
+fn resolveClientCidr(literal: []const u8) ParseError!filter.Cidr {
+    const slash = std.mem.indexOfScalar(u8, literal, '/') orelse
+        return error.FilterClientCidrInvalid;
+    const address_text = literal[0..slash];
+    const prefix_text = literal[slash + 1 ..];
+    if (prefix_text.len == 0) {
+        return error.FilterClientPrefixInvalid;
+    }
+    const prefix_len = std.fmt.parseUnsigned(u8, prefix_text, 10) catch
+        return error.FilterClientPrefixInvalid;
+    const address = std.Io.net.IpAddress.parse(address_text, 0) catch
+        return error.FilterClientCidrInvalid;
+    switch (address) {
+        .ip4 => |v4| {
+            if (prefix_len > 32) {
+                return error.FilterClientPrefixTooNarrow;
+            }
+            assert(prefix_len <= 32);
+            const bits = std.mem.readInt(u32, &v4.bytes, .big);
+            if (hostBitsSet(u32, bits, prefix_len)) {
+                return error.FilterClientCidrHostBits;
+            }
+        },
+        .ip6 => |v6| {
+            // A client's IPv6 identity is its /64 (`hash.key:
+            // source_ip`, §7): RFC 8981 rotates the interface half on a
+            // timer, so a narrower prefix names bits that will not mean
+            // the same client in an hour.
+            if (prefix_len > 64) {
+                return error.FilterClientPrefixTooNarrow;
+            }
+            assert(prefix_len <= 64);
+            const high = std.mem.readInt(u64, v6.bytes[0..8], .big);
+            const low = std.mem.readInt(u64, v6.bytes[8..16], .big);
+            if (low != 0) {
+                return error.FilterClientCidrHostBits;
+            }
+            assert(low == 0);
+            if (hostBitsSet(u64, high, prefix_len)) {
+                return error.FilterClientCidrHostBits;
+            }
+        },
+    }
+    // The compiled prefix `Cidr.contains` and `clientMatches` assert on
+    // their side of the seam, proven where it is produced.
+    assert(prefix_len <= 64 or address == .ip4);
+    return .{ .address = address, .prefix_len = prefix_len };
+}
+
+/// Whether any bit below the prefix is set — the host half that a
+/// canonical CIDR keeps zero.
+fn hostBitsSet(comptime T: type, bits: T, prefix_len: u8) bool {
+    const width = @bitSizeOf(T);
+    assert(prefix_len <= width);
+    if (prefix_len == 0) {
+        return bits != 0;
+    }
+    if (prefix_len == width) {
+        return false;
+    }
+    assert(prefix_len >= 1);
+    const shift: std.math.Log2Int(T) = @intCast(prefix_len);
+    const host_mask = (@as(T, std.math.maxInt(T)) >> shift);
+    return (bits & host_mask) != 0;
 }
 
 fn resolveHeaderMatches(
@@ -2008,15 +2168,16 @@ fn resolveActions(
 }
 
 /// Exactly one action field may carry the kind — the "exactly one of"
-/// fork both action resolvers share, so a sixth kind cannot be counted
-/// in one table and forgotten in the other.
+/// fork both action resolvers share, so a seventh kind cannot be
+/// counted in one table and forgotten in the other.
 fn requireOneActionKind(action_json: *const ActionJson) ParseError!void {
     const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
+        @intFromBool(action_json.redirect != null) +
         @intFromBool(action_json.header_set != null) +
         @intFromBool(action_json.header_add != null) +
         @intFromBool(action_json.header_remove != null) +
         @intFromBool(action_json.rewrite_prefix != null);
-    assert(set <= 5); // The action object has five kind fields.
+    assert(set <= 6); // The action object has six kind fields.
     if (set != 1) {
         return error.FilterActionKind;
     }
@@ -2030,6 +2191,9 @@ fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseEr
             return error.FilterRejectStatus;
         }
         return .{ .reject = status };
+    }
+    if (action_json.redirect) |redirect_json| {
+        return .{ .redirect = try resolveRedirect(&redirect_json) };
     }
     if (action_json.header_set) |edit| {
         return .{ .header_set = try resolveHeaderEdit(&edit) };
@@ -2045,6 +2209,46 @@ fn resolveAction(action_json: *const ActionJson, head_buffer_bytes: u32) ParseEr
     try validateRoutePrefix(rewrite.from, head_buffer_bytes);
     try validateRoutePrefix(rewrite.to, head_buffer_bytes);
     return .{ .rewrite_prefix = .{ .from = rewrite.from, .to = rewrite.to } };
+}
+
+/// Resolve a `redirect` action (#176). The target fork is exactly-one:
+/// a fixed `location`, or a composed target whose `scheme` is required
+/// — a host alone would leave the scheme guessed, and behind a TLS
+/// terminator the guess is wrong exactly when it matters.
+fn resolveRedirect(redirect_json: *const RedirectJson) ParseError!filter.Redirect {
+    if (!filter.isRedirectStatus(redirect_json.status)) {
+        return error.FilterRedirectStatus;
+    }
+    assert(filter.isRedirectStatus(redirect_json.status));
+    const has_location = redirect_json.location != null;
+    const has_composed = redirect_json.scheme != null or redirect_json.host != null;
+    if (has_location == has_composed) {
+        // Neither form, or both at once.
+        return error.FilterRedirectTarget;
+    }
+    if (redirect_json.location) |location| {
+        if (location.len == 0) {
+            return error.FilterRedirectTarget;
+        }
+        // A Location is a header value the render emits verbatim: the
+        // same injection-safety the header edits prove at load.
+        try validateHeaderValue(location);
+        return .{ .status = redirect_json.status, .target = .{ .location = location } };
+    }
+    const scheme_literal = redirect_json.scheme orelse {
+        // Host without scheme: half a composed target.
+        return error.FilterRedirectTarget;
+    };
+    const scheme = std.meta.stringToEnum(filter.Redirect.Scheme, scheme_literal) orelse
+        return error.FilterRedirectSchemeUnknown;
+    var composed: filter.Redirect.Composed = .{ .scheme = scheme };
+    if (redirect_json.host) |host| {
+        // Canonical like a route host: the Location's authority is a
+        // name the operator writes, and the same validation keeps it
+        // one the render can emit without a second look.
+        composed.host = try validateRouteHost(host);
+    }
+    return .{ .status = redirect_json.status, .target = .{ .composed = composed } };
 }
 
 /// Validate a name/value header edit shared by `header_set` and
@@ -2994,6 +3198,118 @@ test "config: a filter set over the header-edit budget is rejected" {
     try expectParseError(error.FilterHeaderEditsOverLimit, json);
 }
 
+test "config: redirect actions compile in both target forms" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","request_filters":[
+        \\   {"match":{"host":"www.example.com"},
+        \\    "actions":[{"redirect":{"status":308,"scheme":"https","host":"example.com"}}]},
+        \\   {"actions":[{"redirect":{"scheme":"https"}}]},
+        \\   {"match":{"path_prefix":"/gone"},
+        \\    "actions":[{"redirect":{"status":302,"location":"https://status.example.com/"}}]}
+        \\ ]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const rules = parsed.listeners[0].request_filters;
+    const canonical = rules[0].actions[0].redirect;
+    try std.testing.expectEqual(@as(u16, 308), canonical.status);
+    try std.testing.expectEqual(filter.Redirect.Scheme.https, canonical.target.composed.scheme);
+    try std.testing.expectEqualStrings("example.com", canonical.target.composed.host.?);
+    // Scheme-only composed, and the status defaults to the permanent one.
+    const to_https = rules[1].actions[0].redirect;
+    try std.testing.expectEqual(@as(u16, 301), to_https.status);
+    try std.testing.expectEqual(@as(?[]const u8, null), to_https.target.composed.host);
+    const fixed = rules[2].actions[0].redirect;
+    try std.testing.expectEqual(@as(u16, 302), fixed.status);
+    try std.testing.expectEqualStrings("https://status.example.com/", fixed.target.location);
+}
+
+test "config: redirect validation has its own errors" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
+    // Outside the closed set — 303 changes the method's meaning and has
+    // no proxy semantics here.
+    try expectParseError(error.FilterRedirectStatus, head ++ "{\"actions\":[{\"redirect\":{\"status\":303,\"scheme\":\"https\"}}]}]}]," ++ tail);
+    // Neither target form, both at once, half a composed one, and an
+    // empty literal: each is FilterRedirectTarget.
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"status\":301}}]}]}]," ++ tail);
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\",\"scheme\":\"https\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"host\":\"example.com\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterRedirectSchemeUnknown, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"ftp\"}}]}]}]," ++ tail);
+    // The composed host is a route host: canonical or refused.
+    try expectParseError(error.RouteHostNotCanonical, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\",\"host\":\"WWW.Example.com\"}}]}]}]," ++ tail);
+    // A literal Location is a header value the render emits verbatim:
+    // injection-safety is proven at load.
+    try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\\r\\nSet-Cookie: a\"}}]}]}]," ++ tail);
+    // Two kinds is still a kind error; a redirect on the way out is
+    // refused by name.
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\"},\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.ResponseFilterRedirect, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\"," ++
+        "\"response_filters\":[{\"actions\":[{\"redirect\":{\"scheme\":\"https\"}}]}]}]," ++ tail);
+}
+
+test "config: client CIDR predicates compile with their prefixes" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","request_filters":[
+        \\   {"match":{"path_prefix":"/admin","client":["10.0.0.0/8","192.168.1.0/24","2001:db8::/32"]},
+        \\    "actions":[{"reject":403}]},
+        \\   {"match":{"client":["0.0.0.0/0","::/0"]},
+        \\    "actions":[{"header_set":{"name":"X-Any","value":"1"}}]}
+        \\ ]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const clients = parsed.listeners[0].request_filters[0].match.clients;
+    try std.testing.expectEqual(@as(usize, 3), clients.len);
+    try std.testing.expectEqual(@as(u8, 8), clients[0].prefix_len);
+    try std.testing.expectEqual(@as(u8, 24), clients[1].prefix_len);
+    try std.testing.expectEqual(@as(u8, 32), clients[2].prefix_len);
+    // The /0 edge parses in both families: an explicit everyone, whose
+    // host-bits rule still demands an all-zero address.
+    const any = parsed.listeners[0].request_filters[1].match.clients;
+    try std.testing.expectEqual(@as(u8, 0), any[0].prefix_len);
+    try std.testing.expectEqual(@as(u8, 0), any[1].prefix_len);
+    // The compiled prefixes admit and refuse — proving address bytes
+    // survived the parse, not only the lengths.
+    const office = std.Io.net.IpAddress.parseLiteral("10.9.8.7:1") catch unreachable;
+    const stranger = std.Io.net.IpAddress.parseLiteral("11.0.0.1:1") catch unreachable;
+    try std.testing.expect(clients[0].contains(&office));
+    try std.testing.expect(!clients[0].contains(&stranger));
+}
+
+test "config: client CIDR validation has its own errors" {
+    const tail =
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
+    // An explicitly empty list: absence already says "any client".
+    try expectParseError(error.FilterClientEmpty, head ++ "{\"match\":{\"client\":[]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // A bare address has no single meaning across families (an exact
+    // IPv4 host is /32, an exact IPv6 client is its /64): the prefix is
+    // mandatory.
+    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.1\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"office/8\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/eight\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // Past the family's bound: /32 for v4; /64 for v6, where the low
+    // half is interface identity that rotates (RFC 8981).
+    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"10.0.0.0/33\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"2001:db8::/65\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    // Host bits set past the prefix: a typo for one of two different
+    // ranges, and the loader cannot know which.
+    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"10.0.0.1/8\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"2001:db8::1/48\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+}
+
 test "config: response filters compile into rules with matches and edits" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
@@ -3803,6 +4119,7 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 /// `drain_deadline_ms` gives it no path to that branch of the parser.
 const fuzz_seed_json =
     \\{"listeners":[{"bind":"127.0.0.1:8080","routes":[{"prefix":"/","cluster":"o"}],
+    \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]}],
     \\ "protocol":"http"}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],"pick":"p2c","max_inflight":8,

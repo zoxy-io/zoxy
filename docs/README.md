@@ -449,14 +449,60 @@ the list but the file you write.
 ]
 ```
 
-Match on `method`, `host`, `path_prefix`, and header predicates
-(`present` / `equals` / `contains`). Actions are `reject` with a status,
-`header_set` / `header_add` / `header_remove`, and `rewrite_prefix`.
+Match on `method`, `host`, `path_prefix`, header predicates
+(`present` / `equals` / `contains`), and `client` — CIDR ranges the
+connection's address must fall inside. Actions are `reject` with a status,
+`redirect`, `header_set` / `header_add` / `header_remove`, and
+`rewrite_prefix`.
 
 Rules compile into immutable tables at load time and are interpreted with
 bounded loops — no plugins, no scripting, nothing that can allocate or run
 unbounded. A rewrite changes only what is *forwarded*: routing already chose
 the cluster from the original path, so a rewrite never re-routes.
+
+#### Matching the client address
+
+The standard rule — `/admin` from the office range and nowhere else — is a
+`client` list on the allow rule and a reject beneath it:
+
+```json
+"request_filters": [
+    { "match": { "path_prefix": "/admin",
+                 "client": ["10.0.0.0/8", "192.168.1.0/24"] },
+      "actions": [{ "header_set": { "name": "X-Internal", "value": "1" } }] },
+    { "match": { "path_prefix": "/admin" }, "actions": [{ "reject": 403 }] }
+]
+```
+
+The address matched is the one zoxy actually believes: the TCP peer, or the
+PROXY-protocol-announced client on a listener that requires the header —
+never an `X-Forwarded-For` chain, which any client can write. Prefixes run
+to `/32` for IPv4 and `/64` for IPv6 (a client's IPv6 identity is its /64,
+the same rule sticky hashing uses), the `/len` is mandatory, and host bits
+past the prefix are rejected — `10.0.0.1/8` is a typo for one of two
+different ranges, and zoxy will not guess which.
+
+#### Redirects
+
+The two most common edge rules are one action each — no second server
+needed in front of a load balancer to answer them:
+
+```json
+"request_filters": [
+    { "actions": [{ "redirect": { "status": 301, "scheme": "https" } }] },
+    { "match": { "host": "www.example.com" },
+      "actions": [{ "redirect": { "status": 308, "scheme": "https",
+                                  "host": "example.com" } }] }
+]
+```
+
+A composed target replaces the scheme (required — zoxy never guesses it,
+since behind a TLS terminator every hop it sees is plaintext) and
+optionally the host; the request's own path and query are carried through.
+A fixed `location` is the other form, sent verbatim. Statuses are `301`,
+`302`, `307`, `308`. Redirects count as `zoxy_l7_redirected` and log as
+`redirected` — separate from rejects on purpose, so refused traffic and
+relocated traffic never blur.
 
 #### Response filters
 
