@@ -712,7 +712,7 @@ fn runPass(io: Io, port: u16, host: []const u8, pass: u32) !void {
                 );
                 return err;
             };
-            try expectResponse(response, origin_module.body.len);
+            try expectResponse(response, origin_module.body.len, .http);
         }
         assert(request == requests_per_connection);
     }
@@ -730,7 +730,7 @@ fn runPass(io: Io, port: u16, host: []const u8, pass: u32) !void {
             std.debug.print("smoke: pass {d} bulk request {d}: {t}\n", .{ pass, large, err });
             return err;
         };
-        try expectResponse(response, origin_module.large_body_bytes);
+        try expectResponse(response, origin_module.large_body_bytes, .http);
     }
     assert(large == large_requests);
 }
@@ -749,16 +749,22 @@ fn runL4Load(io: Io, port: u16, host: []const u8) !void {
             std.debug.print("smoke: l4 connection {d}: {t}\n", .{ index, err });
             return err;
         };
-        try expectResponse(response, origin_module.body.len);
+        try expectResponse(response, origin_module.body.len, .l4);
     }
     assert(index == l4_connections);
 }
+
+/// Which listener the exchange crossed, because the #175 stamp cuts both
+/// ways: the http leg re-renders the response head and must carry it,
+/// while the l4 leg's whole claim is byte transparency — the stamp there
+/// would mean L7 machinery leaked into the raw relay.
+const Leg = enum { http, l4 };
 
 /// The response the origin sent, checked byte-count and all: a hop that
 /// truncated or re-framed a body is a data-path bug this tier sees before
 /// any counter does — and the bulk target is where a hop is most likely
 /// to, since its body crosses the head buffer in more than one piece.
-fn expectResponse(response: client_module.Response, body_bytes: u32) !void {
+fn expectResponse(response: client_module.Response, body_bytes: u32, leg: Leg) !void {
     // The client parses both out of the wire and bounds them there; a
     // value outside those bounds reaching here would mean the two files
     // disagree about what a response is.
@@ -774,6 +780,19 @@ fn expectResponse(response: client_module.Response, body_bytes: u32) !void {
             .{ response.body_bytes, body_bytes },
         );
         return error.UnexpectedBody;
+    }
+    // The #175 stamp, judged per leg: on http its absence means the
+    // response edit path did not run on the real wire; on l4 its
+    // presence means the relay stopped being a relay.
+    switch (leg) {
+        .http => if (!response.edited) {
+            std.debug.print("smoke: http response carried no X-Zoxy-Smoke stamp\n", .{});
+            return error.ResponseEditMissing;
+        },
+        .l4 => if (response.edited) {
+            std.debug.print("smoke: l4-relayed response gained the X-Zoxy-Smoke stamp\n", .{});
+            return error.ResponseEditForged;
+        },
     }
 }
 
@@ -906,7 +925,10 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
         \\    "listeners": [
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }},
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http",
+        \\          "response_filters": [
+        \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
+        \\          ] }},
         \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }}
         \\    ],
         \\    "clusters": {{

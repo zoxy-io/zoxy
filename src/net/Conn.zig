@@ -301,9 +301,14 @@ pub fn Conn(comptime IoType: type) type {
         /// it has no path to match. Set once at admission and constant for
         /// the connection's life, so it survives keep-alive turnarounds.
         routes: []const router.Route,
-        /// The listener's §7 filter rules, same lifetime as `routes`
-        /// (empty on L4 and when no filters are configured).
-        filters: []const filter.Rule,
+        /// The listener's §7 request filter rules, same lifetime as
+        /// `routes` (empty on L4 and when no request filters are
+        /// configured).
+        request_filters: []const filter.Rule,
+        /// The listener's #175 response filter rules, same lifetime:
+        /// matched against the origin's parsed response head at the
+        /// re-render (empty on L4 and when none are configured).
+        response_filters: []const filter.ResponseRule,
         /// The listener's §7 client-address forwarding mode, same lifetime
         /// as `routes`; null leaves `X-Forwarded-For` untouched.
         forwarded: ?config_module.Config.Listener.Forwarded,
@@ -594,7 +599,8 @@ pub fn Conn(comptime IoType: type) type {
             // Placeholders until the admission tail installs the
             // listener's real tables (§7); L4 never reads them.
             conn.routes = &.{};
-            conn.filters = &.{};
+            conn.request_filters = &.{};
+            conn.response_filters = &.{};
             conn.forwarded = null;
             conn.upstream = null;
             conn.charged_endpoint = LogState.endpoint_none;

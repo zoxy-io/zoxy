@@ -235,6 +235,18 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
                 try out.write("string");
             }
         },
+        // An integer element (the response-match `status` list, #175):
+        // the bounds come from the field's own metadata, exactly as a
+        // scalar integer field's do.
+        .int => {
+            comptime assert(meta.minimum <= meta.maximum);
+            try out.objectField("type");
+            try out.write("integer");
+            try out.objectField("minimum");
+            try out.write(meta.minimum);
+            try out.objectField("maximum");
+            try out.write(meta.maximum);
+        },
         else => comptime unreachable,
     }
 }
@@ -430,6 +442,33 @@ test "config_schema: endpoint items accept both spellings" {
         weight.get("maximum").?.integer,
     );
     try std.testing.expectEqual(@as(i64, 0), weight.get("minimum").?.integer);
+}
+
+test "config_schema: response filter status bounds and class vocabulary" {
+    var buffer: [64 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+
+    const listener = parsed.value.object.get("properties").?.object
+        .get("listeners").?.object.get("items").?.object;
+    const response_filters = listener.get("properties").?.object
+        .get("response_filters").?.object;
+    const match = response_filters.get("items").?.object.get("properties").?.object
+        .get("match").?.object;
+    // The status list's items carry the loader's own bounds — the schema
+    // cannot promise a status the parser can never produce.
+    const status_items = match.get("properties").?.object
+        .get("status").?.object.get("items").?.object;
+    try std.testing.expectEqualStrings("integer", status_items.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 100), status_items.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, 599), status_items.get("maximum").?.integer);
+    // The class vocabulary is the closed enum, "1xx" through "5xx".
+    const class_values = match.get("properties").?.object
+        .get("status_class").?.object.get("enum").?.array;
+    try std.testing.expectEqual(@as(usize, 5), class_values.items.len);
+    try std.testing.expectEqualStrings("1xx", class_values.items[0].string);
+    try std.testing.expectEqualStrings("5xx", class_values.items[4].string);
 }
 
 test "config_schema: the method enum matches what the parser accepts" {

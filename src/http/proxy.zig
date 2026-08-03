@@ -435,7 +435,7 @@ pub fn Proxy(comptime IoType: type) type {
         ) error{Oversize}!Forwarded {
             const base = views.forward;
             assert(base.path.len >= 1);
-            if (conn.filters.len == 0) {
+            if (conn.request_filters.len == 0) {
                 return .{ .target = base, .edits = &.{} };
             }
             // The canonical *host* is still recomputed here, unlike the
@@ -460,7 +460,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .headers = request.headers,
             };
             // One scan yields both the rewrite and the header edits (§7).
-            const forward = filter.collectForward(conn.filters, view, edit_buffer);
+            const forward = filter.collectForward(conn.request_filters, view, edit_buffer);
             // Rewrite only origin-form targets; asterisk-form names no path.
             var target = base;
             if (views.origin_form) {
@@ -578,7 +578,7 @@ pub fn Proxy(comptime IoType: type) type {
             captureTarget(conn, keys.host, keys.views.match);
             // §7 filters run before routing: a policy reject stops the
             // request whether or not it would have routed.
-            if (filter.firstReject(conn.filters, .{
+            if (filter.firstReject(conn.request_filters, .{
                 .method = request.method,
                 .host = keys.host,
                 .path = keys.views.match,
@@ -1343,6 +1343,24 @@ pub fn Proxy(comptime IoType: type) type {
         /// head has vacated it) and forward the coalesced body excess
         /// straight from upstream.head — never copied through a relay
         /// buffer, so an oversized coalesced body is fine.
+        /// The #175 response edits for this exchange, gathered into the
+        /// caller's buffer: matched against the status and headers the
+        /// origin actually answered, and consumed by the render in the
+        /// same frame — the request side's `edit_buffer` discipline,
+        /// isolated here the way `planForward` isolates its half.
+        fn responseEdits(
+            conn: *const ConnType,
+            response: *const parser.ResponseHead,
+            out: []filter.AppliedHeaderEdit,
+        ) []const filter.AppliedHeaderEdit {
+            assert(out.len == constants.header_edits_max);
+            assert(conn.state == .l7_exchanging);
+            return filter.collectResponseEdits(conn.response_filters, .{
+                .status = response.status,
+                .headers = response.headers,
+            }, out);
+        }
+
         fn renderResponse(
             server: *ServerType,
             conn: *ConnType,
@@ -1356,11 +1374,17 @@ pub fn Proxy(comptime IoType: type) type {
             const keep_downstream = downstreamKeepAlive(server, conn, response);
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
+            var edit_buffer: [constants.header_edits_max]filter.AppliedHeaderEdit = undefined;
             const rendered = render.renderResponseHead(
                 response,
                 !keep_downstream,
+                responseEdits(conn, response, &edit_buffer),
                 headBytes(server, conn),
             ) catch {
+                // The head no longer fits — after the #175 edits, or
+                // never did: an origin response the proxy cannot
+                // re-render is not the client's fault, so 502, the
+                // same verdict an unparseable origin head earns.
                 upstreamFailed(server, conn);
                 return;
             };

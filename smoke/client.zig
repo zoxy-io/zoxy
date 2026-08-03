@@ -34,6 +34,10 @@ const response_headers_max: u32 = 64;
 pub const Response = struct {
     status: u16,
     body_bytes: u32,
+    /// Whether the head carried the #175 response-filter stamp the smoke
+    /// config sets unconditionally (`X-Zoxy-Smoke: 1`) — the live gate's
+    /// witness that the response edit path ran on this very hop.
+    edited: bool,
 };
 
 /// What a request says about its connection's future. HTTP/1.1's default
@@ -123,10 +127,10 @@ pub const Client = struct {
 /// the `Content-Length` promised.
 fn readResponse(reader: *Io.Reader) !Response {
     const status = try readStatus(reader);
-    const body_bytes = try readHeaders(reader);
-    assert(body_bytes <= response_body_bytes_max);
-    try reader.discardAll(body_bytes);
-    return .{ .status = status, .body_bytes = body_bytes };
+    const head = try readHeaders(reader);
+    assert(head.body_bytes <= response_body_bytes_max);
+    try reader.discardAll(head.body_bytes);
+    return .{ .status = status, .body_bytes = head.body_bytes, .edited = head.edited };
 }
 
 /// The three-digit status off the status line. A response that does not
@@ -145,20 +149,37 @@ fn readStatus(reader: *Io.Reader) !u16 {
     return status;
 }
 
+/// What the header walk found: the framing, and whether the #175 stamp
+/// was among the lines.
+const Head = struct {
+    body_bytes: u32,
+    edited: bool,
+};
+
 /// Header lines up to the blank one, returning the body length they
 /// framed. A head with no `Content-Length` is an error: the origin always
 /// sends one, so its absence means the hop reframed the response, which
-/// is exactly the kind of thing this tier exists to notice.
-fn readHeaders(reader: *Io.Reader) !u32 {
+/// is exactly the kind of thing this tier exists to notice. The #175
+/// stamp is scanned for on the same walk — spelled here rather than
+/// imported, like the counter names: the gate reads what the binary
+/// *wrote*, so a drift must fail loudly.
+fn readHeaders(reader: *Io.Reader) !Head {
     const length_name = "content-length:";
+    const stamp = "x-zoxy-smoke: 1";
     var body_bytes: ?u32 = null;
+    var edited = false;
     var lines: u32 = 0;
     while (lines < response_headers_max) : (lines += 1) {
         const taken = try reader.takeDelimiter('\n');
         const line = taken orelse return error.ResponseTruncated;
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) {
-            return body_bytes orelse error.ResponseUnframed;
+            const framed = body_bytes orelse return error.ResponseUnframed;
+            return .{ .body_bytes = framed, .edited = edited };
+        }
+        if (std.ascii.eqlIgnoreCase(trimmed, stamp)) {
+            edited = true;
+            continue;
         }
         if (trimmed.len <= length_name.len) continue;
         if (!std.ascii.startsWithIgnoreCase(trimmed, length_name)) continue;

@@ -424,12 +424,13 @@ connection to a sending cluster.
 
 ### Filters
 
-An `http` listener can carry a list of rules, evaluated top-down. Each has a
-match predicate — absent fields match anything — and actions applied in order.
-As with routes, nothing caps the list but the file you write.
+An `http` listener can carry `request_filters` — a list of rules evaluated
+top-down against each request. Each has a match predicate — absent fields
+match anything — and actions applied in order. As with routes, nothing caps
+the list but the file you write.
 
 ```json
-"filters": [
+"request_filters": [
     {
         "match": {
             "path_prefix": "/admin",
@@ -456,6 +457,38 @@ Rules compile into immutable tables at load time and are interpreted with
 bounded loops — no plugins, no scripting, nothing that can allocate or run
 unbounded. A rewrite changes only what is *forwarded*: routing already chose
 the cluster from the original path, so a rewrite never re-routes.
+
+#### Response filters
+
+`response_filters` edits the origin's response on the way out — the
+routine edge work an origin you do not control cannot do for you: add
+`Strict-Transport-Security`, strip `Server`, advertise a retry on 5xx.
+
+```json
+"response_filters": [
+    { "actions": [
+        { "header_remove": "Server" },
+        { "header_set": { "name": "Strict-Transport-Security",
+                          "value": "max-age=63072000" } }
+    ] },
+    { "match": { "status_class": "5xx" },
+      "actions": [{ "header_set": { "name": "Retry-After", "value": "1" } }] }
+]
+```
+
+A response rule matches on `status` (exact codes), `status_class`
+(`"1xx"` through `"5xx"`), and response-header predicates — the same
+`present` / `equals` / `contains` vocabulary. Its actions are the three
+header verbs only: `reject` and `rewrite_prefix` are request-side ideas,
+and the loader says so by name if you reach for them here.
+
+The same guardrails hold in both directions: filters may not touch the
+headers zoxy owns (`Content-Length`, `Transfer-Encoding`, `Connection`
+and the hop-by-hop set, `X-Forwarded-For`), and a response head that no
+longer fits after edits is answered `502` — an origin response the proxy
+cannot re-render is not the client's fault. Responses zoxy generates
+itself (`404`, `503`, filter rejects) are not origin responses and carry
+no edits.
 
 ### Timeouts
 

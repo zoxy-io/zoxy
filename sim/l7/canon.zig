@@ -19,6 +19,14 @@ pub const until_close_head = "HTTP/1.1 200 OK\r\n\r\n";
 pub const until_close_response = until_close_head ++ until_close_body;
 pub const truncated_response = sized_head ++ sized_body[0..16];
 
+/// The #175 response-filter edit every proxied response must carry, and
+/// the one no response may (its rule matches a class the origin never
+/// answers). One definition shared by the harness's rule table and the
+/// client's oracle, so the two cannot drift on a spelling.
+pub const response_edit_name = "X-Sim-Response";
+pub const response_edit_value = "on";
+pub const response_never_name = "X-Sim-Never";
+
 /// A parseable head that cannot survive the render: 8190 bytes fits the
 /// proxy's 8 KiB response buffer, but no Content-Length and no
 /// Transfer-Encoding makes it until-close framing, which forces a

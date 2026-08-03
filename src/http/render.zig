@@ -2,11 +2,13 @@
 //! *rendered* into a fixed staging buffer, never edited in place — the
 //! zero-copy slices of the source head stay valid throughout. Rendering
 //! strips hop-by-hop headers both ways (RFC 9110 §7.6.1), injects
-//! `Connection: close` when the proxy will close, and applies the §7
-//! filter header edits that matched the request. A head that no longer
-//! fits after rendering is oversize — 431 downstream, teardown upstream
-//! (§7) — which now includes a head that outgrows the buffer only once the
-//! edits are applied (the oversize-after-edits verdict).
+//! `Connection: close` when the proxy will close, and applies the filter
+//! header edits that matched — the §7 request rules on the way in, the
+//! #175 response rules on the way out, through one suppress-and-append
+//! mechanism. A head that no longer fits after rendering is oversize:
+//! 431 for a request (the client sent it), 502 for a response (the
+//! origin's answer is not the client's fault) — including a head that
+//! outgrows the buffer only once the edits are applied.
 
 const std = @import("std");
 const constants = @import("../constants.zig");
@@ -144,14 +146,21 @@ pub fn renderRequestHead(
 /// Renders the downstream status line and end-to-end headers. The
 /// origin's version and reason phrase are preserved verbatim;
 /// `inject_close` announces that the proxy will close the downstream
-/// connection after this response (§7).
+/// connection after this response (§7). `edits` are the matched
+/// response filters' header edits (#175), applied by the same
+/// suppress-and-append machinery the request render uses — empty when
+/// the listener configured none, which is most listeners. Overflow is
+/// the caller's 502: an origin response that cannot be re-rendered
+/// after edits is not the client's fault.
 pub fn renderResponseHead(
     response: *const parser.ResponseHead,
     inject_close: bool,
+    edits: []const filter.AppliedHeaderEdit,
     buffer: []u8,
 ) error{Oversize}![]const u8 {
     assert(response.status >= 100);
     assert(response.status <= 599);
+    assert(edits.len <= constants.header_edits_max);
     assert(buffer.len <= std.math.maxInt(u32));
 
     var staging = Staging{ .buffer = buffer };
@@ -165,12 +174,11 @@ pub fn renderResponseHead(
         try staging.append(message);
     }
     try staging.append("\r\n");
-    // Filters are request-side only (§7); the response carries no edits.
     try appendEndToEndHeaders(
         &staging,
         response.headers,
         response.connection_nominates_header,
-        &.{},
+        edits,
         false,
     );
     if (inject_close) {
@@ -584,17 +592,54 @@ test "render: response preserves status line and strips hop-by-hop" {
     const response = try parser.parseResponseHead(head, false, &storage, .get);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
 
-    const rendered = try renderResponseHead(&response, false, &buffer);
+    const rendered = try renderResponseHead(&response, false, &.{}, &buffer);
     try testing.expectEqualStrings(
         "HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nX-Origin: yes\r\n\r\n",
         rendered,
     );
 
-    const closed = try renderResponseHead(&response, true, &buffer);
+    const closed = try renderResponseHead(&response, true, &.{}, &buffer);
     try testing.expectEqualStrings(
         "HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nX-Origin: yes\r\n" ++
             "Connection: close\r\n\r\n",
         closed,
+    );
+}
+
+test "render: response edits suppress, replace and append (#175)" {
+    const head = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" ++
+        "Server: origin/1.0\r\nX-Keep: yes\r\n\r\n";
+    var storage: parser.HeaderStorage = undefined;
+    const response = try parser.parseResponseHead(head, false, &storage, .get);
+    var buffer: [oracle_buffer_bytes]u8 = undefined;
+
+    // A remove drops the origin's copy; a set replaces it at the append
+    // position; an add appends beside whatever survives — the same
+    // suppress-and-append machinery the request render proved.
+    const edits = [_]filter.AppliedHeaderEdit{
+        .{ .kind = .remove, .name = "server", .value = "" },
+        .{ .kind = .set, .name = "X-Keep", .value = "edited" },
+        .{ .kind = .add, .name = "Strict-Transport-Security", .value = "max-age=63072000" },
+    };
+    const rendered = try renderResponseHead(&response, false, &edits, &buffer);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" ++
+            "X-Keep: edited\r\n" ++
+            "Strict-Transport-Security: max-age=63072000\r\n\r\n",
+        rendered,
+    );
+
+    // The close injection lands after the edits, exactly as it lands
+    // after the origin's own headers.
+    const closed = try renderResponseHead(&response, true, &edits, &buffer);
+    try testing.expect(std.mem.endsWith(u8, closed, "Connection: close\r\n\r\n"));
+
+    // Growth from edits is a real overflow: the same head with an added
+    // header must report Oversize into a buffer sized for the original.
+    var tight: [head.len - 1]u8 = undefined;
+    try testing.expectError(
+        error.Oversize,
+        renderResponseHead(&response, false, &edits, &tight),
     );
 }
 
@@ -603,7 +648,7 @@ test "render: bare status line without a reason phrase round-trips" {
     const response = try parser.parseResponseHead("HTTP/1.0 204\r\n\r\n", false, &storage, .get);
     try testing.expectEqual(@as(?[]const u8, null), response.status_message);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderResponseHead(&response, false, &buffer);
+    const rendered = try renderResponseHead(&response, false, &.{}, &buffer);
     try testing.expectEqualStrings("HTTP/1.0 204\r\n\r\n", rendered);
 }
 
@@ -720,7 +765,7 @@ fn checkResponseRender(input: []const u8) void {
     var storage: parser.HeaderStorage = undefined;
     const response = parser.parseResponseHead(input, false, &storage, .get) catch return;
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderResponseHead(&response, false, &buffer) catch unreachable;
+    const rendered = renderResponseHead(&response, false, &.{}, &buffer) catch unreachable;
 
     var reparse_storage: parser.HeaderStorage = undefined;
     const reparsed = parser.parseResponseHead(rendered, false, &reparse_storage, .get) catch unreachable;
