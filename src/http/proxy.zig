@@ -35,6 +35,7 @@ const std = @import("std");
 
 const access_log = @import("../access_log.zig");
 const Balancer = @import("../balancer.zig").Balancer;
+const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
 const pump = @import("../net/pump.zig");
@@ -2298,17 +2299,75 @@ pub fn Proxy(comptime IoType: type) type {
                 !server.draining and
                 !server.keepAliveSuppressed();
             conn.state = .l7_responding;
-            // Straight from static memory (§8): the channel carries the slice
-            // and never copies it, so a shed still costs one send. Both
-            // spellings are comptime byte arrays; only the choice is runtime,
-            // and it must match what happens after the send — an announced
-            // close that kept serving, or a kept connection the client was
-            // told to stop using, are both §7 violations.
+            armStaticAnswer(server, conn, status, keep);
+        }
+
+        /// Send one static answer: the #159 configured page for this
+        /// status when the config carries one, the comptime-rendered
+        /// default otherwise — both straight from immutable memory (§8):
+        /// the channel carries the slice and never copies it, so a shed
+        /// still costs one send. The persistence choice is the caller's
+        /// and must match what happens after the send — an announced
+        /// close that kept serving, or a kept connection the client was
+        /// told to stop using, are both §7 violations. A HEAD request
+        /// gets a configured page's head-only prefix (same buffer, same
+        /// framing headers, RFC 9110's HEAD rule); the defaults carry
+        /// `Content-Length: 0`, where whole and prefix are one slice.
+        ///
+        /// The method is only *known* where a head parsed. On the rungs
+        /// that answer without one — the head-buffer shed (nothing was
+        /// ever read), a malformed head, an oversize URI — the method
+        /// reads as the reset default and an actual `HEAD` would be sent
+        /// a body it must not read. That cannot desync anything, and the
+        /// assert below is why: an unparsed head leaves
+        /// `request_head_len` at zero, `staticResponseResyncable`
+        /// refuses to keep on that, and a closing connection has no next
+        /// response for stray bytes to be mistaken for — the client
+        /// discards them with the FIN.
+        fn armStaticAnswer(
+            server: *ServerType,
+            conn: *ConnType,
+            comptime status: u16,
+            keep: bool,
+        ) void {
+            assert(conn.state == .l7_responding);
+            assert(!conn.l7.response_started);
+            // Keeping implies the head parsed (§7 resync), which is what
+            // makes the HEAD decision below sound wherever it matters.
+            if (keep) {
+                assert(conn.l7.request_head_len >= 1);
+            }
+            if (configuredPage(server, status)) |page| {
+                const head_only = conn.l7.request_method == .head;
+                const bytes = if (keep)
+                    (if (head_only) page.keep[0..page.keep_head_len] else page.keep)
+                else
+                    (if (head_only) page.close[0..page.close_head_len] else page.close);
+                const then: conn_module.ClientWrite.Then =
+                    if (keep) .next_request else .lingering_close;
+                armClientWrite(server, conn, bytes, then);
+                return;
+            }
             if (keep) {
                 armClientWrite(server, conn, shed.staticResponse(status, .keep), .next_request);
             } else {
                 armClientWrite(server, conn, shed.staticResponse(status, .close), .lingering_close);
             }
+        }
+
+        /// The #159 page configured for `status`, or null for the
+        /// comptime default. A linear scan: the table is bounded by the
+        /// closed static-status set (ten), and this runs only on the
+        /// verdict paths — never per proxied byte.
+        fn configuredPage(server: *const ServerType, status: u16) ?*const config_module.Config.StaticPage {
+            for (server.config.error_pages) |*page| {
+                assert(page.keep_head_len <= page.keep.len);
+                assert(page.close_head_len <= page.close.len);
+                if (page.status == status) {
+                    return page;
+                }
+            }
+            return null;
         }
 
         /// The #176 Location for a redirect verdict. A literal target is

@@ -381,6 +381,22 @@ pub const pick_name_bytes_max: u16 = 64;
 /// reserved slot cannot drift out of any of them.
 pub const response_edits_max: u16 = header_edits_max + 1;
 
+/// Upper bound on one configured body's bytes (#159) — file or inline,
+/// rejected at load. The bound is the scope boundary, not a tuning
+/// knob: below it, holding the bytes in the startup arena is the cheap
+/// answer (an error page whose delivery needed a pool would fail when
+/// it is needed most); above it you want the kernel page cache and a
+/// streaming mechanism, which is a different feature. It is also why
+/// the cost statement stays honest — scale-out is N processes behind
+/// SO_REUSEPORT, each holding its own copy, so 1 MiB here is N MiB on
+/// the box, printed per process in the banner's config-arena term.
+pub const body_bytes_max: u32 = 1024 * 1024;
+
+/// Upper bound on a configured body's *name* (#159) — an identifier an
+/// operator writes and error messages echo, bounded like
+/// `cluster_name_bytes_max` and for the same reason.
+pub const body_name_bytes_max: u16 = 64;
+
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
@@ -784,6 +800,11 @@ comptime {
     assert(endpoint_inflight_max >= upstream_slots_max);
     assert(header_edits_max >= 1);
     assert(response_edits_max == header_edits_max + 1);
+    assert(body_bytes_max >= 1);
+    // A body must fit the u32 lengths the render and the channel carry.
+    assert(body_bytes_max <= std.math.maxInt(u32) / 2);
+    assert(body_name_bytes_max >= 1);
+    assert(body_name_bytes_max == cluster_name_bytes_max); // one identifier rule
     assert(pick_name_bytes_max >= 1);
     // A pick name is a header-adjacent identifier; keeping it under the
     // host bound is the sanity relation "this is a name, not a payload".

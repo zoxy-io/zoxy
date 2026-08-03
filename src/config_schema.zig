@@ -116,8 +116,17 @@ fn writeFieldSchema(
             if (Base == config.PickJson) {
                 try writePickField(out);
             } else {
-                // Nested object; its description is the field's, written above.
-                try writeObjectBody(out, Base, false);
+                if (Base == config.BodiesJson) {
+                    try writeNamedMap(out, config.BodyJson);
+                } else {
+                    if (Base == config.ErrorPagesJson) {
+                        try writeNamedMap(out, null);
+                    } else {
+                        // Nested object; its description is the field's,
+                        // written above.
+                        try writeObjectBody(out, Base, false);
+                    }
+                }
             }
         },
         else => try writeShape(out, Base, meta),
@@ -352,6 +361,29 @@ fn writeClustersMap(out: *Stringify) Writer.Error!void {
     try out.beginObject();
     try writeObjectBody(out, config.ClusterJson, true);
     try out.endObject();
+}
+
+/// A #159 map field: string keys to either a nested object schema
+/// (`bodies`, whose values are `BodyJson`) or bare strings
+/// (`error_pages`, whose values are body names). Like `ClustersJson`,
+/// the maps carry custom `jsonParse`s the reflection cannot see, so
+/// their shapes are emitted by hand.
+fn writeNamedMap(out: *Stringify, comptime Value: ?type) Writer.Error!void {
+    try out.objectField("type");
+    try out.write("object");
+    try out.objectField("additionalProperties");
+    if (Value) |ValueType| {
+        try out.beginObject();
+        try writeObjectBody(out, ValueType, true);
+        try out.endObject();
+    } else {
+        try out.beginObject();
+        try out.objectField("type");
+        try out.write("string");
+        try out.objectField("description");
+        try out.write("Name of a configured body.");
+        try out.endObject();
+    }
 }
 
 /// The non-optional element type of `T`, or `T` itself if it is not an

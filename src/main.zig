@@ -210,9 +210,49 @@ fn readConfig(
         std.debug.print("zoxy: cannot read config '{s}': {t}\n", .{ config_path, err });
         return err;
     };
-    return zoxy.config.parse(arena, config_bytes) catch |err| {
+    // Body files (#159) are read through the loader's seam by the same
+    // startup-time reader the config file itself used — the one moment
+    // this process touches the filesystem for content (parse-once, §1).
+    var file_context: BodyFileContext = .{ .io = io };
+    return zoxy.config.parseWithFiles(arena, config_bytes, .{
+        .context = &file_context,
+        .read = readBodyFile,
+    }) catch |err| {
         std.debug.print("zoxy: invalid config '{s}': {t}\n", .{ config_path, err });
         return err;
+    };
+}
+
+const BodyFileContext = struct {
+    io: std.Io,
+};
+
+/// The loader's `FileSource.read` against the real filesystem: whole
+/// file into the arena, refused past `limit` — the loader turns that
+/// into the same verdict an oversized inline body earns.
+fn readBodyFile(
+    context: ?*anyopaque,
+    arena: std.mem.Allocator,
+    path: []const u8,
+    limit: u32,
+) error{ FileUnreadable, FileTooLarge, OutOfMemory }![]const u8 {
+    assert(path.len >= 1);
+    assert(limit >= 1);
+    const body_context: *BodyFileContext = @ptrCast(@alignCast(context.?));
+    return std.Io.Dir.cwd().readFileAlloc(
+        body_context.io,
+        path,
+        arena,
+        .limited(limit),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.FileTooLarge,
+        else => blk: {
+            // Which file and why, here where both are known: the
+            // loader's error names the verdict, not the path.
+            std.debug.print("zoxy: cannot read body file '{s}': {t}\n", .{ path, err });
+            break :blk error.FileUnreadable;
+        },
     };
 }
 
@@ -402,7 +442,7 @@ fn printBudgets(
     std.debug.print(
         \\  fds     {d} required (asserted against RLIMIT_NOFILE)
         \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
-        \\  config  {d} listener(s), {d} cluster(s), access log {s}
+        \\  config  {d} listener(s), {d} cluster(s), {d} error page(s), access log {s}
         \\
     , .{
         fds_required,
@@ -411,6 +451,10 @@ fn printBudgets(
         in_flight,
         config.listeners.len,
         config.clusters.len,
+        // Their rendered bytes live in the config arena term above —
+        // read and pre-rendered at load (#159), so the measured number
+        // already covers them; this count is what says why it grew.
+        config.error_pages.len,
         if (config.access_log_sink) |sink| @tagName(sink) else "off",
     });
 }
