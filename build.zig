@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     // src/main.zig reads its version from this module (also added to the
-    // ReleaseFast `release_zoxy` below, the other build of that same source).
+    // ReleaseSafe `release_zoxy` below, the other build of that same source).
     exe.root_module.addOptions("build_options", build_options);
     b.installArtifact(exe);
 
@@ -133,7 +133,7 @@ pub fn build(b: *std.Build) void {
 
     // §9 Tier 0.5: the live gate — the shipped binary, on a real kernel,
     // against a real origin, on every change. It drives the *default*
-    // build (the one `zig build` installs) rather than the ReleaseFast
+    // build (the one `zig build` installs) rather than the ReleaseSafe
     // one the bench uses: its verdicts are correctness equalities on real
     // output, so what a Debug build's extra checks add is worth more here
     // than the shipped binary's code generation, which Tier 1 is the gate
@@ -156,12 +156,10 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke", "Tier-0.5 live gate: the real binary against a live origin");
     smoke_step.dependOn(&smoke_run.step);
 
-    // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash),
-    // and the zoxy under test is a ReleaseFast build — matching the
-    // shipped binary — whatever -Doptimize says. ReleaseFast selects the
-    // LLVM backend (Zig 0.16's default for release modes), so hparse's
-    // SIMD paths are emitted; a Debug/self-hosted zoxy scalarizes them
-    // and would benchmark the wrong code.
+    // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash) as
+    // its load generator — that role stays ReleaseFast regardless of what
+    // zoxy itself ships as; it isn't the thing under test, it just needs
+    // to generate load fast enough not to be the bottleneck.
     const zrk_dependency = b.dependency("zrk", .{
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseFast,
@@ -173,16 +171,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseFast,
     });
-    // The ReleaseFast zoxy shared by the bench and the profiler, with its
-    // own ReleaseFast hparse instance (SIMD, not scalarized).
+    // The zoxy under test is ReleaseSafe — matching the shipped binary
+    // (release.yml) — whatever -Doptimize says for the default install.
+    // ReleaseSafe still selects the LLVM backend (Zig 0.16's default for
+    // every release mode, not just ReleaseFast), so hparse's SIMD paths
+    // are emitted; only a Debug/self-hosted zoxy scalarizes them and
+    // would benchmark the wrong code. hparse_fast_dependency keeps its
+    // name (distinguishing it from the module-tests' Debug hparse) even
+    // though it's no longer the *fastest* build mode.
     const hparse_fast_dependency = b.dependency("hparse", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseFast,
+        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
     });
     const zoxy_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .ReleaseSafe,
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
@@ -193,13 +197,15 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .ReleaseSafe,
             .imports = &.{
                 .{ .name = "zoxy", .module = zoxy_fast_module },
             },
         }),
     });
     release_zoxy.root_module.addOptions("build_options", build_options);
+    // The harness itself (drives zrk against release_zoxy over the wire)
+    // stays ReleaseFast for the same reason zrk/zio do above.
     const bench_exe = b.addExecutable(.{
         .name = "zoxy-bench",
         .root_module = b.createModule(.{
@@ -213,7 +219,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const bench_run = b.addRunArtifact(bench_exe);
-    // Drive the ReleaseFast zoxy, not the default-optimize install
+    // Drive the ReleaseSafe zoxy, not the default-optimize install
     // artifact — a Debug zoxy scalarizes hparse and benchmarks the wrong
     // binary (§9). bench/run.zig takes it via --zoxy.
     bench_run.addArg("--zoxy");
@@ -229,8 +235,8 @@ pub fn build(b: *std.Build) void {
 
     // §9 Tier 0: micro binaries for manual poop A/B; installed, never run
     // in CI (counter deltas on shared runners are noise). They reuse the
-    // ReleaseFast `zoxy_fast_module` defined above so the SIMD parser is
-    // what gets measured.
+    // ReleaseSafe `zoxy_fast_module` defined above so what gets measured
+    // (SIMD parser included) matches the shipped binary, checks and all.
     const micro_step = b.step("bench-micro", "Build Tier-0 micro binaries for poop A/B");
     for ([_][]const u8{ "pool_acquire_release", "relay_chunking", "l7_head_pipeline", "conn_touch_scaling" }) |micro_name| {
         const micro_exe = b.addExecutable(.{
@@ -238,7 +244,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("bench/micro/{s}.zig", .{micro_name})),
                 .target = target,
-                .optimize = .ReleaseFast,
+                .optimize = .ReleaseSafe,
                 .imports = &.{
                     .{ .name = "zoxy", .module = zoxy_fast_module },
                 },
@@ -247,12 +253,14 @@ pub fn build(b: *std.Build) void {
         micro_step.dependOn(&b.addInstallArtifact(micro_exe, .{}).step);
     }
 
-    // §9 Tier 0: pinned perf + flamegraph of zoxy under load. Two ReleaseFast
-    // binaries — the zoxy under test (shipped-binary fidelity) and the harness
-    // (bench/profile.zig) that spawns nginx + zoxy, pins zoxy to one core so
-    // the PMU and LBR call-graph stay on a single core type, drives zrk load,
-    // and folds perf into a flamegraph. Linux-only — perf/flamegraph/nginx
-    // live in the dev shell. Tooling in Zig, not bash (TIGER_STYLE §Tooling).
+    // §9 Tier 0: pinned perf + flamegraph of zoxy under load. The zoxy
+    // under test is ReleaseSafe (shipped-binary fidelity); the harness
+    // (bench/profile.zig) — which spawns nginx + zoxy, pins zoxy to one
+    // core so the PMU and LBR call-graph stay on a single core type,
+    // drives zrk load, and folds perf into a flamegraph — stays
+    // ReleaseFast, same reasoning as bench_exe above. Linux-only —
+    // perf/flamegraph/nginx live in the dev shell. Tooling in Zig, not
+    // bash (TIGER_STYLE §Tooling).
     const profile_harness = b.addExecutable(.{
         .name = "zoxy-profile-harness",
         .root_module = b.createModule(.{

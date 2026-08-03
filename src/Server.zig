@@ -146,10 +146,11 @@ pub fn Server(comptime IoType: type) type {
         log_headers_per_conn: u32,
         /// Highest armed-op count any one connection has reached (§8):
         /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and,
-        /// under runtime safety only (never in the shipped ReleaseFast
-        /// build), records the peak here, so a test can claim a race
-        /// co-armed exactly the budgeted worst case, not merely stayed
-        /// under it.
+        /// under runtime safety only (Debug and ReleaseSafe — the shipped
+        /// build is ReleaseSafe, see docs/IMPLEMENTATION_NOTES.md
+        /// "Shipping ReleaseSafe"), records the peak here, so a test can
+        /// claim a race co-armed exactly the budgeted worst case, not
+        /// merely stayed under it.
         armed_ops_peak: u8,
         /// The raw errno of the most recent kernel-pressure failure, or 0
         /// (§8). Reported as a gauge rather than a counter because it is a

@@ -7,9 +7,10 @@
 //! zrk load threads, the inherited nginx) is pinned off that core so the load
 //! generator never steals it.
 //!
-//! Run via `zig build profile`, which builds a ReleaseFast zoxy and passes its
-//! path as the first argument; perf, flamegraph and nginx come from the dev
-//! shell. Tooling stays in Zig, not bash (TIGER_STYLE): the perf orchestration
+//! Run via `zig build profile`, which builds a ReleaseSafe zoxy (matching the
+//! shipped binary) and passes its path as the first argument; perf,
+//! flamegraph and nginx come from the dev shell. Tooling stays in Zig, not
+//! bash (TIGER_STYLE): the perf orchestration
 //! and the perf-script -> stackcollapse -> flamegraph pipeline run as
 //! file-redirected child processes here rather than a shell pipe.
 
