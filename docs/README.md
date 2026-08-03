@@ -1,7 +1,8 @@
 # zoxy documentation
 
-How to configure and operate zoxy: every block a config can carry, what the
-proxy exposes while it runs, and what it does when a resource runs out.
+How to run, configure and operate zoxy: starting and replacing the process,
+every block a config can carry, what the proxy exposes while it runs, and
+what it does when a resource runs out.
 
 The **authoritative** surface — every field, enum and numeric bound — is the
 JSON Schema shipped as a release asset and emitted locally by `zig build
@@ -11,6 +12,8 @@ release. What follows is the tour; the *reasoning* behind each behavior lives
 in [DESIGN.md](DESIGN.md), which the bare `§` references point at.
 
 ## Running zoxy
+
+### The command line
 
 The binary takes exactly one argument, the path to a JSON config:
 
@@ -28,6 +31,13 @@ to something else. Packagers can name their own build with
 `zig build -Dbuild-id=…`. The same line opens the startup banner, which is
 what a bug report usually pastes.
 
+A config zoxy will not accept is refused before anything is bound: the
+process prints `zoxy: invalid config '<path>': <reason>` and exits `1`. That
+is what makes the replacement procedure below safe to run against a live
+port.
+
+### Signals
+
 The banner goes to stderr, and so does the `SIGUSR1` counter dump: stdout
 belongs to the access log, whose `stdout` sink must stay one uncontaminated
 JSON line per event.
@@ -42,12 +52,9 @@ A completed drain prints the counters one last time on its way out, so a
 process that exited cleanly leaves its final tally behind without anyone
 having to have scraped it.
 
-A config zoxy will not accept is refused before anything is bound: the
-process prints `zoxy: invalid config '<path>': <reason>` and exits `1`. That
-is what makes the replacement procedure below safe to run against a live
-port.
+### A minimal config
 
-A minimal config — one L4 listener forwarding to one origin:
+One L4 listener forwarding to one origin:
 
 ```json title="config.json"
 {
@@ -65,7 +72,7 @@ That is the whole file: every other block — `timeouts`, `limits`,
 you start with. [`config/example.json`](../config/example.json) is the same
 listener with health checks and the access log turned on.
 
-## Replacing a running instance
+### Replacing a running instance
 
 There is no reload. The pools, the ring and every table are sized from the
 config at startup and never grow, so nothing re-reads the file — which is why
@@ -125,6 +132,13 @@ where the old instance leaves afterwards.
 Config is parsed once at startup and never reloaded — a change is a process
 restart, which is consistent with scaling out as independent processes.
 Unknown fields are rejected rather than ignored.
+
+The sections below follow a request: what a **listener** accepts and which
+**cluster** it routes to, how that cluster picks an endpoint and protects it,
+who zoxy believes the client is, the edits and canned bodies applied at the
+edge, and last the process-wide `timeouts` and `limits`. Two further
+process-wide blocks, `admin` and `access_log`, are documented under
+[Observability](#observability) beside what they emit.
 
 ### Listeners
 
@@ -252,7 +266,7 @@ prefer `p2c`.
 The key is the *observed* client address, so behind another proxy or LB
 every connection carries that machine's address and the whole cluster
 hashes to one endpoint. See
-[Learning who the client is](#learning-who-the-client-is-proxy-protocol)
+[Learning it behind another proxy](#learning-it-behind-another-proxy-proxy-protocol)
 for how an `l4` listener recovers the real client.
 
 #### Sticky on a header
@@ -346,52 +360,23 @@ a live L4 connection are each one unit of work the backend is carrying.
 refusals — kept apart from `zoxy_l7_shed_upstream_slots`, which means zoxy
 ran out of its own slots and wants a wider pool rather than a busier backend.
 
-### Telling the origin who the client is
+### Who the client is
 
-Without this, everything behind zoxy sees zoxy — origin logs, IP
-allowlists, per-client rate limits. An `http` listener can add
-`X-Forwarded-For`:
+One address is consumed everywhere it matters — the `source_ip` hash pick,
+a filter's `client` match, the access log — and three blocks decide what it
+is and who hears it. They sit at different scopes (a listener learns and
+states it, a cluster states it to its origins) and are grouped here because
+a deployment that needs one usually needs another: learn the address first,
+then pass it on in whichever form the origin can read.
 
-```json
-{
-    "bind": "0.0.0.0:80",
-    "protocol": "http",
-    "cluster": "web",
-    "forwarded": { "mode": "replace" }
-}
-```
+#### Learning it behind another proxy (PROXY protocol)
 
-> [!IMPORTANT]
-> There is no default mode, on purpose. The two answers are each a security
-> bug in the other's position, and zoxy cannot tell from the inside which
-> position it is in.
-
-| mode | behaviour | use when |
-|---|---|---|
-| `replace` | state the peer zoxy observed, discard any inbound chain | **at the edge** — an inbound chain is client-controlled there, so honouring it lets a caller pick the address your allowlists then trust |
-| `append` | extend the inbound chain with the observed peer | **only behind proxies you own** — anywhere else this is the forgery above, appended to |
-
-Omit the block and the header is passed through untouched, exactly as
-before the feature existed.
-
-The carried chain is bounded: a chain grows by an address per hop and
-nothing in HTTP caps it, so past `forwarded_chain_bytes_max` (512) it is
-dropped *whole* — leaving the line stating only the observed peer, which
-is the safe direction, since a truncated chain reads as complete and
-isn't. `zoxy_forwarded_chain_dropped` counts that.
-
-Filters may not set `X-Forwarded-For`; the loader rejects it. A filter
-can only write a constant, so it would pin one fixed address to every
-client — which looks like forwarding and is the opposite of it.
-
-### Learning who the client is (PROXY protocol)
-
-The mirror problem: put a load balancer in front of zoxy and *zoxy* sees
-only the balancer. That breaks more than logging — a `source_ip`-keyed
-hash pick reads the client address, so behind an LB every connection hashes alike and
-the whole fleet lands on one endpoint. An `l4` listener can instead
-require each connection to open with a PROXY protocol header (v1 or v2 —
-what AWS NLB, GCP and HAProxy emit) announcing the real client:
+Put a load balancer in front of zoxy and *zoxy* sees only the balancer.
+That breaks more than logging — a `source_ip`-keyed hash pick reads the
+client address, so behind an LB every connection hashes alike and the
+whole fleet lands on one endpoint. An `l4` listener can instead require
+each connection to open with a PROXY protocol header (v1 or v2 — what
+AWS NLB, GCP and HAProxy emit) announcing the real client:
 
 ```json
 {
@@ -430,7 +415,45 @@ configured proxy is reaching the listener — exactly what the mode
 exists to refuse. `http` listeners reject the block for now: the L7
 receive phase does not exist yet.
 
-### Telling an origin who the client is (PROXY protocol)
+#### Telling an HTTP origin (X-Forwarded-For)
+
+The mirror problem: without this, everything *behind* zoxy sees zoxy —
+origin logs, IP allowlists, per-client rate limits. An `http` listener can
+add `X-Forwarded-For`:
+
+```json
+{
+    "bind": "0.0.0.0:80",
+    "protocol": "http",
+    "cluster": "web",
+    "forwarded": { "mode": "replace" }
+}
+```
+
+> [!IMPORTANT]
+> There is no default mode, on purpose. The two answers are each a security
+> bug in the other's position, and zoxy cannot tell from the inside which
+> position it is in.
+
+| mode | behaviour | use when |
+|---|---|---|
+| `replace` | state the peer zoxy observed, discard any inbound chain | **at the edge** — an inbound chain is client-controlled there, so honouring it lets a caller pick the address your allowlists then trust |
+| `append` | extend the inbound chain with the observed peer | **only behind proxies you own** — anywhere else this is the forgery above, appended to |
+
+Omit the block and the header is passed through untouched, exactly as
+before the feature existed.
+
+The carried chain is bounded: a chain grows by an address per hop and
+nothing in HTTP caps it, so past `forwarded_chain_bytes_max` (512) it is
+dropped *whole* — leaving the line stating only the observed peer, which
+is the safe direction, since a truncated chain reads as complete and
+isn't. `zoxy_forwarded_chain_dropped` counts that.
+
+Filters may not set `X-Forwarded-For`; the loader rejects it. A filter
+can only write a constant, so it would pin one fixed address to every
+client — which looks like forwarding and is the opposite of it.
+
+#### Telling an L4 origin (PROXY protocol)
 
 The send direction: an origin behind an `l4` relay has no header to read
 an address from — the relay is the whole point — so the only way to tell
@@ -458,7 +481,7 @@ Two consequences of the header being per *connection*:
 - Only `l4` listeners may route to a sending cluster. A pooled HTTP
   upstream is shared across clients, and a header naming one client
   would lie to every other — the loader rejects the pairing outright.
-  For HTTP origins, use [`forwarded`](#telling-the-origin-who-the-client-is)
+  For HTTP origins, use [`forwarded`](#telling-an-http-origin-x-forwarded-for)
   instead.
 - Health probes do not send the header. The dial-only `tcp` check is
   unaffected (it proves the port accepts and sends nothing), but an
@@ -521,12 +544,13 @@ The standard rule — `/admin` from the office range and nowhere else — is a
 ```
 
 The address matched is the one zoxy actually believes: the TCP peer, or the
-PROXY-protocol-announced client on a listener that requires the header —
-never an `X-Forwarded-For` chain, which any client can write. Prefixes run
-to `/32` for IPv4 and `/64` for IPv6 (a client's IPv6 identity is its /64,
-the same rule sticky hashing uses), the `/len` is mandatory, and host bits
-past the prefix are rejected — `10.0.0.1/8` is a typo for one of two
-different ranges, and zoxy will not guess which.
+[PROXY-protocol-announced client](#learning-it-behind-another-proxy-proxy-protocol)
+on a listener that requires the header — never an `X-Forwarded-For` chain,
+which any client can write. Prefixes run to `/32` for IPv4 and `/64` for
+IPv6 (a client's IPv6 identity is its /64, the same rule sticky hashing
+uses), the `/len` is mandatory, and host bits past the prefix are rejected
+— `10.0.0.1/8` is a typo for one of two different ranges, and zoxy will not
+guess which.
 
 #### Redirects
 
@@ -715,7 +739,8 @@ default 8 KiB.
 
 `cq_fill_eighths` trades connection ceiling for `io_uring` completion-queue
 burst headroom; `access_log_buffer_bytes` sizes the access log's staging
-buffers.
+buffers. What zoxy does when one of these pools runs out is
+[Under load](#under-load).
 
 ## Observability
 
