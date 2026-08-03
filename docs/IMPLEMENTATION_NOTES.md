@@ -1246,9 +1246,11 @@ Measured while sizing the nightly soak, 20k seeds on the dev box:
 **Debug 25 s, ReleaseSafe 88 s, ReleaseFast 3 s.** ReleaseSafe being
 3.5× *slower than unoptimized* is the surprise; it is unexplained and
 worth its own look if anything ever wants to ship ReleaseSafe. Nothing
-does today — release.yml builds `-Doptimize=ReleaseFast` — so this is a
-simulator-workload finding, not a production one, and the ~90 k req/s
-bench bands are unaffected.
+did at the time — release.yml built `-Doptimize=ReleaseFast` then — so
+this was a simulator-workload finding, not a production one, and the
+~90 k req/s bench bands were unaffected. (release.yml now ships
+ReleaseSafe — see "Shipping ReleaseSafe" below — but the sim gate itself
+stays on Debug regardless; that verdict doesn't change.)
 
 The actionable half is the build mode the sim gates run under. ReleaseFast
 is 8× faster than Debug and is exactly the wrong choice: it compiles
@@ -1259,6 +1261,50 @@ a performance argument as a disguise. ReleaseSafe keeps the assertions
 but loses to Debug on speed, so Debug is both the strictest and the
 fastest option available and there is no trade to make. Recorded so the
 soak's runtime is never "optimized" by changing its build mode.
+
+The 3.5× anomaly stayed unexplained — but it's a `sim/main.zig` seed-loop
+finding, not evidence about the proxy's own request-handling code; see
+"Shipping ReleaseSafe" below for what the production hot path actually
+does under it.
+
+## Shipping ReleaseSafe (2026-08-04)
+
+`release.yml` and every build.zig target that compiles zoxy's own code
+for measurement (`release_zoxy`, the Tier-0 micro binaries) moved from
+ReleaseFast to ReleaseSafe. Motivation: a security review found that
+`std.debug.assert` — which several bounds/invariant guards rely on as
+their *only* enforcement (`mem/Pool.zig`'s double-release guard,
+`net/Conn.zig`'s stale-completion generation check) — is UB-on-violation
+in ReleaseFast, not a panic, contradicting TIGER_STYLE.md's "assertions
+are always on" policy. No live trigger for either guard was found after
+tracing every call site, so this is a hardening move, not a hotfix.
+zrk/zio and the bench/profile harness binaries stayed ReleaseFast — they
+generate load, they aren't the thing under test.
+
+Given the sim finding above, the change shipped only after measuring the
+actual proxy, not by assuming the sim's 3.5× applied here. Procedure:
+`git worktree add` at the pre-change commit (ReleaseFast baseline),
+`zig build bench -- --rate 20000 --connections 32 --seconds 5` alternated
+3 rounds each between that worktree and the ReleaseSafe tree (§9 band
+procedure). Steady-state (20k req/s, ~100k requests/run, the
+high-volume/low-noise scenario): hop p50 zoxy L4 baseline [24,25]µs vs
+ReleaseSafe [24,27]µs, zoxy L7 baseline [18,24]µs vs ReleaseSafe
+[22,25]µs — bands overlap, no separation. Overload/churn band (256 conns
+vs 64 slots): completed throughput baseline {5017,5009,5007} vs
+ReleaseSafe {5007,5030,5007} req/s — indistinguishable. The large-body
+scenario (400 req/s, 100 MiB/s, only 2000 requests/run — noisiest band)
+looked separated after 2 rounds (baseline max 314µs vs ReleaseSafe min
+362µs) and collapsed to full overlap by round 3 (baseline max 360µs,
+ReleaseSafe min 362µs) — a clean in-session demonstration of why one or
+two runs isn't enough, matching the "run-to-run variance" note below.
+Confirms the prior CPU profiling (zoxy is syscall-bound, 98.6% of cycles
+in `io_uring_enter`, user code 1.26%): ReleaseSafe's added checks land in
+that thin user-code slice and don't move the wall-clock number. One real,
+minor difference: RSS under the overload scenario sat ~1440 KiB higher
+under ReleaseSafe (2128-2132 KiB baseline vs 3600-3604 KiB ReleaseSafe,
+each stable across its own 3 runs) — larger static code/metadata from the
+safety instrumentation, not a per-connection or growth-under-load cost
+(both stayed flat across their own churn window).
 
 ## The deadline rebase cancel reaches the expiry path (#65)
 

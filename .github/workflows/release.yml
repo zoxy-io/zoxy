@@ -79,7 +79,7 @@ jobs:
             # recognises and omits — a release says `zoxy 0.0.7` and
             # nothing else, whatever the checkout depth happens to be.
             devenv shell -- zig build \
-              -Dtarget="$zig_t" ${cpu:+-Dcpu="$cpu"} -Doptimize=ReleaseFast \
+              -Dtarget="$zig_t" ${cpu:+-Dcpu="$cpu"} -Doptimize=ReleaseSafe \
               -Dbuild-id="${{ steps.ver.outputs.tag }}" --prefix "out/$label"
             tar czf "dist/zoxy-$version-$label.tar.gz" -C "out/$label/bin" zoxy
             echo "::endgroup::"
