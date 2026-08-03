@@ -498,8 +498,8 @@ the list but the file you write.
 Match on `method`, `host`, `path_prefix`, header predicates
 (`present` / `equals` / `contains`), and `client` — CIDR ranges the
 connection's address must fall inside. Actions are `reject` with a status,
-`redirect`, `header_set` / `header_add` / `header_remove`, and
-`rewrite_prefix`.
+`redirect`, `respond` (answer from a configured body),
+`header_set` / `header_add` / `header_remove`, and `rewrite_prefix`.
 
 Rules compile into immutable tables at load time and are interpreted with
 bounded loops — no plugins, no scripting, nothing that can allocate or run
@@ -579,8 +579,64 @@ headers zoxy owns (`Content-Length`, `Transfer-Encoding`, `Connection`
 and the hop-by-hop set, `X-Forwarded-For`), and a response head that no
 longer fits after edits is answered `502` — an origin response the proxy
 cannot re-render is not the client's fault. Responses zoxy generates
-itself (`404`, `503`, filter rejects) are not origin responses and carry
-no edits.
+itself (`404`, `503`, filter rejects, a `respond` action's body) are not
+origin responses and carry no edits.
+
+### Response bodies
+
+Every status zoxy sends itself is empty by default. `bodies` names
+content once — from a file read at startup, or inline for one-liners —
+and anything that serves content references it by name:
+
+```json
+"bodies": {
+    "maintenance": { "file": "/etc/zoxy/503.html", "content_type": "text/html; charset=utf-8" },
+    "not-found":   { "file": "/etc/zoxy/404.html", "content_type": "text/html; charset=utf-8" },
+    "robots":      { "inline": "User-agent: *\nDisallow: /private\n",
+                     "content_type": "text/plain" }
+},
+"error_pages": { "404": "not-found", "503": "maintenance" }
+```
+
+Each name is read once and rendered once, however many places serve it —
+so the same maintenance page on `error_pages` and three filter rules is
+one buffer, and a name that does not exist is a startup error rather
+than a silently blank page. `content_type` is required: nothing is
+guessed from a filename. Files are read at startup like the rest of the
+config, so **changing one needs a restart**.
+
+`error_pages` accepts only the statuses zoxy actually sends — `400`,
+`403`, `404`, `414`, `429`, `431`, `501`, `502`, `503`, `504` — and a
+page for anything else is refused at load.
+
+Bodies live in memory, and that is the point rather than a shortcut: a
+`503` is raised *because* something ran out, so an error page whose
+delivery needed a resource would fail exactly when it is needed. The
+cost is bounded and visible — capped per body, counted in the startup
+banner, and paid once per worker process.
+
+**Listing a status is the opt-in, including for sheds.** Leave `503`
+out and overload behaves exactly as it does today; put it in and you
+have said you want the bytes. There is no second switch, because
+writing the page down is the decision.
+
+#### Serving a body directly
+
+```json
+"request_filters": [
+    { "match": { "path_prefix": "/robots.txt" },
+      "actions": [{ "respond": { "status": 200, "body": "robots" } }] },
+    { "match": { "host": "old.example.com" },
+      "actions": [{ "respond": { "status": 503, "body": "maintenance" } }] }
+]
+```
+
+`respond` answers from a body instead of forwarding — a `robots.txt`, a
+maintenance window, a health target the balancer serves itself. It stops
+the request like `reject` and `redirect` do, but counts as
+`zoxy_l7_responded` and logs as `responded`: refusing traffic and serving
+it are different facts, and neither should have to be subtracted from
+the other. Statuses are `200` plus the error set.
 
 ### Timeouts
 

@@ -1183,6 +1183,52 @@ origin, not one this proxy can pick for them.
   per-request — and it may do so only because its render runs after
   every read of those bytes: the Location is composed first, into the
   rewrite scratch, so nothing aliases what the render overwrites (§7).
+- **Those responses can carry a body, and bodies are a named table**
+  (#159, settled 2026-08-03). `bodies` maps a name to bytes — a `file`
+  read once at startup or an `inline` string, exactly one, plus the
+  `content_type` nothing infers — and every feature that serves content
+  references one *by name*: `error_pages` maps a status to a body,
+  a `respond` filter action answers with one. The indirection is the
+  design, not ceremony: one body is one read, one charge against the
+  cap, and one rendered buffer per (body, status) however many places
+  serve it, while a dangling name is a load error rather than a
+  silently empty page — the `clusters` idiom, applied to the same kind
+  of thing.
+  Each configured page is rendered **at load** into two complete
+  responses — both persistence variants, status line through body, one
+  contiguous arena buffer each — with the head length recorded so a
+  `HEAD` request sends that same buffer's prefix. Serving one is
+  therefore the comptime path unchanged: one send from immutable
+  memory, nothing acquired. That is the whole reason bodies live in
+  memory rather than being spliced from a file: an admitted `503` is
+  raised *because* a pool ran out, and an error page whose delivery
+  needed a pipe from another bounded pool would fail exactly when it is
+  needed. `body_bytes_max` caps a body and marks the scope boundary —
+  below it memory is the right answer, above it the page cache and a
+  streaming path are, which is a different feature. The cost is per
+  process, so N workers behind `SO_REUSEPORT` hold N copies; the banner
+  prints the page count beside the measured config arena that holds
+  them. A changed file needs a restart, like every other parse-once
+  input (§1).
+  Configuring a status is the **whole opt-in**, sheds included. A `503`
+  does not grow a body by default: the cost is not arena bytes but
+  kernel socket-buffer bytes, which §5 explicitly leaves outside the
+  closed form, multiplied by the shed rate at the moment the proxy is
+  under most pressure. Writing the page down is the operator saying
+  they want that, so a second `send_body_on_shed` switch would only
+  override a decision the config already expresses — the reasoning that
+  makes `forwarded` an absent block rather than a `mode: "off"`.
+  The `respond` action is the same machinery pointed at a different
+  question: a maintenance page, a `robots.txt`, a health target served
+  by the balancer itself. It is terminal like `reject` and `redirect`
+  and stops the request before routing acquires anything, but it is
+  deliberately *not* a body on `reject`: a reject is policy refusing
+  traffic and a respond is this proxy being the origin, so they keep
+  separate counters (`l7_responded`) and separate access-log outcomes
+  (`responded`). Its status set is the error statuses plus `200`, the
+  one status no rung raises. Response filters (#175) cannot carry the
+  action at all — those rules run when an origin response already
+  exists, and replacing it is not an edit.
 - **A shed keeps the connection when it can.** Closing is not free: it
   costs the client a handshake and this proxy an accept, a conn slot and
   an admission — so an always-closing shed is *more* expensive per
@@ -1571,7 +1617,7 @@ src/
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
   balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)
-  shed.zig            // exhaustion ladder: decisions + static responses
+  shed.zig            // exhaustion ladder: decisions + static responses (incl. configured pages, #159)
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
   admin.zig           // admin/metrics listener: one reserved scrape slot (§8)
   access_log.zig      // JSON access log: double-buffered sink, drop rung (§8)
