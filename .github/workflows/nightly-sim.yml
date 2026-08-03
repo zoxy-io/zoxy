@@ -212,13 +212,31 @@ jobs:
           # for the verdict.
           seeds_failed=$(grep -oE '^sim: [0-9]+ seed\(s\) failed: .*' "sweep-${SHARD}.log" \
             | sed 's/^.*failed: //' | head -1 || true)
+          # A shard can fail with every seed passing: the §9 census is a
+          # verdict about the whole range, not about one schedule, so it
+          # names no seed. Its line is the only thing that says what
+          # broke, and without carrying it the report can do no better
+          # than "something failed, go read the log" — which is what it
+          # used to say. Anchored like the lines above.
+          census_reason=$(grep -oE '^sim census: .*' "sweep-${SHARD}.log" | head -1 || true)
           swept_last=$(grep -oE '^sim: swept [0-9]+\.\.[0-9]+' "sweep-${SHARD}.log" \
             | grep -oE '[0-9]+$' | head -1 || true)
+          # A census failure sweeps its whole slice and *then* fails on
+          # the aggregate, so it prints neither of the lines above — it
+          # names its range on its own line. Without reading it the
+          # branch below would take a shard where every seed held for a
+          # shard that crashed, and credit it zero verified seeds.
+          census_last=$(grep -oE '^sim: [0-9]+ seed\(s\) ran, [0-9]+\.\.[0-9]+, census FAILED' \
+            "sweep-${SHARD}.log" | sed -E 's/.*\.\.([0-9]+), census FAILED$/\1/' | head -1 || true)
           extent=exact
           if [ -z "$swept_last" ]; then
             if [ "$status" -eq 0 ]; then
               # A clean pass prints no `swept` line; the whole slice is done.
               swept_last="$shard_last"
+            elif [ -n "$census_last" ]; then
+              # Every seed in the slice held; what failed was the census
+              # over their totals. The coverage is real and exact.
+              swept_last="$census_last"
             else
               # Neither summary line: the sim panicked rather than
               # returning, so `keep-going` never ran and how far this
@@ -249,9 +267,10 @@ jobs:
             --arg kind "$kind" \
             --arg extent "$extent" \
             --arg seeds "$seeds_failed" \
+            --arg reason "$census_reason" \
             '{shard: $shard, start: $start, last: $last, swept_last: $swept_last,
               status: $status, elapsed: $elapsed, capped: $capped, kind: $kind,
-              extent: $extent,
+              extent: $extent, reason: $reason,
               failed: ($seeds | split(" ") | map(select(length > 0) | tonumber))}' \
             > "result-${SHARD}.json"
           cat "result-${SHARD}.json"
@@ -307,6 +326,12 @@ jobs:
           capped=$(echo "$records" | jq '[.[] | select(.capped)] | length')
           seeds=$(echo "$records" | jq -r '[.[] | .failed[]] | sort | .[0:20] | join(" ")')
           total_seeds=$(echo "$records" | jq '[.[] | .failed | length] | add // 0')
+          # The census verdicts, deduplicated: shards sweep disjoint
+          # slices, so two hitting the same rung is one finding stated
+          # twice. `// ""` because a record written before this field
+          # existed is still a valid record.
+          reasons=$(echo "$records" \
+            | jq -r '[.[] | select((.reason // "") != "") | .reason] | unique | .[0:3] | join("\n")')
           missing=$(( SHARDS - reported ))
           unknown=$(echo "$records" | jq '[.[] | select(.extent == "unknown")] | length')
           elapsed=$(echo "$records" | jq '[.[] | .elapsed] | max // 0')
@@ -331,8 +356,16 @@ jobs:
             if [ "$total_seeds" -gt 0 ]; then
               detail=$(printf '%s of %s shards failed, naming %s seed(s)%s. Replay any of them exactly:\n```\nzig build sim -- <seed> 1\n```\nSeeds: `%s`' \
                 "$failing" "$SHARDS" "$total_seeds" "$shown" "$seeds")
+            elif [ -n "$reasons" ]; then
+              # Every seed held and the sweep still failed: a §9 census
+              # verdict, which is about the range rather than any one
+              # schedule. There is no seed to replay, so the reason is
+              # the whole finding — print it rather than sending someone
+              # to the log for a line we already have.
+              detail=$(printf '%s of %s shards failed with every seed holding — a §9 census verdict, so there is no seed to replay:\n```\n%s\n```' \
+                "$failing" "$SHARDS" "$reasons")
             else
-              detail=$(printf '%s of %s shards failed without naming a seed — see the run log.' \
+              detail=$(printf '%s of %s shards failed without naming a seed or a census verdict — see the run log.' \
                 "$failing" "$SHARDS")
             fi
             if [ "$capped" -gt 0 ]; then

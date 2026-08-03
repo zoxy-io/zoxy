@@ -433,6 +433,42 @@ protected was available more cheaply. Reversed deliberately, no knob:
 - SimIo keeps zeroing its slab — that was never residency, it is seed
   determinism (a replayed schedule must see identical bytes).
 
+## The simulator runs fastest in Debug — why, not just that (2026-08-03)
+
+That Debug beats ReleaseSafe here was measured on 2026-07-28 and
+recorded where the decision lives, in `nightly-sim.yml`'s build step
+(20k seeds: Debug 25 s, ReleaseSafe 88 s, ReleaseFast 3 s). Re-measured
+2026-08-03 when the question came up again — 20k seeds, raw binaries,
+no build overhead — it reproduces, and `perf` now says *why*, which the
+original note could not:
+
+| build | wall | instructions | cache misses |
+|---|---|---|---|
+| Debug (self-hosted backend) | 21.0 s | 7.73e9 | 1.88e8 |
+| ReleaseSafe (LLVM) | 65.8 s | 6.84e10 | 1.68e8 |
+
+Nearly nine times the instructions for identical work, with *fewer*
+cache misses — so it is not memory traffic, which rules out the first
+hypothesis (the `undefined` 0xaa fill over the harness's large
+structs). The optimized build simply emits far more work per
+operation; the likely cause is the safety checks LLVM materializes that
+the self-hosted Debug backend does not, amplified by inlining. Not
+chased past that: the verdict does not depend on the mechanism, and the
+instruction ratio is the part worth knowing — it says the gap is code
+generation, not the machine or the workload.
+
+ReleaseFast is not the fallback, for the reason the workflow already
+gives: it compiles `assert` out entirely, and a sweep with no
+assertions checks the oracles and nothing else — §9's density is most
+of what a seed is for.
+
+So Debug is not a leftover, it is the fast mode, and the sweep's cost
+is what it is: ~4.8 s for `ci`'s 4096 seeds, ~115 s for 100 000, and
+~800-1060 seeds/s on the nightly's shared runners (measured across the
+four shards of run 30789778589). Do not re-propose an optimize-mode
+change without re-measuring this table; if the self-hosted backend's
+safety coverage ever changes, that is the thing to re-check first.
+
 ## Pre-block spin — rejected (2026-07-12)
 
 Spinning before the loop blocks: p50 +15–25 µs *worse* and CPU ×2. The

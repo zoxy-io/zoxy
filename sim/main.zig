@@ -59,7 +59,7 @@ const failures_max: u8 = 16;
 /// not move — but that is what re-measuring them was for.
 const census_iterations_min: u64 = 1024;
 
-/// A counter the sweep expects to stay at zero, and why.
+/// A counter the sweep expects to stay at (or under) zero, and why.
 const Uncovered = struct {
     name: []const u8,
     why: Why,
@@ -67,20 +67,54 @@ const Uncovered = struct {
     /// non-zero reading would mean. Printed when the entry's claim stops
     /// holding, so it has to read as an argument rather than a label.
     reason: []const u8,
+    /// How often this may fire and still hold. Almost every entry says
+    /// `.never`, and that is the whole table's usual claim.
+    ///
+    /// The exception is an alarm for a regression that would fire
+    /// *constantly*, guarding an event that is legal and vanishingly
+    /// rare. There the honest claim is a rate, not zero: "never" was
+    /// only ever true at the sweep sizes we had run, and a nightly soak
+    /// large enough to see the rare event would fail on the legal case
+    /// while the regression it guards against is orders of magnitude
+    /// louder. Scaling the allowance with the sweep is what keeps the
+    /// two apart at every size.
+    allowance: Allowance = .never,
 
     /// The two reasons an entry is here. They look identical to the gate
-    /// — both must read zero — and want opposite things from whoever the
-    /// gate wakes, so the remedy is printed from this rather than assumed.
+    /// — both are bounded by their allowance — and want opposite things
+    /// from whoever the gate wakes, so the remedy is printed from this
+    /// rather than assumed.
     const Why = enum {
         /// No scenario reaches it. A non-zero reading is good news: some
         /// scenario grew, and the entry has outlived its argument.
         unreached,
-        /// It can be reached and must not be. A non-zero reading is a bug
-        /// report, and deleting the entry would be deleting the alarm.
+        /// It can be reached and must not be, past its allowance. A
+        /// reading over that is a bug report, and deleting the entry
+        /// would be deleting the alarm.
         must_stay_zero,
     };
 
-    /// What to tell the reader when this entry's counter fires.
+    const Allowance = union(enum) {
+        never,
+        /// At most one per this many seeds, plus one — so a small sweep
+        /// tolerates a single occurrence of a rare legal event and a
+        /// large one scales with its own size, rather than the gate
+        /// becoming stricter the longer it runs.
+        at_most_one_per: u64,
+
+        fn limit(allowance: Allowance, iterations: u64) u64 {
+            return switch (allowance) {
+                .never => 0,
+                .at_most_one_per => |per| blk: {
+                    assert(per >= 1);
+                    break :blk 1 + iterations / per;
+                },
+            };
+        }
+    };
+
+    /// What to tell the reader when this entry's counter fires past its
+    /// allowance.
     fn remedy(entry: *const Uncovered) []const u8 {
         return switch (entry.why) {
             .unreached => "a scenario now reaches it, so delete this entry",
@@ -111,11 +145,19 @@ const uncovered = [_]Uncovered{
     .{
         .name = "health_probe_deadline_raced",
         .why = .must_stay_zero,
+        // Legal and vanishingly rare, so the claim is a rate: the
+        // nightly soak saw it once in a million seeds (run
+        // 30789778589), where "never" had held for every 4096-seed
+        // sweep before it. One per 100k leaves ten times the observed
+        // rate as headroom and still sits five orders of magnitude
+        // under the regression, which fires more than once per seed.
+        .allowance = .{ .at_most_one_per = 100_000 },
         .reason = "the §4 race it counts — a probe deadline firing after its " ++
-            "own cancel was issued — is legal but has never occurred in a " ++
-            "sweep, while a prober that stopped cancelling at all reports " ++
-            "every verdict correctly and moves only this. That is #130 " ++
-            "exactly. Measured: 0 with the fix, 4760 with it reverted",
+            "own cancel was issued — is legal and vanishingly rare (once in " ++
+            "a million seeds), while a prober that stopped cancelling at all " ++
+            "reports every verdict correctly and moves only this. That is " ++
+            "#130 exactly. Measured: 1 per million with the fix, 4760 per " ++
+            "4096 seeds with it reverted",
     },
     .{
         .name = "l7_headers_too_large",
@@ -336,9 +378,14 @@ const Census = struct {
     /// sentence twice: a silent rung wants a scenario that reaches it, and
     /// a fired entry wants either its deletion or a bug fixed, depending
     /// on which kind of entry it was (`Uncovered.remedy`).
-    fn verify(census: *const Census) bool {
+    fn verify(census: *const Census, iterations: u64) bool {
+        assert(iterations >= census_iterations_min);
         var held = true;
         var fired: usize = 0;
+        // Exempt entries that fired *within* their allowance — the rare
+        // legal ones. Counted so the partition below stays exact
+        // instead of being loosened to an inequality.
+        var allowed_fired: usize = 0;
         for (Counters.names, census.totals) |name, total| {
             if (total != 0) fired += 1;
             const entry = entryFor(name);
@@ -351,21 +398,29 @@ const Census = struct {
                 held = false;
             }
             if (entry) |exempt| {
-                if (total != 0) {
+                const limit = exempt.allowance.limit(iterations);
+                if (total > limit) {
                     std.debug.print(
-                        "sim census: {s} fired {d} time(s), and should not have.\n" ++
-                            "  why: {s}\n  do: {s}\n",
-                        .{ name, total, exempt.reason, exempt.remedy() },
+                        "sim census: {s} fired {d} time(s) against an allowance " ++
+                            "of {d}, and should not have.\n  why: {s}\n  do: {s}\n",
+                        .{ name, total, limit, exempt.reason, exempt.remedy() },
                     );
                     held = false;
+                }
+                if (total != 0 and total <= limit) {
+                    allowed_fired += 1;
                 }
             }
         }
         assert(fired <= Counters.names.len);
+        assert(allowed_fired <= uncovered.len);
         // The verdict restated as a partition: holding means the set that
-        // fired is exactly the complement of the exemption table — not
-        // merely that no single name was caught on the wrong side.
-        if (held) assert(fired == Counters.names.len - uncovered.len);
+        // fired is exactly the complement of the exemption table — plus
+        // whichever exempt entries fired inside their allowance, which
+        // is the one way a name can honestly be on both sides.
+        if (held) {
+            assert(fired == Counters.names.len - uncovered.len + allowed_fired);
+        }
         return census.verifyOps() and held;
     }
 
@@ -541,7 +596,7 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         });
         return true;
     }
-    if (!census.verify()) return false;
+    if (!census.verify(options.iterations)) return false;
     std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} seam op(s), {d} exempt\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
