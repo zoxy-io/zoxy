@@ -1678,6 +1678,7 @@ src/
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
   tls/
+    Engine.zig        // ztls wrapper: sans-I/O TLS 1.3 seam, pooled (§4, §5)
     Credentials.zig   // per-listener PEM chain + signing key, parsed once (§4)
     libcrypto_heap.zig // libcrypto's mallocs into one fixed startup buffer (§4, §5)
   balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)

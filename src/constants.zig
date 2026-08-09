@@ -206,6 +206,42 @@ comptime {
 /// into is sized from it.
 pub const tls_record_plaintext_bytes_max: u32 = 16 * 1024;
 
+/// The most ciphertext one TLS read takes off the socket. A cap, not a
+/// capability: the engine's record buffer holds more, but what a single
+/// read may deliver is what bounds a single decrypt's *output*, and that
+/// output needs somewhere to land. One max record keeps a full-size
+/// record a one- or two-read affair while holding the plaintext
+/// destination to twice a record (§4).
+pub const tls_read_chunk_bytes: u32 = tls_record_plaintext_bytes_max;
+
+/// The most plaintext zoxy hands the engine to encrypt at once. Emitting
+/// smaller records than a peer would accept is always legal — no
+/// negotiation, no conformance risk — and it is what keeps the engine's
+/// outbound staging a fixed size instead of a function of
+/// `limits.head_buffer_bytes`, which the operator may set to 1 MiB. Set
+/// to the relay buffer's size so an L4 chunk crosses in one record.
+pub const tls_app_chunk_bytes: u32 = relay_buffer_bytes;
+
+comptime {
+    // A read that could not hold a record header plus something would
+    // make progress impossible on a full-size record.
+    assert(tls_read_chunk_bytes >= 1024);
+    assert(tls_app_chunk_bytes >= 1024);
+    // Both are plaintext quantities the record layer must be able to
+    // carry; past the record ceiling neither has a legal framing.
+    assert(tls_read_chunk_bytes <= tls_record_plaintext_bytes_max);
+    assert(tls_app_chunk_bytes <= tls_record_plaintext_bytes_max);
+}
+
+/// The ceiling on one TLS engine's own footprint, asserted against
+/// `@sizeOf(Engine)` in `src/tls/Engine.zig` (§5: a budget is a stated
+/// number a thing must fit, not a number read back off whatever it grew
+/// to). Measured at 132 KiB — mostly ztls's record and reassembly
+/// buffers, each two max records wide — with the headroom here for a pin
+/// that adds a field. A bump past this is a deliberate re-costing of the
+/// engine pool, which is what tripping the assert makes it.
+pub const tls_engine_bytes_max: u32 = 160 * 1024;
+
 /// Bounded per-head header array. Overflowing it is load, not malice: it
 /// maps to 431, distinguishable from malformed input's 400 (§7).
 pub const headers_max: u16 = 64;

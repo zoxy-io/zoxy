@@ -31,6 +31,7 @@ pub const shed = @import("shed.zig");
 /// only place libcrypto is reachable from — lint-enforced.
 pub const tls = struct {
     pub const Credentials = @import("tls/Credentials.zig");
+    pub const Engine = @import("tls/Engine.zig");
 };
 /// Shared test-support harness pieces, factored out so multiple test
 /// suites can drive the same origin double instead of growing their own.
@@ -55,6 +56,8 @@ test {
     _ = Server;
     _ = shed;
     _ = tls.Credentials;
+    _ = tls.Engine;
+    _ = @import("tls/engine_test.zig");
     _ = @import("tls/spike_test.zig");
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
