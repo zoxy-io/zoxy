@@ -15,6 +15,7 @@ const parser = @import("../http/parser.zig");
 const router = @import("../http/router.zig");
 const filter = @import("../http/filter.zig");
 const relay = @import("relay.zig");
+const TlsEngine = @import("../tls/Engine.zig");
 const upstream_module = @import("upstream.zig");
 
 const assert = std.debug.assert;
@@ -297,6 +298,25 @@ pub fn Conn(comptime IoType: type) type {
         /// half — and zeroes it at hand-over, so the relay starts clean
         /// and the L7 meaning is never mixed with the L4 one.
         head_len: u32,
+        /// This connection's TLS session (§4), or null on a plaintext
+        /// listener — which is every connection on a deployment without a
+        /// `tls` block, and what makes the whole feature cost nothing
+        /// there. Drawn from the §5 engine pool at admission and returned
+        /// at teardown: unlike a relay buffer it is never handed back
+        /// mid-connection, because it holds the session's keys and a
+        /// terminated connection needs them until it is gone.
+        ///
+        /// Its presence is what every transforming path branches on, so
+        /// it is the connection's answer to "are my wire bytes my
+        /// plaintext bytes".
+        tls: ?*TlsEngine,
+        /// Plaintext the handshake's last flight carried in with it,
+        /// waiting in `tls.?.plaintext` for the protocol that is about to
+        /// start. Common rather than exotic: a client that writes its
+        /// request immediately after its Finished lands both in one
+        /// segment, and a protocol that only ever armed a fresh read
+        /// would wait for bytes already in hand.
+        tls_pending_len: u32,
         /// The client-directed write in flight, if any (§7, §8) — see
         /// `ClientWrite`. Idle on the L4 path, which relays through the pump.
         client_write: ClientWrite,
@@ -382,6 +402,14 @@ pub fn Conn(comptime IoType: type) type {
             /// consumes `client_address` (the hash pick, §7), and the
             /// header is what makes that address the real client's.
             l4_reading_proxy_header,
+            /// Running the TLS handshake a terminating listener requires
+            /// (§4, #125). Like the PROXY header phase it runs *before*
+            /// the protocol rather than inside it — termination is
+            /// orthogonal to whether the terminated stream is then relayed
+            /// or proxied — so `startProtocol` is what it hands over to.
+            /// Ordered after the PROXY header, which travels in the clear
+            /// outside the TLS session by the spec's own rule.
+            tls_handshaking,
             connecting,
             relaying,
             // L7 states (§7): `l7_reading_head` accumulates and re-parses
@@ -415,6 +443,7 @@ pub fn Conn(comptime IoType: type) type {
         pub fn isLive(conn: *const Self) bool {
             return switch (conn.state) {
                 .l4_reading_proxy_header,
+                .tls_handshaking,
                 .connecting,
                 .relaying,
                 .l7_reading_head,
@@ -595,6 +624,7 @@ pub fn Conn(comptime IoType: type) type {
             server: *ServerType,
             client_socket: IoType.Socket,
             buffer: ?*relay.RelayBuffer,
+            engine: ?*TlsEngine,
             state: State,
             cluster_index: u16,
             protocol: config_module.Config.Listener.Protocol,
@@ -612,6 +642,12 @@ pub fn Conn(comptime IoType: type) type {
             conn.directions = .{ .{}, .{} };
             conn.head_buffer_id = head_buffer_none;
             conn.head_len = 0;
+            // A parameter, not a field the caller installs afterwards: a
+            // slot is recycled across listeners, so a caller that acquired
+            // an engine and then let this reset it would leak one per
+            // connection.
+            conn.tls = engine;
+            conn.tls_pending_len = 0;
             conn.client_write = .{};
             conn.cluster_index = cluster_index;
             // Placeholders until the admission tail installs the

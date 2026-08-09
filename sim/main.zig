@@ -165,6 +165,48 @@ const uncovered = [_]Uncovered{
         .reason = "no script sends a header section past the head buffer; " ++
             "src/http_proxy_test.zig drives both 431 shapes",
     },
+    // The §4 counters (#125). No scenario here terminates TLS yet: the
+    // harness builds plaintext listeners, so nothing draws an engine and
+    // none of these can move. Directed coverage exists and is named per
+    // entry; a sweep that drives a seeded TLS client population is the
+    // work that retires these, and it retires all five together.
+    .{
+        .name = "shed_tls_engines",
+        .why = .unreached,
+        .reason = "no scenario configures a terminating listener; " ++
+            "src/server_test.zig drives the pool to its wall with two " ++
+            "clients against one engine",
+    },
+    .{
+        .name = "shed_tls_crypto",
+        .why = .unreached,
+        .reason = "libcrypto refusing a key derivation needs the fixed heap " ++
+            "exhausted, which no scenario can reach and no directed test " ++
+            "fakes — the rung exists so that failure is not read as the " ++
+            "engine pool's, and is expected to stay at zero in production too",
+    },
+    .{
+        .name = "tls_handshakes_completed",
+        .why = .unreached,
+        .reason = "no scenario configures a terminating listener; " ++
+            "src/server_test.zig handshakes a real ztls client through to " ++
+            "relayed plaintext",
+    },
+    .{
+        .name = "tls_handshake_failed",
+        .why = .unreached,
+        .reason = "no scenario configures a terminating listener; " ++
+            "src/server_test.zig sends plaintext at a TLS port, the case a " ++
+            "misdirected client or scanner produces",
+    },
+    .{
+        .name = "tls_relay_failed",
+        .why = .unreached,
+        .reason = "no scenario configures a terminating listener, and a " ++
+            "session that fails mid-relay needs a peer corrupting records " ++
+            "or a far side too slow to drain the outbox — neither of which " ++
+            "any directed test drives yet either",
+    },
     .{
         .name = "l7_no_route",
         .why = .unreached,

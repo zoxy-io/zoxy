@@ -33,6 +33,7 @@ pub const tls = struct {
     pub const Credentials = @import("tls/Credentials.zig");
     pub const Engine = @import("tls/Engine.zig");
     pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
+    pub const TestClient = @import("tls/TestClient.zig").TestClient;
 };
 /// Shared test-support harness pieces, factored out so multiple test
 /// suites can drive the same origin double instead of growing their own.
@@ -59,6 +60,7 @@ test {
     _ = tls.Credentials;
     _ = tls.Engine;
     _ = @import("tls/engine_test.zig");
+    _ = tls.TestClient;
     _ = @import("tls/spike_test.zig");
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
