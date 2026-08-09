@@ -149,6 +149,17 @@ pub const Config = struct {
         /// well as lowered — the big-cookie/JWT case is the reason it
         /// exists. Inert when both pools are zero (an L4-only config).
         head_buffer_bytes: u32 = constants.head_buffer_bytes_default,
+        /// The §4 TLS engine pool: how many sessions may be handshaking
+        /// or terminated at once. An engine is ~132 KiB plus a plaintext
+        /// buffer, far the largest per-connection object here, so this is
+        /// the knob that decides what a TLS deployment costs in RSS. The
+        /// loader resolves an omitted field to conn slots capped at
+        /// `tls_engines_max`; the operator trades it down against a
+        /// handshake wall, on the same terms as every other pool (§8).
+        /// Zero exactly when no listener
+        /// terminates TLS, and the struct default is the off state on the
+        /// same terms as `head_buffers`.
+        tls_engines: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -202,6 +213,16 @@ pub const Config = struct {
         /// and for the same reason: it states what sits in front of this
         /// socket. `l4` only until the L7 receive phase exists.
         proxy_protocol: ?ProxyProtocol = null,
+        /// Whether this listener terminates TLS, and with what (§4, #125),
+        /// or null for a plaintext socket — every config predating this.
+        /// Per listener, like `forwarded` and `proxy_protocol`: it states
+        /// what this socket is, and the same cluster is commonly reachable
+        /// from a TLS edge listener and a plaintext internal one.
+        ///
+        /// Inbound only. The upstream leg stays plaintext whatever this
+        /// says; originating TLS to a backend is a separate decision with
+        /// its own trust store, and #125 is termination.
+        tls: ?Tls = null,
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
         /// `http` runs the HTTP/1.1 reverse-proxy state machine. The
@@ -243,6 +264,19 @@ pub const Config = struct {
             /// unusable by anything except the proxy configured in
             /// front of it — that is the point.
             require,
+        };
+
+        /// Where this listener's certificate and key live (§4). Paths
+        /// only: this loader is IO-free (§1), so it validates the shape
+        /// and `main` does the reading — which is also what puts a
+        /// missing or malformed certificate in the startup error that
+        /// names the file, rather than in the first client's handshake.
+        pub const Tls = struct {
+            /// PEM certificate chain, leaf first.
+            cert_path: []const u8,
+            /// PEM private key for the leaf. ECDSA P-256 or P-384; any
+            /// other key type is refused at load (`tls/Credentials.zig`).
+            key_path: []const u8,
         };
     };
 
@@ -450,6 +484,8 @@ pub const ValidationError = error{
     ListenerForwardedModeUnknown,
     ListenerHttpProxyProtocol,
     ListenerProxyProtocolModeUnknown,
+    ListenerTlsCertPathEmpty,
+    ListenerTlsKeyPathEmpty,
     ClusterProxyProtocolSendUnknown,
     ClusterProxyProtocolOnHttpListener,
     FilterMethodEmpty,
@@ -498,6 +534,9 @@ pub const ValidationError = error{
     LimitUpstreamHeadBuffersOverUpstreamSlots,
     LimitUpstreamHeadBuffersWithoutHttpListener,
     LimitHeadBufferBytesOutOfRange,
+    LimitTlsEnginesOutOfRange,
+    LimitTlsEnginesOverConnSlots,
+    LimitTlsEnginesWithoutTlsListener,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -577,8 +616,15 @@ pub fn parseWithFiles(
         return error.ListenersEmpty;
     }
     var http_listeners_count: u32 = 0;
+    var tls_listeners_count: u32 = 0;
     for (parsed.listeners) |listener_json| {
         if (try protocolOf(listener_json.protocol) == .http) http_listeners_count += 1;
+        // Presence only: whether the block is *usable* is `resolveTls`'s
+        // to say, later and per listener. Counting it here would mean
+        // deciding the engine pool's size against blocks that might yet
+        // be refused, and reporting a limit error for a config whose real
+        // fault is a missing path.
+        if (listener_json.tls != null) tls_listeners_count += 1;
     }
     const access_log_sink = try resolveAccessLogSink(parsed.access_log);
     // Before the limits, because the named headers widen the line the
@@ -588,6 +634,7 @@ pub fn parseWithFiles(
         &parsed.limits,
         @intCast(parsed.listeners.len),
         http_listeners_count,
+        tls_listeners_count,
         access_log_sink != null,
         log_headers.count(),
     );
@@ -992,15 +1039,80 @@ fn resolveLimits(
     limits_json: *const LimitsJson,
     listeners_count: u32,
     http_listeners_count: u32,
+    tls_listeners_count: u32,
     access_log_on: bool,
     log_header_count: u32,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     assert(http_listeners_count <= listeners_count);
-    // Omitted limits default to the lean out-of-box sizes, not the
-    // compiled ceilings (§5): a small footprint unless the operator opts
-    // up. relay buffers still follow conn slots when omitted (one buffer
-    // per L4 connection), capped at their own ceiling.
+    assert(tls_listeners_count <= listeners_count);
+    const slots = try resolveSlotCounts(limits_json);
+    const conn_slots = slots.conn_slots;
+    const relay_buffers = slots.relay_buffers;
+    const upstream_slots = slots.upstream_slots;
+    const head_buffers = try resolveHeadBuffers(
+        limits_json.head_buffers,
+        conn_slots,
+        http_listeners_count,
+    );
+    const upstream_head_buffers = try resolveUpstreamHeadBuffers(
+        limits_json.upstream_head_buffers,
+        upstream_slots,
+        http_listeners_count,
+    );
+    const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
+    const tls_engines = try resolveTlsEngines(
+        limits_json.tls_engines,
+        conn_slots,
+        tls_listeners_count,
+    );
+    const cq_fill_eighths = try resolveCqFill(
+        limits_json.cq_fill_eighths,
+        conn_slots,
+        upstream_slots,
+        listeners_count,
+    );
+    // Zero exactly when the log is off, so the one number says both how
+    // big the staging buffers are and whether there are any (§8). A
+    // deployment that sized the buffers but never named a sink has asked
+    // for something contradictory, and is told so rather than quietly
+    // getting no log.
+    const access_log_buffer_bytes = try resolveAccessLogBuffer(
+        limits_json.access_log_buffer_bytes,
+        access_log_on,
+        log_header_count,
+    );
+    assert(relay_buffers <= conn_slots);
+    assert(head_buffers <= conn_slots);
+    assert(tls_engines <= conn_slots);
+    return .{
+        .conn_slots = conn_slots,
+        .relay_buffers = relay_buffers,
+        .upstream_slots = upstream_slots,
+        .head_buffers = head_buffers,
+        .upstream_head_buffers = upstream_head_buffers,
+        .head_buffer_bytes = head_buffer_bytes,
+        .tls_engines = tls_engines,
+        .cq_fill_eighths = cq_fill_eighths,
+        .access_log_buffer_bytes = access_log_buffer_bytes,
+    };
+}
+
+/// The three pool counts that bound the others (§5). Their own group
+/// because they are the only limits resolved against nothing but the
+/// compiled ceilings and each other — everything after them is gated on
+/// one of these three, which is also why they come out together.
+const SlotCounts = struct {
+    conn_slots: u32,
+    relay_buffers: u32,
+    upstream_slots: u32,
+};
+
+/// Omitted limits default to the lean out-of-box sizes, not the compiled
+/// ceilings (§5): a small footprint unless the operator opts up. Relay
+/// buffers still follow conn slots when omitted (one buffer per L4
+/// connection), capped at their own ceiling.
+fn resolveSlotCounts(limits_json: *const LimitsJson) ValidationError!SlotCounts {
     const conn_slots = limits_json.conn_slots orelse constants.conn_slots_default;
     if (conn_slots < 1 or conn_slots > constants.conn_slots_max) {
         return error.LimitConnSlotsOutOfRange;
@@ -1017,51 +1129,70 @@ fn resolveLimits(
     if (upstream_slots < 1 or upstream_slots > constants.upstream_slots_max) {
         return error.LimitUpstreamSlotsOutOfRange;
     }
-    const head_buffers = try resolveHeadBuffers(
-        limits_json.head_buffers,
-        conn_slots,
-        http_listeners_count,
-    );
-    const upstream_head_buffers = try resolveUpstreamHeadBuffers(
-        limits_json.upstream_head_buffers,
-        upstream_slots,
-        http_listeners_count,
-    );
-    const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
-    // The CQ fill is the one limit an operator tightens for headroom, not a
-    // pool shrink (§8): a smaller fill demands a deeper ring for the same
-    // conn slots. Range-check first, then reject a fill that — with these
-    // conn/upstream slots and listeners — would need a completion queue past
-    // the compiled ring, so main.zig's completionQueueDepthFor never clamps.
-    const cq_fill_eighths = limits_json.cq_fill_eighths orelse constants.cq_fill_eighths_default;
-    if (cq_fill_eighths < constants.cq_fill_eighths_min or cq_fill_eighths > constants.cq_fill_eighths_max) {
+    assert(relay_buffers <= conn_slots);
+    assert(conn_slots >= 1);
+    return .{
+        .conn_slots = conn_slots,
+        .relay_buffers = relay_buffers,
+        .upstream_slots = upstream_slots,
+    };
+}
+
+/// The CQ fill is the one limit an operator tightens for headroom, not a
+/// pool shrink (§8): a smaller fill demands a deeper ring for the same
+/// conn slots. Range-check first, then reject a fill that — with these
+/// conn/upstream slots and listeners — would need a completion queue past
+/// the compiled ring, so main.zig's `completionQueueDepthFor` never clamps.
+fn resolveCqFill(
+    requested: ?u32,
+    conn_slots: u32,
+    upstream_slots: u32,
+    listeners_count: u32,
+) ValidationError!u32 {
+    assert(conn_slots >= 1);
+    assert(listeners_count >= 1);
+    const cq_fill_eighths = requested orelse constants.cq_fill_eighths_default;
+    if (cq_fill_eighths < constants.cq_fill_eighths_min or
+        cq_fill_eighths > constants.cq_fill_eighths_max)
+    {
         return error.LimitCqFillOutOfRange;
     }
     if (!constants.cqFillFits(conn_slots, upstream_slots, listeners_count, cq_fill_eighths)) {
         return error.LimitConnSlotsOverCqFill;
     }
-    // Zero exactly when the log is off, so the one number says both how
-    // big the staging buffers are and whether there are any (§8). A
-    // deployment that sized the buffers but never named a sink has asked
-    // for something contradictory, and is told so rather than quietly
-    // getting no log.
-    const access_log_buffer_bytes = try resolveAccessLogBuffer(
-        limits_json.access_log_buffer_bytes,
-        access_log_on,
-        log_header_count,
-    );
-    assert(relay_buffers <= conn_slots);
-    assert(head_buffers <= conn_slots);
-    return .{
-        .conn_slots = conn_slots,
-        .relay_buffers = relay_buffers,
-        .upstream_slots = upstream_slots,
-        .head_buffers = head_buffers,
-        .upstream_head_buffers = upstream_head_buffers,
-        .head_buffer_bytes = head_buffer_bytes,
-        .cq_fill_eighths = cq_fill_eighths,
-        .access_log_buffer_bytes = access_log_buffer_bytes,
-    };
+    return cq_fill_eighths;
+}
+
+/// The §4 engine pool follows conn slots when omitted, capped at
+/// `tls_engines_max` — an engine is ~132 KiB, so unlike a head buffer the
+/// default cannot simply be "one each" at every conn-slot count anyone
+/// might configure. Zero exactly when no listener terminates TLS: a
+/// plaintext-only deployment reserves nothing, and one that asked for
+/// engines it cannot use is told so rather than quietly paying for them.
+/// A TLS deployment with a zero pool would shed every handshake, so that
+/// is rejected too.
+fn resolveTlsEngines(
+    requested: ?u32,
+    conn_slots: u32,
+    tls_listeners_count: u32,
+) ValidationError!u32 {
+    assert(conn_slots >= 1);
+    const tls_engines = requested orelse
+        (if (tls_listeners_count >= 1) @min(constants.tls_engines_default, conn_slots) else 0);
+    if (tls_engines > constants.tls_engines_max) {
+        return error.LimitTlsEnginesOutOfRange;
+    }
+    if (tls_engines > conn_slots) {
+        return error.LimitTlsEnginesOverConnSlots;
+    }
+    if (tls_listeners_count == 0 and tls_engines >= 1) {
+        return error.LimitTlsEnginesWithoutTlsListener;
+    }
+    if (tls_listeners_count >= 1 and tls_engines == 0) {
+        return error.LimitTlsEnginesOutOfRange;
+    }
+    assert(tls_engines <= conn_slots);
+    return tls_engines;
 }
 
 /// The §5 head-buffer ring follows conn slots when omitted (every
@@ -1289,6 +1420,7 @@ pub const LimitsJson = struct {
     head_buffers: ?u32 = null,
     upstream_head_buffers: ?u32 = null,
     head_buffer_bytes: ?u32 = null,
+    tls_engines: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 
@@ -1335,6 +1467,14 @@ pub const LimitsJson = struct {
             .minimum = constants.head_buffer_bytes_min,
             .maximum = constants.head_buffer_bytes_max,
         },
+        .tls_engines = .{
+            .desc = "Concurrent TLS sessions — handshaking or terminated. The " ++
+                "largest per-connection object zoxy holds (~132 KiB plus a " ++
+                "plaintext buffer), so this is what a TLS deployment's memory " ++
+                "follows. Zero exactly when no listener terminates TLS.",
+            .minimum = 1,
+            .maximum = constants.tls_engines_max,
+        },
         .cq_fill_eighths = .{
             .desc = "Eighths of the io_uring completion queue the worst-case " ++
                 "in-flight ops may fill; lower reserves more burst headroom " ++
@@ -1371,6 +1511,8 @@ pub const ListenerJson = struct {
     /// Optional PROXY protocol expectation (#142); absent treats first
     /// bytes as payload. L4-only until the L7 receive phase exists.
     proxy_protocol: ?ProxyProtocolJson = null,
+    /// Optional TLS termination (#125); absent is a plaintext socket.
+    tls: ?TlsJson = null,
 
     pub const schema_doc =
         "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
@@ -1401,6 +1543,34 @@ pub const ListenerJson = struct {
             .desc = "Expect a PROXY protocol header (v1 or v2) ahead of every " ++
                 "connection's payload (l4 listeners only); absent treats first " ++
                 "bytes as payload.",
+        },
+        .tls = .{
+            .desc = "Terminate TLS on this listener with the given certificate " ++
+                "and key; absent is a plaintext socket. Inbound only — the " ++
+                "upstream leg stays plaintext.",
+        },
+    };
+};
+
+pub const TlsJson = struct {
+    cert: []const u8,
+    key: []const u8,
+
+    pub const schema_doc =
+        "TLS termination for this listener: where its certificate chain and " ++
+        "private key live. Both are read once at startup, so a missing or " ++
+        "unusable file stops the proxy while the error can still name it — " ++
+        "never mid-handshake against a real client. The key must be ECDSA " ++
+        "P-256 or P-384: the handshake runs on the event loop, where an RSA " ++
+        "signature's milliseconds would stall every other connection on it.";
+    pub const schema_fields = .{
+        .cert = .{
+            .desc = "Path to the PEM certificate chain, leaf first.",
+            .min_length = 1,
+        },
+        .key = .{
+            .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384).",
+            .min_length = 1,
         },
     };
 };
@@ -2282,6 +2452,7 @@ pub const dto_types = .{
     AdminJson,          AccessLogJson,     CheckJson,                PickJson,
     ForwardedJson,      ProxyProtocolJson, ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson, RedirectJson,             BodyJson,
+    TlsJson,
 };
 
 comptime {
@@ -2519,6 +2690,7 @@ fn resolveListener(
         .protocol = protocol,
         .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
         .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
+        .tls = try resolveTls(listener_json.tls),
     };
     if (protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
@@ -3372,6 +3544,19 @@ fn resolveProxyProtocol(
     }
     return std.meta.stringToEnum(Config.Listener.ProxyProtocol, proxy_protocol.mode) orelse
         error.ListenerProxyProtocolModeUnknown;
+}
+
+/// A listener's TLS block, shape-checked only (§4). This loader does no
+/// IO, so whether the files exist, parse, or carry a key of a type the
+/// on-loop handshake can afford is `main`'s to find out — where the error
+/// can name the path. What is checkable here is that a path was given at
+/// all: an empty string would otherwise reach `openat` as a request to
+/// open the current directory, which fails somewhere far less obvious.
+fn resolveTls(tls_json: ?TlsJson) ValidationError!?Config.Listener.Tls {
+    const tls = tls_json orelse return null;
+    if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
+    if (tls.key.len == 0) return error.ListenerTlsKeyPathEmpty;
+    return .{ .cert_path = tls.cert, .key_path = tls.key };
 }
 
 /// A cluster's resolved pick: the policy, and — for `hash` — the key it
@@ -4952,14 +5137,14 @@ const fuzz_seed_json =
     \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]},
     \\ {"match":{"path_prefix":"/old"},"actions":[{"redirect":{"status":301,"scheme":"https"}}]},
     \\ {"match":{"path_prefix":"/robots.txt"},"actions":[{"respond":{"status":200,"body":"oops"}}]}],
-    \\ "protocol":"http"}],
+    \\ "protocol":"http","tls":{"cert":"/c.pem","key":"/k.pem"}}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],
     \\ "pick":{"policy":"hash","key":"cookie","name":"zoxy-srv"},"max_inflight":8,
     \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}}},
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
-    \\ "limits":{"conn_slots":64,"relay_buffers":32,"upstream_slots":32},
+    \\ "limits":{"conn_slots":64,"relay_buffers":32,"upstream_slots":32,"tls_engines":16},
     \\ "access_log":{"sink":"file","path":"/var/log/zoxy.log"},
     \\ "bodies":{"oops":{"inline":"be right back","content_type":"text/plain"}},
     \\ "error_pages":{"503":"oops"},
@@ -4974,7 +5159,10 @@ const fuzz_seed_json =
 // grammar is a starting point rather than a shape the mutator must
 // blindly discover. The `inline` body arm is the one it can reach:
 // `parse` refuses `file` sources outright, since the fuzzer has no
-// filesystem.
+// filesystem. The `tls` block (#125) rides here for the same reason its
+// paths can be nonsense: the loader is IO-free, so what the mutator gets
+// to explore is the grammar and its `tls_engines` relation, which is all
+// of the TLS surface this layer owns.
 
 test "config: the fuzz seed carrying every block parses" {
     // It is a corpus entry, so it has to be a *valid* config — an
@@ -4996,6 +5184,11 @@ test "config: the fuzz seed carrying every block parses" {
     try std.testing.expectEqual(@as(u16, 403), rules[0].actions[0].reject);
     try std.testing.expectEqual(@as(u16, 301), rules[1].actions[0].redirect.status);
     try std.testing.expectEqual(@as(u16, 200), rules[2].actions[0].respond.status);
+    // The #125 grammar and the limit that follows it: both in the seed, so
+    // the mutator has the vocabulary for either branch.
+    try std.testing.expectEqualStrings("/c.pem", parsed.listeners[0].tls.?.cert_path);
+    try std.testing.expectEqualStrings("/k.pem", parsed.listeners[0].tls.?.key_path);
+    try std.testing.expectEqual(@as(u32, 16), parsed.limits.tls_engines);
 }
 
 test "fuzz: parse never panics — parse or reject, no third outcome" {
@@ -5018,6 +5211,12 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
         // config that loads, so the fuzzer checks it here rather than
         // trusting that the one rejecting branch was reached.
         assert(parsed.connect_timeout_ms < parsed.idle_timeout_ms);
+        // The engine pool is zero exactly when nothing terminates TLS
+        // (§4/§5), which is what lets the startup loader read "no TLS
+        // anywhere" off the one number and skip reserving a libcrypto heap.
+        // A config that loaded with either half of that broken would price
+        // memory it cannot use, or use memory it did not price.
+        var tls_listeners: u32 = 0;
         for (parsed.listeners) |listener| {
             assert(listener.routes.len >= 1);
             for (listener.routes) |route| {
@@ -5025,7 +5224,14 @@ fn fuzzParse(context: void, smith: *std.testing.Smith) !void {
                 assert(route.prefix.len >= 1);
                 assert(route.prefix[0] == '/');
             }
+            if (listener.tls) |tls| {
+                tls_listeners += 1;
+                assert(tls.cert_path.len >= 1);
+                assert(tls.key_path.len >= 1);
+            }
         }
+        assert((tls_listeners >= 1) == (parsed.limits.tls_engines >= 1));
+        assert(parsed.limits.tls_engines <= parsed.limits.conn_slots);
     } else |_| {}
 }
 
@@ -5919,6 +6125,140 @@ test "config: the proxy_protocol block resolves a mode, and is l4-only" {
     try expectParseError(
         error.MissingField,
         head ++ ",\"proxy_protocol\":{}" ++ tail,
+    );
+}
+
+test "config: the tls block resolves paths, and only shape-checks them" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // Absent: a plaintext socket, every config predating this.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
+        try std.testing.expect(parsed.listeners[0].tls == null);
+    }
+    // Present on either protocol: termination is orthogonal to what the
+    // terminated stream then speaks.
+    inline for (.{ "", ",\"protocol\":\"http\"" }) |protocol_field| {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ protocol_field ++
+                ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail,
+        );
+        const tls = parsed.listeners[0].tls.?;
+        try std.testing.expectEqualStrings("/c.pem", tls.cert_path);
+        try std.testing.expectEqualStrings("/k.pem", tls.key_path);
+    }
+    // Paths that do not exist still load: this loader does no IO (§1), and
+    // `main` is where a missing file becomes an error that can name it.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        _ = try expectParseOk(
+            &arena_state,
+            head ++ ",\"tls\":{\"cert\":\"/nope\",\"key\":\"/nope\"}" ++ tail,
+        );
+    }
+    // An empty path is checkable here, and worth checking: it would reach
+    // `openat` as a request to open the current directory, failing
+    // somewhere far less obvious than the config that asked for it.
+    try expectParseError(
+        error.ListenerTlsCertPathEmpty,
+        head ++ ",\"tls\":{\"cert\":\"\",\"key\":\"/k.pem\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerTlsKeyPathEmpty,
+        head ++ ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"\"}" ++ tail,
+    );
+    // Both paths are required: a certificate with no key is not a
+    // half-configured listener, it is one that cannot answer a handshake.
+    try expectParseError(
+        error.MissingField,
+        head ++ ",\"tls\":{\"cert\":\"/c.pem\"}" ++ tail,
+    );
+    try expectParseError(
+        error.MissingField,
+        head ++ ",\"tls\":{\"key\":\"/k.pem\"}" ++ tail,
+    );
+}
+
+test "config: tls_engines follows the tls listeners, and refuses a mismatch" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    const tls_block = ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}";
+    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}";
+    const close = "}";
+
+    // No TLS listener: the pool is zero, so a plaintext deployment
+    // reserves nothing for a feature it does not use.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail ++ close);
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.tls_engines);
+    }
+    // A TLS listener with no stated limit: conn slots, capped at the
+    // engine ceiling — every connection could be mid-handshake at once.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tls_block ++ tail ++ close);
+        try std.testing.expectEqual(
+            @min(constants.tls_engines_default, parsed.limits.conn_slots),
+            parsed.limits.tls_engines,
+        );
+        try std.testing.expect(parsed.limits.tls_engines >= 1);
+    }
+    // The default is capped by conn slots, not just by the ceiling: a
+    // deployment that shrank its slots must not out-provision them.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ tls_block ++ tail ++ ",\"limits\":{\"conn_slots\":4}" ++ close,
+        );
+        try std.testing.expectEqual(@as(u32, 4), parsed.limits.tls_engines);
+    }
+    // Stated explicitly, it is honored — this is the knob a TLS
+    // deployment trades memory against the shed wall with.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ tls_block ++ tail ++ ",\"limits\":{\"tls_engines\":16}" ++ close,
+        );
+        try std.testing.expectEqual(@as(u32, 16), parsed.limits.tls_engines);
+    }
+    // Engines nobody can use: paid for in RSS, drawn from never. Said so
+    // rather than silently zeroed, because the operator asked for a thing
+    // and the answer is that this config cannot use it.
+    try expectParseError(
+        error.LimitTlsEnginesWithoutTlsListener,
+        head ++ tail ++ ",\"limits\":{\"tls_engines\":16}" ++ close,
+    );
+    // A TLS listener with no engines would shed every handshake — a
+    // listener that accepts and then refuses everything.
+    try expectParseError(
+        error.LimitTlsEnginesOutOfRange,
+        head ++ tls_block ++ tail ++ ",\"limits\":{\"tls_engines\":0}" ++ close,
+    );
+    // Past the ceiling: an engine is ~132 KiB, so this bound is what
+    // stands between a typo and a gigabyte.
+    try expectParseError(
+        error.LimitTlsEnginesOutOfRange,
+        head ++ tls_block ++ tail ++ ",\"limits\":{\"tls_engines\":100000}" ++ close,
+    );
+    // More engines than connections that could hold one.
+    try expectParseError(
+        error.LimitTlsEnginesOverConnSlots,
+        head ++ tls_block ++ tail ++ ",\"limits\":{\"conn_slots\":4,\"tls_engines\":8}" ++ close,
     );
 }
 

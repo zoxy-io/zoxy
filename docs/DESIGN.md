@@ -481,6 +481,7 @@ a raised `RLIMIT_NOFILE`:
 | upstream slots | 1311 | 11466 | ~48 B state |
 | head buffers (ring) | = conn slots | 11466 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11466 | `head_buffer_bytes` + 24 B |
+| tls engines | 0, or min(conn slots, 1024) | 1024 | ~132 KiB + plaintext |
 | **pool memory** | **~34 MiB** | **~288 MiB** | |
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
@@ -489,6 +490,18 @@ knob is operator-visible behaviour, not only memory. Three head-sized
 side buffers ride the same knob — the serving path's two
 canonicalization scratches and the health prober's response buffer — and
 appear in the banner as their own term.
+
+The **TLS engine pool** (§4) is the one whose default is not "one per
+connection", and the row above says so: an engine is ~132 KiB of ztls
+record and reassembly buffers plus a plaintext destination of
+`max(head_buffer_bytes, 32 KiB)`, two orders of magnitude past a head
+buffer. One-per-slot at the c10k ceiling would be gigabytes, so the
+default is conn slots *capped* at 1024 and a deployment past that sheds
+rather than reserves. It is zero — the whole feature free — unless some
+listener carries a `tls` block. Beside the per-engine cost sits one
+process-wide reservation: the fixed heap libcrypto allocates from, 4 MiB,
+which is what makes zero-allocation-after-startup provable with a C
+library underneath (§4).
 
 The access log (§8) adds one fixed reservation beside the pools — two
 staging buffers, 64 KiB together by default — and nothing at all when it

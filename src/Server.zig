@@ -29,6 +29,7 @@ const filter = @import("http/filter.zig");
 const proxy_protocol = @import("net/proxy_protocol.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
+const Credentials = @import("tls/Credentials.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -63,6 +64,13 @@ pub fn Server(comptime IoType: type) type {
         l4_inflight: []u16,
         listeners: []ListenerState,
         listeners_count: u16,
+        /// One slot per listener, null where that listener is plaintext
+        /// (§4). Loaded before `start` by whoever can read files — `main`
+        /// in production, the harness in a test — because this file is
+        /// under the Io seam and the loader is not. Empty until then, and
+        /// empty for the whole process on a deployment with no `tls`
+        /// block anywhere.
+        tls_credentials: []const ?Credentials,
         /// The load-balancing policy: resolves a cluster to the endpoint to
         /// dial. Owns its own per-cluster state so the serving path never
         /// hardcodes how an endpoint is chosen (§7).
@@ -224,6 +232,12 @@ pub fn Server(comptime IoType: type) type {
             /// Copied from config so admission forks without reaching back
             /// through the listener index (§6, §7).
             protocol: config_module.Config.Listener.Protocol,
+            /// This listener's certificate chain and signing key (§4), or
+            /// null on a plaintext socket. Borrowed from the startup-lived
+            /// table `setTlsCredentials` handed over, and shared by every
+            /// engine this listener drives — a chain and a libcrypto key
+            /// are parsed once per listener, never per connection.
+            credentials: ?*const Credentials,
             accepting: bool,
         };
 
@@ -345,6 +359,9 @@ pub fn Server(comptime IoType: type) type {
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
+            // Empty until `setTlsCredentials`, which is before `start` when
+            // there is anything to hand over and never otherwise.
+            server.tls_credentials = &.{};
             try server.balancer.init(arena, config, keys);
             try server.initMetrics(arena, config, keys);
             server.resetRuntimeState(&options);
@@ -467,6 +484,29 @@ pub fn Server(comptime IoType: type) type {
             server.admin.setBind(bind_address);
         }
 
+        /// Hand over the per-listener TLS credentials before `start` (§4).
+        /// A setter rather than an `init` argument because loading them
+        /// reads files, and everything below the Io seam — this file
+        /// included — is written not to: `main` reads, this holds.
+        ///
+        /// The table must outlive the server: every engine on a listener
+        /// borrows that listener's entry for the session's life.
+        pub fn setTlsCredentials(server: *Self, credentials: []const ?Credentials) void {
+            assert(credentials.len == server.config.listeners.len);
+            server.tls_credentials = credentials;
+        }
+
+        /// This listener's credentials, or null where it is plaintext or
+        /// none were handed over. Borrowed from the caller's table, so the
+        /// pointer is to the entry rather than to a copy: a `Credentials`
+        /// holds a libcrypto key object, and two copies pointing at one
+        /// key would be two owners of something with a single `deinit`.
+        fn credentialsFor(server: *Self, index: usize) ?*const Credentials {
+            if (index >= server.tls_credentials.len) return null;
+            if (server.tls_credentials[index]) |*entry| return entry;
+            return null;
+        }
+
         pub fn start(server: *Self) Io.ListenError!void {
             assert(!server.draining);
             assert(server.listeners_count >= 1);
@@ -487,8 +527,14 @@ pub fn Server(comptime IoType: type) type {
                     .forwarded = listener_config.forwarded,
                     .proxy_protocol = listener_config.proxy_protocol,
                     .protocol = listener_config.protocol,
+                    .credentials = server.credentialsFor(index),
                     .accepting = false,
                 };
+                // A listener the config says terminates TLS must have
+                // credentials by now: `main` loads them before `start`, and
+                // starting without them would bind a socket that answers
+                // every handshake with a teardown.
+                assert((listener_config.tls != null) == (state.credentials != null));
                 server.armAccept(state);
             }
             try server.admin.start();
