@@ -104,6 +104,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&exe_tests.step);
     test_step.dependOn(&lint_tests.step);
 
+    // The fixed libcrypto heap (§4, §5): its own step, and the one TLS
+    // test that cannot ride the main test binary. The allocation hooks
+    // must be installed before libcrypto's *first* allocation, which only
+    // a fresh process whose first libcrypto touch is the install can
+    // promise — the test binary loads credentials long before it. Every
+    // other TLS test runs under `zig build test`.
+    const tls_heap_proof_module = b.createModule(.{
+        .root_source_file = b.path("src/tls_heap_proof.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ztls", .module = ztls_module },
+        },
+    });
+    linkLibcrypto(tls_heap_proof_module);
+    const tls_heap_proof_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = tls_heap_proof_module,
+    }));
+    const tls_heap_proof_step = b.step(
+        "tls-heap-proof",
+        "Prove a TLS handshake runs on the fixed libcrypto heap (§4)",
+    );
+    tls_heap_proof_step.dependOn(&tls_heap_proof_tests.step);
+
     const sim_exe = b.addExecutable(.{
         .name = "zoxy-sim",
         .root_module = b.createModule(.{
@@ -323,6 +347,10 @@ pub fn build(b: *std.Build) void {
     // in this list that runs the binary at all.
     const ci_step = b.step("ci", "Per-change gates: test + lint + sim + smoke (bench runs at merge)");
     ci_step.dependOn(test_step);
+    // A separate binary, but not a separate decision: the zero-allocation
+    // promise (§5) is unbacked with a C library underneath unless this
+    // passes, so it gates every change like the rest.
+    ci_step.dependOn(tls_heap_proof_step);
     ci_step.dependOn(lint_step);
     ci_step.dependOn(sim_step);
     // Every platform. On its first CI run the gate found that the macOS

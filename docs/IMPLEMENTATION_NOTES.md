@@ -17,39 +17,44 @@ Threads still being worked, carrying real tradeoffs rather than a simple
 feature request. Each stays here until resolved, or promoted to a
 GitHub issue once there's a concrete plan.
 
-### TLS termination — unshipped, hardening gate open
+### TLS termination — in progress on ztls (#125)
 
 The design settled on **no worker threads** for TLS handshakes (§3,
 DESIGN.md; measured below in "TLS handshake CPU" and "TLS on the
-loop"): handshakes run on the loop under a per-tick budget, ECDSA/Ed25519
-only (RSA excluded by policy — the ~1–2 ms figure that once motivated a
-worker pool was an RSA number). The stack is a hardened fork of
-[tls.zig](https://github.com/ianic/tls.zig), pinned at `5452baf`, chosen
-for its sans-I/O `nonblock.Server`, allocation-free handshake path, and
-injectable `rng`/`now` (so SimIo can drive handshakes deterministically).
-Not yet landed — the fork's hardening gate is open:
+loop"): handshakes run on the loop, ECDSA only (RSA excluded by policy —
+the ~1–2 ms figure that once motivated a worker pool was an RSA number,
+and ztls carries no Ed25519 CertificateVerify).
 
-1. Server-side session resumption (NewSessionTicket issuance, PSK-DHE
-   acceptance, binder verification) — load-bearing: without tickets a
-   full-population reconnect storm is ~14k × ~260 µs ≈ seconds of
-   handshake CPU; with them, µs-class per connection.
-2. Fragmented ClientHello (upstream tls.zig #36) — a robustness gap the
-   fuzz gate would find anyway.
-3. Three post-pin fixes to backport (CBC-padding overflow `106d10b`,
-   dangling `alpn_protocol` `47c402a`, `d633a0f`).
-4. The server handshake fuzzed through zoxy's wrapper, hparse-style (§9,
-   DESIGN.md).
+The engine is [ztls](https://github.com/mattrobenolt/ztls) — a sans-I/O
+TLS 1.3 state machine in Zig over libcrypto primitives — through the
+audited `zoxy-io/ztls` fork (`zoxy-tls` branch). It settled §4's reserved
+C-dependency decision: the protocol layer, where TLS CVEs live, stays
+auditable Zig; the constant-time primitives get the most-watched assembly
+available. The fork carries four commits, each re-audited in
+`build.zig.zon`; the two that are load-bearing rather than incidental:
 
-The server must emit its post-handshake flight (NewSessionTicket)
-*after* processing the client's `Finished`, not alongside the server
-flight — see "The ~45 ms stall, identified" below; this is why
-resumption is load-bearing rather than a latency nicety.
+- **RFC 6979 deterministic ECDSA nonces** (upstream mattrobenolt/ztls#82,
+  still open). Without it the CertificateVerify signature — and, through
+  DER integer trimming, the encrypted flight's *length* — varies run to
+  run, so §9's identical-trace oracle could never assert on TLS traffic.
+  Opt-in, off in production. Proven in `src/tls/spike_test.zig`, which
+  also pins the negative: without the flag the same two seeded runs
+  diverge, and only in the encrypted flight.
+- **Server-side NewSessionTicket issuance**. Resumption is load-bearing
+  twice over: a full-population reconnect storm is ~14k × ~260 µs ≈
+  seconds of handshake CPU without tickets and µs-class with them, *and*
+  the ticket is what answers the client's `Finished` — see "The ~45 ms
+  stall, identified" below. The ticket must be emitted **after**
+  processing that `Finished`, not alongside the server flight.
 
-Fallback if hardening proves costlier than estimated: **picotls** —
-functioning, but a C dependency with an un-hookable malloc, plus OpenSSL
-libcrypto for acceptable sign speed (two policy exceptions beyond the
-pure-Zig rule). `std.crypto.tls` stays client-only (re-verified against
-the pinned toolchain and upstream master).
+Earlier candidates, recorded so they are not re-chased: a hardened fork
+of [tls.zig](https://github.com/ianic/tls.zig) (pinned `5452baf`) was the
+plan until its hardening gate — server resumption, fragmented
+ClientHello (upstream #36), three post-pin fixes — proved to be most of
+the work ztls had already done; **picotls** was the C fallback, rejected
+for an un-hookable malloc that no zero-alloc gate could survive.
+`std.crypto.tls` stays client-only (re-verified against the pinned
+toolchain), which makes it a usable *test* client and nothing more.
 
 Follow-up once TLS termination lands: **kTLS record offload**
 (Linux-only) — hand the negotiated keys to the kernel
@@ -552,6 +557,47 @@ itself. The durable "why" for each, so it is not re-chased.
   the CQ. Shares the libxev-fork prerequisite with the CQSIZE work; TLS
   and chunked L7 bodies fall back to copy regardless. Revisit under
   genuine CPU/memory-bandwidth saturation.
+
+## The fixed libcrypto heap plateaus — measured (2026-08-09, #125)
+
+`src/tls/libcrypto_heap.zig` routes libcrypto's internal mallocs into one
+buffer reserved at startup (`CRYPTO_set_mem_functions` through the fork's
+`mem_hooks`), so §5's zero-allocation promise survives having a C library
+underneath. Segregated fits: power-of-two size classes, an intrusive free
+list each, a bump frontier into the shared buffer, no coalescing.
+
+The number that matters is not the first handshake's cost but whether the
+frontier **plateaus**. It only ever grows — freed blocks return to their
+class list, never to the frontier — so if recycling did not work, every
+handshake would claim fresh buffer and no reservation could save a
+long-lived proxy. Measured by `zig build tls-heap-proof`, Debug, OpenSSL
+3.6.2:
+
+| after | frontier |
+|---|---|
+| credential load + 1 handshake | 1,082,752 B |
+| + 16 more handshakes | 1,082,752 B (unchanged) |
+
+So one handshake's distinct block footprint is ~1 MiB and every
+subsequent handshake is free. Sabotaging `free` to drop blocks instead of
+listing them takes the same run to 2,484,864 B, which is what the
+plateau assertion is there to catch. The 4 MiB reservation is sized
+against the plateau with room for the concurrency the frontier has not
+seen yet — revisit once many handshakes are genuinely *in flight*
+together, which this sequential proof does not exercise.
+
+Two shapes of this got found rather than reasoned:
+
+- The heap must be a static, not a caller's. `CRYPTO_set_mem_functions`
+  takes bare C function pointers with nowhere to hang a context, so the
+  hooks reach the heap through a module global; the earlier API took a
+  `*Heap` and the proof test handed it a stack local, leaving libcrypto
+  reading a dead frame the moment that test returned. `install` now takes
+  the backing buffer and owns the singleton, so the mistake is unavailable.
+- The proof needs its own process. The hooks must be installed before
+  libcrypto's *first* allocation, and a test binary that also loads
+  credentials has already allocated. Hence `zig build tls-heap-proof` as
+  a separate step, gated in `ci` like everything else.
 
 ## TLS handshake CPU — measured, on-loop verdict (2026-07-24)
 

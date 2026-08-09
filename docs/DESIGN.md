@@ -1679,6 +1679,7 @@ src/
     proxy.zig         // L7 state machine over phases
   tls/
     Credentials.zig   // per-listener PEM chain + signing key, parsed once (§4)
+    libcrypto_heap.zig // libcrypto's mallocs into one fixed startup buffer (§4, §5)
   balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)
   shed.zig            // exhaustion ladder: decisions + static responses (incl. configured pages, #159)
   counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
