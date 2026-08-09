@@ -34,6 +34,18 @@ pub const tls = struct {
     pub const Engine = @import("tls/Engine.zig");
     pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
+    /// The throwaway self-signed fixtures (`tls/testdata/README.md`),
+    /// re-exported because `@embedFile` cannot escape its module root and
+    /// the §9 simulator is its own module. Test material, never a
+    /// production surface — the key signs nothing but in-memory
+    /// handshakes and is trusted by nothing.
+    pub const testdata = struct {
+        pub const cert_pem = @embedFile("tls/testdata/cert.pem");
+        pub const key_pem = @embedFile("tls/testdata/key.pem");
+        /// The certificate's SAN: a client offering any other name fails
+        /// verification for a reason unrelated to what is under test.
+        pub const host_name = "spike.zoxy.test";
+    };
 };
 /// Shared test-support harness pieces, factored out so multiple test
 /// suites can drive the same origin double instead of growing their own.
