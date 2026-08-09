@@ -173,9 +173,13 @@ const uncovered = [_]Uncovered{
     .{
         .name = "shed_tls_engines",
         .why = .unreached,
-        .reason = "no scenario configures a terminating listener; " ++
-            "src/server_test.zig drives the pool to its wall with two " ++
-            "clients against one engine",
+        .reason = "conn-slot-shadowed, the shape `l7_shed_upstream_head_" ++
+            "buffers` has: seeds do terminate TLS, and a starved one runs " ++
+            "the full population against a single engine — but that same " ++
+            "seed sizes conn slots at 1-4 against up to eight clients, and " ++
+            "the slot rung is checked first, so admission is refused before " ++
+            "an engine is ever asked for. src/server_test.zig drives the " ++
+            "wall directly, two clients against one engine with slots to spare",
     },
     .{
         .name = "shed_tls_crypto",
@@ -186,26 +190,14 @@ const uncovered = [_]Uncovered{
             "engine pool's, and is expected to stay at zero in production too",
     },
     .{
-        .name = "tls_handshakes_completed",
-        .why = .unreached,
-        .reason = "no scenario configures a terminating listener; " ++
-            "src/server_test.zig handshakes a real ztls client through to " ++
-            "relayed plaintext",
-    },
-    .{
-        .name = "tls_handshake_failed",
-        .why = .unreached,
-        .reason = "no scenario configures a terminating listener; " ++
-            "src/server_test.zig sends plaintext at a TLS port, the case a " ++
-            "misdirected client or scanner produces",
-    },
-    .{
         .name = "tls_relay_failed",
         .why = .unreached,
-        .reason = "no scenario configures a terminating listener, and a " ++
-            "session that fails mid-relay needs a peer corrupting records " ++
-            "or a far side too slow to drain the outbox — neither of which " ++
-            "any directed test drives yet either",
+        .reason = "seeds do terminate TLS now, but an established session " ++
+            "fails mid-relay only for a peer corrupting records or a far " ++
+            "side too slow to drain the outbox. The adversary reorders and " ++
+            "splits deliveries but never alters a byte, so no schedule it " ++
+            "can produce reaches this — and no directed test drives it " ++
+            "either, which is the honest gap",
     },
     .{
         .name = "l7_no_route",
@@ -695,6 +687,10 @@ fn runSeed(arena_state: *std.heap.ArenaAllocator, seed: u64, census: ?*Census) !
 
     var harness: Harness = undefined;
     try harness.setUp(arena, seed);
+    // Not everything a scenario holds is arena memory: §4's credentials
+    // own a libcrypto key, which resetting the arena would leak — once
+    // per seed, twice over for the determinism check.
+    defer harness.tearDown();
     harness.startClients();
     harness.io.run() catch |err| {
         // Deadlock is precisely what this gate exists to catch.

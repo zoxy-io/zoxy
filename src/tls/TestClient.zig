@@ -26,12 +26,17 @@ pub fn TestClient(comptime IoType: type) type {
         out: ztls.ClientHandshake.OutBuffer,
         socket: IoType.Socket,
         connect_completion: IoType.Completion,
+        cancel_completion: IoType.Completion,
         recv_completion: IoType.Completion,
         send_completion: IoType.Completion,
         recv_buffer: [4096]u8,
         /// Ciphertext still to write. Points into the handshake's own
         /// buffers, so it is fully written before the next engine call.
         pending_send: []const u8,
+        /// Whether `socket` holds a real one. A refused dial never assigns
+        /// it, so this is what stops `finish` closing a socket that does
+        /// not exist.
+        connected: bool,
         /// Set when the session established, when the peer sent
         /// close_notify, and when the client is finished with the socket.
         handshake_done: bool,
@@ -149,6 +154,8 @@ pub fn TestClient(comptime IoType: type) type {
             client.records = .init(&client.storage.buffer);
             client.out = .empty;
             client.connect_completion = .{};
+            client.cancel_completion = .{};
+            client.connected = false;
             client.recv_completion = .{};
             client.send_completion = .{};
             client.pending_send = &.{};
@@ -177,9 +184,12 @@ pub fn TestClient(comptime IoType: type) type {
 
         fn onConnect(client: *Self, result: anyerror!IoType.Socket) void {
             client.socket = result catch {
+                // Refused, unreachable, or the cancel above landing: no
+                // socket was ever assigned, so `finish` must not close one.
                 client.finish();
                 return;
             };
+            client.connected = true;
             client.pending_send = client.hs.start(&client.out.buffer) catch {
                 client.finish();
                 return;
@@ -410,12 +420,47 @@ pub fn TestClient(comptime IoType: type) type {
 
         /// Idempotent: the socket closes once, and the scenario hook runs
         /// once, however many paths converge here.
+        ///
+        /// The `connected` guard is not defensive bookkeeping — a refused
+        /// dial reaches here with `socket` never assigned, and closing that
+        /// is an assert inside the seam's own socket table. Directed tests
+        /// never see it because their beds run with the adversary off; a
+        /// simulation that refuses a fifth of dials (§9) sees it constantly.
         fn finish(client: *Self) void {
             if (client.ended) return;
             client.ended = true;
             if (client.hs.isConnected()) client.handshake_done = true;
-            client.io.closeNow(client.socket);
+            if (client.connected) client.io.closeNow(client.socket);
             if (client.on_end) |hook| hook(client.on_end_context);
+        }
+
+        /// Cancel a dial that can never complete (§9's black-holed
+        /// connect), so the scenario can reap this client instead of
+        /// waiting on a completion the simulator will never deliver. A
+        /// no-op for every other state: an already-connected client ends
+        /// through its own path, and a finished one has nothing armed.
+        pub fn cancelIfStuck(client: *Self) void {
+            if (client.ended) return;
+            if (client.connected) return;
+            client.io.connectCancel(
+                &client.connect_completion,
+                &client.cancel_completion,
+                Self,
+                client,
+                onConnectCanceled,
+            );
+        }
+
+        fn onConnectCanceled(client: *Self) void {
+            // The dial's own completion still arrives and runs `onConnect`,
+            // which finishes the client; this only unsticks it.
+            assert(!client.connected);
+        }
+
+        /// True once this client is done with its socket, however it got
+        /// there — what a scenario asks before deciding it may wind down.
+        pub fn isEnded(client: *const Self) bool {
+            return client.ended;
         }
 
         pub fn deinit(client: *Self) void {

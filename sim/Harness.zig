@@ -27,12 +27,23 @@ const Origin = zoxy.testing.Origin(SimIo);
 const HttpOrigin = l7.HttpOrigin(SimIo);
 const HttpClient = l7.Client(SimIo);
 const EchoClient = l4.Client(SimIo);
+const TlsClient = zoxy.tls.TestClient(SimIo);
 
 const assert = std.debug.assert;
 
 const Harness = @This();
 
 const clients_max: u8 = 6;
+/// The §4 terminating population one seed may draw (#125). Small on
+/// purpose: a real ECDSA handshake is ~260 µs of libcrypto on each side,
+/// so a sweep that gave every client a session would cost minutes rather
+/// than the seconds this gate is run at. Two is enough to reach the
+/// engine-pool wall on a starved seed, which is the one rung that needs
+/// more than one.
+const tls_clients_max: u8 = 2;
+/// Bytes each terminating client echoes. Small: what this population is
+/// for is the handshake and the transform, not throughput.
+const tls_token_bytes: u8 = 24;
 /// "203.0.113.255:65535" is 19 bytes; the slack is headroom, not hope.
 const announced_bytes_max: u8 = 32;
 /// Virtual time from scenario start after which stuck work is force-ended.
@@ -74,12 +85,26 @@ request_filters_http: [5]zoxy.http.filter.Rule,
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
 response_filters_http: [2]zoxy.http.filter.ResponseRule,
-listener_configs: [2]zoxy.config.Config.Listener,
+routes_tls: [1]zoxy.http.router.Route,
+listener_configs: [3]zoxy.config.Config.Listener,
+/// How many of `listener_configs` this seed actually binds: two on a
+/// plaintext seed, three when it drew TLS clients (§4).
+listeners_count: u8,
 config: zoxy.config.Config,
 origin: Origin,
 origin_http: HttpOrigin,
 clients: [clients_max]EchoClient,
 l7_clients: [clients_max]HttpClient,
+/// The §4 terminating population (#125) and its credentials. Held on the
+/// harness because the server borrows the table for its life, and because
+/// a `Credentials` owns a libcrypto key that `tearDown` must free — the
+/// arena cannot, it is not arena memory.
+tls_clients_storage: [tls_clients_max]TlsClient,
+tls_clients: u8,
+/// What each terminating client sends, distinct per client so the echo
+/// oracle can tell one session's bytes from another's.
+tls_tokens: [tls_clients_max][tls_token_bytes]u8,
+tls_credentials: [3]?zoxy.tls.Credentials,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
 proxy_protocol_l4: ?zoxy.config.Config.Listener.ProxyProtocol,
@@ -154,6 +179,13 @@ fn bindAddress() std.Io.net.IpAddress {
 
 fn httpBindAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8081") catch unreachable;
+}
+
+/// The §4 terminating listener (#125). Its own socket rather than TLS on
+/// one of the two above, so a seed that draws it changes what reaches
+/// *this* port and nothing about the plaintext coverage beside it.
+fn tlsBindAddress() std.Io.net.IpAddress {
+    return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8443") catch unreachable;
 }
 
 fn originAddress() std.Io.net.IpAddress {
@@ -464,7 +496,17 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     };
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
+    // The terminating listener rides the l4 cluster's endpoint but keeps
+    // its own route, so `verifyUpstreamIdentities` can tell a terminated
+    // connection's origin conn from a plaintext one's.
+    harness.routes_tls = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.proxy_protocol_l4 = deriveProxyProtocol(random);
+    harness.tls_clients = deriveTlsClients(
+        random,
+        harness.proxy_protocol_send_l4,
+        harness.force_exhaustion,
+    );
+    harness.listeners_count = if (harness.tls_clients >= 1) 3 else 2;
     harness.wireListeners(deriveForwarded(random));
     harness.deriveServerConfig(random, connect_timeout_ms, health.interval_ms);
 }
@@ -482,7 +524,12 @@ fn deriveServerConfig(
     assert(connect_timeout_ms >= 1);
     assert(health_interval_ms >= 1);
     harness.config = .{
-        .listeners = &harness.listener_configs,
+        // The terminating listener is the third, and only a seed that drew
+        // TLS clients binds it. Sliced rather than left inert so a
+        // plaintext seed's fd, ring and listener budgets are exactly what
+        // they were before TLS existed — otherwise every seed in the sweep
+        // would shift, and the coverage this gate already has with it.
+        .listeners = harness.listener_configs[0..harness.listeners_count],
         .clusters = &harness.clusters,
         .connect_timeout_ms = connect_timeout_ms,
         // Drawn *above* the dial budget rather than independently: the
@@ -708,6 +755,32 @@ fn deriveProxyProtocolSend(random: std.Random) ?zoxy.config.Config.Cluster.Proxy
     };
 }
 
+/// How many §4 terminating clients this seed runs (#125), and so whether
+/// it binds a terminating listener at all. A quarter of seeds draw one or
+/// two: enough that ~1000 sessions cross the sweep — well past the census
+/// floor for a rung to fire reliably — while a real handshake's ~260 µs
+/// on each side keeps the gate inside the ~5 s it is run at.
+///
+/// Refused outright when the l4 cluster announces itself with a PROXY
+/// header. That header stages into the relay buffer, which is not where a
+/// terminated connection's wire bytes come from, and `config.zig` rejects
+/// the pair at load — so a harness that hand-built it would be simulating
+/// a deployment nobody can configure.
+fn deriveTlsClients(
+    random: std.Random,
+    send: ?zoxy.config.Config.Cluster.ProxyProtocolSend,
+    force_exhaustion: bool,
+) u8 {
+    if (send != null) return 0;
+    if (random.uintLessThan(u8, 4) != 0) return 0;
+    // A starved seed runs the full population against its single engine,
+    // which is the only way `shed_tls_engines` is reached: with one client
+    // the pool is never contended, and drawing the count independently
+    // left the rung silent across the whole sweep.
+    if (force_exhaustion) return tls_clients_max;
+    return 1 + random.uintLessThan(u8, tls_clients_max);
+}
+
 /// The two #159 pages the sweep serves, rendered here exactly as
 /// `config.zig`'s loader renders one — the simulator builds its
 /// `Config` by hand (no filesystem, no parse), so the shape is spelled
@@ -823,6 +896,22 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .protocol = .http,
             .forwarded = forwarded,
         },
+        .{
+            .bind_address = tlsBindAddress(),
+            // Its own route to its own cluster, so a terminated
+            // connection's origin is one no plaintext client reaches —
+            // which keeps `verifyUpstreamIdentities` able to say whose
+            // identity it heard.
+            .routes = &harness.routes_tls,
+            .protocol = .l4,
+            // Paths nothing reads: the harness embeds the PEMs, so what
+            // this states is only that the listener terminates — which is
+            // what `Server.start` checks its credentials table against.
+            .tls = if (harness.tls_clients >= 1)
+                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+            else
+                null,
+        },
     };
 }
 
@@ -878,6 +967,11 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             // rung itself is relay-shadowed (see sim/main.zig uncovered).
             .upstream_head_buffers = 1,
             .access_log_buffer_bytes = access_log_buffer_bytes,
+            // One engine against up to two sessions: the §4 wall, which
+            // an exhaustion seed is drawn to meet. Zero when the seed
+            // drew no TLS clients, which is what keeps the pool free to
+            // every scenario that does not use it.
+            .tls_engines = if (harness.tls_clients >= 1) 1 else 0,
         }
     else
         .{
@@ -899,8 +993,27 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             .upstream_slots = 2 * clients_max,
             .head_buffers = harness.head_buffers,
             .upstream_head_buffers = 2 * clients_max,
+            // One each, so a non-starved seed's sessions all get through.
+            .tls_engines = harness.tls_clients,
         };
     try harness.server.init(arena, &harness.io, &harness.config, options);
+    harness.tls_credentials = .{ null, null, null };
+    if (harness.tls_clients >= 1) {
+        // Index 2: the terminating listener is the third.
+        harness.tls_credentials[2] = try zoxy.tls.Credentials.load(
+            arena,
+            zoxy.tls.testdata.cert_pem,
+            zoxy.tls.testdata.key_pem,
+            // The deterministic nonce is not optional here: without it the
+            // CertificateVerify signature varies run to run, and this
+            // gate's whole verdict is that one seed replays byte-exact.
+            .{ .deterministic_nonce = true },
+        );
+        // One slot per listener, non-null exactly at the terminating one.
+        harness.server.setTlsCredentials(
+            harness.tls_credentials[0..harness.listeners_count],
+        );
+    }
     try harness.server.start();
 
     harness.origin = .{
@@ -919,15 +1032,26 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
 fn populateClients(harness: *Harness, random: std.Random) void {
     // Each client flips a protocol coin: mixed populations put both
     // serving paths under one schedule and shared pools.
-    harness.clients_count = 1 + random.uintLessThan(u8, clients_max);
+    const plaintext_count = 1 + random.uintLessThan(u8, clients_max);
+    // The terminating clients are part of the population the wind-down
+    // waits on, so they join the count `clientEnded` compares against.
+    harness.clients_count = plaintext_count + harness.tls_clients;
     harness.l4_count = 0;
     harness.l7_count = 0;
     harness.ended_count = 0;
+    harness.tls_clients_storage = @splat(undefined);
+    for (harness.tls_tokens[0..harness.tls_clients], 0..) |*token, index| {
+        random.bytes(token);
+        // A distinguishable first byte, so an echo oracle comparing the
+        // wrong session's bytes fails on the first one rather than
+        // needing the whole token to collide.
+        token[0] = @intCast(index);
+    }
     harness.clients = @splat(.{});
     harness.l7_clients = @splat(.{});
     harness.l4_announced_len = @splat(0);
     var index: u8 = 0;
-    while (index < harness.clients_count) : (index += 1) {
+    while (index < plaintext_count) : (index += 1) {
         if (random.boolean()) {
             const client = &harness.l7_clients[harness.l7_count];
             harness.l7_count += 1;
@@ -969,7 +1093,8 @@ fn populateClients(harness: *Harness, random: std.Random) void {
             client.context = harness;
         }
     }
-    assert(harness.l4_count + harness.l7_count == harness.clients_count);
+    assert(harness.l4_count + harness.l7_count + harness.tls_clients ==
+        harness.clients_count);
 }
 
 /// The header an L4 client opens with when the listener requires one
@@ -1044,12 +1169,46 @@ fn recordAnnounced(harness: *Harness, l4_index: u8, octet: u8, port: u16) void {
 
 pub fn startClients(harness: *Harness) void {
     assert(harness.clients_count >= 1);
-    assert(harness.l4_count + harness.l7_count == harness.clients_count);
+    assert(harness.l4_count + harness.l7_count + harness.tls_clients ==
+        harness.clients_count);
     for (harness.clients[0..harness.l4_count]) |*client| {
         client.begin();
     }
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         client.begin();
+    }
+    harness.startTlsClients();
+}
+
+/// The §4 population (#125). `TestClient.start` dials immediately rather
+/// than splitting prepare from begin, so it runs here rather than in
+/// `populateClients` — and its hook has to be set *after*, because `start`
+/// clears both hook fields.
+///
+/// Every seed is drawn from the scenario stream, not from `fillRandom`:
+/// the client's key material must not interleave with the server's on the
+/// simulator's key stream, or the handshake count would decide what each
+/// peer got and the replay would depend on delivery order.
+fn startTlsClients(harness: *Harness) void {
+    var index: u8 = 0;
+    while (index < harness.tls_clients) : (index += 1) {
+        const client = &harness.tls_clients_storage[index];
+        const random = harness.scenario_prng.random();
+        var seeds: [3][32]u8 = undefined;
+        for (&seeds) |*seed| random.bytes(seed);
+        client.start(&harness.io, Harness.tlsBindAddress(), .{
+            .host_name = zoxy.tls.testdata.host_name,
+            .app_data = harness.tls_tokens[index][0..tls_token_bytes],
+            // Close in protocol once the echo is back: an in-band EOF no
+            // socket EOF follows, which is the §6 half-close a terminated
+            // relay can only learn from a decrypt.
+            .close_after_echo = true,
+            .x25519_seed = seeds[0],
+            .p256_seed = seeds[1],
+            .random = seeds[2],
+        }) catch unreachable; // Seeded keypairs; the inputs are ours.
+        client.on_end = clientEndedHook;
+        client.on_end_context = harness;
     }
 }
 
@@ -1075,9 +1234,28 @@ fn endScenario(harness: *Harness) void {
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         client.cancelIfStuck();
     }
+    for (harness.tls_clients_storage[0..harness.tls_clients]) |*client| {
+        client.cancelIfStuck();
+    }
     harness.server.beginDrain();
     harness.origin.stopListening();
     harness.origin_http.stopListening();
+}
+
+/// Free what the arena cannot (§4): a `Credentials` owns a libcrypto key
+/// object, which is not arena memory, so a sweep that only reset the
+/// arena would leak one key per seed — twice over, since every seed runs
+/// twice for the determinism check.
+pub fn tearDown(harness: *Harness) void {
+    for (&harness.tls_credentials) |*slot| {
+        if (slot.*) |*credentials| {
+            credentials.deinit();
+            slot.* = null;
+        }
+    }
+    for (harness.tls_clients_storage[0..harness.tls_clients]) |*client| {
+        client.deinit();
+    }
 }
 
 pub fn verify(harness: *Harness) !void {
@@ -1111,6 +1289,45 @@ pub fn verify(harness: *Harness) !void {
     }
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         try client.verify();
+    }
+    try harness.verifyTlsSessions();
+}
+
+/// What a terminated session owes (§4).
+///
+/// Prefix-legality holds on every seed: whatever came back must be the
+/// start of what went out, so a session that decrypted another's bytes or
+/// corrupted its own fails wherever it diverged. Exactness is demanded of
+/// the sessions that *said* they were done — the client sends its
+/// close_notify only once the whole echo is back, so `close_sent` is its
+/// own statement that it got everything, and a client that then holds
+/// fewer bytes than it sent is a contradiction.
+///
+/// Not conditioned on `clean`, deliberately. A TLS session costs several
+/// more virtual round trips than a plaintext one, so it can legitimately
+/// meet the scenario's end mid-echo on a seed where every plaintext
+/// client finished — that is the schedule being short, not the proxy
+/// being wrong, and an oracle that called it a truncation would fail
+/// honest runs.
+fn verifyTlsSessions(harness: *Harness) !void {
+    if (harness.tls_clients == 0) return;
+    var closed_count: u8 = 0;
+    for (harness.tls_clients_storage[0..harness.tls_clients], 0..) |*client, index| {
+        const sent = harness.tls_tokens[index][0..tls_token_bytes];
+        const back = client.app_received[0..client.app_received_len];
+        if (back.len > sent.len) return error.TlsEchoOverrun;
+        if (!std.mem.eql(u8, sent[0..back.len], back)) return error.TlsEchoCorrupted;
+        if (client.close_sent) {
+            closed_count += 1;
+            if (back.len != sent.len) return error.TlsEchoTruncated;
+        }
+    }
+    // A session that closed in protocol necessarily completed its
+    // handshake, so the counter cannot read lower than that — which is
+    // what catches a run that quietly failed handshakes and still
+    // satisfied the byte comparison above on empty echoes.
+    if (harness.server.counters.get("tls_handshakes_completed") < closed_count) {
+        return error.TlsHandshakesDiverged;
     }
 }
 
@@ -1248,7 +1465,13 @@ fn verifyAccessLog(harness: *Harness) !void {
         // clock on admission rather than on first byte — so even the
         // silent clients (`sim/l4.zig` draws some) owe a line, theirs
         // reporting `bytes_in: 0`.
-        if (tally.l4 != harness.l4_count) return error.AccessLogL4LinesDiverged;
+        // The terminating listener is an `l4` one, so its sessions log
+        // the same kind of line: TLS is a phase ahead of the protocol
+        // (§4), not a protocol of its own, and the log reports what the
+        // connection *spoke* rather than how it was wrapped.
+        if (tally.l4 != harness.l4_count + harness.tls_clients) {
+            return error.AccessLogL4LinesDiverged;
+        }
         try harness.verifyAnnouncedClients(sink);
     }
 }
