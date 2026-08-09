@@ -443,7 +443,7 @@ pub fn Server(comptime IoType: type) type {
             // renders back over) and the request body, which §7 lets run
             // concurrently with it. `plaintextBytesFor` prices the pair.
             const plaintext_bytes = TlsEngine.plaintextBytesFor(options.head_buffer_bytes);
-            const head_bytes = plaintext_bytes - TlsEngine.plaintext_bytes_min;
+            const head_slice_bytes = plaintext_bytes - TlsEngine.plaintext_bytes_min;
             const slab = try arena.alloc(
                 u8,
                 @as(usize, options.tls_engines) * plaintext_bytes,
@@ -455,8 +455,12 @@ pub fn Server(comptime IoType: type) type {
             for (server.tls_engines.slots, 0..) |*engine, index| {
                 const slot = slab[index * plaintext_bytes ..][0..plaintext_bytes];
                 engine.bindPlaintext(
-                    slot[0..head_bytes],
-                    slot[head_bytes..],
+                    slot[0..head_slice_bytes],
+                    slot[head_slice_bytes..],
+                    // The slice is as wide as a decrypt needs; the *limit*
+                    // is the operator's, and they are different numbers
+                    // whenever the config sits below the engine's floor.
+                    options.head_buffer_bytes,
                 );
             }
             assert(server.tls_engines.slots.len == options.tls_engines);

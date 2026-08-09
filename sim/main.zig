@@ -195,11 +195,10 @@ const uncovered = [_]Uncovered{
         .reason = "only a terminated connection can overrun its head buffer " ++
             "— one record decrypts to up to 16 KiB at once, where a plaintext " ++
             "read cannot deliver more than the buffer holds — and the seeds " ++
-            "that do terminate send a token far under it. No directed test " ++
-            "reaches it either, which is the honest gap: writing one found " ++
-            "that a terminated listener does not enforce " ++
-            "`limits.head_buffer_bytes` at all (IMPLEMENTATION_NOTES.md), so " ++
-            "the overflow it answers is not the one an operator configured",
+            "that do terminate send a token far under it; " ++
+            "src/http_proxy_test.zig drives it with a small head and an " ++
+            "oversize body in one record, against a listener whose head " ++
+            "limit sits below the engine's own decrypt floor",
     },
     .{
         .name = "tls_relay_failed",
