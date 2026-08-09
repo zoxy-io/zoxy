@@ -30,6 +30,7 @@ const proxy_protocol = @import("net/proxy_protocol.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 const Credentials = @import("tls/Credentials.zig");
+const TlsEngine = @import("tls/Engine.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -71,6 +72,16 @@ pub fn Server(comptime IoType: type) type {
         /// empty for the whole process on a deployment with no `tls`
         /// block anywhere.
         tls_credentials: []const ?Credentials,
+        /// The §4 TLS engine pool: one engine per session being
+        /// handshaked or terminated, drawn at admission on a listener
+        /// that terminates and returned at teardown. Empty — reserving
+        /// nothing — when no listener does, which is the shape `Pool`'s
+        /// zero-slot support exists for.
+        ///
+        /// A pool rather than a `Conn` field because an engine is ~132 KiB
+        /// against a conn slot's ~1.7: a deployment pays for the TLS it
+        /// serves concurrently, not for every slot it could admit (§5).
+        tls_engines: Pool(TlsEngine),
         /// The load-balancing policy: resolves a cluster to the endpoint to
         /// dial. Owns its own per-cluster state so the serving path never
         /// hardcodes how an endpoint is chosen (§7).
@@ -355,6 +366,7 @@ pub fn Server(comptime IoType: type) type {
             assert(options.upstream_head_buffers <= options.upstream_slots);
             try server.upstream_head_buffers.init(arena, options.upstream_head_buffers);
             try server.initHeadBuffers(arena, &options);
+            try server.initTlsEngines(arena, &options);
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
@@ -407,6 +419,39 @@ pub fn Server(comptime IoType: type) type {
             assert(server.target_scratch.len + server.rewrite_scratch.len +
                 options.head_buffer_bytes == headScratchBytes(options.*));
             try server.initLogHeaders(arena, options);
+        }
+
+        /// The §4 engine pool and the one slab its plaintext destinations
+        /// carve out of. Both are empty on a deployment where no listener
+        /// terminates TLS — the whole feature reserving nothing, which is
+        /// what `limits.tls_engines == 0` means and what `Pool`'s
+        /// zero-slot support is for.
+        fn initTlsEngines(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+        ) error{OutOfMemory}!void {
+            assert(options.tls_engines <= options.conn_slots);
+            try server.tls_engines.init(arena, options.tls_engines);
+            if (options.tls_engines == 0) {
+                return;
+            }
+            // One buffer per slot, sized by the engine's own closed form —
+            // the same call `main`'s banner makes, which is what keeps the
+            // printed §5 total and this reservation the same number.
+            const plaintext_bytes = TlsEngine.plaintextBytesFor(options.head_buffer_bytes);
+            const slab = try arena.alloc(
+                u8,
+                @as(usize, options.tls_engines) * plaintext_bytes,
+            );
+            // Not faulted in, like the upstream head slab beside it: pages
+            // become resident as sessions actually use them, so the printed
+            // total is a ceiling RSS approaches under load rather than a
+            // startup floor. Nothing reads a byte it did not first write.
+            for (server.tls_engines.slots, 0..) |*engine, index| {
+                engine.bindPlaintext(slab[index * plaintext_bytes ..][0..plaintext_bytes]);
+            }
+            assert(server.tls_engines.slots.len == options.tls_engines);
         }
 
         /// The #140 capture table, sized by the config's named headers
@@ -1038,6 +1083,67 @@ pub fn Server(comptime IoType: type) type {
         pub fn releaseRelayBuffer(server: *Self, buffer: *relay.RelayBuffer) void {
             server.relay_buffers.release(buffer);
             server.updateRelayPressure();
+        }
+
+        /// Why a session could not get an engine (§4, §8). Two causes, and
+        /// deliberately not one `null`: an operator's response to them
+        /// differs completely, and this is the last frame where they are
+        /// still distinguishable.
+        pub const AcquireEngineError = error{
+            /// Every engine is in use. Ordinary backpressure — the §8 wall
+            /// `limits.tls_engines` names, answered by shedding, and fixed
+            /// by provisioning more if the memory is there.
+            EnginesExhausted,
+            /// libcrypto could not serve the key derivation. Under the
+            /// fixed heap (§4) that means the heap is out, which is a
+            /// sizing failure rather than a load one: more engines would
+            /// not help, and no amount of shedding frees it.
+            CryptoUnavailable,
+        };
+
+        /// A TLS engine for one session (§4), initialized against the
+        /// listener's credentials and this run's key material.
+        ///
+        /// Key material comes through the Io seam so the simulator's
+        /// seeded stream drives it (§9): a handshake is only replayable if
+        /// its randomness came from the run's seed, and nothing below this
+        /// line could know that. One draw for both seeds — the seam serves
+        /// a whole request or panics, so two calls would buy nothing.
+        pub fn acquireTlsEngine(
+            server: *Self,
+            credentials: *const Credentials,
+        ) AcquireEngineError!*TlsEngine {
+            assert(credentials.chain.len >= 1);
+            const engine = server.tls_engines.acquire() orelse
+                return error.EnginesExhausted;
+            var seeds: [64]u8 = undefined;
+            server.io.fillRandom(&seeds);
+            engine.init(&.{
+                .x25519_seed = seeds[0..32].*,
+                .random = seeds[32..64].*,
+                .credentials = credentials,
+            }) catch {
+                // Deriving the ephemeral keypair is the one fallible step,
+                // and under the OpenSSL backend it *allocates*
+                // (`EVP_PKEY_new_raw_private_key`) — from the fixed heap,
+                // so this is that heap running out rather than the seed
+                // being bad. Give the slot back before reporting: the
+                // connection is lost either way, and a leaked engine would
+                // cost every later one too.
+                server.tls_engines.release(engine);
+                return error.CryptoUnavailable;
+            };
+            assert(!engine.isConnected());
+            assert(engine.plaintext.len >= TlsEngine.plaintext_bytes_min);
+            return engine;
+        }
+
+        /// The release pair, at teardown. Unlike a relay buffer this is
+        /// never returned mid-connection: the engine holds the session's
+        /// keys, so a terminated connection needs it until it is gone.
+        pub fn releaseTlsEngine(server: *Self, engine: *TlsEngine) void {
+            engine.deinit();
+            server.tls_engines.release(engine);
         }
 
         /// The ring pair (§5): the bind side is the seam's — the kernel
