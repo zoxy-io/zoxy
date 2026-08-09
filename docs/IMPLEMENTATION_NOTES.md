@@ -47,6 +47,29 @@ available. The fork carries four commits, each re-audited in
   stall, identified" below. The ticket must be emitted **after**
   processing that `Finished`, not alongside the server flight.
 
+Remaining, in the order the work wants:
+
+1. **Session tickets.** The fork can issue them (`sendNewSessionTicket`,
+   `resumptionPsk`) and accept them (`Config.psk_lookup`, upstream), and
+   `src/tls/Tickets.zig` has the stateless seal/open — but nothing is
+   wired, so no ticket is ever sent. That is both §4's resumption and the
+   ~45 ms stall below, and the emission has to land *after* the client
+   Finished is processed, not alongside the server flight.
+2. **The Tier-0.5 smoke gate.** Feasible as planned and with no new
+   dependency: `std.crypto.tls.Client` in the pinned toolchain offers
+   `ca: .self_signed` and `host: .no_verification`, which is exactly the
+   checked-in fixture's shape. Worth doing with std rather than
+   `TestClient` precisely because it is an *independent* implementation —
+   ztls talking to ztls proves interoperability with nobody.
+3. **The Tier-1 bands**, whose acceptance is the close-mode rate gate PR
+   #84 could not pass; (1) is what is expected to move it.
+
+Two smaller things the reviews left open: `ResponseBodyPolicy.afterSend`
+credits ciphertext to `bytes_out` where the client-write channel credits
+plaintext, so a streamed TLS response over-counts; and the sim's TLS
+http client sends `Connection: close` and a GET, leaving the keep-alive
+turnaround and the request-body leg reachable by directed tests only.
+
 Earlier candidates, recorded so they are not re-chased: a hardened fork
 of [tls.zig](https://github.com/ianic/tls.zig) (pinned `5452baf`) was the
 plan until its hardening gate — server resumption, fragmented
