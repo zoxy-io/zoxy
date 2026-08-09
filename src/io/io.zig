@@ -41,6 +41,9 @@
 //!   peerAddress(io, socket) IpAddress                   (sync; who connected)
 //!   localAddress(io, socket) IpAddress                  (sync; this end —
 //!       what the peer connected *to*, §6's send-header destination)
+//!   fillRandom(io, buffer) void                         (sync; key material —
+//!       the OS CSPRNG in production, the scenario's seeded stream in the
+//!       simulator, which is what makes a handshake replayable at all)
 //!   lastPressure(io) Pressure                           (classified cause
 //!       of the op just delivered, §8)
 //!   nowNs(io) u64                                       (per-tick clock, §4)
@@ -197,6 +200,12 @@ pub const Pressure = struct {
     pub const none: Pressure = .{ .cause = .other, .errno = 0 };
 };
 
+/// The largest buffer one `fillRandom` may ask for. Linux's `getrandom`
+/// promises short-read-free, uninterruptible service only up to 256 bytes;
+/// rather than write a partial-fill loop no caller needs, the promise is a
+/// precondition both backends assert. Key material comes a key at a time.
+pub const random_bytes_max: u32 = 256;
+
 pub const RunError = error{
     /// SimIo only: pending work exists but nothing can ever become ready —
     /// a liveness bug in the scenario or the data path (§9 invariant).
@@ -238,6 +247,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "closeNow",
             "peerAddress",
             "localAddress",
+            "fillRandom",
             "lastPressure",
             "nowNs",
             "nowWallNs",

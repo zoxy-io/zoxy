@@ -9,6 +9,7 @@
 //! control ops below touch the fd directly. `CompletionQueueOvercommitted`
 //! is an invariant violation (§8: the budget makes it unreachable).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const xev = @import("xev");
 
@@ -35,6 +36,15 @@ const needs_thread_pool = xev.backend == .kqueue;
 const uses_buf_ring = xev.backend == .io_uring;
 /// The one buffer group this backend registers (§5's head-buffer ring).
 const buffer_group_id: u16 = 0;
+/// Which door the OS CSPRNG is behind. Linux has the `getrandom` syscall;
+/// Darwin publishes no stable syscall ABI, so `fillRandom` goes through
+/// libSystem there. Keyed on the OS, not on `xev.backend` — the event
+/// backend and the entropy source are unrelated choices.
+const uses_getrandom_syscall = builtin.os.tag == .linux;
+/// How many times `fillRandom` retries an interrupted `getrandom` before
+/// declaring the entropy source broken. Generous: EINTR needs an unseeded
+/// pool *and* a signal, so even one retry is already the unusual path.
+const getrandom_attempts_max: u8 = 16;
 
 /// The access-log sink's `stdout` arm (§8): the process's own stdout,
 /// inherited, never opened and never closed — already one of the three
@@ -1112,6 +1122,51 @@ pub fn shutdown(io: *XevIo, socket: Socket, how: Io.ShutdownHow) void {
 pub fn closeNow(io: *XevIo, socket: Socket) void {
     _ = io;
     closeFd(@intFromEnum(socket));
+}
+
+/// Key material for the TLS engine (§4): the OS CSPRNG, read here because
+/// `src/io/` is the only place a raw syscall may live. Production
+/// randomness is never derived from the clock or a seed — SimIo alone
+/// substitutes a deterministic stream, and only so the simulator can
+/// replay a handshake byte-for-byte (§9).
+///
+/// A CSPRNG that cannot answer is not a condition to degrade around, so
+/// this panics rather than hand back weak key material: every caller is a
+/// key or a nonce, and there is no such thing as serving one badly.
+pub fn fillRandom(io: *XevIo, buffer: []u8) void {
+    _ = io;
+    assert(buffer.len > 0);
+    assert(buffer.len <= Io.random_bytes_max);
+    if (uses_getrandom_syscall) {
+        // Bounded, per TIGER_STYLE: EINTR is only reachable before the
+        // kernel pool is seeded, where the call blocks and a signal can cut
+        // it short. A pool that stays unseeded across this many attempts is
+        // a boot the proxy cannot serve from anyway.
+        for (0..getrandom_attempts_max) |_| {
+            const rc = linux.getrandom(buffer.ptr, buffer.len, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    // At or under `random_bytes_max` a seeded pool fills the
+                    // whole request, so a short answer is a broken promise,
+                    // not a case to loop around.
+                    assert(rc == buffer.len);
+                    return;
+                },
+                .INTR => continue,
+                else => |err| std.debug.panic("getrandom failed: {t}", .{err}),
+            }
+        }
+        std.debug.panic(
+            "getrandom interrupted {d} times",
+            .{getrandom_attempts_max},
+        );
+    } else {
+        // Darwin publishes no stable syscall interface; libSystem's CSPRNG
+        // is the supported door and cannot fail — it aborts internally
+        // rather than return unseeded bytes, which is this function's own
+        // policy already.
+        std.c.arc4random_buf(buffer.ptr, buffer.len);
+    }
 }
 
 pub fn nowNs(io: *XevIo) u64 {

@@ -61,6 +61,9 @@ const pending_signals_max: u8 = 8;
 const clock_start_ns: u64 = 1_000_000_000;
 const jitter_ns_max: u64 = 1_000_000;
 const never_ns: u64 = std.math.maxInt(u64);
+/// Separates `key_prng` from `prng` while keeping both a function of the
+/// run's one seed. Any fixed non-zero constant does; this one is arbitrary.
+const key_seed_salt: u64 = 0x7a_74_6c_73_6b_65_79_00;
 const peer_none: u16 = std.math.maxInt(u16);
 /// Ports the simulator hands out for port-zero binds.
 const ephemeral_port_base: u16 = 40_000;
@@ -94,6 +97,14 @@ signal_callback: ?*const fn (?*anyopaque, Io.Signal) void,
 signal_userdata: ?*anyopaque,
 now_ns_value: u64,
 prng: std.Random.DefaultPrng,
+/// Key material for `fillRandom`, kept on its own stream rather than
+/// drawn from `prng`. Both are seeded from the run's seed, so `zig build
+/// sim -- <seed>` still replays everything; the split is so that adding or
+/// removing a handshake does not shift every later adversary decision in
+/// the scenario. Sharing the stream would make any TLS change silently re-roll
+/// the delivery schedule of every *non*-TLS connection under every seed —
+/// re-rolling the sweep's coverage while the sweep still reports green.
+key_prng: std.Random.DefaultPrng,
 adversary: Adversary,
 /// Pending one-shot `setNodelay`/`setLingerRst` failures (§9). A virtual
 /// socket table has no reason to refuse a socket option, so without this
@@ -447,6 +458,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.signal_userdata = null;
     io.now_ns_value = clock_start_ns;
     io.prng = std.Random.DefaultPrng.init(options.seed);
+    io.key_prng = std.Random.DefaultPrng.init(options.seed ^ key_seed_salt);
     io.adversary = options.adversary;
     io.pending_set_option_errors = 0;
     io.pressure_cause = .out_of_buffers;
@@ -931,6 +943,16 @@ pub fn shutdown(io: *SimIo, socket: Socket, how: Io.ShutdownHow) void {
 /// op. Honors a prior setLingerRst by resetting the peer.
 pub fn closeNow(io: *SimIo, socket: Socket) void {
     io.closeEntry(socket);
+}
+
+/// Key material for the TLS engine (§4). Drawn from the scenario's own
+/// seeded stream rather than the OS CSPRNG, which is what makes a seeded
+/// run replay a byte-exact handshake — and so makes TLS traffic assertable
+/// by the §9 identical-trace oracle at all.
+pub fn fillRandom(io: *SimIo, buffer: []u8) void {
+    assert(buffer.len > 0);
+    assert(buffer.len <= Io.random_bytes_max);
+    io.key_prng.random().bytes(buffer);
 }
 
 pub fn nowNs(io: *SimIo) u64 {
