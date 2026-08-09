@@ -1534,7 +1534,9 @@ test "tls: what the pool holds is what the budget priced" {
     // recomputed — a slot bound to the wrong-sized slice shows up here.
     var held: u64 = @as(u64, engines) * @sizeOf(TlsEngine);
     for (bed.server.tls_engines.slots) |*engine| {
-        held += engine.plaintext.len;
+        // Both destinations: a slot holds the head's and the body's, which
+        // is what `plaintextBytesFor` prices as one number.
+        held += engine.plaintext.len + engine.body_plaintext.len;
     }
 
     // What the budget charges for it. `memoryBytesTotal`'s TLS term with
@@ -1565,12 +1567,17 @@ test "tls: an operator's head size widens the plaintext buffer, and is priced" {
     });
     defer bed.tearDown();
 
+    const engine = &bed.server.tls_engines.slots[0];
+    // The head destination follows the operator's size; the body's keeps
+    // the engine's own floor, because a body never has to hold a head.
+    try std.testing.expectEqual(@as(usize, wide_head), engine.plaintext.len);
+    try std.testing.expectEqual(TlsEngine.plaintext_bytes_min, engine.body_plaintext.len);
+    // Distinct regions: the two legs run concurrently (§7), so a slot that
+    // handed the same slice twice would let a request-body chunk clobber
+    // the response head still being written out of it.
+    try std.testing.expect(engine.plaintext.ptr != engine.body_plaintext.ptr);
     try std.testing.expectEqual(
-        @as(usize, wide_head),
-        bed.server.tls_engines.slots[0].plaintext.len,
-    );
-    try std.testing.expectEqual(
-        wide_head,
+        wide_head + TlsEngine.plaintext_bytes_min,
         TlsEngine.plaintextBytesFor(wide_head),
     );
 }

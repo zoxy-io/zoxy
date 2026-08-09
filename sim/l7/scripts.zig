@@ -158,6 +158,13 @@ const post_body = "request-body-24-bytes-ab";
 /// can ever appear.
 const trace_line = canon.log_request_header ++ ": " ++ canon.log_request_value ++ "\r\n";
 pub const get_request = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++ "\r\n";
+/// The same request with an explicit close, for a caller that has no
+/// script driving it and needs the exchange to end the connection: the
+/// §4 terminating population sends one request and is done, so a
+/// kept-alive connection would leave it waiting on a peer with nothing
+/// left to say.
+pub const get_request_close = "GET /sim HTTP/1.1\r\nHost: sim\r\nConnection: close\r\n" ++
+    trace_line ++ "\r\n";
 /// Deterministic 6000-byte body for `post_big`, cycled so the
 /// origin-side §7 oracle can spot any reordering.
 const big_body = blk: {

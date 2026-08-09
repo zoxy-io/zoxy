@@ -144,6 +144,7 @@ const Bed = struct {
     credentials: Credentials,
     engine: Engine,
     plaintext: [Engine.plaintext_bytes_min]u8,
+    body_plaintext: [Engine.plaintext_bytes_min]u8,
     client: Client,
     to_server: Peer,
     to_client: Peer,
@@ -156,7 +157,7 @@ const Bed = struct {
             key_pem,
             .{},
         );
-        bed.engine.bindPlaintext(&bed.plaintext);
+        bed.engine.bindPlaintext(&bed.plaintext, &bed.body_plaintext);
         try bed.engine.init(&.{
             .x25519_seed = @splat(0x42),
             .random = @splat(0x43),

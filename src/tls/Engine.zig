@@ -70,6 +70,17 @@ outbox_sent: u32,
 /// step, an L7 head accumulates across reads until the parser is
 /// satisfied — and only the caller knows which.
 plaintext: []u8,
+/// A second destination, for a request *body* (§7). Separate from the
+/// one above and not an economy the pool can skip: on the L7 path the
+/// head buffer holds the request head until the response head renders
+/// over it, and an origin may legally answer before the request body
+/// finishes — a 413 mid-upload is §7's own example. So the two legs run
+/// concurrently, and a body chunk decrypting into the buffer a response
+/// head is still being written out of would clobber it.
+///
+/// Sized by the same floor and unused on the L4 path, where a relayed
+/// direction's plaintext has nothing to share with.
+body_plaintext: []u8,
 /// Whether this session's close_notify has been staged. The engine owns
 /// it because `sendClose` is its only writer, and because the transport
 /// needs the answer *after* the outbox drains — by which time the alert
@@ -206,17 +217,27 @@ pub const Config = struct {
 pub fn plaintextBytesFor(head_buffer_bytes: u32) u32 {
     assert(head_buffer_bytes >= constants.head_buffer_bytes_min);
     assert(head_buffer_bytes <= constants.head_buffer_bytes_max);
-    const bytes = @max(head_buffer_bytes, plaintext_bytes_min);
-    assert(bytes >= plaintext_bytes_min);
+    // The head destination, then the body's. The first has to cover a
+    // whole L7 head as well as a decrypt; the second only ever holds
+    // body bytes, so the floor is enough for it.
+    const head = @max(head_buffer_bytes, plaintext_bytes_min);
+    const bytes = head + plaintext_bytes_min;
+    assert(bytes >= 2 * plaintext_bytes_min);
     return @intCast(bytes);
 }
 
 /// Bind this slot's plaintext destination. Called once at pool init, not
 /// per session: the slab is startup memory and a slot keeps its slice for
 /// the process, so `init` below can assume it is already there.
-pub fn bindPlaintext(engine: *Engine, buffer: []u8) void {
+pub fn bindPlaintext(engine: *Engine, buffer: []u8, body: []u8) void {
     assert(buffer.len >= plaintext_bytes_min);
+    assert(body.len >= plaintext_bytes_min);
+    // Distinct regions, which is the whole point of there being two: one
+    // slab handing the same slice twice would reintroduce the aliasing
+    // the split exists to remove, and silently.
+    assert(buffer.ptr != body.ptr);
     engine.plaintext = buffer;
+    engine.body_plaintext = body;
 }
 
 /// In-place init via out-pointer: `records` borrows `record_storage` and
@@ -225,6 +246,7 @@ pub fn bindPlaintext(engine: *Engine, buffer: []u8) void {
 pub fn init(engine: *Engine, config: *const Config) !void {
     assert(config.credentials.chain.len >= 1);
     assert(engine.plaintext.len >= plaintext_bytes_min); // bindPlaintext ran.
+    assert(engine.body_plaintext.len >= plaintext_bytes_min);
     const keypair = try ztls.x25519.KeyPair.generateDeterministic(
         .init(config.x25519_seed),
     );

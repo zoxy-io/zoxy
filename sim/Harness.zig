@@ -44,6 +44,11 @@ const tls_clients_max: u8 = 2;
 /// Bytes each terminating client echoes. Small: what this population is
 /// for is the handshake and the transform, not throughput.
 const tls_token_bytes: u8 = 24;
+/// What a terminating *http* listener's client sends. The plain GET the
+/// L7 scripts already use, so the origin double answers it exactly as it
+/// answers a plaintext one and the difference under test is the
+/// transform rather than the request.
+const tls_http_request = l7.scripts.get_request_close;
 /// "203.0.113.255:65535" is 19 bytes; the slack is headroom, not hope.
 const announced_bytes_max: u8 = 32;
 /// Virtual time from scenario start after which stuck work is force-ended.
@@ -101,6 +106,8 @@ l7_clients: [clients_max]HttpClient,
 /// arena cannot, it is not arena memory.
 tls_clients_storage: [tls_clients_max]TlsClient,
 tls_clients: u8,
+/// What the terminating listener speaks once the handshake hands over.
+tls_protocol: zoxy.config.Config.Listener.Protocol,
 /// What each terminating client sends, distinct per client so the echo
 /// oracle can tell one session's bytes from another's.
 tls_tokens: [tls_clients_max][tls_token_bytes]u8,
@@ -499,7 +506,11 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // The terminating listener rides the l4 cluster's endpoint but keeps
     // its own route, so `verifyUpstreamIdentities` can tell a terminated
     // connection's origin conn from a plaintext one's.
-    harness.routes_tls = .{.{ .prefix = "/", .cluster_index = 0 }};
+    harness.tls_protocol = if (random.boolean()) .http else .l4;
+    harness.routes_tls = .{.{
+        .prefix = "/",
+        .cluster_index = if (harness.tls_protocol == .http) 1 else 0,
+    }};
     harness.proxy_protocol_l4 = deriveProxyProtocol(random);
     harness.tls_clients = deriveTlsClients(
         random,
@@ -898,12 +909,18 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
         },
         .{
             .bind_address = tlsBindAddress(),
-            // Its own route to its own cluster, so a terminated
-            // connection's origin is one no plaintext client reaches —
-            // which keeps `verifyUpstreamIdentities` able to say whose
-            // identity it heard.
+            // Its own route, so a terminated connection's origin conn is
+            // one `verifyUpstreamIdentities` can tell from a plaintext
+            // client's. Which cluster it points at follows the protocol:
+            // an http terminator has to reach an origin that speaks HTTP.
             .routes = &harness.routes_tls,
-            .protocol = .l4,
+            // Both, across seeds. Termination is a phase ahead of the
+            // protocol (§4), so the two combinations exercise genuinely
+            // different code — the L4 relay's transform hooks against the
+            // L7 head-fill source and client-write channel — and a sweep
+            // that only ever drew one would leave the other's states
+            // reachable by nothing.
+            .protocol = harness.tls_protocol,
             // Paths nothing reads: the harness embeds the PEMs, so what
             // this states is only that the listener terminates — which is
             // what `Server.start` checks its credentials table against.
@@ -1198,11 +1215,35 @@ fn startTlsClients(harness: *Harness) void {
         for (&seeds) |*seed| random.bytes(seed);
         client.start(&harness.io, Harness.tlsBindAddress(), .{
             .host_name = zoxy.tls.testdata.host_name,
-            .app_data = harness.tls_tokens[index][0..tls_token_bytes],
-            // Close in protocol once the echo is back: an in-band EOF no
-            // socket EOF follows, which is the §6 half-close a terminated
-            // relay can only learn from a decrypt.
-            .close_after_echo = true,
+            // An echo token for a relayed session, a real request for a
+            // proxied one — the terminated stream has to be what the
+            // listener behind it expects, or the head parser answers 400
+            // and the transform is never exercised at all.
+            .app_data = if (harness.tls_protocol == .http)
+                tls_http_request
+            else
+                harness.tls_tokens[index][0..tls_token_bytes],
+            // A relayed session closes in protocol once its echo is back:
+            // an in-band EOF no socket EOF follows, which is the §6
+            // half-close a terminated relay can only learn from a decrypt.
+            //
+            // A proxied one must not. That option waits for as many bytes
+            // back as went out, which is an echo's shape and not an
+            // exchange's — a response shorter than its request would leave
+            // the client waiting forever. The request carries
+            // `Connection: close` instead, so the proxy ends the
+            // connection and the client finishes on the EOF.
+            //
+            // Two gaps that leaves, stated because closing them is the
+            // next work here and not something to rediscover. A
+            // `Connection: close` request is one exchange, so the
+            // keep-alive turnaround — which is where the head source's
+            // first defect lived — is never re-entered; and a GET carries
+            // no body, so the request-body leg's transform never runs. A
+            // second request and a POST are what cover both, and each
+            // needs the client to end on something other than the peer's
+            // EOF.
+            .close_after_echo = harness.tls_protocol == .l4,
             .x25519_seed = seeds[0],
             .p256_seed = seeds[1],
             .random = seeds[2],
@@ -1313,8 +1354,25 @@ fn verifyTlsSessions(harness: *Harness) !void {
     if (harness.tls_clients == 0) return;
     var closed_count: u8 = 0;
     for (harness.tls_clients_storage[0..harness.tls_clients], 0..) |*client, index| {
-        const sent = harness.tls_tokens[index][0..tls_token_bytes];
         const back = client.app_received[0..client.app_received_len];
+        if (harness.tls_protocol == .http) {
+            // A proxied session gets a response, not its own bytes back.
+            // What is checkable without restating the L7 oracle is that
+            // anything which arrived is a *response* — an origin's answer
+            // relayed through the transform, not the request echoing back
+            // or another session's plaintext.
+            if (back.len >= 1 and !std.mem.startsWith(u8, back, "HTTP/1.1 ")) {
+                return error.TlsResponseCorrupted;
+            }
+            // Response bytes, not `handshake_done`: a client believes it
+            // is connected once it has processed the server's flight,
+            // which is one step before the server has seen its Finished —
+            // so the client's own view can legitimately lead the server's
+            // counter. A relayed response cannot.
+            if (back.len >= 1) closed_count += 1;
+            continue;
+        }
+        const sent = harness.tls_tokens[index][0..tls_token_bytes];
         if (back.len > sent.len) return error.TlsEchoOverrun;
         if (!std.mem.eql(u8, sent[0..back.len], back)) return error.TlsEchoCorrupted;
         if (client.close_sent) {
@@ -1465,11 +1523,13 @@ fn verifyAccessLog(harness: *Harness) !void {
         // clock on admission rather than on first byte — so even the
         // silent clients (`sim/l4.zig` draws some) owe a line, theirs
         // reporting `bytes_in: 0`.
-        // The terminating listener is an `l4` one, so its sessions log
-        // the same kind of line: TLS is a phase ahead of the protocol
-        // (§4), not a protocol of its own, and the log reports what the
-        // connection *spoke* rather than how it was wrapped.
-        if (tally.l4 != harness.l4_count + harness.tls_clients) {
+        // TLS is a phase ahead of the protocol (§4), not a protocol of its
+        // own, so a terminated connection logs whatever it went on to
+        // speak: an `l4` terminator adds L4 lines, an `http` one adds its
+        // exchanges to the HTTP tally the equality above already covers.
+        const terminated_l4: u8 =
+            if (harness.tls_protocol == .l4) harness.tls_clients else 0;
+        if (tally.l4 != harness.l4_count + terminated_l4) {
             return error.AccessLogL4LinesDiverged;
         }
         try harness.verifyAnnouncedClients(sink);
@@ -1543,6 +1603,11 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_bad_request",
         "l7_uri_too_long",
         "l7_headers_too_large",
+        // The #125 sibling: a terminated connection whose head fit and
+        // whose body did not. Answered like the two above, so it belongs
+        // in the same sum — added while it is free rather than on the
+        // first seed that reaches it.
+        "l7_body_too_large",
         "l7_not_implemented",
         "l7_no_route",
         "l7_filtered",

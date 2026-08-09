@@ -119,6 +119,13 @@ pub const ClientWrite = struct {
     /// upstream head. Empty means no write is in flight.
     pending: []const u8 = &.{},
     then: Then = .lingering_close,
+    /// How much of `pending`'s front the engine has already encrypted
+    /// into its outbox (§4), zero on a plaintext connection. The cursor
+    /// above counts plaintext, because that is what the writers framed and
+    /// what the access log means by `bytes_out`; the wire carries more.
+    /// So `pending` advances only when the chunk that produced the
+    /// ciphertext has fully gone out — never per byte the socket took.
+    staged: u32 = 0,
 
     /// What the channel does when `pending` empties.
     pub const Then = enum(u8) {

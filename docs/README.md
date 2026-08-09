@@ -172,7 +172,7 @@ the same filters.
 
 ```json
 "listeners": [
-    { "bind": "0.0.0.0:8443", "protocol": "l4", "cluster": "backend",
+    { "bind": "0.0.0.0:443", "protocol": "http", "cluster": "web",
       "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key" } }
 ]
 ```
@@ -182,17 +182,16 @@ the proxy with an error naming the file — never mid-handshake against a
 real client. `cert` is a PEM chain, leaf first; `key` is the leaf's PEM
 private key.
 
+Either protocol may terminate. The handshake runs as a phase ahead of the
+protocol, so routing, filters, redirects and access logs work exactly as
+they do in the clear — an `http` listener parses its request out of
+decrypted bytes and encrypts its response on the way back.
+
 > [!NOTE]
-> `l4` listeners only, for now. On an `http` listener the request parser
-> reads straight off the socket and would be handed ciphertext, so that
-> combination is refused at load rather than accepted into a listener that
-> fails every request. Terminating in front of an HTTP backend works today
-> as an `l4` listener; routing, filters and access logs on a terminated
-> connection are what the `http` case still needs.
->
 > A cluster with `proxy_protocol.send` is refused from a terminating
-> listener for the same reason — the header would be staged where the wire
-> does not read it.
+> listener: that header stages into the relay buffer, which is not where a
+> terminated connection's wire bytes come from. The combination is
+> rejected at load rather than sent to your origin as garbage.
 
 > [!IMPORTANT]
 > The key must be **ECDSA P-256 or P-384**. Handshakes run on the event
