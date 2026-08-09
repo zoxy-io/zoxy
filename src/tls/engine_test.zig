@@ -157,7 +157,11 @@ const Bed = struct {
             key_pem,
             .{},
         );
-        bed.engine.bindPlaintext(&bed.plaintext, &bed.body_plaintext);
+        bed.engine.bindPlaintext(
+            &bed.plaintext,
+            &bed.body_plaintext,
+            constants.head_buffer_bytes_default,
+        );
         try bed.engine.init(&.{
             .x25519_seed = @splat(0x42),
             .random = @splat(0x43),

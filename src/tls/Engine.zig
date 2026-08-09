@@ -81,6 +81,16 @@ plaintext: []u8,
 /// Sized by the same floor and unused on the L4 path, where a relayed
 /// direction's plaintext has nothing to share with.
 body_plaintext: []u8,
+/// How much of `plaintext` an L7 *head* may occupy —
+/// `limits.head_buffer_bytes`, and not the buffer's own length.
+///
+/// The two are different numbers and conflating them was a real hole: the
+/// buffer is sized `max(head_bytes, plaintext_bytes_min)` so a record's
+/// decrypt always has somewhere to land, and a deployment that set the
+/// head limit *below* that floor to bound what it accepts would otherwise
+/// have got the floor instead. The limit is operator-visible behaviour —
+/// it decides 414 and 431 — so it is carried rather than inferred.
+head_bytes: u32,
 /// Whether this session's close_notify has been staged. The engine owns
 /// it because `sendClose` is its only writer, and because the transport
 /// needs the answer *after* the outbox drains — by which time the alert
@@ -229,9 +239,12 @@ pub fn plaintextBytesFor(head_buffer_bytes: u32) u32 {
 /// Bind this slot's plaintext destination. Called once at pool init, not
 /// per session: the slab is startup memory and a slot keeps its slice for
 /// the process, so `init` below can assume it is already there.
-pub fn bindPlaintext(engine: *Engine, buffer: []u8, body: []u8) void {
+pub fn bindPlaintext(engine: *Engine, buffer: []u8, body: []u8, head_bytes: u32) void {
     assert(buffer.len >= plaintext_bytes_min);
     assert(body.len >= plaintext_bytes_min);
+    assert(head_bytes >= constants.head_buffer_bytes_min);
+    assert(head_bytes <= buffer.len);
+    engine.head_bytes = head_bytes;
     // Distinct regions, which is the whole point of there being two: one
     // slab handing the same slice twice would reintroduce the aliasing
     // the split exists to remove, and silently.

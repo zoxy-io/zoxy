@@ -4216,3 +4216,91 @@ const TlsWindDown = struct {
         client.on_end_context = self;
     }
 };
+
+test "l7: a terminated head that fits with a body that does not is 413, not 431" {
+    // The one L7 state only termination can reach. A plaintext read
+    // cannot deliver more than the head buffer holds, but one TLS record
+    // decrypts up to 16 KiB at once — so a client that sends its head and
+    // a large payload in a single record overruns the buffer with bytes
+    // that are *body*, not headers.
+    //
+    // Which answer is honest depends on what those bytes were, so the
+    // parser is asked: telling a client its headers are too large when
+    // its body is sends it chasing the wrong thing.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 52,
+        .tls = true,
+        // The floor. Also the case the head limit had to stop conflating
+        // with the engine's own: this is *below* the decrypt floor, so a
+        // buffer-length capacity would have admitted 32 KiB of head here.
+        .head_buffer_bytes = constants.head_buffer_bytes_min,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // A valid, small head followed by a body that will not fit — one
+    // write, so the proxy decrypts both out of the same record.
+    const head = "POST /x HTTP/1.1\r\nHost: o\r\nContent-Length: 4000\r\n\r\n";
+    var request: [4096]u8 = undefined;
+    @memcpy(request[0..head.len], head);
+    @memset(request[head.len..], 'a');
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = &request,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_too_large"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_headers_too_large"));
+    // The client is told in terms it can act on: 413, decrypted.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        client.app_received[0..client.app_received_len],
+        "HTTP/1.1 413 Content Too Large\r\n",
+    ));
+    try bed.expectDrained();
+}
+
+test "l7: a terminated listener honours the configured head limit" {
+    // What the fix above is really about. The engine's plaintext buffer
+    // is wider than the configured head so a record's decrypt always
+    // lands; before this, that width *was* the limit, so an operator who
+    // set 1 KiB to bound what this proxy accepts silently got 32 KiB.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 53,
+        .tls = true,
+        .head_buffer_bytes = constants.head_buffer_bytes_min,
+    });
+    defer bed.tearDown();
+
+    // A header section comfortably over the 1 KiB limit and comfortably
+    // under the engine's 32 KiB buffer — the window the bug lived in.
+    const filler = "X-Pad: " ++ ("p" ** 2000) ++ "\r\n";
+    const request = "GET /x HTTP/1.1\r\nHost: o\r\n" ++ filler ++ "\r\n";
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = request,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_headers_too_large"),
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        client.app_received[0..client.app_received_len],
+        "HTTP/1.1 431 ",
+    ));
+    try bed.expectDrained();
+}

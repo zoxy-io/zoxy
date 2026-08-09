@@ -102,9 +102,22 @@ pub fn Proxy(comptime IoType: type) type {
                 // may be a whole request, so parse before reading: a fresh
                 // read would wait on bytes already in hand.
                 if (conn.tls_pending_len >= 1) {
-                    fillHead(conn, conn.tls_pending_len, headBytes(server, conn).len);
+                    const capacity = headBytes(server, conn).len;
+                    const pending = conn.tls_pending_len;
                     conn.tls_pending_len = 0;
                     server.beginLogRequest(conn);
+                    // The handshake phase collects whatever the last
+                    // flight carried without knowing what the protocol
+                    // will make of it, so it can hold more than an L7
+                    // head may be. Same answer as an oversize read: fill
+                    // to the limit and let the dispatch say which of 413
+                    // or 431 it earned.
+                    if (pending > capacity) {
+                        fillHead(conn, @intCast(capacity), capacity);
+                        answerHeadOverflow(server, conn);
+                        return;
+                    }
+                    fillHead(conn, pending, capacity);
                     parseAndDispatch(server, conn);
                     return;
                 }
@@ -204,9 +217,29 @@ pub fn Proxy(comptime IoType: type) type {
                 true,
                 &storage,
             )) |_| {
+                // The head completed inside the buffer, so what overran it
+                // was payload.
                 respond(server, conn, 413, "l7_body_too_large");
-            } else |_| {
-                respond(server, conn, 431, "l7_headers_too_large");
+            } else |err| switch (err) {
+                // The same three verdicts `parseAndDispatch` gives, and
+                // for the same reasons: a head that overran is still a
+                // head, and answering 431 for a malformed one or an
+                // oversize request line sends the client after the wrong
+                // thing. `Incomplete` is unreachable — the parser converts
+                // it to an oversize verdict once the buffer is full, which
+                // is exactly the state this function is called in.
+                //
+                // Only the 431 and the 413 above are covered: reaching the
+                // other two needs a malformed or long-request-line head
+                // that *also* overruns in one record, which no test builds
+                // yet. They mirror the dispatch above rather than deciding
+                // anything new, which is why they are written this way and
+                // not left collapsed.
+                error.Malformed => respond(server, conn, 400, "l7_bad_request"),
+                error.UriTooLong => respond(server, conn, 414, "l7_uri_too_long"),
+                error.HeadTooLarge,
+                error.Incomplete,
+                => respond(server, conn, 431, "l7_headers_too_large"),
             }
         }
 
@@ -285,7 +318,12 @@ pub fn Proxy(comptime IoType: type) type {
             // that arrived inside the handshake's last flight has no later
             // delivery to bind one with. The engine's buffer is sized for
             // whichever is wider, a head or a record's decrypt.
-            if (conn.tls) |engine| return engine.plaintext;
+            // Sliced to the *configured* head size, not the buffer's own
+            // length: the buffer is wider so a record's decrypt always has
+            // somewhere to land, and a deployment that lowered
+            // `limits.head_buffer_bytes` to bound what it accepts must get
+            // that number back rather than the floor.
+            if (conn.tls) |engine| return engine.plaintext[0..engine.head_bytes];
             assert(conn.head_buffer_id != ConnType.head_buffer_none);
             return server.io.bufferGroupSlice(conn.head_buffer_id);
         }
