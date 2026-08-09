@@ -206,6 +206,20 @@ How many TLS sessions may be in flight at once is `limits.tls_engines`,
 and it is the largest single line in the startup banner's memory budget;
 see [Limits](#limits).
 
+> [!WARNING]
+> **Session resumption is not implemented yet, so every connection pays a
+> full handshake.** On steady keep-alive traffic that costs nothing
+> measurable — a terminated hop benchmarks at parity with HAProxy. On
+> handshake-heavy traffic it is expensive twice over: ~260 µs of signing
+> per connection, and a ~45 ms stall per handshake from a delayed-ACK
+> interaction that resumption's post-handshake ticket is what resolves.
+> A `Connection: close` workload measured 664 of 2000 requests per second
+> offered against HAProxy's 831.
+>
+> Terminate TLS behind a client population that reuses connections. If
+> yours reconnects constantly — many short-lived clients, no keep-alive —
+> wait for resumption before putting this in that path.
+
 ### Routing
 
 `"cluster"` is sugar for a single catch-all route. An `http` listener can
