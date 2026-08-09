@@ -92,6 +92,11 @@ pub fn main(init: std.process.Init) !void {
 
     const cq_entries = try resolveBudgets(&config, config_arena_bytes);
     const log_sink_fd = try openLogSinkFd(&config);
+    // Certificates before the loop, on `openLogSinkFd`'s reasoning: the
+    // config named a file, so open it while a failure can still name it
+    // and stop the process, rather than surfacing as a broken connection
+    // under traffic (§4).
+    const tls_credentials = try loadTlsCredentials(init.io, arena, &config);
 
     // The ring is the config's to size (§5), count and unit both;
     // Server.init asserts its own accounting against the same numbers.
@@ -110,6 +115,9 @@ pub fn main(init: std.process.Init) !void {
     );
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
+    if (tls_credentials.len > 0) {
+        server.setTlsCredentials(tls_credentials);
+    }
     try server.start();
     installSignalHandlers();
 
@@ -226,6 +234,87 @@ fn readConfig(
 const BodyFileContext = struct {
     io: std.Io,
 };
+
+/// Turn each listener's configured certificate paths into loaded
+/// credentials (§4), one slot per listener and null where the listener is
+/// plaintext. Startup-only: the arena owns the decoded chains for the
+/// process, and every engine on a listener borrows that listener's entry.
+///
+/// This is where a bad certificate stops the proxy. The alternative —
+/// discovering it on the first handshake — turns a typo into an outage
+/// that only shows up under traffic, and reports it as a failed
+/// connection rather than as the config being wrong.
+fn loadTlsCredentials(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config: *const zoxy.config.Config,
+) ![]const ?zoxy.tls.Credentials {
+    assert(config.listeners.len >= 1);
+    if (config.limits.tls_engines == 0) {
+        // No listener terminates TLS: nothing to load, and — the point of
+        // checking here — no libcrypto heap to reserve either.
+        return &.{};
+    }
+
+    // Before any credential, because `Credentials.load` calls libcrypto
+    // and the allocator swap is refused once anything has allocated. If
+    // it fails the zero-allocation promise (§5) is unbacked, and a proxy
+    // that cannot keep its own invariants should not start.
+    const heap_buffer = try arena.alignedAlloc(
+        u8,
+        .of(u128),
+        zoxy.constants.libcrypto_heap_bytes,
+    );
+    if (!zoxy.tls.libcrypto_heap.install(heap_buffer)) {
+        std.debug.print(
+            "zoxy: libcrypto refused the fixed-heap install; " ++
+                "the zero-allocation budget (DESIGN.md §5) cannot be kept\n",
+            .{},
+        );
+        return error.LibcryptoHeapUnavailable;
+    }
+
+    const credentials = try arena.alloc(?zoxy.tls.Credentials, config.listeners.len);
+    for (config.listeners, 0..) |listener, index| {
+        const tls = listener.tls orelse {
+            credentials[index] = null;
+            continue;
+        };
+        const cert_pem = try readPemFile(io, arena, tls.cert_path);
+        const key_pem = try readPemFile(io, arena, tls.key_path);
+        credentials[index] = zoxy.tls.Credentials.load(arena, cert_pem, key_pem, .{}) catch |err| {
+            // Which listener and which verdict: the paths are right here,
+            // and an operator with several listeners needs to know which
+            // one to look at.
+            std.debug.print(
+                "zoxy: listener {d} cannot use '{s}' + '{s}': {t}\n",
+                .{ index, tls.cert_path, tls.key_path, err },
+            );
+            return err;
+        };
+    }
+    // One slot per listener, in listener order: `Server.credentialsFor`
+    // indexes this by listener index, so a table of any other length would
+    // hand some listener another's key or none at all.
+    assert(credentials.len == config.listeners.len);
+    return credentials;
+}
+
+/// One PEM file into the arena, bounded. The bound's job is to turn "the
+/// operator pointed at the wrong file" into a named error rather than an
+/// arena the size of whatever was on disk.
+fn readPemFile(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    assert(path.len >= 1);
+    return std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        arena,
+        .limited(zoxy.constants.tls_pem_bytes_max),
+    ) catch |err| {
+        std.debug.print("zoxy: cannot read TLS file '{s}': {t}\n", .{ path, err });
+        return err;
+    };
+}
 
 /// The loader's `FileSource.read` against the real filesystem: whole
 /// file into the arena, refused past `limit` — the loader turns that
@@ -398,6 +487,20 @@ fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
         // its share of the slab itself.
         .upstream_head_buffer_bytes = @sizeOf(zoxy.UpstreamHeadBuffer) + limits.head_buffer_bytes,
         .head_scratch_bytes = head_scratch_bytes,
+        // Zero unless a listener terminates TLS, which is what makes the
+        // whole feature free to a deployment that did not ask for it. The
+        // three terms move together: `limits.tls_engines` is zero exactly
+        // when no listener has a `tls` block.
+        .tls_engines = limits.tls_engines,
+        .tls_engine_bytes = if (limits.tls_engines == 0) 0 else @sizeOf(zoxy.tls.Engine),
+        .tls_plaintext_bytes = if (limits.tls_engines == 0)
+            0
+        else
+            zoxy.tls.Engine.plaintextBytesFor(limits.head_buffer_bytes),
+        .libcrypto_heap_bytes = if (limits.tls_engines == 0)
+            0
+        else
+            zoxy.constants.libcrypto_heap_bytes,
     };
 }
 
@@ -484,6 +587,7 @@ fn printMemoryBanner(
         \\          + access log {d} KiB (+ logged headers {d} B)
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + labeled metrics {d} B (tables, labels and render buffers)
+        \\          + tls engines {d} x {d} B (+ plaintext {d} B each, libcrypto heap {d} KiB)
         \\          + config arena {d} KiB (measured, not closed-form)
         \\
     , .{
@@ -510,6 +614,13 @@ fn printMemoryBanner(
         config.clusters.len,
         ServerXev.endpointKeysFor(config).stride,
         ServerXev.metricsBytes(config),
+        // All four read zero on a plaintext deployment, which is the line
+        // saying "you are not paying for this" rather than omitting itself
+        // and leaving the reader to wonder.
+        limits.tls_engines,
+        sizes.tls_engine_bytes,
+        sizes.tls_plaintext_bytes,
+        sizes.libcrypto_heap_bytes / 1024,
         config_arena_bytes / 1024,
     });
 }

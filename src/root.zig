@@ -32,6 +32,7 @@ pub const shed = @import("shed.zig");
 pub const tls = struct {
     pub const Credentials = @import("tls/Credentials.zig");
     pub const Engine = @import("tls/Engine.zig");
+    pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
 };
 /// Shared test-support harness pieces, factored out so multiple test
 /// suites can drive the same origin double instead of growing their own.

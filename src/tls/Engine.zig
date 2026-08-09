@@ -193,6 +193,24 @@ pub const Config = struct {
     credentials: *const Credentials,
 };
 
+/// What one slot's plaintext buffer must be, given the head size the
+/// operator chose. The closed form lives here rather than at the pool,
+/// because only the engine knows its own floor — and both the startup
+/// banner and the allocation itself have to arrive at the same number or
+/// §5's printed total is a fiction.
+///
+/// One pool serves both protocols, so every slot is sized for whichever
+/// use is wider: an L7 head, which accumulates until the parser is
+/// satisfied and so may need `limits.head_buffer_bytes`, or a decrypt
+/// step's own output.
+pub fn plaintextBytesFor(head_buffer_bytes: u32) u32 {
+    assert(head_buffer_bytes >= constants.head_buffer_bytes_min);
+    assert(head_buffer_bytes <= constants.head_buffer_bytes_max);
+    const bytes = @max(head_buffer_bytes, plaintext_bytes_min);
+    assert(bytes >= plaintext_bytes_min);
+    return @intCast(bytes);
+}
+
 /// Bind this slot's plaintext destination. Called once at pool init, not
 /// per session: the slab is startup memory and a slot keeps its slice for
 /// the process, so `init` below can assume it is already there.

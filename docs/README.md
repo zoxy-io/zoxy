@@ -133,8 +133,9 @@ Config is parsed once at startup and never reloaded — a change is a process
 restart, which is consistent with scaling out as independent processes.
 Unknown fields are rejected rather than ignored.
 
-The sections below follow a request: what a **listener** accepts and which
-**cluster** it routes to, how that cluster picks an endpoint and protects it,
+The sections below follow a request: what a **listener** accepts (including
+whether it terminates TLS) and which **cluster** it routes to, how that
+cluster picks an endpoint and protects it,
 who zoxy believes the client is, the edits and canned bodies applied at the
 edge, and last the process-wide `timeouts` and `limits`. Two further
 process-wide blocks, `admin` and `access_log`, are documented under
@@ -162,6 +163,37 @@ same port is the supported way to use more than one core, and the way to
 connection — accepted and upstream alike — gets `TCP_NODELAY`
 unconditionally: Nagle plus delayed ACK costs a reused keep-alive connection
 a hard 40 ms stall, which is not worth a config knob.
+
+#### Terminating TLS
+
+Add a `tls` block and the listener speaks TLS 1.3 instead of plaintext.
+Everything else about it is unchanged: the same routes, the same cluster,
+the same filters.
+
+```json
+"listeners": [
+    { "bind": "0.0.0.0:443", "protocol": "http", "cluster": "web",
+      "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key" } }
+]
+```
+
+Both paths are read once at startup, so a missing or unusable file stops
+the proxy with an error naming the file — never mid-handshake against a
+real client. `cert` is a PEM chain, leaf first; `key` is the leaf's PEM
+private key.
+
+> [!IMPORTANT]
+> The key must be **ECDSA P-256 or P-384**. Handshakes run on the event
+> loop, where an RSA signature's millisecond would stall every other
+> connection sharing it; an ECDSA one costs about 260 µs. An RSA key is
+> refused at startup rather than accepted into a latency cliff.
+
+This is termination only — inbound. The connection zoxy opens to your
+backend stays plaintext, so the backend sees exactly what it saw before.
+
+How many TLS sessions may be in flight at once is `limits.tls_engines`,
+and it is the largest single line in the startup banner's memory budget;
+see [Limits](#limits).
 
 ### Routing
 
@@ -736,6 +768,14 @@ heavy deployment trades down for memory. `head_buffer_bytes` sizes every head
 buffer and is therefore the largest HTTP head accepted (oversize requests are
 answered `414`/`431`) — raise it for big-cookie/JWT traffic, 1 KiB to 1 MiB,
 default 8 KiB.
+
+`tls_engines` bounds *TLS sessions in flight* — handshaking or terminated —
+and is zero unless some listener has a `tls` block. It is the knob that
+decides what a TLS deployment costs: an engine is by far the largest
+per-connection object zoxy holds, about 132 KiB plus a 32 KiB plaintext
+buffer, so 1024 of them is roughly 170 MiB. It defaults to your connection
+slots capped at 1024, and the startup banner prints the total either way —
+lower it if that is more concurrent TLS than you serve.
 
 `cq_fill_eighths` trades connection ceiling for `io_uring` completion-queue
 burst headroom; `access_log_buffer_bytes` sizes the access log's staging

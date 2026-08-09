@@ -242,6 +242,53 @@ comptime {
 /// engine pool, which is what tripping the assert makes it.
 pub const tls_engine_bytes_max: u32 = 160 * 1024;
 
+/// The ceiling on `limits.tls_engines` — how many TLS sessions may be
+/// handshaking or terminated at once (§5). An engine is ~132 KiB plus its
+/// plaintext buffer, so this is the one pool whose count an operator
+/// notices in RSS: 1024 is ~170 MiB, and the ceiling exists so a typo in
+/// the config cannot ask for a gigabyte. Unlike the conn-slot ceiling it
+/// is not derived from the ring — an engine holds no socket and arms no
+/// completion, so it costs memory and nothing else.
+pub const tls_engines_max: u32 = 1024;
+
+/// The default when a listener terminates TLS and the operator did not
+/// say. Follows conn slots like the head-buffer ring does — every
+/// connection could be mid-handshake at once — but capped, because
+/// unlike a head buffer an engine is two orders of magnitude larger and
+/// `conn_slots_max` engines is memory no box would want by accident.
+/// An operator who wants more concurrent TLS than this raises it
+/// deliberately, having seen the number in the startup banner.
+pub const tls_engines_default: u32 = @min(tls_engines_max, conn_slots_default);
+
+/// The fixed heap libcrypto allocates from (§4, `tls/libcrypto_heap.zig`),
+/// reserved at startup exactly when some listener terminates TLS. Sized
+/// against the measured plateau — ~1 MiB for one handshake's distinct
+/// block footprint, with every later handshake free once the size classes
+/// have filled (IMPLEMENTATION_NOTES.md) — plus headroom for the
+/// concurrency that measurement did not exercise.
+pub const libcrypto_heap_bytes: u32 = 4 * 1024 * 1024;
+
+/// The most a certificate or key PEM file may be. A bound on a startup
+/// read, so its job is only to turn "the operator pointed at the wrong
+/// file" into a named error instead of an arena the size of whatever was
+/// on disk. Generous: the DER inside is bounded far tighter by
+/// `tls_cert_chain_bytes_max`.
+pub const tls_pem_bytes_max: u32 = 256 * 1024;
+
+comptime {
+    assert(tls_engines_default >= 1);
+    assert(tls_engines_default <= tls_engines_max);
+    // Engines are per *connection*, so a pool deeper than the slot count
+    // could never be drawn from — the same relation head buffers have.
+    assert(tls_engines_max <= conn_slots_max);
+    // The heap must hold more than one handshake's measured plateau, or
+    // the first connection exhausts it.
+    assert(libcrypto_heap_bytes >= 2 * 1024 * 1024);
+    // A PEM that could not carry the DER it wraps would make the tighter
+    // chain bound unreachable — base64 costs a third on top.
+    assert(tls_pem_bytes_max > tls_cert_chain_bytes_max * 2);
+}
+
 /// Bounded per-head header array. Overflowing it is load, not malice: it
 /// maps to 431, distinguishable from malformed input's 400 (§7).
 pub const headers_max: u16 = 64;
@@ -1102,6 +1149,25 @@ pub const PoolSizes = struct {
     /// reservation like the access log's, in the total on the same
     /// promise; `main.zig` composes it to mirror `Server.init` exactly.
     head_scratch_bytes: u64,
+    /// The §4 TLS engine pool (`limits.tls_engines`; zero when no
+    /// listener terminates TLS) and its unit size — `@sizeOf(Engine)`,
+    /// so the pool's own free-list header rides along like every other
+    /// pool's. By far the largest per-connection unit here, which is why
+    /// it prints on its own banner line rather than folding into another.
+    tls_engines: u32 = 0,
+    tls_engine_bytes: u64 = 0,
+    /// What one engine's plaintext destination costs. Runtime-sized, not
+    /// comptime: an L7 head may be up to `limits.head_buffer_bytes`, so
+    /// a slot has to cover whichever of that and the engine's own floor
+    /// is larger. One pool serves both protocols, so every slot is sized
+    /// for the widest use any of them may be put to.
+    tls_plaintext_bytes: u64 = 0,
+    /// The fixed heap libcrypto allocates from (§4), reserved exactly
+    /// when some listener terminates TLS. Not per-engine — one
+    /// process-wide reservation, priced here for the same reason the
+    /// access log's buffers are: §5's promise is that the printed total
+    /// covers every byte this process holds for its life.
+    libcrypto_heap_bytes: u64 = 0,
 };
 
 /// What the access log reserves: nothing when it is off, both staging
@@ -1147,6 +1213,22 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     // A config has at least one cluster with one endpoint, so the
     // labeled tables and their buffers can never price at zero.
     assert(sizes.metrics_bytes > 0);
+    // The TLS terms are all-or-nothing together: a pool with no engines
+    // is a plaintext deployment, which reserves no heap and no plaintext
+    // buffers either. Any mixture is a composition mistake, not a
+    // configuration one — `limits.tls_engines` already refuses the
+    // config-level version of it.
+    assert(sizes.tls_engines <= tls_engines_max);
+    if (sizes.tls_engines == 0) {
+        assert(sizes.tls_engine_bytes == 0);
+        assert(sizes.tls_plaintext_bytes == 0);
+        assert(sizes.libcrypto_heap_bytes == 0);
+    } else {
+        assert(sizes.tls_engine_bytes > 0);
+        assert(sizes.tls_engine_bytes <= tls_engine_bytes_max);
+        assert(sizes.tls_plaintext_bytes >= tls_record_plaintext_bytes_max);
+        assert(sizes.libcrypto_heap_bytes == libcrypto_heap_bytes);
+    }
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
@@ -1155,7 +1237,10 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
         @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes +
-        sizes.head_scratch_bytes;
+        sizes.head_scratch_bytes +
+        @as(u64, sizes.tls_engines) *
+            (sizes.tls_engine_bytes + sizes.tls_plaintext_bytes) +
+        sizes.libcrypto_heap_bytes;
     assert(total > 0);
     return total;
 }
@@ -1257,6 +1342,37 @@ test "budgets: memory total matches the closed form" {
         .upstream_head_buffers = 0,
         .upstream_head_buffer_bytes = head_buffer_bytes_default,
         .head_scratch_bytes = head_buffer_bytes_default,
+    }));
+    // TLS is priced only when a listener terminates it, and then by three
+    // terms that move together: the engines, their plaintext buffers, and
+    // the one process-wide libcrypto heap. Same shape as the L4 case above
+    // plus TLS, so the difference between the two totals is exactly what
+    // TLS costs and nothing else.
+    const engines: u32 = 32;
+    const engine_bytes: u64 = tls_engine_bytes_max;
+    const plaintext_bytes: u64 = 32 * 1024;
+    const expected_tls = expected_small +
+        @as(u64, engines) * (engine_bytes + plaintext_bytes) +
+        libcrypto_heap_bytes;
+    try std.testing.expectEqual(expected_tls, memoryBytesTotal(&.{
+        .conn_slots = 64,
+        .conn_bytes = conn_bytes,
+        .relay_buffers = 8,
+        .relay_buffer_pair_bytes = pair_bytes,
+        .upstream_slots = 8,
+        .upstream_bytes = upstream_bytes,
+        .access_log_bytes = accessLogBytes(0),
+        .endpoint_table_bytes = 0,
+        .metrics_bytes = metrics,
+        .head_buffers = 0,
+        .head_buffer_bytes = head_buffer_bytes_default,
+        .upstream_head_buffers = 0,
+        .upstream_head_buffer_bytes = head_buffer_bytes_default,
+        .head_scratch_bytes = head_buffer_bytes_default,
+        .tls_engines = engines,
+        .tls_engine_bytes = engine_bytes,
+        .tls_plaintext_bytes = plaintext_bytes,
+        .libcrypto_heap_bytes = libcrypto_heap_bytes,
     }));
     // An unconfigured access log reserves nothing (§5), and a configured
     // one reserves both buffers at whatever size it was given — the term
