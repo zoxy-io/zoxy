@@ -11,17 +11,25 @@ const std = @import("std");
 
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
+const Credentials = @import("tls/Credentials.zig");
 const router = @import("http/router.zig");
 const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
 const origin_mod = @import("testing/origin.zig");
+const TlsEngine = @import("tls/Engine.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
 
 const ServerSim = Server(SimIo);
 const Origin = origin_mod.Origin(SimIo);
+
+// The throwaway self-signed fixtures (`tls/testdata/README.md`), embedded
+// rather than read: this file runs under the Io seam, where a filesystem
+// is exactly what does not exist.
+const fixture_cert_pem = @embedFile("tls/testdata/cert.pem");
+const fixture_key_pem = @embedFile("tls/testdata/key.pem");
 
 const echo_token = "proxied-echo-token-0123456789abc";
 
@@ -222,6 +230,10 @@ pub const TestBed = struct {
     config: config_module.Config,
     server: ServerSim,
     scenario: Scenario,
+    /// One slot, matching the one listener. Held by the bed rather than
+    /// by the server because a `Credentials` owns a libcrypto key with a
+    /// single `deinit`, and the server borrows what it is handed.
+    tls_credentials: [1]?Credentials,
 
     pub const SetUpOptions = struct {
         server: ServerSim.InitOptions = .{ .conn_slots = 4, .relay_buffers = 2 },
@@ -249,6 +261,13 @@ pub const TestBed = struct {
         /// The #142 send gate on the one cluster; when set, the origin
         /// double expects and strips the header before echoing.
         proxy_protocol_send: ?config_module.Config.Cluster.ProxyProtocolSend = null,
+        /// Terminate TLS on the one listener (#125). The bed loads the
+        /// checked-in fixture credentials and hands them over before
+        /// `start`, standing in for what `main` does — this file is under
+        /// the Io seam, so it embeds the PEMs rather than reading them.
+        /// Set `server.tls_engines` alongside; the two are checked against
+        /// each other the way a real config's are.
+        tls: bool = false,
     };
 
     fn bindAddress() std.Io.net.IpAddress {
@@ -269,6 +288,10 @@ pub const TestBed = struct {
         // match, so a bed cannot drift them apart.
         var sim_options = options.sim;
         sim_options.buffer_group_count = options.server.head_buffers;
+        // The unit size has to match too, not just the count: `Server.init`
+        // asserts both, because the health prober's buffer follows the head
+        // size whether or not a ring was registered.
+        sim_options.buffer_group_bytes = options.server.head_buffer_bytes;
         try bed.sim_io.init(arena, sim_options);
         bed.endpoints = .{originAddress()};
         bed.clusters = .{.{
@@ -284,6 +307,13 @@ pub const TestBed = struct {
             .routes = &bed.routes,
             .protocol = .l4,
             .proxy_protocol = options.proxy_protocol,
+            // Paths nothing reads: the bed embeds the PEMs, so what this
+            // states is only that the listener terminates — which is what
+            // `Server.start` checks its credentials against.
+            .tls = if (options.tls)
+                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+            else
+                null,
         }};
         bed.config = .{
             .listeners = &bed.listeners,
@@ -304,6 +334,20 @@ pub const TestBed = struct {
         else
             0;
         try bed.server.init(arena, &bed.sim_io, &bed.config, server_options);
+        bed.tls_credentials = .{null};
+        if (options.tls) {
+            assert(server_options.tls_engines >= 1);
+            bed.tls_credentials[0] = try Credentials.load(
+                arena,
+                fixture_cert_pem,
+                fixture_key_pem,
+                // Deterministic signatures, so a seeded run replays a
+                // byte-exact handshake — the §9 property the whole
+                // simulation rests on. Never set in production.
+                .{ .deterministic_nonce = true },
+            );
+            bed.server.setTlsCredentials(&bed.tls_credentials);
+        }
         try bed.server.start();
 
         bed.scenario = .{
@@ -332,6 +376,9 @@ pub const TestBed = struct {
     }
 
     pub fn tearDown(bed: *TestBed) void {
+        if (bed.tls_credentials[0]) |*credentials| {
+            credentials.deinit();
+        }
         bed.arena_state.deinit();
     }
 
@@ -1348,4 +1395,151 @@ test "relay: an L4 connection past the endpoint cap is closed, not dialed" {
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("completed"));
     try std.testing.expect(bed.server.reconcile());
     try bed.expectDrained();
+}
+
+test "tls: the engine pool hands out what the config provisioned, and no more" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 31 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    const credentials = &bed.tls_credentials[0].?;
+    const first = try bed.server.acquireTlsEngine(credentials);
+    const second = try bed.server.acquireTlsEngine(credentials);
+    try std.testing.expect(first != second);
+    // Exhausted at exactly the provisioned count: the wall a shed rung
+    // will report is this null, not a larger pool than the banner priced.
+    try std.testing.expectError(
+        error.EnginesExhausted,
+        bed.server.acquireTlsEngine(credentials),
+    );
+
+    // Each slot's plaintext destination is bound and sized by the engine's
+    // own floor — a slot handed out unbound would fault on its first
+    // decrypt, long after the mistake.
+    for ([_]*TlsEngine{ first, second }) |engine| {
+        try std.testing.expect(engine.plaintext.len >= TlsEngine.plaintext_bytes_min);
+        try std.testing.expect(!engine.isConnected());
+    }
+    // Distinct buffers: two sessions decrypting into one would be a data
+    // leak between connections, not merely a bug.
+    try std.testing.expect(first.plaintext.ptr != second.plaintext.ptr);
+
+    bed.server.releaseTlsEngine(first);
+    const reused = try bed.server.acquireTlsEngine(credentials);
+    try std.testing.expectEqual(first, reused);
+    bed.server.releaseTlsEngine(reused);
+    bed.server.releaseTlsEngine(second);
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+}
+
+test "tls: two engines from one seed produce one handshake, replayed" {
+    // The §9 property every TLS scenario rests on: a seeded run's key
+    // material comes from the run's seed, so the same seed twice is the
+    // same handshake twice. Checked at the seam that draws it, because a
+    // pool that quietly used the OS CSPRNG would still pass every
+    // functional test and fail every replay.
+    var runs: [2][32]u8 = undefined;
+    for (&runs) |*captured| {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = 77 },
+            .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 1 },
+            .tls = true,
+        });
+        defer bed.tearDown();
+
+        const engine = try bed.server.acquireTlsEngine(&bed.tls_credentials[0].?);
+        // The ServerHello random is the engine's seeded input made
+        // visible: it goes on the wire verbatim, so comparing it compares
+        // what the peer would see.
+        captured.* = engine.hs.random.data;
+        bed.server.releaseTlsEngine(engine);
+    }
+    try std.testing.expectEqualSlices(u8, &runs[0], &runs[1]);
+}
+
+test "tls: a plaintext deployment reserves no engines at all" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 32 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2 },
+    });
+    defer bed.tearDown();
+
+    // Zero slots, not one held back: `limits.tls_engines` is zero exactly
+    // when nothing terminates, and the pool is what makes that free (§5).
+    try std.testing.expectEqual(@as(usize, 0), bed.server.tls_engines.slots.len);
+    try std.testing.expect(bed.server.tls_engines.isFullyReleased());
+}
+
+test "tls: what the pool holds is what the budget priced" {
+    // §5's promise is that the startup banner's total covers every byte
+    // this process holds for its life. That is only true if the engine
+    // pool's actual reservation equals the term `memoryBytesTotal` prices
+    // it at — two numbers computed in different files from the same
+    // limits, which is exactly the pair that drifts.
+    const engines: u32 = 3;
+    const head_bytes = constants.head_buffer_bytes_default;
+
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 33 },
+        .server = .{
+            .conn_slots = 4,
+            .relay_buffers = 2,
+            .head_buffer_bytes = head_bytes,
+            .tls_engines = engines,
+        },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    // What was actually reserved: the slots themselves, plus every slot's
+    // share of the plaintext slab, read off the engines rather than
+    // recomputed — a slot bound to the wrong-sized slice shows up here.
+    var held: u64 = @as(u64, engines) * @sizeOf(TlsEngine);
+    for (bed.server.tls_engines.slots) |*engine| {
+        held += engine.plaintext.len;
+    }
+
+    // What the budget charges for it. `memoryBytesTotal`'s TLS term with
+    // the libcrypto heap left out — that one is `main`'s to reserve before
+    // the server exists, so a bed that never installs it is not charged.
+    const priced = @as(u64, engines) *
+        (@sizeOf(TlsEngine) + TlsEngine.plaintextBytesFor(head_bytes));
+    try std.testing.expectEqual(priced, held);
+    try std.testing.expectEqual(@as(usize, engines), bed.server.tls_engines.slots.len);
+}
+
+test "tls: an operator's head size widens the plaintext buffer, and is priced" {
+    // The one runtime input to the engine's footprint. An L7 head
+    // accumulates until the parser is satisfied, so a slot has to cover
+    // `limits.head_buffer_bytes` when that exceeds the engine's own floor
+    // — and the banner has to charge for the same widening.
+    const wide_head = TlsEngine.plaintext_bytes_min * 2;
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 34 },
+        .server = .{
+            .conn_slots = 4,
+            .relay_buffers = 2,
+            .head_buffer_bytes = wide_head,
+            .tls_engines = 1,
+        },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    try std.testing.expectEqual(
+        @as(usize, wide_head),
+        bed.server.tls_engines.slots[0].plaintext.len,
+    );
+    try std.testing.expectEqual(
+        wide_head,
+        TlsEngine.plaintextBytesFor(wide_head),
+    );
 }
