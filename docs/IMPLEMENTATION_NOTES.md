@@ -145,6 +145,26 @@ by the fork" below). Still queued, in rough value order:
    pending — see "The loop is not submission-bound" below; reopen only
    on a measured `cqes/wake` approaching 1.
 
+### ztls fork queue
+
+Same pin policy, same batching. Landed in `zoxy-tls`: deterministic
+ECDSA nonces, `mem_hooks`, the bounded `fin_frag` wipe, NewSessionTicket
+issuance (see "TLS termination" above, and build.zig.zon's audit notes).
+Queued:
+
+1. **The receive path does not enforce RFC 8446 §5.2's plaintext cap**,
+   found while sizing `Engine.plaintext_bytes_min`. `RecordLayer.decrypt`
+   admits any record inside `max_ciphertext_len` (2^14 + 256) and takes
+   the content up to the last non-zero byte, so a non-conforming peer can
+   hand a caller up to 16623 bytes where the spec allows 16384 — 239 past
+   any buffer sized to the RFC. The length check exists on the *send*
+   path only (`RecordLayer.encrypt`). zoxy refuses the over-long record in
+   `Engine.pump` and its buffers are sized on that refusal, so nothing is
+   exposed here; but a caller who trusted `max_plaintext_len` without
+   checking would overflow, and `record_overflow` is the alert §5.2
+   prescribes. Worth raising upstream — it is a two-line receive-side
+   check, and the fix belongs where every other ztls caller inherits it.
+
 ## Loop profile at the Tier-1 band (2026-07-12)
 
 `zig build profile` (pinned-core perf → flamegraph, §9) under load:
