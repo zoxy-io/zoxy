@@ -165,21 +165,21 @@ const uncovered = [_]Uncovered{
         .reason = "no script sends a header section past the head buffer; " ++
             "src/http_proxy_test.zig drives both 431 shapes",
     },
-    // The §4 counters (#125). No scenario here terminates TLS yet: the
-    // harness builds plaintext listeners, so nothing draws an engine and
-    // none of these can move. Directed coverage exists and is named per
-    // entry; a sweep that drives a seeded TLS client population is the
-    // work that retires these, and it retires all five together.
+    // The §4 counters (#125) the sweep still cannot move. Seeds do
+    // terminate TLS now — a quarter of them bind a terminating listener,
+    // l4 or http, and run real handshakes under the adversary — so what
+    // is left here is not "no scenario configures one" but three specific
+    // events a seeded, non-corrupting schedule cannot produce. Each names
+    // what reaches it instead.
     .{
-        .name = "shed_tls_engines",
+        .name = "tls_handshake_failed",
         .why = .unreached,
-        .reason = "conn-slot-shadowed, the shape `l7_shed_upstream_head_" ++
-            "buffers` has: seeds do terminate TLS, and a starved one runs " ++
-            "the full population against a single engine — but that same " ++
-            "seed sizes conn slots at 1-4 against up to eight clients, and " ++
-            "the slot rung is checked first, so admission is refused before " ++
-            "an engine is ever asked for. src/server_test.zig drives the " ++
-            "wall directly, two clients against one engine with slots to spare",
+        .reason = "a seeded handshake between two peers that both mean it " ++
+            "does not fail: the adversary reorders, splits and delays but " ++
+            "never corrupts, and a dial it refuses or black-holes never " ++
+            "reaches a handshake at all. src/server_test.zig sends plaintext " ++
+            "at a TLS port, which is the shape a misdirected client or a " ++
+            "scanner actually produces",
     },
     .{
         .name = "shed_tls_crypto",
@@ -188,6 +188,18 @@ const uncovered = [_]Uncovered{
             "exhausted, which no scenario can reach and no directed test " ++
             "fakes — the rung exists so that failure is not read as the " ++
             "engine pool's, and is expected to stay at zero in production too",
+    },
+    .{
+        .name = "l7_body_too_large",
+        .why = .unreached,
+        .reason = "only a terminated connection can overrun its head buffer " ++
+            "— one record decrypts to up to 16 KiB at once, where a plaintext " ++
+            "read cannot deliver more than the buffer holds — and the seeds " ++
+            "that do terminate send a token far under it. No directed test " ++
+            "reaches it either, which is the honest gap: writing one found " ++
+            "that a terminated listener does not enforce " ++
+            "`limits.head_buffer_bytes` at all (IMPLEMENTATION_NOTES.md), so " ++
+            "the overflow it answers is not the one an operator configured",
     },
     .{
         .name = "tls_relay_failed",

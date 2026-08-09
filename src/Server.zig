@@ -439,7 +439,11 @@ pub fn Server(comptime IoType: type) type {
             // One buffer per slot, sized by the engine's own closed form —
             // the same call `main`'s banner makes, which is what keeps the
             // printed §5 total and this reservation the same number.
+            // Two destinations per slot: the head (which the response head
+            // renders back over) and the request body, which §7 lets run
+            // concurrently with it. `plaintextBytesFor` prices the pair.
             const plaintext_bytes = TlsEngine.plaintextBytesFor(options.head_buffer_bytes);
+            const head_bytes = plaintext_bytes - TlsEngine.plaintext_bytes_min;
             const slab = try arena.alloc(
                 u8,
                 @as(usize, options.tls_engines) * plaintext_bytes,
@@ -449,7 +453,11 @@ pub fn Server(comptime IoType: type) type {
             // total is a ceiling RSS approaches under load rather than a
             // startup floor. Nothing reads a byte it did not first write.
             for (server.tls_engines.slots, 0..) |*engine, index| {
-                engine.bindPlaintext(slab[index * plaintext_bytes ..][0..plaintext_bytes]);
+                const slot = slab[index * plaintext_bytes ..][0..plaintext_bytes];
+                engine.bindPlaintext(
+                    slot[0..head_bytes],
+                    slot[head_bytes..],
+                );
             }
             assert(server.tls_engines.slots.len == options.tls_engines);
         }
@@ -1209,6 +1217,15 @@ pub fn Server(comptime IoType: type) type {
         }
 
         pub fn returnHeadBuffer(server: *Self, conn: *ConnType) void {
+            // A terminated connection's head lives in its engine, not the
+            // ring (§4): it never bound a buffer, so there is none to give
+            // back and no in-use count to decrement. Every site that
+            // returns a buffer on the L7 path reaches here, so the fork
+            // lives once rather than at each of them.
+            if (conn.tls != null) {
+                assert(conn.head_buffer_id == ConnType.head_buffer_none);
+                return;
+            }
             assert(conn.head_buffer_id != ConnType.head_buffer_none);
             assert(server.head_buffers_in_use >= 1);
             server.io.bufferGroupReturn(conn.head_buffer_id);

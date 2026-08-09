@@ -17,8 +17,17 @@ const Io = @import("io/io.zig");
 const parser = @import("http/parser.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
+const Credentials = @import("tls/Credentials.zig");
+const TlsClient = @import("tls/TestClient.zig").TestClient(SimIo);
 
 const assert = std.debug.assert;
+
+// The throwaway self-signed fixtures (`tls/testdata/README.md`),
+// embedded rather than read: this file runs under the Io seam.
+const fixture_cert_pem = @embedFile("tls/testdata/cert.pem");
+const fixture_key_pem = @embedFile("tls/testdata/key.pem");
+/// The fixture certificate SAN a TLS client must offer.
+const fixture_host_name = "spike.zoxy.test";
 
 const ServerSim = Server(SimIo);
 
@@ -448,6 +457,7 @@ const Http1Bed = struct {
     client2: HttpClient,
     drain_timer_completion: SimIo.Completion,
     origin_stop_completion: SimIo.Completion,
+    tls_credentials: [1]?Credentials,
 
     const idle_timeout_ms: u32 = 1000;
     /// Deliberately 20× tighter than the idle timeout so a test can witness
@@ -455,7 +465,7 @@ const Http1Bed = struct {
     /// the far looser head-read/idle deadline (finding #1).
     const connect_timeout_ms: u32 = 50;
 
-    fn bindAddress() std.Io.net.IpAddress {
+    pub fn bindAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
     }
 
@@ -466,6 +476,11 @@ const Http1Bed = struct {
     const Options = struct {
         seed: u64,
         partial_io: bool = false,
+        /// Terminate TLS on the one listener (#125). The bed loads the
+        /// checked-in fixtures and hands them over before `start`,
+        /// standing in for what `main` does — this file runs under the Io
+        /// seam, where a filesystem is what does not exist.
+        tls: bool = false,
         /// Socket-ring size, null for SimIo's own default (§9). The default
         /// is narrower than a head buffer, so no delivery can fill one in a
         /// single read; a scenario that needs the shape production takes
@@ -583,6 +598,12 @@ const Http1Bed = struct {
             .response_filters = options.response_filters,
             .protocol = .http,
             .forwarded = options.forwarded,
+            // Paths nothing reads: the bed embeds the PEMs, so what this
+            // states is only that the listener terminates.
+            .tls = if (options.tls)
+                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+            else
+                null,
         }};
         bed.config = .{
             .listeners = &bed.listeners,
@@ -609,7 +630,9 @@ const Http1Bed = struct {
                 constants.access_log_buffer_bytes_default
             else
                 0,
+            .tls_engines = if (options.tls) options.conn_slots else 0,
         });
+        try bed.loadTlsCredentials(arena, options.tls);
         try bed.server.start();
         bed.origin = .{
             .response = options.origin_response,
@@ -663,7 +686,27 @@ const Http1Bed = struct {
         bed.origin.stopListening();
     }
 
+    /// Stand in for what `main` does before `start` (§4): this file runs
+    /// under the Io seam, so it embeds the fixtures rather than reading
+    /// them. Its own function for `setUp`'s length limit.
+    fn loadTlsCredentials(bed: *Http1Bed, arena: std.mem.Allocator, on: bool) !void {
+        bed.tls_credentials = .{null};
+        if (!on) return;
+        bed.tls_credentials[0] = try Credentials.load(
+            arena,
+            fixture_cert_pem,
+            fixture_key_pem,
+            // Deterministic signatures, so a seeded run replays a
+            // byte-exact handshake (§9). Never set in production.
+            .{ .deterministic_nonce = true },
+        );
+        bed.server.setTlsCredentials(&bed.tls_credentials);
+    }
+
     fn tearDown(bed: *Http1Bed) void {
+        if (bed.tls_credentials[0]) |*credentials| {
+            credentials.deinit();
+        }
         bed.arena_state.deinit();
     }
 
@@ -4115,3 +4158,61 @@ test "l7: a client that sent no chain gets a line naming only itself" {
     const seen = (try forwardedForSeenByOrigin(&bed)).?;
     try std.testing.expectEqualStrings("198.51.100.1", seen);
 }
+
+test "l7: a terminated listener proxies an HTTPS request end to end" {
+    // The whole L7-over-TLS promise: a real ztls client sends an HTTP
+    // request inside a TLS session, an origin that knows nothing about
+    // TLS answers it, and the response comes back encrypted. The head is
+    // parsed out of decrypted bytes and the response is encrypted on its
+    // way out — both directions cross the transform.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 51,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    // The origin saw a plain HTTP request and its answer reached the
+    // client through the record layer, byte for byte.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
+/// Winds a TLS scenario down once its client is done: drains the server
+/// and stops the origin, so the loop reaches idle instead of sitting on
+/// armed accepts. The plaintext `HttpClient` does this itself; the TLS
+/// client is not one of them.
+const TlsWindDown = struct {
+    bed: *Http1Bed,
+
+    fn onEnd(context: ?*anyopaque) void {
+        const self: *TlsWindDown = @ptrCast(@alignCast(context.?));
+        self.bed.server.beginDrain();
+        self.bed.origin.stopListening();
+    }
+
+    /// Attach after `start`: no callback can run before the loop does.
+    fn attach(self: *TlsWindDown, client: *TlsClient) void {
+        client.on_end = onEnd;
+        client.on_end_context = self;
+    }
+};

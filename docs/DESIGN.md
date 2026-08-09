@@ -493,9 +493,11 @@ appear in the banner as their own term.
 
 The **TLS engine pool** (§4) is the one whose default is not "one per
 connection", and the row above says so: an engine is ~132 KiB of ztls
-record and reassembly buffers plus a plaintext destination of
-`max(head_buffer_bytes, 32 KiB)`, two orders of magnitude past a head
-buffer. One-per-slot at the c10k ceiling would be gigabytes, so the
+record and reassembly buffers plus *two* plaintext destinations —
+`max(head_buffer_bytes, 32 KiB)` for the head, which the response head
+then renders back over, and a further 32 KiB for the request body, which
+§7 lets run concurrently with that render and so cannot share it. Two
+orders of magnitude past a head buffer. One-per-slot at the c10k ceiling would be gigabytes, so the
 default is conn slots *capped* at 1024 and a deployment past that sheds
 rather than reserves. It is zero — the whole feature free — unless some
 listener carries a `tls` block. Beside the per-engine cost sits one

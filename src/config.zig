@@ -484,7 +484,6 @@ pub const ValidationError = error{
     ListenerForwardedModeUnknown,
     ListenerHttpProxyProtocol,
     ListenerProxyProtocolModeUnknown,
-    ListenerHttpTls,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
     ClusterProxyProtocolSendUnknown,
@@ -3561,13 +3560,8 @@ fn resolveTls(
     tls_json: ?TlsJson,
     protocol: Config.Listener.Protocol,
 ) ValidationError!?Config.Listener.Tls {
+    _ = protocol; // Both speak over a terminated session (§4, §7).
     const tls = tls_json orelse return null;
-    // The L7 path reads its head straight off the socket, so a terminated
-    // http listener would hand ciphertext to the request parser and answer
-    // every request 400. Refused rather than ignored, on
-    // `ListenerHttpProxyProtocol`'s exact reasoning: accepting the config
-    // would promise termination that the serving path does not deliver.
-    if (protocol == .http) return error.ListenerHttpTls;
     if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
     if (tls.key.len == 0) return error.ListenerTlsKeyPathEmpty;
     return .{ .cert_path = tls.cert, .key_path = tls.key };
@@ -6176,8 +6170,10 @@ test "config: the tls block resolves paths, and only shape-checks them" {
         const parsed = try expectParseOk(&arena_state, head ++ tail);
         try std.testing.expect(parsed.listeners[0].tls == null);
     }
-    // Present on the defaulted protocol and on a stated l4 alike.
-    inline for (.{ "", ",\"protocol\":\"l4\"" }) |protocol_field| {
+    // Present on either protocol: termination is orthogonal to what the
+    // terminated stream then speaks, which is why the handshake is a
+    // phase ahead of the protocol rather than part of one.
+    inline for (.{ "", ",\"protocol\":\"l4\"", ",\"protocol\":\"http\"" }) |protocol_field| {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(
@@ -6189,14 +6185,6 @@ test "config: the tls block resolves paths, and only shape-checks them" {
         try std.testing.expectEqualStrings("/c.pem", tls.cert_path);
         try std.testing.expectEqualStrings("/k.pem", tls.key_path);
     }
-    // The L7 path reads its head straight off the socket, so a terminated
-    // http listener would hand ciphertext to the request parser. Refused
-    // rather than accepted into a listener that 400s every request — the
-    // same call `proxy_protocol` on http gets, for the same reason.
-    try expectParseError(
-        error.ListenerHttpTls,
-        head ++ ",\"protocol\":\"http\",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail,
-    );
     // Paths that do not exist still load: this loader does no IO (§1), and
     // `main` is where a missing file becomes an error that can name it.
     {

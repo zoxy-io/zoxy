@@ -78,6 +78,15 @@ pub const Counters = struct {
     l7_bad_request: Value = Value.init(0),
     l7_uri_too_long: Value = Value.init(0),
     l7_headers_too_large: Value = Value.init(0),
+    /// A terminated connection whose head *fit* but whose body did not
+    /// (§4, #125): one TLS record decrypts to up to 16 KiB at once, so a
+    /// client that sent its head and a large payload in one record
+    /// overruns the head buffer with bytes that are payload, not headers.
+    /// Answered 413 rather than 431 — the parser is asked which it was,
+    /// because telling a client its headers are too large when its body
+    /// is sends it chasing the wrong thing. Unreachable on the plaintext
+    /// path, where a read cannot deliver more than the buffer holds.
+    l7_body_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
     /// No route matched the request's canonical path (§7), answered 404.
     /// A valid head, so the connection keeps serving when its stream is

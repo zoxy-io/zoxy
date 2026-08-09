@@ -145,6 +145,30 @@ by the fork" below). Still queued, in rough value order:
    pending — see "The loop is not submission-bound" below; reopen only
    on a measured `cqes/wake` approaching 1.
 
+### A terminated L7 listener ignores `limits.head_buffer_bytes` (#125)
+
+Found writing the directed test for `l7_body_too_large`, which is why
+that counter still has no coverage: the test asserted a 413 that never
+came, because the overflow it was trying to provoke cannot happen.
+
+`Proxy.headBytes` returns `engine.plaintext` for a terminated connection,
+and that buffer is sized `max(limits.head_buffer_bytes,
+plaintext_bytes_min)` — the floor exists so one record's decrypt always
+fits. `fillHead`'s capacity is therefore the *buffer's* length, not the
+operator's number. An operator who sets `head_buffer_bytes` to 1 KiB to
+bound what this proxy accepts gets 32 KiB on any terminating listener,
+and the 414/431 answers the README calls operator-visible behaviour fire
+at the wrong threshold.
+
+The two needs are genuinely different and the fix is to stop conflating
+them: the decrypt destination has to hold a record, the *head limit* is
+the config's. Either the head-fill seam carries the configured bound
+separately from the buffer it fills, or the engine is told its head size
+and slices `plaintext` to it while keeping the floor for the decrypt.
+Whichever, `answerHeadOverflow`'s 413/431 fork only starts meaning
+something once the threshold is the configured one — and it needs the
+400/414 arms it currently collapses into 431 at the same time.
+
 ### ztls fork queue
 
 Same pin policy, same batching. Landed in `zoxy-tls`: deterministic
