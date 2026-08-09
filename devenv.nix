@@ -1,5 +1,6 @@
-# Dev environment (https://devenv.sh): the pinned toolchain. Only two packages
-# are used by CI — zig (every job) and kcov (the Linux `zig build coverage`
+# Dev environment (https://devenv.sh): the pinned toolchain. Only three
+# packages are used by CI — zig (every job), openssl (every build links
+# libcrypto for ztls, §4) and kcov (the Linux `zig build coverage`
 # job) — so everything else is developer/bench/profile tooling gated out of the
 # CI closure: zls (editor LSP), nginx + haproxy (Tier-1 bench origins, §9), poop
 # (Tier-0 hardware-counter A/B) and perf + flamegraph (the pinned
@@ -19,6 +20,12 @@ in
   packages =
     [
       pkgs.zig_0_16
+      # ztls's crypto primitives (§4). Every zoxy build links libcrypto, so
+      # this belongs to the CI closure rather than the dev-only set below —
+      # without it `zig build` cannot find `-lcrypto` at all. The `.dev`
+      # output carries the headers ztls's C bindings need; the runtime
+      # library rides along in its closure.
+      pkgs.openssl.dev
     ]
     # kcov drives the Linux `zig build coverage` job.
     ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [

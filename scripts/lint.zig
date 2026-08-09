@@ -3,9 +3,11 @@
 //! named only under `src/io/`, with an explicit allowlist for `main.zig`
 //! startup work (rlimits, sigaction). The `hparse` import is likewise
 //! confined to `src/http/parser.zig` — the wrapper that owns the trust
-//! boundary (§7). `@cImport` is forbidden everywhere — the codebase has no
-//! C-FFI dependency (§4). Runs as `zig build lint` with the source root as
-//! its single argument.
+//! boundary (§7) — and `ztls` to `src/tls/`, the wrapper that owns the
+//! crypto boundary (§4). `@cImport` is forbidden everywhere: the codebase's
+//! one C surface is inside ztls, behind its Zig protocol layer, and a
+//! second one opened here would not be (§4). Runs as `zig build lint` with
+//! the source root as its single argument.
 
 const std = @import("std");
 
@@ -19,9 +21,9 @@ const file_bytes_max: u32 = 1024 * 1024;
 const syscall_needles = [_][]const u8{ "std.posix", "std.os", "os.linux" };
 
 /// One import boundary: a needle that may appear only under `confined_to`.
-/// Data rather than code, so adding a boundary — the TLS engine's own
-/// wrapper is the next one (§4) — is a row here instead of another
-/// parameter threaded through `lintLine` and every one of its tests.
+/// Data rather than code, so adding a boundary is a row here instead of
+/// another parameter threaded through `lintLine` and every one of its
+/// tests.
 const Boundary = struct {
     needle: []const u8,
     /// A path prefix (`"io/"`) or an exact file (`"http/parser.zig"`),
@@ -35,7 +37,7 @@ const boundaries = [_]Boundary{
     .{
         .needle = "@cImport",
         .confined_to = "",
-        .message = "@cImport is forbidden: no C-FFI dependency (DESIGN.md §4)",
+        .message = "@cImport is forbidden: the C bindings live inside ztls (DESIGN.md §4)",
     },
     .{
         .needle = "@import(\"hparse\")",
@@ -46,6 +48,11 @@ const boundaries = [_]Boundary{
         .needle = "@import(\"xev\")",
         .confined_to = "io/",
         .message = "xev may only be imported under src/io/ (DESIGN.md §4)",
+    },
+    .{
+        .needle = "@import(\"ztls\")",
+        .confined_to = "tls/",
+        .message = "ztls may only be imported under src/tls/ — the crypto boundary (DESIGN.md §4)",
     },
 };
 
@@ -246,6 +253,15 @@ test "lintLine: hparse import is confined to the http parser wrapper" {
     try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "http/proxy.zig") != null);
     // Not even src/io/ may reach around the wrapper.
     try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "io/XevIo.zig") != null);
+}
+
+test "lintLine: ztls import is confined to the TLS engine wrapper" {
+    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "tls/Engine.zig") == null);
+    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "Server.zig") != null);
+    // The data path talks to `src/tls/`, never to the crypto library —
+    // not even the parts that are already past a trust boundary of their own.
+    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "http/parser.zig") != null);
+    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "io/XevIo.zig") != null);
 }
 
 test "pathIsUnder: exact files, directory prefixes, and near misses" {

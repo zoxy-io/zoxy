@@ -123,6 +123,72 @@
             .url = "git+https://github.com/zoxy-io/hparse#65521edfc09f19c5574a3360e2ce236c6dbc3be3",
             .hash = "hparse-0.2.0-IukW0rSOAQAmTPCaHzBakxuRRv6dfMds5OGdGU8nxlXw",
         },
+        // Audited fork: zoxy-io/ztls branch zoxy-tls = upstream
+        // mattrobenolt/ztls 7c5049ec (the audited snapshot) plus four
+        // commits of ours:
+        //   40f2481 opt-in RFC 6979 deterministic ECDSA nonces
+        //           (mattrobenolt/ztls#82, still open upstream)
+        //   924817f libcrypto allocation hooks (`mem_hooks`)
+        //   5a87235 wipe only the part of fin_frag that was used
+        //   dba5cdf server-side NewSessionTicket issuance
+        // Diff against that upstream commit to audit; the pin moves only
+        // after re-audit.
+        //
+        // ztls is the codebase's one C surface: a Zig TLS 1.3 protocol
+        // layer over libcrypto primitives, which is why every build links
+        // libcrypto (§4's crypto-primitives exception — the protocol layer
+        // is audited Zig, the primitives are trusted institutionally, and
+        // `@cImport` stays lint-forbidden inside `src/`). Only `src/tls/`
+        // may import it, also lint-enforced.
+        //
+        // Re-audit for dba5cdf, the one commit new since the pin PR #84
+        // carried: ~280 lines adding server-side ticket issuance.
+        // `ServerHandshake` derives resumption_master_secret at RFC 8446
+        // §7.1's transcript point — after the client Finished joins the
+        // transcript and before `forgetHandshakeSecrets` wipes what feeds
+        // it, the only window it exists in. `NewSessionTicket` gains an
+        // encoder (it could only parse, being the client half) writing no
+        // extensions, so `early_data` is not offered and 0-RTT stays a
+        // separate decision with its own replay analysis. Two entry points:
+        // `resumptionPsk(nonce, out)` derives the PSK an identity will
+        // stand for, separate from sending because a stateless server needs
+        // the PSK *before* the ticket that seals it exists; and
+        // `sendNewSessionTicket` encrypts the message onto the application
+        // stream, treating the ticket body as opaque. Acceptance
+        // (`Config.psk_lookup`, `selectPsk`) was already upstream and
+        // unreachable without this. It is load-bearing for us twice over:
+        // §4's resumption, and the ~45 ms delayed-ACK handshake stall
+        // (IMPLEMENTATION_NOTES.md), whose fix is issuing a ticket
+        // immediately rather than leaving the client's Finished unanswered.
+        //
+        // Re-audit for 40f2481: ECDSA signing draws a random nonce, so
+        // CertificateVerify bytes — and, through DER integer trimming, the
+        // flight length — differ every run. That is the one thing standing
+        // between ztls and byte-exact handshake replay under §9's seeded
+        // simulation. The flag is opt-in and off by default, sets OpenSSL
+        // 3.2+'s "nonce-type" provider parameter, and a settable-params
+        // probe makes an older OpenSSL a loud error instead of a silent
+        // random-nonce fallback — the failure the option exists to prevent.
+        // Production signing keeps the default. Rebasing it onto 7c5049ec
+        // required classifying the new error in upstream's `errors.zig`
+        // table, which is exhaustive by construction: `.options`, since the
+        // caller asked for something the backend cannot do.
+        //
+        // Re-audit for 924817f: a thin wrap of `CRYPTO_set_mem_functions`
+        // so libcrypto's internal allocations land in memory we own. §5's
+        // zero-allocation-after-startup promise is otherwise unprovable
+        // with a C library underneath. Returns false rather than throwing
+        // when the swap is refused (already-allocated, or a BoringSSL-family
+        // build with no such API), which is the signal startup fails on.
+        //
+        // Re-audit for 5a87235: `fin_frag`'s teardown wipe cleared the
+        // whole 16 KiB capacity rather than the bytes actually used, at
+        // ~3% of handshake throughput (IMPLEMENTATION_NOTES.md). Bounding
+        // it narrows what is zeroed, never what is retained.
+        .ztls = .{
+            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#dba5cdf93483ccdb9a76c30c5f979912440a791e",
+            .hash = "ztls-0.0.0-SHHDXhqPFQAt_KHHb6p-5wgcImq3pWtCP1UEESUPjXVr",
+        },
     },
     .paths = .{
         "build.zig",
