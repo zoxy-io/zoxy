@@ -499,6 +499,117 @@ test "contract: the provided-buffer group on XevIo over real loopback" {
     try runGroupContract(XevIo, &xev_io);
 }
 
+/// How many draws the fill contract takes. Every byte position must be
+/// written by at least one of them; a backend that left a position alone
+/// would have to draw the sentinel there `random_draws` times running,
+/// which at 1/256 per draw is not a flake anyone will meet.
+const random_draws: u8 = 8;
+const random_sentinel: u8 = 0xAA;
+
+/// What `fillRandom` owes its callers, whichever backend answers: every
+/// byte of the request is written, and two draws do not repeat. Key
+/// material is the one thing the data path cannot check for itself — a
+/// stuck source produces a handshake that looks perfectly well-formed.
+fn runRandomContract(comptime IoType: type, io: *IoType) !void {
+    var draws: [random_draws][Io.random_bytes_max]u8 = @splat(@splat(random_sentinel));
+    for (&draws) |*draw| {
+        io.fillRandom(draw[0..]);
+    }
+
+    // Every position written by someone.
+    for (0..Io.random_bytes_max) |index| {
+        var untouched = true;
+        for (&draws) |*draw| {
+            if (draw[index] != random_sentinel) untouched = false;
+        }
+        try std.testing.expect(!untouched);
+    }
+
+    // No two draws alike: a source that answers once and then repeats
+    // would satisfy the check above and still be useless.
+    for (0..random_draws) |first| {
+        for (first + 1..random_draws) |second| {
+            try std.testing.expect(!std.mem.eql(u8, &draws[first], &draws[second]));
+        }
+    }
+
+    // A short request writes exactly what was asked for and nothing past it.
+    var bounded: [Io.random_bytes_max]u8 = @splat(random_sentinel);
+    io.fillRandom(bounded[0..1]);
+    try std.testing.expectEqualSlices(
+        u8,
+        &[_]u8{random_sentinel} ** (Io.random_bytes_max - 1),
+        bounded[1..],
+    );
+}
+
+test "contract: fillRandom on SimIo" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 7 });
+    try runRandomContract(SimIo, &sim_io);
+}
+
+test "contract: fillRandom on XevIo" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+    try runRandomContract(XevIo, &xev_io);
+}
+
+test "simio: one seed replays one key stream, and a different seed does not" {
+    // The §9 property TLS rides on: a seeded run's handshake is byte-exact,
+    // which is only true if the key material replays with everything else.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var first: SimIo = undefined;
+    var again: SimIo = undefined;
+    var other: SimIo = undefined;
+    try first.init(arena, .{ .seed = 42 });
+    try again.init(arena, .{ .seed = 42 });
+    try other.init(arena, .{ .seed = 43 });
+
+    var first_bytes: [64]u8 = undefined;
+    var again_bytes: [64]u8 = undefined;
+    var other_bytes: [64]u8 = undefined;
+    first.fillRandom(&first_bytes);
+    again.fillRandom(&again_bytes);
+    other.fillRandom(&other_bytes);
+
+    try std.testing.expectEqualSlices(u8, &first_bytes, &again_bytes);
+    try std.testing.expect(!std.mem.eql(u8, &first_bytes, &other_bytes));
+}
+
+test "simio: drawing key material does not move the adversary's stream" {
+    // Why `key_prng` is its own stream: if TLS drew from `prng`, adding one
+    // handshake would re-roll every later scheduling decision in the
+    // scenario — silently re-rolling the sweep's non-TLS coverage while the
+    // sweep still reported green.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var undrawn: SimIo = undefined;
+    var drawn: SimIo = undefined;
+    try undrawn.init(arena, .{ .seed = 11 });
+    try drawn.init(arena, .{ .seed = 11 });
+
+    var key_bytes: [32]u8 = undefined;
+    drawn.fillRandom(&key_bytes);
+
+    try std.testing.expectEqual(
+        undrawn.prng.random().int(u64),
+        drawn.prng.random().int(u64),
+    );
+}
+
 test "contract: XevIo requests a nonzero IORING_SETUP_CQSIZE depth" {
     // The CQSIZE passthrough (§8, the c10k lever): a nonzero cq_entries must
     // be accepted end-to-end. 16384 is deeper than the kernel's default
