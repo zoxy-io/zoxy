@@ -24,6 +24,17 @@ pub const Counters = struct {
     shed_conn_slots: Value = Value.init(0),
     /// §8 rung: relay buffers exhausted at admission → close.
     shed_relay_buffers: Value = Value.init(0),
+    /// §8 rung: the §4 engine pool was full at admission → close. The
+    /// TLS wall `limits.tls_engines` names, and the one an operator
+    /// answers by provisioning more if the memory is there.
+    shed_tls_engines: Value = Value.init(0),
+    /// §8 rung: libcrypto could not serve a session's key derivation →
+    /// close. Its own rung rather than the one above because the answer
+    /// is the opposite: engines are not what ran out, the fixed heap (§4)
+    /// is, and more engines would consume it faster. Expected to sit at
+    /// zero forever; any value at all means `libcrypto_heap_bytes` is
+    /// undersized for the concurrency this deployment reaches.
+    shed_tls_crypto: Value = Value.init(0),
     /// §8 "watermarks before walls": pool pressure engaged (false→true
     /// crossings of a pool's high watermark), one counter per pool. Not
     /// sheds — biases that precede the walls — so they stay out of
@@ -311,6 +322,30 @@ pub const Counters = struct {
     /// difference is exactly the fates `upstream_connect_failed` and the
     /// teardown counters already witness. Pure observability.
     l4_proxy_header_sent: Value = Value.init(0),
+    /// §4 TLS sessions that reached application data (#125). The
+    /// denominator for everything a terminating listener does, and — read
+    /// against `admitted` on a TLS-only listener — what says whether
+    /// clients are getting through at all.
+    tls_handshakes_completed: Value = Value.init(0),
+    /// Handshakes that ended without a session: a protocol error, a
+    /// client that hung up or closed mid-flight, a reset while the
+    /// server's flight was going out. Deliberately **not**
+    /// `shed_`-prefixed, on `l4_proxy_header_invalid`'s exact reasoning —
+    /// the connection was admitted before its handshake could fail, so it
+    /// counts in the flow identity as an ordinary completion.
+    ///
+    /// One counter for every cause on purpose. The distinctions matter to
+    /// whoever is debugging a client, and to nobody operating the proxy;
+    /// worse, publishing which step a handshake died at is a probing
+    /// oracle, so the peer learns nothing and neither does this.
+    tls_handshake_failed: Value = Value.init(0),
+    /// Established sessions torn down by a TLS-layer failure while
+    /// relaying: a record that would not decrypt, or an engine outbox
+    /// with no room for what the next step would stage. Distinct from
+    /// `tls_handshake_failed` because the session *worked* — a rising
+    /// count here is a peer misbehaving mid-stream or a far side too slow
+    /// to drain, neither of which a handshake counter would attribute.
+    tls_relay_failed: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).
@@ -1261,6 +1296,12 @@ test "counters: the gate identity sums exactly today's admission rungs" {
     const expected = [_][]const u8{
         "shed_conn_slots",
         "shed_relay_buffers",
+        // Both §4 admission rungs (#125): a session that could not get an
+        // engine, and one whose key derivation libcrypto refused. Two
+        // rungs because an operator answers them oppositely, and both in
+        // the gate identity because neither ever counted `admitted`.
+        "shed_tls_engines",
+        "shed_tls_crypto",
         "shed_draining",
     };
     comptime var actual_count: usize = 0;

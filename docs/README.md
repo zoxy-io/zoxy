@@ -172,7 +172,7 @@ the same filters.
 
 ```json
 "listeners": [
-    { "bind": "0.0.0.0:443", "protocol": "http", "cluster": "web",
+    { "bind": "0.0.0.0:8443", "protocol": "l4", "cluster": "backend",
       "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key" } }
 ]
 ```
@@ -181,6 +181,18 @@ Both paths are read once at startup, so a missing or unusable file stops
 the proxy with an error naming the file — never mid-handshake against a
 real client. `cert` is a PEM chain, leaf first; `key` is the leaf's PEM
 private key.
+
+> [!NOTE]
+> `l4` listeners only, for now. On an `http` listener the request parser
+> reads straight off the socket and would be handed ciphertext, so that
+> combination is refused at load rather than accepted into a listener that
+> fails every request. Terminating in front of an HTTP backend works today
+> as an `l4` listener; routing, filters and access logs on a terminated
+> connection are what the `http` case still needs.
+>
+> A cluster with `proxy_protocol.send` is refused from a terminating
+> listener for the same reason — the header would be staged where the wire
+> does not read it.
 
 > [!IMPORTANT]
 > The key must be **ECDSA P-256 or P-384**. Handshakes run on the event

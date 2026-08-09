@@ -30,6 +30,37 @@ const Origin = origin_mod.Origin(SimIo);
 // is exactly what does not exist.
 const fixture_cert_pem = @embedFile("tls/testdata/cert.pem");
 const fixture_key_pem = @embedFile("tls/testdata/key.pem");
+/// The fixture certificate's SAN. A client that offered any other name
+/// would fail verification for a reason unrelated to what is under test.
+const fixture_host_name = "spike.zoxy.test";
+const TlsClient = @import("tls/TestClient.zig").TestClient(SimIo);
+
+/// Winds a TLS scenario down once every client is done: drains the
+/// server and stops the origin listening, so the loop can reach idle
+/// instead of sitting on armed accepts forever. `Scenario` does the same
+/// job for the plaintext clients; the TLS client carries its own hook
+/// because it is not one of them.
+const TlsWindDown = struct {
+    bed: *TestBed,
+    expected: u8,
+    ended: u8 = 0,
+
+    fn onEnd(context: ?*anyopaque) void {
+        const self: *TlsWindDown = @ptrCast(@alignCast(context.?));
+        self.ended += 1;
+        assert(self.ended <= self.expected);
+        if (self.ended < self.expected) return;
+        self.bed.server.beginDrain();
+        self.bed.scenario.origin.stopListening();
+    }
+
+    /// Attach after `start`: no callback can run before the loop does, so
+    /// the hook is in place well ahead of the first completion.
+    fn attach(self: *TlsWindDown, client: *TlsClient) void {
+        client.on_end = onEnd;
+        client.on_end_context = self;
+    }
+};
 
 const echo_token = "proxied-echo-token-0123456789abc";
 
@@ -270,7 +301,7 @@ pub const TestBed = struct {
         tls: bool = false,
     };
 
-    fn bindAddress() std.Io.net.IpAddress {
+    pub fn bindAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:8080") catch unreachable;
     }
 
@@ -1542,4 +1573,111 @@ test "tls: an operator's head size widens the plaintext buffer, and is priced" {
         wide_head,
         TlsEngine.plaintextBytesFor(wide_head),
     );
+}
+
+test "tls: an L4 listener terminates, and relays the plaintext both ways" {
+    // The whole promise in one scenario: a real ztls client handshakes
+    // against the proxy, sends application data, and the origin — which
+    // knows nothing about TLS — echoes plaintext that comes back
+    // encrypted. Every byte crosses the transform twice.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 41 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = echo_token,
+        .close_after_echo = true,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed, .expected = 1 };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    // The payload made the full round trip in plaintext, through an
+    // origin that never saw a TLS record.
+    try std.testing.expectEqualStrings(
+        echo_token,
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
+}
+
+test "tls: bytes that are not a handshake are counted, not mistaken for pressure" {
+    // The realistic failure: something that is not a TLS client reaches a
+    // terminating listener — a plaintext client on the wrong port, a
+    // scanner, a health check aimed at the wrong socket. It must be a
+    // counted handshake failure and a clean teardown, never §8 pressure,
+    // because nothing here is under strain.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 42 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    // The plaintext client sends `echo_token` — perfectly good bytes, and
+    // not a ClientHello.
+    bed.startClients(1, true);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    // The origin was never dialed: a session that never came up has no
+    // plaintext to relay, so no backend should have heard about it.
+    try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_recv"));
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
+}
+
+test "tls: engine exhaustion sheds at admission, before the gate identity" {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 43 },
+        // One engine, two clients: the second meets the §8 wall.
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 1 },
+        .tls = true,
+        // Silent clients hold their engine to the deadline, so the second
+        // certainly meets a full pool rather than racing the first's exit.
+        .idle_timeout_ms = 60,
+    });
+    defer bed.tearDown();
+
+    var clients: [2]TlsClient = undefined;
+    var wind_down: TlsWindDown = .{ .bed = &bed, .expected = clients.len };
+    for (&clients) |*client| {
+        try client.start(&bed.sim_io, TestBed.bindAddress(), .{ .host_name = fixture_host_name });
+        wind_down.attach(client);
+    }
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("shed_tls_engines"));
+    // A shed at admission never counted `admitted`, which is what keeps
+    // the reconcile identity exact (§9) — and the libcrypto rung stays at
+    // zero, because engines are what ran out, not the heap.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("accepted"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("shed_tls_crypto"));
+    // The relay buffer the shed connection had already taken went back:
+    // this is the first rung that fires holding one, so a leak here would
+    // cost a buffer per refused session rather than being harmless.
+    try std.testing.expect(bed.server.relay_buffers.isFullyReleased());
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
 }

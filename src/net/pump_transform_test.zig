@@ -701,6 +701,9 @@ const Harness = struct {
             &bed.server,
             bed.proxy_client_socket,
             buffer,
+            // Plaintext: this bed drives the pump seam directly, which is
+            // the layer a transform sits above rather than inside.
+            null,
             .connecting,
             0,
             .l4,

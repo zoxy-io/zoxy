@@ -484,10 +484,12 @@ pub const ValidationError = error{
     ListenerForwardedModeUnknown,
     ListenerHttpProxyProtocol,
     ListenerProxyProtocolModeUnknown,
+    ListenerHttpTls,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
     ClusterProxyProtocolSendUnknown,
     ClusterProxyProtocolOnHttpListener,
+    ClusterProxyProtocolOnTlsListener,
     FilterMethodEmpty,
     FilterMethodUnknown,
     FilterHeaderMatchKind,
@@ -2690,10 +2692,13 @@ fn resolveListener(
         .protocol = protocol,
         .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
         .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
-        .tls = try resolveTls(listener_json.tls),
+        .tls = try resolveTls(listener_json.tls, protocol),
     };
     if (protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
+    }
+    if (listener.tls != null) {
+        try rejectTlsClusterSend(listener.routes, clusters);
     }
     assert(listener.routes.len >= 1);
     return listener;
@@ -3552,8 +3557,17 @@ fn resolveProxyProtocol(
 /// can name the path. What is checkable here is that a path was given at
 /// all: an empty string would otherwise reach `openat` as a request to
 /// open the current directory, which fails somewhere far less obvious.
-fn resolveTls(tls_json: ?TlsJson) ValidationError!?Config.Listener.Tls {
+fn resolveTls(
+    tls_json: ?TlsJson,
+    protocol: Config.Listener.Protocol,
+) ValidationError!?Config.Listener.Tls {
     const tls = tls_json orelse return null;
+    // The L7 path reads its head straight off the socket, so a terminated
+    // http listener would hand ciphertext to the request parser and answer
+    // every request 400. Refused rather than ignored, on
+    // `ListenerHttpProxyProtocol`'s exact reasoning: accepting the config
+    // would promise termination that the serving path does not deliver.
+    if (protocol == .http) return error.ListenerHttpTls;
     if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
     if (tls.key.len == 0) return error.ListenerTlsKeyPathEmpty;
     return .{ .cert_path = tls.cert, .key_path = tls.key };
@@ -3642,6 +3656,26 @@ fn rejectHttpClusterSend(
         assert(route.cluster_index < clusters.len);
         if (clusters[route.cluster_index].proxy_protocol_send != null) {
             return error.ClusterProxyProtocolOnHttpListener;
+        }
+    }
+}
+
+/// The same shape for a terminating listener (§4, #125). A TLS
+/// connection's client→upstream window is the engine's plaintext buffer,
+/// not the relay buffer — so the send-side PROXY header, which stages
+/// into the relay buffer, would be written somewhere the wire never reads
+/// and the origin would receive whatever that window happened to hold.
+/// Refused at load rather than sent as garbage; the two features compose
+/// fine in principle and the staging fork is what has not been written.
+fn rejectTlsClusterSend(
+    routes: []const router.Route,
+    clusters: []const Config.Cluster,
+) ValidationError!void {
+    assert(routes.len >= 1);
+    for (routes) |route| {
+        assert(route.cluster_index < clusters.len);
+        if (clusters[route.cluster_index].proxy_protocol_send != null) {
+            return error.ClusterProxyProtocolOnTlsListener;
         }
     }
 }
@@ -5137,11 +5171,13 @@ const fuzz_seed_json =
     \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]},
     \\ {"match":{"path_prefix":"/old"},"actions":[{"redirect":{"status":301,"scheme":"https"}}]},
     \\ {"match":{"path_prefix":"/robots.txt"},"actions":[{"respond":{"status":200,"body":"oops"}}]}],
-    \\ "protocol":"http","tls":{"cert":"/c.pem","key":"/k.pem"}}],
+    \\ "protocol":"http"},
+    \\ {"bind":"127.0.0.1:8443","cluster":"t","tls":{"cert":"/c.pem","key":"/k.pem"}}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],
     \\ "pick":{"policy":"hash","key":"cookie","name":"zoxy-srv"},"max_inflight":8,
-    \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}}},
+    \\ "check":{"type":"http","path":"/health","expect_status":200,"timeout_ms":250}},
+    \\ "t":{"endpoints":["127.0.0.1:9100"]}},
     \\ "timeouts":{"connect_ms":5000,"idle_ms":60000,"drain_deadline_ms":10000,
     \\ "max_lifetime_ms":300000,"request_ms":30000,"health_interval_ms":2000},
     \\ "limits":{"conn_slots":64,"relay_buffers":32,"upstream_slots":32,"tls_engines":16},
@@ -5186,8 +5222,8 @@ test "config: the fuzz seed carrying every block parses" {
     try std.testing.expectEqual(@as(u16, 200), rules[2].actions[0].respond.status);
     // The #125 grammar and the limit that follows it: both in the seed, so
     // the mutator has the vocabulary for either branch.
-    try std.testing.expectEqualStrings("/c.pem", parsed.listeners[0].tls.?.cert_path);
-    try std.testing.expectEqualStrings("/k.pem", parsed.listeners[0].tls.?.key_path);
+    try std.testing.expectEqualStrings("/c.pem", parsed.listeners[1].tls.?.cert_path);
+    try std.testing.expectEqualStrings("/k.pem", parsed.listeners[1].tls.?.key_path);
     try std.testing.expectEqual(@as(u32, 16), parsed.limits.tls_engines);
 }
 
@@ -6140,9 +6176,8 @@ test "config: the tls block resolves paths, and only shape-checks them" {
         const parsed = try expectParseOk(&arena_state, head ++ tail);
         try std.testing.expect(parsed.listeners[0].tls == null);
     }
-    // Present on either protocol: termination is orthogonal to what the
-    // terminated stream then speaks.
-    inline for (.{ "", ",\"protocol\":\"http\"" }) |protocol_field| {
+    // Present on the defaulted protocol and on a stated l4 alike.
+    inline for (.{ "", ",\"protocol\":\"l4\"" }) |protocol_field| {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(
@@ -6154,6 +6189,14 @@ test "config: the tls block resolves paths, and only shape-checks them" {
         try std.testing.expectEqualStrings("/c.pem", tls.cert_path);
         try std.testing.expectEqualStrings("/k.pem", tls.key_path);
     }
+    // The L7 path reads its head straight off the socket, so a terminated
+    // http listener would hand ciphertext to the request parser. Refused
+    // rather than accepted into a listener that 400s every request — the
+    // same call `proxy_protocol` on http gets, for the same reason.
+    try expectParseError(
+        error.ListenerHttpTls,
+        head ++ ",\"protocol\":\"http\",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail,
+    );
     // Paths that do not exist still load: this loader does no IO (§1), and
     // `main` is where a missing file becomes an error that can name it.
     {
@@ -6185,6 +6228,34 @@ test "config: the tls block resolves paths, and only shape-checks them" {
         error.MissingField,
         head ++ ",\"tls\":{\"key\":\"/k.pem\"}" ++ tail,
     );
+}
+
+test "config: a terminating listener cannot reach a PROXY-sending cluster" {
+    // A TLS connection's client→upstream window is the engine's plaintext
+    // buffer, not the relay buffer the send-side header stages into — so
+    // the origin would receive whatever that window happened to hold
+    // rather than the header. Refused at load rather than sent as garbage.
+    // Reachability, not exclusivity, exactly like the http case beside it:
+    // the same cluster stays valid for every plaintext listener.
+    const tail = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
+        "\"proxy_protocol\":{\"send\":\"v2\"}}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    try expectParseError(
+        error.ClusterProxyProtocolOnTlsListener,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"," ++
+            "\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}}]," ++ tail,
+    );
+    // Without the tls block the same cluster is fine.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}]," ++ tail,
+        );
+        try std.testing.expect(parsed.clusters[0].proxy_protocol_send != null);
+    }
 }
 
 test "config: tls_engines follows the tls listeners, and refuses a mismatch" {

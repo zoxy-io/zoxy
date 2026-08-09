@@ -878,12 +878,56 @@ pub fn Server(comptime IoType: type) type {
                 },
                 .http => null,
             };
-            server.finishAdmission(conn, client_socket, buffer, state);
+            // The engine before the tail, so a shed here is an admission
+            // rung like the relay buffer's above and never counts
+            // `admitted` (§8, §9). Acquired at admission rather than at
+            // the handshake's first byte because that is where a shed can
+            // still be one — past `finishAdmission` the connection is in
+            // the gate identity and the answer would have to be a teardown.
+            const engine: ?*TlsEngine = if (state.credentials) |credentials|
+                server.acquireTlsEngine(credentials) catch |err| {
+                    // The two causes want opposite answers from an
+                    // operator — provision more engines, or size the
+                    // libcrypto heap — so they keep separate rungs (§8).
+                    // This is the first rung that fires with a relay
+                    // buffer already in hand — every earlier one aborts
+                    // because it could not get what it needed, so
+                    // `abortAdmission` has never had one to give back.
+                    // Returning it here rather than teaching that function
+                    // about buffers keeps the ordering visible: acquire,
+                    // then acquire, then release what the failed step's
+                    // predecessor took.
+                    if (buffer) |acquired| {
+                        server.releaseRelayBuffer(acquired);
+                    }
+                    // Two calls rather than a switch on the rung name:
+                    // `abortAdmission` takes it comptime, which is what
+                    // makes `witnessShed` check the `shed_` prefix that
+                    // puts a rung in the reconcile identity (§9).
+                    switch (err) {
+                        error.EnginesExhausted => server.abortAdmission(
+                            conn,
+                            client_socket,
+                            "shed_tls_engines",
+                        ),
+                        error.CryptoUnavailable => server.abortAdmission(
+                            conn,
+                            client_socket,
+                            "shed_tls_crypto",
+                        ),
+                    }
+                    return;
+                }
+            else
+                null;
+            server.finishAdmission(conn, client_socket, buffer, engine, state);
             if (state.proxy_protocol != null) {
                 // The loader rejects the block on an http listener, so a
                 // non-null here can only be an l4 one (#142).
                 assert(state.protocol == .l4);
                 server.startProxyHeaderPhase(conn);
+            } else if (conn.tls != null) {
+                server.startTlsPhase(conn);
             } else {
                 server.startProtocol(conn, state.protocol);
             }
@@ -1028,14 +1072,21 @@ pub fn Server(comptime IoType: type) type {
             conn: *ConnType,
             client_socket: IoType.Socket,
             buffer: ?*relay.RelayBuffer,
+            engine: ?*TlsEngine,
             listener: *const ListenerState,
         ) void {
             assert(!server.draining);
+            // Whatever a listener terminates, it terminates for every
+            // connection: an engine without a credentialed listener would
+            // be one this slot leaks, and a credentialed listener without
+            // one would serve ciphertext as if it were a request.
+            assert((engine != null) == (listener.credentials != null));
             server.counters.increment("admitted");
             conn.prepare(
                 server,
                 client_socket,
                 buffer,
+                engine,
                 entryState(listener.protocol),
                 listener.cluster_index,
                 listener.protocol,
@@ -1464,17 +1515,25 @@ pub fn Server(comptime IoType: type) type {
                 conn.client_address = client;
             }
             const leftover_len = conn.head_len - header.bytes_len;
+            const staging = &conn.relay_buffer.?.client_to_upstream;
+            const leftover = staging[header.bytes_len..conn.head_len];
+            if (conn.tls) |engine| {
+                // On a terminating listener those leftover bytes are the
+                // client's first handshake record, not payload: the PROXY
+                // header rides in the clear *outside* the session, so
+                // everything past it already belongs to TLS. Framing them
+                // as relay debt would send a ClientHello to the origin.
+                assert(leftover_len <= engine.plaintext.len);
+                conn.head_len = 0;
+                server.startTlsPhaseWith(conn, leftover);
+                return;
+            }
             if (leftover_len >= 1) {
                 // Payload the last recv delivered behind the header. Move
                 // it to the buffer's start and frame it as the client→
                 // upstream direction's debt; `Relay.start` enters the
                 // pump mid-cycle on exactly this state.
-                const staging = &conn.relay_buffer.?.client_to_upstream;
-                std.mem.copyForwards(
-                    u8,
-                    staging[0..leftover_len],
-                    staging[header.bytes_len..conn.head_len],
-                );
+                std.mem.copyForwards(u8, staging[0..leftover_len], leftover);
                 // The payload is client bytes that crossed the wire — the
                 // access log's `bytes_in` unit (§8) — which the relay's
                 // own counting will never see; the header is metadata the
@@ -1490,6 +1549,257 @@ pub fn Server(comptime IoType: type) type {
             conn.head_len = 0;
             server.startProtocol(conn, .l4);
         }
+
+        /// Enter the §4 TLS handshake phase (#125) on an admitted
+        /// connection whose listener terminates. Runs *after* the PROXY
+        /// header phase where both are configured — that header travels in
+        /// the clear, outside the session, by the spec's own rule — and
+        /// *before* the protocol, because termination is orthogonal to
+        /// whether the plaintext is then relayed or proxied.
+        ///
+        /// Under whatever deadline admission stored: a client that
+        /// connects and says nothing is a slowloris whichever phase it
+        /// stalls in, and the hand-over's fresh deadline only ever moves
+        /// later, which the lazily re-armed timer absorbs (§4).
+        fn startTlsPhase(server: *Self, conn: *ConnType) void {
+            server.startTlsPhaseWith(conn, &.{});
+        }
+
+        /// The same entry for a phase that already holds the session's
+        /// first bytes: the PROXY-header phase reads past its own header
+        /// routinely, and on a terminating listener what it read past is a
+        /// ClientHello. Feeding them here rather than waiting for a read
+        /// is not an optimization — no later read will produce them again.
+        fn startTlsPhaseWith(server: *Self, conn: *ConnType, opening: []const u8) void {
+            assert(!conn.isTearingDown());
+            assert(conn.tls != null);
+            assert(conn.armed.deadline);
+            assert(!conn.tls.?.isConnected());
+            assert(conn.tls_pending_len == 0);
+            conn.state = .tls_handshaking;
+            if (opening.len == 0) {
+                server.armTlsRecv(conn);
+                return;
+            }
+            var sink: TlsHandshakeSink = .{ .conn = conn };
+            conn.tls.?.feed(opening, &sink.sink()) catch {
+                server.counters.increment("tls_handshake_failed");
+                server.beginTeardown(conn);
+                return;
+            };
+            server.pumpTlsOutbound(conn);
+        }
+
+        /// One ciphertext read, straight into the engine's record buffer —
+        /// there is no second buffer between the socket and reassembly.
+        /// The engine bounds what it hands out, so a record split across
+        /// any number of reads costs round trips and nothing else.
+        fn armTlsRecv(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            assert(conn.tls != null);
+            const destination = conn.tls.?.recvBuffer();
+            assert(destination.len >= 1);
+            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            server.io.recv(
+                conn.client_socket,
+                destination,
+                &conn.op_data_client_to_upstream.completion,
+                ConnType,
+                conn,
+                onTlsRecv,
+            );
+        }
+
+        fn onTlsRecv(conn: *ConnType, result: Io.RecvError!u32) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .tls_handshaking);
+            const received = result catch |err| {
+                if (err == error.EndOfStream) {
+                    // A peer that hangs up mid-handshake never became a
+                    // session. Counted as a failed handshake rather than as
+                    // kernel pressure: nothing here is under strain, the
+                    // client simply left.
+                    server.counters.increment("tls_handshake_failed");
+                } else {
+                    server.witnessKernelPressure(.recv, err);
+                }
+                server.beginTeardown(conn);
+                return;
+            };
+            assert(received >= 1);
+            server.driveTlsHandshake(conn, received);
+        }
+
+        /// Feed what arrived and act on where that leaves the session.
+        /// Split from the completion so the reentrancy rule is visible in
+        /// one place: `pumpTlsOutbound` may complete synchronously and
+        /// begin the next step, so nothing may touch `conn` after it.
+        fn driveTlsHandshake(server: *Self, conn: *ConnType, received: u32) void {
+            assert(conn.state == .tls_handshaking);
+            const engine = conn.tls.?;
+            var sink: TlsHandshakeSink = .{ .conn = conn };
+            engine.received(received, &sink.sink()) catch {
+                // Any protocol error is this connection's: a malformed
+                // record, a bad MAC, an unacceptable parameter. The peer
+                // gets a teardown rather than a diagnosis — telling it
+                // which of those it was is telling an attacker.
+                server.counters.increment("tls_handshake_failed");
+                server.beginTeardown(conn);
+                return;
+            };
+            // A client that closed the session mid-handshake said goodbye
+            // to something that never existed. Same verdict as a FIN.
+            if (engine.peerClosed()) {
+                server.counters.increment("tls_handshake_failed");
+                server.beginTeardown(conn);
+                return;
+            }
+            server.pumpTlsOutbound(conn);
+        }
+
+        /// Write whatever the engine staged, then take the next step. The
+        /// send's completion re-enters here, so the loop is: drain the
+        /// outbox, and only once it is empty decide whether the session is
+        /// up (hand over) or still handshaking (read again).
+        fn pumpTlsOutbound(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            const engine = conn.tls.?;
+            const staged = engine.outbound();
+            if (staged.len >= 1) {
+                conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+                server.io.send(
+                    conn.client_socket,
+                    staged,
+                    &conn.op_data_upstream_to_client.completion,
+                    ConnType,
+                    conn,
+                    onTlsSent,
+                );
+                return;
+            }
+            if (engine.isConnected()) {
+                server.finishTlsHandshake(conn);
+            } else {
+                server.armTlsRecv(conn);
+            }
+        }
+
+        fn onTlsSent(conn: *ConnType, result: Io.SendError!u32) void {
+            const server = conn.server;
+            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .tls_handshaking);
+            const sent = result catch |err| {
+                if (err == error.Reset) {
+                    server.counters.increment("tls_handshake_failed");
+                } else {
+                    server.witnessKernelPressure(.send, err);
+                }
+                server.beginTeardown(conn);
+                return;
+            };
+            assert(sent >= 1);
+            // A short send credits partially and comes back here; the
+            // staged bytes never move, so the remainder is still valid.
+            conn.tls.?.outboundSent(sent);
+            server.pumpTlsOutbound(conn);
+        }
+
+        /// The hand-over: the session is up, so start the protocol the
+        /// listener configured — `startProtocol`'s third caller, and the
+        /// one its doc comment was written for.
+        fn finishTlsHandshake(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            assert(conn.tls.?.isConnected());
+            assert(conn.tls.?.outbound().len == 0);
+            server.counters.increment("tls_handshakes_completed");
+            // An L4 connection relays for its whole life and must hold a
+            // buffer before the dial (§6); an L7 one takes its per-leg.
+            // Admission already settled that, so nothing is acquired here.
+            if (conn.protocol == .l4) {
+                assert(conn.relay_buffer != null);
+                server.stageTlsPending(conn);
+            }
+            server.startProtocol(conn, conn.protocol);
+        }
+
+        /// Frame whatever plaintext arrived with the handshake as the
+        /// relay's opening debt — the same mid-cycle entry a PROXY header's
+        /// coalesced payload uses (#142), and for the same reason: those
+        /// bytes crossed the wire once and no later read will produce them
+        /// again.
+        ///
+        /// Not an edge case. A client with nothing to wait for writes its
+        /// request straight after its Finished, and TCP delivers both in
+        /// one segment — so a relay that only ever armed a fresh read would
+        /// sit waiting for bytes it was already holding, until the idle
+        /// deadline reaped a connection that had done nothing wrong.
+        fn stageTlsPending(server: *Self, conn: *ConnType) void {
+            _ = server;
+            assert(conn.state == .tls_handshaking);
+            assert(conn.protocol == .l4);
+            if (conn.tls_pending_len == 0) return;
+            const engine = conn.tls.?;
+            assert(conn.tls_pending_len <= engine.plaintext.len);
+            // At the buffer's front, which is where `sendSlice` reads a
+            // TLS direction's pending window from.
+            const direction = &conn.directions[
+                @intFromEnum(ConnType.Direction.client_to_upstream)
+            ];
+            assert(direction.phase == .idle);
+            direction.phase = .receiving;
+            direction.owe(conn.tls_pending_len);
+            conn.tls_pending_len = 0;
+        }
+
+        /// Where the handshake's decrypted output goes. A handshake
+        /// yields no application data of its own, so anything arriving
+        /// here is the client speaking early — its request coalesced with
+        /// its Finished, which is what a client that has nothing to wait
+        /// for does. Kept rather than dropped: those bytes crossed the
+        /// wire once and no later read will produce them again.
+        const TlsHandshakeSink = struct {
+            conn: *ConnType,
+
+            fn sink(self: *TlsHandshakeSink) TlsEngine.Sink {
+                return .{ .ctx = self, .appData = appData, .closed = closed };
+            }
+
+            fn appData(ctx: *anyopaque, bytes: []const u8) void {
+                const self: *TlsHandshakeSink = @ptrCast(@alignCast(ctx));
+                const conn = self.conn;
+                const engine = conn.tls.?;
+                // The engine decrypts into its own buffer and hands back a
+                // slice of it, so this both *is* where the bytes already
+                // are and where the protocol will look for them. Copying
+                // to the front is what makes `tls_pending_len` mean "from
+                // byte zero" for a protocol that never saw this phase.
+                assert(conn.tls_pending_len + bytes.len <= engine.plaintext.len);
+                std.mem.copyForwards(
+                    u8,
+                    engine.plaintext[conn.tls_pending_len..][0..bytes.len],
+                    bytes,
+                );
+                conn.tls_pending_len += @intCast(bytes.len);
+                conn.log.bytes_in += bytes.len;
+            }
+
+            fn closed(ctx: *anyopaque) void {
+                // Recorded on the engine, which `driveTlsHandshake` asks
+                // after the feed returns. Nothing to do here: a callback
+                // that tore the connection down would do it underneath the
+                // engine still walking its own records.
+                _ = ctx;
+            }
+        };
 
         /// Stage the PROXY header a sending cluster's origin expects
         /// (#142 send) as the client→upstream direction's front debt:
@@ -1709,6 +2019,16 @@ pub fn Server(comptime IoType: type) type {
             // made this connection work against an origin is closed just
             // above, so the origin is no longer carrying it (§7).
             server.releaseL4(conn);
+            // The TLS engine, last of the per-connection resources and the
+            // only one held for the whole life of the connection rather
+            // than a phase of it (§4): it holds the session's keys, so
+            // there is no point before now at which it could go back.
+            if (conn.tls) |engine| {
+                server.releaseTlsEngine(engine);
+                conn.tls = null;
+                conn.tls_pending_len = 0;
+            }
+            assert(conn.tls == null);
             assert(conn.relay_buffer == null);
             assert(conn.upstream == null);
             assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
