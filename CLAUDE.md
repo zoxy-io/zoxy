@@ -28,11 +28,14 @@ direnv activates the shell). Read before writing code:
 
 ## Policies
 
-- Dependencies are audited pure-Zig forks pinned by content hash in
-  build.zig.zon (libxev, hparse). A pin moves only after re-audit. No
-  C FFI — `@cImport` is lint-forbidden.
+- Dependencies are audited forks pinned by content hash in build.zig.zon
+  (libxev, hparse, ztls). A pin moves only after re-audit. libxev and
+  hparse are pure Zig; ztls is the one C surface — a Zig TLS 1.3 protocol
+  layer over libcrypto primitives (DESIGN.md §4's scoped exception), and
+  the C binding lives inside it, so `@cImport` stays lint-forbidden here.
 - Boundaries (lint-enforced): raw syscalls and the `xev` import live only
-  under `src/io/`; `hparse` is imported only by `src/http/parser.zig`.
+  under `src/io/`; `hparse` is imported only by `src/http/parser.zig`;
+  `ztls` only under `src/tls/`.
 - Zero allocation after startup. The memory, fd, and ring budgets are
   closed-form functions of `src/constants.zig` and the loaded config.
   Where a budget is a property of one constant it is comptime-asserted;

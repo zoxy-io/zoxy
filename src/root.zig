@@ -27,6 +27,11 @@ pub const UpstreamHeadBuffer = @import("net/upstream.zig").HeadBuffer;
 pub const UpstreamPool = @import("net/upstream.zig").UpstreamPool;
 pub const Server = @import("Server.zig").Server;
 pub const shed = @import("shed.zig");
+/// TLS termination (§4). The only files that may name ztls, and so the
+/// only place libcrypto is reachable from — lint-enforced.
+pub const tls = struct {
+    pub const Credentials = @import("tls/Credentials.zig");
+};
 /// Shared test-support harness pieces, factored out so multiple test
 /// suites can drive the same origin double instead of growing their own.
 pub const testing = struct {
@@ -49,6 +54,8 @@ test {
     _ = Io;
     _ = Server;
     _ = shed;
+    _ = tls.Credentials;
+    _ = @import("tls/spike_test.zig");
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
     _ = @import("net/proxy_protocol.zig");

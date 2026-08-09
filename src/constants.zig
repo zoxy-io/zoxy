@@ -180,6 +180,32 @@ comptime {
     assert(head_buffer_bytes_default <= head_buffer_bytes_max);
 }
 
+/// The most DER a listener's certificate chain may total (§4). This is a
+/// bound on what goes *on the wire*, not on what came off disk: the server
+/// flight carrying the chain is staged whole before any of it is written,
+/// so the engine sizes its outbound staging from this number. 8 KiB fits a
+/// leaf plus two intermediates at ordinary sizes with room to spare; a
+/// chain past it is refused at startup, naming the limit, rather than
+/// tripping a staging assert against the first client to connect.
+pub const tls_cert_chain_bytes_max: u32 = 8 * 1024;
+
+comptime {
+    // A single P-256 leaf is ~450 bytes of DER; below a kilobyte the
+    // limit would reject certificates that every other proxy serves.
+    assert(tls_cert_chain_bytes_max >= 1024);
+    // The chain is staged whole inside one server flight, and a flight
+    // travels as TLS records. Holding it to the record ceiling keeps the
+    // staging buffer that carries it a fixed multiple of a record rather
+    // than a number that has to be re-derived when this one moves.
+    assert(tls_cert_chain_bytes_max <= tls_record_plaintext_bytes_max / 2);
+}
+
+/// The RFC 8446 §5.1 ceiling on one TLS record's plaintext: 2^14. Not a
+/// choice — it is what a conforming peer may send and what ztls will
+/// hand back from a single record, so every buffer the engine decrypts
+/// into is sized from it.
+pub const tls_record_plaintext_bytes_max: u32 = 16 * 1024;
+
 /// Bounded per-head header array. Overflowing it is load, not malice: it
 /// maps to 431, distinguishable from malformed input's 400 (§7).
 pub const headers_max: u16 = 64;

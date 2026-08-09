@@ -32,6 +32,18 @@ pub fn build(b: *std.Build) void {
     });
     const hparse_module = hparse_dependency.module("hparse");
 
+    // ztls — the TLS 1.3 engine (DESIGN.md §4) — is pinned by content hash
+    // to the audited zoxy-io fork; the pin moves only after re-audit. Only
+    // src/tls/ may import it (lint-enforced). It is a Zig protocol layer
+    // over libcrypto primitives, which is why every build below links
+    // libcrypto: the §4 crypto-primitives exception, and the codebase's one
+    // C surface.
+    const ztls_dependency = b.dependency("ztls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ztls_module = ztls_dependency.module("ztls");
+
     const zoxy_module = b.addModule("zoxy", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -39,8 +51,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_module },
+            .{ .name = "ztls", .module = ztls_module },
         },
     });
+    linkLibcrypto(zoxy_module);
     // The shipped example config is embedded so tests and the fuzz corpus
     // stay in sync with the file users actually copy.
     zoxy_module.addAnonymousImport("example_config", .{
@@ -183,6 +197,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseSafe,
     });
+    const ztls_fast_dependency = b.dependency("ztls", .{
+        .target = target,
+        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+    });
     const zoxy_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -190,8 +208,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
+            .{ .name = "ztls", .module = ztls_fast_dependency.module("ztls") },
         },
     });
+    linkLibcrypto(zoxy_fast_module);
     const release_zoxy = b.addExecutable(.{
         .name = "zoxy-release",
         .root_module = b.createModule(.{
@@ -441,4 +461,14 @@ fn resolveBuildId(b: *std.Build) []const u8 {
         .ignore,
     ) catch return "";
     return std.mem.trim(u8, described, " \t\r\n");
+}
+
+/// ztls's C surface: the protocol layer is Zig, the primitives are
+/// libcrypto's (DESIGN.md §4's crypto-primitives exception). Every module
+/// that reaches `src/tls/` needs both, and they always travel together —
+/// linking one without the other produces a link error a long way from
+/// here, so they are set in one place rather than repeated per module.
+fn linkLibcrypto(module: *std.Build.Module) void {
+    module.link_libc = true;
+    module.linkSystemLibrary("crypto", .{});
 }
