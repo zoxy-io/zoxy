@@ -1243,6 +1243,19 @@ fn startTlsClients(harness: *Harness) void {
             // second request and a POST are what cover both, and each
             // needs the client to end on something other than the peer's
             // EOF.
+            //
+            // The first gap has since cost a real defect: a close_notify
+            // on a connection idle *between* requests started an access
+            // log entry for a request nobody made (see the directed test
+            // `l7: close_notify between requests writes no access-log
+            // line`, and the Tier-0.5 leg that found it). It is covered
+            // now, but by two hand-picked cases rather than the sweep.
+            // Flipping this option on for `.http` is not the fix — the
+            // paragraph above is the reason, and it is a hang, not a
+            // failure: the option would wait for a response as long as
+            // the request. Closing it properly means teaching the client
+            // to end on a *complete response* rather than a byte count,
+            // which is a change to `TestClient`, not to this call.
             .close_after_echo = harness.tls_protocol == .l4,
             .x25519_seed = seeds[0],
             .p256_seed = seeds[1],

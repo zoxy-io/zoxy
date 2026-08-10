@@ -1598,6 +1598,19 @@ equalities a shared runner's noise cannot move.
    rendered head that did not *grow* fits its excess exactly. The
    proxy's resident set must not move across two identical load passes,
    §5's promise witnessed from outside the process.
+   One listener terminates TLS (§4), driven by `std.crypto.tls.Client` —
+   an implementation sharing no code with the one zoxy terminates on,
+   which is the only kind whose agreement is evidence. It handshakes,
+   holds a keep-alive session across several requests, and ends it with a
+   `close_notify`; its requests join the same line and accept equalities
+   as every other, because a terminated request is an ordinary request by
+   the time it is logged. It earned its place immediately: it found that
+   every terminating process segfaulted at exit — after a clean drain and
+   a correct exit code — in a libcrypto atexit handler freeing through a
+   heap the arena had already taken, which needs a real *process* to see;
+   and a phantom access-log line per terminated keep-alive connection,
+   the same defect as #129 one layer down, where the log clock started on
+   the ciphertext delivery rather than the first decrypted byte.
    The one exception to "equalities" is the health-probe *rate*, and it
    is the exception that proves the rule: #130 was a bug no equality
    could see, because every verdict the prober reached was correct and
