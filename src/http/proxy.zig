@@ -165,10 +165,6 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(received >= 1);
-            // A request begins with its first byte, on the plaintext
-            // path's own rule: before the decrypt, because a slowloris
-            // dribbling records must report the time it spent (§8).
-            server.beginLogRequest(conn);
             var head: HeadPlaintext = .{ .server = server, .conn = conn };
             const sink = head.sink();
             conn.tls.?.received(received, &sink) catch {
@@ -177,6 +173,15 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             if (head.appended >= 1) {
+                // A request begins with its first *plaintext* byte, on the
+                // plaintext path's own rule (§8) — not with the delivery
+                // that carried it. A record can decrypt to no application
+                // data at all: a KeyUpdate, an alert, or the close_notify
+                // that ends an idle keep-alive connection. Starting the
+                // clock on the delivery opens a log entry for a request
+                // nobody made, which teardown then writes out as an
+                // aborted exchange with no method and no bytes.
+                server.beginLogRequest(conn);
                 conn.log.bytes_in += head.appended;
             }
             if (conn.tls.?.peerClosed()) {

@@ -55,20 +55,39 @@ Remaining, in the order the work wants:
    wired, so no ticket is ever sent. That is both §4's resumption and the
    ~45 ms stall below, and the emission has to land *after* the client
    Finished is processed, not alongside the server flight.
-2. **The Tier-0.5 smoke gate.** Feasible as planned and with no new
-   dependency: `std.crypto.tls.Client` in the pinned toolchain offers
-   `ca: .self_signed` and `host: .no_verification`, which is exactly the
-   checked-in fixture's shape. Worth doing with std rather than
-   `TestClient` precisely because it is an *independent* implementation —
-   ztls talking to ztls proves interoperability with nobody.
-3. **The Tier-1 bands**, whose acceptance is the close-mode rate gate PR
+2. **The Tier-1 bands**, whose acceptance is the close-mode rate gate PR
    #84 could not pass; (1) is what is expected to move it.
 
 Two smaller things the reviews left open: `ResponseBodyPolicy.afterSend`
 credits ciphertext to `bytes_out` where the client-write channel credits
 plaintext, so a streamed TLS response over-counts; and the sim's TLS
-http client sends `Connection: close` and a GET, leaving the keep-alive
-turnaround and the request-body leg reachable by directed tests only.
+http client sends `Connection: close` and a GET, leaving the request-body
+leg reachable by directed tests only.
+
+### What the live gate found
+
+Tier 0.5 terminates real TLS from `std.crypto.tls.Client` — an
+implementation sharing no code with ztls, which is the only kind whose
+agreement means anything. It landed two defects that every other tier had
+been green on, and both are worth recording because neither was reachable
+from where the other tiers stand.
+
+- **Every terminating process crashed at exit.** The fixed libcrypto heap
+  was arena-backed; `OPENSSL_cleanup` runs from an atexit handler, after
+  `main` returned and took the arena with it. Needs a *process* that
+  installs the heap and then exits — which unit tests never do, the
+  simulator has no process for, and the heap proof already avoids by
+  installing into a static. Storage is static now.
+- **A phantom access-log line per terminated keep-alive connection.** The
+  log clock started on the ciphertext *delivery* rather than on the first
+  decrypted byte, so the `close_notify` that ends an idle connection
+  opened an entry for a request nobody made, which teardown then wrote out
+  as an `aborted` exchange with no method and no bytes. Now pinned by a
+  directed test, but the sim did not have it: its TLS clients close in
+  protocol only after a `Connection: close` request, so no idle keep-alive
+  connection was ever alerted. The reachable-counter census cannot see
+  this class at all — the phantom line increments `access_log_lines`, a
+  counter every run already fires.
 
 Earlier candidates, recorded so they are not re-chased: a hardened fork
 of [tls.zig](https://github.com/ianic/tls.zig) (pinned `5452baf`) was the

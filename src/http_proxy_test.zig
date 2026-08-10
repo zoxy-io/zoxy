@@ -4217,6 +4217,47 @@ const TlsWindDown = struct {
     }
 };
 
+test "l7: close_notify between requests writes no access-log line" {
+    // A terminated keep-alive connection ends the way TLS says to: the
+    // client answers its last response with a close_notify, and the alert
+    // arrives on a connection that is idle between requests.
+    //
+    // The plaintext path has an EOF here too, and writes nothing for it —
+    // an access-log line is a claim that a request was *made*, and nobody
+    // made one. Getting this wrong is invisible from inside: the phantom
+    // line is well-formed, it is merely about nothing, so it shows up as
+    // an `aborted` exchange with no method, no path and no bytes. The
+    // arithmetic below is the only thing that sees it.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 52,
+        .tls = true,
+        .access_log = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        // No `Connection: close`: the connection has to still be *open*
+        // and waiting for a next request when the alert lands, which is
+        // the whole state under test.
+        .app_data = "GET /x HTTP/1.1\r\nHost: o\r\n\r\n",
+        .close_after_echo = true,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    // One request was made, so one line is owed — and exactly one.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("access_log_lines"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("access_log_dropped"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    try bed.expectDrained();
+}
+
 test "l7: a terminated head that fits with a body that does not is 413, not 431" {
     // The one L7 state only termination can reach. A plaintext read
     // cannot deliver more than the head buffer holds, but one TLS record

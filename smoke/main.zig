@@ -66,6 +66,10 @@ const tls_key_pem = @embedFile("tls_key_pem");
 /// L7 state a directed test with a single `Connection: close` client
 /// cannot reach and where a real defect already lived once.
 const tls_requests: u32 = 3;
+/// And the one connection they ride, named for the run-wide accept
+/// equality: a leg that opened a second connection without saying so here
+/// would be caught as an off-by-one rather than pass quietly.
+const tls_connections: u32 = 1;
 const not_found_body = "no such route";
 
 /// The #140 fields as they must appear in a written line: the client's
@@ -149,7 +153,7 @@ const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 =
-    http_exchanges + sticky_exchanges + body_exchanges + l4_connections;
+    http_exchanges + sticky_exchanges + body_exchanges + tls_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -175,7 +179,7 @@ const body_connections: u32 = 1;
 const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
-    body_connections + readiness_probes;
+    body_connections + tls_connections + readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -198,7 +202,18 @@ const drain_deadline_ms: u32 = 300;
 /// scenario — the load is a handful of connections — so the smallest
 /// config that serves it starts fastest and keeps the process's resident
 /// set a number a human can read at a glance.
-const zoxy_limits = .{ .conn_slots = 32, .relay_buffers = 16, .upstream_slots = 16 };
+///
+/// `tls_engines` is set rather than left to default, and it is the one
+/// term here that is not merely thrift: an engine costs two orders of
+/// magnitude more than a conn slot, so the default (one per slot) would
+/// price 32 sessions for a leg that opens one, and the §5 banner this
+/// gate prints would stop being a number a reader can sanity-check.
+const zoxy_limits = .{
+    .conn_slots = 32,
+    .relay_buffers = 16,
+    .upstream_slots = 16,
+    .tls_engines = 2,
+};
 
 /// The head buffer zoxy binds for this run — `limits.head_buffer_bytes`
 /// is not set, so this is `constants.head_buffer_bytes_default`, spelled
@@ -234,6 +249,10 @@ comptime {
     // shed, or `accepted == connections_expected` would be measuring the
     // conn wall instead of the load.
     assert(zoxy_limits.conn_slots >= connections_expected);
+    // Same rule for the engine pool, which is its own admission rung
+    // (§8): the https leg must be admitted rather than shed, or its
+    // counter verdicts would be measuring the wall.
+    assert(zoxy_limits.tls_engines >= tls_connections);
 }
 
 /// The health-check shape this run configures, and the window it is
@@ -360,6 +379,9 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // `sticky_exchanges` — and brings its own scrape.
     const sticky_ok = try stickyPassed(arena, io, &ports);
     const bodies_ok = try bodiesPassed(arena, io, &ports);
+    // Last, so its scrape sees the whole run — and so a wedged handshake
+    // cannot cost the legs above their verdicts.
+    const tls_ok = try tlsPassed(arena, io, &ports);
 
     const drained_cleanly = try drain(io, &child, &running);
     const lines = try readAccessLog(arena, io);
@@ -369,7 +391,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        memory_ok and drain_ok;
+        tls_ok and memory_ok and drain_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -475,7 +497,11 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // below its own subset would mean the counter itself is wrong — which
     // no comparison below would otherwise notice.
     assert(lines.http_ok <= lines.http);
-    const http_lines_expected = http_exchanges + sticky_exchanges + body_exchanges;
+    // The https leg's requests land here with every other L7 one: a
+    // terminated request is an ordinary request by the time it is logged,
+    // and a log that told them apart would be the defect.
+    const http_lines_expected =
+        http_exchanges + sticky_exchanges + body_exchanges + tls_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -513,6 +539,19 @@ fn accessLogPassed(lines: *const LogCounts) bool {
         );
         passed = false;
     }
+    return loggedHeadersPassed(lines) and passed;
+}
+
+/// The #140 half of the log verdict, split out of `accessLogPassed` on
+/// the same terms `loadShapePassed` was split from `identitiesPassed`:
+/// the https leg's term pushed that one past the length limit, and these
+/// two clauses are the pair that reads as its own claim — not "the log
+/// holds the right lines" but "each line carries the headers the config
+/// named".
+fn loggedHeadersPassed(lines: *const LogCounts) bool {
+    assert(lines.http_with_request_id <= lines.http);
+    assert(lines.http_with_origin_tag <= lines.http);
+    var passed = true;
     // Every http request this gate sends carries the correlation
     // header, so every http line must report it — including the two
     // the proxy answered itself, which is exactly when a join matters.
@@ -733,10 +772,11 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
         );
         passed = false;
     }
-    // Minus the two legs that deliberately run after this scrape (see
-    // `sticky_exchanges` and `body_exchanges`); the whole-run equality
-    // is asserted on the last of their scrapes.
-    const opened_so_far = connections_expected - sticky_connections - body_connections;
+    // Minus the three legs that deliberately run after this scrape (see
+    // `sticky_exchanges`, `body_exchanges` and `tls_requests`); the
+    // whole-run equality is asserted on the last of their scrapes.
+    const opened_so_far = connections_expected -
+        sticky_connections - body_connections - tls_connections;
     if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
@@ -1002,14 +1042,15 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
             passed = false;
         }
     }
-    // The accept count with this leg in, but still short the #159
-    // leg's connection — the whole-run equality lands there, on the
-    // last scrape of the run.
+    // The accept count with this leg in, but still short the connections
+    // the #159 and TLS legs open after it — the whole-run equality lands
+    // on the last scrape of the run.
+    const opened_by_here = connections_expected - body_connections - tls_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
-    if (accepted != connections_expected - body_connections) {
+    if (accepted != opened_by_here) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened by here\n",
-            .{ accepted, connections_expected - body_connections },
+            .{ accepted, opened_by_here },
         );
         passed = false;
     }
@@ -1051,14 +1092,14 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         std.debug.print("FAIL: l7_no_route reads {d}, not 1\n", .{no_route});
         passed = false;
     }
-    // The whole-run accept equality, deferred through both late legs:
-    // this is the last scrape, so every connection the run opened is
-    // accounted for here or nowhere.
+    // Short only the TLS leg's connection, which opens after this scrape
+    // and carries the whole-run equality.
+    const opened_by_here = connections_expected - tls_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
-    if (accepted != connections_expected) {
+    if (accepted != opened_by_here) {
         std.debug.print(
-            "FAIL: {d} connections accepted, not the {d} this run opened\n",
-            .{ accepted, connections_expected },
+            "FAIL: {d} connections accepted, not the {d} opened by here\n",
+            .{ accepted, opened_by_here },
         );
         passed = false;
     }
@@ -1097,6 +1138,117 @@ fn expectBodyResponse(
     // boundary the simulator's oracle holds from outside.
     if (response.edited) {
         std.debug.print("FAIL: the {s} response carried the response-filter stamp\n", .{role});
+        return false;
+    }
+    return true;
+}
+
+/// The #125 leg: a real TLS 1.3 handshake against the terminating
+/// listener, `tls_requests` exchanges over the session it opens, and a
+/// `close_notify` to end it — then the counters on the run's last scrape.
+///
+/// The client is `std.crypto.tls`, an implementation that shares no code
+/// with the one zoxy terminates on. That is the whole point of running
+/// this here: ztls agreeing with ztls proves interoperability with
+/// nobody, and the two things this tier can prove that no directed test
+/// can are that an outside implementation completes the handshake, and
+/// that the session survives a keep-alive turnaround — the L7 state where
+/// a defect already lived once during this work.
+///
+/// Runs last, after both late legs, so it carries the whole-run accept
+/// equality.
+fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.tls != 0);
+    assert(ports.admin != 0);
+    var host_buffer: [32]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.tls});
+    try single_client.connectTls(io, ports.tls);
+    defer single_client.close();
+
+    var passed = true;
+    var request: u32 = 0;
+    while (request < tls_requests) : (request += 1) {
+        // Keep-alive throughout: the turnaround is what is being tested,
+        // and it is also what leaves the connection for `close_notify`
+        // to end rather than a response the proxy closed on.
+        const response = try single_client.get(host, "/", .keep_alive, null);
+        if (!expectTlsResponse(response, request)) passed = false;
+    }
+    assert(request == tls_requests);
+    try single_client.endTls();
+
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const verdicts = [_]struct { name: []const u8, expected: u64 }{
+        // One session, completed: the handshake ran once and finished.
+        .{ .name = "tls_handshakes_completed", .expected = 1 },
+        // And nothing on the failure side. Stated as equalities against
+        // zero rather than left unread, because every one of these is a
+        // rung a working run must never reach — a session that failed and
+        // silently retried would otherwise pass on the count above.
+        .{ .name = "tls_handshake_failed", .expected = 0 },
+        .{ .name = "tls_relay_failed", .expected = 0 },
+        .{ .name = "shed_tls_engines", .expected = 0 },
+        .{ .name = "shed_tls_crypto", .expected = 0 },
+    };
+    for (verdicts) |verdict| {
+        const value = counterOf(&scrape, verdict.name) orelse {
+            passed = false;
+            continue;
+        };
+        if (value != verdict.expected) {
+            std.debug.print(
+                "FAIL: {s} reads {d}, not {d}, after the https leg\n",
+                .{ verdict.name, value, verdict.expected },
+            );
+            passed = false;
+        }
+    }
+    // The whole-run accept equality, deferred through all three late
+    // legs: this is the last scrape, so every connection the run opened
+    // is accounted for here or nowhere.
+    const accepted = counterOf(&scrape, "accepted") orelse return false;
+    if (accepted != connections_expected) {
+        std.debug.print(
+            "FAIL: {d} connections accepted, not the {d} this run opened\n",
+            .{ accepted, connections_expected },
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// One response off the terminated listener. The same framing the
+/// plaintext legs demand — a decrypted head that reframed the body would
+/// fail here exactly as a cleartext one does — plus the absence of the
+/// #175 stamp, which is this leg's witness that it reached the *third*
+/// listener: the stamp is configured on the plaintext one only, so a
+/// response carrying it came from the wrong port.
+fn expectTlsResponse(response: client_module.Response, request: u32) bool {
+    // The reader's own bounds, restated before the comparisons switch on
+    // them: a status or a length outside these did not come off a parse
+    // that succeeded, so comparing it would report the wrong failure.
+    assert(response.status >= 100);
+    assert(response.body_bytes <= client_module.response_body_bytes_max);
+    assert(request < tls_requests);
+    if (response.status != 200) {
+        std.debug.print(
+            "FAIL: https request {d} answered {d}, not 200\n",
+            .{ request, response.status },
+        );
+        return false;
+    }
+    if (response.body_bytes != origin_module.body.len) {
+        std.debug.print(
+            "FAIL: https request {d} carried {d} body bytes, not the origin's {d}\n",
+            .{ request, response.body_bytes, origin_module.body.len },
+        );
+        return false;
+    }
+    if (response.edited) {
+        std.debug.print(
+            "FAIL: https request {d} carried the plaintext listener's stamp\n",
+            .{request},
+        );
         return false;
     }
     return true;
@@ -1287,58 +1439,8 @@ fn reservePorts(io: Io) !Ports {
 /// nobody drains is a drop rung (§8) waiting to make the count a lie.
 fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_port: u16) !void {
     assert(origin_port != 0);
-    const config_json = try std.fmt.allocPrint(arena,
-        \\{{
-        \\    "listeners": [
-        \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
-        \\          "routes": [
-        \\              {{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }},
-        \\              {{ "host": "127.0.0.1", "prefix": "/sticky", "cluster": "sticky" }}
-        \\          ],
-        \\          "request_filters": [
-        \\              {{ "match": {{ "path_prefix": "/robots.txt" }},
-        \\                "actions": [{{ "respond": {{ "status": 200, "body": "robots" }} }}] }}
-        \\          ],
-        \\          "response_filters": [
-        \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
-        \\          ] }},
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
-        \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
-        \\          "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}],
-        \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
-        \\    ],
-        \\    "clusters": {{
-        \\        "origin": {{
-        \\            "endpoints": ["127.0.0.1:{d}"],
-        \\            "check": {{ "type": "http", "path": "/health", "timeout_ms": {d} }}
-        \\        }},
-        \\        "sticky": {{
-        \\            "endpoints": ["127.0.0.1:{d}"],
-        \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
-        \\        }}
-        \\    }},
-        \\    "bodies": {{
-        \\        "gone": {{ "inline": "{s}", "content_type": "text/plain" }},
-        \\        "robots": {{ "file": "{s}", "content_type": "text/plain" }}
-        \\    }},
-        \\    "error_pages": {{ "404": "gone" }},
-        \\    "admin": {{ "bind": "127.0.0.1:{d}" }},
-        \\    "access_log": {{ "sink": "file", "path": "{s}",
-        \\        "request_headers": ["X-Request-ID"], "response_headers": ["X-Origin-Tag"] }},
-        \\    "timeouts": {{
-        \\        "connect_ms": 2000,
-        \\        "idle_ms": 30000,
-        \\        "health_interval_ms": {d},
-        \\        "drain_deadline_ms": {d}
-        \\    }},
-        \\    "limits": {{
-        \\        "conn_slots": {d},
-        \\        "relay_buffers": {d},
-        \\        "upstream_slots": {d}
-        \\    }}
-        \\}}
-        \\
-    , .{
+    assert(ports.http != 0);
+    const config_json = try std.fmt.allocPrint(arena, config_template, .{
         ports.http,
         ports.l4,
         ports.tls,
@@ -1356,9 +1458,69 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         zoxy_limits.conn_slots,
         zoxy_limits.relay_buffers,
         zoxy_limits.upstream_slots,
+        zoxy_limits.tls_engines,
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 }
+
+/// The config `writeConfig` fills in. A module-level constant rather than
+/// a literal inside it: the template is most of the function's length,
+/// and it is not logic — separating them keeps the function a readable
+/// list of what each hole is, and keeps that list under the length limit
+/// as listeners are added.
+const config_template =
+    \\{{
+    \\    "listeners": [
+    \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
+    \\          "routes": [
+    \\              {{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }},
+    \\              {{ "host": "127.0.0.1", "prefix": "/sticky", "cluster": "sticky" }}
+    \\          ],
+    \\          "request_filters": [
+    \\              {{ "match": {{ "path_prefix": "/robots.txt" }},
+    \\                "actions": [{{ "respond": {{ "status": 200, "body": "robots" }} }}] }}
+    \\          ],
+    \\          "response_filters": [
+    \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
+    \\          ] }},
+    \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
+    \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
+    \\          "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}],
+    \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
+    \\    ],
+    \\    "clusters": {{
+    \\        "origin": {{
+    \\            "endpoints": ["127.0.0.1:{d}"],
+    \\            "check": {{ "type": "http", "path": "/health", "timeout_ms": {d} }}
+    \\        }},
+    \\        "sticky": {{
+    \\            "endpoints": ["127.0.0.1:{d}"],
+    \\            "pick": {{ "policy": "hash", "key": "cookie", "name": "zoxy-smoke-srv" }}
+    \\        }}
+    \\    }},
+    \\    "bodies": {{
+    \\        "gone": {{ "inline": "{s}", "content_type": "text/plain" }},
+    \\        "robots": {{ "file": "{s}", "content_type": "text/plain" }}
+    \\    }},
+    \\    "error_pages": {{ "404": "gone" }},
+    \\    "admin": {{ "bind": "127.0.0.1:{d}" }},
+    \\    "access_log": {{ "sink": "file", "path": "{s}",
+    \\        "request_headers": ["X-Request-ID"], "response_headers": ["X-Origin-Tag"] }},
+    \\    "timeouts": {{
+    \\        "connect_ms": 2000,
+    \\        "idle_ms": 30000,
+    \\        "health_interval_ms": {d},
+    \\        "drain_deadline_ms": {d}
+    \\    }},
+    \\    "limits": {{
+    \\        "conn_slots": {d},
+    \\        "relay_buffers": {d},
+    \\        "upstream_slots": {d},
+    \\        "tls_engines": {d}
+    \\    }}
+    \\}}
+    \\
+;
 
 /// A fresh work directory every run: the file sink is append-only by
 /// design (§8, so an external rotation is safe), which makes a stale log

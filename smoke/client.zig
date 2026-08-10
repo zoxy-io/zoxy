@@ -27,6 +27,17 @@ const response_head_bytes_max: u32 = 8192;
 /// vocabulary, not for one request, so the cap needs no per-call thought.
 pub const response_body_bytes_max: u32 = 256 * 1024;
 
+/// The TLS session's own buffers (§4). `std.crypto.tls` asserts at
+/// least `min_buffer_len` — one max ciphertext record — on each, so this
+/// is that floor stated where the arrays are declared rather than
+/// discovered as a panic on the first handshake.
+const tls_buffer_bytes: u32 = std.crypto.tls.Client.min_buffer_len;
+
+/// What the socket's own reader and writer hold — the larger of a
+/// response head and one ciphertext record, since the same connection
+/// type serves both.
+const socket_buffer_bytes: u32 = @max(response_head_bytes_max, tls_buffer_bytes);
+
 /// Header lines one response head may spend, on the same terms as the
 /// origin's request cap: a bound so the parse loop cannot run forever.
 const response_headers_max: u32 = 64;
@@ -45,6 +56,10 @@ pub const Response = struct {
     /// instead of passing as either presence or absence.
     sticky_tag: ?[16]u8,
 };
+
+/// How much entropy `std.crypto.tls` wants to seed one handshake — the
+/// two keyshares and the client random together.
+const entropy_len: u32 = std.crypto.tls.Client.Options.entropy_len;
 
 /// The #140 correlation header every request carries, and the one value
 /// it ever holds — spelled here rather than imported, like the counter
@@ -72,8 +87,12 @@ pub const Client = struct {
     stream: Io.net.Stream = undefined,
     reader: Io.net.Stream.Reader = undefined,
     writer: Io.net.Stream.Writer = undefined,
-    read_buffer: [response_head_bytes_max]u8 = undefined,
-    write_buffer: [response_head_bytes_max]u8 = undefined,
+    /// The socket's own buffers. Wide enough for both roles they serve:
+    /// a plaintext connection reads a response head through them, and a
+    /// terminated one carries *ciphertext*, which `std.crypto.tls`
+    /// requires be able to hold a whole record at once.
+    read_buffer: [socket_buffer_bytes]u8 = undefined,
+    write_buffer: [socket_buffer_bytes]u8 = undefined,
     /// Requests issued on this connection, so a caller can assert its own
     /// keep-alive arithmetic against what actually went out.
     requests: u32 = 0,
@@ -81,6 +100,19 @@ pub const Client = struct {
     /// one: a static slot starts closed, so `connect` can refuse to
     /// overwrite a live connection instead of leaking its socket.
     connected: bool = false,
+    /// The TLS session, when this connection was opened with `connectTls`
+    /// (§4). `std.crypto.tls.Client` deliberately, not the ztls TestClient
+    /// the other gates share: this tier is the one that runs the shipped
+    /// binary against a real kernel, and an *independent* implementation
+    /// is the only one whose agreement means anything — ztls talking to
+    /// ztls proves interoperability with nobody. It also keeps libcrypto
+    /// out of the smoke binary entirely.
+    tls: ?std.crypto.tls.Client = null,
+    /// The session's own two buffers, beside the socket's rather than
+    /// shared with them: the socket pair carries ciphertext and these
+    /// carry the plaintext it decrypts to, so both are live at once.
+    tls_read_buffer: [tls_buffer_bytes]u8 = undefined,
+    tls_write_buffer: [tls_buffer_bytes]u8 = undefined,
 
     /// Open a connection to a loopback port. In-place through an
     /// out-pointer: both `Reader` and `Writer` hold pointers into the
@@ -96,11 +128,89 @@ pub const Client = struct {
         client.writer = client.stream.writer(io, &client.write_buffer);
         client.requests = 0;
         client.connected = true;
-        assert(client.reader.interface.buffer.len == response_head_bytes_max);
+        assert(client.reader.interface.buffer.len == socket_buffer_bytes);
+    }
+
+    /// The same, terminating TLS (§4). The stream's own reader and writer
+    /// become the *ciphertext* transport and the session hands back
+    /// plaintext ones, so everything after this — `get`, the response
+    /// parse — is the plaintext path unchanged. That is the point: what
+    /// this gate proves is that the same equalities hold through a real
+    /// handshake, not that TLS has its own client.
+    ///
+    /// Verification is `.self_signed` against no host: the fixture is a
+    /// throwaway self-signed certificate (`src/tls/testdata`), so a CA
+    /// bundle would have nothing to check it against. The gate's subject
+    /// is the proxy's record layer, not this client's trust decisions.
+    pub fn connectTls(client: *Client, io: Io, port: u16) !void {
+        try client.connect(io, port);
+        errdefer client.close();
+        // The client's own handshake randomness, from the OS: this is the
+        // one thing in the run that must *not* be reproducible, and
+        // nothing here replays, so it comes straight off `io` rather than
+        // through zoxy's seeded seam.
+        var entropy: [entropy_len]u8 = undefined;
+        io.random(&entropy);
+        client.tls = try .init(&client.reader.interface, &client.writer.interface, .{
+            .host = .no_verification,
+            .ca = .self_signed,
+            .read_buffer = &client.tls_read_buffer,
+            .write_buffer = &client.tls_write_buffer,
+            .entropy = &entropy,
+            // The real clock, not epoch zero: `.self_signed` still checks
+            // the certificate's validity window, and the fixture is dated
+            // from when it was generated. A fixed timestamp here would
+            // pass until the fixture is regenerated and then fail for a
+            // reason having nothing to do with the proxy.
+            .realtime_now = .now(io, .real),
+        });
+        // The postcondition `connect` states for its own reader, restated
+        // for what this adds: every request after this rides the session,
+        // and `plaintext()` picks by exactly this field being set.
+        assert(client.tls != null);
+    }
+
+    /// Where this connection's bytes are read and written: the session's
+    /// plaintext interfaces when one exists, the socket's otherwise.
+    /// Named so `get` states which it is once rather than branching twice.
+    fn plaintext(client: *Client) struct { in: *Io.Reader, out: *Io.Writer } {
+        if (client.tls) |*session| {
+            return .{ .in = &session.reader, .out = &session.writer };
+        }
+        return .{ .in = &client.reader.interface, .out = &client.writer.interface };
+    }
+
+    /// Push everything written so far all the way to the kernel.
+    ///
+    /// A terminated connection has *two* buffers stacked, and flushing the
+    /// session only moves plaintext across the first: `Client.flush`
+    /// encrypts into the socket writer's buffer and returns, leaving the
+    /// ciphertext in this process. Flushing only the session therefore
+    /// wedges — the request never goes out, and the read that follows
+    /// waits for a response to bytes the server never saw. Both layers,
+    /// outermost last, is what `std.http.Client` does at its own send.
+    fn flushAll(client: *Client) !void {
+        if (client.tls) |*session| {
+            try session.writer.flush();
+        }
+        try client.writer.interface.flush();
+    }
+
+    /// End the session the way TLS says to: a `close_notify` alert, then
+    /// the socket. The alert is the point — a bare FIN is indistinguishable
+    /// from a truncation attack, so zoxy has a separate in-band path for
+    /// this (§6's transform seam treats the alert as the EOF), and only a
+    /// client that actually sends one walks it.
+    pub fn endTls(client: *Client) !void {
+        assert(client.connected);
+        assert(client.tls != null);
+        try client.tls.?.end();
+        try client.writer.interface.flush();
     }
 
     pub fn close(client: *Client) void {
         assert(client.connected);
+        client.tls = null;
         client.stream.close(client.io);
         client.connected = false;
     }
@@ -132,23 +242,24 @@ pub const Client = struct {
         // in the config and then finds this exact value in the written
         // log, which is the join an operator would make between this log
         // and the origin's.
+        const wire = client.plaintext();
         if (cookie) |crumb| {
             assert(crumb.len >= 1);
-            try client.writer.interface.print(
+            try wire.out.print(
                 "GET {s} HTTP/1.1\r\nHost: {s}\r\nCookie: {s}\r\n" ++
                     request_id_header ++ ": " ++ request_id_value ++ "\r\n{s}\r\n",
                 .{ target, host, crumb, persistence.header() },
             );
         } else {
-            try client.writer.interface.print(
+            try wire.out.print(
                 "GET {s} HTTP/1.1\r\nHost: {s}\r\n" ++
                     request_id_header ++ ": " ++ request_id_value ++ "\r\n{s}\r\n",
                 .{ target, host, persistence.header() },
             );
         }
-        try client.writer.interface.flush();
+        try client.flushAll();
         client.requests += 1;
-        const response = try readResponse(&client.reader.interface);
+        const response = try readResponse(wire.in);
         assert(client.requests >= 1);
         return response;
     }
