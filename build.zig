@@ -185,6 +185,18 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The TLS fixture, handed in rather than embedded: `@embedFile` cannot
+    // escape its module root and the harness is its own module. The
+    // `example_config` import above is the same shape. It stays a
+    // *config* input — the harness writes both files into its work
+    // directory and points the proxy at them, exactly as an operator
+    // would — so nothing here links ztls or libcrypto (§4, §9).
+    smoke_exe.root_module.addAnonymousImport("tls_cert_pem", .{
+        .root_source_file = b.path("src/tls/testdata/cert.pem"),
+    });
+    smoke_exe.root_module.addAnonymousImport("tls_key_pem", .{
+        .root_source_file = b.path("src/tls/testdata/key.pem"),
+    });
     const smoke_run = b.addRunArtifact(smoke_exe);
     smoke_run.addArg("--zoxy");
     smoke_run.addArtifactArg(exe);

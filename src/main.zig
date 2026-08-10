@@ -235,6 +235,20 @@ const BodyFileContext = struct {
     io: std.Io,
 };
 
+/// The fixed libcrypto heap's storage (§4). Static rather than carved
+/// from the startup arena, and that is not a style choice: libcrypto
+/// registers an atexit handler, and `OPENSSL_cleanup` frees through our
+/// hooks *after* `main` has returned and the arena with it. An
+/// arena-backed heap therefore segfaults every terminating process on the
+/// way out — clean drain, correct exit code, crash after. Found by the
+/// Tier-0.5 gate the first time it ran the real binary with TLS
+/// configured, which is the only place it could have been found.
+///
+/// BSS, so the pages a plaintext deployment never touches never become
+/// resident; the §5 banner prices this only when a listener terminates,
+/// which is when it is actually used.
+var libcrypto_heap_storage: [zoxy.constants.libcrypto_heap_bytes]u8 align(16) = undefined;
+
 /// Turn each listener's configured certificate paths into loaded
 /// credentials (§4), one slot per listener and null where the listener is
 /// plaintext. Startup-only: the arena owns the decoded chains for the
@@ -260,12 +274,7 @@ fn loadTlsCredentials(
     // and the allocator swap is refused once anything has allocated. If
     // it fails the zero-allocation promise (§5) is unbacked, and a proxy
     // that cannot keep its own invariants should not start.
-    const heap_buffer = try arena.alignedAlloc(
-        u8,
-        .of(u128),
-        zoxy.constants.libcrypto_heap_bytes,
-    );
-    if (!zoxy.tls.libcrypto_heap.install(heap_buffer)) {
+    if (!zoxy.tls.libcrypto_heap.install(&libcrypto_heap_storage)) {
         std.debug.print(
             "zoxy: libcrypto refused the fixed-heap install; " ++
                 "the zero-allocation budget (DESIGN.md §5) cannot be kept\n",

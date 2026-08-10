@@ -52,6 +52,20 @@ const zoxy_log_path = work_directory ++ "/zoxy.log";
 /// the sim and the directed tests).
 const robots_path = work_directory ++ "/robots.txt";
 const robots_body = "User-agent: *\nDisallow: /private\n";
+
+/// The §4 fixture the terminating listener serves. Handed in by the build
+/// rather than embedded here (`@embedFile` cannot escape a module root),
+/// and written to the work directory so the proxy reads it off disk the
+/// way a deployment's certificate arrives.
+const tls_cert_path = work_directory ++ "/cert.pem";
+const tls_key_path = work_directory ++ "/key.pem";
+const tls_cert_pem = @embedFile("tls_cert_pem");
+const tls_key_pem = @embedFile("tls_key_pem");
+/// Requests the HTTPS leg issues on one terminated connection. More than
+/// one on purpose: the second is a keep-alive turnaround, which is the
+/// L7 state a directed test with a single `Connection: close` client
+/// cannot reach and where a real defect already lived once.
+const tls_requests: u32 = 3;
 const not_found_body = "no such route";
 
 /// The #140 fields as they must appear in a written line: the client's
@@ -293,6 +307,7 @@ const Ports = struct {
     http: u16,
     l4: u16,
     admin: u16,
+    tls: u16,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -345,6 +360,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // `sticky_exchanges` — and brings its own scrape.
     const sticky_ok = try stickyPassed(arena, io, &ports);
     const bodies_ok = try bodiesPassed(arena, io, &ports);
+
     const drained_cleanly = try drain(io, &child, &running);
     const lines = try readAccessLog(arena, io);
     // Every check runs and prints; a run that fails two ways should say
@@ -792,6 +808,7 @@ fn runLoad(
 ) !Memory {
     assert(ports.http != 0);
     assert(ports.l4 != 0);
+    assert(ports.tls != 0);
     var host_buffer: [32]u8 = undefined;
     const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.http});
     for (&clients) |*client| {
@@ -1004,7 +1021,6 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
 /// answers from the file-backed body — both on one connection, both
 /// judged on their exact framing, then the counters on a scrape. Runs
 /// after `countersPassed` so those scrapes still describe a run whose
-/// every request routed.
 fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     assert(ports.http != 0);
     assert(ports.admin != 0);
@@ -1242,18 +1258,23 @@ fn reservePorts(io: Io) !Ports {
     var http_listener = try http_address.listen(io, .{ .mode = .stream });
     var l4_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var l4_listener = try l4_address.listen(io, .{ .mode = .stream });
+    var tls_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var tls_listener = try tls_address.listen(io, .{ .mode = .stream });
     var admin_address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var admin_listener = try admin_address.listen(io, .{ .mode = .stream });
     const ports: Ports = .{
         .http = http_listener.socket.address.getPort(),
         .l4 = l4_listener.socket.address.getPort(),
+        .tls = tls_listener.socket.address.getPort(),
         .admin = admin_listener.socket.address.getPort(),
     };
     http_listener.deinit(io);
     l4_listener.deinit(io);
+    tls_listener.deinit(io);
     admin_listener.deinit(io);
     assert(ports.http != 0);
     assert(ports.l4 != 0);
+    assert(ports.tls != 0);
     assert(ports.admin != 0);
     assert(ports.http != ports.l4);
     assert(ports.http != ports.admin);
@@ -1281,7 +1302,10 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\          "response_filters": [
         \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
         \\          ] }},
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }}
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
+        \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
+        \\          "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}],
+        \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
         \\    ],
         \\    "clusters": {{
         \\        "origin": {{
@@ -1317,6 +1341,9 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
     , .{
         ports.http,
         ports.l4,
+        ports.tls,
+        tls_cert_path,
+        tls_key_path,
         origin_port,
         health_probe_timeout_ms,
         origin_port,
@@ -1346,6 +1373,13 @@ fn prepareWorkDirectory(io: Io) !void {
     // is read once at startup (parse-once, §1) — the one thing in this
     // config that comes off the filesystem rather than out of the JSON.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = robots_path, .data = robots_body });
+    // The TLS fixture, written where the config points and read by the
+    // proxy at startup like any operator's certificate (§4). Throwaway
+    // and self-signed — `src/tls/testdata/README.md` says why the key is
+    // committed — so the gate's subject is the record layer, not a trust
+    // decision.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_cert_path, .data = tls_cert_pem });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_key_path, .data = tls_key_pem });
 }
 
 /// zoxy's own output goes to a file rather than this process's stderr:
