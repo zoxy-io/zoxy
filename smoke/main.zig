@@ -70,6 +70,11 @@ const tls_requests: u32 = 3;
 /// equality: a leg that opened a second connection without saying so here
 /// would be caught as an off-by-one rather than pass quietly.
 const tls_connections: u32 = 1;
+/// Tickets a completed handshake is expected to issue — `constants
+/// .tls_tickets_per_handshake`, spelled here rather than imported like
+/// the counter names: the gate reads what the binary *wrote*, so a drift
+/// must fail loudly rather than agree with itself.
+const tls_tickets_per_handshake: u64 = 2;
 const not_found_body = "no such route";
 
 /// The #140 fields as they must appear in a written line: the client's
@@ -1292,6 +1297,15 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // rung a working run must never reach — a session that failed and
         // silently retried would otherwise pass on the count above.
         .{ .name = "tls_handshake_failed", .expected = 0 },
+        // The post-handshake flight, witnessed on the shipped binary
+        // rather than only in a simulator: it is what carries the ACK
+        // that keeps a client's first request out of its own Nagle queue,
+        // so a deployment issuing none has the ~45 ms stall back.
+        .{ .name = "tls_tickets_issued", .expected = tls_tickets_per_handshake },
+        // And nothing resumed: this client is offered tickets and never
+        // returns one, so a count here would mean the counter fires on
+        // something other than resumption.
+        .{ .name = "tls_resumed", .expected = 0 },
         .{ .name = "tls_relay_failed", .expected = 0 },
         .{ .name = "shed_tls_engines", .expected = 0 },
         .{ .name = "shed_tls_crypto", .expected = 0 },
