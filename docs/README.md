@@ -229,11 +229,11 @@ full handshake.
 > stall per connection. The ticket flight is what carries that ACK.
 >
 > Measured: on a `Connection: close` workload — a fresh TLS handshake per
-> request, the worst case — a terminated hop runs at a p50 of 158 µs
-> against HAProxy's 607 µs. On steady keep-alive traffic the two are at
+> request, the worst case — a terminated hop runs at a p50 of 158–161 µs
+> against HAProxy's 429–607 µs. On steady keep-alive traffic the two are at
 > parity, ~20k req/s at a p50 within a few µs of each other. Bulk
-> transfer is the one band zoxy trails on: ~507 µs against ~385 µs at the
-> same 100 MiB/s.
+> transfer is the one band zoxy trails on, by a third to two-fifths:
+> 507–542 µs against 383–385 µs at the same 100 MiB/s.
 
 ### Routing
 

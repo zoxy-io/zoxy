@@ -111,10 +111,11 @@ const Flags = struct {
     // rate: an ECDSA signature plus a key exchange per connection tops
     // out near 840/s on a single pinned core, measured, and measured the
     // same for haproxy (843 vs 830 — IMPLEMENTATION_NOTES). Offering
-    // past that makes every path's latency a queueing artefact rather
-    // than a hop cost, which is the opposite of what this band is for:
-    // it is a latency band (the per-request hop cost), never a
-    // throughput number.
+    // past that makes the *terminating* paths' latency a queueing
+    // artefact rather than a hop cost, which is the opposite of what this
+    // band is for: it is a latency band (the per-request hop cost), never
+    // a throughput number. The plaintext paths held 2000/s and were never
+    // the constraint.
     //
     // So the offer is one every path can actually hold, which keeps all
     // seven directly comparable — the whole point of a band. It also
@@ -865,19 +866,38 @@ fn spawnZoxy(
     };
 }
 
-/// haproxy is the state-of-the-art reference band, not a gate: same
-/// origin, same load, `mode tcp` to match zoxy's L4 relay and
-/// `nbthread 1` to match zoxy's single event-loop thread. Timeouts mirror
-/// the generated zoxy config so neither proxy wins by timing out earlier.
-/// The throwaway self-signed fixtures the TLS gates use
-/// (`src/tls/testdata/README.md`), read from the tree rather than
-/// embedded — the bench is its own module, so `@embedFile` cannot reach
-/// across the package boundary, and the harness already assumes a
-/// repo-root cwd (`zig-out/bin/zoxy`, `.zig-cache/…`). Benchmarking the
-/// same certificate the tests use keeps the bands honest about what they
-/// measure.
-const cert_source = "src/tls/testdata/cert.pem";
-const key_source = "src/tls/testdata/key.pem";
+/// What a PEM fixture may be, mirroring `constants.tls_pem_bytes_max`'s
+/// job on the production path: turn "the harness was pointed at the wrong
+/// file" into a named error rather than an arena the size of whatever was
+/// on disk. Spelled rather than imported — the bench is its own module
+/// and does not link the `zoxy` one.
+const pem_bytes_max: usize = 64 * 1024;
+
+/// Read one of the throwaway self-signed fixtures the TLS gates use
+/// (`src/tls/testdata/README.md`).
+///
+/// From the tree rather than embedded: the bench is its own module, so
+/// `@embedFile` cannot reach across the package boundary, and the harness
+/// already assumes a repo-root cwd (`zig-out/bin/zoxy`, `.zig-cache/…`).
+/// Benchmarking the same certificate the tests use keeps the bands honest
+/// about what they measure.
+///
+/// One function for both files so each names itself on failure. The
+/// alternative — a bare `try` on the second — reports an unlabeled error
+/// from a ReleaseFast binary with no return trace, which is the one thing
+/// a setup failure must not do.
+fn readFixture(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+    assert(path.len > 0);
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(pem_bytes_max)) catch |err| {
+        std.debug.print(
+            "bench: could not read {s} ({t}); run from the repository root\n",
+            .{ path, err },
+        );
+        return err;
+    };
+    assert(bytes.len > 0);
+    return bytes;
+}
 
 /// zoxy reads cert and key as separate files; haproxy wants them
 /// concatenated into one. Written once, before either proxy starts —
@@ -885,17 +905,11 @@ const key_source = "src/tls/testdata/key.pem";
 /// where the error can say which source it came from, rather than as a
 /// proxy that will not start.
 fn writeCertificates(arena: std.mem.Allocator, io: Io) !void {
+    const cert_source = "src/tls/testdata/cert.pem";
+    const key_source = "src/tls/testdata/key.pem";
     const dir = Io.Dir.cwd();
-    const cert = dir.readFileAlloc(io, cert_source, arena, .unlimited) catch |err| {
-        std.debug.print(
-            "bench: could not read {s} ({t}); run from the repository root\n",
-            .{ cert_source, err },
-        );
-        return err;
-    };
-    const key = try dir.readFileAlloc(io, key_source, arena, .unlimited);
-    assert(cert.len > 0);
-    assert(key.len > 0);
+    const cert = try readFixture(arena, io, cert_source);
+    const key = try readFixture(arena, io, key_source);
     try dir.writeFile(io, .{ .sub_path = work_directory ++ "/cert.pem", .data = cert });
     try dir.writeFile(io, .{ .sub_path = work_directory ++ "/key.pem", .data = key });
     const combined = try std.mem.concat(arena, u8, &.{ cert, key });
@@ -903,6 +917,13 @@ fn writeCertificates(arena: std.mem.Allocator, io: Io) !void {
     assert(combined.len == cert.len + key.len);
 }
 
+/// haproxy is the state-of-the-art reference band, not a gate: same
+/// origin, same load, `mode tcp` to match zoxy's L4 relay and
+/// `nbthread 1` to match zoxy's single event-loop thread. Timeouts mirror
+/// the generated zoxy config so neither proxy wins by timing out earlier.
+/// Its `bench_https` listen terminates the same fixture certificate zoxy
+/// does, so the added pair isolates termination cost rather than
+/// comparing two different certificates.
 fn spawnHaproxy(
     arena: std.mem.Allocator,
     io: Io,
@@ -1202,12 +1223,12 @@ fn printMode(label: []const u8, runs: *const Runs, scenario: Scenario) void {
     } else {
         std.debug.print("-- {s} --\n", .{label});
     }
-    printReport("direct      ", &runs.direct, scenario);
-    printReport("zoxy L4     ", &runs.l4, scenario);
-    printReport("zoxy L7     ", &runs.l7, scenario);
-    printReport("zoxy L7 TLS ", &runs.l7_tls, scenario);
-    printReport("haproxy tcp ", &runs.tcp, scenario);
-    printReport("haproxy http", &runs.http, scenario);
+    printReport("direct       ", &runs.direct, scenario);
+    printReport("zoxy L4      ", &runs.l4, scenario);
+    printReport("zoxy L7      ", &runs.l7, scenario);
+    printReport("zoxy L7 TLS  ", &runs.l7_tls, scenario);
+    printReport("haproxy tcp  ", &runs.tcp, scenario);
+    printReport("haproxy http ", &runs.http, scenario);
     printReport("haproxy https", &runs.https, scenario);
     printOverhead(&runs.direct, &runs.l4, &runs.l7, &runs.tcp, &runs.http);
 }
