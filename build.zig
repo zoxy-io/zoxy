@@ -12,6 +12,33 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", zoxy_version);
     build_options.addOption([]const u8, "build_id", resolveBuildId(b));
 
+    // Which libxev backend `XevIo` builds against, for reproducing
+    // readiness-model behaviour on a box that has io_uring (#203).
+    //
+    // Linux picks io_uring and macOS picks kqueue, and those are two
+    // different models: io_uring *completes* operations, kqueue reports
+    // *readiness* and the backend performs a synchronous syscall. Every
+    // assumption zoxy makes about when an op is delivered is therefore
+    // exercised on one model per platform — and the defects that live in
+    // the other one surface only on a shared macOS runner, twice in
+    // thirteen runs, with no way to reproduce them locally.
+    //
+    // epoll is the readiness model on Linux. It is not kqueue, so a green
+    // run here does not clear macOS; what it buys is that a *failure*
+    // here is reproducible in seconds instead of by pushing and waiting.
+    const io_backend = b.option(
+        IoBackend,
+        "io-backend",
+        "libxev backend: platform default, or epoll to exercise the readiness model on Linux",
+    ) orelse .default;
+    // Its own options module rather than a field on `build_options`: that
+    // one is imported by `src/main.zig`, and a module reached from two
+    // import paths at once is an error ("file exists in modules ... and
+    // ...0"). This is the only thing the library module needs from the
+    // build, so it travels alone.
+    const io_options = b.addOptions();
+    io_options.addOption(IoBackend, "backend", io_backend);
+
     // libxev is pinned by content hash to the zoxy-io fork's
     // zoxy-ring-flags branch: the audited upstream snapshot plus the
     // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
@@ -55,6 +82,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     linkLibcrypto(zoxy_module);
+    // `src/io/XevIo.zig` reads the backend choice from here.
+    zoxy_module.addOptions("io_options", io_options);
     // The shipped example config is embedded so tests and the fuzz corpus
     // stay in sync with the file users actually copy.
     zoxy_module.addAnonymousImport("example_config", .{
@@ -248,6 +277,10 @@ pub fn build(b: *std.Build) void {
         },
     });
     linkLibcrypto(zoxy_fast_module);
+    // The ReleaseSafe twin of the library module needs the same backend
+    // choice: it is the same `src/root.zig`, so `XevIo` asks it the same
+    // question.
+    zoxy_fast_module.addOptions("io_options", io_options);
     const release_zoxy = b.addExecutable(.{
         .name = "zoxy-release",
         .root_module = b.createModule(.{
@@ -512,3 +545,9 @@ fn linkLibcrypto(module: *std.Build.Module) void {
     module.link_libc = true;
     module.linkSystemLibrary("crypto", .{});
 }
+
+/// The `-Dio-backend` choice. `default` is what the platform picks
+/// (io_uring on Linux, kqueue on macOS); `epoll` overrides it to the
+/// readiness model on Linux — see the option's own comment for why that
+/// is worth being able to ask for.
+const IoBackend = enum { default, epoll };
