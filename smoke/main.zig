@@ -315,6 +315,64 @@ var single_client: client_module.Client = .{};
 /// Zero until then — the watchdog can outlive the spawn failing.
 var watchdog_child_pid = std.atomic.Value(i32).init(0);
 
+/// What the run is doing, for the watchdog to name if it fires.
+///
+/// A wedge reports from the *other* thread, so it cannot ask the wedged
+/// one where it stopped — this is the only thing that can say. Worth its
+/// weight the first time a gate wedges on a platform the author cannot
+/// run: "exceeded its budget" says a run hung, which is what the exit
+/// code already said; "wedged in: https handshake" says which of a dozen
+/// waits it was, and on which side.
+///
+/// Ordered as the run performs them, so the *last* one reached is also a
+/// statement about everything before it having finished.
+const Stage = enum {
+    starting,
+    awaiting_listener,
+    load,
+    counter_scrape,
+    sticky_leg,
+    bodies_leg,
+    https_handshake,
+    https_request,
+    https_close_notify,
+    https_scrape,
+    drain,
+    verdicts,
+
+    fn label(stage: Stage) []const u8 {
+        return switch (stage) {
+            .starting => "starting the proxy",
+            .awaiting_listener => "waiting for the listener",
+            .load => "the http and l4 load",
+            .counter_scrape => "the counter scrapes",
+            .sticky_leg => "the sticky leg (#178)",
+            .bodies_leg => "the bodies leg (#159)",
+            .https_handshake => "the https handshake",
+            .https_request => "an https request",
+            .https_close_notify => "the https close_notify",
+            .https_scrape => "the https leg's scrape",
+            .drain => "the drain",
+            .verdicts => "reading back the verdicts",
+        };
+    }
+};
+
+var current_stage = std.atomic.Value(u8).init(@intFromEnum(Stage.starting));
+
+/// Which https request is in flight, 1-based, for the stage that repeats.
+/// The distinction it draws is the one worth having: the first request on
+/// a session and the ones after it are different code (the turnaround),
+/// and a wedge that cannot tell them apart leaves both suspect.
+var current_https_request = std.atomic.Value(u32).init(0);
+
+/// Publish what the run is about to wait on. Release-ordered against the
+/// watchdog's acquire load: the label must be readable by the time the
+/// wait it describes can hang.
+fn enterStage(stage: Stage) void {
+    current_stage.store(@intFromEnum(stage), .release);
+}
+
 const Flags = struct {
     zoxy_path: []const u8 = "zig-out/bin/zoxy",
 };
@@ -369,21 +427,28 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     var running = true;
     defer if (running) child.kill(io);
 
+    enterStage(.awaiting_listener);
     try awaitListening(io, ports.http);
+    enterStage(.load);
     const memory = try runLoad(arena, io, &ports, child.id);
 
     // Scraped before the drain: the admin listener closes with every
     // other one when SIGTERM lands (§8).
+    enterStage(.counter_scrape);
     const counters = try countersPassed(arena, io, ports.admin, origin.port);
     // The #178 leg runs after the scrapes above on purpose — see
     // `sticky_exchanges` — and brings its own scrape.
+    enterStage(.sticky_leg);
     const sticky_ok = try stickyPassed(arena, io, &ports);
+    enterStage(.bodies_leg);
     const bodies_ok = try bodiesPassed(arena, io, &ports);
     // Last, so its scrape sees the whole run — and so a wedged handshake
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
 
+    enterStage(.drain);
     const drained_cleanly = try drain(io, &child, &running);
+    enterStage(.verdicts);
     const lines = try readAccessLog(arena, io);
     // Every check runs and prints; a run that fails two ways should say
     // both, not stop at the first.
@@ -456,10 +521,19 @@ fn watchdogTask(io: Io) void {
         assert(err == error.Canceled);
         return;
     };
-    std.debug.print(
-        "FAIL: smoke run exceeded its {d}s budget — something is wedged, not slow\n",
-        .{watchdog_budget_ns / std.time.ns_per_s},
-    );
+    const stage: Stage = @enumFromInt(current_stage.load(.acquire));
+    const seconds = watchdog_budget_ns / std.time.ns_per_s;
+    if (stage == .https_request) {
+        std.debug.print(
+            "FAIL: smoke run exceeded its {d}s budget — wedged in: {s} ({d} of {d})\n",
+            .{ seconds, stage.label(), current_https_request.load(.acquire), tls_requests },
+        );
+    } else {
+        std.debug.print(
+            "FAIL: smoke run exceeded its {d}s budget — wedged in: {s}\n",
+            .{ seconds, stage.label() },
+        );
+    }
     const pid = watchdog_child_pid.load(.acquire);
     if (pid != 0) {
         std.posix.kill(pid, .KILL) catch {};
@@ -1162,12 +1236,15 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     assert(ports.admin != 0);
     var host_buffer: [32]u8 = undefined;
     const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.tls});
+    enterStage(.https_handshake);
     try single_client.connectTls(io, ports.tls);
     defer single_client.close();
 
     var passed = true;
     var request: u32 = 0;
+    enterStage(.https_request);
     while (request < tls_requests) : (request += 1) {
+        current_https_request.store(request + 1, .release);
         // Keep-alive throughout: the turnaround is what is being tested,
         // and it is also what leaves the connection for `close_notify`
         // to end rather than a response the proxy closed on.
@@ -1175,8 +1252,10 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         if (!expectTlsResponse(response, request)) passed = false;
     }
     assert(request == tls_requests);
+    enterStage(.https_close_notify);
     try single_client.endTls();
 
+    enterStage(.https_scrape);
     const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
     const verdicts = [_]struct { name: []const u8, expected: u64 }{
         // One session, completed: the handshake ran once and finished.
