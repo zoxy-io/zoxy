@@ -48,6 +48,17 @@ const uses_buf_ring = xev.backend == .io_uring;
 /// The one buffer group this backend registers (§5's head-buffer ring).
 const buffer_group_id: u16 = 0;
 
+/// Whether cancelling an armed accept makes the backend deliver that
+/// accept's completion.
+///
+/// io_uring does: the cancel terminates the op and the CQE arrives with
+/// `Canceled`, which is what every caller of `listenClose` is written
+/// against. The readiness backends do not — libxev's epoll `.cancel` is
+/// `stop_completion`, which drops the op without calling anything back,
+/// and kqueue orphans it in its own way (#203). There the seam owes the
+/// delivery itself, or a caller waiting for its accept waits forever.
+const delivers_accept_cancel = xev.backend == .io_uring;
+
 /// Whether a libxev error set can report a cancelled op at all.
 ///
 /// It is not universal, and that is the point of asking: io_uring and
@@ -140,6 +151,12 @@ pub const Listener = struct {
     index: u16,
 };
 
+/// Which libxev backend this build selected. Exported so a test can ask
+/// the seam rather than re-deriving it from the platform: with
+/// `-Dio-backend`, `@import("xev").backend` and the one `XevIo` actually
+/// talks to are no longer the same answer.
+pub const backend = xev.backend;
+
 pub const Completion = xev.Completion;
 
 const ListenerEntry = struct {
@@ -148,6 +165,13 @@ const ListenerEntry = struct {
     armed_accept: ?*xev.Completion,
     cancel_completion: xev.Completion,
     open: bool,
+    /// Who to tell when a `listenClose` orphans an armed accept, on the
+    /// backends that will not tell them itself (`delivers_accept_cancel`).
+    /// Type-erased because `accept` is generic over its userdata and this
+    /// has to outlive that call — the seam owes the delivery, so the seam
+    /// keeps what it needs to make it.
+    orphan_callback: ?*const fn (*anyopaque, Io.AcceptError!Socket) void,
+    orphan_userdata: ?*anyopaque,
 };
 
 /// `cq_entries` is the completion-queue depth to request for this
@@ -421,6 +445,8 @@ pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
         .armed_accept = null,
         .cancel_completion = .{},
         .open = true,
+        .orphan_callback = null,
+        .orphan_userdata = null,
     };
     io.listeners_count += 1;
     return .{ .index = index };
@@ -440,17 +466,62 @@ pub fn listenClose(io: *XevIo, listener: Listener) void {
     const entry = io.listenerEntry(listener);
     assert(entry.open);
     if (entry.armed_accept) |accept_completion| {
-        loopCancel(
-            &io.loop,
-            accept_completion,
-            &entry.cancel_completion,
-            void,
-            null,
-            onCancelReaped,
-        );
+        if (comptime delivers_accept_cancel) {
+            loopCancel(
+                &io.loop,
+                accept_completion,
+                &entry.cancel_completion,
+                void,
+                null,
+                onCancelReaped,
+            );
+        } else {
+            // The backend will not tell the caller, so the seam does —
+            // on the next tick rather than from inside this call. A
+            // synchronous callback here would re-enter the caller from
+            // the middle of its own drain: `Server.beginDrain` closes
+            // every listener in a loop, and the admin's accept callback
+            // runs `maybeStopAfterDrain`, which may stop the loop. A
+            // zero-delay timer keeps the delivery asynchronous, which is
+            // the shape every caller is already written against.
+            //
+            // The listener's own cancel completion carries it: this arm
+            // never submits a cancel, so it is free, and one delivery per
+            // `listenClose` is exactly one use of it.
+            entry.armed_accept = null;
+            io.timer.run(
+                &io.loop,
+                &entry.cancel_completion,
+                0,
+                ListenerEntry,
+                entry,
+                onOrphanedAccept,
+            );
+        }
     }
     closeFd(entry.fd);
     entry.open = false;
+}
+
+/// Deliver the `Canceled` an armed accept is owed when its listener
+/// closed and the backend dropped the op without a word (#203).
+fn onOrphanedAccept(
+    entry: ?*ListenerEntry,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    // Nothing cancels this timer: it is armed once per `listenClose` and
+    // the listener does not reopen.
+    result catch unreachable;
+    const listener_entry = entry.?;
+    assert(listener_entry.armed_accept == null); // Cleared at the close.
+    const callback = listener_entry.orphan_callback.?;
+    const userdata = listener_entry.orphan_userdata.?;
+    listener_entry.orphan_callback = null;
+    listener_entry.orphan_userdata = null;
+    callback(userdata, error.Canceled);
+    return .disarm;
 }
 
 pub fn accept(
@@ -465,6 +536,18 @@ pub fn accept(
     assert(entry.open);
     assert(entry.armed_accept == null);
     entry.armed_accept = completion;
+    if (comptime !delivers_accept_cancel) {
+        // Kept only so `listenClose` can make the delivery the backend
+        // will not. Erased through a shim rather than stored generically:
+        // one entry serves every `accept` on this listener, and they all
+        // share the caller's type.
+        entry.orphan_userdata = userdata;
+        entry.orphan_callback = (struct {
+            fn erased(context: *anyopaque, result: Io.AcceptError!Socket) void {
+                callback(@ptrCast(@alignCast(context)), result);
+            }
+        }).erased;
+    }
     const tcp = xev.TCP.initFd(entry.fd);
     tcp.accept(&io.loop, completion, Userdata, userdata, (struct {
         fn adapter(

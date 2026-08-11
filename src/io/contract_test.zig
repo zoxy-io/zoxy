@@ -96,7 +96,7 @@ fn initTestIo(xev_io: *XevIo, arena: std.mem.Allocator, cq_entries: u32) !void {
         }
         // The pause is what lets the kernel's deferred frees land; the
         // phenomenon (and the branch) is io_uring-only.
-        if (comptime xev.backend == .io_uring) {
+        if (comptime XevIo.backend == .io_uring) {
             const pause: std.os.linux.timespec = .{
                 .sec = 0,
                 .nsec = 20 * std.time.ns_per_ms,
@@ -622,7 +622,7 @@ test "contract: XevIo requests a nonzero IORING_SETUP_CQSIZE depth" {
     try initTestIo(&xev_io, arena_state.allocator(), 16384);
     defer xev_io.deinit();
 
-    if (comptime xev.backend == .io_uring) {
+    if (comptime XevIo.backend == .io_uring) {
         try std.testing.expect(xev_io.loop.ring.cq.cqes.len >= 16384);
     }
 }
@@ -638,9 +638,8 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     //
     // io_uring-only: other backends (kqueue on macOS) refresh cached_now
     // every tick and have no now_outdated flag to simulate staleness with.
-    if (comptime !@hasField(@FieldType(xev.Loop, "flags"), "now_outdated")) {
-        return error.SkipZigTest;
-    }
+    if (comptime XevIo.backend != .io_uring) return error.SkipZigTest;
+
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
 
@@ -733,7 +732,7 @@ test "xevio: a send after our own write shutdown is Reset, not kernel pressure" 
     // so on a macOS dev box this scenario would terminate the test binary
     // rather than fail it. Skipping is honest: the arm under test is the
     // io_uring adapter's, and the kqueue path never reaches it.
-    if (comptime xev.backend != .io_uring) return error.SkipZigTest;
+    if (comptime XevIo.backend != .io_uring) return error.SkipZigTest;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -994,7 +993,7 @@ test "xevio: a recv against a linger-RST close is Reset, with the errno pinned" 
     // peer-gone-as-pressure gap the fork queue tracks
     // (docs/IMPLEMENTATION_NOTES.md, "Open questions"), which this test
     // would otherwise report as its own failure.
-    if (comptime xev.backend != .io_uring) return error.SkipZigTest;
+    if (comptime XevIo.backend != .io_uring) return error.SkipZigTest;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1023,7 +1022,7 @@ test "xevio: a recv against a linger-RST close is Reset, with the errno pinned" 
     try std.testing.expectError(error.Reset, result);
     // Pin WHICH arm fired: the errno the fork kept must be the reset,
     // so this cannot silently start passing via a future EOF mapping.
-    if (comptime xev.backend == .io_uring) {
+    if (comptime XevIo.backend == .io_uring) {
         try std.testing.expectEqual(posix.E.CONNRESET, completion.result_errno);
     }
 }
@@ -1038,7 +1037,7 @@ test "xevio: canceling a stuck dial delivers Canceled and releases the op" {
     // io_uring only: the arm under test is the io_uring adapter's, and
     // BSD accept-queue overflow answers RST where Linux drops — the
     // pending-dial premise does not hold on the kqueue dev box.
-    if (comptime xev.backend != .io_uring) return error.SkipZigTest;
+    if (comptime XevIo.backend != .io_uring) return error.SkipZigTest;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
