@@ -17,6 +17,13 @@
 //! outstanding ticket, which costs one full handshake per returning
 //! client and keeps a stolen disk worthless.
 //!
+//! **The rotation half of that is not wired yet.** The server installs
+//! one key at startup and never calls `rotate` again, so both slots hold
+//! the same generation for the process's life and the bounded-exposure
+//! property above is a property of this module rather than of the running
+//! proxy. What it waits on is a policy decision — the interval *is* the
+//! bound — recorded in IMPLEMENTATION_NOTES under "TLS termination".
+//!
 //! 0-RTT is deliberately not offered (`max_early_data_size` is never
 //! set), so a replayed ticket buys an attacker a resumed handshake and
 //! nothing else — no replayed application data. That is why these
@@ -84,10 +91,14 @@ pub fn init(tickets: *Tickets) void {
     tickets.slots = @splat(.{ .id = 0, .key = @splat(0), .live = false });
     tickets.current = 0;
     tickets.next_id = 1;
+    // The property `ready` exists to report, pinned where it is
+    // established: an uninitialised slot must never seal or open.
+    assert(!tickets.ready());
 }
 
 /// Install `key` as the sealing key, demoting the previous one to
-/// opening-only. Called at startup and on every rotation interval.
+/// opening-only. Called at startup — and, once rotation is wired, on
+/// every interval; today the startup call is the only one.
 pub fn rotate(tickets: *Tickets, key: [key_bytes]u8) void {
     const next: u1 = if (tickets.current == 0) 1 else 0;
     tickets.slots[next] = .{ .id = tickets.next_id, .key = key, .live = true };

@@ -275,8 +275,10 @@ pub const tls_tickets_per_handshake: u8 = 2;
 /// bound: a ticket is a bearer credential for a resumed session, and the
 /// sealing key that opens it lives only in memory, so the real question is
 /// how long a stolen ticket is worth carrying. An hour keeps a busy
-/// client's reconnects free while making yesterday's capture useless, and
-/// it is comfortably inside the two-key rotation window.
+/// client's reconnects free while making yesterday's capture useless.
+/// It would also sit comfortably inside a two-key rotation window, once
+/// rotation is wired — see `tls/Tickets.zig`, which today installs one
+/// key at startup and never replaces it.
 pub const tls_ticket_lifetime_s: u32 = 60 * 60;
 
 comptime {

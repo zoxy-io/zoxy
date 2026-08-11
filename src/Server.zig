@@ -1220,7 +1220,7 @@ pub fn Server(comptime IoType: type) type {
                 // would offer resumption it could not honour, and every
                 // ticket it opened would be one it never sealed.
                 .tickets = if (server.tls_tickets.ready()) &server.tls_tickets else null,
-                .now_unix = server.io.nowWallNs() / std.time.ns_per_s,
+                .now_unix = @divFloor(server.io.nowWallNs(), std.time.ns_per_s),
             }) catch {
                 // Deriving the ephemeral keypair is the one fallible step,
                 // and under the OpenSSL backend it *allocates*
@@ -1726,6 +1726,29 @@ pub fn Server(comptime IoType: type) type {
         fn pumpTlsOutbound(server: *Self, conn: *ConnType) void {
             assert(conn.state == .tls_handshaking);
             const engine = conn.tls.?;
+            // A drained outbox on a connected session is exactly once per
+            // handshake, and exactly the moment the post-handshake flight
+            // is owed (§4). Staging it here rather than in
+            // `finishTlsHandshake` keeps it inside this pump: the tickets
+            // go out through the same send path as the server flight,
+            // partial writes included, and the hand-over below happens on
+            // a later pass once they have drained too.
+            //
+            // Before the send rather than after it, so this stays one
+            // pass over the outbox: whatever is staged leaves through the
+            // single send below, whether it is the server flight or the
+            // tickets that follow it.
+            if (engine.outbound().len == 0 and engine.isConnected() and !conn.tls_session_up) {
+                conn.tls_session_up = true;
+                // Counted *here*, not at the hand-over: the client's
+                // Finished has been processed, so this handshake has
+                // succeeded whatever becomes of the flight that follows
+                // it. A peer that leaves while the tickets are going out
+                // is a session that ended, not one that never happened.
+                server.counters.increment("tls_handshakes_completed");
+                if (engine.isResumed()) server.counters.increment("tls_resumed");
+                _ = server.stageTlsTickets(conn);
+            }
             const staged = engine.outbound();
             if (staged.len >= 1) {
                 conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
@@ -1739,30 +1762,8 @@ pub fn Server(comptime IoType: type) type {
                 );
                 return;
             }
+            assert(conn.tls_session_up or !engine.isConnected());
             if (engine.isConnected()) {
-                // The session is up and the outbox is empty, which is
-                // exactly once per handshake and exactly the moment the
-                // post-handshake flight is owed (§4). Staging here rather
-                // than in `finishTlsHandshake` keeps it inside the pump's
-                // own loop: the tickets go out through the same send path
-                // as the server flight, partial writes included, and the
-                // hand-over happens on the next pass when the outbox has
-                // drained again.
-                if (!conn.tls_session_up) {
-                    conn.tls_session_up = true;
-                    // Counted *here*, not at the hand-over below: the
-                    // client's Finished has been processed, so this
-                    // handshake has succeeded whatever becomes of the
-                    // flight that follows it. A peer that leaves while
-                    // the tickets are going out is a session that ended,
-                    // not one that never happened.
-                    server.counters.increment("tls_handshakes_completed");
-                    if (engine.isResumed()) server.counters.increment("tls_resumed");
-                    if (server.stageTlsTickets(conn)) {
-                        server.pumpTlsOutbound(conn);
-                        return;
-                    }
-                }
                 server.finishTlsHandshake(conn);
             } else {
                 server.armTlsRecv(conn);
@@ -1783,9 +1784,12 @@ pub fn Server(comptime IoType: type) type {
             assert(engine.outbound().len == 0);
             if (engine.tickets == null) return false;
 
-            var staged: u8 = 0;
-            var index: u8 = 0;
-            while (index < constants.tls_tickets_per_handshake) : (index += 1) {
+            // One counter, not two: `break` leaves before the index
+            // advances, so "how many were staged" and "how far the loop
+            // got" are the same number and keeping both would be two
+            // names for one fact.
+            var issued: u8 = 0;
+            while (issued < constants.tls_tickets_per_handshake) {
                 // Per-ticket randomness, drawn through the seam so a
                 // seeded run replays the tickets it issued (§9). The
                 // sealing nonce must never repeat under one key, so it is
@@ -1795,16 +1799,16 @@ pub fn Server(comptime IoType: type) type {
                 // RFC 8446 §4.6.1 wants the nonce unique per ticket
                 // within a connection; the index is that, and being one
                 // byte it keeps the message small.
-                const ticket_nonce = [_]u8{index};
+                const ticket_nonce = [_]u8{issued};
                 engine.sendSessionTicket(
                     &ticket_nonce,
                     std.mem.readInt(u32, material[Tickets.nonce_bytes..][0..4], .big),
                     material[0..Tickets.nonce_bytes].*,
                 ) catch break;
-                staged += 1;
+                issued += 1;
                 server.counters.increment("tls_tickets_issued");
             }
-            if (staged == 0) return false;
+            if (issued == 0) return false;
             assert(engine.outbound().len >= 1);
             return true;
         }
