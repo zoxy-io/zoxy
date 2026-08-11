@@ -11,6 +11,8 @@
 
 const std = @import("std");
 
+const constants = @import("../constants.zig");
+const parser = @import("../http/parser.zig");
 const ztls = @import("ztls");
 
 const assert = std.debug.assert;
@@ -64,6 +66,17 @@ pub fn TestClient(comptime IoType: type) type {
         /// as they are produced.
         close_with_data: bool,
         close_in_handshake: bool,
+        /// How this client knows the peer has answered what it last sent
+        /// (`Options.exchange_end`), the payload to send once it has, and
+        /// whether that one has gone.
+        exchange_end: ExchangeEnd,
+        followup_data: []const u8,
+        followup_sent: bool,
+        /// How many application payloads have gone out. The
+        /// `http_response` rule counts responses against this, so a second
+        /// request waits for the first response rather than for any
+        /// response.
+        payloads_sent: u32,
         coalesced: [2048]u8,
         coalesced_len: u32,
         app_received: [65536]u8,
@@ -85,6 +98,21 @@ pub fn TestClient(comptime IoType: type) type {
         on_end_context: ?*anyopaque = null,
 
         const Self = @This();
+
+        /// How a client decides its peer has answered — the gate every
+        /// "send the next thing" step sits behind.
+        pub const ExchangeEnd = enum {
+            /// As many bytes back as went out. An echo's shape, and sound
+            /// only where the peer returns exactly what it got: an L4
+            /// relay to the echo origin, which is what this client was
+            /// first written for and so what it still defaults to.
+            echo,
+            /// A complete HTTP/1.1 response per payload sent. What a
+            /// proxied session needs and a byte count cannot give it: a
+            /// response is not the length of its request, so waiting for
+            /// one by size either fires early or never fires at all.
+            http_response,
+        };
 
         pub const Options = struct {
             /// Must match the certificate's SAN; the fixtures use
@@ -131,6 +159,16 @@ pub fn TestClient(comptime IoType: type) type {
             /// runs its sinks synchronously inside `feed`, so the session
             /// can end underneath the step that is still driving it.
             close_in_handshake: bool = false,
+            /// What counts as the peer having answered. Every gate below
+            /// asks this — the KeyUpdate's ordering, the two echo-shaped
+            /// closes, and `followup_data`.
+            exchange_end: ExchangeEnd = .echo,
+            /// A second payload, sent on the same session once the first
+            /// exchange completes. This is the keep-alive turnaround: one
+            /// connection, two requests, the L7 state re-entered between
+            /// them. Needs `exchange_end = .http_response`, since a byte
+            /// count cannot tell one response from two.
+            followup_data: []const u8 = &.{},
             /// Offer this ticket in the ClientHello, resuming the session
             /// that issued it instead of running a full handshake. The
             /// storage is the caller's and must outlive the client.
@@ -149,6 +187,7 @@ pub fn TestClient(comptime IoType: type) type {
             address: std.Io.net.IpAddress,
             options: Options,
         ) !void {
+            checkOptions(&options);
             const x25519 = try ztls.x25519.KeyPair.generateDeterministic(
                 .init(options.x25519_seed),
             );
@@ -192,12 +231,46 @@ pub fn TestClient(comptime IoType: type) type {
             client.close_sent = false;
             client.close_with_data = options.close_with_data;
             client.close_in_handshake = options.close_in_handshake;
+            client.exchange_end = options.exchange_end;
+            client.followup_data = options.followup_data;
+            client.followup_sent = false;
+            client.payloads_sent = 0;
             client.coalesced_len = 0;
             client.app_received_len = 0;
             client.ticket = .{};
             client.ticket_captured = false;
             client.resume_with = options.resume_with;
             io.connect(address, &client.connect_completion, Self, client, onConnect);
+        }
+
+        /// The `Options` combinations that are not merely unusual but
+        /// contradictory, checked where they are cheapest to explain.
+        fn checkOptions(options: *const Options) void {
+            // A follow-up is gated on the peer having answered, and under
+            // the echo rule that answer is "as many bytes back as went
+            // out" — which two payloads and two responses cannot tell
+            // apart, so the follow-up would go before the first response.
+            assert(options.followup_data.len == 0 or
+                options.exchange_end == .http_response);
+            // The KeyUpdate and both echo-shaped closes hang off that same
+            // gate and their steps run first, so combining any of them
+            // with a follow-up does not suppress it — it *delays* it
+            // behind an unscripted resend of `app_data`. Three requests in
+            // an order nobody chose is worse than either alone, which is
+            // why these are refused rather than ordered.
+            assert(options.followup_data.len == 0 or !options.key_update);
+            assert(options.followup_data.len == 0 or
+                (!options.close_with_data and !options.close_after_echo));
+            // A response's framing is read from its own headers, and HEAD
+            // is the one method whose response contradicts them: a
+            // Content-Length with no body behind it. A scripted HEAD would
+            // make the client take the *next* response's opening bytes for
+            // this one's body and mis-frame everything after, so it is
+            // refused here rather than special-cased there.
+            if (options.exchange_end == .http_response) {
+                assert(!std.mem.startsWith(u8, options.app_data, "HEAD "));
+                assert(!std.mem.startsWith(u8, options.followup_data, "HEAD "));
+            }
         }
 
         fn onConnect(client: *Self, result: anyerror!IoType.Socket) void {
@@ -287,105 +360,8 @@ pub fn TestClient(comptime IoType: type) type {
                 client.armSend();
                 return;
             }
-            // Strictly after the first echo: see `Options.key_update`.
-            if (client.handshake_done and client.key_update_wanted and
-                !client.key_update_sent and client.app_sent and
-                client.app_received_len >= client.app_to_send.len)
-            {
-                client.key_update_sent = true;
-                client.pending_send = client.hs.sendKeyUpdate(
-                    &client.out.buffer,
-                    .update_requested,
-                ) catch {
-                    client.finish();
-                    return;
-                };
-                client.hs.completeWrite();
-                client.armSend();
-                return;
-            }
-            // The second payload: its echo is what arrives while the
-            // KeyUpdate response is still staged.
-            if (client.key_update_sent and !client.app_resent) {
-                client.app_resent = true;
-                client.pending_send = client.hs.sendApplicationData(
-                    client.app_to_send,
-                    &client.out.buffer,
-                ) catch {
-                    client.finish();
-                    return;
-                };
-                client.hs.completeWrite();
-                client.armSend();
-                return;
-            }
-            if (client.handshake_done and !client.app_sent and
-                client.app_to_send.len > 0)
-            {
-                client.app_sent = true;
-                client.pending_send = client.hs.sendApplicationData(
-                    client.app_to_send,
-                    &client.out.buffer,
-                ) catch {
-                    client.finish();
-                    return;
-                };
-                client.hs.completeWrite();
-                client.armSend();
-                return;
-            }
-            // Deliberately *not* waiting for the echo: the point is to
-            // reach the server's handshake drive, not its relay.
-            if (client.close_in_handshake and !client.close_sent and
-                client.handshake_done)
-            {
-                client.close_sent = true;
-                client.pending_send = client.hs.sendAlert(
-                    .close_notify,
-                    &client.out.buffer,
-                ) catch {
-                    client.finish();
-                    return;
-                };
-                client.hs.completeWrite();
-                client.armSend();
-                return;
-            }
-            // Both other close scenarios wait for the first echo, for the same
-            // reason the KeyUpdate does: anything sent before it is consumed
-            // by the server's handshake drive and never reaches the relay.
-            // The coalesced one sends a *second* payload with the alert
-            // riding the same segment, so the relay's final decrypt yields
-            // plaintext and the end of the session together.
-            if (client.close_with_data and !client.close_sent and
-                client.app_sent and
-                client.app_received_len >= client.app_to_send.len)
-            {
-                client.close_sent = true;
-                client.stageCoalescedClose() catch {
-                    client.finish();
-                    return;
-                };
-                client.pending_send = client.coalesced[0..client.coalesced_len];
-                client.armSend();
-                return;
-            }
-            if (client.close_after_echo and !client.close_sent and
-                client.app_sent and
-                client.app_received_len >= client.app_to_send.len)
-            {
-                client.close_sent = true;
-                client.pending_send = client.hs.sendAlert(
-                    .close_notify,
-                    &client.out.buffer,
-                ) catch {
-                    client.finish();
-                    return;
-                };
-                client.hs.completeWrite();
-                client.armSend();
-                return;
-            }
+            if (client.nextDataStep()) return;
+            if (client.nextCloseStep()) return;
             if (client.saw_close) {
                 client.finish();
                 return;
@@ -393,10 +369,171 @@ pub fn TestClient(comptime IoType: type) type {
             client.armRecv();
         }
 
+        /// The steps that put application data on the wire, in the order
+        /// they may fire. True means one did and has armed its write; the
+        /// caller must not fall through to another.
+        fn nextDataStep(client: *Self) bool {
+            // Strictly after the first echo: see `Options.key_update`.
+            if (client.handshake_done and client.key_update_wanted and
+                !client.key_update_sent and client.app_sent and
+                client.exchangeComplete())
+            {
+                client.key_update_sent = true;
+                client.sendKeyUpdate();
+                return true;
+            }
+            // The second payload: its echo is what arrives while the
+            // KeyUpdate response is still staged.
+            if (client.key_update_sent and !client.app_resent) {
+                client.app_resent = true;
+                client.sendPayload(client.app_to_send);
+                return true;
+            }
+            if (client.handshake_done and !client.app_sent and
+                client.app_to_send.len > 0)
+            {
+                client.app_sent = true;
+                client.sendPayload(client.app_to_send);
+                return true;
+            }
+            // The keep-alive turnaround: a second request on the session
+            // the first was answered on, which is how the L7 state gets
+            // re-entered at all. Gated on the first response being
+            // *whole* — a request sent into the middle of one would make
+            // the proxy's next head start mid-body, and that is this
+            // client's defect, not its peer's.
+            if (client.followup_data.len > 0 and !client.followup_sent and
+                client.app_sent and client.exchangeComplete())
+            {
+                client.followup_sent = true;
+                client.sendPayload(client.followup_data);
+                return true;
+            }
+            return false;
+        }
+
+        /// The steps that end the session in protocol. Same contract as
+        /// `nextDataStep`, and reached only once no data step will fire —
+        /// a goodbye is the last thing a client has to say.
+        fn nextCloseStep(client: *Self) bool {
+            // Deliberately *not* waiting for the echo: the point is to
+            // reach the server's handshake drive, not its relay.
+            if (client.close_in_handshake and !client.close_sent and
+                client.handshake_done)
+            {
+                client.close_sent = true;
+                client.sendCloseNotify();
+                return true;
+            }
+            // Both other close scenarios wait for the peer's answer, for the
+            // same reason the KeyUpdate does: anything sent before it is
+            // consumed by the server's handshake drive and never reaches the
+            // relay. The coalesced one sends a *second* payload with the alert
+            // riding the same segment, so the relay's final decrypt yields
+            // plaintext and the end of the session together.
+            if (client.close_with_data and !client.close_sent and
+                client.app_sent and client.exchangeComplete())
+            {
+                client.close_sent = true;
+                client.stageCoalescedClose() catch {
+                    client.finish();
+                    return true;
+                };
+                client.pending_send = client.coalesced[0..client.coalesced_len];
+                client.armSend();
+                return true;
+            }
+            if (client.close_after_echo and !client.close_sent and
+                client.app_sent and client.exchangeComplete())
+            {
+                client.close_sent = true;
+                client.sendCloseNotify();
+                return true;
+            }
+            return false;
+        }
+
+        /// Render one application payload and write it. The three "send
+        /// the next thing" steps differ only in which bytes go, so the
+        /// render / `completeWrite` / arm sequence lives here once —
+        /// `completeWrite` invalidates the previous record, so getting
+        /// that order wrong overwrites bytes that have not left yet.
+        fn sendPayload(client: *Self, bytes: []const u8) void {
+            assert(bytes.len >= 1);
+            assert(client.pending_send.len == 0);
+            client.payloads_sent += 1;
+            client.pending_send = client.hs.sendApplicationData(
+                bytes,
+                &client.out.buffer,
+            ) catch {
+                client.finish();
+                return;
+            };
+            client.hs.completeWrite();
+            client.armSend();
+        }
+
+        /// The in-band goodbye, on the same render-then-arm sequence.
+        /// Both callers set `close_sent` before calling: this is the one
+        /// alert a client sends, and sending it twice is a protocol
+        /// violation, not a retry.
+        fn sendCloseNotify(client: *Self) void {
+            assert(client.close_sent);
+            assert(client.pending_send.len == 0);
+            client.pending_send = client.hs.sendAlert(
+                .close_notify,
+                &client.out.buffer,
+            ) catch {
+                client.finish();
+                return;
+            };
+            client.hs.completeWrite();
+            client.armSend();
+        }
+
+        fn sendKeyUpdate(client: *Self) void {
+            assert(client.key_update_sent);
+            assert(client.pending_send.len == 0);
+            client.pending_send = client.hs.sendKeyUpdate(
+                &client.out.buffer,
+                .update_requested,
+            ) catch {
+                client.finish();
+                return;
+            };
+            client.hs.completeWrite();
+            client.armSend();
+        }
+
+        /// Whether the peer has answered everything sent so far — the gate
+        /// every follow-up step sits behind. What counts as an answer is
+        /// `exchange_end`'s to say, and it has to be: an echo is exactly as
+        /// long as its request, and a response is nothing of the kind.
+        fn exchangeComplete(client: *const Self) bool {
+            assert(client.payloads_sent >= 1);
+            const back = client.app_received[0..client.app_received_len];
+            return switch (client.exchange_end) {
+                .echo => back.len >= client.app_to_send.len,
+                .http_response => completeResponses(back) >= client.payloads_sent,
+            };
+        }
+
+        /// How many complete responses have come back, and how many
+        /// payloads went out to earn them — the pair a scenario oracle
+        /// holds against each other.
+        pub fn responsesReceived(client: *const Self) u32 {
+            return completeResponses(client.app_received[0..client.app_received_len]);
+        }
+
+        pub fn requestsSent(client: *const Self) u32 {
+            return client.payloads_sent;
+        }
+
         /// Render the application data and close_notify back to back into
         /// `coalesced`, so they leave in one segment and arrive in one read.
         fn stageCoalescedClose(client: *Self) !void {
             assert(client.coalesced_len == 0);
+            client.payloads_sent += 1;
             const data = try client.hs.sendApplicationData(
                 client.app_to_send,
                 &client.out.buffer,
@@ -508,4 +645,92 @@ pub fn TestClient(comptime IoType: type) type {
             client.hs.deinit();
         }
     };
+}
+
+/// How many complete HTTP/1.1 responses `bytes` holds, framed by
+/// `src/http/parser.zig` — the wrapper §7 puts every framing and
+/// strictness decision behind. Going through it rather than scanning for
+/// a `Content-Length` here is what makes this client and the simulator's
+/// own L7 oracle agree on what a response *is* by construction, instead
+/// of by two hand-rolled scanners staying in step.
+///
+/// Only the two framings that end at a known offset count. The other two
+/// have no answer to the question being asked, which is "may the next
+/// request go yet": an until-close response is over when the connection
+/// is, by which point there is no next request to send, and a chunked
+/// one needs a scanner this client has no other reason to run. Both
+/// therefore count as incomplete — the client stops sending and ends the
+/// way it would have anyway (its peer's close, or the scenario's
+/// deadline), rather than opening a request in the middle of a body.
+///
+/// Scanned from the front on every call rather than carried as parse
+/// state: the buffer is bounded and the scan is pure, so there is no
+/// cursor to resynchronise after a record arrives split.
+fn completeResponses(bytes: []const u8) u32 {
+    assert(bytes.len <= constants.head_buffer_bytes_max);
+    var count: u32 = 0;
+    var rest = bytes;
+    // Bounded by the buffer: a parsed head is at least one byte, so every
+    // iteration consumes some of a slice that only shrinks.
+    while (rest.len > 0) {
+        var storage: parser.HeaderStorage = undefined;
+        // `.get`, and `checkOptions` refuses to script a HEAD so it stays
+        // true — HEAD is the one method whose response framing
+        // contradicts its own headers.
+        const head = parser.parseResponseHead(rest, false, &storage, .get) catch break;
+        assert(head.head_len >= 1);
+        const body_len: u64 = switch (head.framing) {
+            .content_length => |length| length,
+            .none => 0,
+            .chunked, .until_close => break,
+        };
+        if (rest.len - head.head_len < body_len) break;
+        count += 1;
+        rest = rest[head.head_len + body_len ..];
+    }
+    assert(rest.len <= bytes.len);
+    return count;
+}
+
+test "framing: a sized response counts once it is whole" {
+    const head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+    try std.testing.expectEqual(@as(u32, 0), completeResponses(head));
+    try std.testing.expectEqual(@as(u32, 0), completeResponses(head ++ "o"));
+    try std.testing.expectEqual(@as(u32, 1), completeResponses(head ++ "ok"));
+    // A second response starts where the first body ended, which is the
+    // whole point: the keep-alive gate counts answers, not bytes.
+    try std.testing.expectEqual(@as(u32, 2), completeResponses(head ++ "ok" ++ head ++ "ok"));
+    // A partial head after a complete response leaves the count at one.
+    try std.testing.expectEqual(@as(u32, 1), completeResponses(head ++ "ok" ++ "HTTP/1.1 20"));
+}
+
+test "framing: a response with no body of its own completes at its head" {
+    // 204 carries no body whatever its headers say, and the parser says
+    // so — which is the whole reason this goes through the wrapper.
+    const no_content = "HTTP/1.1 204 No Content\r\n\r\n";
+    try std.testing.expectEqual(@as(u32, 1), completeResponses(no_content));
+    try std.testing.expectEqual(@as(u32, 2), completeResponses(no_content ++ no_content));
+}
+
+test "framing: a response with no fixed end never completes" {
+    // Chunked and until-close are both legal and neither ends at an
+    // offset this client can compute; counting either would let the next
+    // request go out mid-body.
+    const chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    try std.testing.expectEqual(@as(u32, 0), completeResponses(chunked));
+    const until_close = "HTTP/1.1 200 OK\r\n\r\nbody";
+    try std.testing.expectEqual(@as(u32, 0), completeResponses(until_close));
+    // Nor does anything that is not a response at all — an L4 echo of the
+    // request, say, which is what the other `ExchangeEnd` is for.
+    try std.testing.expectEqual(@as(u32, 0), completeResponses("GET / HTTP/1.1\r\n\r\n"));
+    try std.testing.expectEqual(@as(u32, 0), completeResponses(""));
+}
+
+test "framing: the length header is read however it is spelled" {
+    const lower = "HTTP/1.1 200 OK\r\ncontent-length:2\r\n\r\nok";
+    try std.testing.expectEqual(@as(u32, 1), completeResponses(lower));
+    // A length in the *body* is not a header, so what follows the first
+    // response's 23 bytes is nothing, and the count is one rather than two.
+    const nested = "HTTP/1.1 200 OK\r\nContent-Length: 23\r\n\r\nContent-Length: 999\r\n\r\n";
+    try std.testing.expectEqual(@as(u32, 1), completeResponses(nested));
 }
