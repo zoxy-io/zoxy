@@ -1426,6 +1426,14 @@ pub fn stop(io: *XevIo) void {
     io.loop.stop();
 }
 
+/// Always: this process's stderr is an operator's, and a give-up is the
+/// last thing it will ever say. Only the simulator has a reason to answer
+/// otherwise.
+pub fn wantsOperatorDump(io: *const XevIo) bool {
+    _ = io;
+    return true;
+}
+
 /// Give up on this process: the caller has found a state it cannot
 /// recover from and has already said what it was (§8's drain backstop is
 /// the one caller). Behind the seam because a raw process exit is a
@@ -1433,6 +1441,7 @@ pub fn stop(io: *XevIo) void {
 /// directly can never be gated: the simulator would lose the process it
 /// is running the scenario in, so the one path that matters would be the
 /// one no test could enter.
+///
 /// Not `noreturn`, though this one never returns: the signature is the
 /// seam's, and the simulator's implementation has to come back so the
 /// scenario it is running can be asked what happened.

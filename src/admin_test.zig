@@ -422,6 +422,46 @@ test "admin: the scrape deadline reaps a client that never finishes" {
     try harness.expectDrained();
 }
 
+test "admin: a drain that cannot finish says which plane is stuck and gives up" {
+    // The other half of the test below, and the one #203 shipped without.
+    // `onDrainStuck` exists because a teardown waiting on an op the backend
+    // never delivers cannot be waited out — the process simply never exits
+    // and SIGTERM stops meaning anything. Proving what it does when
+    // something *is* stuck needs a backend that can strand an op, which is
+    // what #206 added, and a give-up that does not take the test process
+    // with it, which is what `Io.abort` added.
+    //
+    var harness: Harness = undefined;
+    try harness.setUp(testing.allocator, .{
+        .seed = 1,
+        .adversary = .{ .partial_io = false },
+        // The status line still prints — it is the diagnostic under test,
+        // and one line. The counter set does not: an operator wants it, a
+        // gate run before every commit does not want 190 lines of it.
+        .dump_on_abort = false,
+    });
+    defer harness.tearDown();
+
+    // #203's exact shape: the admin plane's accept is armed, and the
+    // backend takes its cancellation and never delivers it. Both armed
+    // accepts go — this seed's proxy listener has one too — but only the
+    // admin's is a plane the drain waits on, so the admin's is the one
+    // that decides the outcome. Asserted rather than assumed: dropping
+    // nothing would leave a healthy drain and a test that passes for the
+    // wrong reason.
+    try testing.expectEqual(@as(u32, 2), harness.sim_io.dropPendingOps(.accept));
+
+    harness.server.beginDrain();
+    try harness.sim_io.run();
+
+    // Not hung: the grace expires and the server gives up, with the code
+    // that says which backstop it was.
+    try testing.expectEqual(@as(?u8, 4), harness.sim_io.abortedWith());
+    // And it gave up for the right reason — the admin plane is the one
+    // that never reached quiescence, which is what its report names.
+    try testing.expect(!harness.server.admin.isQuiescent());
+}
+
 test "admin: draining an idle-and-accepting listener releases cleanly" {
     // A direct, timing-independent reproduction of the once-fixed drain bug:
     // a Canceled accept during drain must clear `listening` so the loop can

@@ -125,6 +125,9 @@ stopped: bool,
 /// spent on a process exit. Null until one does.
 aborted: ?u8,
 dump_on_deadlock: bool,
+/// Whether a give-up should print the whole counter set (see
+/// `wantsOperatorDump`).
+dump_on_abort: bool,
 /// FNV-1a over every delivery; two runs of one seed must end equal (§9).
 trace_hash: u64,
 /// Completions delivered so far, by op kind (§9). `trace_hash` says two
@@ -216,6 +219,9 @@ pub const Options = struct {
     /// Print pending-op forensics when a deadlock is detected. Tests
     /// that deliberately provoke a deadlock turn this off.
     dump_on_deadlock: bool = true,
+    /// Print the whole counter set when a caller gives up (§8 drain
+    /// backstop). Gates that provoke that path on purpose turn it off.
+    dump_on_abort: bool = true,
     /// The provided-buffer group `recvGroup` selects from — the simulated
     /// twin of the io_uring buf_ring (§5's head-buffer ring). Selection is
     /// deterministic (lowest free id), so a seed replays the same buffer
@@ -241,6 +247,11 @@ pub const Completion = struct {
     userdata: ?*anyopaque = null,
     callback: ErasedCallback = undefined,
     state: State = .dead,
+    /// An op the backend took and will never deliver (`dropPendingOps`).
+    /// It stays pending for the rest of the scenario, holding whatever it
+    /// references, which is the one thing this simulator could not
+    /// express before #206 — and the shape of #203.
+    dropped: bool = false,
 
     pub const State = enum(u8) { dead, pending };
 };
@@ -469,6 +480,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.stopped = false;
     io.aborted = null;
     io.dump_on_deadlock = options.dump_on_deadlock;
+    io.dump_on_abort = options.dump_on_abort;
     io.trace_hash = std.hash.Fnv1a_64.init().value;
     io.delivered = @splat(0);
     io.blackholed_addresses = undefined;
@@ -987,6 +999,48 @@ pub fn abortedWith(io: *const SimIo) ?u8 {
     return io.aborted;
 }
 
+/// Whether a caller about to give up should also spend its whole counter
+/// set on stderr. True everywhere a human reads that output, which is why
+/// XevIo's is a constant; a gate that provokes the give-up on purpose
+/// turns it off, because 190 lines of forensics bury the two that say
+/// what was stuck. Same switch, same reason, as `dump_on_deadlock`.
+pub fn wantsOperatorDump(io: *const SimIo) bool {
+    return io.dump_on_abort;
+}
+
+/// Take every pending op of `kind` and never deliver it (#206). Returns
+/// how many were taken, so a caller can tell "I dropped the accept" from
+/// "there was no accept to drop" — the difference between a scenario
+/// that tested something and one that quietly tested nothing.
+///
+/// This is the class of defect no seed could reach before. Everything
+/// else this simulator does completes: a shutdown delivers EOF to an
+/// armed recv, a close delivers to the peer, a cancel lands. That is
+/// faithful to io_uring, and it is why a readiness backend's "accepted
+/// but never delivered" went unfound by four million nightly seeds and
+/// was caught twice in thirteen runs by a shared macOS runner (#203).
+///
+/// Deliberately *pending* ops rather than the next one enqueued: what
+/// #203 needs is an op that was armed and then had its completion taken
+/// away, which is what a cancel that does not deliver looks like from
+/// above. Marking at enqueue would model a different thing — a backend
+/// that refuses work — and that one already has a name (`Unexpected`).
+pub fn dropPendingOps(io: *SimIo, kind: OpKind) u32 {
+    assert(kind != .none);
+    var dropped: u32 = 0;
+    for (io.pending[0..io.pending_count]) |completion| {
+        if (completion.op != kind) continue;
+        if (completion.dropped) continue;
+        completion.dropped = true;
+        dropped += 1;
+    }
+    // Into the trace, so a run that dropped a different number of ops
+    // cannot hash equal to one that dropped this many.
+    io.mix(@intFromEnum(kind));
+    io.mix(dropped);
+    return dropped;
+}
+
 /// Schedule a signal delivery — drain is just another scheduled event (§4).
 pub fn injectSignal(io: *SimIo, signal: Io.Signal) void {
     io.scheduleSignal(signal, io.now_ns_value);
@@ -1158,6 +1212,11 @@ fn dumpPendingOps(io: *const SimIo) void {
         io.pending_count,
     });
     for (io.pending[0..io.pending_count]) |completion| {
+        // A dropped op is stuck because the scenario asked for it. Saying
+        // so is what keeps this dump readable: without it, a deliberate
+        // hang and a liveness bug print identically, and the forensics
+        // exist precisely to tell them apart.
+        if (completion.dropped) std.debug.print("  [dropped]", .{});
         switch (completion.op) {
             .recv => |op| std.debug.print(
                 "  recv socket={d} gen={d}\n",
@@ -1212,6 +1271,11 @@ fn collectReady(io: *SimIo, buffer: []*Completion) []*Completion {
 
 fn opReady(io: *SimIo, completion: *Completion) bool {
     assert(completion.state == .pending);
+    // The one choke point every kind of readiness passes through, which
+    // is why the drop lives here rather than in each arm: an op the
+    // backend never delivers is not "not ready yet", it is never ready,
+    // whatever its socket or listener goes on to do.
+    if (completion.dropped) return false;
     return switch (completion.op) {
         .none => unreachable,
         .accept => |op| ready: {
@@ -1530,7 +1594,12 @@ fn deliverDueSignals(io: *SimIo) void {
 fn earliestWakeNs(io: *const SimIo) u64 {
     var earliest: u64 = never_ns;
     for (io.pending[0..io.pending_count]) |completion| {
-        const wake = switch (completion.op) {
+        // A dropped op wakes nothing. Only the three kinds below schedule
+        // at all, so a dropped accept or recv was already inert here —
+        // but a dropped connect or timer still carries the deadline it
+        // was armed with, and honouring it would advance the clock for a
+        // completion `opReady` then refuses to deliver.
+        const wake = if (completion.dropped) never_ns else switch (completion.op) {
             .connect, .log_write => completion.ready_at_ns,
             .timer => |op| op.fire_at_ns,
             else => never_ns,
