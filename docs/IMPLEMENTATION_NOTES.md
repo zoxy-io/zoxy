@@ -77,9 +77,10 @@ What it left open, now tracked rather than only recorded here:
 - **#203 — the live gate's https leg wedged once on macOS**, and has not
   recurred. See the section of that name below for what is ruled out and
   where to look.
-- **#204 — the simulator's TLS clients are single-connection**, which is
-  what keeps resumption, the keep-alive turnaround and the request-body
-  leg out of the sweep.
+- **#204 — the simulator's TLS clients open one connection each**, which
+  still keeps resumption out of the sweep: a ticket can only be offered
+  back on a *second* connection, and nothing opens one. The other two legs
+  it named are closed — see "Ending an exchange by framing" below.
 
 One smaller thing still recorded only here, because it is a line rather
 than a project: `ResponseBodyPolicy.afterSend` credits *ciphertext* to
@@ -127,6 +128,50 @@ layer costs zero userspace CPU and the `splice` c10k lever (below) stays
 applicable to TLS traffic. Known fiddly parts: KeyUpdate/post-handshake
 control messages arrive via CMSG, and session tickets must be sent
 before the switchover.
+
+### Ending an exchange by framing (#204)
+
+The scripted TLS client was written for an L4 echo, where "the peer has
+answered" means *as many bytes back as went out*. Pointed at a proxied
+listener that rule is not merely imprecise, it is unusable in both
+directions: a response longer than its request satisfies it early, and a
+shorter one never satisfies it at all. So the terminating http population
+sent one `Connection: close` GET and finished on the peer's EOF — one
+exchange, no body, no turnaround.
+
+`TestClient` now chooses between the two rules (`ExchangeEnd`), and the
+framing one counts **complete responses** through `src/http/parser.zig` —
+the §7 wrapper, not a scan of its own. That was a correction during
+review: the first version looked for `Content-Length` itself, which
+agrees with the wrapper on every response this sweep produces (measured:
+the two give bit-identical counts over 4096 seeds) but not on the two
+shapes where a response contradicts its own headers. A HEAD response
+carries a `Content-Length` with no body behind it, so a hand-rolled
+scanner takes the *next* response's opening bytes for this one's body and
+mis-frames everything after — silent, and a mis-frame rather than a
+stall. `checkOptions` now refuses to script a HEAD, which is what lets
+the parser be told `.get` and stay right.
+
+Only the framings that end at a computable offset count. Chunked and
+until-close have no answer to the question being asked — *may the next
+request go yet* — since an until-close response is over when the
+connection is, by which point there is no next request. Both count as
+incomplete, so the client stops sending and ends the way it would have
+anyway. The failure mode that rules out is the one that matters: a
+request written into the middle of a body, which would make the proxy's
+next head start mid-body and read as *its* defect.
+
+The sweep's terminating http clients now send a keep-alive POST and then
+a closing GET. Measured over 4096 seeds, per terminating-http client
+instance: the second request goes out on **62%**, and both responses come
+back whole on **32%**. The rest are seeds whose schedule ended first, or
+whose origin drew an unsized mode — both honest, and both leaving the
+count *behind*, never ahead. That asymmetry is what makes
+`responsesReceived() <= requestsSent()` a sound per-seed oracle.
+
+What it does not close is resumption. A ticket is offered on a *second
+connection*, and this population still opens one apiece, so
+`tls_resumed`'s census exemption stands.
 
 ### Pool ceilings — policy we choose, or a range the operator picks?
 

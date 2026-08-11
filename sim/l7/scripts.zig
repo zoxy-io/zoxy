@@ -165,6 +165,13 @@ pub const get_request = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++ "\
 /// left to say.
 pub const get_request_close = "GET /sim HTTP/1.1\r\nHost: sim\r\nConnection: close\r\n" ++
     trace_line ++ "\r\n";
+/// A keep-alive POST for the same caller (#204): the request-body leg,
+/// which a GET cannot reach, on a connection the exchange leaves open so
+/// a second request can follow it. Byte-identical to `post_sized`'s
+/// request, so the origin's §7 oracle judges it by the rule it already
+/// has rather than by a second spelling of the same thing.
+pub const post_request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++
+    "Content-Length: 24\r\n\r\n" ++ post_body;
 /// Deterministic 6000-byte body for `post_big`, cycled so the
 /// origin-side §7 oracle can spot any reordering.
 const big_body = blk: {
@@ -251,8 +258,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .allowed_statuses = statuses_routed,
     },
     .post_sized = .{
-        .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++
-            "Content-Length: 24\r\n\r\n" ++ post_body,
+        .request = post_request,
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 200,

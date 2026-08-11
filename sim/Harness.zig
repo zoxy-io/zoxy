@@ -44,11 +44,19 @@ const tls_clients_max: u8 = 2;
 /// Bytes each terminating client echoes. Small: what this population is
 /// for is the handshake and the transform, not throughput.
 const tls_token_bytes: u8 = 24;
-/// What a terminating *http* listener's client sends. The plain GET the
-/// L7 scripts already use, so the origin double answers it exactly as it
-/// answers a plaintext one and the difference under test is the
-/// transform rather than the request.
-const tls_http_request = l7.scripts.get_request_close;
+/// The two requests a terminating *http* listener's client sends, in
+/// order. Both are the L7 scripts' own bytes, so the origin answers them
+/// exactly as it answers a plaintext client's and the difference under
+/// test is the transform rather than the request.
+///
+/// The first is a keep-alive POST: a body, which a GET has none of, and
+/// no `Connection: close`, so the exchange leaves the connection open.
+/// The second closes it, which is how the client ends without waiting on
+/// an idle timeout. Between them is the keep-alive turnaround — the L7
+/// state re-entered on a terminated connection, which is where the head
+/// source's first defect lived (#204).
+const tls_http_request = l7.scripts.post_request;
+const tls_http_followup = l7.scripts.get_request_close;
 /// "203.0.113.255:65535" is 19 bytes; the slack is headroom, not hope.
 const announced_bytes_max: u8 = 32;
 /// Virtual time from scenario start after which stuck work is force-ended.
@@ -1223,39 +1231,29 @@ fn startTlsClients(harness: *Harness) void {
                 tls_http_request
             else
                 harness.tls_tokens[index][0..tls_token_bytes],
+            // How each population knows its peer answered. A relayed
+            // session gets its own bytes back, so a byte count is exactly
+            // right; a proxied one gets a response, whose length has
+            // nothing to do with its request's, so it needs the framing
+            // rule (#204). Wiring the echo rule to the proxied population
+            // would not fail — it would *hang*, waiting for a response as
+            // long as the request that earned it.
+            .exchange_end = if (harness.tls_protocol == .http)
+                .http_response
+            else
+                .echo,
+            // The second request, on the connection the first left open —
+            // only the proxied population has one, since an echo has no
+            // turnaround to take.
+            .followup_data = if (harness.tls_protocol == .http)
+                tls_http_followup
+            else
+                &.{},
             // A relayed session closes in protocol once its echo is back:
             // an in-band EOF no socket EOF follows, which is the §6
             // half-close a terminated relay can only learn from a decrypt.
-            //
-            // A proxied one must not. That option waits for as many bytes
-            // back as went out, which is an echo's shape and not an
-            // exchange's — a response shorter than its request would leave
-            // the client waiting forever. The request carries
-            // `Connection: close` instead, so the proxy ends the
-            // connection and the client finishes on the EOF.
-            //
-            // Two gaps that leaves, tracked as #204 and stated here
-            // because closing them is the next work in this file. A
-            // `Connection: close` request is one exchange, so the
-            // keep-alive turnaround — which is where the head source's
-            // first defect lived — is never re-entered; and a GET carries
-            // no body, so the request-body leg's transform never runs. A
-            // second request and a POST are what cover both, and each
-            // needs the client to end on something other than the peer's
-            // EOF.
-            //
-            // The first gap has since cost a real defect: a close_notify
-            // on a connection idle *between* requests started an access
-            // log entry for a request nobody made (see the directed test
-            // `l7: close_notify between requests writes no access-log
-            // line`, and the Tier-0.5 leg that found it). It is covered
-            // now, but by two hand-picked cases rather than the sweep.
-            // Flipping this option on for `.http` is not the fix — the
-            // paragraph above is the reason, and it is a hang, not a
-            // failure: the option would wait for a response as long as
-            // the request. Closing it properly means teaching the client
-            // to end on a *complete response* rather than a byte count,
-            // which is a change to `TestClient`, not to this call.
+            // A proxied one lets its second request's `Connection: close`
+            // end the connection instead, and finishes on the EOF.
             .close_after_echo = harness.tls_protocol == .l4,
             .x25519_seed = seeds[0],
             .p256_seed = seeds[1],
@@ -1376,6 +1374,17 @@ fn verifyTlsSessions(harness: *Harness) !void {
             // or another session's plaintext.
             if (back.len >= 1 and !std.mem.startsWith(u8, back, "HTTP/1.1 ")) {
                 return error.TlsResponseCorrupted;
+            }
+            // #204: never more answers than questions. The framing rule
+            // the client now ends its exchanges on is what lets it count
+            // them at all, and a count that ran ahead of what it asked
+            // for would mean the transform delivered a response this
+            // session never earned — another connection's, or one
+            // duplicated across the head source's turnaround. Sound on
+            // every seed, since a short schedule can only leave the
+            // count *behind*.
+            if (client.responsesReceived() > client.requestsSent()) {
+                return error.TlsResponseCountDiverged;
             }
             // Response bytes, not `handshake_done`: a client believes it
             // is connected once it has processed the server's flight,

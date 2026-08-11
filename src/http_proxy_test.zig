@@ -4377,6 +4377,12 @@ test "l7: close_notify between requests writes no access-log line" {
         // and waiting for a next request when the alert lands, which is
         // the whole state under test.
         .app_data = "GET /x HTTP/1.1\r\nHost: o\r\n\r\n",
+        // The alert waits for the response, and what makes one whole is
+        // its framing, not its size. The echo rule happens to fire here —
+        // this response is longer than its request — but only by accident
+        // of these two literals, and the state under test is precisely
+        // the connection being idle *after* a complete exchange.
+        .exchange_end = .http_response,
         .close_after_echo = true,
     });
     var wind_down: TlsWindDown = .{ .bed = &bed };
