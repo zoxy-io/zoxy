@@ -1442,6 +1442,40 @@ The two known peer-gone errnos still landing in the fallback are queued
 fork work (see "Open questions" above, "libxev fork queue"): the fix for
 a forgotten mapping is to name it, not to crash on it.
 
+## The nightly's second rare event: `tls_handshake_failed` (2026-08-11)
+
+Run 31457966341 failed every shard on the census: `tls_handshake_failed`
+fired ~530 times per million seeds where "never" had held for every
+4096-seed sweep. Same shape as `health_probe_deadline_raced` before it,
+and the same remedy — but only after finding out *what* fires it, which
+took naming the seeds rather than reasoning about them.
+
+Reproduced locally at 36 seeds in 60k (1 in 1667, against the nightly's 1
+in ~1900) by printing the seed whenever the counter moved, then tagging
+each of the five increment sites with `@src().line` to see which. All 36
+land on one: `onTlsRecv`'s `error.EndOfStream` arm, a peer hanging up
+mid-handshake. The causes are two, both the harness:
+
+- **33 of 36: the scenario's own 2 s virtual cap.** `endScenario` is
+  belt-and-braces for stuck work and cancels every client; a client still
+  handshaking closes its socket under a server still reading.
+- **3 of 36: the adversary failing the *client's* send.** `TestClient`'s
+  `onSend` error arm ends the client, same result. Confirmed by printing
+  the error — `error.Unexpected`, the injected-pressure class.
+
+So the counter is right, and the old exemption's argument was wrong: it
+reasoned that "two peers that both mean it" cannot fail a handshake and
+overlooked that the harness ends sessions the proxy was serving
+correctly. `.must_stay_zero` with `at_most_one_per = 750` now — better
+than twice the observed rate, and orders of magnitude under a real
+regression, which would fail a large fraction of the quarter of seeds
+that terminate rather than one in seventeen hundred.
+
+**The lesson is about the census, not about TLS.** Twice now a nightly has
+turned an exemption's "never" into a rate, and both times the entry's
+stated *reason* was the thing that was wrong rather than the counter.
+An exemption is an argument, and a soak large enough is what audits it.
+
 ## Build mode for the simulator — Debug, and ReleaseSafe is a trap (2026-07-28)
 
 Measured while sizing the nightly soak, 20k seeds on the dev box:
