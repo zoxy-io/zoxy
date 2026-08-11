@@ -534,12 +534,39 @@ fn watchdogTask(io: Io) void {
             .{ seconds, stage.label() },
         );
     }
-    const pid = watchdog_child_pid.load(.acquire);
-    if (pid != 0) {
-        std.posix.kill(pid, .KILL) catch {};
-    }
+    endWedgedProxy(io);
     printZoxyLog(io);
     std.process.exit(3);
+}
+
+/// How long the watchdog lets the proxy drain before killing it. Longer
+/// than the drain deadline the run configures, so a proxy that is *able*
+/// to drain has finished doing so by the time this expires.
+const wedge_drain_grace_ns: u64 = 4 * @as(u64, drain_deadline_ms) * std.time.ns_per_ms;
+
+/// End the proxy, asking before insisting.
+///
+/// SIGTERM first, because a drain makes the proxy dump its counters (§8)
+/// — and on a wedge those counters are the best evidence there is: they
+/// say how many connections it accepted, how many handshakes completed,
+/// and which rung anything was shed on, which together separate "the
+/// proxy never saw the request" from "it answered and the harness missed
+/// it". A SIGKILL throws all of that away, which is what the first
+/// macOS wedge did: the log ended at the startup banner and said nothing
+/// about the run.
+///
+/// Then SIGKILL regardless, since the case being diagnosed is a proxy
+/// that may not answer at all. Killing it is what keeps a timed-out run
+/// from leaving an orphan on the ports the next run will ask for.
+fn endWedgedProxy(io: Io) void {
+    const pid = watchdog_child_pid.load(.acquire);
+    if (pid == 0) return;
+    std.posix.kill(pid, .TERM) catch {
+        // Already gone: nothing to drain and nothing to kill.
+        return;
+    };
+    io.sleep(Io.Duration.fromNanoseconds(wedge_drain_grace_ns), .awake) catch {};
+    std.posix.kill(pid, .KILL) catch {};
 }
 
 /// What one run of the access log said, as counts rather than text: the
