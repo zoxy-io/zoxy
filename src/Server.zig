@@ -730,13 +730,26 @@ pub fn Server(comptime IoType: type) type {
             assert(server.draining);
             result catch unreachable;
             // The ordinary case: everything finished inside the grace and
-            // the loop is already stopping. `maybeStopAfterDrain` may not
-            // have run yet, so ask the same question it does.
-            if (server.conns.isFullyReleased()) return;
+            // the loop is already stopping. Ask the same *four* questions
+            // `maybeStopAfterDrain` does, not just the first — asking only
+            // about conn slots is how the first version of this reported
+            // "nothing stuck" while the admin plane held an armed accept
+            // that would never be delivered (#203).
+            const conns_done = server.conns.isFullyReleased();
+            const admin_done = server.admin.isQuiescent();
+            const log_done = server.access_log.isQuiescent();
+            const health_done = server.health.isQuiescent();
+            if (conns_done and admin_done and log_done and health_done) return;
             std.debug.print(
-                "zoxy: drain did not finish {d}s after its deadline; " ++
-                    "connections stuck in teardown (#203):\n",
-                .{drain_stuck_grace_ns / std.time.ns_per_s},
+                "zoxy: drain did not finish {d}s after its deadline (#203). " ++
+                    "conns={s} admin={s} access_log={s} health={s}\n",
+                .{
+                    drain_stuck_grace_ns / std.time.ns_per_s,
+                    if (conns_done) "done" else "STUCK",
+                    if (admin_done) "done" else "STUCK",
+                    if (log_done) "done" else "STUCK",
+                    if (health_done) "done" else "STUCK",
+                },
             );
             for (server.conns.slots, 0..) |*conn, index| {
                 if (!server.conns.isAcquired(conn)) continue;

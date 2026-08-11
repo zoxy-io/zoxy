@@ -11,7 +11,18 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const xev = @import("xev");
+/// Which libxev backend this build talks to. The platform's own choice
+/// unless `-Dio-backend=epoll` asks otherwise — see build.zig, but the
+/// short version is that io_uring and kqueue are different *models*
+/// (completion versus readiness), each platform exercises exactly one,
+/// and epoll is the only way to run the other one on a box that has
+/// io_uring. Comptime, so a build is one backend and the conditionals
+/// below fold away.
+const xev_root = @import("xev");
+const xev = switch (@import("io_options").backend) {
+    .default => xev_root,
+    .epoll => xev_root.Epoll,
+};
 
 const constants = @import("../constants.zig");
 const Io = @import("io.zig");
@@ -27,7 +38,7 @@ const XevIo = @This();
 /// inside the ring, so Linux never spawns a thread. Pool threads only
 /// perform the blocking syscall; completion callbacks still run on the
 /// loop thread, so the single-threaded discipline holds.
-const needs_thread_pool = xev.backend == .kqueue;
+const needs_thread_pool = xev.backend != .io_uring;
 /// Whether the provided-buffer group is the kernel's (a registered
 /// buf_ring the fork's `recv_group` op selects from) or an app-side
 /// emulation. Only io_uring has the real thing; everywhere else the
@@ -36,6 +47,32 @@ const needs_thread_pool = xev.backend == .kqueue;
 const uses_buf_ring = xev.backend == .io_uring;
 /// The one buffer group this backend registers (§5's head-buffer ring).
 const buffer_group_id: u16 = 0;
+
+/// Whether a libxev error set can report a cancelled op at all.
+///
+/// It is not universal, and that is the point of asking: io_uring and
+/// kqueue both name `Canceled` on an accept, and epoll does not — its
+/// accept has no cancel to report. Anything that maps such an error has
+/// to ask rather than assume, or it fails to compile on the backend that
+/// cannot.
+fn reportsCanceled(comptime Set: type) bool {
+    for (@typeInfo(Set).error_set.?) |candidate| {
+        if (std.mem.eql(u8, candidate.name, "Canceled")) return true;
+    }
+    return false;
+}
+
+/// `Canceled` where the backend has it, `Unexpected` for everything else
+/// — including, on a backend without it, the cancel that cannot arrive.
+fn mapAcceptError(err: xev.AcceptError) Io.AcceptError {
+    if (comptime reportsCanceled(xev.AcceptError)) {
+        return switch (err) {
+            error.Canceled => error.Canceled,
+            else => error.Unexpected,
+        };
+    }
+    return error.Unexpected;
+}
 /// Which door the OS CSPRNG is behind. Linux has the `getrandom` syscall;
 /// Darwin publishes no stable syscall ABI, so `fillRandom` goes through
 /// libSystem there. Keyed on the OS, not on `xev.backend` — the event
@@ -64,7 +101,7 @@ log_sink_fd: posix.fd_t,
 /// The path behind a `file` sink, or null for stdout — what `logReopen`
 /// opens again at rotation (§8). Config-arena memory, process lifetime.
 log_sink_path: ?[]const u8,
-thread_pool: if (needs_thread_pool) xev.ThreadPool else void,
+thread_pool: if (needs_thread_pool) xev_root.ThreadPool else void,
 notifier_completion: xev.Completion,
 signal_mask: std.atomic.Value(u8),
 signal_callback: ?*const fn (?*anyopaque, Io.Signal) void,
@@ -157,7 +194,7 @@ pub fn init(
     const listeners = configured_listeners + constants.admin_listeners;
     assert(listeners >= 1);
     if (comptime needs_thread_pool) {
-        io.thread_pool = xev.ThreadPool.init(.{});
+        io.thread_pool = xev_root.ThreadPool.init(.{});
     }
     errdefer if (comptime needs_thread_pool) {
         io.thread_pool.shutdown();
@@ -249,7 +286,7 @@ fn initBufferGroup(io: *XevIo, arena: std.mem.Allocator, count: u32, bytes: u32)
 /// Build the event loop with zoxy's ring discipline (§3, §4, §8). Split
 /// from `init` so the setup — the fast-ring flags, the deep CQ, and the
 /// old-kernel degrade — stays under the function-length limit.
-fn initLoop(cq_entries: u32, thread_pool: ?*xev.ThreadPool) !xev.Loop {
+fn initLoop(cq_entries: u32, thread_pool: ?*xev_root.ThreadPool) !xev.Loop {
     // SINGLE_ISSUER + COOP_TASKRUN + DEFER_TASKRUN: completion task-work
     // stays on the loop thread and is batched at the GETEVENTS reap point
     // instead of interrupting it (measured 2026-07-12: eliminates the
@@ -441,10 +478,8 @@ pub fn accept(
             io_inner.recordPressure(accept_completion);
             callback(context.?, if (result) |conn|
                 @as(Socket, @enumFromInt(conn.fd))
-            else |err| switch (err) {
-                error.Canceled => error.Canceled,
-                else => error.Unexpected,
-            });
+            else |err|
+                mapAcceptError(err));
             return .disarm;
         }
     }).adapter);
