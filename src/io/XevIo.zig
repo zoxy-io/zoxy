@@ -51,13 +51,21 @@ const buffer_group_id: u16 = 0;
 /// Whether cancelling an armed accept makes the backend deliver that
 /// accept's completion.
 ///
-/// io_uring does: the cancel terminates the op and the CQE arrives with
-/// `Canceled`, which is what every caller of `listenClose` is written
-/// against. The readiness backends do not — libxev's epoll `.cancel` is
-/// `stop_completion`, which drops the op without calling anything back,
-/// and kqueue orphans it in its own way (#203). There the seam owes the
-/// delivery itself, or a caller waiting for its accept waits forever.
-const delivers_accept_cancel = xev.backend == .io_uring;
+/// Asked of the backend's own error set rather than of its name, because
+/// the error set is the backend *stating* the answer: a backend that can
+/// deliver a cancelled accept has `Canceled` in `AcceptError`, and one
+/// that cannot does not. io_uring and kqueue both name it. epoll does
+/// not — libxev implements its `.cancel` as `stop_completion`, which
+/// drops the op without calling anything back, so a caller waiting for
+/// its accept waits forever (#203) and the seam owes the delivery.
+///
+/// Keying this on `backend == .io_uring` instead was a real regression:
+/// it put *kqueue* on the synthesized path, changing behaviour on a
+/// shipped platform on the strength of an inference from epoll, and
+/// macOS CI hung. The rule is now that this only ever changes what a
+/// backend does when that backend has said, in its types, that it cannot
+/// do the other thing.
+const delivers_accept_cancel = reportsCanceled(xev.AcceptError);
 
 /// Whether a libxev error set can report a cancelled op at all.
 ///
