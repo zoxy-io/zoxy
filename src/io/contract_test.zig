@@ -567,8 +567,9 @@ test "contract: fillRandom on XevIo" {
 // process exit, so calling it would take the test runner with it. What
 // holds it to the contract is the compile-time `required_decls` check
 // (`assertIoInterface`) plus `Server.onDrainStuck`'s single caller,
-// which is gated on SimIo in `server_test.zig`. Recorded here with the
-// other per-arm verdicts above, so it is decided rather than omitted.
+// which is gated on SimIo in `admin_test.zig` (the stuck-drain test).
+// Recorded here with the other per-arm verdicts above, so it is decided
+// rather than omitted.
 test "simio: abort records the code and stops the loop" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -583,6 +584,66 @@ test "simio: abort records the code and stops the loop" {
     // process that has given up does not take another tick.
     try sim_io.run();
     try std.testing.expectEqual(@as(?u8, 4), sim_io.abortedWith());
+}
+
+const DroppedAccept = struct {
+    io: *SimIo,
+    completion: SimIo.Completion = .{},
+    outcome: ?(Io.AcceptError!SimIo.Socket) = null,
+
+    fn onAccept(self: *DroppedAccept, result: Io.AcceptError!SimIo.Socket) void {
+        assert(self.outcome == null);
+        self.outcome = result;
+    }
+};
+
+// #206's whole point, in the shape #203 took: an accept the backend
+// took and then never delivered, so the op stays armed for the rest of
+// the process's life and whatever is waiting on it waits forever.
+test "simio: a dropped accept is never delivered, where a live one is" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // The control first: closing a listener completes its armed accept
+    // with Canceled, which is what every backend the seam supports does
+    // and what the rest of this simulator has always modelled.
+    var live_io: SimIo = undefined;
+    try live_io.init(arena_state.allocator(), .{ .seed = 3 });
+    var live: DroppedAccept = .{ .io = &live_io };
+    const live_listener = try live_io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9301"));
+    live_io.accept(live_listener, &live.completion, DroppedAccept, &live, DroppedAccept.onAccept);
+    live_io.listenClose(live_listener);
+    try live_io.run();
+    try std.testing.expectError(error.Canceled, live.outcome.?);
+
+    // Now the same sequence with the accept dropped. The close still
+    // happens; the completion never comes. `run` has nothing left that
+    // can become ready and nothing that ever will, which is a deadlock —
+    // and a deadlock is exactly what a hung process looks like from
+    // inside, so this is the outcome the gate wants to see.
+    var stuck_io: SimIo = undefined;
+    try stuck_io.init(arena_state.allocator(), .{
+        .seed = 3,
+        // The hang is the assertion, so its forensics are noise here.
+        .dump_on_deadlock = false,
+    });
+    var stuck: DroppedAccept = .{ .io = &stuck_io };
+    const stuck_listener = try stuck_io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9301"));
+    stuck_io.accept(
+        stuck_listener,
+        &stuck.completion,
+        DroppedAccept,
+        &stuck,
+        DroppedAccept.onAccept,
+    );
+    try std.testing.expectEqual(@as(u32, 1), stuck_io.dropPendingOps(.accept));
+    stuck_io.listenClose(stuck_listener);
+    try std.testing.expectError(error.Deadlock, stuck_io.run());
+    try std.testing.expect(stuck.outcome == null);
+
+    // And dropping what is not armed is a no-op that says so, so a
+    // scenario can tell "I dropped it" from "there was nothing to drop".
+    try std.testing.expectEqual(@as(u32, 0), stuck_io.dropPendingOps(.recv));
 }
 
 test "simio: one seed replays one key stream, and a different seed does not" {

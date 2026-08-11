@@ -49,6 +49,12 @@
 //!   nowNs(io) u64                                       (per-tick clock, §4)
 //!   nowWallNs(io) u64                                   (epoch clock, §8 log)
 //!   run(io) RunError!void, stop(io) void
+//!   abort(io, code) void                                (give up on this
+//!       process — a real exit in production, a recorded fact in the
+//!       simulator, so the one path a caller takes when it cannot
+//!       continue is not the one path no gate can enter, §8/#206)
+//!   wantsOperatorDump(io) bool                          (whether a
+//!       give-up should also spend the whole counter set on stderr)
 
 const std = @import("std");
 
@@ -254,6 +260,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "run",
             "stop",
             "abort",
+            "wantsOperatorDump",
         };
         for (required_decls) |decl_name| {
             if (!@hasDecl(IoType, decl_name)) {

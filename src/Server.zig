@@ -740,6 +740,39 @@ pub fn Server(comptime IoType: type) type {
             const log_done = server.access_log.isQuiescent();
             const health_done = server.health.isQuiescent();
             if (conns_done and admin_done and log_done and health_done) return;
+            // The forensics are for an operator reading the last thing
+            // this process will ever say. A gate that provokes this path
+            // on purpose wants none of them: stderr from a passing step
+            // makes the build runner print "failed command" under a build
+            // that exited zero, which costs a reader more than the lines
+            // are worth. What the gate asserts is the part with teeth —
+            // that the give-up happened, with the code that names it, and
+            // that the plane it blames is the one that is actually stuck.
+            if (server.io.wantsOperatorDump()) {
+                server.reportStuckDrain(conns_done, admin_done, log_done, health_done);
+            }
+            // Through the seam, not `std.process.exit`: a raw exit here
+            // would be a syscall outside `src/io/` (§4), and — the reason
+            // that matters — it would make this the one branch no gate
+            // could ever enter, since taking the exit takes the test
+            // process with it.
+            server.io.abort(drain_stuck_exit_code);
+        }
+
+        /// What an operator gets from a process that is about to stop
+        /// existing: which of the four planes never finished, what every
+        /// still-held connection slot was waiting on, and the counters.
+        /// Split from the decision above so that decision stays readable,
+        /// and because a gate provoking this path wants the give-up
+        /// without the forensics (`wantsOperatorDump`).
+        fn reportStuckDrain(
+            server: *const Self,
+            conns_done: bool,
+            admin_done: bool,
+            log_done: bool,
+            health_done: bool,
+        ) void {
+            assert(!(conns_done and admin_done and log_done and health_done));
             std.debug.print(
                 "zoxy: drain did not finish {d}s after its deadline (#203). " ++
                     "conns={s} admin={s} access_log={s} health={s}\n",
@@ -772,12 +805,6 @@ pub fn Server(comptime IoType: type) type {
                 );
             }
             server.dumpMetrics();
-            // Through the seam, not `std.process.exit`: a raw exit here
-            // would be a syscall outside `src/io/` (§4), and — the reason
-            // that matters — it would make this the one branch no gate
-            // could ever enter, since taking the exit takes the test
-            // process with it.
-            server.io.abort(drain_stuck_exit_code);
         }
 
         fn onSignal(server: *Self, signal: Io.Signal) void {
