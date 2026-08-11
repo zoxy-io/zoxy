@@ -17,6 +17,11 @@ const ztls = @import("ztls");
 
 const assert = std.debug.assert;
 
+/// What a client captures from one session and offers on the next.
+/// Re-exported because ztls may not be named outside `src/tls/` (§4), and
+/// a gate driving a resumption needs to hold one between two clients.
+pub const SessionTicket = ztls.ClientHandshake.SessionTicket;
+
 /// Generic over the Io backend so the simulator and any socket-backed
 /// test drive the same client.
 pub fn TestClient(comptime IoType: type) type {
@@ -639,6 +644,16 @@ pub fn TestClient(comptime IoType: type) type {
         /// there — what a scenario asks before deciding it may wind down.
         pub fn isEnded(client: *const Self) bool {
             return client.ended;
+        }
+
+        /// The ticket this session was issued, for a later client to offer
+        /// back — null when the server issued none, which is itself a
+        /// legal outcome and so a question rather than an assertion. The
+        /// pointer is into this client's own storage, so whoever offers it
+        /// must not outlive the one that captured it.
+        pub fn capturedTicket(client: *const Self) ?*const ztls.ClientHandshake.SessionTicket {
+            if (!client.ticket_captured) return null;
+            return &client.ticket;
         }
 
         pub fn deinit(client: *Self) void {
