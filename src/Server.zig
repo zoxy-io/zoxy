@@ -30,6 +30,7 @@ const proxy_protocol = @import("net/proxy_protocol.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 const Credentials = @import("tls/Credentials.zig");
+const Tickets = @import("tls/Tickets.zig");
 const TlsEngine = @import("tls/Engine.zig");
 const upstream_module = @import("net/upstream.zig");
 
@@ -82,6 +83,16 @@ pub fn Server(comptime IoType: type) type {
         /// against a conn slot's ~1.7: a deployment pays for the TLS it
         /// serves concurrently, not for every slot it could admit (§5).
         tls_engines: Pool(TlsEngine),
+        /// The §4 session-ticket sealing keys — two slots, rotated, and
+        /// process-lifetime by design: a ticket is a bearer credential
+        /// for a resumed session, so the key that opens one never reaches
+        /// disk. A restart therefore costs every returning client one
+        /// full handshake, which is the price of that.
+        ///
+        /// Sized by nothing: unlike the engine pool this is fixed state
+        /// (two keys), which is what makes stateless tickets free of a
+        /// per-session table (§5).
+        tls_tickets: Tickets,
         /// The load-balancing policy: resolves a cluster to the endpoint to
         /// dial. Owns its own per-cluster state so the serving path never
         /// hardcodes how an endpoint is chosen (§7).
@@ -374,6 +385,10 @@ pub fn Server(comptime IoType: type) type {
             // Empty until `setTlsCredentials`, which is before `start` when
             // there is anything to hand over and never otherwise.
             server.tls_credentials = &.{};
+            // Dead until `start` draws a key: `init` runs in tests that
+            // never start a loop, and a sealing key drawn here would be
+            // one the Io seam had not been asked for.
+            server.tls_tickets.init();
             try server.balancer.init(arena, config, keys);
             try server.initMetrics(arena, config, keys);
             server.resetRuntimeState(&options);
@@ -564,9 +579,25 @@ pub fn Server(comptime IoType: type) type {
             return null;
         }
 
+        /// Draw a sealing key, which is what turns resumption on (§4).
+        ///
+        /// At `start` rather than `init` for the same reason the engine
+        /// seeds are drawn where they are: the key has to come through the
+        /// Io seam, so that a seeded run's tickets are part of what it
+        /// replays (§9). Nothing here decides *whether* to draw — a
+        /// deployment with no terminating listener simply never asks an
+        /// engine for one, and two unused keys are 64 bytes.
+        fn installTicketKey(server: *Self) void {
+            var key: [Tickets.key_bytes]u8 = undefined;
+            server.io.fillRandom(&key);
+            server.tls_tickets.rotate(key);
+            assert(server.tls_tickets.ready());
+        }
+
         pub fn start(server: *Self) Io.ListenError!void {
             assert(!server.draining);
             assert(server.listeners_count >= 1);
+            server.installTicketKey();
             for (server.config.listeners, 0..) |listener_config, index| {
                 const state = &server.listeners[index];
                 state.* = .{
@@ -1185,6 +1216,11 @@ pub fn Server(comptime IoType: type) type {
                 .x25519_seed = seeds[0..32].*,
                 .random = seeds[32..64].*,
                 .credentials = credentials,
+                // Only once a key is installed: before that the engine
+                // would offer resumption it could not honour, and every
+                // ticket it opened would be one it never sealed.
+                .tickets = if (server.tls_tickets.ready()) &server.tls_tickets else null,
+                .now_unix = server.io.nowWallNs() / std.time.ns_per_s,
             }) catch {
                 // Deriving the ephemeral keypair is the one fallible step,
                 // and under the OpenSSL backend it *allocates*
@@ -1704,10 +1740,73 @@ pub fn Server(comptime IoType: type) type {
                 return;
             }
             if (engine.isConnected()) {
+                // The session is up and the outbox is empty, which is
+                // exactly once per handshake and exactly the moment the
+                // post-handshake flight is owed (§4). Staging here rather
+                // than in `finishTlsHandshake` keeps it inside the pump's
+                // own loop: the tickets go out through the same send path
+                // as the server flight, partial writes included, and the
+                // hand-over happens on the next pass when the outbox has
+                // drained again.
+                if (!conn.tls_session_up) {
+                    conn.tls_session_up = true;
+                    // Counted *here*, not at the hand-over below: the
+                    // client's Finished has been processed, so this
+                    // handshake has succeeded whatever becomes of the
+                    // flight that follows it. A peer that leaves while
+                    // the tickets are going out is a session that ended,
+                    // not one that never happened.
+                    server.counters.increment("tls_handshakes_completed");
+                    if (engine.isResumed()) server.counters.increment("tls_resumed");
+                    if (server.stageTlsTickets(conn)) {
+                        server.pumpTlsOutbound(conn);
+                        return;
+                    }
+                }
                 server.finishTlsHandshake(conn);
             } else {
                 server.armTlsRecv(conn);
             }
+        }
+
+        /// Issue this session's NewSessionTickets, returning whether any
+        /// were staged.
+        ///
+        /// Best-effort on purpose: a deployment with no sealing key, or a
+        /// suite whose resumption secret ztls will not hand over, gets a
+        /// working session without resumption rather than a failed
+        /// handshake. Resumption is an optimisation, and a client that is
+        /// offered no ticket simply does a full handshake next time.
+        fn stageTlsTickets(server: *Self, conn: *ConnType) bool {
+            const engine = conn.tls.?;
+            assert(engine.isConnected());
+            assert(engine.outbound().len == 0);
+            if (engine.tickets == null) return false;
+
+            var staged: u8 = 0;
+            var index: u8 = 0;
+            while (index < constants.tls_tickets_per_handshake) : (index += 1) {
+                // Per-ticket randomness, drawn through the seam so a
+                // seeded run replays the tickets it issued (§9). The
+                // sealing nonce must never repeat under one key, so it is
+                // drawn fresh for each rather than derived from anything.
+                var material: [Tickets.nonce_bytes + 4]u8 = undefined;
+                server.io.fillRandom(&material);
+                // RFC 8446 §4.6.1 wants the nonce unique per ticket
+                // within a connection; the index is that, and being one
+                // byte it keeps the message small.
+                const ticket_nonce = [_]u8{index};
+                engine.sendSessionTicket(
+                    &ticket_nonce,
+                    std.mem.readInt(u32, material[Tickets.nonce_bytes..][0..4], .big),
+                    material[0..Tickets.nonce_bytes].*,
+                ) catch break;
+                staged += 1;
+                server.counters.increment("tls_tickets_issued");
+            }
+            if (staged == 0) return false;
+            assert(engine.outbound().len >= 1);
+            return true;
         }
 
         fn onTlsSent(conn: *ConnType, result: Io.SendError!u32) void {
@@ -1719,8 +1818,15 @@ pub fn Server(comptime IoType: type) type {
             }
             assert(conn.state == .tls_handshaking);
             const sent = result catch |err| {
+                // Only while the session is still being built. Past that
+                // this send is the post-handshake ticket flight, and a
+                // peer that leaves during it has not failed a handshake —
+                // it completed one and then went away, which teardown
+                // already accounts for.
                 if (err == error.Reset) {
-                    server.counters.increment("tls_handshake_failed");
+                    if (!conn.tls_session_up) {
+                        server.counters.increment("tls_handshake_failed");
+                    }
                 } else {
                     server.witnessKernelPressure(.send, err);
                 }
@@ -1741,7 +1847,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.state == .tls_handshaking);
             assert(conn.tls.?.isConnected());
             assert(conn.tls.?.outbound().len == 0);
-            server.counters.increment("tls_handshakes_completed");
+            assert(conn.tls_session_up); // The pump counted it on the way here.
             // An L4 connection relays for its whole life and must hold a
             // buffer before the dial (§6); an L7 one takes its per-leg.
             // Admission already settled that, so nothing is acquired here.

@@ -211,6 +211,19 @@ const uncovered = [_]Uncovered{
             "either, which is the honest gap",
     },
     .{
+        .name = "tls_resumed",
+        .why = .unreached,
+        .reason = "resumption needs a client that keeps a ticket from one " ++
+            "connection and offers it on the next, and this population's " ++
+            "clients are single-connection by construction — each ends on " ++
+            "its peer's EOF or its own close_notify and never opens a " ++
+            "second. src/http_proxy_test.zig drives the whole round trip " ++
+            "(issue, capture, offer, open) across two connections and " ++
+            "asserts the counter; what the sweep would add on top is the " ++
+            "adversary's schedules against a resumed handshake, which is " ++
+            "the honest gap and wants a two-connection client to close",
+    },
+    .{
         .name = "l7_no_route",
         .why = .unreached,
         .reason = "the sim's route table is a single \"/\" prefix, which no " ++

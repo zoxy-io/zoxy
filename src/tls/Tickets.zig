@@ -35,8 +35,8 @@ const Tickets = @This();
 /// ChaCha20-Poly1305 because every target that runs zoxy in production
 /// has AES-NI, and this is on the handshake path.
 const Aead = std.crypto.aead.aes_gcm.Aes256Gcm;
-const key_bytes = Aead.key_length;
-const nonce_bytes = Aead.nonce_length;
+pub const key_bytes = Aead.key_length;
+pub const nonce_bytes = Aead.nonce_length;
 const tag_bytes = Aead.tag_length;
 
 /// The largest PSK any supported suite derives (SHA-384).
