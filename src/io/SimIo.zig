@@ -121,6 +121,9 @@ pending_set_option_errors: u8,
 pressure_cause: Io.Pressure.Cause,
 last_pressure: Io.Pressure,
 stopped: bool,
+/// The code a caller gave up with (`abort`), which production would have
+/// spent on a process exit. Null until one does.
+aborted: ?u8,
 dump_on_deadlock: bool,
 /// FNV-1a over every delivery; two runs of one seed must end equal (§9).
 trace_hash: u64,
@@ -464,6 +467,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.pressure_cause = .out_of_buffers;
     io.last_pressure = Io.Pressure.none;
     io.stopped = false;
+    io.aborted = null;
     io.dump_on_deadlock = options.dump_on_deadlock;
     io.trace_hash = std.hash.Fnv1a_64.init().value;
     io.delivered = @splat(0);
@@ -962,6 +966,25 @@ pub fn nowNs(io: *SimIo) u64 {
 
 pub fn stop(io: *SimIo) void {
     io.stopped = true;
+}
+
+/// The seam's give-up, which in production is a process exit and here is
+/// a recorded fact plus a stopped loop. Recording it rather than taking
+/// the process down is the entire reason `abort` is on the seam: the one
+/// path a caller reaches when it has decided it cannot continue is
+/// otherwise the one path no gate can enter.
+pub fn abort(io: *SimIo, code: u8) void {
+    assert(code != 0); // A give-up is never a success.
+    // A second one would mean the first stopped nothing.
+    assert(io.aborted == null);
+    io.aborted = code;
+    io.stop();
+}
+
+/// The code a scenario's server gave up with, or null if it never did —
+/// what an oracle asks instead of watching for an exit it cannot survive.
+pub fn abortedWith(io: *const SimIo) ?u8 {
+    return io.aborted;
 }
 
 /// Schedule a signal delivery — drain is just another scheduled event (§4).

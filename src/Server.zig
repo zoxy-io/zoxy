@@ -772,7 +772,12 @@ pub fn Server(comptime IoType: type) type {
                 );
             }
             server.dumpMetrics();
-            std.process.exit(drain_stuck_exit_code);
+            // Through the seam, not `std.process.exit`: a raw exit here
+            // would be a syscall outside `src/io/` (§4), and — the reason
+            // that matters — it would make this the one branch no gate
+            // could ever enter, since taking the exit takes the test
+            // process with it.
+            server.io.abort(drain_stuck_exit_code);
         }
 
         fn onSignal(server: *Self, signal: Io.Signal) void {

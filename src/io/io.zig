@@ -253,6 +253,7 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "nowWallNs",
             "run",
             "stop",
+            "abort",
         };
         for (required_decls) |decl_name| {
             if (!@hasDecl(IoType, decl_name)) {

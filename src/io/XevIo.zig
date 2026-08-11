@@ -1426,6 +1426,22 @@ pub fn stop(io: *XevIo) void {
     io.loop.stop();
 }
 
+/// Give up on this process: the caller has found a state it cannot
+/// recover from and has already said what it was (§8's drain backstop is
+/// the one caller). Behind the seam because a raw process exit is a
+/// syscall, and those live here — but also because a caller that exits
+/// directly can never be gated: the simulator would lose the process it
+/// is running the scenario in, so the one path that matters would be the
+/// one no test could enter.
+/// Not `noreturn`, though this one never returns: the signature is the
+/// seam's, and the simulator's implementation has to come back so the
+/// scenario it is running can be asked what happened.
+pub fn abort(io: *XevIo, code: u8) void {
+    assert(code != 0); // A give-up is never a success.
+    _ = io;
+    std.process.exit(code);
+}
+
 fn onNotifierWake(
     context: ?*XevIo,
     loop: *xev.Loop,
