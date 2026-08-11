@@ -22,7 +22,7 @@
 //! the same generation for the process's life and the bounded-exposure
 //! property above is a property of this module rather than of the running
 //! proxy. What it waits on is a policy decision — the interval *is* the
-//! bound — recorded in IMPLEMENTATION_NOTES under "TLS termination".
+//! bound — so it is tracked as #202 rather than guessed at here.
 //!
 //! 0-RTT is deliberately not offered (`max_early_data_size` is never
 //! set), so a replayed ticket buys an attacker a resumed handshake and

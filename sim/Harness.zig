@@ -1234,8 +1234,8 @@ fn startTlsClients(harness: *Harness) void {
             // `Connection: close` instead, so the proxy ends the
             // connection and the client finishes on the EOF.
             //
-            // Two gaps that leaves, stated because closing them is the
-            // next work here and not something to rediscover. A
+            // Two gaps that leaves, tracked as #204 and stated here
+            // because closing them is the next work in this file. A
             // `Connection: close` request is one exchange, so the
             // keep-alive turnaround — which is where the head source's
             // first defect lived — is never re-entered; and a GET carries

@@ -64,21 +64,27 @@ session comes up rather than at the hand-over, behind a `tls_session_up`
 latch on the conn, and the send-error arm blames the handshake only while
 that latch is unset.
 
-Remaining:
+The Tier-1 bands measured it — see "The TLS bands, with resumption"
+below. #125 is closed.
 
-1. **The Tier-1 bands**, whose acceptance is the close-mode rate gate PR
-   #84 could not pass. The tickets above are what is expected to move it,
-   and the bands are what say whether they did — nothing measured yet.
+What it left open, now tracked rather than only recorded here:
 
-Three smaller things the reviews left open: `ResponseBodyPolicy.afterSend`
-credits ciphertext to `bytes_out` where the client-write channel credits
-plaintext, so a streamed TLS response over-counts; the sim's TLS http
-client sends `Connection: close` and a GET, leaving the request-body leg
-reachable by directed tests only; and the sealing key is drawn once at
-`start` and never rotated, so the two-slot rotation `Tickets` is built
-for runs with one slot live for the process. Rotation wants a timer and
-the interval is a policy question (it bounds how long a stolen key is
-worth having), so it is deliberately not guessed at here.
+- **#202 — the sealing key is never rotated.** `Tickets` is built for two
+  slots and `rotate` is called once, at `start`, so both hold one
+  generation for the process's life. The interval *is* the security
+  bound, which makes it a policy question rather than an implementation
+  one, so it was deliberately not guessed at.
+- **#203 — the live gate's https leg wedged once on macOS**, and has not
+  recurred. See the section of that name below for what is ruled out and
+  where to look.
+- **#204 — the simulator's TLS clients are single-connection**, which is
+  what keeps resumption, the keep-alive turnaround and the request-body
+  leg out of the sweep.
+
+One smaller thing still recorded only here, because it is a line rather
+than a project: `ResponseBodyPolicy.afterSend` credits *ciphertext* to
+`bytes_out` where the client-write channel credits plaintext, so a
+streamed TLS response over-counts what it told the client.
 
 ### What the live gate found
 
@@ -1717,7 +1723,7 @@ can only be the proxy's fault. The band now prints the refused/timed-out
 split every run: a threshold whose margin is invisible until it trips is
 how this one sat mis-specified for a week.
 
-## Open: the https leg wedged once on macOS (2026-08-11, #125)
+## Open: the https leg wedged once on macOS (2026-08-11, #203)
 
 The first CI run carrying the Tier-0.5 https leg wedged on the macOS
 runner — the whole 30 s budget, against a run that takes about a second.

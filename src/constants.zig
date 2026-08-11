@@ -277,7 +277,7 @@ pub const tls_tickets_per_handshake: u8 = 2;
 /// how long a stolen ticket is worth carrying. An hour keeps a busy
 /// client's reconnects free while making yesterday's capture useless.
 /// It would also sit comfortably inside a two-key rotation window, once
-/// rotation is wired — see `tls/Tickets.zig`, which today installs one
+/// rotation is wired (#202) — see `tls/Tickets.zig`, which installs one
 /// key at startup and never replaces it.
 pub const tls_ticket_lifetime_s: u32 = 60 * 60;
 
