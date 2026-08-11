@@ -188,6 +188,9 @@ pub fn Server(comptime IoType: type) type {
         /// far too wide for a counter each.
         last_pressure_errno: u16,
         drain_deadline_completion: IoType.Completion,
+        /// The backstop behind that deadline: a teardown that cannot
+        /// finish has nothing else watching it (#203, `onDrainStuck`).
+        drain_stuck_completion: IoType.Completion,
         /// The one timer covering every parked upstream (§5): a parked
         /// connection holds no armed op, so this sweep compares stored
         /// deadlines against the clock and reaps overdue connections with
@@ -543,6 +546,7 @@ pub fn Server(comptime IoType: type) type {
             server.armed_ops_peak = 0;
             server.last_pressure_errno = 0;
             server.drain_deadline_completion = .{};
+            server.drain_stuck_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
             assert(!server.draining);
@@ -684,6 +688,78 @@ pub fn Server(comptime IoType: type) type {
                     }
                 }
             }
+            // Tearing a connection down does not finish it: `continueTeardown`
+            // waits for every armed op, and an op the backend never delivers
+            // leaves the slot unreleasable forever. The deadline above fires
+            // once and skips anything already tearing down, so that state has
+            // no backstop at all — the process simply never exits, and SIGTERM
+            // stops meaning anything (#203).
+            //
+            // Waiting longer cannot help a teardown that cannot finish, so
+            // this one reports rather than waits again.
+            server.io.timerStart(
+                &server.drain_stuck_completion,
+                drain_stuck_grace_ns,
+                Self,
+                server,
+                onDrainStuck,
+            );
+        }
+
+        /// How long after the drain deadline a teardown gets to finish
+        /// before it is called stuck. Generous against the work it covers —
+        /// every torn-down connection has only its armed ops to deliver, no
+        /// I/O it could still be waiting on a peer for — so reaching this is
+        /// a defect rather than a slow machine.
+        const drain_stuck_grace_ns: u64 = 5 * std.time.ns_per_s;
+
+        /// Distinct from every ordinary exit so a supervisor can tell "the
+        /// drain failed" from "the config was bad" without parsing output.
+        const drain_stuck_exit_code: u8 = 4;
+
+        /// The drain could not finish. Say what it is waiting on and stop.
+        ///
+        /// Exiting rather than force-releasing: a slot with an armed op is
+        /// still referenced by that op, and releasing it is precisely the
+        /// corruption the generation counter exists to catch (§5). The
+        /// honest move is to report and go, with a status that says the
+        /// drain failed — an operator's process manager gets an answer
+        /// instead of a hang, and the report names the connection and the
+        /// ops it is stuck on rather than leaving it to be guessed.
+        fn onDrainStuck(server: *Self, result: Io.TimerError!void) void {
+            assert(server.draining);
+            result catch unreachable;
+            // The ordinary case: everything finished inside the grace and
+            // the loop is already stopping. `maybeStopAfterDrain` may not
+            // have run yet, so ask the same question it does.
+            if (server.conns.isFullyReleased()) return;
+            std.debug.print(
+                "zoxy: drain did not finish {d}s after its deadline; " ++
+                    "connections stuck in teardown (#203):\n",
+                .{drain_stuck_grace_ns / std.time.ns_per_s},
+            );
+            for (server.conns.slots, 0..) |*conn, index| {
+                if (!server.conns.isAcquired(conn)) continue;
+                std.debug.print(
+                    "  slot {d}: state={t} armed={d} " ++
+                        "(c2u={} u2c={} connect={} connect_cancel={} " ++
+                        "deadline={} deadline_cancel={}) tls={}\n",
+                    .{
+                        index,
+                        conn.state,
+                        conn.armedCount(),
+                        conn.armed.data_client_to_upstream,
+                        conn.armed.data_upstream_to_client,
+                        conn.armed.connect,
+                        conn.armed.connect_cancel,
+                        conn.armed.deadline,
+                        conn.armed.deadline_cancel,
+                        conn.tls != null,
+                    },
+                );
+            }
+            server.dumpMetrics();
+            std.process.exit(drain_stuck_exit_code);
         }
 
         fn onSignal(server: *Self, signal: Io.Signal) void {
