@@ -562,6 +562,29 @@ test "contract: fillRandom on XevIo" {
     try runRandomContract(XevIo, &xev_io);
 }
 
+// `abort` is the one seam decl this file cannot run on both backends,
+// and the asymmetry is the point rather than a gap: XevIo's *is* a
+// process exit, so calling it would take the test runner with it. What
+// holds it to the contract is the compile-time `required_decls` check
+// (`assertIoInterface`) plus `Server.onDrainStuck`'s single caller,
+// which is gated on SimIo in `server_test.zig`. Recorded here with the
+// other per-arm verdicts above, so it is decided rather than omitted.
+test "simio: abort records the code and stops the loop" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 11 });
+    try std.testing.expectEqual(@as(?u8, null), sim_io.abortedWith());
+
+    sim_io.abort(4);
+    try std.testing.expectEqual(@as(?u8, 4), sim_io.abortedWith());
+    // Stopped, so `run` returns rather than draining what is left: a
+    // process that has given up does not take another tick.
+    try sim_io.run();
+    try std.testing.expectEqual(@as(?u8, 4), sim_io.abortedWith());
+}
+
 test "simio: one seed replays one key stream, and a different seed does not" {
     // The §9 property TLS rides on: a seeded run's handshake is byte-exact,
     // which is only true if the key material replays with everything else.
