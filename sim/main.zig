@@ -174,13 +174,36 @@ const uncovered = [_]Uncovered{
     // it instead.
     .{
         .name = "tls_handshake_failed",
-        .why = .unreached,
-        .reason = "a seeded handshake between two peers that both mean it " ++
-            "does not fail: the adversary reorders, splits and delays but " ++
-            "never corrupts, and a dial it refuses or black-holes never " ++
-            "reaches a handshake at all. src/server_test.zig sends plaintext " ++
-            "at a TLS port, which is the shape a misdirected client or a " ++
-            "scanner actually produces",
+        .why = .must_stay_zero,
+        // A rate, not zero — and the nightly is what proved it. "Never"
+        // held for every 4096-seed sweep and failed on the first soak
+        // that ran a million (run 31457966341, ~530 per shard). Measured
+        // again locally at 36 in 60k, and both causes are the harness
+        // rather than the proxy: 33 of those 36 were scenarios the 2 s
+        // virtual cap force-ended, whose `endScenario` cancels every
+        // client — including one mid-handshake, whose socket then closes
+        // under a server still reading. The other 3 were the adversary
+        // failing the *client's* send, which ends that client the same
+        // way. Both are exactly what the counter says on the tin: a peer
+        // that hung up mid-handshake never became a session.
+        //
+        // One per 750 seeds leaves better than twice the observed rate
+        // as headroom while staying orders of magnitude under any real
+        // regression — a handshake path that broke would fail a large
+        // fraction of the quarter of seeds that terminate, not one in
+        // seventeen hundred.
+        .allowance = .{ .at_most_one_per = 750 },
+        .reason = "the adversary reorders, splits and delays but never " ++
+            "corrupts, and a dial it refuses or black-holes never reaches a " ++
+            "handshake at all — so what remains is a peer that leaves " ++
+            "mid-flight: a scenario force-ended at its 2 s cap with a " ++
+            "handshake still in the air, or a client whose own send the " ++
+            "adversary failed. Both are the harness ending a session the " ++
+            "proxy was serving correctly. A reading past the allowance is " ++
+            "not that: it is handshakes failing on their own account, which " ++
+            "is a bug report. src/server_test.zig sends plaintext at a TLS " ++
+            "port, which is the shape a misdirected client or a scanner " ++
+            "actually produces",
     },
     .{
         .name = "shed_tls_crypto",
