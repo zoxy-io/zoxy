@@ -260,6 +260,32 @@ pub const tls_engines_max: u32 = 1024;
 /// deliberately, having seen the number in the startup banner.
 pub const tls_engines_default: u32 = @min(tls_engines_max, conn_slots_default);
 
+/// How many NewSessionTickets one completed handshake issues (§4).
+///
+/// Two, which is what haproxy and OpenSSL send and what browsers expect:
+/// a client that opens several connections at once wants more than one
+/// ticket to spend, and a single ticket would have all but the first of
+/// them fall back to a full handshake. More than two buys nothing — the
+/// resumed sessions issue their own.
+pub const tls_tickets_per_handshake: u8 = 2;
+
+/// How long a ticket stays valid, in seconds.
+///
+/// RFC 8446 §4.6.1 caps this at 7 days and the cap is not the interesting
+/// bound: a ticket is a bearer credential for a resumed session, and the
+/// sealing key that opens it lives only in memory, so the real question is
+/// how long a stolen ticket is worth carrying. An hour keeps a busy
+/// client's reconnects free while making yesterday's capture useless, and
+/// it is comfortably inside the two-key rotation window.
+pub const tls_ticket_lifetime_s: u32 = 60 * 60;
+
+comptime {
+    assert(tls_tickets_per_handshake >= 1);
+    // RFC 8446 §4.6.1: "Servers MUST NOT use any value greater than
+    // 604800 seconds (7 days)."
+    assert(tls_ticket_lifetime_s <= 7 * 24 * 60 * 60);
+}
+
 /// The fixed heap libcrypto allocates from (§4, `tls/libcrypto_heap.zig`),
 /// reserved at startup exactly when some listener terminates TLS. Sized
 /// against the measured plateau — ~1 MiB for one handshake's distinct

@@ -505,6 +505,18 @@ process-wide reservation: the fixed heap libcrypto allocates from, 4 MiB,
 which is what makes zero-allocation-after-startup provable with a C
 library underneath (§4).
 
+Session resumption adds nothing to either. A resumption ticket has to
+carry its session's PSK back to us, and the obvious shape — a table keyed
+by ticket id — is memory that grows with traffic and a lookup on the
+handshake path, both of which this budget would have to cover. So the
+ticket *is* the state: the PSK is sealed into the bytes handed to the
+client, and the server keeps only the two rotating keys that seal them.
+Sixty-four bytes, whatever the traffic. That trade puts the security
+question on the sealing key rather than on a table, which is why a key
+stops sealing before it stops opening and why none of them ever reaches
+disk — a restart costs every returning client one full handshake, and
+makes a stolen disk worthless.
+
 The access log (§8) adds one fixed reservation beside the pools — two
 staging buffers, 64 KiB together by default — and nothing at all when it
 is off. It is in the printed total, because §5's promise is that the

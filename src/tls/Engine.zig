@@ -32,6 +32,7 @@ const constants = @import("../constants.zig");
 const ztls = @import("ztls");
 
 const Credentials = @import("Credentials.zig");
+const Tickets = @import("Tickets.zig");
 
 const assert = std.debug.assert;
 
@@ -59,6 +60,21 @@ reassembly: ztls.ServerHandshake.Storage,
 outbox: [outbox_bytes]u8,
 outbox_len: u32,
 outbox_sent: u32,
+/// Resumption's two halves, both engine-owned because ztls asks this
+/// session's own state for them mid-handshake (§4).
+///
+/// `tickets` is the listener's sealing keys, borrowed and shared — null
+/// when the deployment has none, which is what turns resumption off. The
+/// PSK a ticket opens to lands in `psk_storage` and is handed back to
+/// ztls as a *borrowed* slice, so it has to outlive the lookup call: per
+/// session is the only lifetime that works, since the handshake reads it
+/// after the callback returns.
+tickets: ?*const Tickets,
+psk_storage: [Tickets.psk_bytes_max]u8,
+/// Wall-clock seconds at this session's start, for sealing and for
+/// ageing an offered ticket out. Injected rather than read: the engine
+/// has no clock, and the simulator's must be the one that answers (§9).
+now_unix: u64,
 /// Where decrypted bytes land: the caller's destination for everything
 /// this session ever receives in plaintext. Assigned once at pool init
 /// from a startup slab, never reassigned — runtime-sized because L7's
@@ -212,6 +228,14 @@ pub const Config = struct {
     /// This listener's cert chain and signing key. Borrowed, not owned:
     /// shared across the listener's engines, and must outlive them.
     credentials: *const Credentials,
+    /// The sealing keys resumption runs on, or null to offer none. Same
+    /// borrowing rule as `credentials`: the server owns them for the
+    /// process, an engine only reads them.
+    tickets: ?*const Tickets = null,
+    /// Wall-clock seconds now. Only meaningful when `tickets` is set —
+    /// it is the stamp a sealed ticket carries and the clock an offered
+    /// one is aged against.
+    now_unix: u64 = 0,
 };
 
 /// What one slot's plaintext buffer must be, given the head size the
@@ -264,10 +288,20 @@ pub fn init(engine: *Engine, config: *const Config) !void {
         .init(config.x25519_seed),
     );
     engine.reassembly = .empty;
+    engine.tickets = config.tickets;
+    engine.now_unix = config.now_unix;
     engine.hs = .init(.{
         .keypairs = .init(keypair),
         .random = .init(config.random),
         .reassembly = &engine.reassembly.buffer,
+        // Offered only when this deployment can actually open one. A
+        // lookup that always answers null would work too, but saying so
+        // in the config keeps "resumption is off" a single readable fact
+        // rather than a callback that turns out to never succeed.
+        .psk_lookup = if (config.tickets != null) .{
+            .context = engine,
+            .lookup = openOfferedTicket,
+        } else null,
     });
     engine.hs.setCredentials(config.credentials.chain, config.credentials.signer());
     engine.record_storage = .empty;
@@ -394,6 +428,108 @@ pub fn sendApp(engine: *Engine, bytes: []const u8) !void {
     assert(wire.len > bytes.len); // Record header + AEAD tag overhead.
     engine.stage(wire);
     engine.hs.completeWrite();
+}
+
+/// What one NewSessionTicket costs the outbox: the encoded message plus
+/// a handshake record's header and AEAD tag. The message is dominated by
+/// the ticket itself, which is fixed-size, so this is a closed form and
+/// not an estimate.
+/// The 128 covers the NewSessionTicket fields around the ticket
+/// (lifetime, age add, nonce, extensions) and the 256 the record header
+/// and AEAD tag, on `control_record_bytes_max`'s own reasoning.
+const session_ticket_record_bytes_max: usize = Tickets.ticket_bytes + 128 + 256;
+
+comptime {
+    // Both tickets are staged into an outbox the transport has not begun
+    // draining, so they must fit beside each other or the second would
+    // trip `stage`'s invariant rather than shed.
+    assert(outbox_bytes >= constants.tls_tickets_per_handshake *
+        session_ticket_record_bytes_max);
+}
+
+/// Stage one NewSessionTicket: derive this session's resumption PSK,
+/// seal it into a ticket only this server can open, and encrypt the
+/// message onto the application stream (RFC 8446 §4.6.1).
+///
+/// **When this is called is the point of it.** The flight must go out
+/// *after* the client's Finished is processed, not alongside the server
+/// flight — TLS 1.3 permits either, but only the later one carries an
+/// ACK covering that Finished. Without it the client's next small write
+/// sits in its own Nagle queue waiting for an ACK zoxy has no reason to
+/// send, which is the ~45 ms stall (IMPLEMENTATION_NOTES).
+///
+/// The randomness is passed in rather than drawn: the engine has no I/O,
+/// and a seeded simulator must be able to replay a ticket byte for byte
+/// (§9). `seal_nonce` must never repeat under one sealing key — it is a
+/// GCM nonce, and a repeat there is not a weak ticket but a broken one.
+pub fn sendSessionTicket(
+    engine: *Engine,
+    ticket_nonce: []const u8,
+    age_add: u32,
+    seal_nonce: [Tickets.nonce_bytes]u8,
+) !void {
+    assert(engine.hs.isConnected());
+    assert(ticket_nonce.len >= 1);
+    assert(engine.outboundRoom() >= session_ticket_record_bytes_max);
+    const tickets = engine.tickets orelse return error.NoTicketKeys;
+
+    var psk_buffer: [Tickets.psk_bytes_max]u8 = undefined;
+    const psk = try engine.hs.resumptionPsk(ticket_nonce, &psk_buffer);
+    var ticket: [Tickets.ticket_bytes]u8 = undefined;
+    const sealed = try tickets.seal(
+        &ticket,
+        psk,
+        engine.hs.cipherSuite(),
+        engine.now_unix,
+        seal_nonce,
+    );
+    const wire = try engine.hs.sendNewSessionTicket(
+        &engine.out.buffer,
+        constants.tls_ticket_lifetime_s,
+        age_add,
+        ticket_nonce,
+        sealed,
+    );
+    assert(wire.len > 0);
+    engine.stage(wire);
+    engine.hs.completeWrite();
+}
+
+/// True when this handshake resumed a previous session rather than
+/// running a full one — an offered ticket that opened, and that ztls then
+/// selected. The counter this feeds is the only way to tell resumption
+/// *working* from resumption merely *configured*.
+pub fn isResumed(engine: *const Engine) bool {
+    return engine.hs.selected_psk != null;
+}
+
+/// ztls asking whether an offered ticket is one of ours. Called during
+/// the handshake, synchronously, with the identity the client sent.
+///
+/// Null for every failure — not ours, not intact, expired — because the
+/// answer a peer is entitled to is only that resumption did not happen.
+/// A full handshake follows either way, so nothing is lost but a round
+/// trip's worth of work.
+fn openOfferedTicket(context: *anyopaque, identity: []const u8) ?ztls.ServerHandshake.PskEntry {
+    const engine: *Engine = @ptrCast(@alignCast(context));
+    const tickets = engine.tickets orelse return null;
+    const opened = tickets.open(
+        identity,
+        &engine.psk_storage,
+        engine.now_unix,
+        constants.tls_ticket_lifetime_s,
+    ) orelse return null;
+    // Borrowed from the engine, which outlives the handshake that is
+    // asking — the reason `psk_storage` is a field and not a local.
+    assert(opened.psk.ptr == &engine.psk_storage);
+    return .{
+        .psk = opened.psk,
+        .cipher_suite = opened.suite,
+        // 0-RTT is not offered (§4): a replayed ticket buys a resumed
+        // handshake and nothing else, which is what lets these tickets be
+        // multi-use without the replay table that would defeat the point.
+        .max_early_data_size = null,
+    };
 }
 
 /// Stage an orderly TLS close (close_notify) for the transport.

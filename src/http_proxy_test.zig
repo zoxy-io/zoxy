@@ -4217,6 +4217,139 @@ const TlsWindDown = struct {
     }
 };
 
+test "l7: a completed handshake issues its session tickets" {
+    // The post-handshake flight, and the reason it exists: the ~45 ms
+    // stall (IMPLEMENTATION_NOTES) is a client's second small write held
+    // by its own Nagle, waiting for an ACK zoxy has no reason to send.
+    // Tickets are what give it one — and they are only worth anything if
+    // they go out *after* the client's Finished, which is what makes
+    // "issued once the session is up" the assertion rather than "issued".
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 53,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    try std.testing.expectEqual(
+        @as(u64, constants.tls_tickets_per_handshake),
+        bed.server.counters.get("tls_tickets_issued"),
+    );
+    // Nothing resumed: this client offered no ticket, so a count here
+    // would mean the counter fires on something other than resumption.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_resumed"));
+    // And the flight cost the exchange nothing — the request still got
+    // its answer, which is what says the tickets went out *around* the
+    // hand-over rather than in place of it.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        client.app_received[0..client.app_received_len],
+    );
+    try bed.expectDrained();
+}
+
+/// Starts a second, resuming connection when the first one ends, and
+/// winds the scenario down when *that* one does. Two connections have to
+/// share a loop run — see the test — and this is the seam that lets the
+/// second begin only once the first has a ticket to hand it.
+const TlsResumeAfter = struct {
+    bed: *Http1Bed,
+    first: *TlsClient,
+    second: *TlsClient,
+    wind_down: *TlsWindDown,
+
+    const request = "GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+
+    fn onFirstEnd(context: ?*anyopaque) void {
+        const self: *TlsResumeAfter = @ptrCast(@alignCast(context.?));
+        self.second.start(&self.bed.sim_io, Http1Bed.bindAddress(), .{
+            .host_name = fixture_host_name,
+            .app_data = request,
+            // Different seeds: a resumed handshake still runs its own
+            // ephemeral key exchange (psk_dhe_ke), so reusing the first
+            // session's would prove less than it appears to.
+            .x25519_seed = @splat(0x71),
+            .p256_seed = @splat(0x72),
+            .random = @splat(0x73),
+            .resume_with = &self.first.ticket,
+        }) catch unreachable; // Seeded keypairs; the inputs are ours.
+        self.wind_down.attach(self.second);
+    }
+
+    fn attach(self: *TlsResumeAfter, client: *TlsClient) void {
+        client.on_end = onFirstEnd;
+        client.on_end_context = self;
+    }
+};
+
+test "l7: a ticket issued by one session resumes the next" {
+    // The round trip the whole feature is: a ticket zoxy sealed, handed
+    // to a client, offered back on a fresh connection, and opened by the
+    // key that sealed it. Nothing short of two handshakes proves it —
+    // the seal and open are unit-tested against each other, but only
+    // this says the ticket survives the wire, the client's storage, and
+    // ztls's pre_shared_key extension in between.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 54,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var first: TlsClient = undefined;
+    var second: TlsClient = undefined;
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    // Both connections in one loop run: the server reaches idle between
+    // them with its accepts armed and nothing inbound, which the
+    // simulator calls a deadlock — correctly, since from inside the loop
+    // it is one. So the second connection is started by the first one
+    // ending, the same seam the wind-down uses.
+    var resumer: TlsResumeAfter = .{
+        .bed = &bed,
+        .first = &first,
+        .second = &second,
+        .wind_down = &wind_down,
+    };
+    try first.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = TlsResumeAfter.request,
+    });
+    resumer.attach(&first);
+    try bed.sim_io.run();
+
+    try std.testing.expect(first.ticket_captured);
+
+    // Two sessions, the second resumed — and the response still correct,
+    // because a resumption that broke the stream would be worse than no
+    // resumption at all.
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_resumed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        second.app_received[0..second.app_received_len],
+    );
+    try bed.expectDrained();
+}
+
 test "l7: close_notify between requests writes no access-log line" {
     // A terminated keep-alive connection ends the way TLS says to: the
     // client answers its last response with a close_notify, and the alert

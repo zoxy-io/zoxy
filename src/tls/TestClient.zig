@@ -68,6 +68,17 @@ pub fn TestClient(comptime IoType: type) type {
         coalesced_len: u32,
         app_received: [65536]u8,
         app_received_len: u32,
+        /// The first NewSessionTicket this session was issued, kept so a
+        /// second session can offer it back — which is the only way to
+        /// test that the server's `psk_lookup` opens what it sealed.
+        /// Meaningless until `ticket_captured`; a server that issues none
+        /// leaves it so, and that is itself an assertable fact.
+        ticket: ztls.ClientHandshake.SessionTicket,
+        ticket_captured: bool,
+        /// A ticket to offer at the *next* handshake, from `Options`.
+        /// Borrowed from whoever captured it — normally an earlier
+        /// client whose storage outlives this one.
+        resume_with: ?*const ztls.ClientHandshake.SessionTicket,
         /// Runs once the client is done — how a scenario learns to wind
         /// down (drain the server, stop the origin).
         on_end: ?*const fn (ctx: ?*anyopaque) void = null,
@@ -120,6 +131,10 @@ pub fn TestClient(comptime IoType: type) type {
             /// runs its sinks synchronously inside `feed`, so the session
             /// can end underneath the step that is still driving it.
             close_in_handshake: bool = false,
+            /// Offer this ticket in the ClientHello, resuming the session
+            /// that issued it instead of running a full handshake. The
+            /// storage is the caller's and must outlive the client.
+            resume_with: ?*const ztls.ClientHandshake.SessionTicket = null,
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -179,6 +194,9 @@ pub fn TestClient(comptime IoType: type) type {
             client.close_in_handshake = options.close_in_handshake;
             client.coalesced_len = 0;
             client.app_received_len = 0;
+            client.ticket = .{};
+            client.ticket_captured = false;
+            client.resume_with = options.resume_with;
             io.connect(address, &client.connect_completion, Self, client, onConnect);
         }
 
@@ -190,10 +208,21 @@ pub fn TestClient(comptime IoType: type) type {
                 return;
             };
             client.connected = true;
-            client.pending_send = client.hs.start(&client.out.buffer) catch {
-                client.finish();
-                return;
-            };
+            // A ticket in hand means offer it: the ClientHello carries a
+            // pre_shared_key extension and the server either opens it
+            // (resumed) or ignores it (full handshake). Both are legal
+            // outcomes of the same call, which is why the test asserts on
+            // the server's counters rather than on this succeeding.
+            client.pending_send = if (client.resume_with) |ticket|
+                client.hs.startWithPsk(ticket, &client.out.buffer, false) catch {
+                    client.finish();
+                    return;
+                }
+            else
+                client.hs.start(&client.out.buffer) catch {
+                    client.finish();
+                    return;
+                };
             client.hs.completeWrite();
             client.armSend();
         }
@@ -411,7 +440,19 @@ pub fn TestClient(comptime IoType: type) type {
                             );
                             client.app_received_len += @intCast(bytes.len);
                         },
-                        .key_update, .new_session_ticket, .none => {},
+                        .new_session_ticket => |nst| {
+                            // Keep the *first* only. A server issues
+                            // several and they are interchangeable, so
+                            // storing one keeps this a fixed-size client
+                            // and makes "the ticket" unambiguous in the
+                            // test that offers it back.
+                            if (!client.ticket_captured) {
+                                client.ticket = client.hs.deriveSessionTicket(nst) catch
+                                    continue;
+                                client.ticket_captured = true;
+                            }
+                        },
+                        .key_update, .none => {},
                     }
                 }
                 if (client.hs.isConnected()) client.handshake_done = true;

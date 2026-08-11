@@ -355,6 +355,20 @@ pub const Counters = struct {
     /// count here is a peer misbehaving mid-stream or a far side too slow
     /// to drain, neither of which a handshake counter would attribute.
     tls_relay_failed: Value = Value.init(0),
+    /// NewSessionTickets issued (§4), `tls_tickets_per_handshake` per
+    /// completed handshake that had a sealing key. Read against
+    /// `tls_handshakes_completed` it says whether resumption is being
+    /// *offered* — a deployment whose ratio is zero has tickets
+    /// configured and never sends one, which is invisible from the
+    /// handshake counters alone.
+    tls_tickets_issued: Value = Value.init(0),
+    /// Handshakes that resumed a previous session rather than running a
+    /// full one — a ticket this server sealed, offered back and accepted.
+    /// The other half of the pair above: issuing tickets nobody redeems
+    /// and redeeming none are different failures, and only two counters
+    /// tell them apart. Also the one that moves the handshake CPU: a
+    /// resumed handshake skips the signature entirely.
+    tls_resumed: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).

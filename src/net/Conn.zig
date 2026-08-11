@@ -324,6 +324,19 @@ pub fn Conn(comptime IoType: type) type {
         /// segment, and a protocol that only ever armed a fresh read
         /// would wait for bytes already in hand.
         tls_pending_len: u32,
+        /// Whether this session's handshake has completed (§4) — the
+        /// client's Finished processed and the session usable.
+        ///
+        /// Set once, and it has to be a latch rather than a question
+        /// asked of the engine, for two reasons. The pump reaches
+        /// "connected with an empty outbox" a second time once the
+        /// post-handshake ticket flight has gone out, and without a latch
+        /// it would issue a fresh pair every time and never hand over to
+        /// the protocol. And it is what separates a handshake that failed
+        /// from a session that came up and then lost its peer while those
+        /// tickets were still going out — the same send error, two
+        /// different things to count.
+        tls_session_up: bool,
         /// The client-directed write in flight, if any (§7, §8) — see
         /// `ClientWrite`. Idle on the L4 path, which relays through the pump.
         client_write: ClientWrite,
@@ -655,6 +668,7 @@ pub fn Conn(comptime IoType: type) type {
             // connection.
             conn.tls = engine;
             conn.tls_pending_len = 0;
+            conn.tls_session_up = false;
             conn.client_write = .{};
             conn.cluster_index = cluster_index;
             // Placeholders until the admission tail installs the

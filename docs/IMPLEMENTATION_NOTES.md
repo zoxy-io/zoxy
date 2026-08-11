@@ -47,22 +47,38 @@ available. The fork carries four commits, each re-audited in
   stall, identified" below. The ticket must be emitted **after**
   processing that `Finished`, not alongside the server flight.
 
-Remaining, in the order the work wants:
+Session tickets are wired now, both halves: every completed handshake
+issues `tls_tickets_per_handshake` of them, and an offered ticket comes
+back through ztls's `psk_lookup` to `Tickets.open`. The emission lands
+where the stall analysis says it must — after the client's `Finished` is
+processed, staged inside the outbound pump's own loop so it rides the
+same send path as the server flight.
 
-1. **Session tickets.** The fork can issue them (`sendNewSessionTicket`,
-   `resumptionPsk`) and accept them (`Config.psk_lookup`, upstream), and
-   `src/tls/Tickets.zig` has the stateless seal/open — but nothing is
-   wired, so no ticket is ever sent. That is both §4's resumption and the
-   ~45 ms stall below, and the emission has to land *after* the client
-   Finished is processed, not alongside the server flight.
-2. **The Tier-1 bands**, whose acceptance is the close-mode rate gate PR
-   #84 could not pass; (1) is what is expected to move it.
+Wiring it moved a counter, which is worth recording because the sweep is
+what noticed. The ticket flight goes out while the connection is still
+`tls_handshaking`, so a peer that leaves during it was being counted as
+`tls_handshake_failed` — a handshake that had in fact *succeeded*. The
+census caught it as a counter firing against an allowance of zero.
+`tls_handshakes_completed` and `tls_resumed` are now counted where the
+session comes up rather than at the hand-over, behind a `tls_session_up`
+latch on the conn, and the send-error arm blames the handshake only while
+that latch is unset.
 
-Two smaller things the reviews left open: `ResponseBodyPolicy.afterSend`
+Remaining:
+
+1. **The Tier-1 bands**, whose acceptance is the close-mode rate gate PR
+   #84 could not pass. The tickets above are what is expected to move it,
+   and the bands are what say whether they did — nothing measured yet.
+
+Three smaller things the reviews left open: `ResponseBodyPolicy.afterSend`
 credits ciphertext to `bytes_out` where the client-write channel credits
-plaintext, so a streamed TLS response over-counts; and the sim's TLS
-http client sends `Connection: close` and a GET, leaving the request-body
-leg reachable by directed tests only.
+plaintext, so a streamed TLS response over-counts; the sim's TLS http
+client sends `Connection: close` and a GET, leaving the request-body leg
+reachable by directed tests only; and the sealing key is drawn once at
+`start` and never rotated, so the two-slot rotation `Tickets` is built
+for runs with one slot live for the process. Rotation wants a timer and
+the interval is a policy question (it bounds how long a stolen key is
+worth having), so it is deliberately not guessed at here.
 
 ### What the live gate found
 

@@ -206,19 +206,30 @@ How many TLS sessions may be in flight at once is `limits.tls_engines`,
 and it is the largest single line in the startup banner's memory budget;
 see [Limits](#limits).
 
-> [!WARNING]
-> **Session resumption is not implemented yet, so every connection pays a
-> full handshake.** On steady keep-alive traffic that costs nothing
-> measurable — a terminated hop benchmarks at parity with HAProxy. On
-> handshake-heavy traffic it is expensive twice over: ~260 µs of signing
-> per connection, and a ~45 ms stall per handshake from a delayed-ACK
-> interaction that resumption's post-handshake ticket is what resolves.
-> A `Connection: close` workload measured 664 of 2000 requests per second
-> offered against HAProxy's 831.
->
-> Terminate TLS behind a client population that reuses connections. If
-> yours reconnects constantly — many short-lived clients, no keep-alive —
-> wait for resumption before putting this in that path.
+Session resumption is on, with nothing to configure. Every completed
+handshake hands the client two session tickets; a client that offers one
+back resumes instead of running a full handshake, which skips the
+signature entirely. The tickets are stateless — each carries its own
+session sealed under a key zoxy keeps in memory — so resumption costs no
+per-session memory and no lookup table, and the startup banner's budget
+does not move.
+
+Two consequences worth knowing. A restart invalidates every outstanding
+ticket, because the sealing keys are never written anywhere: returning
+clients pay one full handshake each and then resume again. And tickets
+are not shared between processes, so during a `SO_REUSEPORT` handoff a
+client may land on the process that did not issue its ticket and do a
+full handshake.
+
+> [!NOTE]
+> Resumption's other job is latency, and it is the larger one on
+> handshake-heavy traffic. Without a post-handshake flight, a client that
+> writes its `Finished` and then its request has the second write held by
+> its own Nagle, waiting for an ACK zoxy has no reason to send — a ~45 ms
+> stall per connection. The ticket flight is what carries that ACK. The
+> Tier-1 bands that measure this have not been re-run since resumption
+> landed; the last reading, without it, was 664 of 2000 requests per
+> second offered on a `Connection: close` workload against HAProxy's 831.
 
 ### Routing
 
