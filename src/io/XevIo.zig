@@ -65,6 +65,10 @@ const buffer_group_id: u16 = 0;
 /// macOS CI hung. The rule is now that this only ever changes what a
 /// backend does when that backend has said, in its types, that it cannot
 /// do the other thing.
+///
+/// What the error set promises is *conditional*, and `listenClose` pays
+/// that condition: kqueue delivers the cancel only for an accept it has
+/// already submitted. See `submitPending`, which is how it pays it.
 const delivers_accept_cancel = reportsCanceled(xev.AcceptError);
 
 /// Whether a libxev error set can report a cancelled op at all.
@@ -466,6 +470,41 @@ pub fn listenerAddress(io: *const XevIo, listener: Listener) std.Io.net.IpAddres
     return entry.address;
 }
 
+/// Hand the backend every op still queued, so an op armed during this
+/// tick is one the backend has actually taken.
+///
+/// libxev submits at the top of a tick and never inside its callback
+/// loop, so an accept armed from a callback is still queued when a
+/// `listenClose` later in that same tick cancels it — and cancelling a
+/// queued op only marks it dead: no completion, no callback, and a drain
+/// waiting on that accept waits forever (#203). The admin plane arms
+/// exactly that way, re-arming from `maybeFinish` in the same tick a
+/// signal's `beginDrain` can close the listener in.
+///
+/// Safe to call from inside a callback, which is the whole point: this
+/// fires no callbacks of its own — it is a syscall, not a tick — so it
+/// cannot re-enter the caller mid-drain, the hazard that forces the
+/// synthesized delivery in `listenClose` to be asynchronous.
+fn submitPending(loop: *xev.Loop) void {
+    // What a failed submit costs is the backend's to say, and they do not
+    // say the same thing: io_uring fails before touching its queue, so
+    // the ops are merely still queued — the state this path was in before
+    // it called here at all — while kqueue says plainly that some events
+    // may be lost. Neither is worse than not calling this, which is the
+    // exposure #203 is, and both are exceptional by the backends' own
+    // account. All but one: `CompletionQueueOvercommitted` is the §8
+    // budget violated rather than a submit that did not happen, and it
+    // panics for the same reason `run` panics on it.
+    //
+    // anyerror: that error exists only on io_uring's error set.
+    loop.submit() catch |err| switch (@as(anyerror, err)) {
+        error.CompletionQueueOvercommitted => @panic(
+            "ring budget violated: completion queue overcommitted (DESIGN.md §8)",
+        ),
+        else => {},
+    };
+}
+
 /// Sync listener close (drain, §8). The armed accept — if any — must be
 /// reaped through an async cancel: an io_uring op holds its own file
 /// reference, so closing the fd alone would leave the accept in flight
@@ -475,6 +514,10 @@ pub fn listenClose(io: *XevIo, listener: Listener) void {
     assert(entry.open);
     if (entry.armed_accept) |accept_completion| {
         if (comptime delivers_accept_cancel) {
+            // What the backend promises about a cancelled accept it owes
+            // only for an accept it has already taken (#203) — so make
+            // sure it has taken this one before cancelling it.
+            submitPending(&io.loop);
             loopCancel(
                 &io.loop,
                 accept_completion,

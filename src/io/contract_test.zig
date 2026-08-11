@@ -981,6 +981,79 @@ test "xevio: closing a listener cancels its armed accept" {
     try std.testing.expectError(error.Canceled, result);
 }
 
+/// The same-tick drain shape (#203): an accept armed inside one callback
+/// and the listener closed inside another, with no loop submission in
+/// between. That is the admin plane's own sequence — `onAccept` re-arms,
+/// and the signal completion's `beginDrain` runs later in the same tick's
+/// batch — and it is the shape `DrainCloser` above deliberately does not
+/// have, because there the accept is submitted before the close.
+const SameTickDrain = struct {
+    io: *XevIo,
+    listener: XevIo.Listener,
+    arm_timer: XevIo.Completion = .{},
+    close_timer: XevIo.Completion = .{},
+    accept_completion: XevIo.Completion = .{},
+    outcome: ?(Io.AcceptError!XevIo.Socket) = null,
+    armed: bool = false,
+    closed: bool = false,
+
+    fn onArm(drain: *SameTickDrain, result: Io.TimerError!void) void {
+        // The only TimerError is Canceled, and nothing cancels this timer.
+        result catch unreachable;
+        // The close must not have run first, or the test is asserting
+        // about a listener that was already gone.
+        assert(!drain.closed);
+        drain.io.accept(
+            drain.listener,
+            &drain.accept_completion,
+            SameTickDrain,
+            drain,
+            onAccept,
+        );
+        drain.armed = true;
+    }
+
+    fn onClose(drain: *SameTickDrain, result: Io.TimerError!void) void {
+        result catch unreachable;
+        assert(drain.armed);
+        drain.io.listenClose(drain.listener);
+        drain.closed = true;
+    }
+
+    fn onAccept(drain: *SameTickDrain, result: Io.AcceptError!XevIo.Socket) void {
+        assert(drain.outcome == null);
+        drain.outcome = result;
+    }
+};
+
+test "xevio: closing a listener cancels an accept armed in the same tick" {
+    // #203: the accept above is armed from outside the loop, so the
+    // backend has submitted it by the time the close lands. The admin
+    // plane's is not — it is re-armed from `onAccept` and the drain runs
+    // in the same tick — and a backend that only delivers a cancelled
+    // accept it has already submitted orphans that one. Same contract as
+    // the test above, one tick earlier.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+
+    const listener = try xev_io.listen(
+        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+    );
+    var drain: SameTickDrain = .{ .io = &xev_io, .listener = listener };
+    // Both at zero: one tick's timer batch runs both callbacks, with no
+    // submission between them — which is the whole point.
+    xev_io.timerStart(&drain.arm_timer, 0, SameTickDrain, &drain, SameTickDrain.onArm);
+    xev_io.timerStart(&drain.close_timer, 0, SameTickDrain, &drain, SameTickDrain.onClose);
+    try xev_io.run();
+
+    const result = drain.outcome orelse return error.AcceptNeverCompleted;
+    try std.testing.expectError(error.Canceled, result);
+}
+
 test "xevio: a recv against a linger-RST close is Reset, with the errno pinned" {
     // The ConnectionResetByPeer arm of the read map, deterministic by
     // construction: the close(2) below fires the RST before run() ever
