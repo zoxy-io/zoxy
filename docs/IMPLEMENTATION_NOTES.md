@@ -1619,6 +1619,38 @@ can only be the proxy's fault. The band now prints the refused/timed-out
 split every run: a threshold whose margin is invisible until it trips is
 how this one sat mis-specified for a week.
 
+## Open: the https leg wedged once on macOS (2026-08-11, #125)
+
+The first CI run carrying the Tier-0.5 https leg wedged on the macOS
+runner — the whole 30 s budget, against a run that takes about a second.
+Every run since has passed there, on the same commit and on later ones,
+so this is **intermittent and unexplained**, not a platform that cannot
+terminate TLS. Recorded rather than waved off: an intermittently red gate
+is worse than a red one, because the first instinct on seeing it green
+again is to stop looking.
+
+What is known. Linux has never reproduced it, over dozens of local runs
+and every CI run. The commit before — the same TLS listener, configured
+and started, but with no client connecting to it — passed macOS, so the
+listener, the certificate load and the libcrypto heap install are not it;
+the first macOS execution of the *handshake and exchange* path is also
+its only failure. The proxy was alive and quiet, not crashed: no panic
+reached its log.
+
+What is *not* the explanation, checked: the delayed-ACK stall documented
+above is bounded by a timer in the tens of milliseconds and cannot
+produce a thirty-second wait; and the extra admin scrape the leg adds is
+the fourth of its kind in a run whose first three already pass there.
+
+The instrumentation to catch it next time is in: the watchdog names the
+wait it died in (and, for the requests, which one), and it now SIGTERMs
+the proxy and lets it drain before killing it, so the report carries the
+proxy's own counters. The first wedge had neither — it said only that
+thirty seconds had passed, which is what made it un-diagnosable. The
+standing suspicion to test first is a lost wakeup in the kqueue path,
+since the TLS legs are the one place a data op is armed outside the
+provided-buffer ring, and a race there would present exactly this way.
+
 ## The live gate's measured numbers (2026-08-02, #144)
 
 Tier 0.5 (`zig build smoke`, DESIGN.md §9) landed with these readings on a
