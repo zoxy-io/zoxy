@@ -33,6 +33,7 @@ pub const tls = struct {
     pub const Credentials = @import("tls/Credentials.zig");
     pub const Engine = @import("tls/Engine.zig");
     pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
+    pub const Tickets = @import("tls/Tickets.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
     /// The throwaway self-signed fixtures (`tls/testdata/README.md`),
     /// re-exported because `@embedFile` cannot escape its module root and
@@ -71,6 +72,7 @@ test {
     _ = shed;
     _ = tls.Credentials;
     _ = tls.Engine;
+    _ = tls.Tickets;
     _ = @import("tls/engine_test.zig");
     _ = tls.TestClient;
     _ = @import("tls/spike_test.zig");
