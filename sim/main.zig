@@ -245,7 +245,9 @@ const uncovered = [_]Uncovered{
             "(issue, capture, offer, open) across two connections and " ++
             "asserts the counter; what the sweep would add on top is the " ++
             "adversary's schedules against a resumed handshake, which is " ++
-            "the honest gap and wants a two-connection client to close",
+            "the honest gap, tracked as #204 — it wants a client that ends " ++
+            "on a complete response so a second connection can offer the " ++
+            "first's ticket back",
     },
     .{
         .name = "l7_no_route",
