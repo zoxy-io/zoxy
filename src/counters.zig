@@ -653,6 +653,13 @@ pub const Counters = struct {
         // Every §7 replay rides a checkout: only a reused connection's
         // early failure is blamed on staleness.
         assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));
+        // A resumed session is a completed handshake that skipped the
+        // certificate, not a separate kind of event — so it can never
+        // outrun the handshakes it is a subset of. Worth stating because
+        // the two are credited on different paths: the completion at the
+        // handover, the resumption from the engine's own view of what it
+        // negotiated.
+        assert(counters.get("tls_resumed") <= counters.get("tls_handshakes_completed"));
         // A probe can only fail if it was sent; an ejection needs at least
         // one failed probe; a restore needs a prior ejection (endpoints
         // start healthy, §7).

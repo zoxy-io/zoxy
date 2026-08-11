@@ -35,6 +35,9 @@ pub const tls = struct {
     pub const libcrypto_heap = @import("tls/libcrypto_heap.zig");
     pub const Tickets = @import("tls/Tickets.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
+    /// What a client captures from one session to offer on the next. Named
+    /// here so a gate can hold one without naming ztls itself (§4).
+    pub const SessionTicket = @import("tls/TestClient.zig").SessionTicket;
     /// The throwaway self-signed fixtures (`tls/testdata/README.md`),
     /// re-exported because `@embedFile` cannot escape its module root and
     /// the §9 simulator is its own module. Test material, never a

@@ -77,10 +77,8 @@ What it left open, now tracked rather than only recorded here:
 - **#203 — the live gate's https leg wedged once on macOS**, and has not
   recurred. See the section of that name below for what is ruled out and
   where to look.
-- **#204 — the simulator's TLS clients open one connection each**, which
-  still keeps resumption out of the sweep: a ticket can only be offered
-  back on a *second* connection, and nothing opens one. The other two legs
-  it named are closed — see "Ending an exchange by framing" below.
+- ~~**#204 — the simulator's TLS clients are single-connection.**~~ Closed:
+  see "Ending an exchange by framing" below for all three legs.
 
 One smaller thing still recorded only here, because it is a line rather
 than a project: `ResponseBodyPolicy.afterSend` credits *ciphertext* to
@@ -169,9 +167,28 @@ whose origin drew an unsized mode — both honest, and both leaving the
 count *behind*, never ahead. That asymmetry is what makes
 `responsesReceived() <= requestsSent()` a sound per-seed oracle.
 
-What it does not close is resumption. A ticket is offered on a *second
-connection*, and this population still opens one apiece, so
-`tls_resumed`'s census exemption stands.
+Resumption needed the other half: a *second connection*. One resuming
+client now starts from the end hook of whichever session captured a
+ticket, offering it back — the same slot machinery, one extra storage
+slot, and `clients_count` grown before `clientEnded` compares against it
+so the wind-down waits for the resumed session rather than racing it.
+
+Two things it cost, both worth stating because neither was predictable
+from the design. The clean-seed access-log oracle counts one L4 line per
+connection and had the drawn client count hard-coded, which a second
+connection falsifies. And `tls_engines` had to grow by one: the resumer
+dials from the end hook, but the engine of the session it is resuming is
+released a loop turn later, when the server sees the close — so sizing to
+the drawn count shed the resumption on that overlap instead of covering
+it.
+
+Measured over 4096 seeds: the resuming client starts on 86% of runs that
+drew TLS (the rest are first sessions that ended holding no ticket — a
+refused dial, a cut handshake, a shed engine), and of those 83% are
+resumed. `tls_resumed` fires 385 times, so its census exemption is
+**deleted** rather than relaxed. `Counters.reconcile` now also states the
+relationship the two credit paths must keep: `tls_resumed <=
+tls_handshakes_completed`.
 
 ### Pool ceilings — policy we choose, or a range the operator picks?
 

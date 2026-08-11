@@ -41,6 +41,11 @@ const clients_max: u8 = 6;
 /// engine-pool wall on a starved seed, which is the one rung that needs
 /// more than one.
 const tls_clients_max: u8 = 2;
+/// One more slot than a seed may draw, for the resuming client (#204).
+/// Exactly one: what it covers is a ticket surviving from one connection
+/// to the next, and a second resumer would only re-cover it while
+/// doubling the handshake crypto every TLS seed pays for.
+const tls_client_slots: u8 = tls_clients_max + 1;
 /// Bytes each terminating client echoes. Small: what this population is
 /// for is the handshake and the transform, not throughput.
 const tls_token_bytes: u8 = 24;
@@ -112,13 +117,26 @@ l7_clients: [clients_max]HttpClient,
 /// harness because the server borrows the table for its life, and because
 /// a `Credentials` owns a libcrypto key that `tearDown` must free — the
 /// arena cannot, it is not arena memory.
-tls_clients_storage: [tls_clients_max]TlsClient,
+tls_clients_storage: [tls_client_slots]TlsClient,
+/// How many terminating clients the seed drew — what sizes the engine
+/// pool — against how many storage slots are in use, which the #204
+/// resuming client makes one larger the moment it starts.
 tls_clients: u8,
+tls_clients_live: u8,
+/// Whether the resuming client has started, and the key material it
+/// starts with. Drawn up front from the scenario stream rather than when
+/// it starts: the draw then sits at a fixed point in that stream instead
+/// of one the delivery order chooses.
+tls_resume_started: bool,
+tls_resume_seeds: [3][32]u8,
+/// Set when the wind-down begins, so nothing dials a listener that has
+/// stopped accepting.
+scenario_ended: bool,
 /// What the terminating listener speaks once the handshake hands over.
 tls_protocol: zoxy.config.Config.Listener.Protocol,
 /// What each terminating client sends, distinct per client so the echo
 /// oracle can tell one session's bytes from another's.
-tls_tokens: [tls_clients_max][tls_token_bytes]u8,
+tls_tokens: [tls_client_slots][tls_token_bytes]u8,
 tls_credentials: [3]?zoxy.tls.Credentials,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
@@ -800,6 +818,26 @@ fn deriveTlsClients(
     return 1 + random.uintLessThan(u8, tls_clients_max);
 }
 
+/// The §4 engine pool this seed runs with. Zero when it drew no
+/// terminating clients, which keeps the pool free to every scenario that
+/// does not use it.
+///
+/// A starved seed gets exactly one engine against up to two sessions:
+/// the §4 wall, which is what it was drawn to meet, and the only way
+/// `shed_tls_engines` is reached. Every other seed is sized so no session
+/// is shed — and that means the drawn count *plus one*, not the drawn
+/// count. #204's resuming client dials from the end hook of the session
+/// whose ticket it offers, and that session's engine is released a loop
+/// turn later, when the server sees the close; the two overlap, and
+/// sizing to the population would shed the resumption rather than cover
+/// it.
+fn deriveTlsEngines(tls_clients: u8, force_exhaustion: bool) u32 {
+    assert(tls_clients <= tls_clients_max);
+    if (tls_clients == 0) return 0;
+    if (force_exhaustion) return 1;
+    return @as(u32, tls_clients) + 1;
+}
+
 /// The two #159 pages the sweep serves, rendered here exactly as
 /// `config.zig`'s loader renders one — the simulator builds its
 /// `Config` by hand (no filesystem, no parse), so the shape is spelled
@@ -972,14 +1010,15 @@ fn deriveAccessLogBuffer(harness: *const Harness) u32 {
     return floor;
 }
 
-fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
-    // A quarter of adversarial seeds shrink the pools to force the
-    // §8 rungs; clean seeds keep ample pools so golden outcomes
-    // never meet a shed. Decided in `setUp` (see `force_exhaustion`)
-    // because the ring size had to precede `io.init`.
+/// The pool sizes this seed runs the server with. A quarter of
+/// adversarial seeds shrink them to force the §8 rungs; clean seeds keep
+/// ample pools so golden outcomes never meet a shed. Decided in `setUp`
+/// (see `force_exhaustion`) because the ring size had to precede
+/// `io.init`.
+fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.InitOptions {
     const force_exhaustion = harness.force_exhaustion;
     const access_log_buffer_bytes = harness.deriveAccessLogBuffer();
-    const options: ServerSim.InitOptions = if (force_exhaustion)
+    return if (force_exhaustion)
         .{
             // head_buffers ≤ conn_slots is a Server.init precondition, so
             // the slot draw starts at whatever the ring draw chose.
@@ -992,11 +1031,7 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             // rung itself is relay-shadowed (see sim/main.zig uncovered).
             .upstream_head_buffers = 1,
             .access_log_buffer_bytes = access_log_buffer_bytes,
-            // One engine against up to two sessions: the §4 wall, which
-            // an exhaustion seed is drawn to meet. Zero when the seed
-            // drew no TLS clients, which is what keeps the pool free to
-            // every scenario that does not use it.
-            .tls_engines = if (harness.tls_clients >= 1) 1 else 0,
+            .tls_engines = deriveTlsEngines(harness.tls_clients, force_exhaustion),
         }
     else
         .{
@@ -1018,9 +1053,12 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
             .upstream_slots = 2 * clients_max,
             .head_buffers = harness.head_buffers,
             .upstream_head_buffers = 2 * clients_max,
-            // One each, so a non-starved seed's sessions all get through.
-            .tls_engines = harness.tls_clients,
+            .tls_engines = deriveTlsEngines(harness.tls_clients, force_exhaustion),
         };
+}
+
+fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: std.Random) !void {
+    const options = harness.deriveInitOptions(random);
     try harness.server.init(arena, &harness.io, &harness.config, options);
     harness.tls_credentials = .{ null, null, null };
     if (harness.tls_clients >= 1) {
@@ -1054,6 +1092,34 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
     try harness.origin_http.start(&harness.io, Harness.httpOriginAddress());
 }
 
+/// The terminating population's per-scenario state: the storage, the
+/// slot bookkeeping the resuming client grows, and one echo token per
+/// slot.
+///
+/// A plaintext seed draws nothing here, which is what keeps its stream
+/// position — and so the whole sweep's plaintext coverage — exactly
+/// where it was before TLS existed.
+fn populateTlsClients(harness: *Harness, random: std.Random) void {
+    harness.tls_clients_storage = @splat(undefined);
+    harness.tls_clients_live = harness.tls_clients;
+    harness.tls_resume_started = false;
+    harness.scenario_ended = false;
+    assert(harness.tls_clients <= tls_clients_max);
+    // One token past the drawn count, for the resuming client's slot.
+    const token_count = if (harness.tls_clients >= 1)
+        harness.tls_clients + 1
+    else
+        0;
+    assert(token_count <= tls_client_slots);
+    for (harness.tls_tokens[0..token_count], 0..) |*token, index| {
+        random.bytes(token);
+        // A distinguishable first byte, so an echo oracle comparing the
+        // wrong session's bytes fails on the first one rather than
+        // needing the whole token to collide.
+        token[0] = @intCast(index);
+    }
+}
+
 fn populateClients(harness: *Harness, random: std.Random) void {
     // Each client flips a protocol coin: mixed populations put both
     // serving paths under one schedule and shared pools.
@@ -1064,14 +1130,7 @@ fn populateClients(harness: *Harness, random: std.Random) void {
     harness.l4_count = 0;
     harness.l7_count = 0;
     harness.ended_count = 0;
-    harness.tls_clients_storage = @splat(undefined);
-    for (harness.tls_tokens[0..harness.tls_clients], 0..) |*token, index| {
-        random.bytes(token);
-        // A distinguishable first byte, so an echo oracle comparing the
-        // wrong session's bytes fails on the first one rather than
-        // needing the whole token to collide.
-        token[0] = @intCast(index);
-    }
+    harness.populateTlsClients(random);
     harness.clients = @splat(.{});
     harness.l7_clients = @splat(.{});
     harness.l4_announced_len = @splat(0);
@@ -1217,51 +1276,129 @@ pub fn startClients(harness: *Harness) void {
 fn startTlsClients(harness: *Harness) void {
     var index: u8 = 0;
     while (index < harness.tls_clients) : (index += 1) {
-        const client = &harness.tls_clients_storage[index];
         const random = harness.scenario_prng.random();
         var seeds: [3][32]u8 = undefined;
         for (&seeds) |*seed| random.bytes(seed);
-        client.start(&harness.io, Harness.tlsBindAddress(), .{
-            .host_name = zoxy.tls.testdata.host_name,
-            // An echo token for a relayed session, a real request for a
-            // proxied one — the terminated stream has to be what the
-            // listener behind it expects, or the head parser answers 400
-            // and the transform is never exercised at all.
-            .app_data = if (harness.tls_protocol == .http)
-                tls_http_request
-            else
-                harness.tls_tokens[index][0..tls_token_bytes],
-            // How each population knows its peer answered. A relayed
-            // session gets its own bytes back, so a byte count is exactly
-            // right; a proxied one gets a response, whose length has
-            // nothing to do with its request's, so it needs the framing
-            // rule (#204). Wiring the echo rule to the proxied population
-            // would not fail — it would *hang*, waiting for a response as
-            // long as the request that earned it.
-            .exchange_end = if (harness.tls_protocol == .http)
-                .http_response
-            else
-                .echo,
-            // The second request, on the connection the first left open —
-            // only the proxied population has one, since an echo has no
-            // turnaround to take.
-            .followup_data = if (harness.tls_protocol == .http)
-                tls_http_followup
-            else
-                &.{},
-            // A relayed session closes in protocol once its echo is back:
-            // an in-band EOF no socket EOF follows, which is the §6
-            // half-close a terminated relay can only learn from a decrypt.
-            // A proxied one lets its second request's `Connection: close`
-            // end the connection instead, and finishes on the EOF.
-            .close_after_echo = harness.tls_protocol == .l4,
-            .x25519_seed = seeds[0],
-            .p256_seed = seeds[1],
-            .random = seeds[2],
-        }) catch unreachable; // Seeded keypairs; the inputs are ours.
-        client.on_end = clientEndedHook;
-        client.on_end_context = harness;
+        harness.startTlsClient(index, &seeds, null);
     }
+    if (harness.tls_clients == 0) return;
+    const random = harness.scenario_prng.random();
+    for (&harness.tls_resume_seeds) |*seed| random.bytes(seed);
+}
+
+/// One terminating client into slot `index`, offering `resume_with` if it
+/// has one. Shared by the population and by the resuming client, so the
+/// two differ in exactly the ticket and nothing else — which is what
+/// makes a resumed session's coverage the same coverage, minus a full
+/// handshake.
+fn startTlsClient(
+    harness: *Harness,
+    index: u8,
+    seeds: *const [3][32]u8,
+    resume_with: ?*const zoxy.tls.SessionTicket,
+) void {
+    assert(index < harness.tls_clients_live);
+    const client = &harness.tls_clients_storage[index];
+    client.start(&harness.io, Harness.tlsBindAddress(), .{
+        .host_name = zoxy.tls.testdata.host_name,
+        .resume_with = resume_with,
+        // An echo token for a relayed session, a real request for a
+        // proxied one — the terminated stream has to be what the
+        // listener behind it expects, or the head parser answers 400
+        // and the transform is never exercised at all.
+        .app_data = if (harness.tls_protocol == .http)
+            tls_http_request
+        else
+            harness.tls_tokens[index][0..tls_token_bytes],
+        // How each population knows its peer answered. A relayed
+        // session gets its own bytes back, so a byte count is exactly
+        // right; a proxied one gets a response, whose length has
+        // nothing to do with its request's, so it needs the framing
+        // rule (#204). Wiring the echo rule to the proxied population
+        // would not fail — it would *hang*, waiting for a response as
+        // long as the request that earned it.
+        .exchange_end = if (harness.tls_protocol == .http)
+            .http_response
+        else
+            .echo,
+        // The second request, on the connection the first left open —
+        // only the proxied population has one, since an echo has no
+        // turnaround to take.
+        .followup_data = if (harness.tls_protocol == .http)
+            tls_http_followup
+        else
+            &.{},
+        // A relayed session closes in protocol once its echo is back:
+        // an in-band EOF no socket EOF follows, which is the §6
+        // half-close a terminated relay can only learn from a decrypt.
+        // A proxied one lets its second request's `Connection: close`
+        // end the connection instead, and finishes on the EOF.
+        .close_after_echo = harness.tls_protocol == .l4,
+        .x25519_seed = seeds[0],
+        .p256_seed = seeds[1],
+        .random = seeds[2],
+    }) catch unreachable; // Seeded keypairs; the inputs are ours.
+    // A fresh session holds nothing yet: whatever ticket this slot's
+    // previous occupant captured must not survive into the next one, and
+    // on the resuming slot that is the difference between offering the
+    // issuer's ticket and offering its own.
+    assert(client.capturedTicket() == null);
+    client.on_end = tlsClientEndedHook;
+    client.on_end_context = harness;
+}
+
+/// #204's resumption leg. A ticket can only be offered on a *second*
+/// connection, so this runs off the first one's end: whichever session
+/// captured a ticket, its ticket goes back out on a fresh dial, and the
+/// server's `psk_lookup` either opens what it sealed or falls back to a
+/// full handshake. Both are legal, which is why the counter is the
+/// oracle and not this call succeeding.
+///
+/// `clients_count` grows *before* `clientEnded` compares against it, so
+/// the wind-down waits for the resuming session rather than racing it.
+fn maybeStartResumingClient(harness: *Harness) void {
+    // The hook is wired to terminating clients only, so reaching here at
+    // all means the seed drew some — which is what stops the slot index
+    // below from underflowing.
+    assert(harness.tls_clients >= 1);
+    if (harness.tls_resume_started) return;
+    // The wind-down has stopped the listener accepting, so a dial now
+    // would only ever measure how a refused connect is reaped.
+    if (harness.scenario_ended) return;
+    const issuer = harness.ticketIssuer() orelse return;
+    const ticket = issuer.capturedTicket().?;
+    harness.tls_resume_started = true;
+    harness.tls_clients_live += 1;
+    harness.clients_count += 1;
+    // Exactly one resumer, in exactly the slot past the drawn count —
+    // today only the `tls_resume_started` latch keeps that true, so it is
+    // worth saying out loud rather than inferring from the latch.
+    assert(harness.tls_clients_live == harness.tls_clients + 1);
+    assert(harness.tls_clients_live <= tls_client_slots);
+    harness.startTlsClient(harness.tls_clients_live - 1, &harness.tls_resume_seeds, ticket);
+}
+
+/// The first finished session holding a ticket. A server issues them on
+/// every handshake, so this is normally the first client to end — but a
+/// refused dial, a cut handshake or a shed engine all end a client with
+/// nothing to offer, and on those seeds there is simply no resumption to
+/// cover.
+fn ticketIssuer(harness: *Harness) ?*TlsClient {
+    // The drawn population only: the resuming client's own ticket is
+    // never offered again, and its slot may not even exist yet.
+    assert(harness.tls_clients >= 1);
+    assert(harness.tls_clients <= harness.tls_clients_live);
+    for (harness.tls_clients_storage[0..harness.tls_clients]) |*client| {
+        if (!client.isEnded()) continue;
+        if (client.capturedTicket() != null) return client;
+    }
+    return null;
+}
+
+fn tlsClientEndedHook(context: ?*anyopaque) void {
+    const harness: *Harness = @ptrCast(@alignCast(context.?));
+    harness.maybeStartResumingClient();
+    harness.clientEnded();
 }
 
 fn clientEnded(harness: *Harness) void {
@@ -1280,13 +1417,14 @@ fn onScenarioEnd(harness: *Harness, result: Io.TimerError!void) void {
 }
 
 fn endScenario(harness: *Harness) void {
+    harness.scenario_ended = true;
     for (harness.clients[0..harness.l4_count]) |*client| {
         client.cancelIfStuck();
     }
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         client.cancelIfStuck();
     }
-    for (harness.tls_clients_storage[0..harness.tls_clients]) |*client| {
+    for (harness.tls_clients_storage[0..harness.tls_clients_live]) |*client| {
         client.cancelIfStuck();
     }
     harness.server.beginDrain();
@@ -1305,7 +1443,7 @@ pub fn tearDown(harness: *Harness) void {
             slot.* = null;
         }
     }
-    for (harness.tls_clients_storage[0..harness.tls_clients]) |*client| {
+    for (harness.tls_clients_storage[0..harness.tls_clients_live]) |*client| {
         client.deinit();
     }
 }
@@ -1364,7 +1502,7 @@ pub fn verify(harness: *Harness) !void {
 fn verifyTlsSessions(harness: *Harness) !void {
     if (harness.tls_clients == 0) return;
     var closed_count: u8 = 0;
-    for (harness.tls_clients_storage[0..harness.tls_clients], 0..) |*client, index| {
+    for (harness.tls_clients_storage[0..harness.tls_clients_live], 0..) |*client, index| {
         const back = client.app_received[0..client.app_received_len];
         if (harness.tls_protocol == .http) {
             // A proxied session gets a response, not its own bytes back.
@@ -1545,12 +1683,12 @@ fn verifyAccessLog(harness: *Harness) !void {
         // clock on admission rather than on first byte — so even the
         // silent clients (`sim/l4.zig` draws some) owe a line, theirs
         // reporting `bytes_in: 0`.
-        // TLS is a phase ahead of the protocol (§4), not a protocol of its
-        // own, so a terminated connection logs whatever it went on to
-        // speak: an `l4` terminator adds L4 lines, an `http` one adds its
-        // exchanges to the HTTP tally the equality above already covers.
+        // TLS is a phase ahead of the protocol (§4), so a terminated
+        // connection logs what it went on to speak: an `l4` terminator
+        // adds L4 lines — live, not drawn, since #204's resumer is a
+        // second connection — and an `http` one adds exchanges above.
         const terminated_l4: u8 =
-            if (harness.tls_protocol == .l4) harness.tls_clients else 0;
+            if (harness.tls_protocol == .l4) harness.tls_clients_live else 0;
         if (tally.l4 != harness.l4_count + terminated_l4) {
             return error.AccessLogL4LinesDiverged;
         }
