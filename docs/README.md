@@ -226,10 +226,14 @@ full handshake.
 > handshake-heavy traffic. Without a post-handshake flight, a client that
 > writes its `Finished` and then its request has the second write held by
 > its own Nagle, waiting for an ACK zoxy has no reason to send — a ~45 ms
-> stall per connection. The ticket flight is what carries that ACK. The
-> Tier-1 bands that measure this have not been re-run since resumption
-> landed; the last reading, without it, was 664 of 2000 requests per
-> second offered on a `Connection: close` workload against HAProxy's 831.
+> stall per connection. The ticket flight is what carries that ACK.
+>
+> Measured: on a `Connection: close` workload — a fresh TLS handshake per
+> request, the worst case — a terminated hop runs at a p50 of 158 µs
+> against HAProxy's 607 µs. On steady keep-alive traffic the two are at
+> parity, ~20k req/s at a p50 within a few µs of each other. Bulk
+> transfer is the one band zoxy trails on: ~507 µs against ~385 µs at the
+> same 100 MiB/s.
 
 ### Routing
 

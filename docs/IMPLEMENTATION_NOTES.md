@@ -715,6 +715,48 @@ unshipped. No other production-credible pure-Zig TLS 1.3 server
 exists as of the scan; Geun-Oh/zigtls is aimed the right way but
 0.1.0-dev — watch-list only.
 
+## The TLS bands, with resumption (2026-08-11, #125)
+
+The Tier-1 bands carry `zoxy L7 TLS` and `haproxy https` now, both
+terminating the same fixture certificate in front of the same plaintext
+origin. Run on `main` with session tickets wired, one pinned core for the
+proxy, load and origin off it. Bands, not single numbers.
+
+| band | zoxy L7 TLS | haproxy https |
+|---|---|---|
+| keep-alive, 20k/s offered | 19899–19935 req/s, p50 43–48 µs | 19931–19933 req/s, p50 44–48 µs |
+| large body, 400/s (100 MiB/s) | 398–399 req/s, p50 507–542 µs | 398–399 req/s, p50 383–385 µs |
+| close, 500/s offered | 498 req/s, p50 **158 µs**, p99 2339 µs | 497 req/s, p50 **607 µs**, p99 2591 µs |
+
+**The stall fix worked, and the close band is where it shows.** PR #84
+measured 664 of 2000 req/s offered against haproxy's 831 — behind, and
+failing the rate floor. With tickets: 843 against haproxy's 830 at the
+same 2000/s offer, and at a feasible offer zoxy's p50 is a quarter of
+haproxy's. The post-handshake flight is what a client's Nagle was waiting
+for, and it is no longer waiting.
+
+**The 2000/s close offer was never feasible, for anyone.** Both proxies
+top out near 840/s there — 843 and 830, within 2% of each other — because
+that band is one ECDSA signature and one key exchange per request on a
+single core. Past that the load generator's queue grows without bound and
+every latency it reports is a queueing artefact: the p50 read **2.9
+seconds** on both. So `close_rate` is 500/s now, which every path holds
+and which keeps all seven directly comparable. That is the harness's own
+rule, written into `benchPassed` before this: *haproxy missing the offer
+means the offer is wrong*. It fired on both TLS paths and it was right.
+
+Steady state is parity — 20k req/s at a p50 within a few µs of haproxy,
+which is where a real HTTPS front end lives. Bulk is the one band zoxy is
+behind on: ~507 µs p50 against ~385 µs at the same 100 MiB/s, the record
+layer's per-byte cost showing where the keep-alive band's per-request cost
+does not.
+
+One thing to watch: the RSS ceiling passed with about 1.3 MiB of headroom
+(247896 KiB against a 241038 KiB budget plus 8 MiB slack). The engine
+pool defaults to one per conn slot capped at 1024, so a bench-shaped
+config now prints a ~241 MiB budget where it used to print ~31 MiB, and
+the fixed slack was sized against the smaller number.
+
 ## TLS on the loop — the band that retired the worker pool (2026-07-25)
 
 Measured on the `phase-3a-ztls` branch (ztls engine, ECDSA P-256 fixture

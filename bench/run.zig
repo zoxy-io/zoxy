@@ -36,9 +36,11 @@ const assert = std.debug.assert;
 
 const zoxy_port: u16 = 18180;
 const zoxy_http_port: u16 = 18181;
+const zoxy_https_port: u16 = 18182;
 const origin_port: u16 = 19180;
 const haproxy_port: u16 = 17180;
 const haproxy_http_port: u16 = 17181;
+const haproxy_https_port: u16 = 17182;
 const overload_http_port: u16 = 18291;
 const work_directory = ".zig-cache/zoxy-bench";
 
@@ -104,15 +106,23 @@ const rate_floor_percent: u64 = 90;
 
 const Flags = struct {
     rate: u64 = 20_000,
-    // Connection: close is one TCP handshake per request, so on loopback
-    // it is connect-bound: at this rate the TIME_WAIT population
-    // (rate x 60 s) already exceeds the ~28k ephemeral-port pool, so the
-    // run leans on net.ipv4.tcp_tw_reuse (on by default on modern Linux
-    // and in the dev shell) to reclaim source ports. Without it, lower
-    // --close-rate toward ~400/s or the socket-error gate will trip on
-    // port exhaustion, not a proxy fault. This is a latency band (the
-    // per-request hop cost), never a throughput number.
-    close_rate: u64 = 2_000,
+    // Connection: close is one TCP handshake per request — and, on the
+    // terminating paths, one *TLS* handshake too. That is what sets this
+    // rate: an ECDSA signature plus a key exchange per connection tops
+    // out near 840/s on a single pinned core, measured, and measured the
+    // same for haproxy (843 vs 830 — IMPLEMENTATION_NOTES). Offering
+    // past that makes every path's latency a queueing artefact rather
+    // than a hop cost, which is the opposite of what this band is for:
+    // it is a latency band (the per-request hop cost), never a
+    // throughput number.
+    //
+    // So the offer is one every path can actually hold, which keeps all
+    // seven directly comparable — the whole point of a band. It also
+    // eases what the previous rate had to lean on: at 2000/s the
+    // TIME_WAIT population (rate x 60 s) exceeded the ~28k ephemeral-port
+    // pool and the run depended on net.ipv4.tcp_tw_reuse to reclaim
+    // source ports.
+    close_rate: u64 = 500,
     /// Requests per second for the large-body bands. At
     /// `large_body_bytes` each, 400/s offers ~100 MiB/s through the hop —
     /// enough that per-byte cost dominates, and well inside what loopback
@@ -160,6 +170,8 @@ pub fn main(init: std.process.Init) !u8 {
     // that manifested as a SEGV in this ReleaseFast harness.
     defer if (origin_child) |*child| child.kill(io);
 
+    // Before either proxy: both configs name these paths.
+    try writeCertificates(arena, io);
     var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, origin_address);
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
@@ -320,13 +332,13 @@ fn runOverload(
     if (proxy_cpu) |cpu| {
         affinity.pinChildTo(child.id.?, cpu);
     }
-    _ = try awaitResponsive(arena, io, overload_http_port, "zoxy overload");
+    _ = try awaitResponsive(arena, io, overload_http_port, "zoxy overload", false);
 
     // The same saturate-then-measure discipline as the primary (§9): the
     // shrunken pools are lazily resident too, and an overload burst is
     // its own saturation — the walls this scenario exists to hit fault
     // everything a longer run can touch.
-    var config = benchConfig(overload_http_port, overload_connections, flags.rate, "/");
+    var config = benchConfig(overload_http_port, overload_connections, flags.rate, "/", false);
     config.duration_ns = saturate_duration_s * std.time.ns_per_s;
     _ = try zrk.runner.run(arena, io, &config, 0, null, null, null);
 
@@ -568,17 +580,26 @@ fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers:
     const ring_seconds: u64 = (3 * head_buffers) / flags.rate + 1;
     warm_flags.duration_s = @max(saturate_duration_s, ring_seconds);
     std.debug.print(
-        "bench: saturating warmup — {d}s keep-alive + {d}s close + {d}s large-body, both zoxy ports\n",
+        "bench: saturating warmup — {d}s keep-alive + {d}s close + {d}s large-body, every zoxy port\n",
         .{ warm_flags.duration_s, saturate_duration_s, saturate_duration_s },
     );
-    const zoxy_ports = [_]u16{ zoxy_port, zoxy_http_port };
-    for (zoxy_ports) |port| {
-        _ = try loadTest(arena, io, port, &warm_flags, .keep_alive);
+    // The terminating port is here for the ceiling gate's sake, not for
+    // symmetry: engine slots and the libcrypto heap are the largest
+    // lazily-resident pools §5 prints, and a warmup that never handshakes
+    // leaves them unfaulted — which would make the RSS ceiling pass by
+    // measuring memory the run never touched.
+    const zoxy_ports = [_]struct { port: u16, tls: bool }{
+        .{ .port = zoxy_port, .tls = false },
+        .{ .port = zoxy_http_port, .tls = false },
+        .{ .port = zoxy_https_port, .tls = true },
+    };
+    for (zoxy_ports) |target| {
+        _ = try loadTest(arena, io, target.port, &warm_flags, .keep_alive, target.tls);
     }
     warm_flags.duration_s = saturate_duration_s;
-    for (zoxy_ports) |port| {
-        _ = try loadTest(arena, io, port, &warm_flags, .close);
-        _ = try loadTest(arena, io, port, &warm_flags, .large_body);
+    for (zoxy_ports) |target| {
+        _ = try loadTest(arena, io, target.port, &warm_flags, .close, target.tls);
+        _ = try loadTest(arena, io, target.port, &warm_flags, .large_body, target.tls);
     }
 }
 
@@ -587,11 +608,13 @@ fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers:
 /// before any numbers are printed.
 fn warmUp(arena: std.mem.Allocator, io: Io, direct_port: u16) !void {
     assert(direct_port != 0);
-    _ = try awaitResponsive(arena, io, direct_port, "origin");
-    _ = try awaitResponsive(arena, io, zoxy_port, "zoxy L4");
-    _ = try awaitResponsive(arena, io, zoxy_http_port, "zoxy L7");
-    _ = try awaitResponsive(arena, io, haproxy_port, "haproxy tcp");
-    _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http");
+    _ = try awaitResponsive(arena, io, direct_port, "origin", false);
+    _ = try awaitResponsive(arena, io, zoxy_port, "zoxy L4", false);
+    _ = try awaitResponsive(arena, io, zoxy_http_port, "zoxy L7", false);
+    _ = try awaitResponsive(arena, io, haproxy_port, "haproxy tcp", false);
+    _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http", false);
+    _ = try awaitResponsive(arena, io, zoxy_https_port, "zoxy L7 TLS", true);
+    _ = try awaitResponsive(arena, io, haproxy_https_port, "haproxy https", true);
 }
 
 /// One scenario's bands plus what they were asked to do, so the gates can
@@ -799,7 +822,9 @@ fn spawnZoxy(
         \\{{
         \\    "listeners": [
         \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }},
+        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http",
+        \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
         \\    ],
         \\    "clusters": {{
         \\        "origin": {{ "endpoints": ["{s}"] }}
@@ -811,7 +836,14 @@ fn spawnZoxy(
         \\    }}
         \\}}
         \\
-    , .{ zoxy_port, zoxy_http_port, origin_address });
+    , .{
+        zoxy_port,
+        zoxy_http_port,
+        zoxy_https_port,
+        work_directory ++ "/cert.pem",
+        work_directory ++ "/key.pem",
+        origin_address,
+    });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
     // stderr is piped so `readBanner` can gate on the §5 total (the
@@ -837,6 +869,40 @@ fn spawnZoxy(
 /// origin, same load, `mode tcp` to match zoxy's L4 relay and
 /// `nbthread 1` to match zoxy's single event-loop thread. Timeouts mirror
 /// the generated zoxy config so neither proxy wins by timing out earlier.
+/// The throwaway self-signed fixtures the TLS gates use
+/// (`src/tls/testdata/README.md`), read from the tree rather than
+/// embedded — the bench is its own module, so `@embedFile` cannot reach
+/// across the package boundary, and the harness already assumes a
+/// repo-root cwd (`zig-out/bin/zoxy`, `.zig-cache/…`). Benchmarking the
+/// same certificate the tests use keeps the bands honest about what they
+/// measure.
+const cert_source = "src/tls/testdata/cert.pem";
+const key_source = "src/tls/testdata/key.pem";
+
+/// zoxy reads cert and key as separate files; haproxy wants them
+/// concatenated into one. Written once, before either proxy starts —
+/// both configs name these paths, so a missing file has to fail here,
+/// where the error can say which source it came from, rather than as a
+/// proxy that will not start.
+fn writeCertificates(arena: std.mem.Allocator, io: Io) !void {
+    const dir = Io.Dir.cwd();
+    const cert = dir.readFileAlloc(io, cert_source, arena, .unlimited) catch |err| {
+        std.debug.print(
+            "bench: could not read {s} ({t}); run from the repository root\n",
+            .{ cert_source, err },
+        );
+        return err;
+    };
+    const key = try dir.readFileAlloc(io, key_source, arena, .unlimited);
+    assert(cert.len > 0);
+    assert(key.len > 0);
+    try dir.writeFile(io, .{ .sub_path = work_directory ++ "/cert.pem", .data = cert });
+    try dir.writeFile(io, .{ .sub_path = work_directory ++ "/key.pem", .data = key });
+    const combined = try std.mem.concat(arena, u8, &.{ cert, key });
+    try dir.writeFile(io, .{ .sub_path = work_directory ++ "/haproxy.pem", .data = combined });
+    assert(combined.len == cert.len + key.len);
+}
+
 fn spawnHaproxy(
     arena: std.mem.Allocator,
     io: Io,
@@ -864,7 +930,20 @@ fn spawnHaproxy(
         \\    bind 127.0.0.1:{d}
         \\    server origin {s}
         \\
-    , .{ haproxy_port, origin_address, haproxy_http_port, origin_address });
+        \\listen bench_https
+        \\    mode http
+        \\    bind 127.0.0.1:{d} ssl crt {s}
+        \\    server origin {s}
+        \\
+    , .{
+        haproxy_port,
+        origin_address,
+        haproxy_http_port,
+        origin_address,
+        haproxy_https_port,
+        work_directory ++ "/haproxy.pem",
+        origin_address,
+    });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = conf });
 
     // -db keeps haproxy in the foreground so kill() reaches the process
@@ -885,7 +964,13 @@ fn spawnHaproxy(
 
 /// Short probing runs double as warmup; a target that never answers is a
 /// setup failure, reported before any numbers are printed.
-fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u8) !void {
+fn awaitResponsive(
+    arena: std.mem.Allocator,
+    io: Io,
+    port: u16,
+    label: []const u8,
+    tls: bool,
+) !void {
     assert(port != 0);
     assert(label.len > 0);
     const probe_attempts_max: u8 = 10;
@@ -894,7 +979,7 @@ fn awaitResponsive(arena: std.mem.Allocator, io: Io, port: u16, label: []const u
     const retry_sleep = Io.Duration.fromNanoseconds(200 * std.time.ns_per_ms);
     var attempt: u8 = 0;
     while (attempt < probe_attempts_max) : (attempt += 1) {
-        var config = benchConfig(port, 4, 100, "/");
+        var config = benchConfig(port, 4, 100, "/", tls);
         config.duration_ns = std.time.ns_per_s / 2;
         const report = zrk.runner.run(arena, io, &config, 0, null, null, null) catch |err| {
             if (attempt == probe_attempts_max - 1) return err;
@@ -950,6 +1035,7 @@ fn loadTest(
     port: u16,
     flags: *const Flags,
     scenario: Scenario,
+    tls: bool,
 ) !zrk.runner.Report {
     assert(port != 0);
     assert(flags.duration_s >= 1);
@@ -958,6 +1044,7 @@ fn loadTest(
         flags.connections,
         scenario.rate(flags),
         scenario.target(),
+        tls,
     );
     config.duration_ns = flags.duration_s * std.time.ns_per_s;
     if (scenario == .close) {
@@ -977,8 +1064,10 @@ const Runs = struct {
     direct: zrk.runner.Report,
     l4: zrk.runner.Report,
     l7: zrk.runner.Report,
+    l7_tls: zrk.runner.Report,
     tcp: zrk.runner.Report,
     http: zrk.runner.Report,
+    https: zrk.runner.Report,
 };
 
 /// One full band matrix for a scenario. The paths are identical across
@@ -992,21 +1081,37 @@ fn runMode(
 ) !Runs {
     assert(direct_port != 0);
     return .{
-        .direct = try loadTest(arena, io, direct_port, flags, scenario),
-        .l4 = try loadTest(arena, io, zoxy_port, flags, scenario),
-        .l7 = try loadTest(arena, io, zoxy_http_port, flags, scenario),
-        .tcp = try loadTest(arena, io, haproxy_port, flags, scenario),
-        .http = try loadTest(arena, io, haproxy_http_port, flags, scenario),
+        .direct = try loadTest(arena, io, direct_port, flags, scenario, false),
+        .l4 = try loadTest(arena, io, zoxy_port, flags, scenario, false),
+        .l7 = try loadTest(arena, io, zoxy_http_port, flags, scenario, false),
+        .l7_tls = try loadTest(arena, io, zoxy_https_port, flags, scenario, true),
+        .tcp = try loadTest(arena, io, haproxy_port, flags, scenario, false),
+        .http = try loadTest(arena, io, haproxy_http_port, flags, scenario, false),
+        .https = try loadTest(arena, io, haproxy_https_port, flags, scenario, true),
     };
 }
 
-fn benchConfig(port: u16, connections: u32, rate: u64, target: []const u8) zrk.cli.Config {
+fn benchConfig(
+    port: u16,
+    connections: u32,
+    rate: u64,
+    target: []const u8,
+    tls: bool,
+) zrk.cli.Config {
     assert(port != 0);
     assert(connections >= 1);
     assert(rate >= 1);
     assert(target.len >= 1 and target[0] == '/');
     return .{
-        .url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = target },
+        .url = .{
+            .scheme = if (tls) .https else .http,
+            .host = "127.0.0.1",
+            .port = port,
+            .target = target,
+        },
+        // The fixtures are self-signed, and chain anchoring is not what a
+        // throughput band measures.
+        .insecure = tls,
         .connections = connections,
         .rate = rate,
         .timeout_ns = 2 * std.time.ns_per_s,
@@ -1100,8 +1205,10 @@ fn printMode(label: []const u8, runs: *const Runs, scenario: Scenario) void {
     printReport("direct      ", &runs.direct, scenario);
     printReport("zoxy L4     ", &runs.l4, scenario);
     printReport("zoxy L7     ", &runs.l7, scenario);
+    printReport("zoxy L7 TLS ", &runs.l7_tls, scenario);
     printReport("haproxy tcp ", &runs.tcp, scenario);
     printReport("haproxy http", &runs.http, scenario);
+    printReport("haproxy https", &runs.https, scenario);
     printOverhead(&runs.direct, &runs.l4, &runs.l7, &runs.tcp, &runs.http);
 }
 
@@ -1134,7 +1241,12 @@ fn rateHeld(
 /// faithfully relayed 4xx/5xx) under 1%.
 fn proxiesHealthy(mode: []const u8, runs: *const Runs) bool {
     assert(mode.len > 0);
-    return proxyHealthy(mode, "L4", &runs.l4) and proxyHealthy(mode, "L7", &runs.l7);
+    // Every zoxy path, TLS included: a terminated band that relays
+    // garbage or stalls has to fail here rather than be read off the
+    // rate line as merely slow.
+    return proxyHealthy(mode, "L4", &runs.l4) and
+        proxyHealthy(mode, "L7", &runs.l7) and
+        proxyHealthy(mode, "L7 TLS", &runs.l7_tls);
 }
 
 /// A single proxied band's health, printing the offending band so a
