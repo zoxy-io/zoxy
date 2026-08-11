@@ -168,9 +168,10 @@ const uncovered = [_]Uncovered{
     // The §4 counters (#125) the sweep still cannot move. Seeds do
     // terminate TLS now — a quarter of them bind a terminating listener,
     // l4 or http, and run real handshakes under the adversary — so what
-    // is left here is not "no scenario configures one" but three specific
-    // events a seeded, non-corrupting schedule cannot produce. Each names
-    // what reaches it instead.
+    // is left here is not "no scenario configures one" but a handful of
+    // specific events a seeded, non-corrupting schedule of
+    // single-connection clients cannot produce. Each names what reaches
+    // it instead.
     .{
         .name = "tls_handshake_failed",
         .why = .unreached,
