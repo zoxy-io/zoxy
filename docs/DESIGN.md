@@ -517,6 +517,17 @@ stops sealing before it stops opening and why none of them ever reaches
 disk — a restart costs every returning client one full handshake, and
 makes a stolen disk worthless.
 
+The interval a key seals for is that security question's answer: six
+hours, against a ticket lifetime of one. Rotation is driven from the seal
+rather than from a timer, because what the bound is *about* is how long
+one key goes on sealing — a proxy serving no handshakes seals nothing, so
+a rotation it slept through would buy nothing, while a periodic timer
+would buy an armed op the drain has to cancel and quiescence has to
+count. Six hours being several lifetimes is what makes two slots enough:
+a ticket sealed the instant before a rotation stays openable for every
+second it is valid, and the constants assert that relation rather than
+leaving it to whoever edits one of them next.
+
 The access log (§8) adds one fixed reservation beside the pools — two
 staging buffers, 64 KiB together by default — and nothing at all when it
 is off. It is in the printed total, because §5's promise is that the

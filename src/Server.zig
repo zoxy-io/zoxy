@@ -594,8 +594,34 @@ pub fn Server(comptime IoType: type) type {
         fn installTicketKey(server: *Self) void {
             var key: [Tickets.key_bytes]u8 = undefined;
             server.io.fillRandom(&key);
-            server.tls_tickets.rotate(key);
+            server.tls_tickets.rotate(key, server.nowUnix());
             assert(server.tls_tickets.ready());
+        }
+
+        /// Replace the sealing key if it has been sealing for its whole
+        /// interval (#202). Asked here, at the one place a key is used to
+        /// seal, rather than on a timer — see `tls/Tickets.zig` for why
+        /// that is the bound worth holding and the cheaper one to hold.
+        fn maybeRotateTicketKey(server: *Self) void {
+            // Reached only from the seal, which the caller has already
+            // established has a key to seal with.
+            assert(server.tls_tickets.ready());
+            if (!server.tls_tickets.dueForRotation(
+                server.nowUnix(),
+                constants.tls_ticket_key_rotation_s,
+            )) return;
+            server.installTicketKey();
+            server.counters.increment("tls_ticket_keys_rotated");
+            assert(!server.tls_tickets.dueForRotation(
+                server.nowUnix(),
+                constants.tls_ticket_key_rotation_s,
+            ));
+        }
+
+        /// The §8 wall clock in seconds, which is what a ticket's issue
+        /// time and its key's sealing clock are both measured on.
+        fn nowUnix(server: *const Self) u64 {
+            return @divFloor(server.io.nowWallNs(), std.time.ns_per_s);
         }
 
         pub fn start(server: *Self) Io.ListenError!void {
@@ -1341,7 +1367,7 @@ pub fn Server(comptime IoType: type) type {
                 // would offer resumption it could not honour, and every
                 // ticket it opened would be one it never sealed.
                 .tickets = if (server.tls_tickets.ready()) &server.tls_tickets else null,
-                .now_unix = @divFloor(server.io.nowWallNs(), std.time.ns_per_s),
+                .now_unix = server.nowUnix(),
             }) catch {
                 // Deriving the ephemeral keypair is the one fallible step,
                 // and under the OpenSSL backend it *allocates*
@@ -1904,6 +1930,9 @@ pub fn Server(comptime IoType: type) type {
             assert(engine.isConnected());
             assert(engine.outbound().len == 0);
             if (engine.tickets == null) return false;
+            // Before the first seal of this handshake, so the key these
+            // tickets are sealed under is never older than its interval.
+            server.maybeRotateTicketKey();
 
             // One counter, not two: `break` leaves before the index
             // advances, so "how many were staged" and "how far the loop
