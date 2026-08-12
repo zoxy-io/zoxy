@@ -66,6 +66,11 @@ const tls_http_followup = l7.scripts.get_request_close;
 const announced_bytes_max: u8 = 32;
 /// Virtual time from scenario start after which stuck work is force-ended.
 const scenario_end_ns: u64 = 2_000_000_000;
+/// How far a #202 seed steps the wall clock: one whole rotation interval
+/// plus a second, so the key is unambiguously overdue rather than
+/// balanced on the boundary the directed tests already pin.
+const clock_jump_ns: u64 =
+    (@as(u64, zoxy.constants.tls_ticket_key_rotation_s) + 1) * std.time.ns_per_s;
 /// The slowest §7 probe pacing a non-outage seed may draw. Named so the
 /// origin-capacity bound below is derived from the same number the draw
 /// uses, not restated in prose.
@@ -182,6 +187,12 @@ end_timer_completion: SimIo.Completion,
 /// never sees its outage, which is fine — the sweep needs the schedule
 /// to land often, not on every draw.
 http_origin_stop_at_ns: u64,
+/// Whether this seed steps the wall clock past a sealing key's rotation
+/// interval (#202), and whether it has. Drawn only on seeds that
+/// terminate TLS: a plaintext seed seals no ticket, so a jump there would
+/// move nothing while shifting the whole sweep's stream position.
+clock_jump_wanted: bool,
+clock_jumped: bool,
 http_origin_stop_completion: SimIo.Completion,
 /// Virtual instant at which the drain begins, or 0 for "at the
 /// scenario's end like every other seed".
@@ -529,6 +540,22 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     };
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
+    harness.proxy_protocol_l4 = deriveProxyProtocol(random);
+    harness.deriveTerminatingDraws(random);
+    harness.wireListeners(deriveForwarded(random));
+    harness.deriveServerConfig(random, connect_timeout_ms, health.interval_ms);
+}
+
+/// The §4 terminating draws, split from `deriveTopology` when the #202
+/// clock jump pushed that one past the length limit — the same reason,
+/// and the same remedy, as `deriveServerConfig`.
+///
+/// Order is load-bearing rather than incidental: everything here is drawn
+/// from the scenario stream, and `deriveClockJump` deliberately draws
+/// nothing when the seed took no terminating clients, so a plaintext
+/// seed's stream position — and with it every plaintext seed's coverage —
+/// stays exactly where it was before any of this existed.
+fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     // The terminating listener rides the l4 cluster's endpoint but keeps
     // its own route, so `verifyUpstreamIdentities` can tell a terminated
     // connection's origin conn from a plaintext one's.
@@ -537,15 +564,15 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
         .prefix = "/",
         .cluster_index = if (harness.tls_protocol == .http) 1 else 0,
     }};
-    harness.proxy_protocol_l4 = deriveProxyProtocol(random);
     harness.tls_clients = deriveTlsClients(
         random,
         harness.proxy_protocol_send_l4,
         harness.force_exhaustion,
     );
     harness.listeners_count = if (harness.tls_clients >= 1) 3 else 2;
-    harness.wireListeners(deriveForwarded(random));
-    harness.deriveServerConfig(random, connect_timeout_ms, health.interval_ms);
+    harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
+    assert(harness.listeners_count <= harness.listener_configs.len);
+    assert(harness.tls_clients >= 1 or !harness.clock_jump_wanted);
 }
 
 /// The top-level `Config` draw — the timeouts, the deadlines, and the
@@ -838,6 +865,17 @@ fn deriveTlsEngines(tls_clients: u8, force_exhaustion: bool) u32 {
     return @as(u32, tls_clients) + 1;
 }
 
+/// Whether a seed steps its wall clock past a rotation interval (#202).
+/// Half of the seeds that terminate TLS, and none of the rest: a
+/// plaintext seed seals no ticket, so a jump there would move nothing
+/// while shifting the whole sweep's stream position — the same argument
+/// that keeps the terminating listener off a plaintext seed's budgets.
+fn deriveClockJump(tls_clients: u8, random: std.Random) bool {
+    assert(tls_clients <= tls_clients_max);
+    if (tls_clients == 0) return false;
+    return random.boolean();
+}
+
 /// The two #159 pages the sweep serves, rendered here exactly as
 /// `config.zig`'s loader renders one — the simulator builds its
 /// `Config` by hand (no filesystem, no parse), so the shape is spelled
@@ -1104,6 +1142,7 @@ fn populateTlsClients(harness: *Harness, random: std.Random) void {
     harness.tls_clients_live = harness.tls_clients;
     harness.tls_resume_started = false;
     harness.scenario_ended = false;
+    harness.clock_jumped = false;
     assert(harness.tls_clients <= tls_clients_max);
     // One token past the drawn count, for the resuming client's slot.
     const token_count = if (harness.tls_clients >= 1)
@@ -1397,6 +1436,10 @@ fn ticketIssuer(harness: *Harness) ?*TlsClient {
 
 fn tlsClientEndedHook(context: ?*anyopaque) void {
     const harness: *Harness = @ptrCast(@alignCast(context.?));
+    // Before the resumer dials, so its handshake is the one that finds
+    // the key overdue and its offered ticket the one sealed under the key
+    // being retired.
+    harness.maybeJumpClock();
     harness.maybeStartResumingClient();
     harness.clientEnded();
 }
@@ -1411,6 +1454,38 @@ fn clientEnded(harness: *Harness) void {
 
 /// Belt and suspenders: fires even if some client never ends (a
 /// black-holed connect, a stuck exchange) and force-ends the run.
+/// #202, on the seeds that drew it: step the wall clock past a sealing
+/// key's whole rotation interval while the loop's own clock keeps
+/// ticking. The next handshake to seal a ticket finds its key overdue and
+/// replaces it — the only way a sweep whose scenarios last a virtual
+/// second reaches a bound measured in hours.
+///
+/// Hung off the first terminating session *ending*, not off a virtual
+/// instant. Virtual time only advances when a timer comes due, so a whole
+/// population can handshake, exchange and close at the same instant — a
+/// timer-driven jump measured 9 rotations across the entire sweep,
+/// because it fired long after every seal it was meant to precede. This
+/// placement measures 198.
+///
+/// What it covers, measured rather than assumed: a rotation under the
+/// adversary's schedules, and a ticket carried across a jump longer than
+/// its own lifetime failing to resume: 372 runs fail that way, against
+/// 384 unjumped runs that resume. It does *not* cover the two-slot
+/// property — a key
+/// opening after it has stopped sealing — and cannot, with one jump. One
+/// clock ages the key and the ticket together, so a jump big enough to
+/// retire a six-hour key also ages every outstanding ticket past its one
+/// hour. Reaching that state needs the key old and the ticket young: two
+/// jumps, one before the seal and a smaller one after, landing inside the
+/// window where the ticket is still valid and its key no longer seals.
+/// Left undone deliberately; `src/tls/Tickets.zig` pins it directly.
+fn maybeJumpClock(harness: *Harness) void {
+    if (!harness.clock_jump_wanted) return;
+    if (harness.clock_jumped) return;
+    harness.clock_jumped = true;
+    harness.io.advanceWallClock(clock_jump_ns);
+}
+
 fn onScenarioEnd(harness: *Harness, result: Io.TimerError!void) void {
     result catch return;
     harness.endScenario();
