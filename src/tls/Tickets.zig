@@ -17,12 +17,15 @@
 //! outstanding ticket, which costs one full handshake per returning
 //! client and keeps a stolen disk worthless.
 //!
-//! **The rotation half of that is not wired yet.** The server installs
-//! one key at startup and never calls `rotate` again, so both slots hold
-//! the same generation for the process's life and the bounded-exposure
-//! property above is a property of this module rather than of the running
-//! proxy. What it waits on is a policy decision — the interval *is* the
-//! bound — so it is tracked as #202 rather than guessed at here.
+//! Rotation is driven from the seal (`dueForRotation`), not from a timer:
+//! the bound that matters is how long one key goes on *sealing*, and a
+//! proxy serving no handshakes seals nothing, so a rotation it slept
+//! through would buy nothing — while an armed periodic timer would buy an
+//! op the drain must cancel and quiescence must count. The interval is
+//! `constants.tls_ticket_key_rotation_s` and is asserted to be at least a
+//! ticket's lifetime, which is what makes two slots enough: a ticket
+//! sealed the instant before a rotation is still openable for every
+//! second it is valid.
 //!
 //! 0-RTT is deliberately not offered (`max_early_data_size` is never
 //! set), so a replayed ticket buys an attacker a resumed handshake and
@@ -79,6 +82,10 @@ const Slot = struct {
 /// older cannot be opened, which is what bounds a key's exposure.
 slots: [2]Slot,
 current: u1,
+/// When the current key became the sealing key, in Unix seconds. What
+/// `dueForRotation` measures against — the bound this module claims is
+/// on how long one key goes on *sealing*, not on how long it exists.
+sealing_since_unix: u64,
 /// Monotonic generation counter, so a wrapped `id` never lets a stale
 /// ticket match a fresh key.
 next_id: u8,
@@ -91,21 +98,42 @@ pub fn init(tickets: *Tickets) void {
     tickets.slots = @splat(.{ .id = 0, .key = @splat(0), .live = false });
     tickets.current = 0;
     tickets.next_id = 1;
+    tickets.sealing_since_unix = 0;
     // The property `ready` exists to report, pinned where it is
     // established: an uninitialised slot must never seal or open.
     assert(!tickets.ready());
 }
 
 /// Install `key` as the sealing key, demoting the previous one to
-/// opening-only. Called at startup — and, once rotation is wired, on
-/// every interval; today the startup call is the only one.
-pub fn rotate(tickets: *Tickets, key: [key_bytes]u8) void {
+/// opening-only, and start its sealing clock at `now_unix`. Called at
+/// startup and then whenever `dueForRotation` says so.
+pub fn rotate(tickets: *Tickets, key: [key_bytes]u8, now_unix: u64) void {
     const next: u1 = if (tickets.current == 0) 1 else 0;
     tickets.slots[next] = .{ .id = tickets.next_id, .key = key, .live = true };
     tickets.current = next;
+    tickets.sealing_since_unix = now_unix;
     // Skip 0 on wrap: it is the id of a dead slot.
     tickets.next_id = if (tickets.next_id == 255) 1 else tickets.next_id + 1;
     assert(tickets.slots[tickets.current].live);
+}
+
+/// Whether the current key has been sealing for `interval_s` or longer
+/// (#202). Asked at the seal, not on a timer: the bound that matters is
+/// how long one key goes on sealing, and a proxy with no handshakes is
+/// sealing nothing — so a rotation it slept through would buy nothing,
+/// while an armed timer would buy a periodic op the drain has to cancel
+/// and quiescence has to count.
+///
+/// Saturating, so a wall clock that steps backwards reads as "not due"
+/// rather than as a rotation every seal. A clock that steps *forwards*
+/// rotates once and re-bases, which is the right answer to both.
+pub fn dueForRotation(tickets: *const Tickets, now_unix: u64, interval_s: u32) bool {
+    assert(interval_s >= 1);
+    if (!tickets.ready()) return false;
+    if (now_unix < tickets.sealing_since_unix) return false;
+    const sealing_for = now_unix - tickets.sealing_since_unix;
+    assert(sealing_for <= now_unix);
+    return sealing_for >= interval_s;
 }
 
 /// True once a key has been installed; false means resumption is off.
@@ -221,7 +249,7 @@ fn testKey(fill: u8) [key_bytes]u8 {
 test "tickets: a sealed ticket opens to what went into it" {
     var tickets: Tickets = undefined;
     tickets.init();
-    tickets.rotate(testKey(0x11));
+    tickets.rotate(testKey(0x11), 0);
 
     const psk = [_]u8{0xab} ** 32;
     var buf: [ticket_bytes]u8 = undefined;
@@ -244,10 +272,48 @@ test "tickets: sealing needs a key" {
     );
 }
 
+test "tickets: rotation comes due on the interval, and re-bases when taken" {
+    const constants = @import("../constants.zig");
+    const interval = constants.tls_ticket_key_rotation_s;
+    var tickets: Tickets = undefined;
+    tickets.init();
+    // Before a key exists there is nothing to rotate, so nothing is due —
+    // the seal path asks this before it asks whether it can seal at all.
+    try testing.expect(!tickets.dueForRotation(1_000_000, interval));
+
+    tickets.rotate(testKey(0x11), 1_000_000);
+    try testing.expect(!tickets.dueForRotation(1_000_000, interval));
+    try testing.expect(!tickets.dueForRotation(1_000_000 + interval - 1, interval));
+    // The boundary belongs to the rotation: a key that has sealed for its
+    // whole interval has finished its whole interval.
+    try testing.expect(tickets.dueForRotation(1_000_000 + interval, interval));
+
+    // Taking it re-bases the clock, so one overdue key is one rotation
+    // and not one per seal for the rest of the interval.
+    tickets.rotate(testKey(0x22), 1_000_000 + interval);
+    try testing.expect(!tickets.dueForRotation(1_000_000 + interval, interval));
+    try testing.expect(tickets.dueForRotation(1_000_000 + 2 * interval, interval));
+}
+
+test "tickets: a wall clock that steps backwards does not rotate every seal" {
+    // NTP, a VM restore, an operator with a shell. A backwards step must
+    // read as "not due" — the alternative is a key replaced on every
+    // handshake, which throws away every outstanding ticket each time and
+    // turns a clock correction into a resumption outage.
+    var tickets: Tickets = undefined;
+    tickets.init();
+    tickets.rotate(testKey(0x11), 2_000_000);
+    try testing.expect(!tickets.dueForRotation(1_000_000, 3600));
+    // And the key still seals while the clock is behind: rotation being
+    // undue is not the same as the key being unusable.
+    var buf: [ticket_bytes]u8 = undefined;
+    _ = try tickets.seal(&buf, &[_]u8{0xab} ** 32, .aes_128_gcm_sha256, 1_000_000, @splat(2));
+}
+
 test "tickets: a ticket outlives one rotation and not two" {
     var tickets: Tickets = undefined;
     tickets.init();
-    tickets.rotate(testKey(0x11));
+    tickets.rotate(testKey(0x11), 0);
 
     const psk = [_]u8{0xcd} ** 32;
     var buf: [ticket_bytes]u8 = undefined;
@@ -259,18 +325,18 @@ test "tickets: a ticket outlives one rotation and not two" {
     // One rotation: the sealing key becomes the previous key, still able
     // to open. This is the point of two slots — a client holding a
     // ticket issued a moment ago does not lose it to a rotation tick.
-    tickets.rotate(testKey(0x22));
+    tickets.rotate(testKey(0x22), 0);
     try testing.expect(tickets.open(&ticket, &psk_out, 100, 3600) != null);
 
     // Two rotations: the key is gone and so is the ticket.
-    tickets.rotate(testKey(0x33));
+    tickets.rotate(testKey(0x33), 0);
     try testing.expect(tickets.open(&ticket, &psk_out, 100, 3600) == null);
 }
 
 test "tickets: an expired ticket does not open" {
     var tickets: Tickets = undefined;
     tickets.init();
-    tickets.rotate(testKey(0x44));
+    tickets.rotate(testKey(0x44), 0);
 
     var buf: [ticket_bytes]u8 = undefined;
     const ticket = try tickets.seal(&buf, &[_]u8{0x01} ** 32, .aes_128_gcm_sha256, 100, @splat(2));
@@ -285,7 +351,7 @@ test "tickets: an expired ticket does not open" {
 test "tickets: a tampered ticket does not open" {
     var tickets: Tickets = undefined;
     tickets.init();
-    tickets.rotate(testKey(0x55));
+    tickets.rotate(testKey(0x55), 0);
 
     var buf: [ticket_bytes]u8 = undefined;
     const sealed = try tickets.seal(&buf, &[_]u8{0x02} ** 32, .aes_128_gcm_sha256, 0, @splat(3));
@@ -304,10 +370,10 @@ test "tickets: a tampered ticket does not open" {
 test "tickets: a ticket from another server does not open" {
     var mine: Tickets = undefined;
     mine.init();
-    mine.rotate(testKey(0x66));
+    mine.rotate(testKey(0x66), 0);
     var theirs: Tickets = undefined;
     theirs.init();
-    theirs.rotate(testKey(0x77));
+    theirs.rotate(testKey(0x77), 0);
 
     var buf: [ticket_bytes]u8 = undefined;
     const ticket = try theirs.seal(&buf, &[_]u8{0x03} ** 32, .aes_128_gcm_sha256, 0, @splat(4));
@@ -319,7 +385,7 @@ test "tickets: a ticket from another server does not open" {
 test "tickets: a wrong-sized identity is not a ticket" {
     var tickets: Tickets = undefined;
     tickets.init();
-    tickets.rotate(testKey(0x88));
+    tickets.rotate(testKey(0x88), 0);
     var psk_out: [psk_bytes_max]u8 = undefined;
     try testing.expect(tickets.open(&.{}, &psk_out, 0, 3600) == null);
     try testing.expect(tickets.open(&[_]u8{0} ** 8, &psk_out, 0, 3600) == null);
@@ -329,7 +395,7 @@ test "tickets: a wrong-sized identity is not a ticket" {
 test "tickets: a ticket's length says nothing about the suite" {
     var tickets: Tickets = undefined;
     tickets.init();
-    tickets.rotate(testKey(0x99));
+    tickets.rotate(testKey(0x99), 0);
 
     var short_buf: [ticket_bytes]u8 = undefined;
     var long_buf: [ticket_bytes]u8 = undefined;

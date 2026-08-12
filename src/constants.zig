@@ -276,16 +276,33 @@ pub const tls_tickets_per_handshake: u8 = 2;
 /// sealing key that opens it lives only in memory, so the real question is
 /// how long a stolen ticket is worth carrying. An hour keeps a busy
 /// client's reconnects free while making yesterday's capture useless.
-/// It would also sit comfortably inside a two-key rotation window, once
-/// rotation is wired (#202) — see `tls/Tickets.zig`, which installs one
-/// key at startup and never replaces it.
+/// It also sits comfortably inside the two-key rotation window below.
 pub const tls_ticket_lifetime_s: u32 = 60 * 60;
+
+/// How long one sealing key may go on sealing before it is replaced
+/// (#202). This interval *is* the security bound: a key that seals for
+/// six hours is a key whose theft compromises at most six hours of
+/// issued tickets, each of which is itself worth only an hour.
+///
+/// Six against the lifetime's one is deliberate on both sides. It is
+/// several lifetimes, so the two slots always cover a ticket's whole
+/// validity with room to spare; and it is short enough that a key stolen
+/// from memory ages out the same day rather than living as long as the
+/// process does.
+pub const tls_ticket_key_rotation_s: u32 = 6 * 60 * 60;
 
 comptime {
     assert(tls_tickets_per_handshake >= 1);
     // RFC 8446 §4.6.1: "Servers MUST NOT use any value greater than
     // 604800 seconds (7 days)."
     assert(tls_ticket_lifetime_s <= 7 * 24 * 60 * 60);
+    // What makes two key slots enough. A key stops sealing at a rotation
+    // and stops opening at the next one, so it opens for one interval
+    // after its last seal; a ticket sealed in that last instant must stay
+    // openable for its whole lifetime, which needs the interval to be at
+    // least the lifetime. Shrink the interval below the lifetime and
+    // resumption starts failing for tickets that have not expired.
+    assert(tls_ticket_key_rotation_s >= tls_ticket_lifetime_s);
 }
 
 /// The fixed heap libcrypto allocates from (§4, `tls/libcrypto_heap.zig`),

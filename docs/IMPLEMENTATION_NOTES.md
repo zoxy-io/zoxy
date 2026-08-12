@@ -69,11 +69,9 @@ below. #125 is closed.
 
 What it left open, now tracked rather than only recorded here:
 
-- **#202 — the sealing key is never rotated.** `Tickets` is built for two
-  slots and `rotate` is called once, at `start`, so both hold one
-  generation for the process's life. The interval *is* the security
-  bound, which makes it a policy question rather than an implementation
-  one, so it was deliberately not guessed at.
+- ~~**#202 — the sealing key is never rotated.**~~ Closed: six hours
+  against a one-hour ticket lifetime, driven from the seal rather than
+  from a timer. See "Rotating from the seal" below.
 - **#203 — the live gate's https leg wedged once on macOS**, and has not
   recurred. See the section of that name below for what is ruled out and
   where to look.
@@ -126,6 +124,45 @@ layer costs zero userspace CPU and the `splice` c10k lever (below) stays
 applicable to TLS traffic. Known fiddly parts: KeyUpdate/post-handshake
 control messages arrive via CMSG, and session tickets must be sent
 before the switchover.
+
+### Rotating from the seal (#202)
+
+The interval was the open question, not the mechanism — six hours against
+a ticket lifetime of one. Several lifetimes, so the two slots always
+cover a ticket's whole validity; short enough that a key stolen from
+memory ages out the same day rather than living as long as the process.
+`constants.zig` asserts the relation (`rotation_s >= lifetime_s`) rather
+than trusting whoever edits one of them next: shrink the interval below
+the lifetime and resumption silently starts failing for tickets that have
+not expired.
+
+What is worth recording is the *mechanism*, because the obvious one was
+wrong. A periodic timer is the reflex, and it costs more than it looks:
+an armed op that the drain has to cancel, a cancel completion to own it,
+and a fifth question in `onDrainStuck`'s report — all so that a proxy
+sitting idle at 4am can replace a key that is sealing nothing.
+
+Driving it from the seal instead (`Tickets.dueForRotation`, asked at the
+top of `stageTlsTickets`) gets the property the bound is actually about —
+no key ever seals a ticket after sealing for longer than its interval —
+with no armed op, no drain interaction and no quiescence change. The
+counter then reads as intervals *that saw traffic*, which is the honest
+reading rather than a miss: a key that sealed nothing has nothing to
+expose.
+
+Two edges the directed tests pin. The boundary belongs to the rotation (a
+key that has sealed for its whole interval is done). And a wall clock
+that steps backwards — NTP, a VM restore — must read as "not due":
+saturating there, rather than rotating, is what stops a clock correction
+from replacing the key on every handshake and turning itself into a
+resumption outage.
+
+The sweep cannot reach any of this: six hours against a two-second
+scenario. The census entry refuses the tempting fix — shortening the
+interval for the sweep would gate a different proxy than the one that
+ships — and names the directed tests instead. Reaching it properly needs
+a wall clock a scenario can jump hours forward, which nothing models
+today.
 
 ### Ending an exchange by framing (#204)
 

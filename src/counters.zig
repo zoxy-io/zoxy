@@ -369,6 +369,14 @@ pub const Counters = struct {
     /// tell them apart. Also the one that moves the handshake CPU: a
     /// resumed handshake skips the signature entirely.
     tls_resumed: Value = Value.init(0),
+    /// Sealing keys replaced (#202). Rotation is driven from the seal, so
+    /// this counts intervals *that saw traffic* — a proxy idle across one
+    /// rotates once, at its next handshake, and that is the intended
+    /// reading rather than a miss: a key that sealed nothing has nothing
+    /// to expose. An operator watching this flat while
+    /// `tls_tickets_issued` climbs is watching a clock that is not
+    /// advancing.
+    tls_ticket_keys_rotated: Value = Value.init(0),
     /// Accept completions that landed after the drain began (§8).
     shed_draining: Value = Value.init(0),
     /// Drain deadline tore down stragglers (§8).

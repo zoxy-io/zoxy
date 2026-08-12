@@ -235,6 +235,24 @@ const uncovered = [_]Uncovered{
             "either, which is the honest gap",
     },
     .{
+        .name = "tls_ticket_keys_rotated",
+        .why = .unreached,
+        .reason = "the sealing key rotates after six hours of sealing and a " ++
+            "scenario advances the wall clock by one virtual second, so no " ++
+            "seed can reach it. Shortening the interval for the sweep is " ++
+            "the one fix worth " ++
+            "refusing: that interval is the security bound itself, so a " ++
+            "sweep run against a smaller one would be gating a different " ++
+            "proxy than the one that ships. src/tls/Tickets.zig drives the " ++
+            "whole rule directly — due exactly on the interval and not " ++
+            "before, re-based when taken so one overdue key is one rotation, " ++
+            "held off by a clock that steps backwards, and a ticket that " ++
+            "outlives one rotation and not two. What the sweep would add is " ++
+            "the adversary's schedules across a rotation, and reaching that " ++
+            "needs a wall clock the scenario can jump hours forward — " ++
+            "nothing models that today",
+    },
+    .{
         .name = "l7_no_route",
         .why = .unreached,
         .reason = "the sim's route table is a single \"/\" prefix, which no " ++
