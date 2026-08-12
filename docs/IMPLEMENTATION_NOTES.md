@@ -72,11 +72,16 @@ What it left open, now tracked rather than only recorded here:
 - ~~**#202 — the sealing key is never rotated.**~~ Closed: six hours
   against a one-hour ticket lifetime, driven from the seal rather than
   from a timer. See "Rotating from the seal" below.
-- **#203 — the live gate's https leg wedged once on macOS**, and has not
-  recurred. See the section of that name below for what is ruled out and
-  where to look.
+- ~~**#203 — the live gate's https leg wedged on macOS.**~~ Closed on both
+  backends: `listenClose` assumed a cancelled accept delivers its own
+  completion, which is an io_uring property. Epoll drops it outright;
+  kqueue delivers one it has already submitted and drops one still queued,
+  which is what an accept re-armed from inside a callback always is.
 - ~~**#204 — the simulator's TLS clients are single-connection.**~~ Closed:
   see "Ending an exchange by framing" below for all three legs.
+- **#206 — the sweep could not model an op the backend never delivers.**
+  Mostly closed; see "Stranding an op" below for what the sweep reaches
+  now and the one shape still out of its reach.
 
 One smaller thing still recorded only here, because it is a line rather
 than a project: `ResponseBodyPolicy.afterSend` credits *ciphertext* to
@@ -124,6 +129,89 @@ layer costs zero userspace CPU and the `splice` c10k lever (below) stays
 applicable to TLS traffic. Known fiddly parts: KeyUpdate/post-handshake
 control messages arrive via CMSG, and session tickets must be sent
 before the switchover.
+
+### Stranding an op the backend never delivers (#206)
+
+Everything this simulator did completed. A shutdown delivers EOF to an
+armed recv, a close delivers to the peer, a cancel lands. That is
+faithful to io_uring and it is why the sweep is as good as it is — and it
+put one whole class of defect out of reach of any number of seeds. #203
+was that class, and four million nightly seeds could not have found it.
+
+Half the mechanism already existed: a black-holed connect has always sat
+at `ready_at_ns = never_ns`. `Completion.dropped` generalises it, checked
+at the top of `opReady` — the one choke point every kind of readiness
+passes through. `dropPendingOps(kind)` takes *pending* ops rather than
+ops at enqueue, which is the distinction that matters: #203's shape is an
+op that was armed and then had its completion taken away, which is what a
+cancel that does not deliver looks like from above. Marking at enqueue
+would model a backend refusing work, and that already has a name.
+
+**The give-up had to come out from behind `std.process.exit` first.**
+`onDrainStuck` ended in one, which made it the single branch no gate
+could enter — taking the exit takes the test process with it. That is
+part of why the backstop shipped ungated. `Io.abort` puts it on the seam:
+a real exit in production, a recorded code in the simulator.
+
+**The sweep's oracle is an alternative for every seed, not a branch on
+whether one stranded anything.** Either the ordinary invariants hold, or
+the server gave up with the code that names which backstop it was. What
+that phrasing buys is the property actually worth holding — no schedule
+may end with the loop alive and nobody the wiser — rather than a
+weaker "stranded seeds are excused". 52 runs per 4096-seed sweep take the
+second branch.
+
+The abort is only excused on a seed that actually stranded something,
+which needs the draw and the strand kept as two facts rather than one
+cleared value. Without that gate the branch would accept any stuck drain
+as "#206 working as intended" — including one a future *release* bug
+produced with every op delivered, which is the exact defect the backstop
+exists to catch and the last thing a sweep should swallow.
+
+Clean seeds never draw a strand, for the reason every sibling
+perturbation states: their oracle is each script's exact golden outcome,
+and a stranded op ends the run at the give-up before those oracles run —
+for every client in the scenario, not only the one the strand touched. A
+silently unanswered exchange passing as "the backstop worked" is
+precisely what clean seeds exist to forbid.
+
+**Draw the kind, not the op.** Measured at a wind-down, `accept` and
+`timer` are four fifths of everything pending, so picking a random *op*
+would spend the whole fraction on those two and reach `recv_group` about
+once per sweep.
+
+Two kinds are excluded, for opposite reasons, and both are findings.
+
+`close` is **never** armed at a wind-down — zero occurrences across the
+sweep. So "a slot that can never be released", arguably the scarier half
+of the #203 class, is not reachable by dropping at the drain however the
+seed picks. It needs a drop placed mid-teardown, which is a different
+hook and is what keeps #206 open.
+
+`timer` is worse, and it is the finding worth carrying: **`onDrainStuck`
+cannot catch a stranded timer, because it is one.** A seed that strands
+the drain deadline strands the thing that would have reported it, and the
+run ends in the simulator's own deadlock with no diagnostic at all — seed
+2302, three dropped timers and nothing else pending. That is a true
+statement about the reach of #203's fix rather than a defect this sweep
+can hold the proxy to, so the kind is excluded and the case pinned by a
+directed test in `contract_test.zig` instead — the form that breaks
+loudly if it ever stops being true, where a comment would not. Covering
+it for real would need a watchdog that is not a timer, which is a design
+question and not a gate.
+
+A trap worth naming while it is fresh: the draw indexes a `kinds` array,
+so adding, removing or reordering an entry silently re-rolls which seed
+draws which kind. Seed 2302 above will not reproduce against the shipped
+list, because `.timer` is no longer in it. Any seed number pinned against
+this function has the same short shelf life.
+
+The sweep runs with `dump_on_abort = false`. A stranded seed reaches the
+give-up on purpose and its operator forensics are two hundred lines
+apiece, while the verdict here is `abortedWith` and not the wording. That
+switch exists because stderr from a *passing* build step makes Zig's
+build runner print `failed command:` under a build that exited zero —
+which cost three runs to diagnose the first time.
 
 ### Rotating from the seal (#202)
 
@@ -1850,18 +1938,38 @@ can only be the proxy's fault. The band now prints the refused/timed-out
 split every run: a threshold whose margin is invisible until it trips is
 how this one sat mis-specified for a week.
 
-## Open: the https leg wedged once on macOS (2026-08-11, #203)
+## Closed: the https leg wedged on macOS (2026-08-11, #203)
 
 The first CI run carrying the Tier-0.5 https leg wedged on the macOS
 runner — the whole 30 s budget, against a run that takes about a second.
-Every run since has passed there, on the same commit and on later ones,
-so this is **intermittent and unexplained**, not a platform that cannot
-terminate TLS. Recorded rather than waved off: an intermittently red gate
-is worse than a red one, because the first instinct on seeing it green
-again is to stop looking.
+It then passed for a while, which is the dangerous shape: an
+intermittently red gate is worse than a red one, because the first
+instinct on seeing it green again is to stop looking. Two in thirteen
+runs, in the end.
 
-What is known. Linux has never reproduced it, over dozens of local runs
-and every CI run. The commit before — the same TLS listener, configured
+**It had nothing to do with TLS.** The https leg was the first thing to
+configure an admin listener alongside a terminating one, and the bug was
+in `listenClose`: it cancelled an armed accept and assumed the cancel
+delivers that accept's completion. That is an io_uring property. Epoll's
+`.cancel` is `stop_completion`, which drops the op without calling
+anything back; kqueue delivers a cancelled accept it has already
+*submitted* and drops one still queued — and libxev submits at the top of
+a tick, never inside its callback loop, so an accept re-armed from inside
+a callback is always still queued. The admin plane re-arms exactly that
+way. Its accept was orphaned, `listening` never cleared,
+`maybeStopAfterDrain` never stopped the loop, and SIGTERM stopped meaning
+anything. Any deployment with `admin` configured was exposed.
+
+The diagnosis below is kept because the reasoning is still worth reading,
+and because its standing suspicion — "a lost wakeup in the kqueue path,
+since the TLS legs are the one place a data op is armed outside the
+provided-buffer ring" — was half right in a way that cost two days: the
+lost wakeup was real, the kqueue path was right, and *the TLS legs had
+nothing to do with it*. The correlation was that the https leg was the
+first test to drain a process with two listeners.
+
+What was known at the time, kept as written. Linux has never reproduced
+it, over dozens of local runs and every CI run. The commit before — the same TLS listener, configured
 and started, but with no client connecting to it — passed macOS, so the
 listener, the certificate load and the libcrypto heap install are not it;
 the first macOS execution of the *handshake and exchange* path is also
@@ -1877,10 +1985,28 @@ The instrumentation to catch it next time is in: the watchdog names the
 wait it died in (and, for the requests, which one), and it now SIGTERMs
 the proxy and lets it drain before killing it, so the report carries the
 proxy's own counters. The first wedge had neither — it said only that
-thirty seconds had passed, which is what made it un-diagnosable. The
-standing suspicion to test first is a lost wakeup in the kqueue path,
-since the TLS legs are the one place a data op is armed outside the
-provided-buffer ring, and a race there would present exactly this way.
+thirty seconds had passed, which is what made it un-diagnosable.
+
+What actually closed it was making the failure reproducible instead of
+waiting for it: `-Dio-backend=epoll` builds against libxev's epoll
+backend on Linux, which is the *readiness* model that macOS ships and
+Linux's default is not. It took #203 from "two in thirteen runs on a
+shared runner" to ten of ten locally, in seconds. Green there does not
+clear macOS — they are different backends — but a failure is
+reproducible, and that turned out to be the whole difficulty.
+
+One mistake worth not repeating. The first fix keyed the new delivery
+path on `xev.backend == .io_uring`, which put *kqueue* on it too —
+changing behaviour on a shipped platform on the strength of an inference
+from epoll. macOS CI hung for 23 minutes. The rule since: only change
+what a backend does where that backend has said, in its own types, that
+it cannot do the other thing. Here that is
+`reportsCanceled(xev.AcceptError)`, since a backend that can deliver a
+cancelled accept names `Canceled` and one that cannot does not. That rule
+was still not sufficient — kqueue names `Canceled` and still drops a
+queued accept — but it was sufficient to stop the regression, and the
+real fix (submit before cancelling) came from reproducing on the dev box
+rather than from another inference.
 
 ## The live gate's measured numbers (2026-08-02, #144)
 

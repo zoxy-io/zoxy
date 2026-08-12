@@ -741,7 +741,7 @@ pub fn Server(comptime IoType: type) type {
 
         /// Distinct from every ordinary exit so a supervisor can tell "the
         /// drain failed" from "the config was bad" without parsing output.
-        const drain_stuck_exit_code: u8 = 4;
+        pub const drain_stuck_exit_code: u8 = 4;
 
         /// The drain could not finish. Say what it is waiting on and stop.
         ///
