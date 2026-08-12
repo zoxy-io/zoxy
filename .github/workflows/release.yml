@@ -16,14 +16,52 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: build binaries & publish release
-    runs-on: ubuntu-latest
+  # One runner per target, natively.
+  #
+  # These used to cross-compile from a single Linux runner, which stopped
+  # working the moment zoxy gained a C dependency: `linkSystemLibrary("crypto")`
+  # resolves libcrypto out of the *host's* nix store, so every target but the
+  # host's own architecture fails to link ("libcrypto.so is incompatible with
+  # aarch64linux"). It failed on the 0.2.0 tag, after TLS termination (#125)
+  # made libcrypto load-bearing, and it took the release from four platforms to
+  # one — including both macOS targets, whose SIGTERM hang (#203) was the very
+  # thing that release existed to fix.
+  #
+  # Building natively also means every artifact is produced on the platform it
+  # runs on, which is the only way the release checklist's "smoke the actual
+  # artifact" step can ever stop being manual.
+  build:
+    name: build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64-linux
+            os: ubuntu-latest
+            zig_target: x86_64-linux-musl
+            # x86_64 gets v3 (AVX2/BMI2/FMA, Haswell 2013+ / Zen 2017+): the
+            # default baseline is plain SSE2, which caps hparse's vector width
+            # at 128 bits (std.simd.suggestVectorLength keys off target CPU
+            # features, DESIGN.md §7); v3 doubles it to 256.
+            cpu: x86_64_v3
+          - label: aarch64-linux
+            os: ubuntu-24.04-arm
+            zig_target: aarch64-linux-musl
+            # aarch64 keeps its default baseline — NEON is mandatory in
+            # ARMv8-A, so there is no wider portable win to take.
+            cpu: ''
+          - label: x86_64-macos
+            os: macos-13
+            zig_target: x86_64-macos
+            cpu: x86_64_v3
+          - label: aarch64-macos
+            os: macos-latest
+            zig_target: aarch64-macos
+            cpu: ''
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
-      # Zig cross-compiles every target from this one Linux runner, using the
-      # exact Zig 0.16 the flake pins.
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
         with:
@@ -46,49 +84,98 @@ jobs:
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
           echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and package all targets
+      - name: Build and package
         run: |
           set -euo pipefail
           version="${{ steps.ver.outputs.version }}"
           mkdir -p dist
+          # -Dbuild-id is passed rather than left to build.zig's `git
+          # describe` fallback: this checkout is shallow and carries no
+          # tags, so describe would fall back to a bare commit SHA and
+          # stamp every release binary with one. Handing it the tag makes
+          # the identifier equal the version, which `zoxy --version`
+          # recognises and omits — a release says `zoxy 0.0.7` and
+          # nothing else, whatever the checkout depth happens to be.
+          devenv shell -- zig build \
+            -Dtarget="${{ matrix.zig_target }}" \
+            ${{ matrix.cpu && format('-Dcpu={0}', matrix.cpu) || '' }} \
+            -Doptimize=ReleaseSafe \
+            -Dbuild-id="${{ steps.ver.outputs.tag }}" --prefix out
 
-          # zig-target : release-archive-label : -Dcpu value (empty = default)
-          #
-          # x86_64 gets -Dcpu=x86_64_v3 (AVX2/BMI2/FMA, Haswell 2013+ / Zen
-          # 2017+): the default cross-compile baseline is plain SSE2, which
-          # caps hparse's vector width at 128 bits (std.simd.suggestVectorLength
-          # keys off target CPU features, DESIGN.md §7); v3 doubles it to 256.
-          # aarch64 is left at its default baseline — NEON is mandatory in
-          # ARMv8-A, so there is no wider portable win to take there.
-          targets="
-            x86_64-linux-musl:x86_64-linux:x86_64_v3
-            aarch64-linux-musl:aarch64-linux:
-            x86_64-macos:x86_64-macos:x86_64_v3
-            aarch64-macos:aarch64-macos:
-          "
-          for pair in $targets; do
-            zig_t="$(echo "$pair" | cut -d: -f1)"
-            label="$(echo "$pair" | cut -d: -f2)"
-            cpu="$(echo "$pair" | cut -d: -f3)"
-            echo "::group::$label ($zig_t${cpu:+, -Dcpu=$cpu})"
-            # -Dbuild-id is passed rather than left to build.zig's `git
-            # describe` fallback: this checkout is shallow and carries no
-            # tags, so describe would fall back to a bare commit SHA and
-            # stamp every release binary with one. Handing it the tag makes
-            # the identifier equal the version, which `zoxy --version`
-            # recognises and omits — a release says `zoxy 0.0.7` and
-            # nothing else, whatever the checkout depth happens to be.
-            devenv shell -- zig build \
-              -Dtarget="$zig_t" ${cpu:+-Dcpu="$cpu"} -Doptimize=ReleaseSafe \
-              -Dbuild-id="${{ steps.ver.outputs.tag }}" --prefix "out/$label"
-            tar czf "dist/zoxy-$version-$label.tar.gz" -C "out/$label/bin" zoxy
-            echo "::endgroup::"
+          # The binary runs on the machine that built it now, so the
+          # cheapest possible confidence is free: ask it what it is. A
+          # release that reports the wrong version is the failure the
+          # version-bump-before-tag rule exists to prevent, and this is
+          # where it would show.
+          reported="$(./out/bin/zoxy --version)"
+          echo "built: $reported"
+          case "$reported" in
+            *"$version"*) ;;
+            *) echo "::error::binary reports '$reported', expected $version"; exit 1 ;;
+          esac
+
+          tar czf "dist/zoxy-$version-${{ matrix.label }}.tar.gz" -C out/bin zoxy
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoxy-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v35
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+
+      - name: Set up devenv binary cache
+        uses: cachix/cachix-action@v17
+        with:
+          name: devenv
+          skipPush: true
+
+      - name: Install devenv
+        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+
+      - name: Resolve version
+        id: ver
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: Collect artifacts and checksum
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          find staging -name '*.tar.gz' -exec mv {} dist/ \;
+
+          # Every platform or none. A partial release is how a four-target
+          # matrix quietly becomes a one-target one — which is exactly what
+          # the cross-compile it replaced did on the 0.2.0 tag, and the
+          # `fail-fast: false` above means a single broken target no longer
+          # cancels the others into looking like they were never tried.
+          for label in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+            test -f "dist/zoxy-$version-$label.tar.gz" \
+              || { echo "::error::missing artifact for $label"; exit 1; }
           done
 
           # The config JSON Schema is target-independent, so emit it once
           # (§5). It is generated from the Zig config definitions, never
           # committed; shipping it here as an asset keeps a single source of
-          # truth. The sha256sum step below checksums it with the archives.
+          # truth.
           devenv shell -- zig build schema
           cp zig-out/config.schema.json "dist/zoxy-$version-config.schema.json"
 
