@@ -157,12 +157,40 @@ saturating there, rather than rotating, is what stops a clock correction
 from replacing the key on every handshake and turning itself into a
 resumption outage.
 
-The sweep cannot reach any of this: six hours against a two-second
-scenario. The census entry refuses the tempting fix — shortening the
-interval for the sweep would gate a different proxy than the one that
-ships — and names the directed tests instead. Reaching it properly needs
-a wall clock a scenario can jump hours forward, which nothing models
-today.
+The sweep reaches it now, through `SimIo.advanceWallClock` — a step to
+the wall clock that leaves the monotonic clock alone. The asymmetry is
+what production actually does (an NTP correction, a VM restore, a leap
+second) and it is also the only version that works: moving the monotonic
+clock would fire every armed deadline at once. The census exemption this
+section used to describe is deleted.
+
+Two things that cost a rewrite each, both worth keeping.
+
+**Virtual time only advances when a timer comes due.** The first version
+armed the jump at a drawn instant in the first fifth of the scenario, and
+measured **9 rotations across 4096 seeds**. A whole population can
+handshake, exchange and close at the same virtual instant, so the timer
+fired long after every seal it was meant to precede. Hanging the jump off
+the first terminating session *ending* instead measures **198**. The
+lesson generalises past this feature: in this simulator, "early in the
+scenario" is not a time, it is an event.
+
+**One clock ages the key and the ticket together.** The placement was
+also chosen because it is where #204's resuming client dials, and the
+comment claimed it therefore covered the two-slot property — a key
+opening after it has stopped sealing. Measurement said otherwise: with a
+jump longer than a ticket's lifetime, every outstanding ticket is expired
+before the two-slot question arises. What the sweep actually shows is a
+rotation under adversarial schedules, plus a carried ticket failing to
+resume across the jump: 372 runs fail that way, against 384 unjumped runs
+that resume.
+
+Reaching two slots needs the key old and the ticket young at once, which
+one jump cannot produce: two jumps, one before the seal and a smaller one
+after, landing inside the window where a ticket is still valid and its
+key no longer seals. Deliberately not built — `Tickets.zig` pins that
+property directly, and the arithmetic to place two jumps correctly is
+more fragile than the thing it would test.
 
 ### Ending an exchange by framing (#204)
 

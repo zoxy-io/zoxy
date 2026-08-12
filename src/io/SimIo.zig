@@ -120,6 +120,10 @@ pending_set_option_errors: u8,
 /// none of.
 pressure_cause: Io.Pressure.Cause,
 last_pressure: Io.Pressure,
+/// What `advanceWallClock` has added to the wall clock, on top of
+/// however far virtual time has moved. Zero on every seed that does not
+/// ask, which keeps the two clocks agreeing in the ordinary case.
+wall_offset_ns: u64,
 stopped: bool,
 /// The code a caller gave up with (`abort`), which production would have
 /// spent on a process exit. Null until one does.
@@ -470,9 +474,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.pending_signals_count = 0;
     io.signal_callback = null;
     io.signal_userdata = null;
-    io.now_ns_value = clock_start_ns;
-    io.prng = std.Random.DefaultPrng.init(options.seed);
-    io.key_prng = std.Random.DefaultPrng.init(options.seed ^ key_seed_salt);
+    io.initClocksAndStreams(options.seed);
     io.adversary = options.adversary;
     io.pending_set_option_errors = 0;
     io.pressure_cause = .out_of_buffers;
@@ -794,13 +796,55 @@ pub fn localAddress(io: *SimIo, socket: Socket) std.Io.net.IpAddress {
     return io.socketEntry(socket).local_address;
 }
 
-/// The simulated wall clock (§8): the fixed epoch base plus however far
-/// virtual time has advanced. Derived from `now_ns_value` rather than
-/// tracked separately so the two clocks can never disagree about how much
-/// time a scenario took.
+/// The simulated wall clock (§8): the fixed epoch base, however far
+/// virtual time has advanced, and whatever `advanceWallClock` has added
+/// on top. The first two keep the ordinary case honest — a scenario's two
+/// clocks agree about how much time it took — and the third is what lets
+/// a scenario reach a deadline measured in hours.
 pub fn nowWallNs(io: *const SimIo) u64 {
     assert(io.now_ns_value >= clock_start_ns);
-    return wall_clock_base_ns + (io.now_ns_value - clock_start_ns);
+    return wall_clock_base_ns + (io.now_ns_value - clock_start_ns) +
+        io.wall_offset_ns;
+}
+
+/// The two clocks and the two random streams a seed starts from. Split
+/// out of `init` when the wall-clock offset pushed it past the length
+/// limit, and they belong together anyway: these are the whole of what
+/// makes one seed replay identically.
+///
+/// Two streams, not one, and salted apart: key material is drawn from
+/// `key_prng` so that how much of it a scenario asks for cannot shift the
+/// adversary's schedule, which would make a handshake's mere existence
+/// change every delivery after it.
+fn initClocksAndStreams(io: *SimIo, seed: u64) void {
+    io.now_ns_value = clock_start_ns;
+    io.wall_offset_ns = 0;
+    io.prng = std.Random.DefaultPrng.init(seed);
+    io.key_prng = std.Random.DefaultPrng.init(seed ^ key_seed_salt);
+    assert(io.now_ns_value == clock_start_ns);
+    assert(io.wall_offset_ns == 0);
+}
+
+/// Step the wall clock forward without touching the monotonic one.
+///
+/// The asymmetry is the whole point, and it is what production actually
+/// does: an NTP correction, a VM restore or a leap second moves the wall
+/// clock while the loop's clock keeps ticking uniformly. Moving the
+/// monotonic clock instead would fire every armed deadline at once —
+/// idle, request, drain, health — which is a different scenario and not a
+/// useful one.
+///
+/// It exists because some bounds are measured in hours against scenarios
+/// that run for a virtual second: a ticket's lifetime and its sealing
+/// key's rotation interval (#202) are both unreachable otherwise, so the
+/// sweep would be gating a proxy whose keys never turn over.
+pub fn advanceWallClock(io: *SimIo, delta_ns: u64) void {
+    assert(delta_ns >= 1);
+    // Into the trace: two runs of one seed must jump the same way, and a
+    // run that jumped differently must not hash equal to one that did not.
+    io.mix(delta_ns);
+    io.wall_offset_ns += delta_ns;
+    assert(io.wall_offset_ns >= delta_ns);
 }
 
 /// Targeted scenario control: the next `logWrite` fails, driving the

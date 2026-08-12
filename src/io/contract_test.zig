@@ -646,6 +646,34 @@ test "simio: a dropped accept is never delivered, where a live one is" {
     try std.testing.expectEqual(@as(u32, 0), stuck_io.dropPendingOps(.recv));
 }
 
+// #202: some bounds are measured in hours against scenarios that run for
+// a virtual second. XevIo has no counterpart and needs none — this is
+// scenario control like `injectLogWriteError`, not a seam decl.
+test "simio: a wall-clock step leaves the monotonic clock alone" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 13 });
+    const mono_before = sim_io.nowNs();
+    const wall_before = sim_io.nowWallNs();
+
+    const step_ns: u64 = 6 * 60 * 60 * std.time.ns_per_s;
+    sim_io.advanceWallClock(step_ns);
+
+    // The asymmetry is the point: moving the monotonic clock instead
+    // would fire every armed deadline at once, which is a different
+    // scenario and not a useful one.
+    try std.testing.expectEqual(mono_before, sim_io.nowNs());
+    try std.testing.expectEqual(wall_before + step_ns, sim_io.nowWallNs());
+
+    // Steps accumulate rather than replace, so a scenario can cross a
+    // bound twice.
+    sim_io.advanceWallClock(step_ns);
+    try std.testing.expectEqual(wall_before + 2 * step_ns, sim_io.nowWallNs());
+    try std.testing.expectEqual(mono_before, sim_io.nowNs());
+}
+
 test "simio: one seed replays one key stream, and a different seed does not" {
     // The §9 property TLS rides on: a seeded run's handshake is byte-exact,
     // which is only true if the key material replays with everything else.
