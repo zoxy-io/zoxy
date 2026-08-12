@@ -646,6 +646,55 @@ test "simio: a dropped accept is never delivered, where a live one is" {
     try std.testing.expectEqual(@as(u32, 0), stuck_io.dropPendingOps(.recv));
 }
 
+const StrandedTimer = struct {
+    io: *SimIo,
+    completion: SimIo.Completion = .{},
+    fired: bool = false,
+
+    fn onTimer(self: *StrandedTimer, result: Io.TimerError!void) void {
+        result catch return;
+        self.fired = true;
+    }
+};
+
+// #206: the one shape §8's drain backstop cannot catch, pinned so it
+// breaks loudly if it ever stops being true.
+//
+// `Server.onDrainStuck` is a timer. A backend that strands timers strands
+// that one too, so the process has nothing left to notice with and the
+// run ends in the simulator's deadlock rather than in a diagnostic. The
+// sweep therefore does not draw `.timer` (see `sim/Harness.zig`), which
+// would otherwise fail honest seeds — this is where the limitation lives
+// instead of only in a comment. Covering it for real needs a watchdog
+// that is not a timer, which is a design question and not a gate.
+test "simio: a stranded timer has nothing left to report it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{
+        .seed = 17,
+        // The deadlock is the assertion; its forensics are noise here.
+        .dump_on_deadlock = false,
+    });
+
+    var watchdog: StrandedTimer = .{ .io = &sim_io };
+    sim_io.timerStart(
+        &watchdog.completion,
+        std.time.ns_per_s,
+        StrandedTimer,
+        &watchdog,
+        StrandedTimer.onTimer,
+    );
+    try std.testing.expectEqual(@as(u32, 1), sim_io.dropPendingOps(.timer));
+
+    try std.testing.expectError(error.Deadlock, sim_io.run());
+    // Stated as an assertion rather than left implicit: the watchdog
+    // never ran, so whatever it was watching went unreported.
+    try std.testing.expect(!watchdog.fired);
+    try std.testing.expectEqual(@as(?u8, null), sim_io.abortedWith());
+}
+
 // #202: some bounds are measured in hours against scenarios that run for
 // a virtual second. XevIo has no counterpart and needs none — this is
 // scenario control like `injectLogWriteError`, not a seam decl.

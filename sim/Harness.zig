@@ -193,6 +193,13 @@ http_origin_stop_at_ns: u64,
 /// move nothing while shifting the whole sweep's stream position.
 clock_jump_wanted: bool,
 clock_jumped: bool,
+/// The #206 op kind this seed strands at its wind-down, or null; and
+/// whether the strand has happened. Two fields for the reason the pair
+/// above is two: what a seed drew and what it did are different facts,
+/// and `verify` needs the draw to still be there when it decides whether
+/// a stuck drain was asked for.
+drop_kind: ?SimIo.OpKind,
+drop_taken: bool,
 http_origin_stop_completion: SimIo.Completion,
 /// Virtual instant at which the drain begins, or 0 for "at the
 /// scenario's end like every other seed".
@@ -270,6 +277,11 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
         .seed = seed,
         .adversary = deriveAdversary(random, harness.clean),
         .buffer_group_count = harness.head_buffers,
+        // #206: a stranded seed reaches the §8 give-up on purpose, and
+        // the operator forensics it prints there are two hundred lines
+        // apiece. The sweep's verdict is `abortedWith`, not the wording,
+        // and a gate whose output scrolls is a gate nobody reads.
+        .dump_on_abort = false,
     });
     // Which cause the sim reports for every failure it injects (§8).
     // Production reads it off an errno; a virtual socket table has none,
@@ -288,6 +300,19 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.injectOneShotFaults(random);
     harness.populateClients(random);
 
+    harness.armScenarioTimers();
+}
+
+/// The three timers a scenario runs on: the force-end that outlives any
+/// stuck work, the optional early drain, and the optional origin outage.
+/// Split from `setUp` when the #206 drop pushed that one past the length
+/// limit — the same remedy `deriveTopology` took twice before it.
+///
+/// Every one is armed *after* the population exists, so nothing can fire
+/// against a half-built scenario, and every optional one asserts it lands
+/// before the force-end — a timer scheduled past that is a timer whose
+/// scenario is already over.
+fn armScenarioTimers(harness: *Harness) void {
     harness.end_timer_completion = .{};
     harness.io.timerStart(
         &harness.end_timer_completion,
@@ -571,6 +596,7 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     );
     harness.listeners_count = if (harness.tls_clients >= 1) 3 else 2;
     harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
+    harness.drop_kind = deriveDropKind(harness.clean, random);
     assert(harness.listeners_count <= harness.listener_configs.len);
     assert(harness.tls_clients >= 1 or !harness.clock_jump_wanted);
 }
@@ -1143,6 +1169,7 @@ fn populateTlsClients(harness: *Harness, random: std.Random) void {
     harness.tls_resume_started = false;
     harness.scenario_ended = false;
     harness.clock_jumped = false;
+    harness.drop_taken = false;
     assert(harness.tls_clients <= tls_clients_max);
     // One token past the drawn count, for the resuming client's slot.
     const token_count = if (harness.tls_clients >= 1)
@@ -1452,8 +1479,85 @@ fn clientEnded(harness: *Harness) void {
     }
 }
 
-/// Belt and suspenders: fires even if some client never ends (a
-/// black-holed connect, a stuck exchange) and force-ends the run.
+/// #206, on the seeds that drew it: take every armed op of one kind and
+/// never deliver it, at the instant the wind-down begins. That is the
+/// class of defect no other seed can reach — everything else this
+/// simulator does completes, which is faithful to io_uring and blind to
+/// what a readiness backend did in #203.
+///
+/// At the wind-down because that is where the ops worth stranding are
+/// armed. Measured over the sweep, ops pending when a drain begins:
+/// accept and timer on essentially every run, recv on 55%, log_write 26%,
+/// connect 24%, recv_group 10% — and `close` on *none*, which is why the
+/// kinds below are the ones they are and why "a slot that can never be
+/// released" is still out of reach from here. Reaching that one needs a
+/// drop placed mid-teardown, which is a different hook.
+///
+/// The kind is drawn rather than the op, deliberately: accept and timer
+/// are four fifths of everything pending, so picking a random *op* would
+/// spend the whole fraction on those two and reach recv_group about once
+/// in a sweep.
+fn maybeStrandOps(harness: *Harness) void {
+    const kind = harness.drop_kind orelse return;
+    if (harness.drop_taken) return;
+    // A latch rather than clearing the draw, for the reason the clock
+    // jump keeps two fields: what the seed *drew* and what it *did* are
+    // different facts, and `verify` needs the first one to still be
+    // there when it decides whether a stuck drain was asked for.
+    harness.drop_taken = true;
+    const dropped = harness.io.dropPendingOps(kind);
+    // Nothing armed of that kind is a legal outcome, not a failed draw —
+    // the sweep's job is to try, and the oracle holds either way. A
+    // stranded op stays *pending*, so the table it was counted out of is
+    // still the bound; more than that would mean one was counted twice.
+    assert(dropped <= harness.io.pending_count);
+}
+
+/// Which op kind a seed strands, or null for the fifteen in sixteen that
+/// strand nothing. A small fraction on purpose: a stranded run trades
+/// every other oracle for the one it exists to check, since a drain that
+/// cannot finish leaves pools held and counters unreconciled by design.
+///
+/// The kinds are the ones actually armed at a wind-down, minus two that
+/// are left out for opposite reasons.
+///
+/// `close` is never armed there at all, so naming it would be a draw that
+/// silently tested nothing. Reaching it needs a drop placed mid-teardown.
+///
+/// `timer` is excluded because stranding one is the shape the §8 backstop
+/// provably cannot catch: `onDrainStuck` is itself a timer, so a seed
+/// that strands the drain deadline strands the thing that would have
+/// reported it, and the run ends in `SimIo`'s deadlock rather than in a
+/// diagnostic. Found by drawing it — seed 2302 deadlocked with three
+/// dropped timers and nothing else pending, though that seed will not
+/// reproduce it against the list as shipped: the draw indexes `kinds`,
+/// so adding, removing or reordering an entry silently re-rolls which
+/// seed draws which kind. The case is pinned by a directed test instead
+/// (`src/io/contract_test.zig`), which is the form that breaks loudly if
+/// it ever stops being true. That is a true statement
+/// about the backstop's reach and not a defect this sweep can hold the
+/// proxy to, so it is recorded rather than asserted; covering it would
+/// need a watchdog that is not a timer, which is a design question and
+/// not a gate.
+fn deriveDropKind(clean: bool, random: std.Random) ?SimIo.OpKind {
+    // Adversarial seeds only, for the reason every sibling draw states:
+    // a clean seed's oracle is each script's exact golden outcome, and a
+    // stranded op ends the run at the give-up before those oracles are
+    // reached — for every client in the scenario, not just the one the
+    // strand touched. A silently unanswered exchange passing as "the
+    // backstop worked" is precisely what clean seeds exist to forbid.
+    if (clean) return null;
+    if (random.uintLessThan(u8, 16) != 0) return null;
+    const kinds = [_]SimIo.OpKind{
+        .accept,
+        .recv,
+        .connect,
+        .log_write,
+        .recv_group,
+    };
+    return kinds[random.uintLessThan(usize, kinds.len)];
+}
+
 /// #202, on the seeds that drew it: step the wall clock past a sealing
 /// key's whole rotation interval while the loop's own clock keeps
 /// ticking. The next handshake to seal a ticket finds its key overdue and
@@ -1486,12 +1590,18 @@ fn maybeJumpClock(harness: *Harness) void {
     harness.io.advanceWallClock(clock_jump_ns);
 }
 
+/// Belt and suspenders: fires even if some client never ends (a
+/// black-holed connect, a stuck exchange) and force-ends the run. Its
+/// sentence spent a while attached to the wrong function — restored here
+/// rather than deleted, because "some client never ends" is exactly the
+/// case #206 now creates on purpose.
 fn onScenarioEnd(harness: *Harness, result: Io.TimerError!void) void {
     result catch return;
     harness.endScenario();
 }
 
 fn endScenario(harness: *Harness) void {
+    harness.maybeStrandOps();
     harness.scenario_ended = true;
     for (harness.clients[0..harness.l4_count]) |*client| {
         client.cancelIfStuck();
@@ -1535,6 +1645,25 @@ pub fn verify(harness: *Harness) !void {
     harness.origin.closeRemaining();
     harness.origin_http.closeRemaining();
 
+    // #206: a seed that stranded an op the drain waits on cannot finish
+    // it, and must not be asked to. What is demanded instead is that the
+    // proxy *noticed* — a drain that cannot complete is allowed, a drain
+    // that hangs without saying so is not.
+    //
+    // Written as an alternative for every seed rather than a branch on
+    // whether this one dropped anything, because that is the property
+    // worth holding: no schedule, dropped op or not, may end with the
+    // loop alive and nobody the wiser.
+    if (harness.io.abortedWith()) |code| {
+        if (code != ServerSim.drain_stuck_exit_code) return error.UnexpectedAbort;
+        // Only a seed that stranded something is excused. Without this,
+        // the branch would accept any stuck drain as "#206 working as
+        // intended" — including one a future release bug produced with
+        // every op delivered, which is the exact defect this backstop
+        // exists to catch and the last thing the sweep should swallow.
+        if (!harness.drop_taken) return error.DrainStuckWithoutStrand;
+        return;
+    }
     if (!harness.server.isIdle()) return error.PoolLeak;
     if (!harness.server.reconcile()) return error.CountersDiverged;
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
