@@ -1129,9 +1129,14 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   one `add` edit riding the #175 render machinery (an origin's own
   Set-Cookie rides beside it), on every exchange whose request did not
   already name the endpoint that served it — and *only* those, so a
-  settled session is never re-stamped. No `Secure` attribute: this
-  proxy does not terminate TLS (§1), so it cannot know the
-  client-facing scheme. Three counters partition a cookie cluster's
+  settled session is never re-stamped. `Secure` rides a terminated
+  connection and only that one (§4): where zoxy terminates it knows
+  the scheme is https, and a routing cookie without the attribute is
+  one the browser hands back over plaintext to the same host. On a
+  plaintext listener it is still absent, because there the original
+  reasoning holds — something in front may have terminated, and
+  `Secure` on a cookie the client can only return over http is a
+  cookie it never returns. Three counters partition a cookie cluster's
   forwarded responses — `l7_sticky_followed` / `assigned` /
   `repicked` — and a repick *rate* is the operational signal:
   endpoints flapping under a sticky population. Forgery is priced
