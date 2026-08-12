@@ -367,7 +367,8 @@ tag** zoxy mints from the endpoint's address, stable across restarts,
 processes, and config reordering. A request with no cookie is placed on
 the calmest backend and the response sets one
 (`Set-Cookie: srv_id=<tag>; Path=/; HttpOnly` — no expiry, a session
-cookie); a request whose tag names a healthy, under-capacity backend
+cookie — plus `; Secure` when the listener terminates TLS, since that is
+the case where zoxy knows the client-facing scheme is https); a request whose tag names a healthy, under-capacity backend
 goes there and is **not** re-stamped; a tag naming an ejected, drained
 or removed backend is re-placed and the response re-announces. This is
 the strongest answer to NAT: every user behind one address carries

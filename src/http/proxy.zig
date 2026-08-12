@@ -1733,12 +1733,27 @@ pub fn Proxy(comptime IoType: type) type {
         /// The Set-Cookie attributes every #178 stamp carries. `Path=/`
         /// because the assignment is per *backend*, not per resource;
         /// `HttpOnly` because no script has business reading a routing
-        /// tag. No `Max-Age`: a session cookie, HAProxy's default for
-        /// the same feature. No `Secure`: this proxy does not terminate
-        /// TLS (#125), so it cannot know the client-facing scheme.
+        /// tag. No `Max-Age`: a session cookie, HAProxy's default for the
+        /// same feature.
+        ///
+        /// `Secure` rides a terminated connection and only that one. It
+        /// used to ride nothing, on the reasoning that a proxy which does
+        /// not terminate TLS cannot know the client-facing scheme — true
+        /// when it was written and falsified by the very issue it cited
+        /// (#125). Where zoxy terminates, it knows: the scheme is https,
+        /// and a routing cookie without `Secure` is one the browser will
+        /// hand back over plaintext to the same host, which is the
+        /// downgrade the attribute exists to stop.
+        ///
+        /// Still absent on a plaintext listener rather than always
+        /// present, because there the original reasoning holds intact —
+        /// something in front may have terminated TLS, and `Secure` on a
+        /// cookie the client can only ever return over http is a cookie
+        /// it will never return at all.
         const sticky_attributes = "; Path=/; HttpOnly";
+        const sticky_attributes_secure = sticky_attributes ++ "; Secure";
         const sticky_value_bytes_max = constants.pick_name_bytes_max + 1 +
-            Balancer.endpoint_tag_len + sticky_attributes.len;
+            Balancer.endpoint_tag_len + sticky_attributes_secure.len;
 
         /// This render's full edit set: the #175 filter edits, plus —
         /// when the verdict owes the client an announcement — the #178
@@ -1782,11 +1797,27 @@ pub fn Proxy(comptime IoType: type) type {
                 scratch[len..][0..Balancer.endpoint_tag_len],
             );
             len += Balancer.endpoint_tag_len;
-            @memcpy(scratch[len..][0..sticky_attributes.len], sticky_attributes);
-            len += sticky_attributes.len;
+            // The connection's own termination, not the listener's
+            // config: what `Secure` claims is how *this* client reached
+            // us, and that is what `conn.tls` answers.
+            const attributes = if (conn.tls != null)
+                sticky_attributes_secure
+            else
+                sticky_attributes;
+            @memcpy(scratch[len..][0..attributes.len], attributes);
+            len += @intCast(attributes.len);
             // Exactly the four pieces, no gaps: the value the render
             // emits is the whole composition.
-            assert(len == name.len + 1 + Balancer.endpoint_tag_len + sticky_attributes.len);
+            assert(len == name.len + 1 + Balancer.endpoint_tag_len + attributes.len);
+            // And the attributes the predicate chose are the ones on the
+            // wire. The length check above cannot say that — it reuses
+            // the same binding the copy did, so it holds just as well
+            // under an inverted predicate. This reads the bytes back.
+            if (conn.tls != null) {
+                assert(std.mem.endsWith(u8, scratch[0..len], sticky_attributes_secure));
+            } else {
+                assert(!std.mem.endsWith(u8, scratch[0..len], sticky_attributes_secure));
+            }
             buffer[edits.len] = .{ .kind = .add, .name = "Set-Cookie", .value = scratch[0..len] };
             return buffer[0 .. edits.len + 1];
         }

@@ -2337,6 +2337,57 @@ fn bedEndpointTag(bed: *const Http1Bed) [Balancer.endpoint_tag_len]u8 {
     return tag;
 }
 
+test "l7: a sticky stamp on a terminated connection carries Secure (#125, #178)" {
+    // The attribute used to ride nothing, on the reasoning that a proxy
+    // which does not terminate TLS cannot know the client-facing scheme.
+    // #125 falsified that. Where zoxy terminates it knows the scheme is
+    // https, and a routing cookie without `Secure` is one the browser
+    // hands back over plaintext to the same host.
+    //
+    // Neither the sweep nor any other directed test covers this: the
+    // simulator's byte-exact stamp oracle runs on plaintext clients, and
+    // its terminating clients only check that a response *is* one. So
+    // this is the whole gate on the attribute, both halves of it.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 31,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .pick = .hash,
+        .hash_key = .{ .cookie = "zoxy-srv" },
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+        .exchange_end = .http_response,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    // The whole response, not a substring probe: this is the only gate on
+    // the attribute, and a substring would pass a reply carrying two
+    // stamps — one secure, one not — or the header in the wrong place.
+    // The neighbouring plaintext stamp tests compare whole responses for
+    // the same reason, and the TLS bed is already used that way.
+    var expected_buffer: [512]u8 = undefined;
+    const expected = std.fmt.bufPrint(
+        &expected_buffer,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
+            "Set-Cookie: zoxy-srv={s}; Path=/; HttpOnly; Secure\r\n" ++
+            "Connection: close\r\n\r\nhi",
+        .{&bedEndpointTag(&bed)},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(
+        expected,
+        client.app_received[0..client.app_received_len],
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_sticky_assigned"));
+}
+
 test "l7: a cookieless request on a cookie cluster is assigned and stamped (#178)" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
