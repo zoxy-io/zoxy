@@ -142,7 +142,7 @@ const Server = struct {
     fn init(server: *Server, credentials: *const Credentials) !void {
         const keypair = try ztls.x25519.KeyPair.generateDeterministic(.init(server_x25519_seed));
         server.handshake = .init(.{
-            .keypairs = .init(keypair),
+            .keypairs = try .init(keypair),
             .random = .init(server_random),
         });
         server.handshake.setCredentials(credentials.chain, credentials.signer());
