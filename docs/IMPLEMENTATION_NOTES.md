@@ -1030,6 +1030,45 @@ once, it never recovers, because ztls never drains OpenSSL's error queue
 and those entries allocate through the same hooks. Measured in the same
 issue; a restart is the only cure until that lands.
 
+### `shed_tls_crypto` has no gate, and why the obvious one does not work
+
+The rung is now *reachable* — that is what the ztls pin move buys — but
+nothing in §9 exercises it, and this is a known gap rather than an
+oversight. Its sibling `shed_tls_engines` has both a unit test and a sim
+scenario; `CryptoUnavailable` has neither.
+
+The obvious gate is a third heap-proof-shaped binary: install a heap too
+small to serve a handshake, assert the keygen returns `LibcryptoFailed`
+rather than spinning. **It deadlocks**, and not in our code. With a 1 KiB
+heap the stack is:
+
+```
+ossl_init_base_ossl_  ->  CRYPTO_THREAD_lock_new  ->  CRYPTO_zalloc
+  ->  CRYPTO_malloc      (fails: our heap)
+  ->  ERR_new            (record the failure)
+  ->  ossl_err_get_state_int  ->  OPENSSL_init_crypto
+  ->  CRYPTO_THREAD_run_once  ->  pthread_once     <-- already inside it
+```
+
+OpenSSL reports an allocation failure by calling `ERR_new`, which
+initializes the error machinery, which re-enters the very `pthread_once`
+whose initializer was allocating. An allocation failure *during
+`OPENSSL_init_crypto`* is a self-deadlock in libcrypto, so a heap below
+init's own needs never yields a clean error to assert on.
+
+That is worth knowing for its own sake: our floor is not just "big enough
+for a handshake" but "big enough for libcrypto's one-time init", and below
+that the process hangs at startup instead of refusing. The 2 MiB base is
+comfortably past it, and the `libcrypto_heap_bytes >= 2 * 1024 * 1024`
+comptime assert in `constants.zig` is what keeps it there.
+
+Sizing a heap into the window between "init completes" and "a keygen
+fails" would work, but the window is the keygen's own ~5 KiB against an
+init cost that moves with the libcrypto build — a test that would rot
+silently into passing for the wrong reason. A real gate wants a fault
+injection seam on `Engine.init` instead, so the rung can be driven without
+starving libcrypto at all. Not built here.
+
 Two shapes of this got found rather than reasoned:
 
 - The heap must be a static, not a caller's. `CRYPTO_set_mem_functions`
