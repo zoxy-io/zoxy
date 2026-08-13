@@ -114,8 +114,6 @@ jobs:
           echo "pkg_config_path=$dev/lib/pkgconfig" >> "$GITHUB_OUTPUT"
 
       - name: Build and package
-        env:
-          PKG_CONFIG_PATH: ${{ steps.crypto.outputs.pkg_config_path }}
         run: |
           set -euo pipefail
           version="${{ steps.ver.outputs.version }}"
@@ -127,7 +125,16 @@ jobs:
           # the identifier equal the version, which `zoxy --version`
           # recognises and omits — a release says `zoxy 0.0.7` and
           # nothing else, whatever the checkout depth happens to be.
-          devenv shell -- zig build \
+          # `env` *inside* the devenv shell, not on the step. `devenv
+          # shell` establishes its own environment and replaces
+          # PKG_CONFIG_PATH with one naming the shell's dynamic openssl,
+          # so a value exported outside is silently discarded — the build
+          # then links the shared library and the artifact fails to start.
+          # That is precisely how the first static-linking attempt
+          # regressed: it was verified by invoking zig directly, where
+          # there is no shell to overwrite anything.
+          devenv shell -- env PKG_CONFIG_PATH="${{ steps.crypto.outputs.pkg_config_path }}" \
+            zig build \
             -Dtarget="${{ matrix.zig_target }}" \
             ${{ matrix.cpu && format('-Dcpu={0}', matrix.cpu) || '' }} \
             ${{ matrix.static && '-Dstatic' || '' }} \
