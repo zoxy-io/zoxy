@@ -1531,17 +1531,114 @@ fn maybeStrandOps(harness: *Harness) void {
     // strands nothing, which is why the draw rate above is the higher
     // number.
     if (harness.config.drain_deadline_ms == 0) return;
+    const dropped = harness.io.dropPendingOps(kind);
     // A latch rather than clearing the draw, for the reason the clock
     // jump keeps two fields: what the seed *drew* and what it *did* are
     // different facts, and `verify` needs the first one to still be
     // there when it decides whether a stuck drain was asked for.
-    harness.drop_taken = true;
-    const dropped = harness.io.dropPendingOps(kind);
+    //
+    // Latched on `dropped >= 1`, not on reaching this line. The excuse
+    // `verify` grants is "this seed stranded something, so it may end at
+    // the give-up", and a draw that found nothing armed of its kind
+    // stranded nothing — it is an ordinary seed and owes the ordinary
+    // invariants. Latching on the attempt instead would hand that excuse
+    // to every such seed, so a genuine stuck drain arriving on one would
+    // be waved through as "#206 working as intended": the same hole the
+    // `drop_taken` gate was added to close, one step further out.
+    if (dropped >= 1) harness.drop_taken = true;
+    // The excuse is earned by stranding, not by arriving: this is the
+    // whole content of the paragraph above, in the form that breaks if a
+    // later edit reintroduces the unconditional latch.
+    assert(harness.drop_taken == (dropped >= 1));
     // Nothing armed of that kind is a legal outcome, not a failed draw —
     // the sweep's job is to try, and the oracle holds either way. A
     // stranded op stays *pending*, so the table it was counted out of is
     // still the bound; more than that would mean one was counted twice.
     assert(dropped <= harness.io.pending_count);
+}
+
+/// What a seed that ended at the §8 give-up owes instead of the ordinary
+/// invariants (#206). A seed that stranded an op the drain waits on
+/// cannot finish it and must not be asked to; what is demanded is that
+/// the proxy *noticed*. A drain that cannot complete is allowed, a drain
+/// that hangs without saying so is not.
+///
+/// Reached as an alternative for every seed rather than a branch on
+/// whether this one dropped anything, because that is the property worth
+/// holding: no schedule, dropped op or not, may end with the loop alive
+/// and nobody the wiser.
+///
+/// Split from `verify` when the two oracles below took it to the 70-line
+/// limit — the same remedy `setUp` and `deriveTopology` took before it.
+/// `pending_ops_live` is passed in rather than asked here because it has
+/// to be read before `verify` closes the harness's own sockets.
+fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void {
+    if (code != ServerSim.drain_stuck_exit_code) return error.UnexpectedAbort;
+    // Only a seed that stranded something is excused. Without this, the
+    // branch would accept any stuck drain as "#206 working as intended" —
+    // including one a future release bug produced with every op
+    // delivered, which is the exact defect this backstop exists to catch
+    // and the last thing the sweep should swallow.
+    if (!harness.drop_taken) return error.DrainStuckWithoutStrand;
+    // The give-up is allowed to leave work unfinished. It is not allowed
+    // to have freed a slot an op still points at: that is the §5
+    // corruption the generation counter exists to catch, and this is the
+    // one path where it could hide, since a dropped op never reaches the
+    // stale-handle assert every delivered op passes through. #206 asked
+    // for this oracle by name.
+    if (!pending_ops_live) return error.SlotReleasedUnderPendingOp;
+    if (!harness.strandCanExplainStuck()) return error.StrandCannotExplainStuck;
+}
+
+/// Whether the strand this seed took could account for a plane the
+/// give-up found stuck. Mis-blaming is not hypothetical: the first
+/// `onDrainStuck` reported "nothing stuck" while the admin plane held an
+/// armed accept (#203), and a backstop that names the wrong plane sends
+/// an operator somewhere useless with the process already gone.
+///
+/// Deliberately permissive — it asks that *some* stuck plane could own an
+/// op of the drawn kind, never that a named one is stuck. Which plane a
+/// strand lands on is a property of the schedule, and an oracle that
+/// pinned it would fail on the rare seed rather than on a defect. That
+/// bill was just paid once: #220's deadlock was a gate demanding an
+/// outcome the configuration had declined.
+///
+/// Measured over a 4096-seed sweep, for the shape rather than the rule:
+/// `log_write` lands on the access log 20 runs in 20, `recv` and
+/// `recv_group` on conns 22 in 22, `connect` on health 8 and conns 2.
+fn strandCanExplainStuck(harness: *const Harness) bool {
+    const kind = harness.drop_kind.?;
+    assert(harness.drop_taken);
+    const conns_stuck = !harness.server.conns.isFullyReleased();
+    const admin_stuck = !harness.server.admin.isQuiescent();
+    const log_stuck = !harness.server.access_log.isQuiescent();
+    const health_stuck = !harness.server.health.isQuiescent();
+    // `onDrainStuck` aborts only when one of the four is unfinished, so a
+    // give-up with all four done is the backstop firing at nothing.
+    assert(conns_stuck or admin_stuck or log_stuck or health_stuck);
+    return switch (kind) {
+        // The head ring is the connection path's alone (§5).
+        .recv_group => conns_stuck,
+        // Nothing but the access log writes one.
+        .log_write => log_stuck,
+        // Connections read, the admin plane reads its scrape, and the
+        // prober reads its probe; all three dial except the admin one.
+        .recv => conns_stuck or admin_stuck or health_stuck,
+        .connect => conns_stuck or health_stuck,
+        // A listener's accept feeds admission and the admin plane.
+        .accept => conns_stuck or admin_stuck,
+        // Out of the draw, so unreachable rather than defaulted: adding
+        // one to `deriveDropKind`'s list without giving it an arm here
+        // panics every seed that draws it, and a named arm is what makes
+        // that obvious to whoever adds the next kind.
+        .none,
+        .send,
+        .close,
+        .timer,
+        .timer_cancel,
+        .connect_cancel,
+        => unreachable,
+    };
 }
 
 /// Which op kind a seed strands, or null for the fifteen in sixteen that
@@ -1579,6 +1676,10 @@ fn deriveDropKind(clean: bool, random: std.Random) ?SimIo.OpKind {
     // backstop worked" is precisely what clean seeds exist to forbid.
     if (clean) return null;
     if (random.uintLessThan(u8, 16) != 0) return null;
+    // Adding an entry here needs a matching arm in `strandCanExplainStuck`,
+    // which lists the kinds out of the draw as `unreachable`. Without one
+    // the new kind panics every seed that draws it — on top of re-rolling
+    // which seed draws what, the trap the paragraph above describes.
     const kinds = [_]SimIo.OpKind{
         .accept,
         .recv,
@@ -1665,6 +1766,15 @@ pub fn tearDown(harness: *Harness) void {
 }
 
 pub fn verify(harness: *Harness) !void {
+    // #206: asked *before* the cleanup below, and the order is the whole
+    // point. A strand takes harness-side ops too — the doubles and the
+    // clients arm recvs of their own — and the tidying closes their
+    // sockets, so asking afterwards reads the harness putting its own
+    // things away as the server having freed a slot under a live
+    // reference. Measured on seed 591: live before the cleanup, stale
+    // after, with nothing wrong in between. What the oracle is about is
+    // the state the run ended in, not the state the tidying leaves.
+    const pending_ops_live = harness.io.pendingOpsReferenceLiveSockets();
     // The loop may stop before harness-side terminal completions
     // deliver; close what remains so the socket-leak check is exact.
     for (harness.clients[0..harness.l4_count]) |*client| {
@@ -1676,24 +1786,8 @@ pub fn verify(harness: *Harness) !void {
     harness.origin.closeRemaining();
     harness.origin_http.closeRemaining();
 
-    // #206: a seed that stranded an op the drain waits on cannot finish
-    // it, and must not be asked to. What is demanded instead is that the
-    // proxy *noticed* — a drain that cannot complete is allowed, a drain
-    // that hangs without saying so is not.
-    //
-    // Written as an alternative for every seed rather than a branch on
-    // whether this one dropped anything, because that is the property
-    // worth holding: no schedule, dropped op or not, may end with the
-    // loop alive and nobody the wiser.
     if (harness.io.abortedWith()) |code| {
-        if (code != ServerSim.drain_stuck_exit_code) return error.UnexpectedAbort;
-        // Only a seed that stranded something is excused. Without this,
-        // the branch would accept any stuck drain as "#206 working as
-        // intended" — including one a future release bug produced with
-        // every op delivered, which is the exact defect this backstop
-        // exists to catch and the last thing the sweep should swallow.
-        if (!harness.drop_taken) return error.DrainStuckWithoutStrand;
-        return;
+        return harness.verifyGaveUp(code, pending_ops_live);
     }
     if (!harness.server.isIdle()) return error.PoolLeak;
     if (!harness.server.reconcile()) return error.CountersDiverged;

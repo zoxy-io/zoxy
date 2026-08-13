@@ -1085,6 +1085,51 @@ pub fn dropPendingOps(io: *SimIo, kind: OpKind) u32 {
     return dropped;
 }
 
+/// #206's other ask: no slot may be released while an op still
+/// references it. Every ordinary use of a handle goes through
+/// `socketEntry`, which asserts the entry is still acquired and its
+/// generation still matches, so a stale handle in the data path panics
+/// where it is used. A *dropped* op never reaches that check — it is
+/// never delivered — and a stranded seed is exactly where a slot freed
+/// under a live reference would go unseen. So ask the pending table
+/// directly rather than waiting for a use that will never come.
+///
+/// Only the four kinds naming an already-open socket can be checked.
+/// `accept` names a listener, `connect` a socket that does not exist
+/// until it completes, the two cancels name another completion, and
+/// `log_write` and `timer` name no socket at all.
+///
+/// Enumerated rather than defaulted, like every other correctness switch
+/// over `op` here (`opReady`, the `Result` construction) and unlike the
+/// single-kind filters that may safely say `else`. This one is a §5
+/// corruption oracle: a socket-bearing kind added later must fail to
+/// compile until someone decides whether it belongs, not slip through an
+/// `else => continue` and shrink what the oracle covers in silence.
+pub fn pendingOpsReferenceLiveSockets(io: *const SimIo) bool {
+    assert(io.pending_count <= pending_ops_max);
+    for (io.pending[0..io.pending_count]) |completion| {
+        const socket = switch (completion.op) {
+            .recv => |op| op.socket,
+            .recv_group => |op| op.socket,
+            .send => |op| op.socket,
+            .close => |op| op.socket,
+            .none,
+            .accept,
+            .connect,
+            .log_write,
+            .timer,
+            .timer_cancel,
+            .connect_cancel,
+            => continue,
+        };
+        assert(socket.index < sockets_max);
+        const entry = &io.sockets.slots[socket.index];
+        if (!io.sockets.isAcquired(entry)) return false;
+        if (@as(u16, @truncate(entry.generation)) != socket.generation) return false;
+    }
+    return true;
+}
+
 /// Schedule a signal delivery — drain is just another scheduled event (§4).
 pub fn injectSignal(io: *SimIo, signal: Io.Signal) void {
     io.scheduleSignal(signal, io.now_ns_value);

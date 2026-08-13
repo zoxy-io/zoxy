@@ -168,6 +168,41 @@ as "#206 working as intended" — including one a future *release* bug
 produced with every op delivered, which is the exact defect the backstop
 exists to catch and the last thing a sweep should swallow.
 
+That gate shipped one step short of what the paragraph above claims.
+`drop_taken` was latched on *reaching* the strand rather than on
+stranding anything, and a draw whose kind has nothing armed of it strands
+nothing — so those seeds carried the excuse without having earned it, and
+a genuine stuck drain landing on one would have been waved through. The
+latch is now `dropped >= 1`. It cost no coverage: the give-up branch is
+still taken 52 times per 4096-seed sweep, because a seed that stranded
+nothing had no reason to reach it.
+
+**What the give-up branch asserts.** Reaching it used to end the seed:
+the exit code was checked, the strand was checked, and nothing else. Two
+oracles now run there, because "the proxy gave up" is a weaker claim than
+this issue asked for.
+
+`SimIo.pendingOpsReferenceLiveSockets` answers #206's second ask — no
+slot released while an op still references it. Every ordinary use of a
+handle goes through `socketEntry`, which asserts the entry is acquired
+and the generation matches, so a stale handle panics where it is used. A
+*dropped* op never reaches that check, which makes the abort path the one
+place the §5 corruption could hide. It is asked **before** `verify`'s
+cleanup, and the order is load-bearing: a strand takes harness-side ops
+too, and closing the doubles' sockets reads as the server having freed a
+slot under a live reference. Seed 591 says live before the cleanup and
+stale after, with nothing wrong in between.
+
+`strandCanExplainStuck` demands the give-up blame a plane the strand can
+account for. Mis-blaming is the #203 defect itself — the first
+`onDrainStuck` said "nothing stuck" while the admin plane held an armed
+accept. It is permissive on purpose: *some* stuck plane must be able to
+own an op of the drawn kind, never a named one. Which plane a strand
+lands on is a property of the schedule, and pinning it would fail on the
+rare seed rather than on a defect. Mutation-checked rather than assumed —
+pointing `log_write` at conns instead of the log fails seed 587, so the
+oracle is reached and can fail.
+
 Clean seeds never draw a strand, for the reason every sibling
 perturbation states: their oracle is each script's exact golden outcome,
 and a stranded op ends the run at the give-up before those oracles run —
@@ -183,10 +218,38 @@ once per sweep.
 Two kinds are excluded, for opposite reasons, and both are findings.
 
 `close` is **never** armed at a wind-down — zero occurrences across the
-sweep. So "a slot that can never be released", arguably the scarier half
-of the #203 class, is not reachable by dropping at the drain however the
-seed picks. It needs a drop placed mid-teardown, which is a different
-hook and is what keeps #206 open.
+sweep — so naming it would be a draw that silently tested nothing.
+
+An earlier version of this section drew a second conclusion from that
+measurement and it was wrong, so it is corrected here rather than
+quietly dropped: it said "a slot that can never be released", the
+scarier half of the #203 class, was therefore out of reach until a
+mid-teardown hook existed. Slot release does not wait on a close.
+`continueTeardown` returns early while `armedCount() != 0`, and once that
+reaches zero it closes **synchronously** with `closeNow` and releases in
+the same call; a connection's armed set is two data directions,
+`connect`, `connect_cancel`, `deadline`, `deadline_cancel`, and no close.
+There is no close op to drop because the teardown path arms none.
+Stranding any conn-armed op therefore produces an unreleasable slot
+already: recording the stuck plane at each give-up over a 4096-seed
+sweep gives `recv` 16 runs and `recv_group` 6 on conns, `connect` 8 on
+health and 2 on conns, and `log_write` 20 on the access log — 24 of the
+52 holding a conn slot that never released.
+
+What a wind-down drop genuinely cannot reach is the pair of cancels
+`beginTeardown` arms, since it arms them *after* the strand lands. That
+is the real argument for the mid-teardown hook, and it is not the
+argument this section used to make.
+
+Three kinds are armed at a wind-down and absent from the draw with no
+reason recorded, which is its own small finding: `timer_cancel` at ~15%
+of wind-downs — more common there than `recv_group`, which is in the
+draw — and `send` and `connect_cancel` at ~1.3%. Stranding a
+`timer_cancel` leaves `armed.deadline_cancel` set forever, an
+unreleasable slot by a route the sweep does not take, and it does not hit
+the `timer` self-reference below because nothing cancels the drain-stuck
+timer. The other two are near the noise floor. Adding `timer_cancel`
+looks like a free coverage win and is not done here.
 
 `timer` is worse, and it is the finding worth carrying: **`onDrainStuck`
 cannot catch a stranded timer, because it is one.** A seed that strands
