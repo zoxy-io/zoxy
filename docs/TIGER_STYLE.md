@@ -17,6 +17,30 @@ and the **proxy-specific deltas**. When in doubt, read the original.
   `FailingAllocator` in tests to prove it.
 - **Put a limit on everything.** Every loop and every queue has a fixed upper
   bound. An event loop that cannot terminate must *assert* that it cannot.
+- **No unbounded `while (true)`** (`zig build lint`). A loop with no syntactic
+  bound must state one where a reviewer can see it — an asserted counter at the
+  top of the body:
+
+  ```zig
+  while (true) : (passes += 1) {
+      assert(passes <= pending_ops_max);
+  ```
+
+  A loop whose bound is structural rather than counted (a JSON scanner that
+  terminates on its own `}`) says so at the site with
+  `lint:unbounded-ok — <why>`, on the header line or the comment directly above
+  it. Both forms turn "this always eventually terminates" from an assumption
+  into a claim someone can check.
+- **A retry loop retries transient errors only.** Classify before you retry:
+  a *terminal* error (out of memory, a pool exhausted, a closed fd) must
+  propagate on the first occurrence, because retrying it changes nothing but
+  burns the CPU the rest of the process needs to recover. Never `catch continue`
+  over a whole error set — name the retryable members. This is
+  [#222](https://github.com/zoxy-io/zoxy/issues/222): a `while (true) … catch
+  continue` sized for a once-in-2^32 bad scalar met a persistently full heap and
+  spun at 100% CPU forever, taking both listeners and the admin plane with it.
+  The shed rung that should have handled it (`shed_tls_crypto`) was unreachable
+  because the error never came back.
 - **No recursion.** All bounded executions stay bounded; no unbounded stack.
 - **Assertion density ≥ 2 per function** on average. Assert all arguments,
   return values, pre/postconditions, and invariants — positive space (what you

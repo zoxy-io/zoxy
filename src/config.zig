@@ -2132,6 +2132,7 @@ pub const BodiesJson = struct {
         // Terminated by the object's own `}` or by the input running
         // out, which the scanner reports as an error — every map here
         // carries the same bound.
+        // lint:unbounded-ok — the scanner's `}`/error is the bound
         while (true) {
             const token = try source.nextAlloc(allocator, .alloc_if_needed);
             const name: []const u8 = switch (token) {
@@ -2172,6 +2173,10 @@ pub const ErrorPagesJson = struct {
         if (try source.next() != .object_begin) {
             return error.UnexpectedToken;
         }
+        // Terminated by the object's own `}` or by the input running out,
+        // which the scanner reports as an error — the same bound the other
+        // maps here carry.
+        // lint:unbounded-ok — the scanner's `}`/error is the bound
         while (true) {
             const token = try source.nextAlloc(allocator, .alloc_if_needed);
             const status: []const u8 = switch (token) {
@@ -2362,6 +2367,7 @@ pub const ClustersJson = struct {
         // other array in this config now has, and the reason the old
         // `keys_seen_max` backstop is gone: with no ceiling above it, that
         // 4096 would have quietly become the new cluster limit.
+        // lint:unbounded-ok — the scanner's `}`/error is the bound
         while (true) {
             const token = try source.nextAlloc(allocator, .alloc_if_needed);
             const name: []const u8 = switch (token) {

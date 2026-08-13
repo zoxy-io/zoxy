@@ -56,6 +56,41 @@ const boundaries = [_]Boundary{
     },
 };
 
+/// TIGER_STYLE's "put a limit on everything", made mechanical: `while
+/// (true)` states no bound of its own, so it must carry one where a
+/// reviewer can see it. Two shapes count.
+///
+/// An asserted counter — what `SimIo.stop` and `contract_test.initTestIo`
+/// already use:
+///
+///     while (true) : (passes += 1) {
+///         assert(passes <= pending_ops_max);
+///
+/// Or a bound the syntax cannot show — a JSON scanner that terminates on
+/// its own `}`, the three `config.zig` object loops — which says so at the
+/// site with the marker below and a reason.
+///
+/// The rule exists because of zoxy-io/zoxy#222: ztls's `p256.KeyPair.
+/// generate` retried `while (true) ... catch continue` on the assumption
+/// that its error was a once-in-2^32 bad scalar. When the error became a
+/// persistent one instead (the fixed libcrypto heap full), the retry spun
+/// at 100% CPU forever and took the whole event loop — both listeners and
+/// the admin plane — with it. An unbounded loop is a claim that some
+/// condition always eventually holds; this makes the claim reviewable
+/// instead of implicit.
+const unbounded_loop_needle = "while (true)";
+const unbounded_loop_marker = "lint:unbounded-ok";
+const unbounded_loop_message =
+    "unbounded `while (true)`: assert a counter bound in the loop body, " ++
+    "or mark it `lint:unbounded-ok — <why>` (TIGER_STYLE: put a limit on everything)";
+
+/// Lines after the loop header within which the bound assertion must
+/// appear. The assertion belongs at the top of the body, so this is
+/// deliberately short — far enough to clear a comment between header and
+/// assert, near enough that an unrelated `assert` deeper in the loop
+/// cannot satisfy it by accident.
+const loop_bound_lookahead_lines: u32 = 6;
+
 /// The only `std.posix.` members main.zig may name (rlimits + sigaction);
 /// everything else — sockets, files, pipes — stays behind the Io seam.
 /// These are matched as fully-qualified `std.posix.<name>` occurrences,
@@ -128,7 +163,133 @@ fn lintFile(
         }
     }
     assert(line_number >= 1);
+    return violation_count + lintUnboundedLoops(contents, path);
+}
+
+/// Flag every `while (true)` whose bound is neither asserted nor
+/// declared. A pass of its own rather than a `lintLine` rule because the
+/// evidence is not on the line: the bound lives in the body below the
+/// header, which is exactly why a line-at-a-time reader — human or lint —
+/// missed it for as long as it did.
+fn lintUnboundedLoops(contents: []const u8, path: []const u8) u32 {
+    assert(path.len > 0);
+    var violation_count: u32 = 0;
+    var offset: usize = 0;
+    while (nextUnboundedLoop(contents, offset)) |at| {
+        offset = at + unbounded_loop_needle.len;
+        assert(offset > at);
+        std.debug.print("{s}:{d}: {s}\n", .{
+            path,
+            lineNumberAt(contents, at),
+            unbounded_loop_message,
+        });
+        violation_count += 1;
+    }
     return violation_count;
+}
+
+/// Offset of the next unbounded `while (true)` at or after `from`, or null
+/// when the rest is clean. The decision lives here, apart from the report,
+/// so a test can make it without printing a violation it went looking for
+/// — the same split `lintLine` has for the boundary rules.
+fn nextUnboundedLoop(contents: []const u8, from: usize) ?usize {
+    assert(from <= contents.len);
+    var offset = from;
+    // Bounded: every iteration moves `offset` past the match it found, so
+    // this runs at most once per occurrence in a file `lintFile` has
+    // already held under `file_bytes_max`.
+    while (std.mem.indexOfPos(u8, contents, offset, unbounded_loop_needle)) |at| {
+        offset = at + unbounded_loop_needle.len;
+        assert(offset > at);
+        const start = lineStartOf(contents, at);
+        const end = lineEndOf(contents, at);
+        assert(start <= at);
+        assert(end >= at);
+        const line = contents[start..end];
+        // A loop named in prose — this file's own doc comment above, or a
+        // `// Bounded: …` note — is not a loop.
+        if (lineIsComment(line)) continue;
+        if (markedUnboundedOk(contents, start, line)) continue;
+        if (boundAssertedWithin(contents[end..], loop_bound_lookahead_lines)) continue;
+        return at;
+    }
+    return null;
+}
+
+/// The count without the report — what the tests below assert on.
+fn countUnboundedLoops(contents: []const u8) u32 {
+    var count: u32 = 0;
+    var offset: usize = 0;
+    while (nextUnboundedLoop(contents, offset)) |at| {
+        offset = at + unbounded_loop_needle.len;
+        assert(offset > at);
+        count += 1;
+    }
+    return count;
+}
+
+/// True when the loop declares itself structurally bounded: the marker
+/// sits either on the header line or on the comment line directly above
+/// it. Both are accepted because the reason is what matters and it rarely
+/// fits after `while (true) {` — this codebase explains a construct in the
+/// block above it, which is where such a reason belongs.
+fn markedUnboundedOk(contents: []const u8, start: usize, line: []const u8) bool {
+    assert(start <= contents.len);
+    if (std.mem.indexOf(u8, line, unbounded_loop_marker) != null) return true;
+    if (start == 0) return false;
+    const above_end = start - 1; // The '\n' that ended the line above.
+    const above_start = lineStartOf(contents, above_end);
+    assert(above_start <= above_end);
+    const above = contents[above_start..above_end];
+    if (!lineIsComment(above)) return false;
+    return std.mem.indexOf(u8, above, unbounded_loop_marker) != null;
+}
+
+/// True when one of the next `lines_max` lines asserts an upper bound —
+/// any `assert` naming a `<` relation. Deliberately shape-based rather
+/// than parsing the counter out of the loop header: the point is that a
+/// bound is stated near the top of the body, and every way of writing
+/// `assert(n <= max)` should satisfy it.
+fn boundAssertedWithin(rest: []const u8, lines_max: u32) bool {
+    assert(lines_max >= 1);
+    var lines = std.mem.splitScalar(u8, rest, '\n');
+    var seen: u32 = 0;
+    while (lines.next()) |line| {
+        if (seen == lines_max) return false;
+        seen += 1;
+        if (std.mem.indexOf(u8, line, "assert(") == null) continue;
+        // `<=` contains `<`, so the one test covers both relations.
+        if (std.mem.indexOfScalar(u8, line, '<') != null) return true;
+    }
+    assert(seen <= lines_max);
+    return false;
+}
+
+fn lineStartOf(contents: []const u8, at: usize) usize {
+    assert(at < contents.len);
+    const newline = std.mem.lastIndexOfScalar(u8, contents[0..at], '\n') orelse return 0;
+    assert(newline < at);
+    return newline + 1;
+}
+
+fn lineEndOf(contents: []const u8, at: usize) usize {
+    assert(at < contents.len);
+    const newline = std.mem.indexOfScalarPos(u8, contents, at, '\n') orelse return contents.len;
+    assert(newline >= at);
+    return newline;
+}
+
+fn lineNumberAt(contents: []const u8, at: usize) u32 {
+    assert(at < contents.len);
+    return @intCast(std.mem.count(u8, contents[0..at], "\n") + 1);
+}
+
+/// True when the line's first non-blank characters are `//` — a doc
+/// comment, a module comment, or an ordinary one.
+fn lineIsComment(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    assert(trimmed.len <= line.len);
+    return std.mem.startsWith(u8, trimmed, "//");
 }
 
 comptime {
@@ -262,6 +423,112 @@ test "lintLine: ztls import is confined to the TLS engine wrapper" {
     // not even the parts that are already past a trust boundary of their own.
     try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "http/parser.zig") != null);
     try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "io/XevIo.zig") != null);
+}
+
+test "lintUnboundedLoops: a bare while (true) is a violation" {
+    const source =
+        \\fn spin() void {
+        \\    while (true) {
+        \\        step();
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: an asserted counter bound satisfies the rule" {
+    // The `SimIo.stop` shape: counter in the continue expression, bound
+    // asserted at the top of the body.
+    const source =
+        \\fn flush() void {
+        \\    var passes: u32 = 0;
+        \\    while (true) : (passes += 1) {
+        \\        assert(passes <= pending_ops_max);
+        \\        if (done()) break;
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: the marker exempts a structurally-bounded loop" {
+    const source =
+        \\fn parse() !void {
+        \\    while (true) { // lint:unbounded-ok — the scanner ends it at `}`
+        \\        if (try next() == .object_end) break;
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: the marker is accepted on the line above" {
+    const source =
+        \\fn parse() !void {
+        \\    // lint:unbounded-ok — the scanner ends the object at `}`
+        \\    while (true) {
+        \\        if (try next() == .object_end) break;
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+    // Only *directly* above: a blank line between them breaks the pairing,
+    // so a stale marker cannot drift onto an unrelated loop.
+    const detached =
+        \\fn parse() !void {
+        \\    // lint:unbounded-ok — the scanner ends the object at `}`
+        \\
+        \\    while (true) {
+        \\        step();
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countUnboundedLoops(detached));
+}
+
+test "lintUnboundedLoops: prose about a loop is not a loop" {
+    const source =
+        \\/// Bounded, unlike a bare `while (true)`, which this is not.
+        \\fn ok() void {}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: an assert too far below the header does not count" {
+    // The bound must be at the top of the body: an `assert` seven lines
+    // down is an unrelated invariant, not this loop's limit.
+    const source =
+        \\while (true) {
+        \\    a();
+        \\    b();
+        \\    c();
+        \\    d();
+        \\    e();
+        \\    f();
+        \\    assert(n <= max);
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: each unbounded loop in a file is counted" {
+    const source =
+        \\while (true) {
+        \\    a();
+        \\}
+        \\while (true) {
+        \\    b();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 2), countUnboundedLoops(source));
 }
 
 test "pathIsUnder: exact files, directory prefixes, and near misses" {
