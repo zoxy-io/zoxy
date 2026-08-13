@@ -978,10 +978,57 @@ long-lived proxy. Measured by `zig build tls-heap-proof`, Debug, OpenSSL
 So one handshake's distinct block footprint is ~1 MiB and every
 subsequent handshake is free. Sabotaging `free` to drop blocks instead of
 listing them takes the same run to 2,484,864 B, which is what the
-plateau assertion is there to catch. The 4 MiB reservation is sized
-against the plateau with room for the concurrency the frontier has not
-seen yet — revisit once many handshakes are genuinely *in flight*
-together, which this sequential proof does not exercise.
+plateau assertion is there to catch.
+
+### The concurrency the sequential proof did not exercise (2026-08-13, #222)
+
+This note used to end by sizing the reservation at a flat 4 MiB and saying
+"revisit once many handshakes are genuinely *in flight* together". That
+revisit is done, and the flat number was wrong — not by a margin, by a
+category. **The plateau is a property of sequential handshakes only.** Each
+one's blocks return to their class before the next asks, so the frontier
+never moves: 1811 sequential handshakes at 50 concurrency held it at
+960 KiB. Run them *concurrently* and every live session holds its own
+blocks, so the frontier is linear in the session count:
+
+| concurrent sessions | 50 | 100 | 200 | 400 |
+|---|---|---|---|---|
+| frontier | 1024 KiB | 1280 KiB | 1792 KiB | 2752 KiB |
+
+~4.9 KiB marginal per session (5.12 KiB across 100→200, 4.80 across
+200→400) over a ~1 MiB base. Against a flat 4 MiB that predicts exhaustion
+at ~675 concurrent sessions, and the cliff was observed at exactly that:
+healthy at 600, dead at 700.
+
+Dead rather than degraded, because ztls retried the resulting allocation
+failure forever (`p256.KeyPair.generate`'s `while (true) … catch continue`,
+[mattrobenolt/ztls#88](https://github.com/mattrobenolt/ztls/issues/88)).
+The proxy spun at 100% CPU inside one never-returning call on the loop
+thread, so the TLS listener, the plaintext listener and the admin plane
+went dark together and `SIGTERM` was ignored. `shed_tls_crypto` — the rung
+built for precisely this — read zero throughout, because the error never
+came back for `acquireTlsEngine` to see.
+
+So the reservation is derived now rather than picked:
+`libcryptoHeapBytes(tls_engines)` = 2 MiB base + 8 KiB per engine, the
+measured ~5 KiB with margin for the no-coalescing classes. It stays
+comptime — the storage must be BSS, see the atexit crash above — by
+deriving at `tls_engines_max`, which the loader already enforces; the
+banner prices the whole static array, since that is what is held. At the
+default 1024 engines
+that is 10 MiB against the old 4.
+
+Verified: the 1200-connection run that used to livelock now leaves
+`shed_tls_crypto` at 0 and sheds on `shed_tls_engines` instead — the pool
+ceiling, which is the correct wall — with the proxy healthy at 0% idle CPU
+afterwards. That holds against the *unfixed* ztls, which is the point: the
+sizing removes the trigger, and the ztls fix makes the failure survivable
+if another deployment reaches it anyway.
+
+One thing this does **not** fix: once the heap has been exhausted even
+once, it never recovers, because ztls never drains OpenSSL's error queue
+and those entries allocate through the same hooks. Measured in the same
+issue; a restart is the only cure until that lands.
 
 Two shapes of this got found rather than reasoned:
 
