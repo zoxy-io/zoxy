@@ -1500,6 +1500,37 @@ fn clientEnded(harness: *Harness) void {
 fn maybeStrandOps(harness: *Harness) void {
     const kind = harness.drop_kind orelse return;
     if (harness.drop_taken) return;
+    // A zero `drain_deadline_ms` is "no cap" (§5), and the deadline timer
+    // is the only thing that ever arms the give-up: `onDrainStuck` is
+    // started by `onDrainDeadline`, so a drain with no deadline has no
+    // backstop to provoke. Stranding an op there asks the proxy for a
+    // report the configuration deliberately declined — the drain waits
+    // for the last connection however long that takes, by design — and
+    // the run ends in `SimIo`'s own deadlock with no diagnostic, which is
+    // the same shape the excluded `timer` kind has and just as much a
+    // true statement about the backstop's reach rather than a defect.
+    //
+    // Skipped at the strand rather than at the draw because `drop_kind` is
+    // drawn in `deriveTerminatingDraws` and the deadline one call later in
+    // `deriveServerConfig` — adjacent siblings under `deriveTopology`, in
+    // that order. Gating the draw needs the deadline first, and swapping
+    // two calls re-rolls every draw after them for the whole sweep, taking
+    // the §9 census margins with it. A one-line skip here is the cheaper
+    // half of that trade by a wide margin. It leaves `drop_taken` false, so
+    // `verify` holds this seed to the ordinary invariants — exactly what a
+    // seed that stranded nothing is for — and costs only the seeds where
+    // the backstop does not exist: measured over a 4096-seed sweep, 7 seeds
+    // draw a drop against a no-cap deadline against 159 that draw one they
+    // can use.
+    //
+    // Found by the nightly soak (run #18, 2026-08-13). All four shards hit
+    // the 16-failure cap early in their slices — shard 0 at 36k — and every
+    // named seed had drawn both a mid-scenario drain with the no-cap
+    // deadline and a drop. Only a quarter or so of the seeds this skips
+    // would have deadlocked at all: a drawn kind with nothing armed of it
+    // strands nothing, which is why the draw rate above is the higher
+    // number.
+    if (harness.config.drain_deadline_ms == 0) return;
     // A latch rather than clearing the draw, for the reason the clock
     // jump keeps two fields: what the seed *drew* and what it *did* are
     // different facts, and `verify` needs the first one to still be
