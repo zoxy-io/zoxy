@@ -206,6 +206,41 @@ draws which kind. Seed 2302 above will not reproduce against the shipped
 list, because `.timer` is no longer in it. Any seed number pinned against
 this function has the same short shelf life.
 
+**A third case of the same shape, and the one that shipped broken: a
+drain with no deadline has no backstop to provoke.** `drain_deadline_ms =
+0` is "no cap" (§5) — `beginDrain` arms no timer, and since
+`onDrainStuck` is started by `onDrainDeadline` and nothing else, the
+give-up does not exist on those seeds. A strand there is the `timer` case
+by another route: the drain waits for the last connection however long
+that takes, exactly as configured, and the run ends in `SimIo`'s deadlock
+with no diagnostic. The proxy is right and the gate was wrong — it
+demanded a report the configuration deliberately declined.
+
+Nightly run #18 (2026-08-13) found it. All four shards hit the 16-failure
+cap early in their million-seed slices — shard 0 at 36k — so the night
+swept 163k of its 4M block and every one of the 64 named seeds had drawn
+both a mid-scenario drain with the no-cap deadline and a drop. The draws
+are independent and both are minorities, which is why 4096 seeds per
+change missed it and a million-seed block did not: at roughly 7 such
+seeds per 4096, `ci` clears whole runs without producing one.
+
+`maybeStrandOps` skips the strand when the deadline is zero, rather than
+`deriveDropKind` skipping the draw. `drop_kind` is drawn in
+`deriveTerminatingDraws` and the deadline one call later in
+`deriveServerConfig`, adjacent siblings under `deriveTopology` in that
+order, so gating at the draw means drawing the deadline first — and
+swapping two calls re-rolls every draw after them for the whole sweep,
+census margins included, to fix an 0.2% case. Skipping at the strand
+leaves `drop_taken` false, so the seed is held to the ordinary invariants
+like any seed that stranded nothing. Measured cost over a 4096-seed
+sweep: 7 seeds draw a drop they cannot use, against 159 that draw one
+they can.
+
+The two rates are worth keeping apart: 7 per 4096 is the *draw* rate, and
+the observed failure rate was about a quarter of that (16 across shard
+0's 36k). A drawn kind with nothing armed of it strands nothing, so most
+of what this skip costs was never going to reach the give-up anyway.
+
 The sweep runs with `dump_on_abort = false`. A stranded seed reaches the
 give-up on purpose and its operator forensics are two hundred lines
 apiece, while the verdict here is `abortedWith` and not the wording. That
