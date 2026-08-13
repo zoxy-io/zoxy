@@ -377,10 +377,10 @@ comptime {
     // the first connection exhausts it.
     assert(libcrypto_heap_bytes >= 2 * 1024 * 1024);
     // …and every session the deepest admissible pool can hold at once, or
-    // a full pool exhausts it — which is the shape of #222. The compiled
-    // reservation is derived at that ceiling, so this is the derivation
-    // pinned rather than a second opinion about it.
-    assert(libcrypto_heap_bytes >= libcryptoHeapBytes(tls_engines_max));
+    // a full pool exhausts it — which is the shape of #222. Stated against
+    // the per-engine term rather than against `libcryptoHeapBytes` itself:
+    // the reservation *is* that call, so comparing the two would be a
+    // value checked against its own definition.
     assert(libcrypto_heap_bytes > tls_engines_max * libcrypto_heap_bytes_per_engine);
     // The measured marginal cost with the no-coalescing margin on top. A
     // reservation below what was measured would be a number that had

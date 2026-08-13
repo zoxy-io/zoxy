@@ -482,7 +482,7 @@ a raised `RLIMIT_NOFILE`:
 | head buffers (ring) | = conn slots | 11466 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11466 | `head_buffer_bytes` + 24 B |
 | tls engines | 0, or min(conn slots, 1024) | 1024 | ~132 KiB + plaintext |
-| **pool memory** | **~34 MiB** | **~288 MiB** | |
+| **pool memory** | **~34 MiB** | **~294 MiB** | |
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
 (oversize → 414/431, §7), with a 1 KiB floor and a 1 MiB ceiling: a size
@@ -501,9 +501,16 @@ orders of magnitude past a head buffer. One-per-slot at the c10k ceiling would b
 default is conn slots *capped* at 1024 and a deployment past that sheds
 rather than reserves. It is zero — the whole feature free — unless some
 listener carries a `tls` block. Beside the per-engine cost sits one
-process-wide reservation: the fixed heap libcrypto allocates from, 4 MiB,
-which is what makes zero-allocation-after-startup provable with a C
-library underneath (§4).
+process-wide reservation: the fixed heap libcrypto allocates from, which
+is what makes zero-allocation-after-startup provable with a C library
+underneath (§4). It is sized *from the engine pool* — 2 MiB plus 8 KiB
+per engine, so 10 MiB at the 1024-engine default — because its occupancy
+is per concurrent session rather than per process. It was a flat 4 MiB
+until #222: that number came from measuring *sequential* handshakes,
+where each one's blocks return to their size class before the next asks
+and the frontier never grows. Concurrent sessions each hold their own, so
+the heap ran out at ~675 of them — and the process livelocked rather than
+shed, because the dependency retried that allocation failure forever.
 
 Session resumption adds nothing to either. A resumption ticket has to
 carry its session's PSK back to us, and the obvious shape — a table keyed
