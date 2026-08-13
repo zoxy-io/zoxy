@@ -39,6 +39,16 @@ pub fn build(b: *std.Build) void {
     const io_options = b.addOptions();
     io_options.addOption(IoBackend, "backend", io_backend);
 
+    // Release builds link libcrypto statically; everything else links the
+    // shared one its shell provides. See `static_link` for why the
+    // distinction is not cosmetic, and for why the *choice of libcrypto*
+    // is made through pkg-config rather than here.
+    static_link = b.option(
+        bool,
+        "static",
+        "link the executable statically, libcrypto included (release artifacts)",
+    ) orelse false;
+
     // libxev is pinned by content hash to the zoxy-io fork's
     // zoxy-ring-flags branch: the audited upstream snapshot plus the
     // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
@@ -100,6 +110,12 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zoxy", .module = zoxy_module },
             },
         }),
+        // A release binary is handed to strangers, so it needs nothing on
+        // the box it lands on. Without this the musl target still asks
+        // for a musl loader, which stock Linux does not have — the
+        // artifact links correctly and then refuses to start, which is
+        // exactly what the 0.2.0 tag produced.
+        .linkage = if (static_link) .static else null,
     });
     // src/main.zig reads its version from this module (also added to the
     // ReleaseSafe `release_zoxy` below, the other build of that same source).
@@ -543,8 +559,33 @@ fn resolveBuildId(b: *std.Build) []const u8 {
 /// here, so they are set in one place rather than repeated per module.
 fn linkLibcrypto(module: *std.Build.Module) void {
     module.link_libc = true;
+    // Static where the caller asked for it (`-Dstatic-crypto`), which the
+    // release builds do and nothing else does.
+    //
+    // A dev or CI build links the shared libcrypto its shell provides and
+    // runs on that machine, which is all it needs. A *release* binary is
+    // handed to strangers, and a musl target that dynamically links
+    // libcrypto is not the artifact anyone thinks it is: it wants a musl
+    // loader and a musl-ABI `libcrypto.so.3` at runtime, so a stock
+    // Linux box cannot execute it at all. That shipped unnoticed the
+    // moment TLS termination (#125) gave zoxy a C dependency — before it,
+    // the musl target had nothing to link and was static by default.
     module.linkSystemLibrary("crypto", .{});
 }
+
+/// Set from `-Dstatic` in `build`, read where the executable is declared.
+/// A file global because that is the only other place it is needed and a
+/// parameter would have to travel through code that does not care.
+///
+/// *Which* libcrypto `-lcrypto` resolves to is not decided here. Zig
+/// asks pkg-config, so the answer is whatever `PKG_CONFIG_PATH` names —
+/// which is also the only lever that reaches **ztls's** own
+/// `linkSystemLibrary("crypto")`, since that lives in a pinned dependency
+/// this build cannot reach into. A release therefore points pkg-config at
+/// a static, target-ABI openssl and gets one everywhere; naming an
+/// archive here would have fixed only half the link and left ztls still
+/// pulling in the shared one.
+var static_link: bool = false;
 
 /// The `-Dio-backend` choice. `default` is what the platform picks
 /// (io_uring on Linux, kqueue on macOS); `epoll` overrides it to the

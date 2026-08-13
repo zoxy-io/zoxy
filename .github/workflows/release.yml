@@ -44,20 +44,35 @@ jobs:
             # at 128 bits (std.simd.suggestVectorLength keys off target CPU
             # features, DESIGN.md §7); v3 doubles it to 256.
             cpu: x86_64_v3
+            static: true
           - label: aarch64-linux
             os: ubuntu-24.04-arm
             zig_target: aarch64-linux-musl
             # aarch64 keeps its default baseline — NEON is mandatory in
             # ARMv8-A, so there is no wider portable win to take.
             cpu: ''
-          - label: x86_64-macos
-            os: macos-13
-            zig_target: x86_64-macos
-            cpu: x86_64_v3
+            static: true
+          # x86_64-macos is deliberately absent as of 0.2.0. Building it
+          # natively needs an Intel macOS runner, and GitHub's `macos-13`
+          # is retired: the 0.2.0 attempt sat queued for seven hours and
+          # never started. That is the worse failure mode — a wrong runner
+          # label does not fail, it *hangs*, so it blocks every other leg
+          # rather than reporting. Cross-compiling it from Apple Silicon
+          # is what this whole file just stopped doing, and for the same
+          # reason: libcrypto would come from the wrong architecture.
+          #
+          # Intel Macs can build from source until an Intel runner exists
+          # again. Revisit if GitHub ships a supported label.
           - label: aarch64-macos
             os: macos-latest
             zig_target: aarch64-macos
             cpu: ''
+            # Darwin has no static libc, so a macOS binary cannot be fully
+            # static and must not ask to be. libcrypto still comes from the
+            # archive pkg-config names — what stays dynamic is libSystem,
+            # which every macOS machine has. The nix-store check below is
+            # what holds that distinction to its promise.
+            static: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -84,7 +99,23 @@ jobs:
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
           echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
 
+      # libcrypto has to come from a *static*, target-ABI build, and the
+      # only lever that reaches every consumer is pkg-config: zig resolves
+      # `-lcrypto` through it, and so does ztls's own build.zig, which is
+      # a pinned dependency this repo cannot reach into. Point pkg-config
+      # at a static openssl and both link the archive; point it anywhere
+      # else and the release links a shared library that is not on the
+      # machines it ships to.
+      - name: Resolve a static libcrypto
+        id: crypto
+        run: |
+          set -euo pipefail
+          dev="$(nix build --no-link --print-out-paths 'nixpkgs#pkgsStatic.openssl^dev')"
+          echo "pkg_config_path=$dev/lib/pkgconfig" >> "$GITHUB_OUTPUT"
+
       - name: Build and package
+        env:
+          PKG_CONFIG_PATH: ${{ steps.crypto.outputs.pkg_config_path }}
         run: |
           set -euo pipefail
           version="${{ steps.ver.outputs.version }}"
@@ -99,14 +130,42 @@ jobs:
           devenv shell -- zig build \
             -Dtarget="${{ matrix.zig_target }}" \
             ${{ matrix.cpu && format('-Dcpu={0}', matrix.cpu) || '' }} \
+            ${{ matrix.static && '-Dstatic' || '' }} \
             -Doptimize=ReleaseSafe \
             -Dbuild-id="${{ steps.ver.outputs.tag }}" --prefix out
 
-          # The binary runs on the machine that built it now, so the
-          # cheapest possible confidence is free: ask it what it is. A
-          # release that reports the wrong version is the failure the
-          # version-bump-before-tag rule exists to prevent, and this is
-          # where it would show.
+          # Nothing from the build machine may follow the binary out.
+          #
+          # This is the check the 0.2.0 tag needed and did not have. TLS
+          # termination gave zoxy a C dependency, `linkSystemLibrary`
+          # links it shared, and the Linux artifact silently became one
+          # that wants a musl loader and a musl-ABI libcrypto.so.3 at
+          # runtime — unrunnable on a stock box, and indistinguishable
+          # from a good build until someone tried to start it.
+          #
+          # A nix store path baked into a release is the same failure
+          # wearing macOS clothes, so both are refused here rather than
+          # discovered by whoever downloads it.
+          case "${{ runner.os }}" in
+            Linux)
+              if readelf -d ./out/bin/zoxy 2>/dev/null | grep -q NEEDED; then
+                echo "::error::not static:"; readelf -d ./out/bin/zoxy | grep NEEDED
+                exit 1
+              fi
+              ;;
+            macOS)
+              if otool -L ./out/bin/zoxy | grep -q /nix/store; then
+                echo "::error::links the build machine's nix store:"
+                otool -L ./out/bin/zoxy | grep /nix/store
+                exit 1
+              fi
+              ;;
+          esac
+
+          # And it runs, on the platform it was built for, and says it is
+          # the version being released. A release that reports the wrong
+          # version is the failure the bump-before-tag rule exists to
+          # prevent; this is where it shows.
           reported="$(./out/bin/zoxy --version)"
           echo "built: $reported"
           case "$reported" in
@@ -167,7 +226,7 @@ jobs:
           # the cross-compile it replaced did on the 0.2.0 tag, and the
           # `fail-fast: false` above means a single broken target no longer
           # cancels the others into looking like they were never tried.
-          for label in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+          for label in x86_64-linux aarch64-linux aarch64-macos; do
             test -f "dist/zoxy-$version-$label.tar.gz" \
               || { echo "::error::missing artifact for $label"; exit 1; }
           done
@@ -198,7 +257,6 @@ jobs:
           tag="${{ steps.ver.outputs.tag }}"
 
           sha_aarch64_macos=$(grep "zoxy-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
-          sha_x86_64_macos=$(grep  "zoxy-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
           sha_aarch64_linux=$(grep "zoxy-$version-aarch64-linux.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
           sha_x86_64_linux=$(grep  "zoxy-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
 
@@ -222,14 +280,15 @@ jobs:
               strategy :github_latest
             end
 
+            # Apple Silicon only. There is no Intel macOS bottle from
+            # 0.2.0 on: building one needs an Intel macOS runner, and
+            # GitHub's is retired. Homebrew on an Intel Mac will report
+            # that no bottle is available rather than download one that
+            # cannot run, which is the failure worth having.
             on_macos do
               on_arm do
                 url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-aarch64-macos.tar.gz"
                 sha256 "$sha_aarch64_macos"
-              end
-              on_intel do
-                url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-x86_64-macos.tar.gz"
-                sha256 "$sha_x86_64_macos"
               end
             end
 
