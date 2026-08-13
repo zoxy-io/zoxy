@@ -291,7 +291,12 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     engine.tickets = config.tickets;
     engine.now_unix = config.now_unix;
     engine.hs = .init(.{
-        .keypairs = .init(keypair),
+        // Fallible since ztls 634567a: generating the P-256 half can fail,
+        // and a failure it would repeat — the fixed heap full — is ours to
+        // shed rather than ztls's to retry past (#222). The error lands in
+        // `acquireTlsEngine`, which gives the slot back and answers
+        // `CryptoUnavailable`.
+        .keypairs = try .init(keypair),
         .random = .init(config.random),
         .reassembly = &engine.reassembly.buffer,
         // Offered only when this deployment can actually open one. A

@@ -185,9 +185,38 @@
         // whole 16 KiB capacity rather than the bytes actually used, at
         // ~3% of handshake throughput (IMPLEMENTATION_NOTES.md). Bounding
         // it narrows what is zeroed, never what is retained.
+        //
+        // Re-audit for 634567a (zoxy-io/ztls#1, upstream
+        // mattrobenolt/ztls#88): `p256`/`p384` `KeyPair.generate` retried
+        // `while (true) … catch continue`, a bound sized for the
+        // once-in-2^32 scalar outside [1, n-1] but applied to the whole
+        // error set — including the six allocation paths that answer
+        // `LibcryptoFailed`. With our fixed heap full, every attempt failed
+        // identically and the loop never ended: #222's 100% CPU livelock,
+        // on the loop thread, taking both listeners and the admin plane.
+        //
+        // The diff is a classification and the propagation that follows
+        // from it. `EC_KEY_set_private_key`/`set_public_key`/`check_key`
+        // judge the scalar, so they now answer `IdentityElement`, leaving
+        // `LibcryptoFailed` to mean the library failed — the two were
+        // indistinguishable before, which is why no caller could have
+        // handled this. `generate` returns `Error!KeyPair`, retries only
+        // `IdentityElement`, bounds that at 4 attempts, and propagates
+        // `LibcryptoFailed` on the first. No change to key derivation, the
+        // record layer, or any byte on the wire; the ephemeral scalars are
+        // still drawn from `entropy.fill` and still checked by the same
+        // three OpenSSL calls, only under a different error name.
+        //
+        // Blast radius here is one `try` in `tls/Engine.zig`: the error now
+        // reaches `Server.acquireTlsEngine`, which already released the
+        // engine and returned `CryptoUnavailable` for exactly this — a rung
+        // (`shed_tls_crypto`) that until now could never fire. Two upstream
+        // tests that pinned the old mapping moved with it; zero is the
+        // "draw again" case they describe. Still open upstream, so this
+        // rides the fork like the other four.
         .ztls = .{
-            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#dba5cdf93483ccdb9a76c30c5f979912440a791e",
-            .hash = "ztls-0.0.0-SHHDXhqPFQAt_KHHb6p-5wgcImq3pWtCP1UEESUPjXVr",
+            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#634567aedb66ed7c8abcd0d6b2e4fefdba6b6cb5",
+            .hash = "ztls-0.0.0-SHHDXm2kFQB_YpgKnzsrxFllS1bq1WTSN-HTr8fAdAYr",
         },
     },
     .paths = .{

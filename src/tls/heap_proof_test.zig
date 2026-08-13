@@ -77,7 +77,7 @@ test "a handshake runs entirely on the fixed libcrypto heap" {
 fn handshake(credentials: *const Credentials) !void {
     const server_keypair = try ztls.x25519.KeyPair.generateDeterministic(.init(@splat(0x42)));
     var server: ztls.ServerHandshake = .init(.{
-        .keypairs = .init(server_keypair),
+        .keypairs = try .init(server_keypair),
         .random = .init(@splat(0x43)),
     });
     defer server.deinit();
