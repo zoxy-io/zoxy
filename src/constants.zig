@@ -305,13 +305,60 @@ comptime {
     assert(tls_ticket_key_rotation_s >= tls_ticket_lifetime_s);
 }
 
+/// What one *concurrent* TLS session costs the fixed heap on top of the
+/// base below: libcrypto's per-session state, live for as long as that
+/// session holds an engine.
+///
+/// Measured 2026-08-13 (ECDSA P-256, TLS_AES_128_GCM_SHA256, 1 KiB body)
+/// by reading the heap's own frontier at steady concurrency:
+///
+///     concurrent sessions    50     100    200    400
+///     heap frontier        1024K  1280K  1792K  2752K
+///
+/// The marginal cost is flat — 5.12 KiB across 100→200, 4.80 KiB across
+/// 200→400 — so this term is linear in the *session* count and not in the
+/// handshake count: 1811 sequential handshakes moved the frontier not at
+/// all, because each one's blocks return to their class before the next
+/// asks. Reserved at 8 KiB rather than the measured ~5: the heap is
+/// segregated-fits with no coalescing, so a class whose free list is empty
+/// cannot be served out of another's, and the slack absorbs that.
+pub const libcrypto_heap_bytes_per_engine: u32 = 8 * 1024;
+
+/// What the heap costs before any session: libcrypto's one-time tables
+/// plus the first handshake's distinct block footprint, which every later
+/// handshake reuses off the class free lists rather than growing
+/// (IMPLEMENTATION_NOTES.md). Measured at ~1 MiB — 384 KiB at startup,
+/// ~960 KiB once the first handshakes settle — reserved at 2 MiB.
+pub const libcrypto_heap_base_bytes: u32 = 2 * 1024 * 1024;
+
 /// The fixed heap libcrypto allocates from (§4, `tls/libcrypto_heap.zig`),
-/// reserved at startup exactly when some listener terminates TLS. Sized
-/// against the measured plateau — ~1 MiB for one handshake's distinct
-/// block footprint, with every later handshake free once the size classes
-/// have filled (IMPLEMENTATION_NOTES.md) — plus headroom for the
-/// concurrency that measurement did not exercise.
-pub const libcrypto_heap_bytes: u32 = 4 * 1024 * 1024;
+/// reserved at startup exactly when some listener terminates TLS.
+///
+/// Scales with the engine pool, because the heap's occupancy does. The
+/// previous fixed 4 MiB was sized against a *sequential* measurement — one
+/// handshake at a time, each freeing before the next — which is true
+/// serially and false concurrently, and the gap was an outage rather than
+/// a rounding error: the heap ran out at ~675 concurrent sessions, and
+/// because ztls retried that allocation failure forever, the process
+/// livelocked at 100% CPU with every listener dark (#222).
+pub fn libcryptoHeapBytes(tls_engines: u32) u32 {
+    assert(tls_engines <= tls_engines_max);
+    // Zero exactly when no listener terminates TLS — the same condition
+    // that makes the engine pool itself free (§5).
+    if (tls_engines == 0) return 0;
+    return libcrypto_heap_base_bytes + tls_engines * libcrypto_heap_bytes_per_engine;
+}
+
+/// The compiled reservation: what the deepest pool a config may ask for
+/// needs, so one static array covers every admissible `limits.tls_engines`
+/// (the loader holds it to `tls_engines_max`).
+///
+/// It has to be comptime. The heap is BSS rather than arena memory because
+/// `OPENSSL_cleanup` frees through our hooks from an atexit handler, after
+/// `main` has returned and the arena with it (see `main.zig`) — so sizing
+/// for the ceiling is what a static reservation costs, and BSS pages a
+/// smaller deployment never touches never become resident.
+pub const libcrypto_heap_bytes: u32 = libcryptoHeapBytes(tls_engines_max);
 
 /// The most a certificate or key PEM file may be. A bound on a startup
 /// read, so its job is only to turn "the operator pointed at the wrong
@@ -329,6 +376,16 @@ comptime {
     // The heap must hold more than one handshake's measured plateau, or
     // the first connection exhausts it.
     assert(libcrypto_heap_bytes >= 2 * 1024 * 1024);
+    // …and every session the deepest admissible pool can hold at once, or
+    // a full pool exhausts it — which is the shape of #222. The compiled
+    // reservation is derived at that ceiling, so this is the derivation
+    // pinned rather than a second opinion about it.
+    assert(libcrypto_heap_bytes >= libcryptoHeapBytes(tls_engines_max));
+    assert(libcrypto_heap_bytes > tls_engines_max * libcrypto_heap_bytes_per_engine);
+    // The measured marginal cost with the no-coalescing margin on top. A
+    // reservation below what was measured would be a number that had
+    // stopped tracking the thing it was derived from.
+    assert(libcrypto_heap_bytes_per_engine >= 5 * 1024);
     // A PEM that could not carry the DER it wraps would make the tighter
     // chain bound unreachable — base64 costs a third on top.
     assert(tls_pem_bytes_max > tls_cert_chain_bytes_max * 2);
@@ -1208,10 +1265,18 @@ pub const PoolSizes = struct {
     /// for the widest use any of them may be put to.
     tls_plaintext_bytes: u64 = 0,
     /// The fixed heap libcrypto allocates from (§4), reserved exactly
-    /// when some listener terminates TLS. Not per-engine — one
-    /// process-wide reservation, priced here for the same reason the
-    /// access log's buffers are: §5's promise is that the printed total
-    /// covers every byte this process holds for its life.
+    /// when some listener terminates TLS. One process-wide reservation
+    /// rather than a per-engine buffer, but sized *from* the engine count
+    /// (`libcryptoHeapBytes`) because that is what its occupancy tracks —
+    /// priced here for the same reason the access log's buffers are: §5's
+    /// promise is that the printed total covers every byte this process
+    /// holds for its life.
+    ///
+    /// Priced at the whole compiled reservation rather than this config's
+    /// share of it: the storage is one static array (it must outlive the
+    /// arena), so the process holds all of it whatever `tls_engines` says.
+    /// `libcryptoHeapBytes` is what *derives* that array's size, at
+    /// `tls_engines_max`; it is not a per-config subtotal to print.
     libcrypto_heap_bytes: u64 = 0,
 };
 

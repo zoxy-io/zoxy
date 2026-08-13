@@ -506,6 +506,11 @@ fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
             0
         else
             zoxy.tls.Engine.plaintextBytesFor(limits.head_buffer_bytes),
+        // The whole compiled reservation, not this config's share of it:
+        // the storage is one static array sized at `tls_engines_max` (it
+        // must outlive the arena — see `libcrypto_heap_storage`), so that
+        // is what the process holds for its life whatever `tls_engines`
+        // says, and §5 prices what is held.
         .libcrypto_heap_bytes = if (limits.tls_engines == 0)
             0
         else
