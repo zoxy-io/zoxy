@@ -36,6 +36,7 @@
 const std = @import("std");
 
 const config_module = @import("../config.zig");
+const constants = @import("../constants.zig");
 const conn_module = @import("Conn.zig");
 const pump = @import("pump.zig");
 const router = @import("../http/router.zig");
@@ -630,6 +631,7 @@ const Harness = struct {
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = 0,
             .request_timeout_ms = 0,
+            .tunnel_timeout_ms = constants.tunnel_ms_default,
         };
         // The Server owns the pools, the clock and teardown. Its own
         // listeners stay unbound: this scenario drives the pump directly, so

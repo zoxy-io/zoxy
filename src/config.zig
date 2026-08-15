@@ -43,6 +43,23 @@ pub const Config = struct {
     /// otherwise. `0` disables it, so it is optional in the JSON and
     /// defaults off. L4 connections never set it.
     request_timeout_ms: u32,
+    /// Bound on one tunnel's whole life (§8, #180), replacing `idle_ms`,
+    /// `request_ms` and `max_lifetime_ms` from the moment a connection
+    /// becomes one. Not a fourth clock running beside them: each of those
+    /// would cut a healthy session — `idle_ms` defaults to 60 s, and a
+    /// WebSocket's keepalive is application-layer ping/pong this proxy
+    /// cannot see, because after `101` the bytes are opaque by
+    /// construction. Unlike `max_lifetime_ms` and `request_ms`, zero is
+    /// **not** legal: a tunnel holds a dedicated pool slot for its whole
+    /// life, and an unbounded hold on a bounded pool is the one thing
+    /// that model cannot absorb. Inert when no listener allows upgrades.
+    ///
+    /// No struct default, deliberately, on the same terms as
+    /// `request_timeout_ms`: a hand-built config that forgot this would
+    /// otherwise run a real one-hour deadline nobody asked for, and a
+    /// silently-inherited deadline is exactly what the absent defaults
+    /// on the other caps exist to prevent.
+    tunnel_timeout_ms: u32,
     /// Pause between §7 health-probe sweeps over every `check` cluster's
     /// endpoints. Probing itself is enabled per cluster (`Cluster.check`);
     /// this only paces it, so it is optional in the JSON and defaults to
@@ -160,6 +177,22 @@ pub const Config = struct {
         /// terminates TLS, and the struct default is the off state on the
         /// same terms as `head_buffers`.
         tls_engines: u32 = 0,
+        /// The §5 tunnel pool (#180): how many upgraded connections may be
+        /// carried at once, each holding its own relay buffer and upstream
+        /// socket for its whole life rather than drawing from the shared
+        /// pools — which is the point, since a tunnel has the opposite
+        /// shape to everything those pools are sized for.
+        ///
+        /// Alone among the optional pools it has **no derived default**.
+        /// The others resolve to a worst case that cannot shed — every
+        /// connection mid-head, every leased slot holding one head — and
+        /// a count derived that way is safe because it can only be too
+        /// generous. There is no such number here: how many long-lived
+        /// sessions an origin fleet should carry is a capacity decision
+        /// with no honest guess available from a connection count, so a
+        /// listener that allows upgrades without one is rejected at load.
+        /// Zero exactly when no listener allows any upgrade.
+        tunnels: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -223,6 +256,37 @@ pub const Config = struct {
         /// says; originating TLS to a backend is a separate decision with
         /// its own trust store, and #125 is termination.
         tls: ?Tls = null,
+        /// Which protocol upgrades this listener will carry as tunnels
+        /// (§7, #180). Empty by default — an `Upgrade` naming nothing
+        /// here is `501`, which is what every config predating this
+        /// keeps getting. Per listener, like `forwarded` and `tls`, and
+        /// for the stronger version of the same reason: after `101` the
+        /// stream is opaque and no filter, route or header rule on this
+        /// listener applies to another byte of it, so which sockets may
+        /// hand out that exemption is a property of the socket.
+        upgrades: Upgrades = .{},
+
+        /// The upgrade tokens a listener may allow, as a set rather than
+        /// a list: the vocabulary is closed, so membership is a field
+        /// and not an arena slice to bound.
+        ///
+        /// Closed deliberately, and it is the §7 "closed action enum"
+        /// instinct rather than a shortcut. A token this proxy does not
+        /// name is one it cannot reason about: `h2c` would tunnel HTTP/2
+        /// to an origin it cannot parse, past every rule the config
+        /// expresses. Adding a token is therefore a code decision, made
+        /// once with its consequences understood, not a string an
+        /// operator can invent.
+        pub const Upgrades = struct {
+            websocket: bool = false,
+
+            /// Whether this listener allows any upgrade at all — what
+            /// decides whether a `limits.tunnels` is required (§5) and
+            /// whether the §7 gate has anything to consult.
+            pub fn any(upgrades: Upgrades) bool {
+                return upgrades.websocket;
+            }
+        };
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
         /// `http` runs the HTTP/1.1 reverse-proxy state machine. The
@@ -490,6 +554,9 @@ pub const ValidationError = error{
     ListenerL4RequestFilters,
     ListenerL4ResponseFilters,
     ListenerL4Forwarded,
+    ListenerL4Upgrades,
+    ListenerUpgradesEmpty,
+    ListenerUpgradeTokenUnknown,
     ListenerForwardedModeUnknown,
     ListenerHttpProxyProtocol,
     ListenerProxyProtocolModeUnknown,
@@ -533,6 +600,7 @@ pub const ValidationError = error{
     TimeoutZero,
     TimeoutOverLimit,
     TimeoutOrderInvalid,
+    TimeoutTunnelOutOfRange,
     LimitConnSlotsOutOfRange,
     LimitRelayBuffersOutOfRange,
     LimitRelayBuffersOverConnSlots,
@@ -547,6 +615,10 @@ pub const ValidationError = error{
     LimitTlsEnginesOutOfRange,
     LimitTlsEnginesOverConnSlots,
     LimitTlsEnginesWithoutTlsListener,
+    LimitTunnelsRequired,
+    LimitTunnelsOutOfRange,
+    LimitTunnelsOverConnSlots,
+    LimitTunnelsWithoutUpgrades,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -627,6 +699,7 @@ pub fn parseWithFiles(
     }
     var http_listeners_count: u32 = 0;
     var tls_listeners_count: u32 = 0;
+    var upgrade_listeners_count: u32 = 0;
     for (parsed.listeners) |listener_json| {
         if (try protocolOf(listener_json.protocol) == .http) http_listeners_count += 1;
         // Presence only: whether the block is *usable* is `resolveTls`'s
@@ -635,6 +708,12 @@ pub fn parseWithFiles(
         // be refused, and reporting a limit error for a config whose real
         // fault is a missing path.
         if (listener_json.tls != null) tls_listeners_count += 1;
+        // Presence only, like `tls` above and for the same reason: what
+        // the tokens *say* is `resolveUpgrades`'s to judge per listener,
+        // and sizing the tunnel pool against a list that might yet be
+        // refused would report a limits error for a config whose real
+        // fault is a token nobody recognises.
+        if (listener_json.upgrades != null) upgrade_listeners_count += 1;
     }
     const access_log_sink = try resolveAccessLogSink(parsed.access_log);
     // Before the limits, because the named headers widen the line the
@@ -645,6 +724,7 @@ pub fn parseWithFiles(
         @intCast(parsed.listeners.len),
         http_listeners_count,
         tls_listeners_count,
+        upgrade_listeners_count,
         access_log_sink != null,
         log_headers.count(),
     );
@@ -675,6 +755,7 @@ pub fn parseWithFiles(
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
         .request_timeout_ms = parsed.timeouts.request_ms,
+        .tunnel_timeout_ms = parsed.timeouts.tunnel_ms,
         .health_interval_ms = parsed.timeouts.health_interval_ms,
         .limits = limits,
         .admin_bind = admin_bind,
@@ -1045,17 +1126,38 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 /// relay-buffer count derives from the effective conn slots (a buffer
 /// beyond the slot count could never be acquired); a *specified* count
 /// above them is a contradiction and fails loudly.
+/// The §5 relation every per-connection pool shares: none of them may
+/// out-size the connections that draw on it. Stated once, after the
+/// resolvers have each enforced their own half, because a pool past this
+/// is not merely wasteful — the fd and ring budgets are derived from
+/// `conn_slots` on the strength of it (`fdsRequired`, `inFlightOps`), so
+/// a breach here is an under-provisioned ring rather than spare memory.
+fn assertPoolsFitConnSlots(
+    conn_slots: u32,
+    relay_buffers: u32,
+    head_buffers: u32,
+    tls_engines: u32,
+    tunnels: u32,
+) void {
+    assert(relay_buffers <= conn_slots);
+    assert(head_buffers <= conn_slots);
+    assert(tls_engines <= conn_slots);
+    assert(tunnels <= conn_slots);
+}
+
 fn resolveLimits(
     limits_json: *const LimitsJson,
     listeners_count: u32,
     http_listeners_count: u32,
     tls_listeners_count: u32,
+    upgrade_listeners_count: u32,
     access_log_on: bool,
     log_header_count: u32,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     assert(http_listeners_count <= listeners_count);
     assert(tls_listeners_count <= listeners_count);
+    assert(upgrade_listeners_count <= listeners_count);
     const slots = try resolveSlotCounts(limits_json);
     const conn_slots = slots.conn_slots;
     const relay_buffers = slots.relay_buffers;
@@ -1076,6 +1178,11 @@ fn resolveLimits(
         conn_slots,
         tls_listeners_count,
     );
+    const tunnels = try resolveTunnels(
+        limits_json.tunnels,
+        conn_slots,
+        upgrade_listeners_count,
+    );
     const cq_fill_eighths = try resolveCqFill(
         limits_json.cq_fill_eighths,
         conn_slots,
@@ -1092,9 +1199,7 @@ fn resolveLimits(
         access_log_on,
         log_header_count,
     );
-    assert(relay_buffers <= conn_slots);
-    assert(head_buffers <= conn_slots);
-    assert(tls_engines <= conn_slots);
+    assertPoolsFitConnSlots(conn_slots, relay_buffers, head_buffers, tls_engines, tunnels);
     return .{
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
@@ -1103,6 +1208,7 @@ fn resolveLimits(
         .upstream_head_buffers = upstream_head_buffers,
         .head_buffer_bytes = head_buffer_bytes,
         .tls_engines = tls_engines,
+        .tunnels = tunnels,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
     };
@@ -1203,6 +1309,56 @@ fn resolveTlsEngines(
     }
     assert(tls_engines <= conn_slots);
     return tls_engines;
+}
+
+/// The §5 tunnel pool (#180). Shaped like `resolveTlsEngines` in every
+/// respect but the one that matters: **there is no derived default**.
+///
+/// Every other optional pool falls back to a worst case that cannot shed
+/// — head buffers to conn slots because every connection could be
+/// mid-head at once, engines to conn slots capped — and such a fallback
+/// is safe precisely because it can only be too generous. A tunnel count
+/// has no such number behind it. How many long-lived sessions an origin
+/// fleet should carry is a capacity decision, and deriving it from a
+/// connection count would silently promise a pool nobody sized: the
+/// failure would arrive as tunnels refused under load, far from the
+/// config that caused it. So a listener that allows upgrades without a
+/// `limits.tunnels` is refused at load, where the operator is looking.
+///
+/// The `≤ conn_slots` bound is not arithmetic hygiene either — it is
+/// what leaves the fd and ring budgets untouched (§5): `fdsRequired`
+/// already charges two sockets per connection, which is exactly what a
+/// tunnel holds, and `conn_ops_max` is 4 because one of its tying peaks
+/// is a relay teardown, which is a tunnel's steady state.
+fn resolveTunnels(
+    requested: ?u32,
+    conn_slots: u32,
+    upgrade_listeners_count: u32,
+) ValidationError!u32 {
+    assert(conn_slots >= 1);
+    const tunnels = requested orelse {
+        if (upgrade_listeners_count >= 1) {
+            return error.LimitTunnelsRequired;
+        }
+        return 0;
+    };
+    if (tunnels > constants.tunnels_max) {
+        return error.LimitTunnelsOutOfRange;
+    }
+    if (tunnels > conn_slots) {
+        return error.LimitTunnelsOverConnSlots;
+    }
+    if (upgrade_listeners_count == 0 and tunnels >= 1) {
+        return error.LimitTunnelsWithoutUpgrades;
+    }
+    // A pool of zero beside a listener that allows upgrades would refuse
+    // every one of them: the same contradiction as sizing the head ring
+    // to zero on an http deployment, and rejected on the same terms.
+    if (upgrade_listeners_count >= 1 and tunnels == 0) {
+        return error.LimitTunnelsOutOfRange;
+    }
+    assert(tunnels <= conn_slots);
+    return tunnels;
 }
 
 /// The §5 head-buffer ring follows conn slots when omitted (every
@@ -1431,6 +1587,7 @@ pub const LimitsJson = struct {
     upstream_head_buffers: ?u32 = null,
     head_buffer_bytes: ?u32 = null,
     tls_engines: ?u32 = null,
+    tunnels: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 
@@ -1485,6 +1642,16 @@ pub const LimitsJson = struct {
             .minimum = 1,
             .maximum = constants.tls_engines_max,
         },
+        .tunnels = .{
+            .desc = "Concurrent tunnelled upgrades (#180). Each holds its own relay " ++
+                "buffer and upstream socket for its whole life, so tunnels never " ++
+                "draw on the pools ordinary traffic shares. Required — and only " ++
+                "legal — when some listener allows an upgrade; no default is " ++
+                "derived, because a count of long-lived sessions is a capacity " ++
+                "decision rather than something a connection count implies.",
+            .minimum = 1,
+            .maximum = constants.tunnels_max,
+        },
         .cq_fill_eighths = .{
             .desc = "Eighths of the io_uring completion queue the worst-case " ++
                 "in-flight ops may fill; lower reserves more burst headroom " ++
@@ -1523,6 +1690,10 @@ pub const ListenerJson = struct {
     proxy_protocol: ?ProxyProtocolJson = null,
     /// Optional TLS termination (#125); absent is a plaintext socket.
     tls: ?TlsJson = null,
+    /// Optional #180 upgrade allowlist; absent allows none, so an
+    /// `Upgrade` stays the 501 it has always been. HTTP-only — an l4
+    /// relay parses no handshake to recognise.
+    upgrades: ?[]const []const u8 = null,
 
     pub const schema_doc =
         "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
@@ -1558,6 +1729,13 @@ pub const ListenerJson = struct {
             .desc = "Terminate TLS on this listener with the given certificate " ++
                 "and key; absent is a plaintext socket. Inbound only — the " ++
                 "upstream leg stays plaintext.",
+        },
+        .upgrades = .{
+            .desc = "Protocol upgrades this listener will carry as tunnels (http " ++
+                "listeners only); absent allows none and an Upgrade stays 501. " ++
+                "Requires limits.tunnels.",
+            .min_items = 1,
+            .items = SchemaItems.upgrade_token,
         },
     };
 };
@@ -2318,6 +2496,10 @@ pub const TimeoutsJson = struct {
     /// because a request deadline is a policy an operator sets against
     /// their own origin's latency, not a value zoxy can pick for them.
     request_ms: u32 = 0,
+    /// Optional #180 tunnel lifetime; absent means an hour. Unlike the
+    /// two caps above, zero is rejected — a tunnel pins a dedicated pool
+    /// slot, so "no cap" is the one answer §5 cannot carry.
+    tunnel_ms: u32 = constants.tunnel_ms_default,
     /// Optional §7 health-probe pacing; absent means HAProxy's `inter`
     /// default. Unlike the two caps above, zero is rejected: probing is
     /// switched per cluster (`check`), never by zeroing its interval.
@@ -2344,6 +2526,13 @@ pub const TimeoutsJson = struct {
             .desc = "Absolute connection-age cap; 0 disables it.",
             .minimum = 0,
             .maximum = constants.timeout_ms_max,
+        },
+        .tunnel_ms = .{
+            .desc = "Cap on one tunnelled upgrade's whole life, replacing the idle, " ++
+                "request and lifetime deadlines once a connection becomes one. " ++
+                "Zero is rejected: a tunnel holds a dedicated pool slot.",
+            .minimum = constants.tunnel_ms_min,
+            .maximum = constants.tunnel_ms_max,
         },
         .request_ms = .{
             .desc = "Cap on one L7 exchange, not refreshed by activity; 0 disables it.",
@@ -2414,8 +2603,9 @@ pub const ClustersJson = struct {
 
 /// Marker for array-item vocabularies reflection can't infer from the
 /// element type alone. `http_method` means "the items are the registered
-/// HTTP method tokens", which `config_schema.zig` emits as a token enum.
-pub const SchemaItems = enum { http_method };
+/// HTTP method tokens" and `upgrade_token` "the #180 upgrade set's field
+/// names", each of which `config_schema.zig` emits as a token enum.
+pub const SchemaItems = enum { http_method, upgrade_token };
 
 /// The attribute keys a `schema_fields` entry may carry beyond `.desc`.
 /// `assert_meta_matches` rejects any other key at comptime, so a typo'd
@@ -2719,6 +2909,7 @@ fn resolveListener(
         .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
         .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
         .tls = try resolveTls(listener_json.tls, protocol),
+        .upgrades = try resolveUpgrades(listener_json.upgrades, protocol),
     };
     if (protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
@@ -3556,6 +3747,53 @@ fn resolveRetries(retries: u16) ParseError!u16 {
     return retries;
 }
 
+/// Resolve a listener's #180 upgrade allowlist. Absent allows none, so
+/// an `Upgrade` keeps the `501` it has always got.
+///
+/// The vocabulary is the `Upgrades` set's own field names, which *are*
+/// the JSON tokens — the same one-source-of-truth the `protocol` and
+/// `pick` matches use, so a token the proxy can carry and a token an
+/// operator may write cannot drift apart. Anything else is refused by
+/// name rather than ignored: a config that asked to tunnel `h2c` and got
+/// silence would believe it had, and after `101` there is no rule left
+/// to catch what came through.
+///
+/// An empty list is refused too. It reads as "allow nothing", which
+/// already has a spelling — omit the field — and configured this way it
+/// would demand a `limits.tunnels` for a listener that can never use
+/// one.
+fn resolveUpgrades(
+    upgrades_json: ?[]const []const u8,
+    protocol: Config.Listener.Protocol,
+) ValidationError!Config.Listener.Upgrades {
+    const tokens = upgrades_json orelse return .{};
+    if (protocol == .l4) {
+        // A byte relay parses no handshake to recognise, so there is
+        // nothing here for it to allow — the same refusal `forwarded`
+        // and `routes` get on an l4 listener, for the same reason.
+        return error.ListenerL4Upgrades;
+    }
+    if (tokens.len == 0) {
+        return error.ListenerUpgradesEmpty;
+    }
+    assert(tokens.len >= 1);
+    var upgrades: Config.Listener.Upgrades = .{};
+    for (tokens) |token| {
+        var matched = false;
+        inline for (@typeInfo(Config.Listener.Upgrades).@"struct".fields) |field| {
+            if (std.mem.eql(u8, token, field.name)) {
+                @field(upgrades, field.name) = true;
+                matched = true;
+            }
+        }
+        if (!matched) {
+            return error.ListenerUpgradeTokenUnknown;
+        }
+    }
+    assert(upgrades.any()); // A non-empty list of known tokens sets one.
+    return upgrades;
+}
+
 /// Resolve a listener's §7 client-address forwarding: absent is off, and
 /// a `forwarded` block on an `l4` listener is rejected rather than
 /// ignored — a byte relay has no header to carry an address, so asking
@@ -3756,6 +3994,29 @@ fn clusterIndexOf(
     return error.ClusterUnknown;
 }
 
+/// The #180 tunnel lifetime, which is neither of the two shapes
+/// `validateTimeouts` handles in bulk.
+///
+/// It has no "off": a tunnel holds a dedicated pool slot for its whole
+/// life, so an unbounded one is the single hold §5's model cannot
+/// absorb, and `0` is therefore a value rather than a switch. It carries
+/// a *floor* rather than a nonzero check, because a sub-second lifetime
+/// would reap every session the instant it opened — a typo that presents
+/// as the feature not working. And its ceiling is its own, above
+/// `timeout_ms_max`: that bound calls an hour suspicious, which is right
+/// for every other timeout and wrong for this one, where an hour is the
+/// routine case and must leave somewhere to go.
+fn validateTunnelTimeout(tunnel_ms: u32) ValidationError!void {
+    if (tunnel_ms < constants.tunnel_ms_min) {
+        return error.TimeoutTunnelOutOfRange;
+    }
+    if (tunnel_ms > constants.tunnel_ms_max) {
+        return error.TimeoutTunnelOutOfRange;
+    }
+    assert(tunnel_ms >= constants.tunnel_ms_min);
+    assert(tunnel_ms <= constants.tunnel_ms_max);
+}
+
 fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
     // Deadlines a zero would break rather than disable: a 0 ms connect or
     // idle budget reaps on arrival, and a 0 ms probe interval would probe
@@ -3805,6 +4066,7 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
     if (timeouts.connect_ms >= timeouts.idle_ms) {
         return error.TimeoutOrderInvalid;
     }
+    try validateTunnelTimeout(timeouts.tunnel_ms);
     // Postconditions: reaching here means every bound a consumer reads
     // without checking is in range, and every optional one is at most the
     // ceiling — zero included, which each consumer reads as "off" — and the
@@ -3818,6 +4080,8 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
         assert(value <= constants.timeout_ms_max);
     }
     assert(timeouts.connect_ms < timeouts.idle_ms);
+    assert(timeouts.tunnel_ms >= constants.tunnel_ms_min);
+    assert(timeouts.tunnel_ms <= constants.tunnel_ms_max);
 }
 
 const example_json = @embedFile("example_config");
@@ -6493,5 +6757,150 @@ test "config: retries resolves, defaults to none, rejects past the ceiling" {
             .{ head, constants.cluster_retries_max + 1, tail },
         );
         try expectParseError(error.ClusterRetriesOutOfRange, json);
+    }
+}
+
+test "config: the upgrade allowlist is closed, http-only, and never empty" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
+        \\ "upgrades":
+    ;
+    const tail =
+        \\},{"bind":"127.0.0.1:2","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"tunnels":16},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "[\"websocket\"]" ++ tail);
+        try std.testing.expect(parsed.listeners[0].upgrades.websocket);
+        try std.testing.expect(parsed.listeners[0].upgrades.any());
+        // Per listener, and the l4 one beside it allows nothing — which is
+        // what every config predating the key keeps getting.
+        try std.testing.expect(!parsed.listeners[1].upgrades.any());
+        try std.testing.expectEqual(@as(u32, 16), parsed.limits.tunnels);
+    }
+    // A token this proxy cannot reason about is refused by name, never
+    // ignored: `h2c` would tunnel HTTP/2 to an origin it cannot parse,
+    // and a config that asked for it and got silence would believe it
+    // had — with no rule left after 101 to catch what came through.
+    try expectParseError(error.ListenerUpgradeTokenUnknown, head ++ "[\"h2c\"]" ++ tail);
+    try expectParseError(error.ListenerUpgradeTokenUnknown, head ++ "[\"websocket\",\"h2c\"]" ++ tail);
+    // "Allow nothing" already has a spelling — omit the field — and this
+    // one would demand a tunnel pool for a listener that can never use it.
+    try expectParseError(error.ListenerUpgradesEmpty, head ++ "[]" ++ tail);
+}
+
+test "config: upgrades are refused on an l4 listener" {
+    // A byte relay parses no handshake to recognise, so there is nothing
+    // here for it to allow — the same refusal `forwarded` and `routes`
+    // get on an l4 listener, rather than a block that quietly does
+    // nothing.
+    try expectParseError(error.ListenerL4Upgrades,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","upgrades":["websocket"]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"tunnels":4},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: the tunnel pool has no derived default, and binds to the allowlist" {
+    const with_upgrades =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
+        \\ "upgrades":["websocket"]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}
+    ;
+    // Every other optional pool derives a fallback that can only be too
+    // generous; a count of long-lived sessions has no such number behind
+    // it, so the omission is refused where the operator is looking rather
+    // than surfacing later as tunnels shed under load.
+    try expectParseError(error.LimitTunnelsRequired, with_upgrades ++ "}");
+    // A pool of zero beside a listener that allows upgrades would refuse
+    // every one of them — the same contradiction as a zero head ring on
+    // an http deployment.
+    try expectParseError(
+        error.LimitTunnelsOutOfRange,
+        with_upgrades ++ ",\"limits\":{\"tunnels\":0}}",
+    );
+    // And a pool nothing can draw on is the mirror image: asked for, and
+    // unusable.
+    try expectParseError(error.LimitTunnelsWithoutUpgrades,
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"tunnels":8},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // Zero exactly when no listener allows an upgrade, so one number says
+    // both how many tunnels there may be and whether the feature is on.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.tunnels);
+    }
+}
+
+test "config: the tunnel pool may not exceed the connections that hold one" {
+    // Not arithmetic hygiene: this bound is what leaves the fd and ring
+    // budgets untouched by the feature (§5). A tunnel is an accepted
+    // client connection, so `fdsRequired`'s two-sockets-per-connection
+    // already covers its pair — but only while every tunnel has a
+    // connection to be.
+    var buffer: [512]u8 = undefined;
+    const json = try std.fmt.bufPrint(
+        &buffer,
+        "{s}{d}{s}",
+        .{
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
+            \\ "upgrades":["websocket"]}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+            \\ "limits":{"conn_slots":8,"tunnels":
+            ,
+            @as(u32, 9),
+            \\},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+            ,
+        },
+    );
+    try expectParseError(error.LimitTunnelsOverConnSlots, json);
+}
+
+test "config: tunnel_ms defaults to an hour and has no off switch" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
+        \\ "upgrades":["websocket"]}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "limits":{"tunnels":4},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1
+    ;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "}}");
+        try std.testing.expectEqual(
+            constants.tunnel_ms_default,
+            parsed.tunnel_timeout_ms,
+        );
+    }
+    // Zero is legal for `max_lifetime_ms` and `request_ms` and means "no
+    // cap". It cannot mean that here: a tunnel pins a dedicated pool slot
+    // for its whole life, and an unbounded hold on a bounded pool is the
+    // one thing that model cannot absorb.
+    try expectParseError(error.TimeoutTunnelOutOfRange, head ++ ",\"tunnel_ms\":0}}");
+    // The floor is a floor, not a nonzero check: a sub-second lifetime
+    // would reap every session on arrival, which reads as a typo.
+    try expectParseError(error.TimeoutTunnelOutOfRange, head ++ ",\"tunnel_ms\":999}}");
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ ",\"tunnel_ms\":1000}}");
+        try std.testing.expectEqual(constants.tunnel_ms_min, parsed.tunnel_timeout_ms);
     }
 }

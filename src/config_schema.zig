@@ -242,8 +242,10 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
         .pointer => |ptr| {
             comptime assert(ptr.child == u8);
             if (comptime @hasField(@TypeOf(meta), "items")) {
-                comptime assert(meta.items == .http_method); // the only marker we define
-                try writeMethodEnum(out);
+                switch (meta.items) {
+                    .http_method => try writeMethodEnum(out),
+                    .upgrade_token => try writeUpgradeEnum(out),
+                }
             } else {
                 try out.objectField("type");
                 try out.write("string");
@@ -319,6 +321,22 @@ fn writePickField(out: *Stringify) Writer.Error!void {
 /// (`protocol` via a literal match, `pick` via `std.meta.stringToEnum`).
 fn writeEnum(out: *Stringify, comptime Enum: type) Writer.Error!void {
     const fields = @typeInfo(Enum).@"enum".fields;
+    comptime assert(fields.len >= 1);
+    try out.objectField("enum");
+    try out.beginArray();
+    inline for (fields) |field| try out.write(field.name);
+    try out.endArray();
+}
+
+/// The #180 upgrade vocabulary as an `"enum"` array, read off the
+/// `Upgrades` set's own field names — which *are* the JSON tokens, the
+/// same one-source-of-truth `protocol` and `pick` get from their enums.
+/// The set is a struct rather than an enum because membership is what
+/// the config expresses, so this walks fields where `writeEnum` walks
+/// variants; the closedness it publishes is the same, and it is the
+/// point: a token absent from here is one no rule could catch after 101.
+fn writeUpgradeEnum(out: *Stringify) Writer.Error!void {
+    const fields = @typeInfo(config.Config.Listener.Upgrades).@"struct".fields;
     comptime assert(fields.len >= 1);
     try out.objectField("enum");
     try out.beginArray();

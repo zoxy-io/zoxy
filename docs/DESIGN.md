@@ -916,8 +916,13 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   in the same read; the head buffer already holds "parsed head plus
   possibly more", so the remainder is handed to the relay rather than
   discarded with the head.
-  **The allowed tokens are an allowlist, defaulting to `websocket`
-  alone**, per listener. After 101 the connection is opaque bytes:
+  **The allowed tokens are a per-listener allowlist, empty unless the
+  config names one**, over a closed vocabulary whose only member today is
+  `websocket`. Two separate statements, and worth keeping apart because
+  reading them as one lands the opposite, security-relevant behavior: no
+  listener carries an upgrade it was not told to carry, exactly as
+  `proxy_protocol` defaults off per listener despite `require` being its
+  only mode. After 101 the connection is opaque bytes:
   filters, routing, header rules and canonicalisation no longer apply to
   anything on it, so "tunnel any upgrade token" is a policy escape
   hatch, not a convenience. `h2c` is the sharp case — it would tunnel

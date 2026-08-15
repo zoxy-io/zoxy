@@ -775,6 +775,11 @@ fn deriveServerConfig(
         // The §8 per-exchange deadline: measured from routing instead, so
         // the same range lands on a different clock.
         .request_timeout_ms = deriveOptionalDeadlineMs(random),
+        // Stated, not drawn: no seed allows an upgrade yet, so this clock
+        // is inert and drawing it would move every seed's stream position
+        // for coverage that does not exist. The draw arrives with the
+        // tunnels themselves (#180).
+        .tunnel_timeout_ms = zoxy.constants.tunnel_ms_default,
         // Three seeds in four run with the access log on, so the sink,
         // its staging swap, and the per-request captures all take the
         // schedule fuzz; the fourth leaves it off, which is the shape

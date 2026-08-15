@@ -356,6 +356,7 @@ pub const TestBed = struct {
             // L4 only: the §8 request deadline is an L7 exchange bound and
             // this bed never routes one.
             .request_timeout_ms = 0,
+            .tunnel_timeout_ms = constants.tunnel_ms_default,
             .access_log_sink = if (options.access_log) .stdout else null,
             .health_interval_ms = options.health_interval_ms,
         };
