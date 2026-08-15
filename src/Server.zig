@@ -44,6 +44,21 @@ pub fn Server(comptime IoType: type) type {
         config: *const config_module.Config,
         conns: Pool(ConnType),
         relay_buffers: Pool(relay.RelayBuffer),
+        /// The §5 tunnel pool (#180): relay buffers for upgraded
+        /// connections, deliberately *not* the pool above.
+        ///
+        /// Same element, separate reservation, and the separation is the
+        /// whole feature. Every other pool here is sized for concurrent
+        /// activity — a keep-alive connection holds no head buffer, a
+        /// parked upstream holds no head — while a tunnel pins its buffer
+        /// for the connection's entire life and can never return to
+        /// keep-alive. Sharing one pool between the two shapes would let
+        /// long-lived sessions consume the buffers ordinary traffic sheds
+        /// on, so tunnels cannot starve HTTP because they never touch
+        /// what HTTP draws from. Zero exactly when no listener allows an
+        /// upgrade, which is what makes the feature free to a deployment
+        /// that did not ask for it.
+        tunnel_buffers: Pool(relay.RelayBuffer),
         /// The shared upstream connection pool (§3, §5): leased per L7
         /// exchange today; parking joins with keep-alive.
         upstreams: upstream_module.UpstreamPool(IoType),
@@ -373,6 +388,7 @@ pub fn Server(comptime IoType: type) type {
             server.config = config;
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
+            try server.initTunnelBuffers(arena, &options);
             // One index space, derived once and shared by every
             // endpoint-keyed table so they cannot disagree about a key.
             const keys = endpointKeysFor(config);
@@ -442,6 +458,33 @@ pub fn Server(comptime IoType: type) type {
         /// The §4 engine pool and the one slab its plaintext destinations
         /// carve out of. Both are empty on a deployment where no listener
         /// terminates TLS — the whole feature reserving nothing, which is
+        /// The §5 tunnel pool (#180), split from `init` for the length
+        /// limit like `initHeadBuffers` beside it.
+        ///
+        /// A second pool of the *same element* as `relay_buffers`, and the
+        /// separation is the feature rather than an implementation
+        /// detail: a tunnel holds its buffer for the connection's whole
+        /// life, so sharing one reservation with traffic sized for
+        /// concurrent activity would let long-lived sessions consume what
+        /// ordinary requests shed against. Zero slots is a deployment
+        /// that allows no upgrade, which is what `Pool`'s zero-slot
+        /// support is for.
+        fn initTunnelBuffers(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+        ) error{OutOfMemory}!void {
+            // A tunnel is an accepted client connection holding one of
+            // these, so a pool past the connections that could hold one is
+            // unreachable capacity — and the fd and ring budgets are
+            // derived from `conn_slots` on the strength of that bound
+            // (§5), so this is the assert those budgets rest on. The
+            // loader refuses the config-level version of the same rule.
+            assert(options.tunnels <= options.conn_slots);
+            try server.tunnel_buffers.init(arena, options.tunnels);
+            assert(server.tunnel_buffers.slots.len == options.tunnels);
+        }
+
         /// what `limits.tls_engines == 0` means and what `Pool`'s
         /// zero-slot support is for.
         fn initTlsEngines(
@@ -937,6 +980,11 @@ pub fn Server(comptime IoType: type) type {
             // Same rule for the prober's armed ops (§8).
             if (!server.health.isQuiescent()) return;
             assert(server.relay_buffers.isFullyReleased());
+            // Trivially true until a tunnel can exist, and stated now for
+            // exactly that reason: the §9 leak invariant is cheapest to
+            // extend while it cannot fail, and a pool added to the server
+            // but not to this enumeration is a leak nothing would report.
+            assert(server.tunnel_buffers.isFullyReleased());
             // beginDrain reaped every parked slot synchronously and no
             // conn is left to lease one, so the pool must be empty.
             assert(server.upstreams.isFullyReleased());
@@ -1020,6 +1068,7 @@ pub fn Server(comptime IoType: type) type {
             return server.l4Released() and
                 server.conns.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
+                server.tunnel_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
                 server.upstream_head_buffers.isFullyReleased() and
                 server.head_buffers_in_use == 0 and
@@ -1376,6 +1425,38 @@ pub fn Server(comptime IoType: type) type {
             const buffer = server.relay_buffers.acquire() orelse return null;
             server.updateRelayPressure();
             return buffer;
+        }
+
+        /// Take a tunnel's relay buffer, or null when the pool is full
+        /// (§8: the upgrade is refused up front with a `503`, before the
+        /// handshake is forwarded, rather than admitted and torn down
+        /// once it is live).
+        ///
+        /// No pressure recompute, unlike its sibling above, and that is
+        /// the difference between a watermark and a wall. The shared
+        /// pools bias idle deadlines as they fill, so ordinary traffic
+        /// returns buffers sooner; there is nothing equivalent to ask of
+        /// a tunnel, whose whole contract is to hold its buffer until the
+        /// session ends. The pool's ceiling is the only answer it has.
+        pub fn acquireTunnelBuffer(server: *Self) ?*relay.RelayBuffer {
+            return server.tunnel_buffers.acquire();
+        }
+
+        /// Give one back when the tunnel closes — to the pool it came
+        /// from, never the shared one.
+        ///
+        /// Worth being exact about what enforces that, because it is less
+        /// than it looks: the two pools hold the *same* element type, so
+        /// a buffer from either type-checks at either release site.
+        /// `Pool.indexOf`'s bounds assert does catch a crossed release
+        /// today, but only because the two reservations occupy disjoint
+        /// arena ranges — a property of allocation order, not of the type
+        /// system. So this is a discipline the caller keeps, backed by a
+        /// check that happens to hold, rather than a guarantee. Naming it
+        /// here because the slice that gives tunnels a lifecycle is the
+        /// one that could get it wrong.
+        pub fn releaseTunnelBuffer(server: *Self, buffer: *relay.RelayBuffer) void {
+            server.tunnel_buffers.release(buffer);
         }
 
         /// The release pair: an L7 connection going idle on keep-alive

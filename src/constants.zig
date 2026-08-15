@@ -1310,6 +1310,16 @@ pub const PoolSizes = struct {
     /// reservation like the access log's, in the total on the same
     /// promise; `main.zig` composes it to mirror `Server.init` exactly.
     head_scratch_bytes: u64,
+    /// The §5 tunnel pool (`limits.tunnels`; zero when no listener
+    /// allows an upgrade) and its unit size — the same `RelayBuffer` the
+    /// shared pool holds, reserved apart from it (§5, #180). Its own
+    /// term rather than folded into `relay_buffers` precisely because
+    /// the two are sized for opposite shapes: that pool for concurrent
+    /// activity, this one for connections that hold a buffer until they
+    /// close. A reader comparing the banner's two lines is reading the
+    /// trade the feature makes.
+    tunnels: u32 = 0,
+    tunnel_buffer_pair_bytes: u64 = 0,
     /// The §4 TLS engine pool (`limits.tls_engines`; zero when no
     /// listener terminates TLS) and its unit size — `@sizeOf(Engine)`,
     /// so the pool's own free-list header rides along like every other
@@ -1382,6 +1392,18 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     // A config has at least one cluster with one endpoint, so the
     // labeled tables and their buffers can never price at zero.
     assert(sizes.metrics_bytes > 0);
+    // All-or-nothing together, like the TLS terms below and for the same
+    // reason: a pool with no tunnels is a deployment that allows no
+    // upgrade, and any mixture is a composition mistake rather than a
+    // configuration one — `limits.tunnels` already refuses the
+    // config-level version of it.
+    assert(sizes.tunnels <= tunnels_max);
+    assert(sizes.tunnels <= sizes.conn_slots);
+    if (sizes.tunnels == 0) {
+        assert(sizes.tunnel_buffer_pair_bytes == 0);
+    } else {
+        assert(sizes.tunnel_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
+    }
     // The TLS terms are all-or-nothing together: a pool with no engines
     // is a plaintext deployment, which reserves no heap and no plaintext
     // buffers either. Any mixture is a composition mistake, not a
@@ -1403,6 +1425,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.log_header_bytes +
         sizes.endpoint_table_bytes + sizes.metrics_bytes +
+        @as(u64, sizes.tunnels) * sizes.tunnel_buffer_pair_bytes +
         @as(u64, sizes.head_buffers) * (sizes.head_buffer_bytes + 1) +
         bufferGroupDescriptorBytes(sizes.head_buffers) +
         @as(u64, sizes.upstream_head_buffers) * sizes.upstream_head_buffer_bytes +
@@ -1512,6 +1535,39 @@ test "budgets: memory total matches the closed form" {
         .upstream_head_buffer_bytes = head_buffer_bytes_default,
         .head_scratch_bytes = head_buffer_bytes_default,
     }));
+    // Tunnels are priced only when a listener allows an upgrade, and the
+    // term is the pool's own — same shape as the L4 case above plus a
+    // tunnel pool, so the difference between the two totals is exactly
+    // what tunnels cost and nothing else. That separability is the
+    // budget half of §5's argument: a reader can see what the feature
+    // costs without unpicking it from the buffers HTTP shares.
+    const tunnels: u32 = 16;
+    const expected_tunnels = expected_small + @as(u64, tunnels) * pair_bytes;
+    try std.testing.expectEqual(expected_tunnels, memoryBytesTotal(&.{
+        .conn_slots = 64,
+        .conn_bytes = conn_bytes,
+        .relay_buffers = 8,
+        .relay_buffer_pair_bytes = pair_bytes,
+        .upstream_slots = 8,
+        .upstream_bytes = upstream_bytes,
+        .access_log_bytes = accessLogBytes(0),
+        .endpoint_table_bytes = 0,
+        .metrics_bytes = metrics,
+        .head_buffers = 0,
+        .head_buffer_bytes = head_buffer_bytes_default,
+        .upstream_head_buffers = 0,
+        .upstream_head_buffer_bytes = head_buffer_bytes_default,
+        .head_scratch_bytes = head_buffer_bytes_default,
+        .tunnels = tunnels,
+        .tunnel_buffer_pair_bytes = pair_bytes,
+    }));
+    // And the term really is what separates them: the difference between
+    // the two totals is the pool and nothing else, which is the claim a
+    // reader of the banner's tunnel line is entitled to make.
+    try std.testing.expectEqual(
+        @as(u64, tunnels) * pair_bytes,
+        expected_tunnels - expected_small,
+    );
     // TLS is priced only when a listener terminates it, and then by three
     // terms that move together: the engines, their plaintext buffers, and
     // the one process-wide libcrypto heap. Same shape as the L4 case above
