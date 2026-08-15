@@ -44,7 +44,12 @@ Goals, in priority order:
 
 Non-goals (deliberate, recorded so they are decisions rather than drift):
 
-- HTTP/2, HTTP/3, gRPC, WebSocket — deferred until the L4/L7 core is proven.
+- HTTP/2, HTTP/3, gRPC — deferred until the L4/L7 core is proven. WebSocket
+  was deferred on the same line and is not any more (#180, §7): the
+  condition was met, and carrying it needs no new I/O machinery — a
+  tunnel is the L4 relay this proxy already runs, entered from an L7
+  exchange. What it does need is its own resource model, which is why it
+  is a §5 pool rather than a §7 detail.
 - Feature parity with Envoy/NGINX. Pingora's lesson is that a small, sharp
   proxy core beats a configurable monolith.
 - Caching, compression, request transformation.
@@ -482,7 +487,8 @@ a raised `RLIMIT_NOFILE`:
 | head buffers (ring) | = conn slots | 11466 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11466 | `head_buffer_bytes` + 24 B |
 | tls engines | 0, or min(conn slots, 1024) | 1024 | ~132 KiB + plaintext |
-| **pool memory** | **~34 MiB** | **~294 MiB** | |
+| tunnels | 0 (off) | 11466 | 2 × 4 KiB + ~64 B state |
+| **pool memory** | **~34 MiB** | **~384 MiB** | |
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
 (oversize → 414/431, §7), with a 1 KiB floor and a 1 MiB ceiling: a size
@@ -490,6 +496,57 @@ knob is operator-visible behaviour, not only memory. Three head-sized
 side buffers ride the same knob — the serving path's two
 canonicalization scratches and the health prober's response buffer — and
 appear in the banner as their own term.
+
+The **tunnel pool** (§7, #180) is the one that exists because a tunnel
+has the opposite shape to everything else here. Every pool above is
+sized for concurrent *activity*: a keep-alive connection holds no head
+buffer, a parked upstream holds no head, and that is the whole reason
+these numbers look the way they do. A tunnel inverts it — it pins its
+buffers for the connection's entire life and can never return to the
+keep-alive pool, so thousands of mostly-idle long-lived connections is
+the pathological case for the model. Drawing them from the shared pools
+would cap tunnels at the upstream-slot count *and starve ordinary HTTP
+on the way there*: not a tuning problem, but two workloads with opposite
+shapes sharing one budget.
+
+So a tunnel draws its relay buffer and its upstream socket from a pool
+of its own, and the request is refused **up front** when that pool is
+full rather than admitted and torn down later (§8). Three properties
+follow, and they are why the pool is worth the extra concept: tunnels
+cannot starve HTTP, because they never touch its pools; the cost stays
+closed-form and printable in the startup banner like every other row;
+and "unbounded long-lived connections", which §1 rules out, becomes "a
+bounded number of long-lived connections an operator explicitly paid
+for".
+
+`limits.tunnels` is zero — the feature entirely free — unless some
+listener allows an upgrade token, and it has **no derived default** when
+one does. Every other optional pool resolves an omitted field to
+something (head buffers to conn slots, engines to conn slots capped);
+this one is rejected at load instead, because the others' derived value
+is a worst case that *cannot shed*, while a tunnel count is a capacity
+decision with no honest guess available — how many long-lived sessions
+an origin fleet should carry is not something this proxy can infer from
+a connection count. The one bound it does carry is `≤ conn_slots`: a
+tunnel is still an accepted client connection occupying a slot, so
+sizing tunnels above the connections that could hold them describes a
+proxy that cannot exist.
+
+That bound is also what keeps the **fd and ring budgets unchanged**,
+which is worth stating rather than leaving a reader to verify: a tunnel
+pool costs ~90 MiB at the ceiling and nothing else. `fdsRequired`
+already charges `2 × conn_slots` — a client socket and an upstream one
+for every connection — and a tunnel holds exactly that pair, so its
+upstream socket is an fd the budget has always reserved; the separate
+`upstream_slots` term covers *parked* pooled connections, which have no
+connection of their own and which a tunnel by definition is not.
+`inFlightOps` needs nothing either: `conn_ops_max` is 4 precisely
+because one of its two tying peaks is "a relay teardown holds both data
+ops, the deadline and the deadline-cancel", which is a tunnel's steady
+state and its teardown exactly. So this pool costs memory, and the two
+budgets that would otherwise have to grow beside it do not — but only
+while `tunnels ≤ conn_slots` holds, which is why that is a rejection at
+load rather than advice.
 
 The **TLS engine pool** (§4) is the one whose default is not "one per
 connection", and the row above says so: an engine is ~132 KiB of ztls
@@ -786,7 +843,8 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   dependency's.
 - **Both directions framed** (RFC 9112 §6.3). Smuggling shapes (TE+CL,
   duplicate/garbage Content-Length) → 400 before any byte reaches an
-  upstream. `Upgrade` → 501 (non-goal). Hop-by-hop headers stripped both
+  upstream. An `Upgrade` this listener does not allow → 501 (below).
+  Hop-by-hop headers stripped both
   ways; `Connection: close` injected when the proxy will close — announced,
   not silent, or a client pipelines into the close and reads the reset as
   an error instead of a clean end.
@@ -834,6 +892,57 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   one matches only the any-host routes; config hosts must themselves be
   canonical (rejected at load otherwise), so a request host compares
   byte-for-byte against them.
+- **An allowed upgrade becomes a tunnel** (#180). The proxy does not
+  speak WebSocket and will not: it forwards the handshake, recognises
+  `101 Switching Protocols`, and relays bytes both ways for the rest of
+  the connection's life — which is the L4 relay of §6, entered from an
+  L7 exchange. So this is a **state transition, not new I/O machinery**:
+  the exchange ends in `.relaying`, the state a `l4` listener's
+  connections already live in, half-close and all.
+  Three things make that transition correct, and each is a rule the
+  ordinary path would otherwise get wrong. **101 is terminal, not
+  interim.** The parser already frames a `< 200` status as bodiless, so
+  a 101 *parses* today — but the state machine would treat the exchange
+  as complete and go read the next request, which is precisely the
+  desynchronisation §7 exists to prevent. 100 continues an exchange; 101
+  ends the HTTP conversation on that connection forever, and that
+  distinction is the actual change. **A participating `Upgrade` survives
+  hop-by-hop stripping.** `Connection` and `Upgrade` are hop-by-hop by
+  definition and are stripped both ways today; a handshake this proxy is
+  choosing to forward is the one case where they name *this* hop's
+  intent and must travel. **The bytes past the boundary are relayed, not
+  dropped.** A client may pipeline its first frame straight behind the
+  handshake, and the origin's 101 may arrive with frame bytes behind it
+  in the same read; the head buffer already holds "parsed head plus
+  possibly more", so the remainder is handed to the relay rather than
+  discarded with the head.
+  **The allowed tokens are an allowlist, defaulting to `websocket`
+  alone**, per listener. After 101 the connection is opaque bytes:
+  filters, routing, header rules and canonicalisation no longer apply to
+  anything on it, so "tunnel any upgrade token" is a policy escape
+  hatch, not a convenience. `h2c` is the sharp case — it would tunnel
+  HTTP/2 to an origin this proxy cannot parse, past every rule the
+  config expresses. Same instinct as `proxy_protocol`'s single `require`
+  mode: the permissive reading is the one that hands control to the
+  caller. An `Upgrade` naming a token the listener does not allow keeps
+  today's answer, `501` counted as `l7_not_implemented`, which fails at
+  the proxy with a status that means what happened rather than failing
+  confusingly at an origin that never saw the handshake. `CONNECT` is
+  unchanged and stays a 501: it asks this proxy to open an arbitrary
+  destination, which is a forward-proxy behaviour and a different
+  decision from carrying a protocol upgrade to a *routed* cluster.
+  **The upgraded upstream connection leaves the pool and never returns
+  to it** (§5): it is no longer an interchangeable origin connection but
+  one client's session. `max_inflight` counts a tunnel for its whole
+  life, which is correct — the backend really is carrying it.
+  The access log writes one line at close, carrying the request facts
+  that opened the tunnel plus the byte counts each way, because a line
+  written at 101 would name a transfer that had not happened yet.
+  Tunnels established, the live gauge, and upgrades refused for want of
+  capacity are each counted — and the §9 census is what makes that a
+  requirement rather than an intention: a counter no scenario reaches
+  fails the sweep, so the simulator has to carry the L7→L4 transition
+  and the trailing-bytes case before any of this can land.
 - **Early responses are legal.** An origin may answer before the request
   body finishes (RFC 9110 — e.g. 413 mid-upload): the response head is
   forwarded when it arrives, and the remaining request body is drained or
@@ -1257,6 +1366,7 @@ the loop thread.
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) |
 | upstream head buffers | beside the slot, as it is obtained | static `503`, then keep or close per pressure |
 | **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) |
+| tunnels | the upgrade request, **before** it is forwarded | static `503`, then keep or close per pressure |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
@@ -1275,6 +1385,24 @@ caps the work one endpoint may carry, counted across both protocols
 upstream slots says *widen the pool*, while a capped endpoint says *the
 backend is full*, and the two have their own counters so an operator
 cannot read one as the other.
+
+The tunnel rung is the one that refuses **before** doing the work rather
+than after: the check runs on the upgrade request, before the handshake
+is forwarded, so a client that cannot be carried learns it from a `503`
+instead of from a live tunnel torn down seconds later. That ordering is
+the rung — admitting first and shedding after would spend an origin
+handshake to produce a worse answer.
+
+**Tunnels need their own timeout class**, and it is the same reasoning
+that gives them their own pool. `idle_ms` defaults to 60 s and would
+reap an idle WebSocket; `request_ms` and `max_lifetime_ms` would cut a
+healthy one mid-session. A WebSocket may be legitimately idle for hours,
+and its keepalive is application-layer ping/pong — bytes this proxy
+cannot see, because after 101 they are opaque by construction. So
+`timeouts.tunnel_ms` replaces all three for a connection that has
+become a tunnel, exactly as HAProxy's `timeout tunnel` does, and the
+substitution happens at the transition rather than being a fourth clock
+running beside them.
 
 The rung that answers on **time** rather than on exhaustion is the
 request deadline, and `timeouts.request_ms` is what arms it: an absolute
@@ -1576,6 +1704,49 @@ What still bounds a straggler either way is its own per-connection
 deadlines: `idle_ms` always, plus `request_ms` and `max_lifetime_ms` when
 configured, and the drain's `Connection: close` injection stops an idle
 keep-alive connection from waiting on a request that will never come.
+
+**A tunnel is the straggler none of that reaches** (#180), and it is
+sharp enough to state as its own rule. A tunnel has no message boundary
+to finish at, so "let admitted work finish" has no meaning for one; its
+`tunnel_ms` is measured in hours by design; and `Connection: close`
+announces nothing to a connection that stopped speaking HTTP at 101. So
+one idle WebSocket would hold a `drain_deadline_ms: 0` drain open
+forever. That does not breach the contract above — a zero deadline says
+the supervisor owns the upper bound, and it still would — but it
+converts "the drain ends in milliseconds" into "every rolling restart
+waits out `TimeoutStopSec` and dies by `SIGKILL`", which is a real
+regression in the documented replacement procedure even though no
+invariant broke. Worth being precise about, because the machinery built
+for a drain that will not finish does not cover this either: layer 3
+arms only when a deadline is configured, so the watchdog would not fire.
+
+The rule: **a drain cuts tunnels at `drain_deadline_ms`, and at a finite
+tunnel-only bound when that is `0`.** The first half is not a special
+case at all — the deadline already tears down what is left, and a tunnel
+is simply always left. The second half is, and it is the smaller of two
+evils: a constant rather than a config key, because the alternative is
+asking every operator to answer a question created entirely by a feature
+they may not use, and because a tunnel is the one connection kind where
+"no cap" cannot mean what it means everywhere else. `drain_deadline_ms`
+keeps its exact present meaning for every other connection.
+
+A tunnel cut either way is a **teardown, not a shed**: it was admitted,
+it carried bytes, and it ends because the process is going away. So it
+settles into the same accounting every drained straggler does rather
+than earning a rung of its own — `admitted = completed + shed +
+in-flight` is the identity §9 reconciles against, and a new terminal
+state that landed outside it would be a counter bug wearing a feature's
+clothes. What the tunnel-only bound needs is a name and a value in
+`constants.zig`, not a place in that sum.
+
+Cutting rather than waiting is also the honest reading of what a tunnel
+is. The replacement instance has already bound the port, every WebSocket
+client reconnects — it is the protocol's expected failure mode — and
+holding the old process open longer delays the disconnect without
+preventing it. That is more aggressive than HAProxy or nginx, which let
+tunnels run to their tunnel timeout across a reload; the difference is
+deliberate, and it is §8's posture everywhere else: shed rather than
+heroics.
 
 **Three layers under a drain that will not finish**, because the first two
 are ops and the failure they exist to report is a backend that has stopped
