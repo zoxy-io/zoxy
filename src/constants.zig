@@ -495,6 +495,16 @@ pub const cluster_name_bytes_max: u16 = 64;
 /// not a share.
 pub const endpoint_weight_max: u16 = 256;
 
+/// Upper bound on a cluster's configured `retries` (#181) — the extra
+/// dials one request may spend after a refused or unreachable first try.
+/// HAProxy's own default, and a ceiling rather than a taste: every try
+/// this permits is load moved onto the endpoints that are still answering,
+/// so a generous bound would make a partial outage worse at the moment the
+/// cluster is least able to absorb it. It also sizes the per-connection
+/// tried-endpoint set, which is why it is a constant and not open-ended:
+/// the set holds the first try plus this many retries.
+pub const cluster_retries_max: u16 = 3;
+
 /// Lower bound on configured clusters: a config with no cluster can route
 /// nowhere, so the loader rejects an empty map and the config JSON Schema
 /// emits it as `minProperties`.
@@ -1153,6 +1163,11 @@ comptime {
     // A weight ceiling of zero would make every cluster all-drained and
     // unloadable; one weight step is the degenerate-but-legal minimum.
     assert(endpoint_weight_max >= 1);
+    // A retry cap of zero would make the config key unspellable; one
+    // retry is the degenerate-but-legal minimum. The set it sizes must
+    // still fit the u16 count the balancer scans it with.
+    assert(cluster_retries_max >= 1);
+    assert(cluster_retries_max < std.math.maxInt(u16));
     // The health prober's reservations and thresholds (§7): the op budget
     // covers dial + deadline + one cancel, a threshold of zero would eject
     // or restore on no evidence, and the default probe interval is a legal
