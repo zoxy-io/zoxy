@@ -64,6 +64,18 @@ pub const ClientError = error{
     StickyStampForged,
 };
 
+/// What the connection under the responses was, which two of the
+/// oracles below need and no script can describe: the same request over a
+/// terminated listener earns a different stamp from the same render.
+pub const Connection = struct {
+    /// The seed drew the #178 cookie-keyed cluster, so every routed 200
+    /// owes the stamp.
+    sticky: bool,
+    /// The client reached the proxy over a listener that terminates TLS,
+    /// so that stamp owes `Secure` (#125).
+    terminated: bool = false,
+};
+
 pub fn Client(comptime IoType: type) type {
     return struct {
         io: *IoType = undefined,
@@ -232,7 +244,7 @@ pub fn Client(comptime IoType: type) type {
             const walk = walkResponses(
                 client.receive_buffer[0..client.received_len],
                 scripts.spec(client.script),
-                client.sticky,
+                .{ .sticky = client.sticky },
             );
             client.maybeSendSecondRequest(&walk);
             if (walk.violation == null and walk.complete_count >= responsesTarget(client.script, &walk)) {
@@ -342,7 +354,7 @@ pub fn Client(comptime IoType: type) type {
             if (client.overrun) return ClientError.ResponseOverrun;
             const bytes = client.receive_buffer[0..client.received_len];
             const entry = scripts.spec(client.script);
-            const walk = walkResponses(bytes, entry, client.sticky);
+            const walk = walkResponses(bytes, entry, .{ .sticky = client.sticky });
             if (walk.violation) |violation| return violation;
             assert(walk.offset <= client.received_len);
             if (client.clean) {
@@ -381,7 +393,7 @@ pub fn Client(comptime IoType: type) type {
         /// a legal prefix (the adversary cuts mid-anything); bytes that
         /// can never extend to a legal transcript — or one complete
         /// response more than the transcript contains — are a violation.
-        pub fn walkResponses(bytes: []const u8, entry: Spec, sticky: bool) Walk {
+        pub fn walkResponses(bytes: []const u8, entry: Spec, connection: Connection) Walk {
             var walk = Walk{
                 .complete_count = 0,
                 .offset = 0,
@@ -413,7 +425,7 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = violation;
                     return walk;
                 }
-                if (stickyViolation(sticky, entry, &response)) |violation| {
+                if (stickyViolation(connection, entry, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
                 }
@@ -496,14 +508,14 @@ pub fn Client(comptime IoType: type) type {
         /// distinguishes the render paths from outside the process,
         /// under every schedule the adversary produces.
         fn stickyViolation(
-            sticky: bool,
+            connection: Connection,
             entry: Spec,
             response: *const parser.ResponseHead,
         ) ?ClientError {
             assert(response.status >= 100);
             assert(response.headers.len <= zoxy.constants.headers_max);
             const named = stickyNamePresent(response.headers);
-            if (!sticky) {
+            if (!connection.sticky) {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
@@ -519,11 +531,17 @@ pub fn Client(comptime IoType: type) type {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
-            if (!headerEquals(
-                response.headers,
-                "set-cookie",
-                canon.sticky_set_cookie_value,
-            )) return ClientError.StickyStampMissing;
+            // The one place the two populations differ, and the reason
+            // this oracle needs to know which it is serving: where zoxy
+            // terminated, the render knows the client-facing scheme is
+            // https and the stamp carries `Secure` (#125).
+            const expected = if (connection.terminated)
+                canon.sticky_set_cookie_value_secure
+            else
+                canon.sticky_set_cookie_value;
+            if (!headerEquals(response.headers, "set-cookie", expected)) {
+                return ClientError.StickyStampMissing;
+            }
             return null;
         }
 

@@ -58,6 +58,14 @@ pub const sticky_tag = "b4a7ea22f14bfcac";
 /// included — one spelling shared by the oracle so it cannot drift.
 pub const sticky_set_cookie_value =
     sticky_cookie_name ++ "=" ++ sticky_tag ++ "; Path=/; HttpOnly";
+/// The same stamp on a connection zoxy terminated (#125, #178): there the
+/// proxy knows the client-facing scheme is https, so the cookie carries
+/// `Secure` and a browser will not hand it back over plaintext. Spelled
+/// as the plaintext value plus the attribute rather than as a second
+/// literal, so the two cannot drift apart — which is the failure the
+/// terminating population's oracle exists to catch, the attribute having
+/// shipped missing once already.
+pub const sticky_set_cookie_value_secure = sticky_set_cookie_value ++ "; Secure";
 
 /// The #159 configured bodies. `error_page_body` is the harness's page
 /// for `403` — the one status a script earns from a filter reject — so

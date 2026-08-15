@@ -498,6 +498,40 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
     },
 });
 
+/// The §4 terminating population's transcript (#215): the fixed
+/// POST-then-close-GET pair the harness sends over a terminated
+/// listener, described so the plaintext response oracle can judge those
+/// responses too. Both requests are the ones the table already holds —
+/// `post_request` is `post_sized`'s bytes and the follow-up is `get`'s
+/// with an explicit close — so what comes back owes exactly what a
+/// plaintext client's would.
+///
+/// A `Spec` and not a `Script`, deliberately: the plaintext population
+/// draws its script with `enumValue`, so a member added for a population
+/// that never draws would re-roll every seed's script and take the §9
+/// census margins with it. This population sends its pair.
+///
+/// The method is the first request's. It reaches the parser only as the
+/// HEAD-shaped body rule, which POST and GET share, so one context is
+/// right for both responses.
+pub const terminating_pair: Spec = .{
+    .request = post_request,
+    .expected_responses = 2,
+    .transcript_cap = 2,
+    .golden_status = 200,
+    .method = .post,
+    .allowed_statuses = statuses_routed,
+};
+
+comptime {
+    // The pair is the two requests the harness actually sends, and the
+    // oracle reads the first one's spelling from here.
+    assert(std.mem.eql(u8, terminating_pair.request, post_request));
+    assert(terminating_pair.expected_responses == terminating_pair.transcript_cap);
+    assert(!terminating_pair.respond_page);
+    assert(!terminating_pair.sticky_request_pinned);
+}
+
 pub fn spec(script: Script) Spec {
     return specs.get(script);
 }
