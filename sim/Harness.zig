@@ -799,6 +799,7 @@ fn deriveServerConfig(
 ) void {
     assert(connect_timeout_ms >= 1);
     assert(health_interval_ms >= 1);
+    const idle_timeout_ms = connect_timeout_ms + 10 + random.uintAtMost(u32, 70);
     harness.config = .{
         // The terminating listener is the third, and only a seed that drew
         // TLS clients binds it. Sliced rather than left inert so a
@@ -811,7 +812,20 @@ fn deriveServerConfig(
         // Drawn *above* the dial budget rather than independently: the
         // loader rejects the other order (§5), so an independent draw would
         // spend seeds on a config production cannot load.
-        .idle_timeout_ms = connect_timeout_ms + 10 + random.uintAtMost(u32, 70),
+        .idle_timeout_ms = idle_timeout_ms,
+        // Mirrors the idle window (#235), which is also what the loader
+        // would derive at this scale: the sim draws its timeouts in tens
+        // of milliseconds, and `defaultHeadMs` clamps its ten seconds down
+        // to `idle_ms` for exactly such a config.
+        //
+        // A known gap, stated rather than left implicit: equal values mean
+        // no seed exercises the first-byte re-base under a *tighter* head
+        // budget, so that call site's randomized coverage is deferred to
+        // the two scripted tests in `src/http_proxy_test.zig`. Drawing the
+        // two apart is a scenario for the split, and wants the head budget
+        // to be a drawn value the response oracles can still live with —
+        // more than this line.
+        .head_timeout_ms = idle_timeout_ms,
         .drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random),
         // The §6 age cap: measured from the connection's birth, so the
         // clamp sometimes reaps an actively-relaying connection.

@@ -88,6 +88,7 @@ const Harness = struct {
             .clusters = &harness.clusters,
             .connect_timeout_ms = 50,
             .idle_timeout_ms = 1000,
+            .head_timeout_ms = 1000,
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = 0,
             .request_timeout_ms = 0,

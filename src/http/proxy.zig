@@ -459,6 +459,13 @@ pub fn Proxy(comptime IoType: type) type {
             // the parse: a slowloris that dribbles for the whole head-read
             // deadline must report the time it spent doing it (§8).
             server.beginLogRequest(conn);
+            // The idle window ends where the head read begins (#235). Until
+            // this byte the connection was quiet and bounded by `idle_ms`;
+            // from here it is a client mid-sentence, bounded by the much
+            // tighter head budget — which is the slowloris's whole window,
+            // and the reason the two stopped being one number.
+            server.storeDeadline(conn, server.config.head_timeout_ms);
+            server.rebaseDeadline(conn);
             conn.log.bytes_in += bound.len;
             fillHead(conn, bound.len, headBytes(server, conn).len);
             parseAndDispatch(server, conn);

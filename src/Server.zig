@@ -370,6 +370,14 @@ pub fn Server(comptime IoType: type) type {
             // directly and would otherwise be measuring a config production
             // cannot load.
             assert(config.connect_timeout_ms < config.idle_timeout_ms);
+            // The #235 head budget sits between the two, and its relations
+            // matter here more than the pair above rather than less: every
+            // hand-built config now states this field, so a test or a seed
+            // that inverted it would silently reproduce the failure the
+            // split exists to prevent — a head read left running under the
+            // wider window — with no loader in the way to say so.
+            assert(config.connect_timeout_ms < config.head_timeout_ms);
+            assert(config.head_timeout_ms <= config.idle_timeout_ms);
             // `Pool` permits an empty pool — that is how an unconfigured
             // feature reserves nothing (§5) — so the requirement that these
             // three are non-empty lives here, where it is true: a proxy with
@@ -1304,8 +1312,15 @@ pub fn Server(comptime IoType: type) type {
         }
 
         /// The first deadline that connection runs under: an L4 connection
-        /// is dialing, so it gets the connect budget (§8); an L7 one is
-        /// reading a head, so a slowloris meets the clock or
+        /// is dialing, so it gets the connect budget (§8); an L7 one has
+        /// said nothing yet, so it gets the *idle* window.
+        ///
+        /// Not the head budget, and the distinction is #235's: a connection
+        /// that has connected and not spoken is quiet, not slow, and
+        /// bounding it as a slowloris would reap the honest client that
+        /// opened early. The slowloris clock starts at its first byte,
+        /// where `onHeadGroupRecv` re-bases this down to
+        /// `head_timeout_ms` — a client mid-sentence meets that or
         /// `limits.head_buffer_bytes`, whichever comes first (§7).
         fn entryTimeoutMs(
             server: *const Self,
@@ -3018,11 +3033,14 @@ pub fn Server(comptime IoType: type) type {
         /// (so the cancel cannot match the fresh timer). A path that already
         /// delivered the timer has no armed op to re-base, so it arms fresh.
         pub fn rebaseDeadline(server: *Self, conn: *ConnType) void {
-            // Two callers, both storing a target earlier than the armed
-            // timer: the dial's per-try connect budget (`.l7_dialing`) and
-            // the request deadline installed at routing (`.l7_reading_head`,
-            // §8) — which must re-base here because the reuse path never
-            // reaches the dial.
+            // Three callers, all storing a target earlier than the armed
+            // timer. The dial's per-try connect budget (`.l7_dialing`); the
+            // request deadline installed at routing (`.l7_reading_head`,
+            // §8), which must re-base here because the reuse path never
+            // reaches the dial; and the #235 head budget, installed at the
+            // client's first byte — also from `.l7_reading_head`, but a
+            // different narrowing: routing tightens to the *exchange* cap,
+            // this one tightens the idle window to the head read.
             assert(conn.state == .l7_dialing or conn.state == .l7_reading_head);
             // A prior dial's rebase cancel can still be draining if the
             // exchange outran it across a keep-alive turnaround. It re-arms

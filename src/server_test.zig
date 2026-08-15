@@ -351,6 +351,7 @@ pub const TestBed = struct {
             .clusters = &bed.clusters,
             .connect_timeout_ms = options.connect_timeout_ms,
             .idle_timeout_ms = options.idle_timeout_ms,
+            .head_timeout_ms = options.idle_timeout_ms,
             .drain_deadline_ms = options.drain_deadline_ms,
             .max_lifetime_ms = options.max_lifetime_ms,
             // L4 only: the §8 request deadline is an L7 exchange bound and
