@@ -25,6 +25,7 @@ const scripts = @import("scripts.zig");
 const Io = zoxy.Io;
 const parser = zoxy.http.parser;
 const Script = scripts.Script;
+const Spec = scripts.Spec;
 
 const assert = std.debug.assert;
 
@@ -230,7 +231,7 @@ pub fn Client(comptime IoType: type) type {
             assert(client.received_len <= client.receive_buffer.len);
             const walk = walkResponses(
                 client.receive_buffer[0..client.received_len],
-                client.script,
+                scripts.spec(client.script),
                 client.sticky,
             );
             client.maybeSendSecondRequest(&walk);
@@ -340,11 +341,11 @@ pub fn Client(comptime IoType: type) type {
             assert(client.received_len <= client.receive_buffer.len);
             if (client.overrun) return ClientError.ResponseOverrun;
             const bytes = client.receive_buffer[0..client.received_len];
-            const walk = walkResponses(bytes, client.script, client.sticky);
+            const entry = scripts.spec(client.script);
+            const walk = walkResponses(bytes, entry, client.sticky);
             if (walk.violation) |violation| return violation;
             assert(walk.offset <= client.received_len);
             if (client.clean) {
-                const entry = scripts.spec(client.script);
                 if (walk.complete_count != entry.expected_responses) {
                     return ClientError.GoldenOutcomeMissed;
                 }
@@ -364,7 +365,7 @@ pub fn Client(comptime IoType: type) type {
             }
         }
 
-        const Walk = struct {
+        pub const Walk = struct {
             complete_count: u8,
             offset: u32,
             statuses: [responses_max]u16,
@@ -380,8 +381,7 @@ pub fn Client(comptime IoType: type) type {
         /// a legal prefix (the adversary cuts mid-anything); bytes that
         /// can never extend to a legal transcript — or one complete
         /// response more than the transcript contains — are a violation.
-        fn walkResponses(bytes: []const u8, script: Script, sticky: bool) Walk {
-            const entry = scripts.spec(script);
+        pub fn walkResponses(bytes: []const u8, entry: Spec, sticky: bool) Walk {
             var walk = Walk{
                 .complete_count = 0,
                 .offset = 0,
@@ -409,11 +409,11 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = ClientError.ResponseStatusUnexpected;
                     return walk;
                 }
-                if (responseEditViolation(script, &response)) |violation| {
+                if (responseEditViolation(entry, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
                 }
-                if (stickyViolation(sticky, script, &response)) |violation| {
+                if (stickyViolation(sticky, entry, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
                 }
@@ -428,7 +428,7 @@ pub fn Client(comptime IoType: type) type {
                     }
                 }
                 const body = bytes[walk.offset + response.head_len ..];
-                const verdict = walkBody(response, body, script) orelse return walk;
+                const verdict = walkBody(response, body, entry) orelse return walk;
                 if (verdict.violation) |violation| {
                     walk.violation = violation;
                     return walk;
@@ -456,7 +456,7 @@ pub fn Client(comptime IoType: type) type {
         /// means the class predicate fired on a class the origin never
         /// answers. Distinguishes the two render paths from outside the
         /// process, under every schedule the adversary produces.
-        fn responseEditViolation(script: Script, response: *const parser.ResponseHead) ?ClientError {
+        fn responseEditViolation(entry: Spec, response: *const parser.ResponseHead) ?ClientError {
             assert(response.status >= 100);
             assert(response.headers.len <= zoxy.constants.headers_max);
             const stamped = headerEquals(
@@ -468,7 +468,7 @@ pub fn Client(comptime IoType: type) type {
             // is sent from immutable memory and never crosses the
             // response render, so the stamp on one would mean a
             // configured body had grown filter edits.
-            const from_memory = pageBodyFor(script, response.status) != null;
+            const from_memory = pageBodyFor(entry, response.status) != null;
             if (response.status == 200 and !from_memory) {
                 if (!stamped) {
                     return ClientError.ResponseEditMissing;
@@ -497,7 +497,7 @@ pub fn Client(comptime IoType: type) type {
         /// under every schedule the adversary produces.
         fn stickyViolation(
             sticky: bool,
-            script: Script,
+            entry: Spec,
             response: *const parser.ResponseHead,
         ) ?ClientError {
             assert(response.status >= 100);
@@ -511,18 +511,19 @@ pub fn Client(comptime IoType: type) type {
             // reaches no origin and runs no response render, so a
             // cookie on one would be the stamp path firing for an
             // exchange that never happened.
-            if (response.status != 200 or pageBodyFor(script, response.status) != null) {
+            if (response.status != 200 or pageBodyFor(entry, response.status) != null) {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
-            switch (script) {
-                .sticky_follow => if (named) return ClientError.StickyStampForged,
-                else => if (!headerEquals(
-                    response.headers,
-                    "set-cookie",
-                    canon.sticky_set_cookie_value,
-                )) return ClientError.StickyStampMissing,
+            if (entry.sticky_request_pinned) {
+                if (named) return ClientError.StickyStampForged;
+                return null;
             }
+            if (!headerEquals(
+                response.headers,
+                "set-cookie",
+                canon.sticky_set_cookie_value,
+            )) return ClientError.StickyStampMissing;
             return null;
         }
 
@@ -581,7 +582,7 @@ pub fn Client(comptime IoType: type) type {
         /// cookie. The three oracles below all key off this one
         /// predicate, so the sweep cannot come to disagree with itself
         /// about which responses were rendered.
-        fn pageBodyFor(script: Script, status: u16) ?[]const u8 {
+        fn pageBodyFor(entry: Spec, status: u16) ?[]const u8 {
             assert(status >= 100);
             assert(status <= 599);
             if (status == 403) {
@@ -591,7 +592,7 @@ pub fn Client(comptime IoType: type) type {
                 assert(canon.error_page_body.len >= 1);
                 return canon.error_page_body;
             }
-            if (status == 200 and script == .filter_respond) {
+            if (status == 200 and entry.respond_page) {
                 assert(canon.respond_body.len >= 1);
                 return canon.respond_body;
             }
@@ -610,8 +611,8 @@ pub fn Client(comptime IoType: type) type {
         /// framing (the proxy relays body wire bytes verbatim), and
         /// every legal non-200 is a static with Content-Length 0 — so a
         /// corrupted length fails even before its body arrives.
-        fn walkBody(response: parser.ResponseHead, body: []const u8, script: Script) ?BodyVerdict {
-            const page_body = pageBodyFor(script, response.status);
+        fn walkBody(response: parser.ResponseHead, body: []const u8, entry: Spec) ?BodyVerdict {
+            const page_body = pageBodyFor(entry, response.status);
             switch (response.framing) {
                 .content_length => |length| {
                     // A configured page's body, byte-exact (#159): it is
