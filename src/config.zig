@@ -1062,6 +1062,8 @@ fn pageFor(
         .close = close.bytes,
         .keep_head_len = keep.head_len,
         .close_head_len = close.head_len,
+        .keep_date = keep.date,
+        .close_date = close.date,
     };
     // What every consumer of a page relies on, stated where every page
     // is made rather than at one call site: the head is a prefix of its
@@ -1093,17 +1095,26 @@ fn renderStaticPage(
     status: u16,
     body: *const ResolvedBody,
     persistence: shed.Persistence,
-) ParseError!struct { bytes: []const u8, head_len: u32 } {
+) ParseError!struct { bytes: []const u8, head_len: u32, date: *[shed.date_bytes]u8 } {
     assert(shed.isPageStatus(status));
     assert(body.content_type.len >= 1);
+    // The `Date` value is a placeholder here and a slot from here on
+    // (#234): fixed-width, so the serving path patches it in place and a
+    // page stays one contiguous send. Its offset is recorded rather than
+    // re-derived, because the only thing that knows it is this format
+    // string.
+    const prefix = try std.fmt.allocPrint(
+        arena,
+        "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nDate: ",
+        .{ status, shed.reasonPhrase(status), body.bytes.len, body.content_type },
+    );
     const rendered = try std.fmt.allocPrint(
         arena,
-        "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\n{s}\r\n{s}",
+        "{s}{s}\r\n{s}{s}\r\n{s}",
         .{
-            status,
-            shed.reasonPhrase(status),
-            body.bytes.len,
-            body.content_type,
+            prefix,
+            shed.date_placeholder,
+            shed.server_line,
             switch (persistence) {
                 .keep => "",
                 .close => "Connection: close\r\n",
@@ -1112,9 +1123,14 @@ fn renderStaticPage(
         },
     );
     assert(rendered.len > body.bytes.len);
+    const head_len: u32 = @intCast(rendered.len - body.bytes.len);
+    // The slot must sit inside the *head*, or a HEAD request would be
+    // sent the prefix without it.
+    assert(prefix.len + shed.date_bytes <= head_len);
     return .{
         .bytes = rendered,
-        .head_len = @intCast(rendered.len - body.bytes.len),
+        .head_len = head_len,
+        .date = rendered[prefix.len..][0..shed.date_bytes],
     };
 }
 
@@ -6124,12 +6140,12 @@ test "config: bodies render into complete pages, both variants, HEAD as prefix" 
     try std.testing.expectEqual(@as(u16, 404), not_found.status);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n" ++
-            "Content-Type: text/plain\r\n\r\ngone",
+            "Content-Type: text/plain\r\n" ++ page_date ++ "\r\ngone",
         not_found.keep,
     );
     try std.testing.expectEqualStrings(
         "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n" ++
-            "Content-Type: text/plain\r\nConnection: close\r\n\r\ngone",
+            "Content-Type: text/plain\r\n" ++ page_date ++ "Connection: close\r\n\r\ngone",
         not_found.close,
     );
     // The head lengths are the HEAD contract: the prefix ends exactly at
@@ -6371,6 +6387,12 @@ test "config: the two header lists share one cap, and widen the line (#140)" {
     try expectParseError(error.LimitAccessLogBufferUnderLine, with_narrow_buffer);
 }
 
+/// The two lines every rendered #159 page now carries (#234). The date
+/// is still the placeholder here because a page is rendered at *load*,
+/// before any response is served — the serving path stamps the slot, and
+/// what the loader owes is a slot of exactly the right shape.
+const page_date = "Date: " ++ shed.date_placeholder ++ "\r\n" ++ shed.server_line;
+
 test "config: a respond action compiles to a page, sharing one buffer (#159)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -6398,7 +6420,7 @@ test "config: a respond action compiles to a page, sharing one buffer (#159)" {
     try std.testing.expectEqual(@as(u16, 200), robots.status);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
-            "Content-Type: text/plain\r\n\r\nUser-agent: *\n",
+            "Content-Type: text/plain\r\n" ++ page_date ++ "\r\nUser-agent: *\n",
         robots.keep,
     );
 

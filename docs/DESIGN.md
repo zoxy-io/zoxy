@@ -1545,8 +1545,8 @@ disables it: what counts as too slow is a property of the operator's
 origin, not one this proxy can pick for them.
 
 - **Static error responses.** `400`/`404`/`414`/`431`/`501`/`503`/`504`
-  are comptime byte arrays sent directly from static memory — never
-  staged through
+  are comptime-rendered byte arrays sent directly from server memory —
+  never staged through
   the connection's head buffer, whose bytes the parsed head's zero-copy
   slices may still reference (§7). Shedding costs one send, no
   allocation, no copy. The #176 redirect is the one proxy-originated
@@ -1554,6 +1554,34 @@ origin, not one this proxy can pick for them.
   per-request — and it may do so only because its render runs after
   every read of those bytes: the Location is composed first, into the
   rewrite scratch, so nothing aliases what the render overwrites (§7).
+- **Every proxy-generated response carries a `Date` and a `Server`**
+  (#234, RFC 9110 §6.6.1 makes the first a MUST for a server with a
+  clock, and §4 gives this one). The responses that most want a
+  timestamp are exactly the ones this section originates: an operator
+  placing a shed `503` against an incident timeline is reading the one
+  response that had no time on it, and `Server` is the cheapest tell
+  that a `503` is the ladder's rather than the origin's — the two are
+  the same three digits and opposite events. A forwarded response is
+  untouched: the origin's own `Date` travels through the §7 re-render.
+  This **changes what the point above claims**, and the change is worth
+  stating rather than burying. A `Date` is per-second, so a static
+  response stops being `const` and gains a written region: the value is
+  fixed-width (IMF-fixdate always is), so each response carries a slot
+  at a comptime-known offset that the serving path patches in place —
+  29 bytes, at most once per response. Nothing is acquired, assembled or
+  copied per response, so the cost that mattered is unchanged; what the
+  section can no longer say is that the bytes never change.
+  The patch is **safe rather than merely conventional**, and that is the
+  whole of the design. A submitted send holds a pointer the kernel may
+  read at any moment before its completion, so a patch landing under one
+  could put a *torn* date on the wire — nginx keeps one cached date
+  string and lives with exactly that race. Here a slot is stamped only
+  while no static send is in flight, which the server tracks as a
+  per-connection claim, so the bytes a send was handed can never change
+  under it. The cost lands the right way round: under a sustained shed
+  storm the date goes stale, never malformed. Every slot is stamped once
+  at startup, where nothing is in flight by construction, so no response
+  is ever the first user of an un-stamped one.
 - **Those responses can carry a body, and bodies are a named table**
   (#159, settled 2026-08-03). `bodies` maps a name to bytes — a `file`
   read once at startup or an `inline` string, exactly one, plus the
@@ -2199,7 +2227,7 @@ is a trap rather than a synonym.
 
 | spec | what binds a gateway | here |
 |---|---|---|
-| **9110** Semantics | §3.7 roles; §4.2.3 host comparison; §6.6.1 `Date`; §7.6.1 hop-by-hop; §7.6.2 `Max-Forwards`; §7.6.3 `Via`; §15.2.1 `100 Continue` | §7, with three deviations below |
+| **9110** Semantics | §3.7 roles; §4.2.3 host comparison; §5.6.7 date format; §6.6.1 `Date`; §7.6.1 hop-by-hop; §7.6.2 `Max-Forwards`; §7.6.3 `Via`; §15.2.1 `100 Continue` | §7, §8's `Date`, with two deviations below |
 | **9112** HTTP/1.1 | §3.2 target forms; §6.3 body length; §7 transfer codings; §9 connection management | §7 framing, §8 close announcement |
 | **6585** additional statuses | defines `429` and `431` — **9110 did not absorb these**, the registry still points here | §8's static set |
 | **8297** early hints | defines `103` | §7's interim relay (#232) |
@@ -2233,11 +2261,13 @@ header because that is what origins read. And the **PROXY protocol**
 pins its two writers to its parser by round-trip test: there is no
 independent text to be conformant *to*.
 
-**The deviations.** Three requirements this proxy does not meet today.
-The first is settled; the rest are open, and the issue is where each
-decision is being taken rather than here. Absolute-form request-targets
-(9112 §3.2.2) left this list with #233: they are accepted, and §7 states
-what their authority does to the `Host` beside them.
+**The deviations.** Two requirements this proxy does not meet today.
+The first is settled; the second is open, and the issue is where that
+decision is being taken rather than here. Two left this list together:
+absolute-form request-targets (9112 §3.2.2) with #233 — §7 states what
+their authority does to the `Host` beside them — and the missing `Date`
+(9110 §6.6.1) with #234, which §8 states, along with what carrying one
+costs a response that used to be immutable.
 
 - **`Via` is not sent** (9110 §7.6.3, a MUST for intermediaries). The
   cost is real and worth naming: a request that loops through this proxy
@@ -2252,10 +2282,6 @@ what their authority does to the `Host` beside them.
   the remaining `OPTIONS` half needs a header whose value this proxy
   *computes*, which the render machinery has exactly one instance of
   (`X-Forwarded-For`) and no general mechanism for.
-- **Proxy-generated responses carry no `Date`** (§6.6.1, a MUST for a
-  server with a clock, which this one has) — #234. §8's static
-  responses are comptime bytes; a `Date` makes them a written region,
-  which is a change to what that section claims.
 
 **There is no conformance suite**, official or otherwise, and §9's gates
 are internal by construction — the fuzzer asserts *this* parser never

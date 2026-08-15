@@ -170,6 +170,43 @@ pub fn Server(comptime IoType: type) type {
         /// Empty on an L4-only config, which never canonicalizes.
         target_scratch: []u8,
         rewrite_scratch: []u8,
+        /// The §8 static responses in writable memory, because each now
+        /// carries a `Date` slot (#234). Comptime-sized and held inline:
+        /// a closed status set times two persistence variants, so this is
+        /// a fixed field like `drain_sink`, not a budget the config can
+        /// move.
+        static_responses: shed.StaticTable,
+        /// The one rendering of the current second every proxy-generated
+        /// response is stamped from, and the second it renders. Cached
+        /// because the calendar arithmetic is per-second work and the
+        /// responses that need it arrive per-request; re-rendered lazily,
+        /// on the first stamp of a new second.
+        ///
+        /// Never read by a send — only ever copied *out of*, into a
+        /// response's own slot — so unlike those slots this one is safe
+        /// to rewrite at any moment.
+        date_line: [shed.date_bytes]u8,
+        date_second: u64,
+        /// How many static responses are on the wire right now (#234):
+        /// armed and not yet fully written, counting the whole span
+        /// because a partial write re-arms on the same shared bytes.
+        ///
+        /// This is what makes patching a `Date` in place safe rather than
+        /// merely conventional. A submitted send holds a pointer the
+        /// kernel may read at any point before its completion, so a patch
+        /// landing underneath one could put a torn date on the wire —
+        /// nginx lives with exactly that race; this does not. A stamp
+        /// happens only while this reads zero, so the bytes a send was
+        /// handed can never change under it. The cost is the right way
+        /// round: under a sustained shed storm the date goes *stale*,
+        /// never malformed.
+        ///
+        /// A claim, not a tally: `Conn.static_send` records who holds one,
+        /// so the release is a no-op wherever nothing was taken and the
+        /// conn's own release path is the backstop. A leak would freeze
+        /// the date silently, which is why `isIdle` asserts a drained
+        /// server holds none.
+        static_sends_inflight: u32,
         /// The #140 capture table: one value slot per connection slot per
         /// named header, and the length of each. A logged value is copied
         /// out of the head buffer while it is still live (the response
@@ -399,6 +436,16 @@ pub fn Server(comptime IoType: type) type {
             assert(io.bufferGroupBytes() == options.head_buffer_bytes);
             server.io = io;
             server.config = config;
+            // The static answers, and the clock they will be stamped from
+            // (#234). Both start at the epoch rather than at `nowWallNs`:
+            // the second and the line then agree by construction, so the
+            // first stamp of any real second re-renders instead of
+            // trusting whatever the field happened to hold.
+            server.static_responses.init();
+            server.date_second = 0;
+            shed.formatHttpDate(0, &server.date_line);
+            server.static_sends_inflight = 0;
+            server.initDateSlots();
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
             try server.initTunnelBuffers(arena, &options);
@@ -678,6 +725,115 @@ pub fn Server(comptime IoType: type) type {
         /// time and its key's sealing clock are both measured on.
         fn nowUnix(server: *const Self) u64 {
             return @divFloor(server.io.nowWallNs(), std.time.ns_per_s);
+        }
+
+        /// The current second as a `Date` value, re-rendered only when
+        /// the second has turned over (#234). Safe to call at any moment:
+        /// nothing sends these bytes, they are only ever copied into a
+        /// response's own slot.
+        pub fn currentDate(server: *Self) *const [shed.date_bytes]u8 {
+            const second = server.nowUnix();
+            if (second != server.date_second) {
+                shed.formatHttpDate(second, &server.date_line);
+                server.date_second = second;
+            }
+            // The pair is the whole cache: a line rendered from one second
+            // and a field claiming another would hand every later response
+            // a date nothing ever measured.
+            assert(server.date_second == second);
+            return &server.date_line;
+        }
+
+        /// Stamp a *shared* static response's `Date` slot — the one thing
+        /// `currentDate` is not enough for, because those bytes may be
+        /// under a submitted send (#234).
+        ///
+        /// The whole rule is the early return: with a send outstanding,
+        /// the kernel may read this slot at any moment before its
+        /// completion, so the response goes out carrying whatever second
+        /// it was last stamped with. That is a stale `Date`, which is
+        /// legal and honest; patching anyway would risk a torn one, which
+        /// is neither.
+        pub fn stampStaticDate(server: *Self, slot: *[shed.date_bytes]u8) void {
+            if (server.static_sends_inflight != 0) {
+                server.counters.increment("l7_static_date_stale");
+                return;
+            }
+            @memcpy(slot, server.currentDate());
+            // Startup stamped every slot, and nothing writes one but this,
+            // so a placeholder surviving a stamp is impossible — said here
+            // because it is the property the wire depends on, and the one a
+            // future slot that escaped `initDateSlots` would break.
+            assert(!std.mem.eql(u8, slot, shed.date_placeholder));
+        }
+
+        /// Stamp every shared `Date` slot with the second the server
+        /// started (#234) — the static table's, and every #159 page the
+        /// config rendered.
+        ///
+        /// Without this, a slot's *first* use could fall while some other
+        /// static send was in flight, and `stampStaticDate` would rightly
+        /// decline to patch it — putting the un-stamped placeholder on the
+        /// wire, which is not a date at all. Here nothing is in flight by
+        /// construction, so every slot holds a real one from the first
+        /// response onward and the in-flight rule can only ever cost
+        /// freshness, which is what it was chosen to cost.
+        ///
+        /// The pages are reached through the config rather than through a
+        /// list the loader hands over, because the simulator and the
+        /// directed tests build their `Config` by hand: a list would be a
+        /// field they could each forget, and the walk cannot be.
+        fn initDateSlots(server: *Self) void {
+            // Nothing has been served yet, which is exactly what makes this
+            // the one moment a slot can be written unconditionally.
+            assert(server.static_sends_inflight == 0);
+            const now = server.currentDate();
+            server.static_responses.stampAll(now);
+            for (server.config.error_pages) |page| {
+                @memcpy(page.keep_date, now);
+                @memcpy(page.close_date, now);
+            }
+            // A `respond` action's page is shared with every other
+            // reference to the same body and status (#159), so a page
+            // reached twice is stamped twice with the same bytes.
+            for (server.config.listeners) |listener| {
+                for (listener.request_filters) |rule| {
+                    for (rule.actions) |action| {
+                        switch (action) {
+                            .respond => |page| {
+                                @memcpy(page.keep_date, now);
+                                @memcpy(page.close_date, now);
+                            },
+                            else => {},
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Take the claim that says this connection's pending write is
+        /// reading shared static bytes (#234). Paired with
+        /// `releaseStaticSend`, which every path out of that write runs.
+        pub fn claimStaticSend(server: *Self, conn: *ConnType) void {
+            // One write at a time per connection (`armClientWrite`), so a
+            // conn already holding one would mean two are in flight.
+            assert(!conn.static_send);
+            conn.static_send = true;
+            server.static_sends_inflight += 1;
+            assert(server.static_sends_inflight <= server.conns.capacity());
+        }
+
+        /// Hand back the claim, if this connection holds one. A no-op
+        /// otherwise, so the paths that end a write do not each re-test
+        /// what they were writing — and so the connection's own release
+        /// can be the backstop for the ones that end it abruptly.
+        pub fn releaseStaticSend(server: *Self, conn: *ConnType) void {
+            if (!conn.static_send) {
+                return;
+            }
+            conn.static_send = false;
+            assert(server.static_sends_inflight >= 1);
+            server.static_sends_inflight -= 1;
         }
 
         pub fn start(server: *Self) Io.ListenError!void {
@@ -1138,6 +1294,15 @@ pub fn Server(comptime IoType: type) type {
         /// all the same, so its quiescence is part of "idle" — and so is
         /// an endpoint left carrying a charge for a connection that ended.
         pub fn isIdle(server: *const Self) bool {
+            // Every #234 claim is a connection's, so a released conn pool
+            // and an outstanding claim contradict each other — and a
+            // leaked one would silently freeze the `Date`. Asserted here
+            // rather than merely reported, because an idle server with a
+            // claim standing is a bug in the release path, not a state a
+            // caller should be asked to handle.
+            if (server.conns.isFullyReleased()) {
+                assert(server.static_sends_inflight == 0);
+            }
             return server.l4Released() and
                 server.conns.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
@@ -1842,6 +2007,11 @@ pub fn Server(comptime IoType: type) type {
         /// every slot return goes through here and the flag can never
         /// outlive the occupancy that raised it.
         fn releaseConn(server: *Self, conn: *ConnType) void {
+            // The backstop for the #234 claim: a static answer torn down
+            // mid-write ends here like every other, and a claim that
+            // outlived its connection would freeze the `Date` for the
+            // life of the process.
+            server.releaseStaticSend(conn);
             server.conns.release(conn);
             server.updateConnPressure();
         }

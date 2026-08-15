@@ -10,6 +10,23 @@ const std = @import("std");
 
 const Balancer = @import("balancer.zig").Balancer;
 const config_module = @import("config.zig");
+const shed = @import("shed.zig");
+
+/// The `Date` and `Server` every proxy-generated response carries
+/// (#234), as this bed's clock renders them. `SimIo`'s wall clock starts
+/// at a fixed epoch and a directed scenario rarely spans a second, so
+/// this is the value nearly every expectation below wants — the few
+/// scenarios that *do* cross a second spell their own, which is the
+/// clock proving it is live rather than pinned.
+const expected_date = "Date: Wed, 01 Jan 2020 00:00:00 GMT\r\nServer: zoxy\r\n";
+
+/// The `Date` and `Server` the bed's *origin* sends on the fixtures that
+/// carry them — deliberately unlike anything this proxy would write
+/// (#234). A forwarded response keeps the origin's own headers, and an
+/// origin spelling them the way the proxy does would make that property
+/// invisible: the bytes would match whether they were passed through or
+/// silently replaced.
+const origin_date = "Date: Tue, 31 Dec 2019 23:59:59 GMT\r\nServer: origin/1.0\r\n";
 const constants = @import("constants.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
@@ -831,7 +848,7 @@ test "l7: a malformed request head is answered 400 and closed with FIN" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
@@ -856,7 +873,7 @@ test "l7: a malformed chunked body coalesced with the head is answered 400" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
@@ -874,7 +891,7 @@ test "l7: oversize request line is 414, oversize header section is 431" {
         try bed.exchange("GET " ++ long_target ++ " HTTP/1.1\r\n");
 
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_uri_too_long"));
@@ -898,7 +915,7 @@ test "l7: oversize request line is 414, oversize header section is 431" {
         try bed.exchange(request[0..len]);
 
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_headers_too_large"));
@@ -911,7 +928,7 @@ test "l7: oversize request line is 414, oversize header section is 431" {
 /// is the origin: it accepted a connection and never saw a request on it.
 fn expectRejectedAfterDial(bed: *const Http1Bed) !void {
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_headers_too_large"));
@@ -1010,7 +1027,7 @@ test "l7: an absolute-form target routes on its authority, not on Host" {
         // Case is folded on the way to the routing key, exactly as a Host
         // header's would be, so the mixed-case authority still matches.
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
@@ -1052,7 +1069,7 @@ test "l7: an unsupported absolute-form scheme is 400" {
     try bed.exchange("GET ftp://files.example/x HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
@@ -1070,7 +1087,7 @@ test "l7: CONNECT and Upgrade are answered 501" {
         defer bed.tearDown();
         try bed.exchange("CONNECT origin:443 HTTP/1.1\r\nHost: origin\r\n\r\n");
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
@@ -1082,7 +1099,7 @@ test "l7: CONNECT and Upgrade are answered 501" {
         defer bed.tearDown();
         try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
@@ -1180,7 +1197,7 @@ test "l7: an unroutable path is answered 404" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
@@ -1202,7 +1219,7 @@ test "l7: a structure-changing escape in the path is answered 400" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
@@ -1253,7 +1270,7 @@ test "l7: a request to a host with no route is answered 404" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
@@ -1288,7 +1305,7 @@ test "l7: a filter reject answers its policy status before the origin is dialed"
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
@@ -1346,7 +1363,7 @@ test "l7: a filter reject survives 1-byte adversarial delivery across seeds" {
         try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nX-Env: prod\r\n\r\n");
 
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
@@ -1388,8 +1405,8 @@ test "l7: an upstream-slot shed keeps the connection, and the client's ask decid
     try bed.exchange("GET /held HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n" ++
-            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n" ++
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client2.response(),
     );
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_shed_upstream_slots"));
@@ -1427,7 +1444,7 @@ test "l7: a head-ring shed answers 503 and always closes" {
     try bed.exchange("GET /held HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client2.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_shed_head_buffers"));
@@ -1490,8 +1507,8 @@ test "l7: an upstream head-pool shed keeps the connection like any post-parse ru
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_upstream_slots"));
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_shed_upstream_head_buffers"));
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n" ++
-            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n" ++
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client2.response(),
     );
     try bed.expectDrained();
@@ -1522,7 +1539,7 @@ test "l7: the configured head size is the accepted head size" {
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_uri_too_long"));
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client2.response(),
     );
     try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 OK"));
@@ -1581,7 +1598,7 @@ test "l7: a 501 keeps the connection, and the next request is served" {
     // The 501 keeps, and the request after it is proxied normally — the
     // connection was never lost to a method it happened not to support.
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n" ++
+        "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n" ++
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         bed.client.response(),
     );
@@ -1619,7 +1636,7 @@ test "l7: a reject closes when the client pipelined the next request" {
     // One response, and it announces the close: the second head is never
     // answered on this connection.
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
@@ -1649,7 +1666,7 @@ test "l7: a reject closes when the body has not arrived with the head" {
         try bed.exchange("POST /admin HTTP/1.1\r\nHost: o\r\nContent-Length: 4\r\n\r\nbody");
 
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
             bed.client.response(),
         );
         try bed.expectDrained();
@@ -1682,7 +1699,7 @@ test "l7: a drain closes a reject that would otherwise be kept" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     // The drain finished because the connection left, not because the
@@ -1722,7 +1739,7 @@ test "l7: relay pressure closes a reject that would otherwise be kept" {
 
     try std.testing.expect(bed.server.counters.get("relay_pressure_engaged") >= 1);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client2.response(),
     );
     try bed.expectDrained();
@@ -1751,7 +1768,7 @@ test "l7: a reject closes when the request carries a body" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
@@ -1912,7 +1929,7 @@ test "l7: an HTTP/1.0 request with no Host matches only any-host routes" {
         defer bed.tearDown();
         try bed.exchange("GET /x HTTP/1.0\r\n\r\n");
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
@@ -2119,7 +2136,7 @@ test "l7: an unreachable origin is answered 502" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
@@ -2145,7 +2162,7 @@ test "l7: kernel pressure on the upstream dial is witnessed and answered 502" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
@@ -2178,7 +2195,7 @@ test "l7: an origin response head the proxy cannot parse is 502" {
 
         try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
@@ -2202,7 +2219,7 @@ test "l7: an origin response head the proxy cannot parse is 502" {
 
         try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
@@ -2236,7 +2253,7 @@ test "l7: an origin head that no longer fits once the close is injected is 502" 
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
@@ -2269,7 +2286,7 @@ test "l7: a redirect composes Location from the request and keeps serving (#176)
     try std.testing.expectEqualStrings(
         "HTTP/1.1 301 Moved Permanently\r\n" ++
             "Location: https://o/old/path?q=1\r\n" ++
-            "Content-Length: 0\r\n\r\n" ++
+            "Content-Length: 0\r\n" ++ expected_date ++ "\r\n" ++
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
         bed.client.response(),
     );
@@ -2307,10 +2324,10 @@ test "l7: a redirect can replace the host, or name a fixed target (#176)" {
     try std.testing.expectEqualStrings(
         "HTTP/1.1 308 Permanent Redirect\r\n" ++
             "Location: https://example.com/www?keep=1\r\n" ++
-            "Content-Length: 0\r\n\r\n" ++
+            "Content-Length: 0\r\n" ++ expected_date ++ "\r\n" ++
             "HTTP/1.1 302 Found\r\n" ++
             "Location: https://status.example.com/\r\n" ++
-            "Content-Length: 0\r\nConnection: close\r\n\r\n",
+            "Content-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_redirected"));
@@ -2335,7 +2352,7 @@ test "l7: a composed redirect with no authority to compose from is 400 (#176)" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
@@ -2377,7 +2394,7 @@ test "l7: a redirect whose Location cannot be carried is 414 (#176)" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 414 URI Too Long\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_uri_too_long"));
@@ -2432,7 +2449,8 @@ test "l7: a 5xx-scoped response filter fires on the status that names it (#175)"
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 22,
-        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
+            origin_date ++ "\r\n",
         .response_filters = &rules,
     });
     defer bed.tearDown();
@@ -2443,7 +2461,7 @@ test "l7: a 5xx-scoped response filter fires on the status that names it (#175)"
     // The origin's 503 forwards — a response filter edits, never
     // rewrites the verdict — and the edit rides along.
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++ origin_date ++
             "Retry-After: 1\r\nConnection: close\r\n\r\n",
         bed.client.response(),
     );
@@ -2486,7 +2504,7 @@ test "l7: an origin head that no longer fits after response edits is 502 (#175)"
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
@@ -2695,21 +2713,41 @@ test "l7: a header-keyed cluster stamps nothing (#178)" {
 }
 
 /// A hand-rendered #159 page for the directed tests: exactly what the
-/// loader's `renderStaticPage` produces for a 5-byte text body, so the
-/// serve path's output can be pinned byte-for-byte here without a
-/// loader round trip.
+/// loader's `renderStaticPage` produces for a text body, so the serve
+/// path's output can be pinned byte-for-byte here without a loader round
+/// trip.
+///
+/// Storage, not a constant, because a rendered page now carries a `Date`
+/// slot the serve path stamps in place (#234) — this is the loader's
+/// arena in miniature, and a distinct type per page so each owns its own
+/// bytes the way two arena allocations would.
+fn TestPage(comptime status: u16, comptime reason: []const u8, comptime body: []const u8) type {
+    return struct {
+        const head_prefix = std.fmt.comptimePrint(
+            "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: text/plain\r\nDate: ",
+            .{ status, reason, body.len },
+        );
+        const keep_template = head_prefix ++ shed.date_placeholder ++ "\r\n" ++
+            shed.server_line ++ "\r\n" ++ body;
+        const close_template = head_prefix ++ shed.date_placeholder ++ "\r\n" ++
+            shed.server_line ++ "Connection: close\r\n\r\n" ++ body;
+
+        var keep: [keep_template.len]u8 = keep_template.*;
+        var close: [close_template.len]u8 = close_template.*;
+        var page: config_module.Config.StaticPage = .{
+            .status = status,
+            .keep = &keep,
+            .close = &close,
+            .keep_head_len = keep_template.len - body.len,
+            .close_head_len = close_template.len - body.len,
+            .keep_date = keep[head_prefix.len..][0..shed.date_bytes],
+            .close_date = close[head_prefix.len..][0..shed.date_bytes],
+        };
+    };
+}
+
 const test_page_body = "gone\n";
-const test_not_found_keep = "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n" ++
-    "Content-Type: text/plain\r\n\r\n" ++ test_page_body;
-const test_not_found_close = "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n" ++
-    "Content-Type: text/plain\r\nConnection: close\r\n\r\n" ++ test_page_body;
-const test_not_found_page = config_module.Config.StaticPage{
-    .status = 404,
-    .keep = test_not_found_keep,
-    .close = test_not_found_close,
-    .keep_head_len = test_not_found_keep.len - test_page_body.len,
-    .close_head_len = test_not_found_close.len - test_page_body.len,
-};
+const TestNotFound = TestPage(404, "Not Found", test_page_body);
 
 test "l7: a configured 404 page serves where the empty static did (#159)" {
     var bed: Http1Bed = undefined;
@@ -2717,7 +2755,7 @@ test "l7: a configured 404 page serves where the empty static did (#159)" {
         .seed = 41,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .route_prefix = "/api",
-        .error_pages = &.{&test_not_found_page},
+        .error_pages = &.{&TestNotFound.page},
     });
     defer bed.tearDown();
 
@@ -2727,7 +2765,7 @@ test "l7: a configured 404 page serves where the empty static did (#159)" {
     try bed.exchange("GET /nope HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
-    try std.testing.expectEqualStrings(test_not_found_page.close, bed.client.response());
+    try std.testing.expectEqualStrings(TestNotFound.page.close, bed.client.response());
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
     try bed.expectDrained();
 }
@@ -2738,7 +2776,7 @@ test "l7: a keep-alive reject serves the page and keeps serving (#159)" {
         .seed = 42,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .route_prefix = "/api",
-        .error_pages = &.{&test_not_found_page},
+        .error_pages = &.{&TestNotFound.page},
     });
     defer bed.tearDown();
 
@@ -2755,7 +2793,7 @@ test "l7: a keep-alive reject serves the page and keeps serving (#159)" {
     const expected = std.fmt.bufPrint(
         &expected_buffer,
         "{s}HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
-        .{test_not_found_page.keep},
+        .{TestNotFound.page.keep},
     ) catch unreachable;
     try std.testing.expectEqualStrings(expected, bed.client.response());
     try bed.expectDrained();
@@ -2767,7 +2805,7 @@ test "l7: a HEAD request gets a page's head and none of its body (#159)" {
         .seed = 43,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .route_prefix = "/api",
-        .error_pages = &.{&test_not_found_page},
+        .error_pages = &.{&TestNotFound.page},
     });
     defer bed.tearDown();
 
@@ -2778,7 +2816,7 @@ test "l7: a HEAD request gets a page's head and none of its body (#159)" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        test_not_found_page.close[0..test_not_found_page.close_head_len],
+        TestNotFound.page.close[0..TestNotFound.page.close_head_len],
         bed.client.response(),
     );
     try bed.expectDrained();
@@ -2788,18 +2826,8 @@ test "l7: a filter reject wears its configured page too (#159)" {
     // `respondFilter` routes through the same `respond`, so a 403 page
     // fires for policy rejects without any per-feature wiring — the
     // point of pages living behind the one static path.
-    const forbidden_body = "no\n";
-    const forbidden_keep = "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n" ++
-        "Content-Type: text/plain\r\n\r\n" ++ forbidden_body;
-    const forbidden_close = "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n" ++
-        "Content-Type: text/plain\r\nConnection: close\r\n\r\n" ++ forbidden_body;
-    const page = config_module.Config.StaticPage{
-        .status = 403,
-        .keep = forbidden_keep,
-        .close = forbidden_close,
-        .keep_head_len = forbidden_keep.len - forbidden_body.len,
-        .close_head_len = forbidden_close.len - forbidden_body.len,
-    };
+    const Forbidden = TestPage(403, "Forbidden", "no\n");
+    const page = &Forbidden.page;
     const rules = [_]filter.Rule{.{
         .match = .{ .path_prefix = "/private" },
         .actions = &.{.{ .reject = 403 }},
@@ -2809,7 +2837,7 @@ test "l7: a filter reject wears its configured page too (#159)" {
         .seed = 44,
         .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
         .request_filters = &rules,
-        .error_pages = &.{&page},
+        .error_pages = &.{page},
     });
     defer bed.tearDown();
 
@@ -2822,21 +2850,11 @@ test "l7: a filter reject wears its configured page too (#159)" {
 }
 
 test "l7: a respond action answers from memory and never dials (#159)" {
-    const robots_body = "User-agent: *\n";
-    const robots_keep = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
-        "Content-Type: text/plain\r\n\r\n" ++ robots_body;
-    const robots_close = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n" ++
-        "Content-Type: text/plain\r\nConnection: close\r\n\r\n" ++ robots_body;
-    const robots_page = config_module.Config.StaticPage{
-        .status = 200,
-        .keep = robots_keep,
-        .close = robots_close,
-        .keep_head_len = robots_keep.len - robots_body.len,
-        .close_head_len = robots_close.len - robots_body.len,
-    };
+    const Robots = TestPage(200, "OK", "User-agent: *\n");
+    const robots_page = &Robots.page;
     const rules = [_]filter.Rule{.{
         .match = .{ .path_prefix = "/robots.txt" },
-        .actions = &.{.{ .respond = &robots_page }},
+        .actions = &.{.{ .respond = robots_page }},
     }};
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
@@ -2860,7 +2878,7 @@ test "l7: a respond action answers from memory and never dials (#159)" {
     const expected = std.fmt.bufPrint(
         &expected_buffer,
         "{s}HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
-        .{robots_keep},
+        .{Robots.page.keep},
     ) catch unreachable;
     try std.testing.expectEqualStrings(expected, bed.client.response());
     // Answered as the origin, counted apart from refusals — and only
@@ -2887,7 +2905,8 @@ test "l7: a hung dial fires 504 at the connect budget, not the idle timeout" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++
+            expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
@@ -2915,7 +2934,7 @@ test "l7: rejects survive 1-byte adversarial delivery across seeds" {
 
         try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
         try std.testing.expectEqualStrings(
-            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
@@ -2950,8 +2969,13 @@ test "l7: a mute origin earns the §8 request-deadline 504 verdict" {
     try bed.exchange("GET /stalled HTTP/1.1\r\nHost: o\r\n\r\n");
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // A second later than every other scenario's, and spelled out rather
+    // than shared: the request deadline this test waits out is measured in
+    // virtual seconds, so the `Date` moving with it is the cheapest proof
+    // that the stamp reads a live clock rather than a pinned one (#234).
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++
+            "Date: Wed, 01 Jan 2020 00:00:01 GMT\r\nServer: zoxy\r\nConnection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
@@ -3074,7 +3098,7 @@ test "l7: the request deadline fires 504 ahead of the connect and idle budgets" 
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
@@ -3628,7 +3652,7 @@ test "l7: the replay budget is one — a second early failure answers 502" {
     try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
 
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client2.response(),
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_replayed"));
@@ -3954,7 +3978,8 @@ test "l7: a shed and an origin 503 are the same status and different outcomes" {
     var origin_bed: Http1Bed = undefined;
     try origin_bed.setUp(std.testing.allocator, .{
         .seed = 11,
-        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
+            origin_date ++ "\r\n",
         .access_log = true,
     });
     defer origin_bed.tearDown();
@@ -4133,7 +4158,8 @@ test "health: an http probe fails on a status it was not promised" {
         .seed = 62,
         // The origin is listening and answering — a TCP check would call
         // this endpoint healthy. Only reading the status can tell.
-        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        .origin_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
+            origin_date ++ "\r\n",
         .check = .{
             .kind = .http,
             .timeout_ms = Http1Bed.connect_timeout_ms,
@@ -4760,7 +4786,7 @@ test "l7: a retry runs out of endpoints before its budget and answers 502" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     // Two dials, one retry between them, and no third: the exclusion
@@ -4795,7 +4821,7 @@ test "l7: our own dial exhaustion is not retried onto another endpoint" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     // The healthy origin sat there untried, and that is correct: the
@@ -4832,7 +4858,7 @@ test "l7: a dial that times out does not retry, because it spent the budget" {
 
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     // One budget, not one per endpoint: three tries at a fresh deadline
@@ -5136,7 +5162,7 @@ test "l7: a 101 nobody asked for fails the exchange" {
     try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
 
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_interim_forwarded"));
@@ -5253,7 +5279,7 @@ test "l7: a declared body over the cap is refused before the origin is dialed" {
         "Content-Length: 64\r\n\r\n" ++ ("x" ** 64));
 
     try std.testing.expectEqualStrings(
-        "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
         bed.client.response(),
     );
     // No origin was contacted: the refusal is this proxy's own, decided

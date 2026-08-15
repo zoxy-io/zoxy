@@ -55,6 +55,15 @@ pub const Response = struct {
     /// attributes — so a present-but-mangled stamp fails the read
     /// instead of passing as either presence or absence.
     sticky_tag: ?[16]u8,
+    /// The `Date` value this response carried, or null when it carried
+    /// none (#234). Kept verbatim so the caller can hold it against its
+    /// own clock: the simulator's oracle can only prove the stamp is
+    /// well-formed, because its clock is the one the proxy reads — this
+    /// tier is where the real `nowWallNs` is on the other side of a
+    /// socket and a wrong one is visible.
+    date: ?[29]u8,
+    /// Whether the head named this proxy as the responder (#234).
+    from_proxy: bool,
 };
 
 /// How much entropy `std.crypto.tls` wants to seed one handshake — the
@@ -277,6 +286,8 @@ fn readResponse(reader: *Io.Reader) !Response {
         .body_bytes = head.body_bytes,
         .edited = head.edited,
         .sticky_tag = head.sticky_tag,
+        .date = head.date,
+        .from_proxy = head.from_proxy,
     };
 }
 
@@ -302,6 +313,8 @@ const Head = struct {
     body_bytes: u32,
     edited: bool,
     sticky_tag: ?[16]u8,
+    date: ?[29]u8,
+    from_proxy: bool,
 };
 
 /// Header lines up to the blank one, returning the body length they
@@ -314,9 +327,16 @@ const Head = struct {
 fn readHeaders(reader: *Io.Reader) !Head {
     const length_name = "content-length:";
     const stamp = "x-zoxy-smoke: 1";
+    // #234, spelled here for the same reason the stamp is: what this
+    // gate reads is what the binary wrote, so a drift must fail rather
+    // than agree with itself.
+    const date_name = "date:";
+    const server_line = "server: zoxy";
     var body_bytes: ?u32 = null;
     var edited = false;
     var sticky_tag: ?[16]u8 = null;
+    var date: ?[29]u8 = null;
+    var from_proxy = false;
     var lines: u32 = 0;
     while (lines < response_headers_max) : (lines += 1) {
         const taken = try reader.takeDelimiter('\n');
@@ -324,7 +344,27 @@ fn readHeaders(reader: *Io.Reader) !Head {
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) {
             const framed = body_bytes orelse return error.ResponseUnframed;
-            return .{ .body_bytes = framed, .edited = edited, .sticky_tag = sticky_tag };
+            return .{
+                .body_bytes = framed,
+                .edited = edited,
+                .sticky_tag = sticky_tag,
+                .date = date,
+                .from_proxy = from_proxy,
+            };
+        }
+        if (std.ascii.eqlIgnoreCase(trimmed, server_line)) {
+            from_proxy = true;
+            continue;
+        }
+        if (std.ascii.startsWithIgnoreCase(trimmed, date_name)) {
+            const value = std.mem.trim(u8, trimmed[date_name.len..], " \t");
+            // Fixed-width by construction (RFC 9110 §5.6.7), so any other
+            // width is a slot patched wrongly rather than a spelling
+            // choice — and a second `Date` would mean two writers.
+            if (value.len != 29) return error.ResponseMalformed;
+            if (date != null) return error.ResponseMalformed;
+            date = value[0..29].*;
+            continue;
         }
         if (std.ascii.eqlIgnoreCase(trimmed, stamp)) {
             edited = true;

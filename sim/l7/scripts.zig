@@ -33,6 +33,13 @@ pub const Script = enum(u8) {
     post_big,
     /// A POST with a valid chunked body; expects one canonical 200.
     post_chunked,
+    /// A POST with a chunked body too big for one delivery. `post_big`'s
+    /// shape without a declared length, and the only script that can
+    /// reach the #236 cap's *streaming* half: a declared body is refused
+    /// before a byte is pumped, so cutting one mid-stream needs a body
+    /// whose size the head never states and a cap it outgrows only after
+    /// the first delivery has already passed under it.
+    post_chunked_big,
     /// A chunked POST whose first body byte violates chunk framing —
     /// the silent-teardown-instead-of-400 shape (§7): clean seeds
     /// demand the 400.
@@ -241,6 +248,18 @@ const big_body = blk: {
     const frozen = bytes;
     break :blk frozen;
 };
+/// `post_chunked_big`'s payload — `big_body`'s bytes, so the two scripts
+/// differ in their *framing* alone and any difference the sweep sees
+/// comes from the declared length rather than the size. Public because
+/// the harness sizes the #236 cap against it, and that relation is
+/// asserted where both halves are visible rather than guessed at from
+/// either side.
+pub const chunked_big_body_bytes: u32 = big_body.len;
+
+/// That payload in one chunk, framed so the head states no length at all.
+const big_chunked_wire = std.fmt.comptimePrint("{x}\r\n", .{big_body.len}) ++
+    big_body ++ "\r\n0\r\n\r\n";
+
 comptime {
     assert(post_body.len == 24);
     assert(big_body.len == 6000);
@@ -346,6 +365,20 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
     .post_chunked = .{
         .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
             "Transfer-Encoding: chunked\r\n\r\n" ++ "8\r\nabcdefgh\r\n0\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .post,
+        .allowed_statuses = statuses_routed_body,
+        .carries_body = true,
+        .routed_canonical = true,
+    },
+    .post_chunked_big = .{
+        // No declared length, so nothing about this request is refusable
+        // before the body is pumped — which is what makes it the one
+        // script that can reach the #236 cap's streaming half.
+        .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
+            "Transfer-Encoding: chunked\r\n\r\n" ++ big_chunked_wire,
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 200,
@@ -654,6 +687,7 @@ pub const terminating_scripts = [_]Script{
     .post_sized,
     .post_big,
     .post_chunked,
+    .post_chunked_big,
     .post_chunked_malformed,
     .malformed_head,
     .oversize_uri,

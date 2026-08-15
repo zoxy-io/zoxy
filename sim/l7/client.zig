@@ -55,6 +55,19 @@ pub const ClientError = error{
     /// anywhere (the scripted origin answers no 5xx) — either way a
     /// predicate fired where it could not have.
     ResponseEditForged,
+    /// A response this proxy originated arrived without the `Date` and
+    /// `Server` lines RFC 9110 §6.6.1 requires of it (#234) — or with a
+    /// `Date` still holding the un-stamped placeholder, which is the
+    /// shape a slot never patched would take.
+    ProxyDateMissing,
+    /// A `Date` that is not an IMF-fixdate: the value is fixed-width by
+    /// construction, so any other width is a slot patched wrongly rather
+    /// than a formatting preference.
+    ProxyDateMalformed,
+    /// A *forwarded* response carried a `Date` or `Server` the sim origin
+    /// never sent, which would mean the proxy is stamping responses that
+    /// are not its own to stamp.
+    ProxyDateForged,
     /// A sticky seed's proxied 200 arrived without the exact #178
     /// Set-Cookie stamp the drawn cookie cluster owes it — every routed
     /// request but `sticky_follow`'s is assigned or repicked, and the
@@ -466,6 +479,10 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = violation;
                     return walk;
                 }
+                if (dateViolation(entry, &response)) |violation| {
+                    walk.violation = violation;
+                    return walk;
+                }
                 if (stickyViolation(connection, entry, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
@@ -550,6 +567,56 @@ pub fn Client(comptime IoType: type) type {
             }
             if (headerPresent(response.headers, canon.response_never_name)) {
                 return ClientError.ResponseEditForged;
+            }
+            return null;
+        }
+
+        /// The #234 oracle over one parsed response head: whatever this
+        /// proxy *originates* carries a `Date` and a `Server`, and
+        /// whatever it merely *forwards* carries neither.
+        ///
+        /// Both halves have teeth. The sim origin sends no `Date` and no
+        /// `Server` on any of its canonical responses, so the forwarded
+        /// half proves the proxy is not stamping answers that are not its
+        /// own — the shape a `Date` written on the response render rather
+        /// than on the static path would take. The originated half proves
+        /// the slot was actually patched: an un-stamped one still has the
+        /// right width and the right shape, and would pass every check
+        /// but the placeholder comparison.
+        ///
+        /// Which is which comes from the same predicate `#175`'s oracle
+        /// uses, because it is the same distinction: a `200` that is not
+        /// a #159 page came from an origin, a `101` is the origin's
+        /// switch (#180), and every other status here is one this proxy
+        /// raised — the §8 ladder's, a filter's reject, a redirect.
+        fn dateViolation(entry: Spec, response: *const parser.ResponseHead) ?ClientError {
+            assert(response.status >= 100);
+            const from_memory = pageBodyFor(entry, response.status) != null;
+            const forwarded = !from_memory and
+                (response.status == 200 or response.status == 101);
+            const stamped_server = headerEquals(response.headers, "Server", "zoxy");
+            const date = parser.headerValue(response.headers, "Date");
+            if (forwarded) {
+                if (stamped_server or date != null) {
+                    return ClientError.ProxyDateForged;
+                }
+                return null;
+            }
+            if (!stamped_server) {
+                return ClientError.ProxyDateMissing;
+            }
+            const value = date orelse return ClientError.ProxyDateMissing;
+            if (std.mem.eql(u8, value, zoxy.shed.date_placeholder)) {
+                return ClientError.ProxyDateMissing; // The slot was never patched.
+            }
+            if (value.len != zoxy.shed.date_bytes) {
+                return ClientError.ProxyDateMalformed;
+            }
+            if (!std.mem.endsWith(u8, value, " GMT")) {
+                return ClientError.ProxyDateMalformed;
+            }
+            if (value[3] != ',') {
+                return ClientError.ProxyDateMalformed;
             }
             return null;
         }

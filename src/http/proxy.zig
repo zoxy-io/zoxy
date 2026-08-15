@@ -2751,6 +2751,12 @@ pub fn Proxy(comptime IoType: type) type {
                 resumeClientWrite(server, conn); // More to write (§6).
                 return;
             }
+            // The shared static bytes are off the wire (#234). Released
+            // here rather than left to the connection's own teardown,
+            // because a kept connection holds its slot for as long as the
+            // client stays — and a claim standing that long would freeze
+            // the `Date` every later response is stamped from.
+            server.releaseStaticSend(conn);
             assertWriteContinuation(conn, write.then);
             switch (write.then) {
                 // The origin's `101` has reached the client, so the HTTP
@@ -3542,11 +3548,17 @@ pub fn Proxy(comptime IoType: type) type {
             if (configuredPage(server, status)) |page| {
                 return armPageWrite(server, conn, page, keep);
             }
-            if (keep) {
-                armClientWrite(server, conn, shed.staticResponse(status, .keep), .next_request);
-            } else {
-                armClientWrite(server, conn, shed.staticResponse(status, .close), .lingering_close);
-            }
+            const persistence: shed.Persistence = if (keep) .keep else .close;
+            const answer = server.static_responses.get(status, persistence);
+            // The `Date` this answer will carry (#234), written now
+            // because now is when the server can still prove nothing is
+            // reading these bytes — the claim taken below is what makes
+            // that true for the next one to ask.
+            server.stampStaticDate(answer.date);
+            server.claimStaticSend(conn);
+            const then: conn_module.ClientWrite.Then =
+                if (keep) .next_request else .lingering_close;
+            armClientWrite(server, conn, answer.bytes, then);
         }
 
         /// Send one pre-rendered #159 page: the persistence variant the
@@ -3571,6 +3583,12 @@ pub fn Proxy(comptime IoType: type) type {
             else
                 (if (head_only) page.close[0..page.close_head_len] else page.close);
             assert(bytes.len >= 1);
+            // A configured page is shared arena memory exactly as the
+            // comptime statics are shared server memory, so its `Date`
+            // slot is stamped under the same claim (#234). The slot sits
+            // in the head, so the HEAD prefix carries it too.
+            server.stampStaticDate(if (keep) page.keep_date else page.close_date);
+            server.claimStaticSend(conn);
             const then: conn_module.ClientWrite.Then =
                 if (keep) .next_request else .lingering_close;
             armClientWrite(server, conn, bytes, then);
@@ -3728,6 +3746,7 @@ pub fn Proxy(comptime IoType: type) type {
                 redirect.status,
                 location,
                 !keep,
+                server.currentDate(),
                 headBytes(server, conn),
             ) catch {
                 // The Location fit the scratch but head + Location does
