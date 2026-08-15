@@ -158,8 +158,9 @@ whether one stranded anything.** Either the ordinary invariants hold, or
 the server gave up with the code that names which backstop it was. What
 that phrasing buys is the property actually worth holding — no schedule
 may end with the loop alive and nobody the wiser — rather than a
-weaker "stranded seeds are excused". 112 runs per 4096-seed sweep take
-the second branch.
+weaker "stranded seeds are excused". 358 runs per 4096-seed sweep take
+the second branch — 112 from the wind-down hook and 246 from the teardown
+latch below.
 
 The abort is only excused on a seed that actually stranded something,
 which needs the draw and the strand kept as two facts rather than one
@@ -263,11 +264,52 @@ slot that never released. `accept` is the one kind that strands without
 ever leaving a plane stuck: 88 strands per sweep, no give-up. The admin
 plane is never the stuck one.
 
-What a wind-down drop genuinely cannot reach is the pair of cancels
-`beginTeardown` arms, since it arms them *after* the strand lands. That
-is the real argument for the mid-teardown hook, and it is not the
-argument this section used to make.
+What a wind-down drop cannot reach is the pair of cancels `beginTeardown`
+arms, since it arms them *after* the strand lands. That is the real
+argument for the mid-teardown hook — not the one this section used to
+make — and it is what the second hook was built on.
 
+**The second hook: strand an op that does not exist yet.** A drop can
+only take what is in the pending table, and the cancels a teardown arms
+are not in it when either drain entry runs. `SimIo.armDropNext(kinds)`
+latches instead: the next op submitted of a kind in the set is born
+dropped, and the latch closes on that one op. Everything downstream is
+unchanged — a dropped op is still checked at the top of `opReady`, still
+holds whatever it references, still never delivers.
+
+Seeds draw *where* they strand, not whether: `.wind_down` takes one of
+the sixteen values, `.teardown` two, out of the same single draw that
+used to mean "strand or not". Keeping it one draw is deliberate — the
+sweep's whole stream position hangs off how many values are drawn here,
+so a second draw would re-roll every seed after it and take the §9 census
+margins along.
+
+The result is the sharpest signal this issue has produced. Per 4096-seed
+sweep, 246 of the 784 `.teardown` runs find a cancel to take, and **all
+246 reach the give-up** — against 112 of the 316 wind-down strands. 168
+leave the connection plane stuck, which is #203's shape exactly: a cancel
+armed during teardown and never delivered leaves that connection's armed
+set non-empty forever, `continueTeardown` returns early for as long as
+that holds, and the slot is never released. The other 78 are the prober's
+own dial cancel. The 538 runs that find nothing to take are held to the
+ordinary invariants, having taken nothing — the price of waiting for an
+op that does not exist yet, and why the mode is drawn twice as often.
+
+**Where the latch is armed decides what it catches**, which took two
+measurements to get right:
+
+| latch armed | runs that strand | strands on conns |
+| --- | --- | --- |
+| before the doubles' `cancelIfStuck` burst | 82% | — (a fifth took a client double's cancel) |
+| after the doubles, before `beginDrain` returns | 75% | 7% |
+| after `beginDrain` returns | 31% | 68% |
+
+The first two spend the latch on cancels submitted from inside the drain
+— the harness's own doubles, then the prober being stopped — and the
+connection teardowns never get a look in. The third strands on fewer runs
+precisely because those are gone by the time it arms, which is the point.
+It arms at both drain entries, since a seed that drains mid-scenario
+tears its connections down there.
 `timer` is the one kind still excluded, and it is the finding worth
 carrying: **`onDrainStuck` cannot catch a stranded timer, because it is
 one.** A seed that strands the drain deadline strands the thing that
@@ -308,15 +350,15 @@ are independent and both are minorities, which is why 4096 seeds per
 change missed it and a million-seed block did not: at roughly 7 such
 seeds per 4096, `ci` clears whole runs without producing one.
 
-`maybeStrandOps` skips the strand when the deadline is zero, rather than
-`deriveDropWanted` skipping the draw. The draw runs in
+Both hooks skip the strand when the deadline is zero (`giveUpCanExist`),
+rather than `deriveDropMode` skipping the draw. The draw runs in
 `deriveTerminatingDraws` and the deadline is settled one call later in
 `deriveServerConfig`, adjacent siblings under `deriveTopology` in that
 order, so gating at the draw means drawing the deadline first — and
 swapping two calls re-rolls every draw after them for the whole sweep,
 census margins included, to fix an 0.2% case. Skipping at the strand
-leaves `drop_kind` null, so the seed is held to the ordinary invariants
-like any seed that stranded nothing. Measured cost over a 4096-seed
+leaves the seed having taken nothing, so it is held to the ordinary
+invariants like any seed that stranded nothing. Measured cost over a 4096-seed
 sweep: 8 seeds draw a drop they cannot use, against 158 that draw one
 they can.
 
