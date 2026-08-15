@@ -144,6 +144,18 @@ pub const Spec = struct {
     /// the pipelined shape: the proxy serves the first request and
     /// refuses to look at the second.
     golden_first_announces_close: bool = false,
+    /// This script's 200 is answered from a configured page (#159) rather
+    /// than proxied, so it crosses neither response-side render — no #175
+    /// stamp, no #178 cookie — and its body is the page's, byte for byte.
+    /// A property of the request's path, which only the table knows: 403
+    /// pages are blanket by status, but a 200 from memory is
+    /// indistinguishable from a proxied one without this.
+    respond_page: bool = false,
+    /// The request already names an endpoint in the #178 grammar, so its
+    /// proxied 200 owes *no* re-stamp — idempotence is the contract.
+    /// Every other routed request is assigned or repicked and owes the
+    /// pinned cookie.
+    sticky_request_pinned: bool = false,
 };
 
 const post_body = "request-body-24-bytes-ab";
@@ -415,6 +427,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = &.{ 200, 503 },
+        .respond_page = true,
     },
     .filter_edit = .{
         // Routes and forwards like a plain GET, so the §8 rungs and a
@@ -472,6 +485,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .sticky_request_pinned = true,
     },
     .sticky_repick = .{
         .request = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++
@@ -505,5 +519,10 @@ comptime {
         }
         if (entry.second_request_when_reusable) assert(entry.expected_responses == 2);
         if (entry.golden_first_announces_close) assert(entry.transcript_cap == 2);
+        // A page is answered from memory, so its script can only ever see
+        // the one status the page carries — and a pinned request is one
+        // that routes, which a page never does.
+        if (entry.respond_page) assert(entry.golden_status == 200);
+        if (entry.respond_page) assert(!entry.sticky_request_pinned);
     }
 }
