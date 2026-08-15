@@ -39,6 +39,13 @@ pub const response_edit_name = "X-Sim-Response";
 pub const response_edit_value = "on";
 pub const response_never_name = "X-Sim-Never";
 
+/// The Host header the `absolute_form` script sends beside a request
+/// line that names a different authority (#233). RFC 9112 §3.2.2 has the
+/// authority win, so these bytes must never reach an origin — the origin
+/// checks every forwarded head for them, and only that one script can
+/// produce them, which makes a global check a precise one.
+pub const overridden_host = "overridden.example";
+
 /// The one Location a sim 301 may carry (#176): the harness's redirect
 /// rule composes scheme + the request's own host and canonical path,
 /// and `filter_redirect` is the only script that earns a 301 — so the

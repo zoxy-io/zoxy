@@ -988,6 +988,79 @@ test "l7: a head that fits on arrival but not after forwarding is 431" {
     }
 }
 
+test "l7: an absolute-form target routes on its authority, not on Host" {
+    // RFC 9112 §3.2.2 makes accepting absolute-form a MUST and has the
+    // received Host ignored in favour of the target's authority (#233).
+    // Both halves are asserted: what the policy saw, and what the origin
+    // saw — they must be the same name, or the router and the origin
+    // disagree about which resource was named (§7).
+    {
+        // The rule matches the *authority*, and the disagreeing Host is
+        // the name it would have matched had the override not happened.
+        const rules = [_]filter.Rule{.{
+            .match = .{ .host = "api.example" },
+            .actions = &.{.{ .reject = 403 }},
+        }};
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .seed = 41, .request_filters = &rules });
+        defer bed.tearDown();
+
+        try bed.exchange("GET http://API.Example/v2/x HTTP/1.1\r\nHost: stale.example\r\n\r\n");
+
+        // Case is folded on the way to the routing key, exactly as a Host
+        // header's would be, so the mixed-case authority still matches.
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_absolute_form"));
+        try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+        try bed.expectDrained();
+    }
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 42,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange(
+            "GET http://api.example:8080/v2/../x?q=1 HTTP/1.1\r\nHost: stale.example\r\n\r\n",
+        );
+
+        var storage: parser.HeaderStorage = undefined;
+        const forwarded = try forwardedRequest(&bed, &storage);
+        // Origin-form upstream, canonicalized like any other target, and
+        // carrying exactly one Host — the authority, port and all.
+        try std.testing.expectEqualStrings("/x?q=1", forwarded.target);
+        try std.testing.expectEqualStrings("api.example:8080", forwarded.host.?);
+        try std.testing.expectEqual(@as(?[]const u8, null), forwarded.authority);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_absolute_form"));
+        try bed.expectDrained();
+    }
+}
+
+test "l7: an unsupported absolute-form scheme is 400" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{ .seed = 43 });
+    defer bed.tearDown();
+
+    // §7 speaks http and https; a target naming anything else is refused
+    // at the boundary rather than routed by its path alone (#233).
+    try bed.exchange("GET ftp://files.example/x HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
+    // The head never parsed, so nothing counted the form it was in.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_absolute_form"));
+    try bed.expectDrained();
+}
+
 // Both heads parse cleanly and carry no body, so the 501 keeps the
 // connection (§8) — the method is refused, not the framing.
 test "l7: CONNECT and Upgrade are answered 501" {

@@ -2501,6 +2501,16 @@ fn verifyAccessLog(harness: *Harness) !void {
     // range finishes, which is too late to explain a single seed.
     if (counters.get("access_log_dropped") != 0) return error.AccessLogDroppedInSweep;
 
+    // #233: an absolute-form request line's authority overrides the Host
+    // beside it, and what the log records is the name the request
+    // *routed* on. So the overridden spelling must never reach a line —
+    // the same check the origin makes on what it was forwarded, made
+    // here on what the operator is told. Only one script can produce
+    // these bytes, which is what makes a scan of the whole sink exact.
+    if (std.mem.indexOf(u8, sink, l7.canon.overridden_host) != null) {
+        return error.AccessLogHostNotOverridden;
+    }
+
     // Every HTTP line is either an outcome the data path counted or an
     // abort — an equality, and the reason this file no longer asks
     // whether the log wrote *enough* lines. The `>=` it replaces was

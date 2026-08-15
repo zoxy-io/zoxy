@@ -558,7 +558,7 @@ pub fn Proxy(comptime IoType: type) type {
             host_scratch: *[constants.host_bytes_max]u8,
         ) error{BadPath}!RequestKeys {
             assert(request.target.len >= 1);
-            const host: ?[]const u8 = if (request.host) |raw|
+            const host: ?[]const u8 = if (request.routingAuthority()) |raw|
                 parser.canonicalHost(raw, host_scratch)
             else
                 null;
@@ -573,7 +573,10 @@ pub fn Proxy(comptime IoType: type) type {
         /// They differ in exactly one case, and this is the only place that
         /// case is written: OPTIONS asterisk-form matches and routes as the
         /// origin root but is forwarded as `*`. Origin-form canonicalizes,
-        /// and both views are then the same bytes.
+        /// and both views are then the same bytes. Absolute-form was split
+        /// back to origin-form by the parser (#233), so it takes that same
+        /// path — the authority it also carried is a routing key, not a
+        /// target view, and never reaches here.
         ///
         /// Canonicalizing decodes percent-escapes and collapses dot
         /// segments over the whole path, so it is done once and both
@@ -592,7 +595,7 @@ pub fn Proxy(comptime IoType: type) type {
             scratch: []u8,
         ) error{BadPath}!TargetViews {
             assert(request.target.len >= 1);
-            if (request.target[0] != '/') {
+            if (request.authority == null and request.target[0] != '/') {
                 // validateTarget admitted only asterisk-form here.
                 assert(request.method == .options);
                 return .{
@@ -656,7 +659,7 @@ pub fn Proxy(comptime IoType: type) type {
             // with its frame at the connect await, so this path would need
             // to rebuild it regardless — and unlike the target, nothing
             // else is asking for one canonical spelling of it.
-            const host: ?[]const u8 = if (request.host) |raw|
+            const host: ?[]const u8 = if (request.routingAuthority()) |raw|
                 parser.canonicalHost(raw, host_scratch)
             else
                 null;
@@ -774,6 +777,15 @@ pub fn Proxy(comptime IoType: type) type {
             // here, which is right — the cap bounds work this connection
             // asked for, not bytes it fumbled.
             conn.requests_served +|= 1;
+            // Counted here, beside the request tally and ahead of every
+            // verdict, because it records what the *client sent* rather
+            // than what this proxy decided (#233): an absolute-form
+            // request refused for its method, its body size or its path
+            // is still one more client naming its own authority, which
+            // is the whole question this counter answers.
+            if (request.authority != null) {
+                server.counters.increment("l7_absolute_form");
+            }
             armRequestDeadline(server, conn);
             if (request.method == .connect) {
                 return respond(server, conn, 501, "l7_not_implemented");
