@@ -298,6 +298,13 @@ pub fn Conn(comptime IoType: type) type {
         /// upgrade being admitted and the origin answering; at `101` the
         /// shared one goes back and this one takes its place.
         tunnel_buffer: ?*relay.RelayBuffer,
+        /// Whether this connection's pending client write is reading the
+        /// server's shared static response memory (#234) — the claim that
+        /// holds the `Date` stamp off those bytes while a send may be
+        /// reading them. False for every other write, including the #176
+        /// redirect, which renders into this connection's own head buffer
+        /// and so shares nothing.
+        static_send: bool,
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
@@ -722,6 +729,11 @@ pub fn Conn(comptime IoType: type) type {
             conn.upstream_socket = null;
             conn.relay_buffer = buffer;
             conn.tunnel_buffer = null;
+            // The claim is the server's counter to release, and
+            // `releaseConn` has already done so by the time a slot is
+            // handed out again — this only states the invariant the reset
+            // inherits.
+            conn.static_send = false;
             conn.deadline_ns = 0;
             conn.birth_ns = server.io.nowNs();
             conn.armed = .{};
