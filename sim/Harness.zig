@@ -969,7 +969,12 @@ fn renderSimPage(comptime status: u16, comptime body: []const u8) zoxy.config.Co
     };
 }
 
-fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
+/// The §7 request rules and the #175 response rules the http listener
+/// runs — and, on the seeds whose tls listener terminates http, that one
+/// too (#215). Split from `wireListeners` when attaching the second
+/// listener's chain took it past the length limit; the two halves are
+/// what a listener is made of, in the order the config reads.
+fn wireFilters(harness: *Harness) void {
     harness.request_filters_http = .{
         .{
             .match = .{ .path_prefix = "/reject" },
@@ -1021,6 +1026,14 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .edits = &.{.{ .kind = .set, .name = l7.canon.response_never_name, .value = "1" }},
         },
     };
+}
+
+fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forwarded) void {
+    harness.wireFilters();
+    // One binding for both filter fields: a tls listener either runs the
+    // http listener's whole chain or none of it, and two spellings of the
+    // same condition are two chances to edit one and not the other.
+    const terminates_http = harness.tls_protocol == .http;
     harness.listener_configs = .{
         .{
             .bind_address = bindAddress(),
@@ -1043,6 +1056,18 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             // client's. Which cluster it points at follows the protocol:
             // an http terminator has to reach an origin that speaks HTTP.
             .routes = &harness.routes_tls,
+            // The same filter chain the plaintext http listener runs
+            // (#215). The claim termination rests on is that TLS is a
+            // phase ahead of the protocol and not a protocol of its own —
+            // the same render, the same filters, the same stamps — and a
+            // listener configured with no filters cannot test any of it:
+            // the response oracle these clients now run would be asking
+            // for a stamp the config never ordered. Only on the http
+            // draw, since filters on an l4 listener are a config error
+            // (`ListenerL4ResponseFilters`) and an l4 relay has no head to
+            // apply them to.
+            .request_filters = if (terminates_http) &harness.request_filters_http else &.{},
+            .response_filters = if (terminates_http) &harness.response_filters_http else &.{},
             // Both, across seeds. Termination is a phase ahead of the
             // protocol (§4), so the two combinations exercise genuinely
             // different code — the L4 relay's transform hooks against the
@@ -1984,34 +2009,70 @@ pub fn verify(harness: *Harness) !void {
 /// own statement that it got everything, and a client that then holds
 /// fewer bytes than it sent is a contradiction.
 ///
-/// Not conditioned on `clean`, deliberately. A TLS session costs several
-/// more virtual round trips than a plaintext one, so it can legitimately
-/// meet the scenario's end mid-echo on a seed where every plaintext
-/// client finished — that is the schedule being short, not the proxy
-/// being wrong, and an oracle that called it a truncation would fail
-/// honest runs.
+/// A proxied session's responses go through the plaintext population's
+/// own oracle (#215), which is the point: the argument for terminating
+/// in-process is that TLS is a phase ahead of the protocol and not a
+/// protocol of its own — the same render, the same filters, the same
+/// stamps — and an unexamined response is exactly what leaves that claim
+/// untested. It was untested: the #178 sticky stamp shipped 0.2.0
+/// omitting `Secure` on terminated connections and `zig build ci` passed
+/// identically either side, because all this asked was that the bytes
+/// started with "HTTP/1.1 ".
+///
+/// Not conditioned on `clean`, deliberately, and that is where this stops
+/// short of the plaintext oracle. A TLS session costs several more
+/// virtual round trips than a plaintext one, so it can legitimately meet
+/// the scenario's end mid-exchange on a seed where every plaintext client
+/// finished — that is the schedule being short, not the proxy being
+/// wrong, and an oracle demanding the golden *count* would fail honest
+/// runs. What is demanded is everything that does not depend on how far
+/// the schedule got: every complete response parses, carries an allowed
+/// status, a canonical body, the #175 stamp its render owes and the #178
+/// stamp its cluster owes, and no surplus response beyond the pair.
+///
+/// Mutation-checked rather than assumed, both directions:
+///
+///   - Restoring the pre-#125 stamp — no `Secure` on a terminated
+///     connection, with the assert that shipped beside it — fails seeds
+///     61, 129, 176, 295 and 501 of the first 512. That is the 0.2.0 bug,
+///     and this oracle is what would have caught it.
+///   - Taking the response filters back off the tls listener fails ~10%
+///     of the first 512 on `ResponseEditMissing`, which is how the
+///     listener's own filter chain is held to running at all.
+///
+/// A violation surfaces under the plaintext oracle's own error name.
+/// Which population raised it is not in the name, and does not need to
+/// be: the plaintext clients verify first, so an error arriving from here
+/// is one their transcripts did not have.
 fn verifyTlsSessions(harness: *Harness) !void {
     if (harness.tls_clients == 0) return;
+    assert(harness.tls_clients_live <= harness.tls_clients_storage.len);
     var closed_count: u8 = 0;
     for (harness.tls_clients_storage[0..harness.tls_clients_live], 0..) |*client, index| {
         const back = client.app_received[0..client.app_received_len];
         if (harness.tls_protocol == .http) {
-            // A proxied session gets a response, not its own bytes back.
-            // What is checkable without restating the L7 oracle is that
-            // anything which arrived is a *response* — an origin's answer
-            // relayed through the transform, not the request echoing back
-            // or another session's plaintext.
-            if (back.len >= 1 and !std.mem.startsWith(u8, back, "HTTP/1.1 ")) {
-                return error.TlsResponseCorrupted;
-            }
+            // The spec the walk judges by describes the pair this
+            // population sends, so what went out cannot exceed it — the
+            // check that catches the two drifting apart, since a wider
+            // send would be judged against a transcript that never
+            // mentions it.
+            assert(client.requestsSent() <= l7.scripts.terminating_pair.expected_responses);
+            const walk = HttpClient.walkResponses(
+                back,
+                l7.scripts.terminating_pair,
+                .{ .sticky = harness.sticky_http, .terminated = true },
+            );
+            if (walk.violation) |violation| return violation;
             // #204: never more answers than questions. The framing rule
-            // the client now ends its exchanges on is what lets it count
-            // them at all, and a count that ran ahead of what it asked
-            // for would mean the transform delivered a response this
-            // session never earned — another connection's, or one
-            // duplicated across the head source's turnaround. Sound on
-            // every seed, since a short schedule can only leave the
-            // count *behind*.
+            // the client ends its exchanges on is what lets it count them
+            // at all, and a count that ran ahead of what it asked for
+            // would mean the transform delivered a response this session
+            // never earned — another connection's, or one duplicated
+            // across the head source's turnaround. Sound on every seed,
+            // since a short schedule can only leave the count *behind*.
+            // Kept beside the walk rather than folded into it: the walk
+            // bounds responses by the transcript, this bounds them by
+            // what this session actually sent.
             if (client.responsesReceived() > client.requestsSent()) {
                 return error.TlsResponseCountDiverged;
             }
