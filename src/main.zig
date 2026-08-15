@@ -649,6 +649,21 @@ fn installSignalHandlers() void {
     std.posix.sigaction(.INT, &action, null);
     std.posix.sigaction(.USR1, &action, null);
     std.posix.sigaction(.HUP, &action, null);
+    // §8's drain watchdog (#226). Unlike the four above, this one never
+    // reaches the loop: every other bound in the proxy is an op the loop
+    // delivers, which makes them all blind to a backend that has stopped
+    // delivering — including `onDrainStuck`, the backstop for exactly
+    // that. SIGALRM arrives from the kernel regardless, and its handler
+    // exits without asking the loop anything.
+    const alarm_action = std.posix.Sigaction{
+        .handler = .{ .handler = onAlarm },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.ALRM, &alarm_action, null);
+    // Only now may anything arm one: the seam refuses to raise a signal
+    // whose default action would kill this process silently.
+    XevIo.alarmHandlerInstalled();
     // A proxy must not die because something downstream of it went away.
     // The access log writes to a pipe the operator owns (§8), and a `write`
     // to a pipe with no reader raises SIGPIPE, whose default action is to
@@ -664,6 +679,18 @@ fn installSignalHandlers() void {
         .flags = 0,
     };
     std.posix.sigaction(.PIPE, &ignore, null);
+}
+
+/// Async-signal-safe by delegation: the seam's handler is one `write` and
+/// one `_exit` (§4). Nothing here reads process state, because reaching
+/// this means the loop that owns it may be wedged — and nothing here
+/// asserts, for the reason `onRawSignal` does not either: `assert` panics,
+/// and the panic path locks stdio and captures a stack trace, none of
+/// which a signal handler may do. A signal this is not installed for is
+/// dropped the same way that one drops it.
+fn onAlarm(signal_number: std.posix.SIG) callconv(.c) void {
+    if (signal_number != .ALRM) return;
+    XevIo.onAlarmFromHandler();
 }
 
 /// Async-signal-safe: delegates to the seam's atomic-mask + eventfd wake

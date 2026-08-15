@@ -1690,36 +1690,29 @@ fn giveUpCanExist(harness: *const Harness) bool {
     return harness.config.drain_deadline_ms != 0;
 }
 
-/// One kind out of those armed at this wind-down, or null when the
-/// wind-down holds nothing but timers — the one kind left out below.
+/// One kind out of those armed at this wind-down, or null when nothing
+/// strandable is armed at all.
 ///
-/// `timer` is left out because stranding one is the shape the §8 backstop
-/// provably cannot catch: `onDrainStuck` is itself a timer, so a seed that
-/// strands the drain deadline strands the thing that would have reported
-/// it, and the run ends in `SimIo`'s deadlock rather than in a diagnostic.
-/// Found by drawing it — seed 2302, three dropped timers and nothing else
-/// pending. That is a true statement about the backstop's reach and not a
-/// defect this sweep can hold the proxy to, so it is recorded here and
-/// pinned by a directed test (`src/io/contract_test.zig`) instead, which
-/// is the form that breaks loudly if it ever stops being true. Covering it
-/// for real needs a watchdog that is not a timer: a design question, not a
-/// gate.
+/// Nothing is excluded any more, and `timer` leaving the exclusion list is
+/// what #226 bought. Stranding one used to be the shape §8's backstop
+/// provably could not catch — `onDrainStuck` was itself a timer, so a seed
+/// that stranded the drain deadline stranded the thing that would have
+/// reported it, and the run ended in `SimIo`'s deadlock with no diagnostic
+/// at all. The watchdog under it is not an op (`alarmStart`), so it fires
+/// whether or not the backend is still delivering, and the same seeds now
+/// end in a give-up that says so.
 ///
-/// Nothing else is left out, including `close` — the one kind measured at
-/// zero wind-downs in 4096 seeds. Naming it as an exclusion would be a
-/// census baked into the code, going stale the first time the admin plane
-/// (`submitClose`, the sole `io.close` caller) is still closing its scrape
-/// when a drain begins. Asking the pending table instead spends nothing on
-/// a kind that is not there and picks one up the run it appears. Its
-/// absence is a property of the teardown path rather than an accident:
-/// `continueTeardown` waits for `armedCount()` to reach zero and closes
-/// *synchronously*, so a connection never has a close to take away — which
-/// costs this hook nothing, since every conn-armed kind it can strand
-/// already leaves a slot that cannot be released.
+/// `close` is here for a different reason and was never an exclusion: it
+/// is simply not armed at a wind-down on any measured run, and an
+/// armed-set pick spends nothing on a kind that is not there. Its absence
+/// is a property of the teardown path — `continueTeardown` waits for
+/// `armedCount()` to reach zero and closes *synchronously*, so a
+/// connection never has a close to take away — and the admin plane's
+/// `submitClose` is the only `io.close` in the proxy.
 ///
 /// Drawn from the scenario stream at the wind-down, so it consumes nothing
-/// on the fifteen in sixteen seeds that strand nothing and leaves their
-/// stream position — and with it the whole sweep's coverage — where it was.
+/// on the seeds that strand nothing and leaves their stream position — and
+/// with it the whole sweep's coverage — where it was.
 fn drawStrandKind(harness: *Harness) ?SimIo.OpKind {
     // Adding a kind here needs a matching arm in `strandCanExplainStuck`,
     // which lists `timer` and `none` as `unreachable`: without one the new
@@ -1733,6 +1726,7 @@ fn drawStrandKind(harness: *Harness) ?SimIo.OpKind {
         .send,
         .close,
         .log_write,
+        .timer,
         .timer_cancel,
         .connect_cancel,
     };
@@ -1768,7 +1762,10 @@ fn drawStrandKind(harness: *Harness) ?SimIo.OpKind {
 /// `pending_ops_live` is passed in rather than asked here because it has
 /// to be read before `verify` closes the harness's own sockets.
 fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void {
-    if (code != ServerSim.drain_stuck_exit_code) return error.UnexpectedAbort;
+    const watchdog = code == ServerSim.drain_watchdog_exit_code;
+    if (code != ServerSim.drain_stuck_exit_code and !watchdog) {
+        return error.UnexpectedAbort;
+    }
     // Only a seed that stranded something is excused. Without this, the
     // branch would accept any stuck drain as "#206 working as intended" —
     // including one a future release bug produced with every op
@@ -1782,7 +1779,29 @@ fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void
     // stale-handle assert every delivered op passes through. #206 asked
     // for this oracle by name.
     if (!pending_ops_live) return error.SlotReleasedUnderPendingOp;
+    if (watchdog) return harness.verifyWatchdogGaveUp();
     if (!harness.strandCanExplainStuck()) return error.StrandCannotExplainStuck;
+}
+
+/// What the #226 watchdog owes when it is the thing that gave up.
+///
+/// Not `strandCanExplainStuck`: that oracle asks which plane the drain was
+/// waiting on, and reaching this code means nobody was in a position to
+/// ask. The loop stopped delivering, so the planes' states are whatever
+/// the schedule left them as, and demanding one be stuck would be
+/// demanding the wedged process have finished thinking.
+///
+/// What is demanded instead is that the give-up was the watchdog's — the
+/// alarm actually fired, rather than some other path exiting with its
+/// code — and that only a stranded *timer* can reach it. That second one
+/// is the layering, stated where it breaks: every other kind leaves the
+/// drain's own deadline delivering, so `onDrainStuck` fires at the grace
+/// and reports the plane, five virtual seconds before the watchdog would.
+/// A watchdog fire on any other kind means the informative layer stayed
+/// silent when it could have spoken.
+fn verifyWatchdogGaveUp(harness: *const Harness) !void {
+    if (!harness.io.alarmFired()) return error.WatchdogCodeWithoutWatchdog;
+    if (harness.strandedKind() != .timer) return error.WatchdogBeatTheReporter;
 }
 
 /// What this seed actually stranded, by whichever hook took it, or null
@@ -1849,9 +1868,10 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
         .connect => conns_stuck or health_stuck,
         // A listener's accept feeds admission and the admin plane.
         .accept => conns_stuck or admin_stuck,
-        // A timer cancel belongs to a conn's deadline, the prober's own
-        // pacing timer, or the admin plane's scrape deadline.
-        .timer_cancel => conns_stuck or admin_stuck or health_stuck,
+        // Timers, and the cancels that chase them, belong to a conn's
+        // deadline, the prober's pacing or the admin plane's scrape. The
+        // access log arms none, which is why it is absent from both.
+        .timer, .timer_cancel => conns_stuck or admin_stuck or health_stuck,
         // Only the first two of those three dial, so only they can have a
         // connect to cancel.
         .connect_cancel => conns_stuck or health_stuck,
@@ -1866,7 +1886,7 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
         // defaulted: adding one there without giving it an arm here panics
         // every seed that strands it, and a named arm is what makes that
         // obvious to whoever adds the next kind.
-        .none, .timer => unreachable,
+        .none => unreachable,
     };
 }
 

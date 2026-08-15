@@ -310,17 +310,13 @@ connection teardowns never get a look in. The third strands on fewer runs
 precisely because those are gone by the time it arms, which is the point.
 It arms at both drain entries, since a seed that drains mid-scenario
 tears its connections down there.
-`timer` is the one kind still excluded, and it is the finding worth
-carrying: **`onDrainStuck` cannot catch a stranded timer, because it is
-one.** A seed that strands the drain deadline strands the thing that
-would have reported it, and the run ends in the simulator's own deadlock
-with no diagnostic at all — seed 2302, three dropped timers and nothing
-else pending. That is a true statement about the reach of #203's fix
-rather than a defect this sweep can hold the proxy to, so the kind is
-excluded and the case pinned by a directed test in `contract_test.zig`
-instead — the form that breaks loudly if it ever stops being true, where
-a comment would not. Covering it for real would need a watchdog that is
-not a timer, which is a design question and not a gate.
+`timer` was the one kind excluded, and the finding it carried —
+**`onDrainStuck` cannot catch a stranded timer, because it is one** — is
+what #226 went on to fix. A seed that stranded the drain deadline stranded
+the thing that would have reported it, and the run ended in the
+simulator's own deadlock with no diagnostic at all. It is back in the
+draw: see the watchdog section below for why, and for the two seeds per
+4096 that used to fail with `error.Deadlock` and now report.
 
 A trap worth naming while it is fresh: what a given seed strands is not
 stable across edits to this machinery. It was already true when the draw
@@ -376,6 +372,61 @@ apiece, while the verdict here is `abortedWith` and not the wording. That
 switch exists because stderr from a *passing* build step makes Zig's
 build runner print `failed command:` under a build that exited zero —
 which cost three runs to diagnose the first time.
+
+### A watchdog that is not a timer (#226)
+
+Every bound in this proxy was an op. `timerStart` submits one and the loop
+delivers it — which makes all of them blind to a backend that has stopped
+delivering, including the two the drain relies on. `onDrainStuck` is a
+timer, so the process it exists to diagnose is exactly the process that
+cannot run it.
+
+**libxev cannot answer this with a bounded wait.** Its `RunMode` is
+`no_wait | once | until_done`, and `tick(1)` blocks until at least one
+completion; there is no timeout on the wait. Adding one means changing the
+audited fork and moving the pin, which is a re-audit for a backstop — so
+the bounded-wait sketch #226 opened with is priced out rather than wrong.
+
+What ships is `alarm(2)`. The kernel raises SIGALRM whatever this process
+is doing, and the handler writes one line and `_exit`s — no loop, no
+completion, no allocation, two async-signal-safe calls. It is the second
+function in the codebase legal to call from a sigaction handler, and the
+pair differ in the one way that matters: `notifySignalFromHandler` hands
+the signal to the loop, `onAlarmFromHandler` gives up on the loop.
+
+Coarse — whole seconds — which is right for a backstop measured in them.
+The informative report still belongs to `onDrainStuck`: a handler cannot
+walk connection state safely, so all this line can honestly say is that
+nobody said anything. It waits five seconds past the point that report
+would have come, so a live loop always wins the race.
+
+**The exit codes are distinct on purpose.** `4` is "the drain could not
+finish, and here is the plane that held it". `5` is "the loop stopped
+answering". An operator reading a status with no output has only that to
+go on.
+
+**Armed at `beginDrain`, not beside `onDrainStuck`.** The stuck timer is
+started *by* the deadline timer, so arming the watchdog there would make
+it depend on the delivery it is the backstop for. And only when a deadline
+is configured, for #220's reason in the other direction: a
+`drain_deadline_ms` of `0` asked for an uncapped drain, and a watchdog
+that killed it anyway would be overruling a configuration rather than
+backstopping it.
+
+**The simulator models it as a deadline, not an op** — `alarm_at_ns`,
+checked by the run loop and folded into `earliestWakeNs`, so a schedule
+that has stranded every op still advances to it. That is the property, not
+a shortcut: a watchdog that rode the pending table would be the timer it
+replaces.
+
+Measured over a 4096-seed sweep with `.timer` back in the strand draw: 94
+runs strand a timer and still reach `onDrainStuck` (their drain deadline
+was armed after the strand landed, so it delivered), and 4 runs reach the
+watchdog instead — two seeds, 1754 and 2526, each run twice for the
+determinism check, whose mid-scenario drain had its deadline pending when
+the strand hit. Disarming the watchdog fails exactly
+those two with `error.Deadlock`, which is what the whole class looked like
+before this existed.
 
 ### Rotating from the seal (#202)
 

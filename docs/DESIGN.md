@@ -1527,6 +1527,39 @@ deadlines: `idle_ms` always, plus `request_ms` and `max_lifetime_ms` when
 configured, and the drain's `Connection: close` injection stops an idle
 keep-alive connection from waiting on a request that will never come.
 
+**Three layers under a drain that will not finish**, because the first two
+are ops and the failure they exist to report is a backend that has stopped
+delivering ops (#203, #226):
+
+1. `drain_deadline_ms` fires and tears down what is left. A timer.
+2. `onDrainStuck`, five seconds later, reports which plane is still
+   holding — the connection pool, the admin plane, the access log or the
+   prober — and exits **4**. Also a timer, so it is blind to exactly the
+   case where a torn-down connection's armed op never completes.
+3. The **watchdog**: `alarmStart` on the seam (§4), which is `alarm(2)`
+   and not a completion. The kernel raises SIGALRM whatever this process
+   is doing; the handler writes one line and `_exit`s **5**. Five seconds
+   past layer 2, so a loop that is alive always gets to say the useful
+   thing first.
+
+The exit codes are distinct because the two failures are: **4** means the
+drain could not finish and the process named what held it, **5** means the
+loop stopped answering and nothing could be said at all. Layer 3 arms only
+when a deadline is configured — a `drain_deadline_ms` of `0` asked for an
+uncapped drain, and killing that process after a bound it never named
+would be overruling a configuration rather than backstopping it.
+
+Layer 3's five seconds are absolute, so a deployment whose platform kills
+sooner — a `terminationGracePeriodSeconds` of 10 against a drain deadline
+of a few seconds — may never see it. That is the right trade: the layer
+worth waiting for is 2, which names the plane, and a platform that
+SIGKILLs is itself an answer. The watchdog is for the case where nothing
+else will ever come.
+
+The simulator models the alarm as a deadline its run loop checks directly
+rather than a pending op, which is what lets §9 strand every timer a
+schedule has and still demand a diagnostic instead of a hang.
+
 ## 9. Testing — required from day 0
 
 The deterministic-simulation seam is the single highest-leverage testing
