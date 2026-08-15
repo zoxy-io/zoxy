@@ -86,10 +86,21 @@ pub const page_content_type = "text/plain";
 /// 502 or teardown, never a crash.
 pub const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ ("p" ** 8162) ++ "\r\n\r\n";
 
+/// The `101` a WebSocket origin answers an upgrade request with (#180).
+/// Carries the participating pair the proxy must let travel: strip
+/// either and the client is told it succeeded without being told to
+/// what, which is exactly what §7's hop-by-hop exemption exists to stop.
+pub const switching_response = "HTTP/1.1 101 Switching Protocols\r\n" ++
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+
 comptime {
     assert(sticky_tag.len == 16);
     assert(sized_body.len == 32);
     assert(chunked_wire[0] == '1' and chunked_wire[1] == '0');
     assert(chunked_wire.len == 4 + 16 + 2 + 5);
     assert(oversize_head.len == 8190);
+    // The handshake answer must carry both halves of the pair, or the
+    // scenario would pass while proving nothing about the exemption.
+    assert(std.mem.indexOf(u8, switching_response, "Upgrade: websocket") != null);
+    assert(std.mem.indexOf(u8, switching_response, "Connection: Upgrade") != null);
 }

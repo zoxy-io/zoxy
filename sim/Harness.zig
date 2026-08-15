@@ -198,6 +198,11 @@ sticky_http: bool,
 /// The #181 dial-retry budget on the http cluster; zero on the seeds
 /// that carry no second endpoint, which is most of them.
 retries_http: u16,
+/// The seed allows the #180 upgrade token on its http listener, and has
+/// a tunnel pool to carry it. Off on most seeds, so the handshake script
+/// keeps proving the `501` every config had before the feature.
+upgrades_http: bool,
+tunnels: u32,
 /// Decided before `io.init` (the ring the sim registers must equal the
 /// limit the server accounts against — Server.init asserts the match),
 /// consumed by `startServerAndOrigins` for the rest of the pool shape.
@@ -602,10 +607,38 @@ fn deriveRetries(harness: *Harness, random: std.Random) void {
     assert(harness.retries_http <= zoxy.constants.cluster_retries_max);
 }
 
+/// The #180 draw: a third of seeds allow the WebSocket token and size a
+/// tunnel pool for it. The rest keep the `501` — which is not merely the
+/// absence of coverage but the other half of the gate, and the shape
+/// every config written before the feature still has.
+///
+/// A clean seed's pool is wide enough that no handshake can be shed,
+/// because its oracle demands an exact transcript and a `503` is not the
+/// answer its script asked for — the same reason `deriveMaxInflight`
+/// caps only under the adversary. An adversarial seed draws a pool small
+/// enough to run out, which is what reaches the §8 tunnel rung.
+fn deriveUpgrades(harness: *Harness, random: std.Random) void {
+    if (random.uintLessThan(u8, 3) != 0) {
+        harness.upgrades_http = false;
+        harness.tunnels = 0;
+        return;
+    }
+    harness.upgrades_http = true;
+    // One tunnel under the adversary, so two concurrent handshakes
+    // collide and the §8 rung is reached by ordinary scheduling rather
+    // than by a rare coincidence. A clean seed gets room for every
+    // client instead: its oracle demands an exact transcript, and a
+    // `503` is not the answer its script asked for.
+    harness.tunnels = if (harness.clean) clients_max else 1;
+    assert(harness.tunnels >= 1);
+    assert(harness.tunnels <= clients_max);
+}
+
 fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.endpoints_l4 = .{originAddress()};
     harness.endpoints_http = .{ httpOriginAddress(), httpOriginAddress() };
     deriveRetries(harness, random);
+    deriveUpgrades(harness, random);
     // Each cluster draws its pick policy independently so mixed configs
     // (one cluster each way) flow through the balancer under the schedule
     // fuzz, not just the uniform pairings. Single-endpoint clusters
@@ -1176,6 +1209,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .response_filters = &harness.response_filters_http,
             .protocol = .http,
             .forwarded = forwarded,
+            .upgrades = .{ .websocket = harness.upgrades_http },
         },
         .{
             .bind_address = tlsBindAddress(),
@@ -1262,6 +1296,14 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             .relay_buffers = 1,
             .upstream_slots = 1,
             .head_buffers = harness.head_buffers,
+            // Clamped, because a starved seed's slot count is drawn from
+            // the ring and can sit below the pool the upgrade draw asked
+            // for — and a tunnel is an accepted connection, so a pool
+            // wider than the slots that hold one cannot exist (§5). A
+            // clamp to zero is legal here and means every handshake on
+            // this seed meets the tunnel rung, which is coverage rather
+            // than a loss.
+            .tunnels = @min(harness.tunnels, harness.head_buffers),
             // Capacity 1: the first render engages the pressure flag, so
             // the engage counter stays reachable even though the shed
             // rung itself is relay-shadowed (see sim/main.zig uncovered).
@@ -1271,6 +1313,7 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
         }
     else
         .{
+            .tunnels = harness.tunnels,
             .access_log_buffer_bytes = access_log_buffer_bytes,
             // Clean seeds size every pool so its §8 pressure
             // watermark (ceil of 3/4 capacity: 9 of 12) sits above
@@ -1378,11 +1421,22 @@ fn populateClients(harness: *Harness, random: std.Random) void {
         if (random.boolean()) {
             const client = &harness.l7_clients[harness.l7_count];
             harness.l7_count += 1;
+            // A seed that enables upgrades puts its first two http
+            // clients on the handshake, rather than waiting for a
+            // uniform draw over every script to produce one. It raises
+            // the odds rather than guaranteeing them — the client count
+            // and the per-slot coin still decide how many http clients a
+            // seed has — but it is what makes two concurrent handshakes,
+            // and so the §8 tunnel rung, ordinary across a sweep instead
+            // of a coincidence. Every other client still draws freely,
+            // so the population keeps its shape.
+            const forced_upgrade = harness.upgrades_http and harness.l7_count < 2;
             client.prepare(
                 &harness.io,
                 httpBindAddress(),
-                random.enumValue(l7.Script),
+                if (forced_upgrade) .upgrade_request else random.enumValue(l7.Script),
                 harness.clean,
+                harness.upgrades_http,
                 harness.sticky_http,
             );
             client.on_ended = clientEndedHook;
@@ -2468,6 +2522,19 @@ fn tallyAccessLog(sink: []const u8) !LineTally {
             continue;
         }
         tally.http += 1;
+        // A tunnel's line is already explained by `tunnels_established`
+        // (#180), so it must not also be counted as an unexplained
+        // abort. Its outcome legitimately goes both ways — `closed` when
+        // both halves said goodbye, `aborted` when a drain or a peer cut
+        // it — because after `101` this connection ends the way an L4
+        // relay ends, not the way an exchange does. Never `ok`: only
+        // `finishExchange` sets that, and a tunnel never returns there.
+        // The status is what identifies it: `101` is the one status no
+        // ordinary exchange can carry, since the proxy answers it only
+        // for a tunnel that its client provably received.
+        if (std.mem.indexOf(u8, line, "\"status\":101") != null) {
+            continue;
+        }
         if (std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null) {
             tally.http_aborted += 1;
         }
@@ -2497,6 +2564,15 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_responded",
         "l7_shed_relay_buffers",
         "l7_shed_tunnels",
+        // A tunnel is an *answered* exchange like any other here (#180):
+        // the client asked for an upgrade and got its `101`. It is the
+        // one member that reaches neither `respond` nor `finishExchange`
+        // — its line is written at close by the ordinary teardown path —
+        // which is why the sum's own description above names two paths
+        // and this needs a third. Leaving it out makes the line
+        // unexplained, exactly what this identity caught on the first
+        // seed to carry one.
+        "tunnels_established",
         "l7_shed_upstream_slots",
         "l7_shed_endpoint_inflight",
         "l7_bad_gateway",

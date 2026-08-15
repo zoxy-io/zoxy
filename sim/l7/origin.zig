@@ -257,6 +257,20 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     conn.close();
                     return false;
                 };
+                // A forwarded `Upgrade` means the proxy agreed to carry a
+                // handshake (#180), so answer it the way an origin that
+                // speaks the protocol would: `101`, and then the bytes
+                // are opaque — no further request will ever parse out of
+                // this connection, so it drains from here.
+                //
+                // Decided from the request rather than from a drawn mode,
+                // because that is what a real origin does and because it
+                // keeps a clean seed deterministic: the same request gets
+                // the same answer whatever the schedule.
+                if (parser.headerValue(request.headers, "upgrade") != null) {
+                    conn.response_bytes = canon.switching_response;
+                    conn.drain_only = true;
+                }
                 // §7 canonical forwarding: the proxy sends the canonical
                 // path the router matched on, so what the origin receives
                 // must already be canonical — re-canonicalizing is a no-op.
