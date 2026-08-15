@@ -502,6 +502,10 @@ const Http1Bed = struct {
         /// default, which is the shape every pre-#180 config has.
         upgrades: config_module.Config.Listener.Upgrades = .{},
         tunnels: u32 = 0,
+        /// The §8 drain deadline. The bed's default is a real one; a
+        /// tunnel scenario needs the zero case, which is production's
+        /// default and the one #180 had to answer for.
+        drain_deadline_ms: u32 = 1000,
         /// Put an endpoint nothing listens on *ahead* of the origin, so
         /// the first pick of an `rr` cluster is always the one that
         /// refuses and the retry is the only way to reach the origin.
@@ -633,7 +637,7 @@ const Http1Bed = struct {
             .clusters = &bed.clusters,
             .connect_timeout_ms = connect_timeout_ms,
             .idle_timeout_ms = idle_timeout_ms,
-            .drain_deadline_ms = 1000,
+            .drain_deadline_ms = options.drain_deadline_ms,
             .max_lifetime_ms = options.max_lifetime_ms,
             .request_timeout_ms = options.request_timeout_ms,
             .tunnel_timeout_ms = constants.tunnel_ms_default,
@@ -4850,5 +4854,40 @@ test "l7: an origin that declines an upgrade gives the tunnel back" {
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_tunnels"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tunnels_established"));
     try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
+}
+
+test "l7: a drain with no deadline still ends, because tunnels are cut" {
+    // The trap #180 had to answer (§8). `drain_deadline_ms: 0` means
+    // "wait for the last connection", and a tunnel has no message
+    // boundary to be the last thing it does — so without this bound one
+    // idle session holds the process open until the supervisor's SIGKILL,
+    // turning a millisecond drain into every rolling restart waiting out
+    // TimeoutStopSec. Not an invariant breach, which is why it needed
+    // stating: a zero deadline always said the supervisor owns the upper
+    // bound, and it still does for every other connection.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 205,
+        .origin_response = "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        .upgrades = .{ .websocket = true },
+        .tunnels = 1,
+        .drain_deadline_ms = 0,
+    });
+    defer bed.tearDown();
+
+    // The tunnel is established and then simply sits there, exactly as an
+    // idle WebSocket does; the drain arrives with it live.
+    bed.client.drain_on_finish = false;
+    bed.armDrainTimer(50);
+    try bed.exchange("GET /ws HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tunnels_established"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tunnels_drained"));
+    // The line the drain's own counter cannot say: the loop actually
+    // stopped, with every pool given back (§9's leak invariant).
+    try std.testing.expect(bed.server.isIdle());
     try bed.expectDrained();
 }

@@ -658,6 +658,21 @@ pub const tunnel_ms_default: u32 = 60 * 60 * 1000;
 /// thing that model cannot absorb.
 pub const tunnel_ms_min: u32 = 1000;
 
+/// How long a drain carries live tunnels when `drain_deadline_ms` is `0`
+/// (#180, §8). Five seconds, matching the drain ladder's other steps.
+///
+/// It exists because a zero deadline means "wait for the last
+/// connection", and a tunnel has no message boundary to finish at — one
+/// idle WebSocket would hold the drain open until the supervisor's
+/// SIGKILL, turning a millisecond drain into every rolling restart
+/// waiting out `TimeoutStopSec`. A constant rather than a config key
+/// deliberately: the alternative asks every operator to answer a
+/// question raised entirely by a feature they may not use, and
+/// `drain_deadline_ms` keeps its exact present meaning for every other
+/// connection. When a deadline *is* configured it governs tunnels like
+/// anything else and this is never armed.
+pub const tunnel_drain_ms: u32 = 5000;
+
 /// Default `timeouts.connect_ms`: the per-try upstream dial budget when
 /// the config omits it (§5). Five seconds is the conventional figure — an
 /// order below nginx's 60 s `proxy_connect_timeout`, which is a read
@@ -1210,6 +1225,10 @@ comptime {
     assert(tunnel_ms_default >= tunnel_ms_min);
     assert(tunnel_ms_max > tunnel_ms_default);
     assert(tunnel_ms_max >= timeout_ms_max);
+    // The tunnel drain bound must be a real wait and must not itself be
+    // the thing that makes a drain slow.
+    assert(tunnel_drain_ms >= 1);
+    assert(tunnel_drain_ms <= timeout_ms_max);
     assert(cluster_retries_max >= 1);
     assert(cluster_retries_max < std.math.maxInt(u16));
     // The health prober's reservations and thresholds (§7): the op budget

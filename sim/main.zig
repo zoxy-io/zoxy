@@ -275,6 +275,16 @@ const uncovered = [_]Uncovered{
             "the handshake",
     },
     .{
+        .name = "tunnels_drained",
+        .why = .unreached,
+        .reason = "the third of #180's counters, unreachable for the same one " ++
+            "reason as the two above: no seed allows an upgrade, so no " ++
+            "scenario has a tunnel for a drain to cut. All three retire " ++
+            "together when the harness learns to script one; " ++
+            "src/http_proxy_test.zig drains a live tunnel under a zero " ++
+            "drain_deadline_ms directly",
+    },
+    .{
         .name = "l7_shed_upstream_head_buffers",
         .why = .unreached,
         .reason = "same shadow as l7_shed_upstream_slots: the relay rung " ++
