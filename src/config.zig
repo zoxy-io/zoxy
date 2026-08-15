@@ -32,6 +32,20 @@ pub const Config = struct {
     /// where zero is legal (an unbounded connection age), so it is optional
     /// in the JSON and defaults off.
     max_lifetime_ms: u32,
+    /// Budget for reading one request head (§8, #235): from the client's
+    /// first byte to a complete head, which is a slowloris's whole window.
+    /// Distinct from `idle_timeout_ms`, which bounds a *quiet* connection
+    /// — the two want opposite values, and one number serving both meant
+    /// the head-read budget inherited whatever the keep-alive window was
+    /// tuned to. Rebased down from the idle deadline at the first byte,
+    /// and down again to `connect_timeout_ms` at the dial.
+    ///
+    /// No struct default, on the same terms as `request_timeout_ms`: the
+    /// loader *derives* one from this config's own neighbours, and a flat
+    /// fallback here would hand a hand-built config a ten-second head
+    /// budget beside a millisecond idle window — the very inversion the
+    /// loader refuses, and one nothing else would notice.
+    head_timeout_ms: u32,
     /// Cap on one L7 exchange, from the moment a request head is routed to
     /// the last response byte (§8). Unlike the idle timeout it is *not*
     /// refreshed by activity, so it bounds a request that is progressing
@@ -754,6 +768,7 @@ pub fn parseWithFiles(
         .idle_timeout_ms = parsed.timeouts.idle_ms,
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
+        .head_timeout_ms = resolveHeadTimeout(&parsed.timeouts),
         .request_timeout_ms = parsed.timeouts.request_ms,
         .tunnel_timeout_ms = parsed.timeouts.tunnel_ms,
         .health_interval_ms = parsed.timeouts.health_interval_ms,
@@ -2496,6 +2511,10 @@ pub const TimeoutsJson = struct {
     /// because a request deadline is a policy an operator sets against
     /// their own origin's latency, not a value zoxy can pick for them.
     request_ms: u32 = 0,
+    /// Optional #235 head-read budget. Absent is *derived* rather than
+    /// fixed — see `resolveHeadTimeout`, which is what keeps every config
+    /// written before this field behaving exactly as it did.
+    head_ms: ?u32 = null,
     /// Optional #180 tunnel lifetime; absent means an hour. Unlike the
     /// two caps above, zero is rejected — a tunnel pins a dedicated pool
     /// slot, so "no cap" is the one answer §5 cannot carry.
@@ -2525,6 +2544,12 @@ pub const TimeoutsJson = struct {
         .max_lifetime_ms = .{
             .desc = "Absolute connection-age cap; 0 disables it.",
             .minimum = 0,
+            .maximum = constants.timeout_ms_max,
+        },
+        .head_ms = .{
+            .desc = "Budget for reading one request head — a slowloris's window. " ++
+                "Must exceed connect_ms and not exceed idle_ms.",
+            .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
         .tunnel_ms = .{
@@ -4017,6 +4042,66 @@ fn validateTunnelTimeout(tunnel_ms: u32) ValidationError!void {
     assert(tunnel_ms <= constants.tunnel_ms_max);
 }
 
+/// The #235 head-read budget when the config names none.
+///
+/// Derived rather than fixed, and that is what keeps every config written
+/// before this field existed behaving exactly as it did. A flat ten
+/// seconds would break two shapes: a config whose whole `idle_ms` is
+/// smaller than the default (the head budget must never exceed the idle
+/// window it tightens), and — the one that would have been a silent
+/// regression rather than a load error — a config with a `connect_ms`
+/// *above* ten seconds, whose dial budget would quietly have been cut to
+/// the head budget, since the lazy timer cannot move later at the
+/// re-base. So the default is the ten seconds clamped into the band the
+/// two neighbours leave: strictly above the dial, at or below the idle.
+/// `connect_ms < idle_ms` is already enforced, so that band is never
+/// empty.
+fn defaultHeadMs(timeouts: *const TimeoutsJson) u32 {
+    assert(timeouts.connect_ms < timeouts.idle_ms);
+    const floored = @max(constants.head_ms_default, timeouts.connect_ms + 1);
+    const derived = @min(floored, timeouts.idle_ms);
+    assert(derived > timeouts.connect_ms);
+    assert(derived <= timeouts.idle_ms);
+    return derived;
+}
+
+/// The resolved head budget: what the config named, or the derived
+/// default. Plain `u32` rather than the usual resolver error union,
+/// because `validateHeadOrder` has already held both spellings to the
+/// same relations — there is no failure left for this to report, and a
+/// return type that claimed one would be the wider of two that fit.
+fn resolveHeadTimeout(timeouts: *const TimeoutsJson) u32 {
+    const head_ms = timeouts.head_ms orelse defaultHeadMs(timeouts);
+    assert(timeouts.connect_ms < head_ms);
+    assert(head_ms <= timeouts.idle_ms);
+    return head_ms;
+}
+
+/// The #235 head-read budget's two orderings, extracted for the length
+/// limit the way `validateTunnelTimeout` was.
+///
+/// Both exist for the reason `connect_ms < idle_ms` does: the single lazy
+/// timer only ever moves *earlier* once armed (§4). The first byte
+/// re-bases the idle deadline down to the head budget, and the dial
+/// re-bases the head budget down to the connect one — so a head budget
+/// above `idle_ms` would never take effect, and one at or below
+/// `connect_ms` would make the dial's re-base a lengthening the timer
+/// cannot honour, silently cutting the dial short. Rejected rather than
+/// clamped, like its sibling: a config that reads one way and behaves
+/// another is what these checks exist to prevent.
+fn validateHeadOrder(timeouts: *const TimeoutsJson) ValidationError!void {
+    const head_ms = timeouts.head_ms orelse defaultHeadMs(timeouts);
+    if (head_ms == 0 or head_ms > constants.timeout_ms_max) {
+        return error.TimeoutOverLimit;
+    }
+    if (timeouts.connect_ms >= head_ms) {
+        return error.TimeoutOrderInvalid;
+    }
+    if (head_ms > timeouts.idle_ms) {
+        return error.TimeoutOrderInvalid;
+    }
+}
+
 fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
     // Deadlines a zero would break rather than disable: a 0 ms connect or
     // idle budget reaps on arrival, and a 0 ms probe interval would probe
@@ -4066,12 +4151,33 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
     if (timeouts.connect_ms >= timeouts.idle_ms) {
         return error.TimeoutOrderInvalid;
     }
+    // The #235 head-read budget sits between the two, and both relations
+    // exist for the same reason as the one above: the single lazy timer
+    // never moves *later* once armed, only earlier. The first byte
+    // re-bases the idle deadline down to the head budget, and the dial
+    // re-bases the head budget down to the connect one — so a head budget
+    // above `idle_ms` would never take effect, and one at or below
+    // `connect_ms` would make the dial's re-base a lengthening the timer
+    // cannot honour. Rejected rather than clamped, like its sibling: a
+    // config that reads one way and behaves another is the failure this
+    // check exists to prevent.
+    try validateHeadOrder(timeouts);
     try validateTunnelTimeout(timeouts.tunnel_ms);
-    // Postconditions: reaching here means every bound a consumer reads
-    // without checking is in range, and every optional one is at most the
-    // ceiling — zero included, which each consumer reads as "off" — and the
-    // pair the deadline handoff depends on is ordered, which is what
-    // `Server.init` asserts of any config however it was built.
+    assertTimeoutsBounded(timeouts, &nonzero, &optional);
+}
+
+/// What reaching the end of `validateTimeouts` means, restated: every
+/// bound a consumer reads without checking is in range, every optional
+/// one is at most the ceiling — zero included, which each consumer reads
+/// as "off" — and the three relations the deadline handoff depends on are
+/// ordered. `Server.init` asserts those same relations of any config
+/// however it was built, which is what covers the configs the simulator
+/// and the tests hand-build past this loader entirely.
+fn assertTimeoutsBounded(
+    timeouts: *const TimeoutsJson,
+    nonzero: []const u32,
+    optional: []const u32,
+) void {
     for (nonzero) |value| {
         assert(value >= 1);
         assert(value <= constants.timeout_ms_max);
@@ -4080,6 +4186,9 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
         assert(value <= constants.timeout_ms_max);
     }
     assert(timeouts.connect_ms < timeouts.idle_ms);
+    const head_ms = resolveHeadTimeout(timeouts);
+    assert(timeouts.connect_ms < head_ms);
+    assert(head_ms <= timeouts.idle_ms);
     assert(timeouts.tunnel_ms >= constants.tunnel_ms_min);
     assert(timeouts.tunnel_ms <= constants.tunnel_ms_max);
 }
@@ -6903,4 +7012,73 @@ test "config: tunnel_ms defaults to an hour and has no off switch" {
         const parsed = try expectParseOk(&arena_state, head ++ ",\"tunnel_ms\":1000}}");
         try std.testing.expectEqual(constants.tunnel_ms_min, parsed.tunnel_timeout_ms);
     }
+}
+
+test "config: the head budget is derived from its neighbours, never fixed" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"drain_deadline_ms":1,
+    ;
+    const tail = "}}";
+    // The ordinary shape: the default lands as itself, an order of
+    // magnitude under the idle window it tightens (#235).
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"connect_ms\":5000,\"idle_ms\":60000" ++ tail,
+        );
+        try std.testing.expectEqual(constants.head_ms_default, parsed.head_timeout_ms);
+    }
+    // A config whose whole idle window is under the default keeps it: the
+    // head budget tightens the idle one, so it can never exceed it. This
+    // is most hand-written test configs, and every one of them predates
+    // the field.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"connect_ms\":1,\"idle_ms\":2" ++ tail,
+        );
+        try std.testing.expectEqual(@as(u32, 2), parsed.head_timeout_ms);
+    }
+    // The shape a flat default would have broken *silently*: a dial budget
+    // above the default. The head budget would have sat below it, and the
+    // lazy timer cannot lengthen at the re-base — so the dial would have
+    // been cut to ten seconds by a field the operator never set.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"connect_ms\":20000,\"idle_ms\":60000" ++ tail,
+        );
+        try std.testing.expect(parsed.head_timeout_ms > 20000);
+    }
+}
+
+test "config: head_ms must sit strictly above the dial and at or below the idle" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"drain_deadline_ms":1,"connect_ms":5000,"idle_ms":60000,"head_ms":
+    ;
+    const tail = "}}";
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "9000" ++ tail);
+        try std.testing.expectEqual(@as(u32, 9000), parsed.head_timeout_ms);
+    }
+    // Both inversions are rejected rather than clamped, on the same
+    // grounds as `connect_ms < idle_ms`: the single lazy timer only ever
+    // moves earlier, so either one would leave the wider value quietly in
+    // force and the config would behave differently than it reads.
+    try expectParseError(error.TimeoutOrderInvalid, head ++ "5000" ++ tail);
+    try expectParseError(error.TimeoutOrderInvalid, head ++ "4000" ++ tail);
+    try expectParseError(error.TimeoutOrderInvalid, head ++ "60001" ++ tail);
+    try expectParseError(error.TimeoutOverLimit, head ++ "0" ++ tail);
 }

@@ -504,6 +504,23 @@ pub const cluster_name_bytes_max: u16 = 64;
 /// not a share.
 pub const endpoint_weight_max: u16 = 256;
 
+/// Default budget for reading one request head (#235) — from the
+/// client's first byte to a complete head, which is exactly a slowloris's
+/// window (§7: "a slowloris meets the clock or `head_buffer_bytes`,
+/// whichever comes first").
+///
+/// Ten seconds, an order of magnitude under `idle_ms`, and the split is
+/// the point rather than the number. One value used to serve both this
+/// and the keep-alive idle window, and they want opposite things: a head
+/// read is a client mid-sentence, where nothing legitimate is slow, while
+/// an idle window is a healthy connection between requests, where short
+/// values churn the population into reconnects. With one knob an operator
+/// tunes the one whose cost is visible — the idle window — and the
+/// head-read budget silently inherits it. The conservative choice was the
+/// insecure one, which is the signature of a knob that should have been
+/// two.
+pub const head_ms_default: u32 = 10_000;
+
 /// Interim (`1xx`) responses one exchange may carry before the origin's
 /// final answer (#232). RFC 9110 puts no cap on them, and neither nginx
 /// nor HAProxy does — both loop while the status is `1xx` — but an origin
@@ -1242,6 +1259,14 @@ comptime {
     // An exchange must be allowed at least one interim, or the bound
     // would forbid the `100 Continue` the feature exists to carry.
     assert(interim_responses_max >= 1);
+    // The head-read budget sits between the dial budget and the idle
+    // window, and both relations are what the single lazy timer needs
+    // (§4): the dial re-bases the head deadline *down* to `connect_ms`,
+    // and the first byte re-bases the idle deadline *down* to this — a
+    // timer never moves later once armed, so an inversion either way
+    // would silently leave the wider value in force.
+    assert(connect_ms_default < head_ms_default);
+    assert(head_ms_default <= idle_ms_default);
     assert(cluster_retries_max >= 1);
     assert(cluster_retries_max < std.math.maxInt(u16));
     // The health prober's reservations and thresholds (§7): the op budget

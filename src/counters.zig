@@ -1473,6 +1473,7 @@ fn labeledTestConfig(clusters: []const config_module.Config.Cluster) config_modu
         .clusters = clusters,
         .connect_timeout_ms = 1,
         .idle_timeout_ms = 1,
+        .head_timeout_ms = 1,
         .drain_deadline_ms = 1,
         .max_lifetime_ms = 0,
         .request_timeout_ms = 0,

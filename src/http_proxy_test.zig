@@ -530,6 +530,8 @@ const Http1Bed = struct {
         /// tunnel scenario needs the zero case, which is production's
         /// default and the one #180 had to answer for.
         drain_deadline_ms: u32 = 1000,
+        /// The #235 head-read budget; absent mirrors the bed's idle window.
+        head_timeout_ms: ?u32 = null,
         /// Put an endpoint nothing listens on *ahead* of the origin, so
         /// the first pick of an `rr` cluster is always the one that
         /// refuses and the retry is the only way to reach the origin.
@@ -664,6 +666,10 @@ const Http1Bed = struct {
             .clusters = &bed.clusters,
             .connect_timeout_ms = connect_timeout_ms,
             .idle_timeout_ms = idle_timeout_ms,
+            // Mirrors the idle window unless a test is about the split
+            // (#235): the bed's timeouts are milliseconds, so a flat
+            // default would sit far above the window it must tighten.
+            .head_timeout_ms = options.head_timeout_ms orelse idle_timeout_ms,
             .drain_deadline_ms = options.drain_deadline_ms,
             .max_lifetime_ms = options.max_lifetime_ms,
             .request_timeout_ms = options.request_timeout_ms,
@@ -5068,5 +5074,62 @@ test "l7: an interim spends the free replay — the origin already spoke" {
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_replayed"));
     // One origin connection per client: the request was never sent twice.
     try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    try bed.expectDrained();
+}
+
+test "l7: a partial head is reaped at the head budget, not the idle window" {
+    // #235's whole point. One number used to serve both, and the one an
+    // operator tunes is the keep-alive window — its cost is the visible
+    // one — so the slowloris budget silently inherited it. Here the two
+    // are an order of magnitude apart, and the connection that goes quiet
+    // *mid-head* must meet the tighter of them.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 310,
+        .head_timeout_ms = 100,
+    });
+    defer bed.tearDown();
+
+    // A head that never finishes: the client sends a request line and a
+    // header, then nothing — no blank line, so the parse never completes.
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("GET /slow HTTP/1.1\r\nHost: o\r\n");
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+    // Reaped on the head budget. The idle window is 1000 ms, so anything
+    // near it would mean the split is not in force — which is exactly the
+    // state this fix found.
+    try std.testing.expect(elapsed_ms >= 100);
+    try std.testing.expect(elapsed_ms < 500);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try bed.expectDrained();
+}
+
+test "l7: an idle kept connection still gets the whole idle window" {
+    // The other half of the split, and the reason it is a split rather
+    // than a tightening: between requests a connection is quiet and
+    // healthy, and short values there churn the population into
+    // reconnects. The head budget must not reach it.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 311,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .head_timeout_ms = 100,
+    });
+    defer bed.tearDown();
+
+    // One exchange, then the client holds the connection open saying
+    // nothing. The turnaround stores the idle window, and no head byte
+    // has arrived to replace it with the tighter budget.
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\n\r\n");
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    // Past the head budget by a wide margin, and bounded above by the
+    // idle window it should actually meet: an idle connection is not a
+    // slowloris, and treating it as one is the churn the split avoids.
+    try std.testing.expect(elapsed_ms > 500);
+    try std.testing.expect(elapsed_ms < 2000);
     try bed.expectDrained();
 }

@@ -454,9 +454,25 @@ that sent the signal keeps the upper bound it already enforces with
 `SIGKILL`. Where a zero would break rather than disable — a 0 ms dial,
 idle, or probe interval — it stays rejected.
 
-One *ordering* is enforced alongside those zeroes, and it is the only
-cross-check between two configured values in the loader: `connect_ms`
-must sit strictly below `idle_ms`. A connection's first deadline is
+`head_ms` (#235) is the one field whose default is *derived* rather than
+borrowed or refused, and the reason is that its neighbours already fix
+the band it may sit in. Ten seconds is the figure — a head read is a
+client mid-sentence, where nothing legitimate is slow, and the window is
+exactly a slowloris's budget — but a flat ten seconds would break two
+shapes of existing config: one whose whole `idle_ms` is smaller, and one
+whose `connect_ms` is *larger*, whose dial budget would then be quietly
+cut to the head budget at the re-base. So the default is that figure
+clamped between the two, which is what lets the field arrive without
+changing any config that predates it. Splitting it out at all is the
+point: one value served both the head read and the keep-alive idle
+window, they want opposite figures, and the one an operator tunes is the
+idle window — so the slowloris budget silently inherited it, and the
+conservative choice was the insecure one.
+
+*Orderings* are enforced alongside those zeroes, and they are the only
+cross-checks between configured values in the loader: `connect_ms` must
+sit strictly below `head_ms`, which must sit at or below `idle_ms` — and
+so, transitively, strictly below `idle_ms` as before. A connection's first deadline is
 armed at the dial budget and the dial's completion re-stores it to the
 idle one, but the single lazy timer never moves *earlier* once armed
 (§4) — only the stored target does. So the reverse order does not

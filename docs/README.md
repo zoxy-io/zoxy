@@ -814,6 +814,7 @@ the other. Statuses are `200` plus the error set.
 ```json
 "timeouts": {
     "connect_ms": 5000,
+    "head_ms": 10000,
     "idle_ms": 60000,
     "drain_deadline_ms": 10000,
     "max_lifetime_ms": 0,
@@ -829,18 +830,23 @@ caps; for `connect_ms` and `idle_ms` it is rejected, since a zero-length
 dial or idle budget is a mistake rather than a policy.
 
 > [!WARNING]
-> `connect_ms` must be **strictly below** `idle_ms`, or the config is
-> rejected at load. A connection's first deadline is the dial budget and the
+> `connect_ms` must be **strictly below** `head_ms`, which must be at or
+> below `idle_ms`, or the config is rejected at load. A connection's first deadline is the dial budget and the
 > dial's completion re-stores it to the idle one, but zoxy's single timer per
 > connection never moves earlier once armed — so an idle budget that does not
 > exceed the dial budget would not take effect at the handoff and would reap
 > late instead. This bites when only *one* field is tuned: raising
 > `connect_ms` past the default 60 s `idle_ms` is rejected just the same.
+> The same reasoning is why `head_ms` sits between them rather than
+> beside them: it is re-based *down* from the idle deadline when the
+> client's first byte lands, and *down* again to `connect_ms` at the
+> dial.
 
 | field | default | meaning |
 |---|---|---|
 | `connect_ms` | `5000` | per-try upstream connect budget |
-| `idle_ms` | `60000` | idle and head-read deadline — what a slowloris meets |
+| `head_ms` | derived | budget for reading one request head — what a slowloris meets. 10 s, clamped between `connect_ms` and `idle_ms` so it never changes a config that predates it |
+| `idle_ms` | `60000` | how long a connection may stay quiet — between requests, or before its first byte |
 | `drain_deadline_ms` | `0` | how long a `SIGTERM` drain waits before reaping stragglers; `0` waits for the last connection |
 | `max_lifetime_ms` | `0` | absolute connection-age cap regardless of activity; `0` disables |
 | `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity — bounds a request that is merely slow, where `idle_ms` only bounds one that has stalled; `0` disables |
