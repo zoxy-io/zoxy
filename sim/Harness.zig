@@ -107,11 +107,15 @@ comptime {
 io: SimIo,
 server: ServerSim,
 endpoints_l4: [1]std.Io.net.IpAddress,
-endpoints_http: [1]std.Io.net.IpAddress,
-/// The #174 weight tables the clusters may reference; single-entry like
-/// the endpoint lists they parallel.
+/// The http cluster's endpoints: the origin at index 0 always, and on a
+/// #181 retry seed a second one nothing is listening on (`deriveRetries`).
+/// How many are configured is `endpoints_http_count`.
+endpoints_http: [2]std.Io.net.IpAddress,
+endpoints_http_count: u16,
+/// The #174 weight tables the clusters may reference, each as long as
+/// the endpoint list it parallels.
 weights_l4: [1]u16,
-weights_http: [1]u16,
+weights_http: [2]u16,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
@@ -191,6 +195,9 @@ clean: bool,
 /// runs the stamp oracle, and `verify` holds the sticky counters to
 /// the responses they annotate.
 sticky_http: bool,
+/// The #181 dial-retry budget on the http cluster; zero on the seeds
+/// that carry no second endpoint, which is most of them.
+retries_http: u16,
 /// Decided before `io.init` (the ring the sim registers must equal the
 /// limit the server accounts against — Server.init asserts the match),
 /// consumed by `startServerAndOrigins` for the rest of the pool shape.
@@ -270,6 +277,24 @@ fn originAddress() std.Io.net.IpAddress {
 
 fn httpOriginAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9001") catch unreachable;
+}
+
+/// The #181 second endpoint: an address no origin ever binds, so every
+/// dial to it is refused by `SimIo.finishConnect`'s own listener lookup
+/// rather than by an adversary roll. That is the issue's motivating
+/// failure modelled exactly — one endpoint of a cluster refusing while
+/// the others are healthy — and it is refused on *clean* seeds too, so
+/// the retry path is reached by the seeds whose oracles demand exact
+/// outcomes rather than only by the ones that tolerate a cut.
+///
+/// Dead rather than merely slow on purpose: a black-holed endpoint would
+/// time out, and a timed-out dial does not retry (it has spent the
+/// budget a retry carries). Dead rather than a second live origin also
+/// keeps every oracle untouched — nothing here can serve, so every
+/// response the clients check still came from the one origin at index 0,
+/// including the #178 sticky tag pinned to its address.
+fn refusingEndpointAddress() std.Io.net.IpAddress {
+    return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9002") catch unreachable;
 }
 
 pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
@@ -532,9 +557,55 @@ fn randomPick(random: std.Random) zoxy.config.Config.Cluster.Pick {
     return random.enumValue(zoxy.config.Config.Cluster.Pick);
 }
 
+/// The #181 draw: a third of seeds give the http cluster a retry budget
+/// and, with it, the refusing second endpoint the budget exists to get
+/// past. The two ride together deliberately — a dead endpoint without
+/// retries would answer half the requests `502`, which a clean seed's
+/// golden outcomes forbid, while retries without one would be a budget
+/// nothing ever spends.
+///
+/// Drawn across the whole legal range rather than fixed at 1, because
+/// the two ways a retry can end are decided by which of the budget and
+/// the endpoint set runs out first: at 1 retry a second failure answers
+/// `502` with the budget spent, while at 2 or more it is the *endpoints*
+/// that run out and the answer comes from the exhaustion rung instead.
+/// Both are reachable here only because the range is.
+/// A pool-starved seed keeps the single-endpoint topology whatever it
+/// drew, and the reason is a shadow the §9 census depends on. Those seeds
+/// set `relay_buffers` and `upstream_slots` both to 1, and the exemption
+/// for `l7_shed_upstream_slots` rests on the L7 path taking the relay
+/// buffer first, so the relay rung answers everything that would reach
+/// the slot rung. A *second endpoint* breaks that: the one slot can be
+/// parked on endpoint 0 while a request picks endpoint 1, which cannot
+/// reuse it and must dial — a correct shed, and one no single-endpoint
+/// cluster can produce, because there the parked connection is always the
+/// one wanted. Found on seed 4316 of a 16384-seed sweep. The behavior
+/// itself is covered directly by `src/http_proxy_test.zig`, which
+/// exhausts the upstream pool on purpose; what does not belong here is a
+/// pool-sizing scenario arriving as a side effect of a retry draw.
+fn deriveRetries(harness: *Harness, random: std.Random) void {
+    // Drawn either way, so a starved seed's stream position stays where
+    // an unstarved one's is and the suppression costs no other coverage.
+    const budget: u16 = if (random.uintLessThan(u8, 3) == 0)
+        1 + random.uintAtMost(u16, zoxy.constants.cluster_retries_max - 1)
+    else
+        0;
+    if (budget == 0 or harness.force_exhaustion) {
+        harness.retries_http = 0;
+        harness.endpoints_http_count = 1;
+        return;
+    }
+    harness.retries_http = budget;
+    harness.endpoints_http_count = 2;
+    harness.endpoints_http[1] = refusingEndpointAddress();
+    assert(harness.retries_http >= 1);
+    assert(harness.retries_http <= zoxy.constants.cluster_retries_max);
+}
+
 fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.endpoints_l4 = .{originAddress()};
-    harness.endpoints_http = .{httpOriginAddress()};
+    harness.endpoints_http = .{ httpOriginAddress(), httpOriginAddress() };
+    deriveRetries(harness, random);
     // Each cluster draws its pick policy independently so mixed configs
     // (one cluster each way) flow through the balancer under the schedule
     // fuzz, not just the uniform pairings. Single-endpoint clusters
@@ -568,33 +639,73 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // properties are pinned by balancer.zig's own tests, exactly like
     // `hash`'s stickiness above.
     harness.weights_l4 = .{1 + random.uintAtMost(u16, 255)};
-    harness.weights_http = .{1 + random.uintAtMost(u16, 255)};
-    harness.clusters = .{
-        .{
-            .name = "origin-l4",
-            .endpoints = &harness.endpoints_l4,
-            .weights = if (random.boolean()) &harness.weights_l4 else null,
-            .pick = pick_l4,
-            .check = health.check_l4,
-            .max_inflight = deriveMaxInflight(harness.clean, random),
-            .proxy_protocol_send = harness.proxy_protocol_send_l4,
-        },
-        .{
-            .name = "origin-http",
-            .endpoints = &harness.endpoints_http,
-            .weights = if (random.boolean()) &harness.weights_http else null,
-            .pick = pick_http,
-            .hash_key = http_hash_key,
-            .check = health.check_http,
-            .max_inflight = deriveMaxInflight(harness.clean, random),
-        },
+    harness.weights_http = .{
+        1 + random.uintAtMost(u16, 255),
+        1 + random.uintAtMost(u16, 255),
     };
+    wireClusters(harness, random, .{
+        .l4 = pick_l4,
+        .http = pick_http,
+        .http_hash_key = http_hash_key,
+    }, health);
     harness.routes_l4 = .{.{ .prefix = "/", .cluster_index = 0 }};
     harness.routes_http = .{.{ .prefix = "/", .cluster_index = 1 }};
     harness.proxy_protocol_l4 = deriveProxyProtocol(random);
     harness.deriveTerminatingDraws(random);
     harness.wireListeners(deriveForwarded(random));
     harness.deriveServerConfig(random, connect_timeout_ms, health.interval_ms);
+}
+
+/// The picks the two clusters were drawn with, bundled so `wireClusters`
+/// takes one argument for them rather than three positional ones that
+/// read alike at the call site.
+const ClusterPicks = struct {
+    l4: zoxy.config.Config.Cluster.Pick,
+    http: zoxy.config.Config.Cluster.Pick,
+    http_hash_key: zoxy.config.Config.Cluster.HashKey,
+};
+
+/// The two cluster records, split from `deriveTopology` for exactly the
+/// reason `deriveTerminatingDraws` below was: the #181 second endpoint
+/// pushed that function past the length limit again. Nothing moved but
+/// the braces — the literal is still evaluated where it was, so the four
+/// draws inside it (a weights coin and a `max_inflight` per cluster) keep
+/// their stream positions.
+fn wireClusters(
+    harness: *Harness,
+    random: std.Random,
+    picks: ClusterPicks,
+    health: HealthDraw,
+) void {
+    assert(harness.endpoints_http_count >= 1);
+    assert(harness.endpoints_http_count <= harness.endpoints_http.len);
+    harness.clusters = .{
+        .{
+            .name = "origin-l4",
+            .endpoints = &harness.endpoints_l4,
+            .weights = if (random.boolean()) &harness.weights_l4 else null,
+            .pick = picks.l4,
+            .check = health.check_l4,
+            .max_inflight = deriveMaxInflight(harness.clean, random),
+            .proxy_protocol_send = harness.proxy_protocol_send_l4,
+        },
+        .{
+            .name = "origin-http",
+            .endpoints = harness.endpoints_http[0..harness.endpoints_http_count],
+            .weights = if (random.boolean())
+                harness.weights_http[0..harness.endpoints_http_count]
+            else
+                null,
+            .pick = picks.http,
+            .hash_key = picks.http_hash_key,
+            .check = health.check_http,
+            .max_inflight = deriveMaxInflight(harness.clean, random),
+            .retries = harness.retries_http,
+        },
+    };
+    // The retry budget and the endpoint that makes it spendable ride
+    // together (`deriveRetries`), so neither is ever configured alone.
+    assert((harness.retries_http == 0) == (harness.endpoints_http_count == 1));
 }
 
 /// The §4 terminating draws, split from `deriveTopology` when the #202

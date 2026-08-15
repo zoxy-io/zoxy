@@ -247,8 +247,13 @@ const uncovered = [_]Uncovered{
         .reason = "the only seeds that starve a pool set relay_buffers and " ++
             "upstream_slots both to 1, and the L7 path takes the relay " ++
             "buffer first, so the relay rung answers every request that " ++
-            "would have reached this one; src/http_proxy_test.zig " ++
-            "exhausts the upstream pool directly",
+            "would have reached this one. That shadow needs the starved " ++
+            "seeds to stay single-endpoint, which is why the #181 retry " ++
+            "draw suppresses its second endpoint on them: one slot parked " ++
+            "on endpoint 0 cannot serve a request picking endpoint 1, and " ++
+            "the resulting shed is legal but reaches this rung (seed 4316 " ++
+            "of 4097..20480, before `deriveRetries` accounted for it); " ++
+            "src/http_proxy_test.zig exhausts the upstream pool directly",
     },
     .{
         .name = "l7_shed_upstream_head_buffers",

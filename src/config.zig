@@ -311,6 +311,14 @@ pub const Config = struct {
         /// L7 requests and live L4 connections alike (§7).
         max_inflight: ?u32 = null,
 
+        /// How many further endpoints one request may dial after a
+        /// refused or unreachable first try (#181), 0 for none — the
+        /// default, and what every config predating this key keeps
+        /// doing. Bounded by `cluster_retries_max`. Only the L7 path
+        /// spends it: an L4 connection dials once and relays whatever
+        /// the dial produced, with no request to send somewhere else.
+        retries: u16 = 0,
+
         /// What a `hash` cluster keys its endpoint choice on (§7, #178).
         /// Read only when `pick == .hash`; the loader rejects key
         /// settings beside any other policy rather than leaving them
@@ -443,6 +451,7 @@ pub const ValidationError = error{
     ClusterCheckHostInvalid,
     ClusterCheckStatusInvalid,
     ClusterMaxInflightOutOfRange,
+    ClusterRetriesOutOfRange,
     ClusterPickKeyMissing,
     ClusterPickKeyUnknown,
     ClusterPickKeyWithoutHash,
@@ -1876,6 +1885,10 @@ pub const ClusterJson = struct {
     check: ?CheckJson = null,
     /// Optional §8 per-endpoint concurrency cap; absent means uncapped.
     max_inflight: ?u32 = null,
+    /// Optional #181 dial retries across this cluster's endpoints;
+    /// absent means none, which is what every config written before the
+    /// key existed asked for.
+    retries: u16 = 0,
     /// Optional PROXY protocol announcement on upstream connections
     /// (#142); absent sends none. Only valid on clusters no http
     /// listener routes to.
@@ -1900,6 +1913,13 @@ pub const ClusterJson = struct {
             .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
             .minimum = 1,
             .maximum = constants.endpoint_inflight_max,
+        },
+        .retries = .{
+            .desc = "Further endpoints one request may dial after a refused or " ++
+                "unreachable first try; 0 (the default) answers 502 on the first " ++
+                "failure. All tries share the one connect timeout.",
+            .minimum = 0,
+            .maximum = constants.cluster_retries_max,
         },
         .proxy_protocol = .{
             .desc = "Announce each client to this cluster's origins with a PROXY " ++
@@ -2507,6 +2527,7 @@ fn resolveClusters(
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
             .hash_key = picked.hash_key,
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
+            .retries = try resolveRetries(entry.cluster.retries),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
         };
     }
@@ -3520,6 +3541,19 @@ fn resolveMaxInflight(max_inflight: ?u32) ParseError!?u32 {
         return error.ClusterMaxInflightOutOfRange;
     }
     return cap;
+}
+
+/// Resolve the #181 dial-retry budget. Zero is the default and means
+/// "answer the first failure", so it needs no rejection; past the
+/// ceiling is refused rather than clamped, because every try this
+/// permits is load the surviving endpoints absorb, and an operator who
+/// wrote a number the proxy will not honor should hear about it at load
+/// rather than infer it from a counter.
+fn resolveRetries(retries: u16) ParseError!u16 {
+    if (retries > constants.cluster_retries_max) {
+        return error.ClusterRetriesOutOfRange;
+    }
+    return retries;
 }
 
 /// Resolve a listener's §7 client-address forwarding: absent is off, and
@@ -6404,5 +6438,60 @@ test "config: a filter may not name the header zoxy manages" {
         const parsed = try expectParseOk(&arena_state, head ++
             "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-Proto\",\"value\":\"https\"}}]}" ++ tail);
         try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].request_filters.len);
+    }
+}
+
+test "config: retries resolves, defaults to none, rejects past the ceiling" {
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state,
+            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "clusters":{"a":{"endpoints":["127.0.0.1:2","127.0.0.1:3"],"retries":2},
+            \\   "b":{"endpoints":["127.0.0.1:4"]}},
+            \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+        );
+        try std.testing.expectEqual(@as(u16, 2), parsed.clusters[0].retries);
+        // Absent is no retry, which is what every config written before
+        // the key existed asked for and must keep getting (#181).
+        try std.testing.expectEqual(@as(u16, 0), parsed.clusters[1].retries);
+    }
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"retries":
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // Zero is the default rather than a typo, so it loads; past the
+    // ceiling is refused rather than clamped, because a number the proxy
+    // will not honor should be heard about at load.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "0" ++ tail);
+        try std.testing.expectEqual(@as(u16, 0), parsed.clusters[0].retries);
+    }
+    {
+        var buffer: [512]u8 = undefined;
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const json = try std.fmt.bufPrint(
+            &buffer,
+            "{s}{d}{s}",
+            .{ head, constants.cluster_retries_max, tail },
+        );
+        const parsed = try expectParseOk(&arena_state, json);
+        try std.testing.expectEqual(constants.cluster_retries_max, parsed.clusters[0].retries);
+    }
+    {
+        var buffer: [512]u8 = undefined;
+        const json = try std.fmt.bufPrint(
+            &buffer,
+            "{s}{d}{s}",
+            .{ head, constants.cluster_retries_max + 1, tail },
+        );
+        try expectParseError(error.ClusterRetriesOutOfRange, json);
     }
 }
