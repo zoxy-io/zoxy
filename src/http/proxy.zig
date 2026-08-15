@@ -850,10 +850,16 @@ pub fn Proxy(comptime IoType: type) type {
             }
         }
 
-        /// Picks a live endpoint under the §8 per-endpoint inflight cap, or
-        /// sheds 503 and returns null when every endpoint of this cluster
-        /// is already at it. Shared by the first-try and replay dial paths
-        /// so the cap and its shed counter cannot drift between them.
+        /// Picks a live endpoint under the §8 per-endpoint inflight cap
+        /// and outside what this request has already tried (#181), or
+        /// answers and returns null. Shared by all three dial paths — the
+        /// first try, the §7 replay and the retry — so neither the cap's
+        /// shed nor the exhaustion 502 can drift between them.
+        ///
+        /// The two null answers are different rungs and are counted apart:
+        /// every candidate at its cap sheds 503, while every routable
+        /// endpoint already tried answers 502. Only a retry can reach the
+        /// second, since the exclusion set is empty until a dial fails.
         fn pickEndpointOrShed(
             server: *ServerType,
             conn: *ConnType,
@@ -865,12 +871,22 @@ pub fn Proxy(comptime IoType: type) type {
                 server.health.healthy,
                 &conn.client_address,
                 request_key,
-                &.{},
+                conn.l7.tried[0..conn.l7.tried_count],
             );
             switch (outcome) {
                 .dial => |chosen| return chosen,
-                // Nothing was tried, so the routable set cannot be empty.
-                .exhausted => unreachable,
+                .exhausted => {
+                    // Every routable endpoint refused this request (#181).
+                    // 502 rather than 503: the origins were reachable
+                    // enough to say no, which is a different sentence from
+                    // "they are full", and the shed rungs must not absorb
+                    // it. A first try cannot land here — the routable set
+                    // is non-empty until something has been tried.
+                    assert(conn.l7.tried_count >= 1);
+                    server.counters.increment("upstream_retries_exhausted");
+                    respond(server, conn, 502, "l7_bad_gateway");
+                    return null;
+                },
                 .capped => {
                     // The labeled twin (#179) carries only the cluster:
                     // this fires precisely because no endpoint could be
@@ -941,7 +957,7 @@ pub fn Proxy(comptime IoType: type) type {
                 renderRequestAndStartLegs(server, conn, request, views);
                 return;
             }
-            dialUpstream(server, conn, pick);
+            dialUpstream(server, conn, pick, .fresh);
         }
 
         /// Acquire the exchange's upstream head buffer (§5) — the render
@@ -964,12 +980,37 @@ pub fn Proxy(comptime IoType: type) type {
             return true;
         }
 
-        /// Acquire a fresh slot and dial `pick` under the per-try connect
-        /// deadline (§8) — shared by the first try (`routeRequest`) and
-        /// the §7 stale replay (`beginReplay`), so both tries dial
-        /// identically.
-        fn dialUpstream(server: *ServerType, conn: *ConnType, pick: Balancer.Pick) void {
-            assert(conn.state == .l7_reading_head or conn.state == .l7_exchanging);
+        /// Whether a dial opens its own connect budget or continues one
+        /// already running.
+        ///
+        /// `fresh` is the §7 rule — each try, the first and the stale
+        /// replay's, runs under its own `connect_ms`. `carried` is
+        /// #181's: a retry chain is one client waiting for one answer, so
+        /// every dial in it shares the budget the first one armed. That
+        /// keeps the worst-case dial wait at `connect_ms` however many
+        /// endpoints the request walks, and it is why a *timed-out* dial
+        /// does not retry — the budget it would retry under is the budget
+        /// it just spent, so there is nothing left to try with. The two
+        /// answers to the "does a retry multiply the client's wait"
+        /// question, and this picks the one that says no.
+        const DialBudget = enum { fresh, carried };
+
+        /// Acquire a fresh slot and dial `pick` under the connect deadline
+        /// (§8) — shared by the first try (`routeRequest`), the §7 stale
+        /// replay (`beginReplay`) and the #181 retry (`beginRetry`), so
+        /// every try dials identically but for its budget.
+        fn dialUpstream(
+            server: *ServerType,
+            conn: *ConnType,
+            pick: Balancer.Pick,
+            budget: DialBudget,
+        ) void {
+            // `.l7_dialing` is a retry re-entering: the state never left
+            // the dial, because nothing about this request reached an
+            // origin and there is no exchange to be in.
+            assert(conn.state == .l7_reading_head or conn.state == .l7_dialing or
+                conn.state == .l7_exchanging);
+            if (conn.state == .l7_dialing) assert(budget == .carried);
             assert(conn.upstream == null);
             assert(conn.upstream_socket == null);
             conn.upstream = server.acquireUpstream(conn.cluster_index, pick.endpoint_index) orelse {
@@ -984,9 +1025,22 @@ pub fn Proxy(comptime IoType: type) type {
             // The head-read/idle timer is already armed; re-base it to the
             // tighter per-try connect budget so a hung origin fires the §8
             // 504 at connect_timeout, not idle_timeout (§4: the lazy timer
-            // never moves earlier on its own).
-            server.storeDeadline(conn, server.config.connect_timeout_ms);
-            server.rebaseDeadline(conn);
+            // never moves earlier on its own). A carried budget leaves the
+            // running deadline exactly where the first dial put it, so the
+            // expiry still fires on time and still finds this connection
+            // dialing — whichever endpoint it is dialing by then.
+            if (budget == .fresh) {
+                server.storeDeadline(conn, server.config.connect_timeout_ms);
+                server.rebaseDeadline(conn);
+            } else {
+                // Stated rather than assumed: the budget being carried is
+                // only a budget if it is still running. It must be, since
+                // a fired deadline reaches `onUpstreamConnect` as a
+                // pending verdict and answers 504 before any failure could
+                // ask to retry — but a future path that disarmed it would
+                // otherwise leave this dial with no clock at all.
+                assert(conn.armed.deadline);
+            }
             conn.arm(&conn.op_connect, "connect");
             server.io.connect(
                 pick.address,
@@ -1040,6 +1094,10 @@ pub fn Proxy(comptime IoType: type) type {
                 // Same split as the L4 dial: the origin's verdict arrives
                 // typed, our own resource exhaustion does not (§8).
                 server.witnessKernelPressure(.connect, err);
+                if (retryEligible(server, conn, err)) {
+                    beginRetry(server, conn);
+                    return;
+                }
                 respond(server, conn, 502, "l7_bad_gateway");
                 return;
             };
@@ -1049,6 +1107,88 @@ pub fn Proxy(comptime IoType: type) type {
                 server.witnessKernelPressure(.set_option, err);
             };
             renderAndStartLegs(server, conn);
+        }
+
+        /// Whether a failed dial may be sent to another endpoint (#181).
+        ///
+        /// Two of the four `ConnectError`s qualify, and the split is the
+        /// feature's whole safety argument. `Refused` and `Unreachable`
+        /// are the *origin's* verdict: the request reached no application,
+        /// nothing was processed, nothing was observed — so §7's settled
+        /// reading of "may have begun processing" ("a response byte
+        /// arrived or relay chunks flowed") is unambiguously not met, and
+        /// re-sending is safe for every method including POST, with no
+        /// idempotency analysis and no knob about which methods may
+        /// replay. `Unexpected` is *our* resource exhaustion, already
+        /// witnessed as kernel pressure by the caller: another dial would
+        /// meet the same wall and §8 says shed rather than retry.
+        /// `Canceled` is the dial deadline, which arrives through
+        /// `pending_verdict` above and never reaches here — and could not
+        /// retry anyway, having spent the budget a retry would carry.
+        fn retryEligible(
+            server: *const ServerType,
+            conn: *const ConnType,
+            err: Io.ConnectError,
+        ) bool {
+            assert(conn.state == .l7_dialing);
+            assert(conn.upstream != null);
+            // Exhaustive rather than an `else`, so a fifth connect error
+            // is a compile error here — a decision to make once, not a
+            // default to inherit silently.
+            switch (err) {
+                error.Refused, error.Unreachable => {},
+                error.Canceled, error.Unexpected => return false,
+            }
+            const budget = server.config.clusters[conn.cluster_index].retries;
+            assert(budget <= constants.cluster_retries_max);
+            assert(conn.l7.retries_used <= budget);
+            return conn.l7.retries_used < budget;
+        }
+
+        /// Spend one retry: record the endpoint that refused, give its
+        /// slot back, and dial an untried one from the same client bytes.
+        ///
+        /// Cheaper than the §7 replay, and for a structural reason — a
+        /// dial that never connected sent nothing, so there is no stale
+        /// socket to shut down, no framing to rebuild and no per-try state
+        /// to reset. The head still holds the request exactly as it
+        /// arrived (the render happens after the connect completes), so
+        /// the re-parse here is the same one the replay does, for the same
+        /// reason: only the bytes survive an await, and they are unchanged.
+        fn beginRetry(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_dialing);
+            assert(conn.upstream_socket == null); // A failed dial produced none.
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            const failed = conn.upstream.?;
+            assert(conn.l7.tried_count < conn.l7.tried.len);
+            conn.l7.tried[conn.l7.tried_count] = failed.endpoint_index;
+            conn.l7.tried_count += 1;
+            // Released before the re-pick, not after: the endpoint's
+            // in-flight total is what `p2c` and the §8 cap read, and
+            // leaving a dead dial counted there would make the retry
+            // avoid a busy endpoint on the strength of work nobody is
+            // doing. The slot is re-acquired in the same callback, so the
+            // pool cannot have been emptied in between.
+            server.releaseUpstream(failed);
+            conn.upstream = null;
+            var storage: parser.HeaderStorage = undefined;
+            const request = parser.parseRequestHead(
+                headBytes(server, conn)[0..conn.head_len],
+                false,
+                &storage,
+            ) catch unreachable;
+            // Re-derived rather than remembered, like the replay's
+            // framing: same bytes, same key. A cookie cluster's #178
+            // announcement still names whichever endpoint finally serves,
+            // because `sticky_cookie` records what the *client* asked for
+            // and that has not changed.
+            const request_key = requestKeyFor(server, conn, &request);
+            const pick = pickEndpointOrShed(server, conn, request_key) orelse return;
+            assert(pick.endpoint_index != conn.l7.tried[conn.l7.tried_count - 1]);
+            conn.l7.retries_used += 1;
+            server.counters.increment("upstream_retried");
+            dialUpstream(server, conn, pick, .carried);
         }
 
         /// The fresh-dial completion path: the head bytes are re-parsed —
@@ -2543,6 +2683,11 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.pending_verdict == .none);
             assert(conn.l7.replay_used); // Spent before the try began.
+            // A replay always precedes any #181 retry, never follows one:
+            // it needs a *reused* checkout, and a retry only ever dials
+            // fresh. So the rebuild below defaulting the tried set to
+            // empty is the truth, not a reset.
+            assert(conn.l7.tried_count == 0);
             assert(!conn.armed.data_client_to_upstream);
             assert(!conn.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
@@ -2597,7 +2742,7 @@ pub fn Proxy(comptime IoType: type) type {
                 else => null,
             };
             const pick = pickEndpointOrShed(server, conn, request_key) orelse return;
-            dialUpstream(server, conn, pick);
+            dialUpstream(server, conn, pick, .fresh);
         }
 
         /// The upstream leg failed. A stale checkout takes its one free

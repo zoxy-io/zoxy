@@ -1003,8 +1003,55 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   kernel buffer of an already-FIN'd parked connection replays, because
   the FIN-before-checkout race is overwhelmingly the real cause. The
   replay is spent before its try begins (no loop) and always dials
-  fresh — the endpoint's whole idle list may be stale the same way. The
-  endpoint pick is per-cluster config: `p2c` (two weight-biased
+  fresh — the endpoint's whole idle list may be stale the same way.
+- **A refused dial is sent to another endpoint** (#181, settled
+  2026-08-15). `"retries": 2` beside a cluster's endpoints, 0 by
+  default and bounded by `cluster_retries_max`; without it one
+  refusing endpoint in a three-endpoint cluster fails roughly a third
+  of requests, for `fall × health_interval_ms` with checks configured
+  and **forever with them off**, which is the default.
+  This is the *safe* kind of retry, and §7 above is what settles it
+  rather than a new argument: "may have begun processing" is already
+  "a response byte arrived or relay chunks flowed", and a failed
+  connect is neither — the request reached no application, so a
+  re-send is safe for every method including `POST`, with no
+  idempotency analysis and no knob naming which methods may replay.
+  Exactly two of the four `ConnectError`s qualify. `Refused` and
+  `Unreachable` are the origin's verdict. `Unexpected` is *our* own
+  exhaustion, witnessed as kernel pressure: another dial meets the same
+  wall, and §8 says shed rather than spend more of what has run out.
+  `Canceled` is the dial deadline, and the reason it cannot retry is
+  the budget rule below.
+  **The tries share one connect deadline.** A retry chain is one client
+  waiting for one answer, so every dial in it runs under the budget the
+  first one armed rather than arming its own — the worst-case dial wait
+  stays `connect_ms` however many endpoints a request walks, and
+  `retries` never multiplies the time a client can be kept. That is
+  also why a *timed-out* dial does not retry: it has already spent the
+  budget a retry would carry, so "does a timeout retry" needs no rule
+  of its own. The cost is that a black-holed endpoint — a partitioned
+  or wedged backend, which a TCP health check cannot see either — is
+  still answered `504` rather than routed around; detecting that from
+  live traffic is passive ejection's job, not this one's.
+  The retry destination is **the cluster's own configured pick, re-run
+  over the eligible set minus what this request already tried** —
+  untried joining health and capacity as a third predicate, applied
+  before health so fail-open cannot resurrect the endpoint that just
+  refused. Each policy therefore keeps its contract, and `hash` is the
+  one that matters: rendezvous over the smaller set drops each key to
+  its own next-best score, which is precisely the redistribution
+  ejection produces later, so retry and ejection agree instead of the
+  behavior shifting when the prober catches up. Running out of untried
+  endpoints answers `502`, not a shed `503`: the origins were reachable
+  enough to refuse, which is a different sentence from "they are full".
+  `upstream_retried` and `upstream_retries_exhausted` witness both, and
+  the first has to exist — without it `upstream_connect_failed` climbs
+  while requests succeed, and an operator reads a recovery as an
+  outage. Only the L7 path spends the budget: an L4 connection dials
+  once and relays what the dial produced, with no request to send
+  somewhere else. Aggregate retry *budgets* — bounding the extra load a
+  cluster-wide failure pushes onto the survivors — stay deferred below.
+- **The endpoint pick is per-cluster config**: `p2c` (two weight-biased
   candidates from a fixed-seed PRNG — uniform at the default weights —
   the lower **in-flight total** wins: L7 leases and live L4 connections
   summed, since both are work the origin is carrying) by default, `rr`
@@ -1186,10 +1233,13 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   it. Endpoints start healthy — probing demotes, it never gates startup
   — and the pick **fails open**: a cluster with every endpoint ejected
   balances as if none were, because routing nowhere would turn a probe
-  verdict into an outage of its own. Circuit breakers, outlier ejection,
-  retry budgets stay *deferred* — the previous iteration proved them
-  buildable in this architecture; simplicity says they wait for a
-  demonstrated need.
+  verdict into an outage of its own. Circuit breakers, outlier ejection
+  and *aggregate* retry budgets stay deferred — the previous iteration
+  proved them buildable in this architecture; simplicity says they wait
+  for a demonstrated need. The per-request dial retry above is not one
+  of them: it bounds itself per request and per connect deadline, where
+  a retry budget is the cluster-wide cap that keeps a partial outage
+  from pushing its whole load onto the endpoints still answering.
 
 ## 8. Load shedding — the exhaustion ladder
 

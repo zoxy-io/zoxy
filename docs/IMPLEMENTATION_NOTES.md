@@ -1970,6 +1970,85 @@ The two known peer-gone errnos still landing in the fallback are queued
 fork work (see "Open questions" above, "libxev fork queue"): the fix for
 a forgotten mapping is to name it, not to crash on it.
 
+## A dead endpoint is better sim coverage than a second live one (2026-08-15, #181)
+
+The dial retry had **zero** simulator reachability the moment it landed,
+and the §9 census said so in the same breath: `upstream_retried` and
+`upstream_retries_exhausted` "never fired — no scenario reaches it".
+Both sim clusters were single-endpoint (`endpoints_http: [1]`), and a
+single-endpoint cluster cannot retry by construction. The harness had
+even anticipated this — its pick-policy draw carried the comment
+"pre-wired coverage for a multi-endpoint topology" — so the topology was
+the missing half, not the draw.
+
+The obvious fix is a second live origin, and it is the expensive one:
+another `HttpOrigin` instance, another address to accept on, and every
+L7 oracle taught that a response may now come from either. The cheap fix
+turned out to be strictly better — **a second endpoint at an address
+nothing binds**, which `SimIo.finishConnect` refuses through its own
+listener lookup (`findListener(address) orelse return error.Refused`).
+Three properties fall out, and the third is the one worth remembering:
+
+- It is the issue's motivating failure *exactly* — one endpoint of a
+  cluster refusing while the rest are healthy — rather than an
+  approximation of it.
+- It refuses on **clean** seeds too, where the refusal is structural
+  rather than an adversary roll. So the retry is exercised by the seeds
+  whose oracles demand exact golden outcomes, not only by the
+  adversarial ones that tolerate a cut. That is what made the mutation
+  test bite: deleting `error.Refused` from the retry-eligible set failed
+  seed 38 with `GoldenOutcomeMissed` inside 38 seeds.
+- **A dead endpoint cannot change any successful response**, so not one
+  oracle needed touching — including #178's sticky tag, which is pinned
+  to `endpoints_http[0]`'s address and stays pinned because nothing at
+  index 1 can ever serve. A second live origin would have put that
+  assertion, and every golden body, into play for no coverage gain.
+
+Black-holing the address instead would have been the wrong instrument
+and is worth stating: a black-holed dial *times out*, and a timed-out
+dial does not retry (it has spent the budget a retry carries), so the
+scenario would have proven the opposite of what it was for.
+
+The retry budget is drawn across its whole legal range rather than fixed
+at 1, because which of the two endings a request reaches depends on
+whether the *budget* or the *endpoint set* runs out first: at
+`retries: 1` a second failure answers 502 with the budget spent, while
+at 2 or more the exclusion set empties first and the answer comes from
+the exhaustion rung. One draw, both rungs.
+
+### The second endpoint was also a pool-sizing scenario (seed 4316)
+
+The 4096-seed gate passed; a 16384-seed sweep did not, and what it caught
+was not a retry bug. `l7_shed_upstream_slots` fired once against a census
+allowance of `0` — on a seed whose counters showed `upstream_retried = 0`
+and `upstream_connect_failed = 0`, so **no dial had failed at all**. The
+second endpoint alone did it.
+
+That counter's exemption reads: the only pool-starved seeds set
+`relay_buffers` and `upstream_slots` both to 1, and the L7 path takes the
+relay buffer first, so the relay rung answers everything that would reach
+the slot rung. The unstated premise was **single-endpoint clusters**.
+With two endpoints and one slot, that slot can be *parked* on endpoint 0
+while the next request picks endpoint 1 — which cannot reuse it and must
+dial, so it sheds. A single-endpoint cluster never produces this, because
+the parked connection is always the one wanted.
+
+The shed is correct §8 behavior, not a defect, and it is covered directly
+by `src/http_proxy_test.zig`. What did not belong was a pool-sizing
+scenario arriving as a side effect of a *retry* draw, so `deriveRetries`
+suppresses its second endpoint on starved seeds, and the exemption now
+states the premise it was silently relying on rather than leaving the
+next multi-endpoint feature to rediscover it. The draw still happens on
+those seeds and only its effect is dropped, so stream positions stay
+where an unstarved seed's are.
+
+Worth separating out as a live question rather than buried here: **an
+idle parked connection can shed a request bound for another endpoint.**
+Evicting the parked one instead of shedding is a real option the design
+has not taken; today the ladder says shed, and at production pool sizes
+it is unreachable. It becomes interesting the moment a deployment runs
+many endpoints against a tight upstream pool.
+
 ## The nightly's second rare event: `tls_handshake_failed` (2026-08-11)
 
 Run 31457966341 failed every shard on the census: `tls_handshake_failed`

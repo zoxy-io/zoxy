@@ -185,6 +185,19 @@ pub const Counters = struct {
     /// and its request took the one free §7 replay on a fresh dial.
     /// Every replay rides a reuse — an inequality `reconcile` asserts.
     upstream_replayed: Value = Value.init(0),
+    /// Dials taken as a #181 retry: a previous endpoint refused or was
+    /// unreachable and the request was sent to an untried one. Every
+    /// retry rides a connect failure — an inequality `reconcile` asserts
+    /// — which is also why this counter has to exist: without it
+    /// `upstream_connect_failed` climbs while requests succeed, and an
+    /// operator reads a recovery as an outage.
+    upstream_retried: Value = Value.init(0),
+    /// Requests allowed to retry that found no untried endpoint left and
+    /// answered 502. Separate from the shed counters on purpose: this is
+    /// "none of them would talk to us", not "all of them are full". On a
+    /// single-endpoint cluster it fires on every dial failure, which is
+    /// the honest reading — a retry budget there can never be spent.
+    upstream_retries_exhausted: Value = Value.init(0),
     /// Parked upstream connections reaped by the idle sweep (§5).
     upstream_idle_reaped: Value = Value.init(0),
     /// §7 active health probes dispatched — one per checked endpoint per
@@ -661,6 +674,11 @@ pub const Counters = struct {
         // Every §7 replay rides a checkout: only a reused connection's
         // early failure is blamed on staleness.
         assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));
+        // Every #181 retry rides a connect failure, and so does every
+        // exhaustion: both are answers to a dial the origin refused.
+        assert(counters.get("upstream_retried") <= counters.get("upstream_connect_failed"));
+        assert(counters.get("upstream_retries_exhausted") <=
+            counters.get("upstream_connect_failed"));
         // A resumed session is a completed handshake that skipped the
         // certificate, not a separate kind of event — so it can never
         // outrun the handshakes it is a subset of. Worth stating because

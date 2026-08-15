@@ -446,7 +446,8 @@ const HttpOrigin = struct {
 const Http1Bed = struct {
     arena_state: std.heap.ArenaAllocator,
     sim_io: SimIo,
-    endpoints: [1]std.Io.net.IpAddress,
+    endpoints: [2]std.Io.net.IpAddress,
+    endpoints_count: u16,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
     listeners: [1]config_module.Config.Listener,
@@ -473,6 +474,13 @@ const Http1Bed = struct {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") catch unreachable;
     }
 
+    /// An address no origin binds, so `SimIo` refuses every dial to it
+    /// through its own listener lookup — the same answer a kernel gives
+    /// for a port nothing is on, and the failure #181 exists to survive.
+    fn refusingEndpointAddress() std.Io.net.IpAddress {
+        return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9002") catch unreachable;
+    }
+
     const Options = struct {
         seed: u64,
         partial_io: bool = false,
@@ -488,6 +496,12 @@ const Http1Bed = struct {
         /// ring was willing to carry.
         inbox_bytes: ?u32 = null,
         origin_response: []const u8 = "",
+        /// The #181 dial-retry budget on the bed's one cluster.
+        retries: u16 = 0,
+        /// Put an endpoint nothing listens on *ahead* of the origin, so
+        /// the first pick of an `rr` cluster is always the one that
+        /// refuses and the retry is the only way to reach the origin.
+        refusing_endpoint_first: bool = false,
         origin_listens: bool = true,
         origin_closes: bool = false,
         /// The origin reads the whole request and never answers (§8 504).
@@ -588,8 +602,12 @@ const Http1Bed = struct {
             .buffer_group_count = head_buffers,
             .buffer_group_bytes = options.head_buffer_bytes,
         });
-        bed.endpoints = .{originAddress()};
-        bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints, .check = options.check, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key }};
+        bed.endpoints = if (options.refusing_endpoint_first)
+            .{ refusingEndpointAddress(), originAddress() }
+        else
+            .{ originAddress(), originAddress() };
+        bed.endpoints_count = if (options.refusing_endpoint_first) 2 else 1;
+        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{
             .bind_address = bindAddress(),
@@ -4533,5 +4551,147 @@ test "l7: a terminated listener honours the configured head limit" {
         client.app_received[0..client.app_received_len],
         "HTTP/1.1 431 ",
     ));
+    try bed.expectDrained();
+}
+
+test "l7: a refused endpoint is retried onto another and the client sees the origin" {
+    // #181's motivating case, end to end: one endpoint of a cluster
+    // refuses while another is healthy. Without a retry every request
+    // the pick sends to the refusing one is a 502, and with health
+    // checks off — the default — that lasts forever rather than for a
+    // detection window.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 190,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        // Strict rotation puts the refusing endpoint first, so the retry
+        // is the only path to the origin rather than a coin flip.
+        .pick = .rr,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // The origin's own answer, not a gateway error: the client cannot
+    // tell that its request took two dials, which is the whole point.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+    // The recovery must be visible as a recovery. Without the retry
+    // counter an operator sees `upstream_connect_failed` climbing while
+    // requests succeed, and reads it as an outage.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_gateway"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_retries_exhausted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
+}
+
+test "l7: a retry runs out of endpoints before its budget and answers 502" {
+    // Both endpoints refuse and the budget still has a try left, so it
+    // is the *endpoint set* that ends the request, not the count. That
+    // is the exhaustion rung, and it answers 502 rather than a shed 503:
+    // the origins were reachable enough to say no, which is a different
+    // sentence from "all of them are full".
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 191,
+        .refusing_endpoint_first = true,
+        .origin_listens = false,
+        .retries = 2,
+        .pick = .rr,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    // Two dials, one retry between them, and no third: the exclusion
+    // set emptied the cluster before the budget's second retry was
+    // reached, so the request stopped without dialing anything twice.
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retries_exhausted"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_endpoint_inflight"));
+    try bed.expectDrained();
+}
+
+test "l7: our own dial exhaustion is not retried onto another endpoint" {
+    // The split that makes the retry safe (#181): a refused or
+    // unreachable dial is the *origin's* verdict, while kernel pressure
+    // is ours. Another dial would meet the same wall, and §8 says shed
+    // rather than spend more of a resource we have already run out of.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 192,
+        .refusing_endpoint_first = true,
+        .retries = 2,
+        .pick = .rr,
+    });
+    defer bed.tearDown();
+
+    bed.sim_io.setPressureCause(.address_unavailable);
+    bed.sim_io.injectConnectError(Http1Bed.refusingEndpointAddress());
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    // The healthy origin sat there untried, and that is correct: the
+    // dial never reached the network to have an opinion about it.
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("kernel_pressure_connect"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_retried"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+    try bed.expectDrained();
+}
+
+test "l7: a dial that times out does not retry, because it spent the budget" {
+    // The retry chain carries one connect deadline rather than arming a
+    // fresh one per try, so the worst-case dial wait stays `connect_ms`
+    // however many endpoints a request walks. A timed-out dial has
+    // therefore already spent the budget a retry would run under, and
+    // the §8 answer is the 504 the deadline decided — not a second dial
+    // the client would wait through all over again.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 193,
+        .refusing_endpoint_first = true,
+        .retries = 2,
+        .pick = .rr,
+    });
+    defer bed.tearDown();
+
+    bed.sim_io.blackholeAddress(Http1Bed.refusingEndpointAddress());
+
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\n\r\n");
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    // One budget, not one per endpoint: three tries at a fresh deadline
+    // each would have kept the client waiting three times as long.
+    try std.testing.expect(elapsed_ms < 2 * Http1Bed.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_retried"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
     try bed.expectDrained();
 }

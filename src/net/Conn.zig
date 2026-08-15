@@ -589,6 +589,24 @@ pub fn Conn(comptime IoType: type) type {
             /// The one free replay is spent (§7): a failure on the replay
             /// try answers 502 like any other, never a second replay.
             replay_used: bool = false,
+            /// The endpoints this request dialed and had refused or found
+            /// unreachable (#181), in the order it tried them — the
+            /// exclusion set the next pick runs over. Sized for the first
+            /// try plus every retry the largest configured budget allows,
+            /// so it is a fixed field like everything else on this
+            /// connection and never grows.
+            tried: [constants.cluster_retries_max + 1]u16 = @splat(0),
+            /// How many of `tried` are written. Every entry past it is
+            /// stale from an earlier request on this connection and must
+            /// not be read.
+            tried_count: u16 = 0,
+            /// Retries spent against the cluster's budget. Equal to
+            /// `tried_count` between hops, since a retry records the
+            /// endpoint that failed and spends a retry to leave it in the
+            /// same step — and one *behind* it in the terminal state where
+            /// the endpoint set ran out first, because that last failure
+            /// is recorded and then answered rather than retried.
+            retries_used: u16 = 0,
 
             pub const Leg = enum(u8) {
                 idle,
