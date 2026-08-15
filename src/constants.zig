@@ -504,6 +504,16 @@ pub const cluster_name_bytes_max: u16 = 64;
 /// not a share.
 pub const endpoint_weight_max: u16 = 256;
 
+/// Interim (`1xx`) responses one exchange may carry before the origin's
+/// final answer (#232). RFC 9110 puts no cap on them, and neither nginx
+/// nor HAProxy does — both loop while the status is `1xx` — but an origin
+/// streaming `103 Early Hints` forever is an unbounded loop on the one
+/// thread (§3), which §1 rules out. Eight is well past what a real origin
+/// sends (a `100`, or a handful of `103`s naming preload targets) and far
+/// short of a stall; the overrun takes the `upstreamFailed` path, the same
+/// verdict an unparseable origin head earns.
+pub const interim_responses_max: u8 = 8;
+
 /// Upper bound on a cluster's configured `retries` (#181) — the extra
 /// dials one request may spend after a refused or unreachable first try.
 /// HAProxy's own default, and a ceiling rather than a taste: every try
@@ -1229,6 +1239,9 @@ comptime {
     // the thing that makes a drain slow.
     assert(tunnel_drain_ms >= 1);
     assert(tunnel_drain_ms <= timeout_ms_max);
+    // An exchange must be allowed at least one interim, or the bound
+    // would forbid the `100 Continue` the feature exists to carry.
+    assert(interim_responses_max >= 1);
     assert(cluster_retries_max >= 1);
     assert(cluster_retries_max < std.math.maxInt(u16));
     // The health prober's reservations and thresholds (§7): the op budget

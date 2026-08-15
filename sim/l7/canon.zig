@@ -93,6 +93,18 @@ pub const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ ("p" ** 8162) ++ "\r\n
 pub const switching_response = "HTTP/1.1 101 Switching Protocols\r\n" ++
     "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
 
+/// The `100 Continue` an Expect-honouring origin answers with (#232),
+/// ahead of the response it was going to send anyway. Interim: the
+/// exchange is not over, and a proxy that settles on it either closes on
+/// a client mid-body or parks an upstream whose real answer is still
+/// unread.
+pub const interim_continue = "HTTP/1.1 100 Continue\r\n\r\n";
+
+/// `103 Early Hints` with a preload link — what Cloudflare, Fastly and
+/// `res.writeEarlyHints` emit. Repeated past `interim_responses_max` it is
+/// also the flood the bound exists to cut.
+pub const interim_hints = "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n";
+
 comptime {
     assert(sticky_tag.len == 16);
     assert(sized_body.len == 32);

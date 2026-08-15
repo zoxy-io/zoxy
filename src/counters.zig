@@ -214,6 +214,17 @@ pub const Counters = struct {
     /// says an operator's deadline expired, this one says a deadline
     /// they never named was supplied for them (§8).
     tunnels_drained: Value = Value.init(0),
+    /// Interim `1xx` responses relayed to the client (#232). Forwarded
+    /// rather than absorbed, which is what both references do: a `103` is
+    /// worthless to a client that never sees it, and a `100` the client is
+    /// blocked waiting for is the whole point of `Expect`. Counted per
+    /// interim, so an exchange carrying several moves it several times.
+    l7_interim_forwarded: Value = Value.init(0),
+    /// Exchanges torn down for exceeding `interim_responses_max` (#232) —
+    /// an origin that kept sending `1xx` and never answered. Its own
+    /// counter because it is a *bound* being hit rather than an origin
+    /// speaking badly: the head parsed fine every time.
+    l7_interim_overrun: Value = Value.init(0),
     /// Parked upstream connections reaped by the idle sweep (§5).
     upstream_idle_reaped: Value = Value.init(0),
     /// §7 active health probes dispatched — one per checked endpoint per

@@ -253,6 +253,12 @@ const HttpOrigin = struct {
     /// later. The only way to reach the *reuse* path with a stalled
     /// exchange — a parked upstream exists only after one was served.
     mute_after_served: u32 = std.math.maxInt(u32),
+    /// From the Nth request on, answer with a bare `100 Continue` and
+    /// close (#232). The sibling of `mute_after_served`, and for the same
+    /// reason: it is the only way to park an upstream on a served
+    /// exchange and then have the *reused* one relay an interim and die,
+    /// which is the shape that decides whether a replay is legal.
+    interim_then_close_after_served: u32 = std.math.maxInt(u32),
     /// Close the second accepted connection immediately: the replayed
     /// try fails too, pinning the one-replay budget (§7).
     close_second_at_accept: bool = false,
@@ -279,6 +285,8 @@ const HttpOrigin = struct {
         /// stay captured in the buffer for the tests' assertions.
         request_offset: u32 = 0,
         request_complete: bool = false,
+        /// This connection answers a bare interim and dies (#232).
+        interim_then_close: bool = false,
         closed: bool = false,
         /// Total bytes expected for the current request (head + framed
         /// body), known once its head parses. 0 means not parsed yet.
@@ -348,14 +356,22 @@ const HttpOrigin = struct {
                 // then stall the *reused* one.
                 return;
             }
+            if (oconn.origin.requests_served >= oconn.origin.interim_then_close_after_served) {
+                oconn.interim_then_close = true;
+            }
             oconn.armSend();
         }
 
+        fn responseBytes(oconn: *const OConn) []const u8 {
+            if (oconn.interim_then_close) return "HTTP/1.1 100 Continue\r\n\r\n";
+            return oconn.origin.response;
+        }
+
         fn armSend(oconn: *OConn) void {
-            assert(oconn.response_sent < oconn.origin.response.len);
+            assert(oconn.response_sent < oconn.responseBytes().len);
             oconn.origin.io.send(
                 oconn.socket,
-                oconn.origin.response[oconn.response_sent..],
+                oconn.responseBytes()[oconn.response_sent..],
                 &oconn.send_completion,
                 OConn,
                 oconn,
@@ -370,8 +386,16 @@ const HttpOrigin = struct {
                 return;
             };
             oconn.response_sent += sent;
-            if (oconn.response_sent < oconn.origin.response.len) {
+            if (oconn.response_sent < oconn.responseBytes().len) {
                 oconn.armSend();
+                return;
+            }
+            if (oconn.interim_then_close) {
+                // The interim went out and the origin dies on it: the
+                // client has been told to go ahead by an origin that then
+                // stopped answering.
+                oconn.origin.io.closeNow(oconn.socket);
+                oconn.closed = true;
                 return;
             }
             oconn.origin.requests_served += 1;
@@ -518,6 +542,9 @@ const Http1Bed = struct {
         /// so a test can stall a *reused* upstream rather than a fresh
         /// dial. Default never stalls.
         origin_mute_after_served: u32 = std.math.maxInt(u32),
+        /// From the Nth request on, the origin answers `100 Continue` and
+        /// closes — the reused-upstream-dies-after-an-interim shape.
+        origin_interim_then_close_after_served: u32 = std.math.maxInt(u32),
         /// The origin closes the second accepted connection at accept —
         /// the replayed try fails too, pinning the one-replay budget.
         close_second_at_accept: bool = false,
@@ -668,6 +695,7 @@ const Http1Bed = struct {
             .close_after_response = options.origin_closes,
             .mute = options.origin_mute,
             .mute_after_served = options.origin_mute_after_served,
+            .interim_then_close_after_served = options.origin_interim_then_close_after_served,
             .close_second_at_accept = options.close_second_at_accept,
         };
         if (options.origin_listens) {
@@ -4889,5 +4917,156 @@ test "l7: a drain with no deadline still ends, because tunnels are cut" {
     // The line the drain's own counter cannot say: the loop actually
     // stopped, with every pool given back (§9's leak invariant).
     try std.testing.expect(bed.server.isIdle());
+    try bed.expectDrained();
+}
+
+test "l7: a 100 Continue reaches the client and the exchange goes on" {
+    // The `curl -d @file` case (#232). curl sends `Expect: 100-continue`
+    // for any body over 1 KiB and nginx honours it, so before this the
+    // client got `100 Continue` followed by a close — the body had not
+    // been pumped, so nothing could park and nothing could keep.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 300,
+        .origin_response = "HTTP/1.1 100 Continue\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
+        "Expect: 100-continue\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody");
+
+    // Both, in order: the interim the client was waiting for, then the
+    // answer. An interim is relayed rather than absorbed because a `100`
+    // a client never sees is the whole point of `Expect` withheld.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 100 Continue\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_interim_forwarded"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_interim_overrun"));
+    try bed.expectDrained();
+}
+
+test "l7: a 103 does not settle the exchange, so no answer is left unread" {
+    // The sharper half of #232. With the body already sent,
+    // `request_leg == .done` and the origin's keep-alive verdict is
+    // honoured — so the interim was rendered as the answer and the
+    // upstream parked with the *real* response still unread in its
+    // socket. The next checkout would read it as its own: one client's
+    // answer delivered to another.
+    //
+    // Two requests over one connection is what makes that visible. If
+    // the 103 settled the first exchange, the second would be served the
+    // first's leftover `200` — here both must get their own.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 301,
+        .origin_response = "HTTP/1.1 103 Early Hints\r\n" ++
+            "Link: </s.css>; rel=preload\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /second HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /first HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" ++
+            "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    // Two exchanges, two answers, two interims — and the origin served
+    // both requests rather than one of them reading the other's reply.
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_interim_forwarded"));
+    try std.testing.expectEqual(@as(u32, 2), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: an origin that only ever sends interims is cut at the bound" {
+    // Neither nginx nor HAProxy bounds this; zoxy must, because an
+    // unbounded loop on the one thread is what §1 rules out (#232). The
+    // overrun is counted apart from a malformed head: nothing was
+    // malformed, the bound is what ran out.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 302,
+        .origin_response = "HTTP/1.1 103 Early Hints\r\n\r\n" ** 12,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(
+        @as(u64, constants.interim_responses_max),
+        bed.server.counters.get("l7_interim_forwarded"),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_interim_overrun"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+    try bed.expectDrained();
+}
+
+test "l7: a 101 nobody asked for fails the exchange" {
+    // `101` is a protocol switch, not a continuation, so it cannot be
+    // relayed as interim — carrying on to read the next head would meet
+    // bytes that are no longer HTTP. An origin sending one to a request
+    // that carried no `Upgrade` is doing something it was not invited to
+    // (#232, #180).
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 303,
+        .origin_response = "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_interim_forwarded"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tunnels_established"));
+    try bed.expectDrained();
+}
+
+test "l7: an interim spends the free replay — the origin already spoke" {
+    // The §7 replay is for a *stale* checkout: a parked connection the
+    // origin closed while nobody was looking, where nothing reached an
+    // application. An interim proves the opposite — the origin answered,
+    // and this proxy already relayed that answer to the client (#232).
+    //
+    // `replayEligible`'s "a response byte arrived" test reads
+    // `upstream.head_len`, which `forwardInterim` compacts back to zero,
+    // so without an explicit check the guard is blind exactly here and
+    // the request would be re-sent to a second origin after the first had
+    // begun processing it.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 304,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        // The first request parks a reusable upstream; the second checks
+        // it out, gets an interim, and loses the origin on it.
+        .origin_interim_then_close_after_served = 1,
+    });
+    defer bed.tearDown();
+
+    bed.client.next = &bed.client2;
+    bed.client2.request = "GET /b HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    // The reuse happened and the interim reached the second client —
+    // and then the exchange failed honestly instead of being replayed.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_reused"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_interim_forwarded"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_replayed"));
+    // One origin connection per client: the request was never sent twice.
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
     try bed.expectDrained();
 }

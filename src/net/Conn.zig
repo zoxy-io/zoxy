@@ -136,6 +136,10 @@ pub const ClientWrite = struct {
         response_body,
         /// A static response is out: the lingering close (§7, §8).
         lingering_close,
+        /// An interim `1xx` reached the client and the exchange is
+        /// *not* over (#232): go back to reading the origin's next
+        /// response head, which may already be buffered behind it.
+        interim_sent,
         /// The origin's `101` is out and the client has it, so the HTTP
         /// conversation on this connection is over (#180): hand the
         /// connection to the relay. Deliberately *after* the head reaches
@@ -619,6 +623,12 @@ pub fn Conn(comptime IoType: type) type {
             /// tells the render to let the participating
             /// `Connection`/`Upgrade` pair travel.
             upgrade_requested: bool = false,
+            /// Interim `1xx` responses this exchange has already relayed
+            /// (#232). Per exchange, not per connection: the bound is
+            /// about one origin answering one request, and a keep-alive
+            /// turnaround clears `l7` wholesale, so it cannot leak into
+            /// the next request even if a path forgets to reset it.
+            interims_seen: u8 = 0,
             /// The endpoints this request dialed and had refused or found
             /// unreachable (#181), in the order it tried them — the
             /// exclusion set the next pick runs over. Sized for the first

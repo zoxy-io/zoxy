@@ -47,6 +47,15 @@ pub const OriginMode = enum(u8) {
     /// Send the oversize-after-edits head at accept time, then drain:
     /// the render-failure race into the deferred-render path.
     instant_oversize,
+    /// Answer `100 Continue` and then the canonical sized 200 (#232).
+    /// An interim is not the answer: a proxy that settles on one closes
+    /// on a client still sending its body, or parks an upstream with the
+    /// real response unread and hands it to the next client.
+    interim_then_sized,
+    /// Answer `103 Early Hints` past the proxy's own bound and never
+    /// answer at all — the unbounded-`1xx` origin neither nginx nor
+    /// HAProxy bounds, which the one-thread design has to.
+    interim_flood,
     /// Answer the sized keep-alive 200, then close: the proxy parks on
     /// the head's promise, the FIN lands while parked, and the next
     /// checkout meets the §5 stale connection — the §7 replay's shape.
@@ -438,6 +447,18 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 assert(conn.phase == .head);
                 switch (conn.mode) {
                     .sized, .reset => conn.armRecv(),
+                    .interim_then_sized => {
+                        conn.response_bytes = canon.interim_continue ++ canon.sized_response;
+                        conn.armRecv();
+                    },
+                    .interim_flood => {
+                        // Never answers: the proxy's own bound is what
+                        // ends this, which is the whole point of the mode.
+                        conn.response_bytes = canon.interim_hints **
+                            (zoxy.constants.interim_responses_max + 2);
+                        conn.drain_only = true;
+                        conn.armRecv();
+                    },
                     .stale_reuse => {
                         // The keep-alive head parks the proxy's side; the
                         // close after responding is the staleness itself.

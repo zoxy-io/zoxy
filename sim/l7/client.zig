@@ -398,6 +398,10 @@ pub fn Client(comptime IoType: type) type {
 
         pub const Walk = struct {
             complete_count: u8,
+            /// Interim `1xx` heads walked past (#232). Kept apart from
+            /// `complete_count` because they are not responses — an
+            /// exchange that carried three of them still answered once.
+            interim_count: u8,
             offset: u32,
             statuses: [responses_max]u16,
             /// Per-response persistence verdicts (§7): version defaults
@@ -415,6 +419,7 @@ pub fn Client(comptime IoType: type) type {
         pub fn walkResponses(bytes: []const u8, entry: Spec, connection: Connection) Walk {
             var walk = Walk{
                 .complete_count = 0,
+                .interim_count = 0,
                 .offset = 0,
                 .statuses = @splat(0),
                 .keep_alives = @splat(false),
@@ -436,6 +441,23 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = ClientError.ResponseCorrupted;
                     return walk;
                 };
+                // An interim `1xx` is not the response (#232): the origin
+                // has not answered yet, so it advances the walk without
+                // counting toward the transcript or its allowed set. That
+                // is what lets every existing script stay exactly as it
+                // was while an origin drawn into an interim mode prefixes
+                // one — and it is the oracle half of the bug, since a
+                // proxy that *settled* on the interim would leave the
+                // real answer unwalked and the count short.
+                // `101` is excluded on the same grounds the proxy excludes
+                // it: a protocol switch, not a continuation. It *is* the
+                // answer to an upgrade (#180), and walking past it would
+                // leave that transcript looking like no response at all.
+                if (response.status >= 100 and response.status < 200 and response.status != 101) {
+                    walk.interim_count +|= 1;
+                    walk.offset += response.head_len;
+                    continue;
+                }
                 if (std.mem.indexOfScalar(u16, entry.allowed_statuses, response.status) == null) {
                     walk.violation = ClientError.ResponseStatusUnexpected;
                     return walk;

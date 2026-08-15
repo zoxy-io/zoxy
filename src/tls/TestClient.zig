@@ -700,6 +700,15 @@ fn completeResponses(bytes: []const u8) u32 {
             .chunked, .until_close => break,
         };
         if (rest.len - head.head_len < body_len) break;
+        // An interim `1xx` is not an answer (#232): the origin still owes
+        // one, so counting it here would read as a response this session
+        // never earned — which is exactly what the caller's
+        // responses-vs-requests bound exists to catch. `101` is excluded
+        // on the proxy's own grounds: a protocol switch *is* the answer.
+        if (head.status >= 100 and head.status < 200 and head.status != 101) {
+            rest = rest[head.head_len..];
+            continue;
+        }
         count += 1;
         rest = rest[head.head_len + body_len ..];
     }
