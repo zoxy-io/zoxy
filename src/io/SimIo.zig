@@ -1085,6 +1085,22 @@ pub fn dropPendingOps(io: *SimIo, kind: OpKind) u32 {
     return dropped;
 }
 
+/// Whether any op of `kind` is pending and still deliverable — what a
+/// caller about to strand one asks first, so it picks a kind the schedule
+/// actually armed instead of spending its seed on a kind that is not
+/// there (#206). Already-dropped ops do not count: they are pending
+/// forever by construction, and stranding them again would take nothing.
+pub fn hasPendingOp(io: *const SimIo, kind: OpKind) bool {
+    assert(kind != .none);
+    assert(io.pending_count <= pending_ops_max);
+    for (io.pending[0..io.pending_count]) |completion| {
+        if (completion.op != kind) continue;
+        if (completion.dropped) continue;
+        return true;
+    }
+    return false;
+}
+
 /// #206's other ask: no slot may be released while an op still
 /// references it. Every ordinary use of a handle goes through
 /// `socketEntry`, which asserts the entry is still acquired and its

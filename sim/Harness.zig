@@ -193,13 +193,15 @@ http_origin_stop_at_ns: u64,
 /// move nothing while shifting the whole sweep's stream position.
 clock_jump_wanted: bool,
 clock_jumped: bool,
-/// The #206 op kind this seed strands at its wind-down, or null; and
-/// whether the strand has happened. Two fields for the reason the pair
-/// above is two: what a seed drew and what it did are different facts,
-/// and `verify` needs the draw to still be there when it decides whether
-/// a stuck drain was asked for.
+/// Whether this seed strands ops at its wind-down (#206), and — once it
+/// has — which kind it stranded. Two fields for the reason the pair above
+/// is two: what a seed drew and what it did are different facts, and
+/// `verify` needs the second one to decide whether a stuck drain was
+/// asked for. The kind is not part of the draw: it is chosen at the
+/// wind-down from the kinds actually armed there, so a strand never
+/// stands for ops that were not there to take.
+drop_wanted: bool,
 drop_kind: ?SimIo.OpKind,
-drop_taken: bool,
 http_origin_stop_completion: SimIo.Completion,
 /// Virtual instant at which the drain begins, or 0 for "at the
 /// scenario's end like every other seed".
@@ -596,7 +598,7 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     );
     harness.listeners_count = if (harness.tls_clients >= 1) 3 else 2;
     harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
-    harness.drop_kind = deriveDropKind(harness.clean, random);
+    harness.drop_wanted = deriveDropWanted(harness.clean, random);
     assert(harness.listeners_count <= harness.listener_configs.len);
     assert(harness.tls_clients >= 1 or !harness.clock_jump_wanted);
 }
@@ -1169,7 +1171,7 @@ fn populateTlsClients(harness: *Harness, random: std.Random) void {
     harness.tls_resume_started = false;
     harness.scenario_ended = false;
     harness.clock_jumped = false;
-    harness.drop_taken = false;
+    harness.drop_kind = null;
     assert(harness.tls_clients <= tls_clients_max);
     // One token past the drawn count, for the resuming client's slot.
     const token_count = if (harness.tls_clients >= 1)
@@ -1486,20 +1488,30 @@ fn clientEnded(harness: *Harness) void {
 /// what a readiness backend did in #203.
 ///
 /// At the wind-down because that is where the ops worth stranding are
-/// armed. Measured over the sweep, ops pending when a drain begins:
-/// accept and timer on essentially every run, recv on 55%, log_write 26%,
-/// connect 24%, recv_group 10% — and `close` on *none*, which is why the
-/// kinds below are the ones they are and why "a slot that can never be
-/// released" is still out of reach from here. Reaching that one needs a
-/// drop placed mid-teardown, which is a different hook.
+/// armed. Measured over a 4096-seed sweep, the share of wind-downs
+/// holding at least one op of a kind: timer 98%, accept 98%, recv 53%,
+/// connect 24%, log_write 24%, timer_cancel 15%, recv_group 10%, send
+/// 1.2%, connect_cancel 1.0% — and `close` on none of them.
 ///
-/// The kind is drawn rather than the op, deliberately: accept and timer
-/// are four fifths of everything pending, so picking a random *op* would
-/// spend the whole fraction on those two and reach recv_group about once
-/// in a sweep.
+/// The kind is picked here, out of what is armed, rather than drawn with
+/// the rest of the topology, and the spread above is why. A kind named
+/// before the run spends its seed whether or not the wind-down holds one:
+/// 230 of the 368 runs that drew a kind found none of it armed and
+/// stranded nothing, and the kinds armed under a fifth of the time were
+/// out of reach in practice — a blind draw finds `send` armed about once
+/// in five sweeps. Picking from the armed set makes every drawn run
+/// strand: 316 strands against 124, and 112 runs reaching the §8 give-up
+/// against 52. What it costs is a seed's strand being settled before the
+/// run starts, which nothing needed — `verify` reads what was stranded,
+/// never what was going to be.
+///
+/// Uniform over *kinds* rather than over pending *ops*, deliberately:
+/// accept and timer are four fifths of everything pending, so picking a
+/// random op would spend nearly every strand on those two and reach
+/// recv_group about once in a sweep.
 fn maybeStrandOps(harness: *Harness) void {
-    const kind = harness.drop_kind orelse return;
-    if (harness.drop_taken) return;
+    if (!harness.drop_wanted) return;
+    if (harness.drop_kind != null) return;
     // A zero `drain_deadline_ms` is "no cap" (§5), and the deadline timer
     // is the only thing that ever arms the give-up: `onDrainStuck` is
     // started by `onDrainDeadline`, so a drain with no deadline has no
@@ -1510,51 +1522,95 @@ fn maybeStrandOps(harness: *Harness) void {
     // the same shape the excluded `timer` kind has and just as much a
     // true statement about the backstop's reach rather than a defect.
     //
-    // Skipped at the strand rather than at the draw because `drop_kind` is
-    // drawn in `deriveTerminatingDraws` and the deadline one call later in
-    // `deriveServerConfig` — adjacent siblings under `deriveTopology`, in
-    // that order. Gating the draw needs the deadline first, and swapping
-    // two calls re-rolls every draw after them for the whole sweep, taking
-    // the §9 census margins with it. A one-line skip here is the cheaper
-    // half of that trade by a wide margin. It leaves `drop_taken` false, so
-    // `verify` holds this seed to the ordinary invariants — exactly what a
-    // seed that stranded nothing is for — and costs only the seeds where
-    // the backstop does not exist: measured over a 4096-seed sweep, 7 seeds
-    // draw a drop against a no-cap deadline against 159 that draw one they
-    // can use.
+    // Skipped at the strand rather than at the draw because the draw runs
+    // in `deriveTerminatingDraws` and the deadline is settled one call
+    // later in `deriveServerConfig`. Gating the draw needs the deadline
+    // first, and swapping two calls re-rolls every draw after them for the
+    // whole sweep, taking the §9 census margins with it. The skip leaves
+    // `drop_kind` null, so `verify` holds this seed to the ordinary
+    // invariants — exactly what a seed that stranded nothing is for.
     //
     // Found by the nightly soak (run #18, 2026-08-13). All four shards hit
     // the 16-failure cap early in their slices — shard 0 at 36k — and every
     // named seed had drawn both a mid-scenario drain with the no-cap
-    // deadline and a drop. Only a quarter or so of the seeds this skips
-    // would have deadlocked at all: a drawn kind with nothing armed of it
-    // strands nothing, which is why the draw rate above is the higher
-    // number.
+    // deadline and a drop.
     if (harness.config.drain_deadline_ms == 0) return;
+    const kind = harness.drawStrandKind() orelse return;
     const dropped = harness.io.dropPendingOps(kind);
-    // A latch rather than clearing the draw, for the reason the clock
-    // jump keeps two fields: what the seed *drew* and what it *did* are
-    // different facts, and `verify` needs the first one to still be
-    // there when it decides whether a stuck drain was asked for.
-    //
-    // Latched on `dropped >= 1`, not on reaching this line. The excuse
-    // `verify` grants is "this seed stranded something, so it may end at
-    // the give-up", and a draw that found nothing armed of its kind
-    // stranded nothing — it is an ordinary seed and owes the ordinary
-    // invariants. Latching on the attempt instead would hand that excuse
-    // to every such seed, so a genuine stuck drain arriving on one would
-    // be waved through as "#206 working as intended": the same hole the
-    // `drop_taken` gate was added to close, one step further out.
-    if (dropped >= 1) harness.drop_taken = true;
-    // The excuse is earned by stranding, not by arriving: this is the
-    // whole content of the paragraph above, in the form that breaks if a
-    // later edit reintroduces the unconditional latch.
-    assert(harness.drop_taken == (dropped >= 1));
-    // Nothing armed of that kind is a legal outcome, not a failed draw —
-    // the sweep's job is to try, and the oracle holds either way. A
-    // stranded op stays *pending*, so the table it was counted out of is
+    // The kind came out of the armed set, so a strand that took nothing is
+    // a contradiction rather than the legal outcome it used to be: either
+    // the pick read a table the drop then disagreed with, or an op left
+    // the table between the two calls — and nothing runs in between.
+    assert(dropped >= 1);
+    // A stranded op stays *pending*, so the table it was counted out of is
     // still the bound; more than that would mean one was counted twice.
     assert(dropped <= harness.io.pending_count);
+    // What the seed *did*, which is the fact `verify` reads — recorded
+    // after the drop rather than before it, because the excuse it grants
+    // ("this run may end at the give-up") is earned by stranding.
+    harness.drop_kind = kind;
+}
+
+/// One kind out of those armed at this wind-down, or null when the
+/// wind-down holds nothing but timers — the one kind left out below.
+///
+/// `timer` is left out because stranding one is the shape the §8 backstop
+/// provably cannot catch: `onDrainStuck` is itself a timer, so a seed that
+/// strands the drain deadline strands the thing that would have reported
+/// it, and the run ends in `SimIo`'s deadlock rather than in a diagnostic.
+/// Found by drawing it — seed 2302, three dropped timers and nothing else
+/// pending. That is a true statement about the backstop's reach and not a
+/// defect this sweep can hold the proxy to, so it is recorded here and
+/// pinned by a directed test (`src/io/contract_test.zig`) instead, which
+/// is the form that breaks loudly if it ever stops being true. Covering it
+/// for real needs a watchdog that is not a timer: a design question, not a
+/// gate.
+///
+/// Nothing else is left out, including `close` — the one kind measured at
+/// zero wind-downs in 4096 seeds. Naming it as an exclusion would be a
+/// census baked into the code, going stale the first time the admin plane
+/// (`submitClose`, the sole `io.close` caller) is still closing its scrape
+/// when a drain begins. Asking the pending table instead spends nothing on
+/// a kind that is not there and picks one up the run it appears. Its
+/// absence is a property of the teardown path rather than an accident:
+/// `continueTeardown` waits for `armedCount()` to reach zero and closes
+/// *synchronously*, so a connection never has a close to take away — which
+/// costs this hook nothing, since every conn-armed kind it can strand
+/// already leaves a slot that cannot be released.
+///
+/// Drawn from the scenario stream at the wind-down, so it consumes nothing
+/// on the fifteen in sixteen seeds that strand nothing and leaves their
+/// stream position — and with it the whole sweep's coverage — where it was.
+fn drawStrandKind(harness: *Harness) ?SimIo.OpKind {
+    // Adding a kind here needs a matching arm in `strandCanExplainStuck`,
+    // which lists `timer` and `none` as `unreachable`: without one the new
+    // kind panics every seed that strands it, which is the loudest way to
+    // ask whoever adds it which planes it can leave stuck.
+    const strandable = [_]SimIo.OpKind{
+        .accept,
+        .connect,
+        .recv,
+        .recv_group,
+        .send,
+        .close,
+        .log_write,
+        .timer_cancel,
+        .connect_cancel,
+    };
+    var armed: [strandable.len]SimIo.OpKind = undefined;
+    var armed_count: usize = 0;
+    for (strandable) |kind| {
+        if (!harness.io.hasPendingOp(kind)) continue;
+        armed[armed_count] = kind;
+        armed_count += 1;
+    }
+    assert(armed_count <= armed.len);
+    if (armed_count == 0) return null;
+    const kind = armed[harness.scenario_prng.random().uintLessThan(usize, armed_count)];
+    // The pick is the whole point: a kind returned here is one the strand
+    // that follows can actually take.
+    assert(harness.io.hasPendingOp(kind));
+    return kind;
 }
 
 /// What a seed that ended at the §8 give-up owes instead of the ordinary
@@ -1579,7 +1635,7 @@ fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void
     // including one a future release bug produced with every op
     // delivered, which is the exact defect this backstop exists to catch
     // and the last thing the sweep should swallow.
-    if (!harness.drop_taken) return error.DrainStuckWithoutStrand;
+    if (harness.drop_kind == null) return error.DrainStuckWithoutStrand;
     // The give-up is allowed to leave work unfinished. It is not allowed
     // to have freed a slot an op still points at: that is the §5
     // corruption the generation counter exists to catch, and this is the
@@ -1597,18 +1653,23 @@ fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void
 /// an operator somewhere useless with the process already gone.
 ///
 /// Deliberately permissive — it asks that *some* stuck plane could own an
-/// op of the drawn kind, never that a named one is stuck. Which plane a
+/// op of the stranded kind, never that a named one is stuck. Which plane a
 /// strand lands on is a property of the schedule, and an oracle that
 /// pinned it would fail on the rare seed rather than on a defect. That
 /// bill was just paid once: #220's deadlock was a gate demanding an
 /// outcome the configuration had declined.
 ///
-/// Measured over a 4096-seed sweep, for the shape rather than the rule:
-/// `log_write` lands on the access log 20 runs in 20, `recv` and
-/// `recv_group` on conns 22 in 22, `connect` on health 8 and conns 2.
+/// Measured over a 4096-seed sweep, for the shape rather than the rule —
+/// which plane each stranded kind left stuck, in runs: `recv` conns 46,
+/// `log_write` the log 24, `timer_cancel` conns 12 and conns+health 2,
+/// `connect` health 10 and conns 4, `recv_group` conns 10, `send` conns 2,
+/// `connect_cancel` conns 2. `accept` never leaves anything stuck at all —
+/// 88 strands, no give-up — and admin is never the stuck plane.
 fn strandCanExplainStuck(harness: *const Harness) bool {
     const kind = harness.drop_kind.?;
-    assert(harness.drop_taken);
+    // Only `verifyGaveUp` calls this, and only after both of its own
+    // gates: the run ended at an abort, and this seed stranded something.
+    assert(harness.io.abortedWith() != null);
     const conns_stuck = !harness.server.conns.isFullyReleased();
     const admin_stuck = !harness.server.admin.isQuiescent();
     const log_stuck = !harness.server.access_log.isQuiescent();
@@ -1622,72 +1683,48 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
         // Nothing but the access log writes one.
         .log_write => log_stuck,
         // Connections read, the admin plane reads its scrape, and the
-        // prober reads its probe; all three dial except the admin one.
-        .recv => conns_stuck or admin_stuck or health_stuck,
+        // prober reads its probe; all three dial except the admin one, and
+        // all three write.
+        .recv, .send => conns_stuck or admin_stuck or health_stuck,
         .connect => conns_stuck or health_stuck,
         // A listener's accept feeds admission and the admin plane.
         .accept => conns_stuck or admin_stuck,
-        // Out of the draw, so unreachable rather than defaulted: adding
-        // one to `deriveDropKind`'s list without giving it an arm here
-        // panics every seed that draws it, and a named arm is what makes
-        // that obvious to whoever adds the next kind.
-        .none,
-        .send,
-        .close,
-        .timer,
-        .timer_cancel,
-        .connect_cancel,
-        => unreachable,
+        // A timer cancel belongs to a conn's deadline, the prober's own
+        // pacing timer, or the admin plane's scrape deadline.
+        .timer_cancel => conns_stuck or admin_stuck or health_stuck,
+        // Only the first two of those three dial, so only they can have a
+        // connect to cancel.
+        .connect_cancel => conns_stuck or health_stuck,
+        // `submitClose` is the proxy's only `io.close`, and it is the admin
+        // plane's; a connection's closes are `closeNow`, which leaves no
+        // completion to strand. No seed has reached this arm — `close` has
+        // never been armed at a wind-down — and it is written out anyway,
+        // because the alternative is an exclusion list, and
+        // `drawStrandKind` records why this hook no longer keeps one.
+        .close => admin_stuck,
+        // Out of `drawStrandKind`'s list, so unreachable rather than
+        // defaulted: adding one there without giving it an arm here panics
+        // every seed that strands it, and a named arm is what makes that
+        // obvious to whoever adds the next kind.
+        .none, .timer => unreachable,
     };
 }
 
-/// Which op kind a seed strands, or null for the fifteen in sixteen that
-/// strand nothing. A small fraction on purpose: a stranded run trades
+/// Whether this seed strands anything at its wind-down: one in sixteen
+/// adversarial ones. A small fraction on purpose — a stranded run trades
 /// every other oracle for the one it exists to check, since a drain that
 /// cannot finish leaves pools held and counters unreconciled by design.
-///
-/// The kinds are the ones actually armed at a wind-down, minus two that
-/// are left out for opposite reasons.
-///
-/// `close` is never armed there at all, so naming it would be a draw that
-/// silently tested nothing. Reaching it needs a drop placed mid-teardown.
-///
-/// `timer` is excluded because stranding one is the shape the §8 backstop
-/// provably cannot catch: `onDrainStuck` is itself a timer, so a seed
-/// that strands the drain deadline strands the thing that would have
-/// reported it, and the run ends in `SimIo`'s deadlock rather than in a
-/// diagnostic. Found by drawing it — seed 2302 deadlocked with three
-/// dropped timers and nothing else pending, though that seed will not
-/// reproduce it against the list as shipped: the draw indexes `kinds`,
-/// so adding, removing or reordering an entry silently re-rolls which
-/// seed draws which kind. The case is pinned by a directed test instead
-/// (`src/io/contract_test.zig`), which is the form that breaks loudly if
-/// it ever stops being true. That is a true statement
-/// about the backstop's reach and not a defect this sweep can hold the
-/// proxy to, so it is recorded rather than asserted; covering it would
-/// need a watchdog that is not a timer, which is a design question and
-/// not a gate.
-fn deriveDropKind(clean: bool, random: std.Random) ?SimIo.OpKind {
+/// Which kind it takes is not decided here; `drawStrandKind` picks that
+/// from what the wind-down actually holds.
+fn deriveDropWanted(clean: bool, random: std.Random) bool {
     // Adversarial seeds only, for the reason every sibling draw states:
     // a clean seed's oracle is each script's exact golden outcome, and a
     // stranded op ends the run at the give-up before those oracles are
     // reached — for every client in the scenario, not just the one the
     // strand touched. A silently unanswered exchange passing as "the
     // backstop worked" is precisely what clean seeds exist to forbid.
-    if (clean) return null;
-    if (random.uintLessThan(u8, 16) != 0) return null;
-    // Adding an entry here needs a matching arm in `strandCanExplainStuck`,
-    // which lists the kinds out of the draw as `unreachable`. Without one
-    // the new kind panics every seed that draws it — on top of re-rolling
-    // which seed draws what, the trap the paragraph above describes.
-    const kinds = [_]SimIo.OpKind{
-        .accept,
-        .recv,
-        .connect,
-        .log_write,
-        .recv_group,
-    };
-    return kinds[random.uintLessThan(usize, kinds.len)];
+    if (clean) return false;
+    return random.uintLessThan(u8, 16) == 0;
 }
 
 /// #202, on the seeds that drew it: step the wall clock past a sealing
