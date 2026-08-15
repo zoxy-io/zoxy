@@ -636,7 +636,13 @@ test "simio: a dropped accept is never delivered, where a live one is" {
         &stuck,
         DroppedAccept.onAccept,
     );
+    // What the sweep picks a kind to strand from (`sim/Harness.zig`):
+    // armed now, and *not* armed once taken, so a later pick cannot spend
+    // itself on ops that are already stranded.
+    try std.testing.expect(stuck_io.hasPendingOp(.accept));
+    try std.testing.expect(!stuck_io.hasPendingOp(.recv));
     try std.testing.expectEqual(@as(u32, 1), stuck_io.dropPendingOps(.accept));
+    try std.testing.expect(!stuck_io.hasPendingOp(.accept));
     stuck_io.listenClose(stuck_listener);
     try std.testing.expectError(error.Deadlock, stuck_io.run());
     try std.testing.expect(stuck.outcome == null);

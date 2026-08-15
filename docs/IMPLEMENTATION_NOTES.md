@@ -158,8 +158,8 @@ whether one stranded anything.** Either the ordinary invariants hold, or
 the server gave up with the code that names which backstop it was. What
 that phrasing buys is the property actually worth holding — no schedule
 may end with the loop alive and nobody the wiser — rather than a
-weaker "stranded seeds are excused". 52 runs per 4096-seed sweep take the
-second branch.
+weaker "stranded seeds are excused". 112 runs per 4096-seed sweep take
+the second branch.
 
 The abort is only excused on a seed that actually stranded something,
 which needs the draw and the strand kept as two facts rather than one
@@ -168,14 +168,14 @@ as "#206 working as intended" — including one a future *release* bug
 produced with every op delivered, which is the exact defect the backstop
 exists to catch and the last thing a sweep should swallow.
 
-That gate shipped one step short of what the paragraph above claims.
-`drop_taken` was latched on *reaching* the strand rather than on
-stranding anything, and a draw whose kind has nothing armed of it strands
-nothing — so those seeds carried the excuse without having earned it, and
-a genuine stuck drain landing on one would have been waved through. The
-latch is now `dropped >= 1`. It cost no coverage: the give-up branch is
-still taken 52 times per 4096-seed sweep, because a seed that stranded
-nothing had no reason to reach it.
+That gate shipped one step short of what the paragraph above claims. The
+excuse was latched on *reaching* the strand rather than on stranding
+anything, and a draw whose kind had nothing armed of it stranded nothing
+— so those seeds carried the excuse without having earned it, and a
+genuine stuck drain landing on one would have been waved through. What
+`verify` reads is now `drop_kind`, recorded only after a drop that took
+at least one op. It cost no coverage, because a seed that stranded
+nothing had no reason to reach the branch anyway.
 
 **What the give-up branch asserts.** Reaching it used to end the seed:
 the exit code was checked, the strand was checked, and nothing else. Two
@@ -210,66 +210,87 @@ for every client in the scenario, not only the one the strand touched. A
 silently unanswered exchange passing as "the backstop worked" is
 precisely what clean seeds exist to forbid.
 
-**Draw the kind, not the op.** Measured at a wind-down, `accept` and
-`timer` are four fifths of everything pending, so picking a random *op*
-would spend the whole fraction on those two and reach `recv_group` about
-once per sweep.
+**Pick the kind out of what is armed, not before the run.** Measured at a
+wind-down, `accept` and `timer` are four fifths of everything pending, so
+picking a random *op* would spend nearly every strand on those two and
+reach `recv_group` about once per sweep. Picking a *kind* fixes that. The
+first version picked it with the rest of the topology, before the
+scenario ran — which is a bet on what the wind-down will hold. The share
+of wind-downs holding at least one op of a kind, over a 4096-seed sweep:
 
-Two kinds are excluded, for opposite reasons, and both are findings.
+| kind | armed | kind | armed |
+| --- | --- | --- | --- |
+| `timer` | 98% | `log_write` | 24% |
+| `accept` | 98% | `timer_cancel` | 15% |
+| `recv` | 53% | `recv_group` | 10% |
+| `connect` | 24% | `send` | 1.2% |
+| | | `connect_cancel` | 1.0% |
+| | | `close` | 0% |
 
-`close` is **never** armed at a wind-down — zero occurrences across the
-sweep — so naming it would be a draw that silently tested nothing.
+The bet lost more often than it won: 230 of the 368 runs that drew a kind
+found none of it armed and stranded nothing, and the kinds armed under a
+fifth of the time were out of reach in practice — a blind draw finds
+`send` armed about once in five sweeps. `drawStrandKind` asks the pending
+table instead and picks uniformly among the kinds that are there. Every
+drawn run now strands: 316 strands per sweep against 124, and 112 runs
+reaching the give-up against 52. The strand is no longer settled before
+the run starts, which nothing needed — `verify` reads what was stranded,
+never what was going to be.
+
+It also empties the exclusion list down to one entry. `close` used to be
+excluded for being armed at *no* wind-down, ever; an armed-set pick
+spends nothing on a kind that is not there, so the exclusion bought
+nothing and would have been a census baked into the code, going stale the
+first time the admin plane's `submitClose` — the proxy's only `io.close`
+— is still in flight when a drain begins.
 
 An earlier version of this section drew a second conclusion from that
-measurement and it was wrong, so it is corrected here rather than
-quietly dropped: it said "a slot that can never be released", the
-scarier half of the #203 class, was therefore out of reach until a
-mid-teardown hook existed. Slot release does not wait on a close.
-`continueTeardown` returns early while `armedCount() != 0`, and once that
-reaches zero it closes **synchronously** with `closeNow` and releases in
-the same call; a connection's armed set is two data directions,
-`connect`, `connect_cancel`, `deadline`, `deadline_cancel`, and no close.
-There is no close op to drop because the teardown path arms none.
-Stranding any conn-armed op therefore produces an unreleasable slot
-already: recording the stuck plane at each give-up over a 4096-seed
-sweep gives `recv` 16 runs and `recv_group` 6 on conns, `connect` 8 on
-health and 2 on conns, and `log_write` 20 on the access log — 24 of the
-52 holding a conn slot that never released.
+zero and it was wrong, so it is corrected here rather than quietly
+dropped: it said "a slot that can never be released", the scarier half of
+the #203 class, was therefore out of reach until a mid-teardown hook
+existed. Slot release does not wait on a close. `continueTeardown`
+returns early while `armedCount() != 0`, and once that reaches zero it
+closes **synchronously** with `closeNow` and releases in the same call; a
+connection's armed set is two data directions, `connect`,
+`connect_cancel`, `deadline`, `deadline_cancel`, and no close. There is
+no close op to drop because the teardown path arms none. Stranding any
+conn-armed op therefore produces an unreleasable slot already: recording
+the stuck plane at each give-up over a 4096-seed sweep gives `recv` 46
+runs, `timer_cancel` 12, `recv_group` 10, `connect` 4, `send` 2 and
+`connect_cancel` 2 on conns, `connect` 10 on health, `timer_cancel` 2 on
+both, and `log_write` 24 on the access log — 76 of the 112 holding a conn
+slot that never released. `accept` is the one kind that strands without
+ever leaving a plane stuck: 88 strands per sweep, no give-up. The admin
+plane is never the stuck one.
 
 What a wind-down drop genuinely cannot reach is the pair of cancels
 `beginTeardown` arms, since it arms them *after* the strand lands. That
 is the real argument for the mid-teardown hook, and it is not the
 argument this section used to make.
 
-Three kinds are armed at a wind-down and absent from the draw with no
-reason recorded, which is its own small finding: `timer_cancel` at ~15%
-of wind-downs — more common there than `recv_group`, which is in the
-draw — and `send` and `connect_cancel` at ~1.3%. Stranding a
-`timer_cancel` leaves `armed.deadline_cancel` set forever, an
-unreleasable slot by a route the sweep does not take, and it does not hit
-the `timer` self-reference below because nothing cancels the drain-stuck
-timer. The other two are near the noise floor. Adding `timer_cancel`
-looks like a free coverage win and is not done here.
+`timer` is the one kind still excluded, and it is the finding worth
+carrying: **`onDrainStuck` cannot catch a stranded timer, because it is
+one.** A seed that strands the drain deadline strands the thing that
+would have reported it, and the run ends in the simulator's own deadlock
+with no diagnostic at all — seed 2302, three dropped timers and nothing
+else pending. That is a true statement about the reach of #203's fix
+rather than a defect this sweep can hold the proxy to, so the kind is
+excluded and the case pinned by a directed test in `contract_test.zig`
+instead — the form that breaks loudly if it ever stops being true, where
+a comment would not. Covering it for real would need a watchdog that is
+not a timer, which is a design question and not a gate.
 
-`timer` is worse, and it is the finding worth carrying: **`onDrainStuck`
-cannot catch a stranded timer, because it is one.** A seed that strands
-the drain deadline strands the thing that would have reported it, and the
-run ends in the simulator's own deadlock with no diagnostic at all — seed
-2302, three dropped timers and nothing else pending. That is a true
-statement about the reach of #203's fix rather than a defect this sweep
-can hold the proxy to, so the kind is excluded and the case pinned by a
-directed test in `contract_test.zig` instead — the form that breaks
-loudly if it ever stops being true, where a comment would not. Covering
-it for real would need a watchdog that is not a timer, which is a design
-question and not a gate.
+A trap worth naming while it is fresh: what a given seed strands is not
+stable across edits to this machinery. It was already true when the draw
+indexed a fixed array — adding, removing or reordering an entry re-rolled
+which seed drew which kind, which is why seed 2302 above will not
+reproduce against the shipped code — and picking from the armed set adds
+a second way for it to move, since anything that changes what a schedule
+has in flight at its wind-down changes what there is to pick. Seed
+numbers pinned against a *kind* have a short shelf life; the directed
+tests in `contract_test.zig` are where a case goes to stay reproducible.
 
-A trap worth naming while it is fresh: the draw indexes a `kinds` array,
-so adding, removing or reordering an entry silently re-rolls which seed
-draws which kind. Seed 2302 above will not reproduce against the shipped
-list, because `.timer` is no longer in it. Any seed number pinned against
-this function has the same short shelf life.
-
-**A third case of the same shape, and the one that shipped broken: a
+**The `timer` shape by another route, and the one that shipped broken: a
 drain with no deadline has no backstop to provoke.** `drain_deadline_ms =
 0` is "no cap" (§5) — `beginDrain` arms no timer, and since
 `onDrainStuck` is started by `onDrainDeadline` and nothing else, the
@@ -288,21 +309,24 @@ change missed it and a million-seed block did not: at roughly 7 such
 seeds per 4096, `ci` clears whole runs without producing one.
 
 `maybeStrandOps` skips the strand when the deadline is zero, rather than
-`deriveDropKind` skipping the draw. `drop_kind` is drawn in
-`deriveTerminatingDraws` and the deadline one call later in
+`deriveDropWanted` skipping the draw. The draw runs in
+`deriveTerminatingDraws` and the deadline is settled one call later in
 `deriveServerConfig`, adjacent siblings under `deriveTopology` in that
 order, so gating at the draw means drawing the deadline first — and
 swapping two calls re-rolls every draw after them for the whole sweep,
 census margins included, to fix an 0.2% case. Skipping at the strand
-leaves `drop_taken` false, so the seed is held to the ordinary invariants
+leaves `drop_kind` null, so the seed is held to the ordinary invariants
 like any seed that stranded nothing. Measured cost over a 4096-seed
-sweep: 7 seeds draw a drop they cannot use, against 159 that draw one
+sweep: 8 seeds draw a drop they cannot use, against 158 that draw one
 they can.
 
-The two rates are worth keeping apart: 7 per 4096 is the *draw* rate, and
-the observed failure rate was about a quarter of that (16 across shard
-0's 36k). A drawn kind with nothing armed of it strands nothing, so most
-of what this skip costs was never going to reach the give-up anyway.
+Under the pre-armed draw those two rates were worth keeping apart — the
+observed failure rate was about a quarter of the draw rate (16 across
+shard 0's 36k), because a drawn kind with nothing armed of it stranded
+nothing. Picking from the armed set closes that gap: no seed in a 4096
+sweep reaches the strand with nothing to take, so all 8 skipped seeds are
+seeds that would have stranded — the skip's full price, where it used to
+be about a quarter of it.
 
 The sweep runs with `dump_on_abort = false`. A stranded seed reaches the
 give-up on purpose and its operator forensics are two hundred lines
