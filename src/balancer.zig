@@ -938,6 +938,7 @@ fn testConfig(clusters: []const config_module.Config.Cluster) config_module.Conf
         .drain_deadline_ms = 1,
         .max_lifetime_ms = 0,
         .request_timeout_ms = 0,
+        .tunnel_timeout_ms = constants.tunnel_ms_default,
     };
 }
 

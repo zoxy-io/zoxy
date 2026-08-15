@@ -631,6 +631,7 @@ const Http1Bed = struct {
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = options.max_lifetime_ms,
             .request_timeout_ms = options.request_timeout_ms,
+            .tunnel_timeout_ms = constants.tunnel_ms_default,
             .access_log_sink = if (options.access_log) .stdout else null,
             .health_interval_ms = options.health_interval_ms,
             .error_pages = options.error_pages,

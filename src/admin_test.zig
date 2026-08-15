@@ -75,6 +75,7 @@ const Harness = struct {
             .drain_deadline_ms = 1000,
             .max_lifetime_ms = 0,
             .request_timeout_ms = 0,
+            .tunnel_timeout_ms = constants.tunnel_ms_default,
         };
         try harness.server.init(arena, &harness.sim_io, &harness.config, .{
             .conn_slots = 4,

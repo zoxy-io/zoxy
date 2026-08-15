@@ -251,6 +251,15 @@ pub const tls_engine_bytes_max: u32 = 160 * 1024;
 /// completion, so it costs memory and nothing else.
 pub const tls_engines_max: u32 = 1024;
 
+/// Ceiling on the §5 tunnel pool (#180): the same c10k ceiling conn slots
+/// carry, and necessarily so — a tunnel is an accepted client connection
+/// occupying a slot, so a pool larger than the connections that could
+/// hold one describes a proxy that cannot exist. The loader rejects past
+/// the *effective* `conn_slots` too; this is the comptime half, and the
+/// pair is what leaves the fd and ring budgets untouched by the feature
+/// (§5): `fdsRequired` already charges two sockets per connection.
+pub const tunnels_max: u32 = conn_slots_max;
+
 /// The default when a listener terminates TLS and the operator did not
 /// say. Follows conn slots like the head-buffer ring does — every
 /// connection could be mid-handshake at once — but capped, because
@@ -621,6 +630,33 @@ pub const body_name_bytes_max: u16 = 64;
 /// Upper bound on every configured timeout — one hour. A timeout above
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
+
+/// Ceiling on `timeouts.tunnel_ms` (#180) — the one timeout allowed past
+/// `timeout_ms_max`, and deliberately. That bound exists because an
+/// ordinary timeout above an hour is almost certainly a units mistake;
+/// for a tunnel an hour is not a suspicious number but a routine one, so
+/// reusing it would leave the default sitting *on* the ceiling with no
+/// way to ask for longer. A day is the units-mistake bound for a clock
+/// whose job is to outlive a working session.
+pub const tunnel_ms_max: u32 = 24 * 60 * 60 * 1000;
+
+/// Default bound on one tunnel's whole life (#180), replacing `idle_ms`,
+/// `request_ms` and `max_lifetime_ms` once a connection has become one —
+/// HAProxy's `timeout tunnel` in everything but spelling. An hour,
+/// because what is being bounded is a session whose keepalive is
+/// application-layer ping/pong this proxy cannot see: after `101` the
+/// bytes are opaque by construction, so a legitimately idle WebSocket is
+/// indistinguishable from an abandoned one and the only honest bound is
+/// a generous one.
+pub const tunnel_ms_default: u32 = 60 * 60 * 1000;
+
+/// Floor on `timeouts.tunnel_ms`. A sub-second lifetime would reap every
+/// session the instant it opened — a typo that presents as the feature
+/// not working. "No cap" deliberately has no spelling here at all,
+/// unlike `request_ms`: a tunnel holds a dedicated pool slot for its
+/// whole life (§5), and an unbounded hold on a bounded pool is the one
+/// thing that model cannot absorb.
+pub const tunnel_ms_min: u32 = 1000;
 
 /// Default `timeouts.connect_ms`: the per-try upstream dial budget when
 /// the config omits it (§5). Five seconds is the conventional figure — an
@@ -1166,6 +1202,14 @@ comptime {
     // A retry cap of zero would make the config key unspellable; one
     // retry is the degenerate-but-legal minimum. The set it sizes must
     // still fit the u16 count the balancer scans it with.
+    // A tunnel's clock must be a real duration, must leave headroom above
+    // its default, and must outrank the ordinary ceiling it deliberately
+    // escapes; the pool cannot exceed the connections that hold it.
+    assert(tunnels_max <= conn_slots_max);
+    assert(tunnel_ms_min >= 1);
+    assert(tunnel_ms_default >= tunnel_ms_min);
+    assert(tunnel_ms_max > tunnel_ms_default);
+    assert(tunnel_ms_max >= timeout_ms_max);
     assert(cluster_retries_max >= 1);
     assert(cluster_retries_max < std.math.maxInt(u16));
     // The health prober's reservations and thresholds (§7): the op budget
