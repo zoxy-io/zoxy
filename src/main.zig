@@ -496,6 +496,15 @@ fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
         // its share of the slab itself.
         .upstream_head_buffer_bytes = @sizeOf(zoxy.UpstreamHeadBuffer) + limits.head_buffer_bytes,
         .head_scratch_bytes = head_scratch_bytes,
+        // Zero unless a listener allows an upgrade, on the same terms as
+        // the TLS terms below: a feature nobody asked for costs nothing.
+        // Same element as a shared relay buffer, reserved apart from it
+        // (§5) — the point of the pool, not an accident of it.
+        .tunnels = limits.tunnels,
+        .tunnel_buffer_pair_bytes = if (limits.tunnels == 0)
+            0
+        else
+            @sizeOf(zoxy.RelayBuffer),
         // Zero unless a listener terminates TLS, which is what makes the
         // whole feature free to a deployment that did not ask for it. The
         // three terms move together: `limits.tls_engines` is zero exactly
@@ -601,6 +610,7 @@ fn printMemoryBanner(
         \\          + access log {d} KiB (+ logged headers {d} B)
         \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
         \\          + labeled metrics {d} B (tables, labels and render buffers)
+        \\          + tunnels {d} x {d} B (their own relay buffers, never HTTP's)
         \\          + tls engines {d} x {d} B (+ plaintext {d} B each, libcrypto heap {d} KiB)
         \\          + config arena {d} KiB (measured, not closed-form)
         \\
@@ -628,6 +638,10 @@ fn printMemoryBanner(
         config.clusters.len,
         ServerXev.endpointKeysFor(config).stride,
         ServerXev.metricsBytes(config),
+        // Both read zero unless a listener allows an upgrade — printed
+        // rather than omitted, on the same terms as the TLS line below.
+        limits.tunnels,
+        sizes.tunnel_buffer_pair_bytes,
         // All four read zero on a plaintext deployment, which is the line
         // saying "you are not paying for this" rather than omitting itself
         // and leaving the reader to wonder.

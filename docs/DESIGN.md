@@ -487,7 +487,7 @@ a raised `RLIMIT_NOFILE`:
 | head buffers (ring) | = conn slots | 11466 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11466 | `head_buffer_bytes` + 24 B |
 | tls engines | 0, or min(conn slots, 1024) | 1024 | ~132 KiB + plaintext |
-| tunnels | 0 (off) | 11466 | 2 × 4 KiB + ~64 B state |
+| tunnels | 0 (off) | 11466 | 2 × 4 KiB |
 | **pool memory** | **~34 MiB** | **~384 MiB** | |
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
@@ -509,9 +509,13 @@ would cap tunnels at the upstream-slot count *and starve ordinary HTTP
 on the way there*: not a tuning problem, but two workloads with opposite
 shapes sharing one budget.
 
-So a tunnel draws its relay buffer and its upstream socket from a pool
-of its own, and the request is refused **up front** when that pool is
-full rather than admitted and torn down later (§8). Three properties
+So a tunnel draws its relay buffer from a pool of its own — the same
+element the shared pool holds, reserved apart from it, which is the
+point rather than an accident of it — and the request is refused **up
+front** when that pool is full rather than admitted and torn down later
+(§8). Its upstream socket needs no pool: a tunnel is an accepted client
+connection, and `fdsRequired` already charges every connection the pair
+it holds. Three properties
 follow, and they are why the pool is worth the extra concept: tunnels
 cannot starve HTTP, because they never touch its pools; the cost stays
 closed-form and printable in the startup banner like every other row;
