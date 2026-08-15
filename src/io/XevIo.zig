@@ -1183,9 +1183,84 @@ pub fn signalWait(
     io.notifier.wait(&io.loop, &io.notifier_completion, XevIo, io, onNotifierWake);
 }
 
-/// Async-signal-safe: an atomic bitmask store plus an eventfd write.
-/// This is the only function in the codebase legal to call from a
-/// sigaction handler (§4).
+/// The exit code the alarm handler will use, and whether `main` has
+/// installed the handler that reads it. Module-level because a signal
+/// handler takes no arguments: the whole point of this watchdog is that
+/// nothing between the kernel and the exit is the loop's (#226).
+var alarm_exit_code = std.atomic.Value(u8).init(0);
+var alarm_handler_installed = std.atomic.Value(bool).init(false);
+
+/// §8's drain watchdog (#226): a deadline that is not a completion.
+///
+/// Every other bound in this proxy is an op — `timerStart` submits one and
+/// the loop delivers it — which makes them all useless against the one
+/// failure they would most like to report. `Server.onDrainStuck` is a
+/// timer, so a backend that has stopped delivering has stopped delivering
+/// the thing that would have said so, and the process hangs with no
+/// diagnostic (#203 was the shape; #206's simulator can strand it on
+/// demand).
+///
+/// `alarm(2)` answers a different question: the kernel raises SIGALRM
+/// whatever this process is doing, and the handler exits without ever
+/// re-entering the loop. Coarse — whole seconds — which is right for a
+/// backstop measured in them, and the informative report still comes from
+/// `onDrainStuck` when the loop is alive to produce one.
+pub fn alarmStart(io: *XevIo, after_ns: u64, exit_code: u8) void {
+    _ = io;
+    assert(exit_code != 0); // A give-up is never a success.
+    assert(after_ns >= std.time.ns_per_s);
+    // Without the handler, SIGALRM's default action terminates the
+    // process silently — the hang would become a death with even less to
+    // say than before. `main` installs it before the loop ever runs; a
+    // caller arming this without one is a wiring bug, not a fallback.
+    assert(alarm_handler_installed.load(.acquire));
+    const seconds = (after_ns + std.time.ns_per_s - 1) / std.time.ns_per_s;
+    assert(seconds >= 1);
+    assert(seconds <= std.math.maxInt(c_uint));
+    alarm_exit_code.store(exit_code, .release);
+    _ = std.c.alarm(@intCast(seconds));
+}
+
+/// Disarm: the drain finished, so the watchdog has nothing left to watch.
+/// `alarm(0)` cancels whatever was pending, which is exactly the contract.
+pub fn alarmCancel(io: *XevIo) void {
+    _ = io;
+    alarm_exit_code.store(0, .release);
+    _ = std.c.alarm(0);
+}
+
+/// Called by `main` once its SIGALRM handler is installed, so `alarmStart`
+/// can refuse to arm a signal nothing is listening for.
+pub fn alarmHandlerInstalled() void {
+    alarm_handler_installed.store(true, .release);
+}
+
+/// The watchdog firing: one `write` and one `_exit`, both async-signal-
+/// safe, and deliberately nothing else. The rich report — which plane is
+/// stuck, which ops it is waiting on — belongs to `onDrainStuck`, which
+/// runs in the loop and can read the state safely; reaching *here* means
+/// the loop never got there, so all this can honestly say is that it
+/// didn't.
+///
+/// The body lives on this side of the seam because `write` and `_exit`
+/// are syscalls and those live here (§4); `main` owns only the sigaction
+/// that points at it.
+pub fn onAlarmFromHandler() noreturn {
+    const message = "zoxy: drain watchdog fired, the event loop stopped " ++
+        "delivering (DESIGN.md §8, #226)\n";
+    _ = std.c.write(2, message.ptr, message.len);
+    const code = alarm_exit_code.load(.acquire);
+    // Armed with a non-zero code, so a zero here would mean the alarm
+    // outlived its `alarmCancel` — exiting 0 on a wedged drain is the one
+    // outcome worse than exiting late.
+    std.c._exit(if (code == 0) 1 else code);
+}
+
+/// Async-signal-safe: an atomic bitmask store plus an eventfd write. One
+/// of the two functions in the codebase legal to call from a sigaction
+/// handler (§4) — `onAlarmFromHandler` is the other, and the pair differ
+/// in the one way that matters: this hands the signal to the loop, that
+/// one gives up on the loop entirely.
 pub fn notifySignalFromHandler(io: *XevIo, signal: Io.Signal) void {
     _ = io.signal_mask.fetchOr(signalBit(signal), .release);
     io.notifier.notify() catch {};

@@ -34,6 +34,14 @@
 //!       file sink only — swap the sink fd between writes, never under one)
 //!   timerStart(io, c, delay_ns, U, u, cb(u, TimerError!void))
 //!   timerCancel(io, timer_c, cancel_c, U, u, cb(u))     (the one legal cancel)
+//!   alarmStart(io, after_ns, exit_code) void            (sync; §8's drain
+//!       watchdog — a deadline with no completion, so it survives a loop
+//!       that has stopped delivering. Takes the process down itself.
+//!       `after_ns` is at least a second: production is `alarm(2)`, whose
+//!       granularity is whole seconds, and both sides enforce the floor so
+//!       a caller cannot ask the simulator for a bound production would
+//!       silently round.)
+//!   alarmCancel(io) void                                (sync)
 //!   signalWait(io, U, u, cb(u, Signal))                 (persistent waiter)
 //!   setNodelay / setLingerRst (io, socket) SetOptionError!void   (sync)
 //!   shutdown(io, socket, how) void                      (sync control op)
@@ -246,6 +254,8 @@ pub fn assertIoInterface(comptime IoType: type) void {
             "logReopen",
             "timerStart",
             "timerCancel",
+            "alarmStart",
+            "alarmCancel",
             "signalWait",
             "setNodelay",
             "setLingerRst",

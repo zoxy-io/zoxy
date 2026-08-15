@@ -663,16 +663,15 @@ const StrandedTimer = struct {
     }
 };
 
-// #206: the one shape §8's drain backstop cannot catch, pinned so it
-// breaks loudly if it ever stops being true.
+// #206, and now #226's other half: what a stranded timer costs a process
+// with no watchdog under it.
 //
 // `Server.onDrainStuck` is a timer. A backend that strands timers strands
-// that one too, so the process has nothing left to notice with and the
-// run ends in the simulator's deadlock rather than in a diagnostic. The
-// sweep therefore does not draw `.timer` (see `sim/Harness.zig`), which
-// would otherwise fail honest seeds — this is where the limitation lives
-// instead of only in a comment. Covering it for real needs a watchdog
-// that is not a timer, which is a design question and not a gate.
+// that one too, so nothing is left to notice and the run ends in the
+// simulator's deadlock — a hung process, from outside — rather than in a
+// diagnostic. This is the *unwatched* case, kept because it is the
+// baseline the watchdog is measured against; the test below arms one and
+// gets an answer instead.
 test "simio: a stranded timer has nothing left to report it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -759,6 +758,47 @@ test "simio: a latched cancel is stranded when it is finally submitted" {
     // being cancelled, which is why nothing else looks wrong.
     try std.testing.expect(!state.cancel_delivered);
     try std.testing.expect(state.timer_delivered);
+}
+
+// #226: the same stranded timer, with the watchdog armed.
+//
+// `alarmStart` is not an op. Production arms `alarm(2)` and the kernel
+// raises SIGALRM whatever the process is doing; here the run loop compares
+// the virtual clock against a deadline no completion carries. Either way
+// the property is the one the timers cannot have: it happens even when
+// nothing else can.
+//
+// So the run that deadlocked above ends in a give-up carrying the code it
+// was armed with. That is the whole of #226 in two assertions — and the
+// sweep pays for it in `sim/Harness.zig`, where `.timer` went back into
+// the strand draw and two seeds per 4096 that used to fail with
+// `error.Deadlock` now report instead.
+test "simio: an armed watchdog answers where a stranded timer cannot" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 17 });
+
+    var watchdog: StrandedTimer = .{ .io = &sim_io };
+    sim_io.timerStart(
+        &watchdog.completion,
+        std.time.ns_per_s,
+        StrandedTimer,
+        &watchdog,
+        StrandedTimer.onTimer,
+    );
+    try std.testing.expectEqual(@as(u32, 1), sim_io.dropPendingOps(.timer));
+    // Past the stranded timer's own deadline, so what fires is the alarm
+    // and not some artefact of the clock stopping short of it.
+    sim_io.alarmStart(2 * std.time.ns_per_s, 5);
+
+    try sim_io.run();
+    try std.testing.expect(sim_io.alarmFired());
+    try std.testing.expectEqual(@as(?u8, 5), sim_io.abortedWith());
+    // The timer it was watching still never delivered: the watchdog
+    // reports the silence, it does not break it.
+    try std.testing.expect(!watchdog.fired);
 }
 
 // #202: some bounds are measured in hours against scenarios that run for

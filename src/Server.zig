@@ -698,6 +698,7 @@ pub fn Server(comptime IoType: type) type {
                     server,
                     onDrainDeadline,
                 );
+                server.armDrainWatchdog();
             }
             server.maybeStopAfterDrain();
         }
@@ -731,6 +732,58 @@ pub fn Server(comptime IoType: type) type {
                 onDrainStuck,
             );
         }
+
+        /// The last line of defence under the two timers above (#226).
+        ///
+        /// Both of them are ops the loop delivers, which makes them blind
+        /// to the one failure they would most like to report: a backend
+        /// that has stopped delivering has stopped delivering *them*, so
+        /// the process hangs and SIGTERM stops meaning anything — with not
+        /// even the diagnostic `onDrainStuck` exists to print. #203 was
+        /// that shape on a real runner, and #206's simulator reproduces it
+        /// on demand by stranding a timer.
+        ///
+        /// The seam's alarm is not an op. In production it is `alarm(2)`:
+        /// the kernel raises SIGALRM whatever this process is doing, and
+        /// the handler writes one line and exits without re-entering the
+        /// loop. So this fires *whether or not anything else can*.
+        ///
+        /// Armed here rather than beside `onDrainStuck`, deliberately —
+        /// that timer is started by the deadline one, so arming the
+        /// watchdog there would make it depend on the very delivery it is
+        /// the backstop for.
+        ///
+        /// Only when a deadline is configured. A zero `drain_deadline_ms`
+        /// is "no cap" (§5): the operator asked for a drain that waits for
+        /// the last connection however long it takes, and killing that
+        /// process after a bound it never named would be this proxy
+        /// overruling a configuration rather than backstopping it. Whoever
+        /// declined the cap owns the SIGKILL, which is #220's lesson in
+        /// the other direction.
+        fn armDrainWatchdog(server: *Self) void {
+            assert(server.draining);
+            assert(server.config.drain_deadline_ms != 0);
+            const deadline_ns = @as(u64, server.config.drain_deadline_ms) *
+                std.time.ns_per_ms;
+            server.io.alarmStart(
+                deadline_ns + drain_stuck_grace_ns + drain_watchdog_margin_ns,
+                drain_watchdog_exit_code,
+            );
+        }
+
+        /// How long past the point `onDrainStuck` would have reported the
+        /// watchdog waits, so a live loop always gets to say the useful
+        /// thing first. Generous because the two answers are not equal: a
+        /// named plane and its armed ops is worth waiting for, and this
+        /// line can only ever say that nobody said anything.
+        const drain_watchdog_margin_ns: u64 = 5 * std.time.ns_per_s;
+
+        /// Distinct from `drain_stuck_exit_code` because the two describe
+        /// different failures, and an operator reading a status without
+        /// output has only this to go on: 4 means the drain could not
+        /// finish and the process said which plane held it, 5 means the
+        /// loop stopped answering and nothing could be said at all.
+        pub const drain_watchdog_exit_code: u8 = 5;
 
         /// How long after the drain deadline a teardown gets to finish
         /// before it is called stuck. Generous against the work it covers —
@@ -892,6 +945,12 @@ pub fn Server(comptime IoType: type) type {
             // and every released or parked upstream let go of its head.
             assert(server.head_buffers_in_use == 0);
             assert(server.upstream_head_buffers.isFullyReleased());
+            // The drain finished, so the watchdog has nothing left to
+            // watch. Unconditional: `alarmCancel` on an unarmed alarm is
+            // a no-op on both sides of the seam, and the alternative is
+            // this line asking the same question `armDrainWatchdog` did
+            // and getting a different answer after a config reload.
+            server.io.alarmCancel();
             server.io.stop();
         }
 

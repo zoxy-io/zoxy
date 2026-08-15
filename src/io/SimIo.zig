@@ -184,6 +184,18 @@ group_in_use: u32,
 /// stranded scenario reporting *which* op it took.
 drop_next_kinds: u16,
 drop_next_taken: ?OpKind,
+/// §8's drain watchdog (#226), virtually: the instant it fires, the code
+/// it gives up with, and whether it has. `never_ns` when unarmed.
+///
+/// Not a `Completion`, and that is the whole point — in production this
+/// is `alarm(2)`, which the kernel raises whether or not the loop is
+/// still delivering. Here it is a deadline the run loop checks directly,
+/// so a schedule that strands every op still reaches it: the simulator's
+/// own `error.Deadlock` is what a wedged production process looks like
+/// from outside, and this is the thing that turns one into a diagnostic.
+alarm_at_ns: u64,
+alarm_exit_code: u8,
+alarm_fired: bool,
 
 const blackholed_addresses_max: u8 = 4;
 const connect_error_addresses_max: u8 = 4;
@@ -518,6 +530,9 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.group_in_use = 0;
     io.drop_next_kinds = 0;
     io.drop_next_taken = null;
+    io.alarm_at_ns = never_ns;
+    io.alarm_exit_code = 0;
+    io.alarm_fired = false;
     assert(io.sockets.isFullyReleased());
 }
 
@@ -1134,6 +1149,64 @@ fn kindBit(kind: OpKind) u16 {
     return @as(u16, 1) << @intCast(@intFromEnum(kind));
 }
 
+/// §8's drain watchdog (#226), the simulator's half. Production arms
+/// `alarm(2)`; here it is a deadline the run loop compares the virtual
+/// clock against, with no completion in between — which is the property
+/// being modelled, not an implementation shortcut. A watchdog that rode
+/// the pending table would be exactly the timer this exists to replace.
+pub fn alarmStart(io: *SimIo, after_ns: u64, exit_code: u8) void {
+    assert(exit_code != 0); // A give-up is never a success.
+    // The seam's floor, enforced here too: production rounds up to whole
+    // seconds, so a scenario arming a shorter one would be testing a bound
+    // no deployment can have.
+    assert(after_ns >= std.time.ns_per_s);
+    assert(io.alarm_at_ns == never_ns);
+    assert(!io.alarm_fired);
+    io.alarm_at_ns = io.now_ns_value + after_ns;
+    io.alarm_exit_code = exit_code;
+    assert(io.alarm_at_ns > io.now_ns_value);
+    // Into the trace: a run that armed a watchdog is a different run from
+    // one that did not, whether or not it ever fires.
+    io.mix(io.alarm_at_ns);
+}
+
+/// Idempotent, and tolerant of an alarm that already fired: the drain
+/// that cancels it may be finishing in the same flush the fire stopped
+/// the loop for, and a watchdog cannot be un-fired anyway.
+pub fn alarmCancel(io: *SimIo) void {
+    io.alarm_at_ns = never_ns;
+    io.alarm_exit_code = 0;
+    assert(io.alarm_at_ns == never_ns);
+    io.mix(0);
+}
+
+/// Whether the watchdog fired this run — the fact a scenario oracle asks
+/// instead of watching for a process exit it cannot survive, the same
+/// bargain `abortedWith` makes.
+pub fn alarmFired(io: *const SimIo) bool {
+    return io.alarm_fired;
+}
+
+/// The watchdog's whole behaviour: give up, with the code it was armed
+/// with. Production writes one line and `_exit`s; here it records and
+/// stops, so the scenario that provoked it can be asked what happened.
+///
+/// Called from the run loop rather than delivered, which is the modelled
+/// property: no schedule, however much of the backend it has stranded,
+/// can keep this from happening.
+fn fireAlarmIfDue(io: *SimIo) bool {
+    if (io.alarm_at_ns == never_ns) return false;
+    if (io.now_ns_value < io.alarm_at_ns) return false;
+    io.alarm_at_ns = never_ns;
+    io.alarm_fired = true;
+    // A give-up the loop was already taking is not this one's to take
+    // twice: `onDrainStuck` aborting means the loop was alive after all,
+    // and the watchdog is the layer under it.
+    if (io.aborted == null) io.abort(io.alarm_exit_code);
+    io.stop();
+    return true;
+}
+
 /// Whether any op of `kind` is pending and still deliverable — what a
 /// caller about to strand one asks first, so it picks a kind the schedule
 /// actually armed instead of spending its seed on a kind that is not
@@ -1302,6 +1375,10 @@ pub fn run(io: *SimIo) Io.RunError!void {
     // buffer need not be re-stacked (and Debug-0xAA-filled) each tick.
     var ready_buffer: [pending_ops_max]*Completion = undefined;
     while (!io.stopped) {
+        // Before anything else each turn: the watchdog is the one deadline
+        // that does not wait to be delivered, so it cannot sit behind a
+        // batch that may never come.
+        if (io.fireAlarmIfDue()) break;
         io.deliverDueSignals();
         const ready = io.collectReady(&ready_buffer);
         if (ready.len == 0) {
@@ -1783,6 +1860,10 @@ fn earliestWakeNs(io: *const SimIo) u64 {
     for (io.pending_signals[0..io.pending_signals_count]) |pending_signal| {
         earliest = @min(earliest, pending_signal.at_ns);
     }
+    // The watchdog wakes the clock like anything else: a run whose every
+    // op is stranded must still advance to it, or the deadlock this
+    // exists to report would be declared before it could fire (#226).
+    earliest = @min(earliest, io.alarm_at_ns);
     return earliest;
 }
 
