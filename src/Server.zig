@@ -2204,35 +2204,46 @@ pub fn Server(comptime IoType: type) type {
                 // off l4 listeners (#178), so `.none` is exact, not a
                 // shrug.
                 .none,
-            ) orelse {
-                // Every endpoint is at its §8 cap. An L4 listener has no
-                // way to say so — it relays bytes, and there is no
-                // protocol to answer in — so the ladder's L4 answer
-                // applies: close. Counted outside the gate identity,
-                // because this connection was admitted before an endpoint
-                // was ever picked (§8) — which is also why the labeled
-                // twin carries only the cluster: no endpoint was full,
-                // all of them were.
-                server.counters.increment("l4_shed_endpoint_inflight");
-                server.labeled.incrementCluster(.l4_shed_inflight, cluster_index);
-                // Nothing was armed for this dial yet — the arm below is
-                // the first — so teardown here cancels only the deadline
-                // admission left running (§5).
-                assert(!conn.armed.connect);
-                server.beginTeardown(conn);
-                return;
+                // An L4 connection dials once and relays whatever the
+                // dial produced, so there is nothing tried to exclude
+                // (#181): a failed L4 dial has no request to re-send.
+                &.{},
+            );
+            const dial = switch (pick) {
+                .dial => |chosen| chosen,
+                // Unreachable with nothing tried: only a retry can run
+                // the routable set empty.
+                .exhausted => unreachable,
+                .capped => {
+                    // Every endpoint is at its §8 cap. An L4 listener has no
+                    // way to say so — it relays bytes, and there is no
+                    // protocol to answer in — so the ladder's L4 answer
+                    // applies: close. Counted outside the gate identity,
+                    // because this connection was admitted before an
+                    // endpoint was ever picked (§8) — which is also why
+                    // the labeled twin carries only the cluster: no
+                    // endpoint was full, all of them were.
+                    server.counters.increment("l4_shed_endpoint_inflight");
+                    server.labeled.incrementCluster(.l4_shed_inflight, cluster_index);
+                    // Nothing was armed for this dial yet — the arm below
+                    // is the first — so teardown here cancels only the
+                    // deadline admission left running (§5).
+                    assert(!conn.armed.connect);
+                    server.beginTeardown(conn);
+                    return;
+                },
             };
             conn.arm(&conn.op_connect, "connect");
             // An L4 dial holds no slot to record the endpoint on, so the
             // access log takes it here — the only place that knows which
             // origin this connection is being relayed to (§8).
-            conn.log.endpoint_index = pick.endpoint_index;
-            server.chargeL4(conn, cluster_index, pick.endpoint_index);
+            conn.log.endpoint_index = dial.endpoint_index;
+            server.chargeL4(conn, cluster_index, dial.endpoint_index);
             if (server.config.clusters[cluster_index].proxy_protocol_send) |version| {
                 server.stageProxySendHeader(conn, version);
             }
             server.io.connect(
-                pick.address,
+                dial.address,
                 &conn.op_connect.completion,
                 ConnType,
                 conn,

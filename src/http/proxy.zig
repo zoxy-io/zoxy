@@ -859,21 +859,28 @@ pub fn Proxy(comptime IoType: type) type {
             conn: *ConnType,
             request_key: Balancer.RequestKey,
         ) ?Balancer.Pick {
-            return server.balancer.pick(
+            const outcome = server.balancer.pick(
                 conn.cluster_index,
                 &server.endpointLoad(),
                 server.health.healthy,
                 &conn.client_address,
                 request_key,
-            ) orelse {
-                // The labeled twin (#179) carries only the cluster: this
-                // fires precisely because no endpoint could be picked —
-                // all of them were full, so an endpoint label would be
-                // an invention.
-                server.labeled.incrementCluster(.l7_shed_inflight, conn.cluster_index);
-                respond(server, conn, 503, "l7_shed_endpoint_inflight");
-                return null;
-            };
+                &.{},
+            );
+            switch (outcome) {
+                .dial => |chosen| return chosen,
+                // Nothing was tried, so the routable set cannot be empty.
+                .exhausted => unreachable,
+                .capped => {
+                    // The labeled twin (#179) carries only the cluster:
+                    // this fires precisely because no endpoint could be
+                    // picked — all of them were full, so an endpoint
+                    // label would be an invention.
+                    server.labeled.incrementCluster(.l7_shed_inflight, conn.cluster_index);
+                    respond(server, conn, 503, "l7_shed_endpoint_inflight");
+                    return null;
+                },
+            }
         }
 
         /// Route resolved and a relay buffer held: choose an endpoint and
