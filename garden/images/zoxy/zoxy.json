@@ -1,0 +1,8 @@
+{
+    "listeners": [
+        { "bind": "0.0.0.0:80", "protocol": "http", "cluster": "garden" }
+    ],
+    "clusters": {
+        "garden": { "endpoints": ["BACKEND_HOST_PLACEHOLDER:BACKEND_PORT_PLACEHOLDER"] }
+    }
+}

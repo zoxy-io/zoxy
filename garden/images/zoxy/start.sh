@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -euo pipefail
+
+python3 /tools/echo_server.py 127.0.0.1 "$((0xdafe))" &
+
+exec zoxy /app/zoxy.json

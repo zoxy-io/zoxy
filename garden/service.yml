@@ -1,0 +1,19 @@
+  zoxy:
+    build:
+      args:
+        APP_BRANCH: main
+        APP_REPO: https://github.com/zoxy-io/zoxy
+        APP_VERSION: 026b4b0b6a7e204259df8fa6bea79e8b25a230c0
+        CONFIG_FILE: zoxy.json
+        START_SCRIPT: start.sh
+      context: ./images/zoxy
+    # zoxy is io_uring-native on Linux (DESIGN.md §4) and Docker's default
+    # seccomp profile denies io_uring_setup, so the process prints its budget
+    # banner and exits with `error: PermissionDenied` under the stock profile.
+    # No other Garden target needs this because no other target uses io_uring.
+    security_opt:
+    - seccomp:unconfined
+    volumes:
+    - ./tools:/tools
+    x-props:
+      role: transducer
