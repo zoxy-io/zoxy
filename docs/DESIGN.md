@@ -942,8 +942,18 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   decision from carrying a protocol upgrade to a *routed* cluster.
   **The upgraded upstream connection leaves the pool and never returns
   to it** (§5): it is no longer an interchangeable origin connection but
-  one client's session. `max_inflight` counts a tunnel for its whole
-  life, which is correct — the backend really is carrying it.
+  one client's session. It leaves by *releasing its upstream slot while
+  keeping its socket* — the two are separable, and separating them is
+  what lets §5's claim and the next sentence both be true. Holding the
+  slot would mean tunnels drawing on the pool ordinary exchanges shed
+  against, which is exactly what the tunnel pool exists to prevent.
+  And `max_inflight` still counts a tunnel for its whole life, which is
+  correct — the backend really is carrying it — because the endpoint is
+  charged the way an **L4 connection** is charged: a per-endpoint count
+  held by a live connection rather than by a pool lease. That is not a
+  special case invented for this. After 101 a tunnel *is* an L4 relay,
+  and §7's in-flight total already sums L7 leases and live L4
+  connections precisely because both are work the origin is carrying.
   The access log writes one line at close, carrying the request facts
   that opened the tunnel plus the byte counts each way, because a line
   written at 101 would name a transfer that had not happened yet.

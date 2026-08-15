@@ -256,6 +256,25 @@ const uncovered = [_]Uncovered{
             "src/http_proxy_test.zig exhausts the upstream pool directly",
     },
     .{
+        .name = "l7_shed_tunnels",
+        .why = .unreached,
+        .reason = "no seed configures an `upgrades` allowlist, so no scenario " ++
+            "can request the tunnel this rung refuses. Teaching the harness " ++
+            "to script an upgrade — an origin that answers 101 and then " ++
+            "echoes, and a client that expects it — is #180's next slice; " ++
+            "src/http_proxy_test.zig exhausts the tunnel pool directly in " ++
+            "the meantime",
+    },
+    .{
+        .name = "tunnels_established",
+        .why = .unreached,
+        .reason = "same gap as l7_shed_tunnels above, and the same remedy: " ++
+            "until a seed can allow an upgrade, no scenario reaches 101 at " ++
+            "all. src/http_proxy_test.zig carries a tunnel end to end, " ++
+            "including the participating Upgrade pair and the relay after " ++
+            "the handshake",
+    },
+    .{
         .name = "l7_shed_upstream_head_buffers",
         .why = .unreached,
         .reason = "same shadow as l7_shed_upstream_slots: the relay rung " ++

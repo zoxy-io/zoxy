@@ -136,6 +136,13 @@ pub const ClientWrite = struct {
         response_body,
         /// A static response is out: the lingering close (§7, §8).
         lingering_close,
+        /// The origin's `101` is out and the client has it, so the HTTP
+        /// conversation on this connection is over (#180): hand the
+        /// connection to the relay. Deliberately *after* the head reaches
+        /// the client rather than at the parse — a tunnel that started
+        /// relaying before its handshake landed would interleave frame
+        /// bytes with the head that announces them.
+        tunnel_start,
         /// A static response is out and the client's byte stream is still
         /// synchronized: serve the next request on this connection (§7,
         /// §8). The keep half of the ladder's "then keep or close per
@@ -274,6 +281,19 @@ pub fn Conn(comptime IoType: type) type {
         /// idle on keep-alive — an idle L7 connection costs a slot and
         /// head buffer only (§5).
         relay_buffer: ?*relay.RelayBuffer,
+        /// The §5 tunnel buffer this connection has claimed (#180), held
+        /// from the moment its upgrade request is admitted until the
+        /// tunnel closes — or until the exchange fails before `101`, in
+        /// which case the disposal paths give it back like any other
+        /// resource.
+        ///
+        /// A field of its own rather than an early swap into
+        /// `relay_buffer`, because the exchange carrying the handshake is
+        /// still an ordinary L7 exchange that may need an ordinary relay
+        /// buffer. The two coexist for exactly the window between the
+        /// upgrade being admitted and the origin answering; at `101` the
+        /// shared one goes back and this one takes its place.
+        tunnel_buffer: ?*relay.RelayBuffer,
         /// Absolute deadline; state transitions only store a new value —
         /// the armed timer op is never touched (§4).
         deadline_ns: u64,
@@ -352,6 +372,10 @@ pub fn Conn(comptime IoType: type) type {
         /// The listener's §7 request filter rules, same lifetime as
         /// `routes` (empty on L4 and when no request filters are
         /// configured).
+        /// The listener's #180 upgrade allowlist, handed over at
+        /// admission like the filter tables beside it, so the gate asks
+        /// what *this* socket allows rather than consulting the config.
+        upgrades: config_module.Config.Listener.Upgrades,
         request_filters: []const filter.Rule,
         /// The listener's #175 response filter rules, same lifetime:
         /// matched against the origin's parsed response head at the
@@ -589,6 +613,12 @@ pub fn Conn(comptime IoType: type) type {
             /// The one free replay is spent (§7): a failure on the replay
             /// try answers 502 like any other, never a second replay.
             replay_used: bool = false,
+            /// This request asked for an upgrade the listener allows, and
+            /// a tunnel buffer is held for it (#180). What makes `101`
+            /// terminal rather than interim on the response path, and what
+            /// tells the render to let the participating
+            /// `Connection`/`Upgrade` pair travel.
+            upgrade_requested: bool = false,
             /// The endpoints this request dialed and had refused or found
             /// unreachable (#181), in the order it tried them — the
             /// exclusion set the next pick runs over. Sized for the first
@@ -674,6 +704,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.client_socket = client_socket;
             conn.upstream_socket = null;
             conn.relay_buffer = buffer;
+            conn.tunnel_buffer = null;
             conn.deadline_ns = 0;
             conn.birth_ns = server.io.nowNs();
             conn.armed = .{};
@@ -694,6 +725,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.routes = &.{};
             conn.request_filters = &.{};
             conn.response_filters = &.{};
+            conn.upgrades = .{};
             conn.forwarded = null;
             conn.upstream = null;
             conn.charged_endpoint = LogState.endpoint_none;

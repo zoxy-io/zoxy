@@ -104,6 +104,10 @@ pub fn renderRequestHead(
     /// deliberate: the trust rule is a security decision with a counter
     /// attached, and a byte-assembler should have access to neither.
     forwarded_for: ?[]const u8,
+    /// True when this request is a protocol upgrade this listener has
+    /// agreed to carry (#180): the participating `Upgrade` travels and
+    /// the proxy writes its own `Connection: upgrade`.
+    keep_upgrade: bool,
     buffer: []u8,
 ) error{Oversize}![]const u8 {
     // The proxy answers CONNECT with 501 itself, never forwards it (§7).
@@ -130,10 +134,21 @@ pub fn renderRequestHead(
         request.connection_nominates_header,
         edits,
         forwarded_for != null,
+        keep_upgrade,
     );
     if (forwarded_for) |value| {
         assert(value.len >= 1);
         try staging.appendHeaderLine(forwarded_for_name, value);
+    }
+    // A carried upgrade announces the opposite of a close: this hop is
+    // continuing, in a different protocol. The two are mutually exclusive
+    // by construction — an exchange that becomes a tunnel is never the
+    // last one on a connection about to end — and the proxy writes this
+    // line itself rather than forwarding whichever spelling arrived, so
+    // what the next hop reads is exactly what this hop decided (#180).
+    if (keep_upgrade) {
+        assert(!inject_close);
+        try staging.append("Connection: upgrade\r\n");
     }
     if (inject_close) {
         try staging.append("Connection: close\r\n");
@@ -158,6 +173,9 @@ pub fn renderResponseHead(
     response: *const parser.ResponseHead,
     inject_close: bool,
     edits: []const filter.AppliedHeaderEdit,
+    /// True when this response is the `101` completing an upgrade this
+    /// proxy is carrying (#180), the mirror of the request-side flag.
+    keep_upgrade: bool,
     buffer: []u8,
 ) error{Oversize}![]const u8 {
     assert(response.status >= 100);
@@ -182,7 +200,18 @@ pub fn renderResponseHead(
         response.connection_nominates_header,
         edits,
         false,
+        keep_upgrade,
     );
+    // A carried upgrade announces the opposite of a close: this hop is
+    // continuing, in a different protocol. The two are mutually exclusive
+    // by construction — an exchange that becomes a tunnel is never the
+    // last one on a connection about to end — and the proxy writes this
+    // line itself rather than forwarding whichever spelling arrived, so
+    // what the next hop reads is exactly what this hop decided (#180).
+    if (keep_upgrade) {
+        assert(!inject_close);
+        try staging.append("Connection: upgrade\r\n");
+    }
     if (inject_close) {
         try staging.append("Connection: close\r\n");
     }
@@ -305,6 +334,21 @@ fn appendEndToEndHeaders(
     /// because the caller already folded it into the line it will write.
     /// Either way the header must appear exactly once downstream.
     suppress_forwarded_for: bool,
+    /// True when this hop is *participating* in a protocol upgrade
+    /// (#180), which is the one case where `Upgrade` must travel.
+    ///
+    /// It is hop-by-hop by definition, and stripping it is right for
+    /// every message this proxy merely forwards — the header names what
+    /// *this* connection could become, not what the next one should. A
+    /// handshake the proxy has decided to carry inverts that: here the
+    /// header names exactly this hop's intent, and removing it would
+    /// leave an origin asked to upgrade to nothing, or a client told it
+    /// succeeded without being told to what. Only the `Upgrade` header
+    /// itself is exempted — a `Connection` value's other nominations
+    /// still strip what they name, and the caller writes its own
+    /// `Connection: upgrade` line rather than forwarding whatever
+    /// spelling arrived.
+    keep_upgrade: bool,
 ) error{Oversize}!void {
     assert(headers.len <= constants.headers_max);
     // One slot past the filter budget: the #178 Set-Cookie stamp.
@@ -333,7 +377,12 @@ fn appendEndToEndHeaders(
     for (headers) |*header| {
         assert(header.name.len >= 1);
         if (isHopByHop(header, active_nominations)) {
-            continue;
+            // The one exemption (#180): a participating `Upgrade` on a
+            // hop this proxy has agreed to carry. Everything else the
+            // hop-by-hop rule names, including whatever a `Connection`
+            // value nominates beside it, still goes.
+            const participating = keep_upgrade and header.tag == .upgrade;
+            if (!participating) continue;
         }
         if (suppress_forwarded_for and header.tag == .x_forwarded_for) {
             continue;
@@ -461,13 +510,13 @@ test "render: request strips hop-by-hop and nominated, keeps the rest" {
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
 
-    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, false, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\n\r\n",
         rendered,
     );
 
-    const closed = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, true, null, &buffer);
+    const closed = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, true, null, false, &buffer);
     try testing.expectEqualStrings(
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\nConnection: close\r\n\r\n",
         closed,
@@ -488,7 +537,7 @@ test "render: filter edits set, add, and remove headers" {
         .{ .kind = .remove, .name = "cookie", .value = "" },
     };
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, false, &buffer);
     // Surviving source headers first (Host, kept X-Trace, X-Keep), then the
     // injected set/add lines; the source X-Env and Cookie are gone.
     try testing.expectEqualStrings(
@@ -518,7 +567,7 @@ test "render: an edit that overflows the buffer is Oversize" {
     var tight: [34]u8 = undefined;
     try testing.expectError(
         error.Oversize,
-        renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, &tight),
+        renderRequestHead(&request, .{ .path = "/p", .query = "" }, &edits, false, null, false, &tight),
     );
 }
 
@@ -551,7 +600,7 @@ test "render: the edited oracle skips a head that grows past head_buffer_bytes_d
         .{ .kind = .remove, .name = "X-Fuzz-Remove", .value = "" },
     };
     var render_buf: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&parsed, .{ .path = "/", .query = "" }, &edits, false, null, &render_buf);
+    const rendered = try renderRequestHead(&parsed, .{ .path = "/", .query = "" }, &edits, false, null, false, &render_buf);
     try testing.expect(rendered.len > constants.head_buffer_bytes_default);
     // Must return cleanly instead of panicking in the reparse precondition.
     checkRequestRenderEdited(&source);
@@ -565,7 +614,7 @@ test "render: nominating a protected header does not strip it" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, false, &buffer);
     try testing.expectEqualStrings(
         "POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n",
         rendered,
@@ -583,7 +632,7 @@ test "render: a nomination on a second Connection line still strips" {
     const request = try parser.parseRequestHead(head, false, &storage);
     try testing.expect(request.connection_nominates_header);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, false, &buffer);
     // Both Connection lines are hop-by-hop; X-Nominated goes because the
     // second line named it; X-Keep is untouched.
     try testing.expectEqualStrings(
@@ -603,7 +652,7 @@ test "render: standard Connection options do not nominate a same-named header" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, false, &buffer);
     // Connection stripped (hop-by-hop) and Keep-Alive stripped (a
     // hop-by-hop name); the "Close" header survives — close nominates
     // nothing.
@@ -618,7 +667,7 @@ test "render: framing headers travel with the body" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead(head, false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, false, &buffer);
 
     var reparse_storage: parser.HeaderStorage = undefined;
     const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage);
@@ -629,7 +678,7 @@ test "render: client version is preserved" {
     var storage: parser.HeaderStorage = undefined;
     const request = try parser.parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, &buffer);
+    const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, false, &buffer);
     try testing.expectEqualStrings("GET / HTTP/1.0\r\n\r\n", rendered);
 }
 
@@ -640,13 +689,13 @@ test "render: response preserves status line and strips hop-by-hop" {
     const response = try parser.parseResponseHead(head, false, &storage, .get);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
 
-    const rendered = try renderResponseHead(&response, false, &.{}, &buffer);
+    const rendered = try renderResponseHead(&response, false, &.{}, false, &buffer);
     try testing.expectEqualStrings(
         "HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nX-Origin: yes\r\n\r\n",
         rendered,
     );
 
-    const closed = try renderResponseHead(&response, true, &.{}, &buffer);
+    const closed = try renderResponseHead(&response, true, &.{}, false, &buffer);
     try testing.expectEqualStrings(
         "HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nX-Origin: yes\r\n" ++
             "Connection: close\r\n\r\n",
@@ -669,7 +718,7 @@ test "render: response edits suppress, replace and append (#175)" {
         .{ .kind = .set, .name = "X-Keep", .value = "edited" },
         .{ .kind = .add, .name = "Strict-Transport-Security", .value = "max-age=63072000" },
     };
-    const rendered = try renderResponseHead(&response, false, &edits, &buffer);
+    const rendered = try renderResponseHead(&response, false, &edits, false, &buffer);
     try testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" ++
             "X-Keep: edited\r\n" ++
@@ -679,7 +728,7 @@ test "render: response edits suppress, replace and append (#175)" {
 
     // The close injection lands after the edits, exactly as it lands
     // after the origin's own headers.
-    const closed = try renderResponseHead(&response, true, &edits, &buffer);
+    const closed = try renderResponseHead(&response, true, &edits, false, &buffer);
     try testing.expect(std.mem.endsWith(u8, closed, "Connection: close\r\n\r\n"));
 
     // Growth from edits is a real overflow: the same head with an added
@@ -687,7 +736,7 @@ test "render: response edits suppress, replace and append (#175)" {
     var tight: [head.len - 1]u8 = undefined;
     try testing.expectError(
         error.Oversize,
-        renderResponseHead(&response, false, &edits, &tight),
+        renderResponseHead(&response, false, &edits, false, &tight),
     );
 }
 
@@ -696,7 +745,7 @@ test "render: bare status line without a reason phrase round-trips" {
     const response = try parser.parseResponseHead("HTTP/1.0 204\r\n\r\n", false, &storage, .get);
     try testing.expectEqual(@as(?[]const u8, null), response.status_message);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = try renderResponseHead(&response, false, &.{}, &buffer);
+    const rendered = try renderResponseHead(&response, false, &.{}, false, &buffer);
     try testing.expectEqualStrings("HTTP/1.0 204\r\n\r\n", rendered);
 }
 
@@ -706,7 +755,7 @@ test "render: a head that no longer fits is Oversize" {
     const request = try parser.parseRequestHead(head, false, &storage);
     const target = parser.CanonicalTarget{ .path = "/path", .query = "" };
     var small: [16]u8 = undefined;
-    try testing.expectError(error.Oversize, renderRequestHead(&request, target, &.{}, false, null, &small));
+    try testing.expectError(error.Oversize, renderRequestHead(&request, target, &.{}, false, null, false, &small));
 }
 
 // Fuzzing (§9 gate 2): whatever the parser accepts, the renderer must
@@ -729,7 +778,7 @@ fn checkRequestRender(input: []const u8) void {
         .{ .path = request.target, .query = "" };
 
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderRequestHead(&request, target, &.{}, false, null, &buffer) catch unreachable;
+    const rendered = renderRequestHead(&request, target, &.{}, false, null, false, &buffer) catch unreachable;
 
     // The oracle buffer carries slack past `head_buffer_bytes_default` so normalization
     // growth never truncates the comparison; production renders into an
@@ -786,7 +835,7 @@ fn checkRequestRenderEdited(input: []const u8) void {
         .{ .kind = .remove, .name = "X-Fuzz-Remove", .value = "" },
     };
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderRequestHead(&request, target, &edits, false, null, &buffer) catch return;
+    const rendered = renderRequestHead(&request, target, &edits, false, null, false, &buffer) catch return;
 
     // The appended edits can push an already-large head past `head_buffer_bytes_default`
     // — the oversize-after-edits verdict (431 in production, which renders
@@ -813,7 +862,7 @@ fn checkResponseRender(input: []const u8) void {
     var storage: parser.HeaderStorage = undefined;
     const response = parser.parseResponseHead(input, false, &storage, .get) catch return;
     var buffer: [oracle_buffer_bytes]u8 = undefined;
-    const rendered = renderResponseHead(&response, false, &.{}, &buffer) catch unreachable;
+    const rendered = renderResponseHead(&response, false, &.{}, false, &buffer) catch unreachable;
 
     var reparse_storage: parser.HeaderStorage = undefined;
     const reparsed = parser.parseResponseHead(rendered, false, &reparse_storage, .get) catch unreachable;
@@ -881,6 +930,7 @@ fn checkRequestRenderForwarded(input: []const u8) void {
         &.{},
         false,
         forwarded_for,
+        false,
         &buffer,
     ) catch return;
     if (rendered.len > constants.head_buffer_bytes_default) {

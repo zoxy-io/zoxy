@@ -260,6 +260,10 @@ pub fn Server(comptime IoType: type) type {
             /// The listener's #175 response filter rules, handed over the
             /// same way so the response re-render can apply its edits.
             response_filters: []const filter.ResponseRule,
+            /// The listener's #180 upgrade allowlist, carried for the same
+            /// reason as the tables above: an admitted connection asks its
+            /// own socket what it may carry.
+            upgrades: config_module.Config.Listener.Upgrades,
             /// The listener's §7 client-address forwarding mode (null = off),
             /// handed over the same way: trust depends on what is in front
             /// of this socket, so it cannot live on the cluster.
@@ -683,6 +687,7 @@ pub fn Server(comptime IoType: type) type {
                     // path's route once the head parses (§7).
                     .cluster_index = listener_config.routes[0].cluster_index,
                     .routes = listener_config.routes,
+                    .upgrades = listener_config.upgrades,
                     .request_filters = listener_config.request_filters,
                     .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
@@ -1403,6 +1408,7 @@ pub fn Server(comptime IoType: type) type {
             conn.routes = listener.routes;
             conn.request_filters = listener.request_filters;
             conn.response_filters = listener.response_filters;
+            conn.upgrades = listener.upgrades;
             conn.forwarded = listener.forwarded;
             // The #140 captures live in a side table addressed by pool
             // slot, so a slot's bytes outlive the connection that wrote
@@ -2319,7 +2325,7 @@ pub fn Server(comptime IoType: type) type {
             // access log takes it here — the only place that knows which
             // origin this connection is being relayed to (§8).
             conn.log.endpoint_index = dial.endpoint_index;
-            server.chargeL4(conn, cluster_index, dial.endpoint_index);
+            server.chargeEndpoint(conn, cluster_index, dial.endpoint_index);
             if (server.config.clusters[cluster_index].proxy_protocol_send) |version| {
                 server.stageProxySendHeader(conn, version);
             }
@@ -2349,7 +2355,7 @@ pub fn Server(comptime IoType: type) type {
             const socket = result catch |err| {
                 server.counters.increment("upstream_connect_failed");
                 // The labeled twin (#179): the pick did not survive the
-                // await, but the L4 charge did — `chargeL4` recorded the
+                // await, but the charge did — `chargeEndpoint` recorded the
                 // endpoint this dial was for, and the charge is released
                 // only at teardown, after this line.
                 assert(conn.charged_endpoint != conn_module.LogState.endpoint_none);
@@ -2428,6 +2434,26 @@ pub fn Server(comptime IoType: type) type {
             if (conn.upstream_socket) |socket| {
                 server.io.closeNow(socket);
                 conn.upstream_socket = null;
+            }
+            // The §5 tunnel buffer first, and the order matters: a live
+            // tunnel's `relay_buffer` *aliases* its `tunnel_buffer`
+            // (#180), so releasing the shared way would hand one pool's
+            // slot to the other — which `Pool.indexOf` catches, but only
+            // after the accounting is already wrong. One owner, checked
+            // before the alias is read.
+            if (conn.tunnel_buffer) |buffer| {
+                // The alias holds only once `beginTunnel` swapped this
+                // buffer in (#180). *Before* `101` the two fields are
+                // distinct buffers from distinct pools — the claim, and
+                // the ordinary relay buffer the exchange is still using —
+                // so clearing the second on the strength of the first
+                // would drop a live pool slot without releasing it. The
+                // pointer compare says exactly which case this is.
+                if (conn.relay_buffer == buffer) {
+                    conn.relay_buffer = null;
+                }
+                server.releaseTunnelBuffer(buffer);
+                conn.tunnel_buffer = null;
             }
             // An idle L7 connection holds no relay buffer (§5); only
             // release one that was actually acquired.
@@ -2764,8 +2790,14 @@ pub fn Server(comptime IoType: type) type {
         /// out counts against its endpoint. The endpoint is recorded on
         /// the connection so the release cannot guess, and so a slot
         /// that never dialed releases nothing.
-        fn chargeL4(server: *Self, conn: *ConnType, cluster_index: u16, endpoint_index: u16) void {
-            assert(conn.protocol == .l4);
+        /// Charge one endpoint for a connection this proxy is carrying
+        /// that holds no upstream *slot* — an L4 relay, or a #180 tunnel,
+        /// which after `101` is the same thing. The `max_inflight` view
+        /// sums this beside the pool's L7 leases precisely because both
+        /// are work the origin is carrying (§7), so a tunnel keeps being
+        /// counted for its whole life without pinning a shared slot.
+        pub fn chargeEndpoint(server: *Self, conn: *ConnType, cluster_index: u16, endpoint_index: u16) void {
+            assert(conn.protocol == .l4 or conn.state == .l7_exchanging);
             assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
             const key = server.upstreams.keys.key(cluster_index, endpoint_index);
             server.l4_inflight[key] += 1;
