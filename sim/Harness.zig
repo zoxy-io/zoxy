@@ -843,6 +843,13 @@ fn deriveServerConfig(
         // for coverage that does not exist. The draw arrives with the
         // tunnels themselves (#180).
         .tunnel_timeout_ms = zoxy.constants.tunnel_ms_default,
+        // The #237 cap is read off the config, where the loader puts it;
+        // `deriveInitOptions` sizes the pools separately. Drawn only under
+        // the adversary, for the reason `deriveMaxInflight` gives: a
+        // capped connection announces a close its script did not ask for,
+        // and a clean seed's golden transcript forbids that. `0` leaves it
+        // unlimited, which is every clean seed and most others.
+        .limits = .{ .keepalive_requests = deriveKeepaliveRequests(harness.clean, random) },
         // Three seeds in four run with the access log on, so the sink,
         // its staging swap, and the per-request captures all take the
         // schedule fuzz; the fourth leaves it off, which is the shape
@@ -920,6 +927,19 @@ fn deriveMaxBodyBytes(clean: bool, random: std.Random) u64 {
     if (clean) return 0;
     if (random.uintLessThan(u8, 3) != 0) return 0;
     return 1 + random.uintLessThan(u64, 16);
+}
+
+/// The #237 keep-alive request cap. One or two, so `keepalive_pair` —
+/// the script that sends a second request once the first settles
+/// reusable — actually meets it: at one the first response announces the
+/// close and the pair degrades to a single exchange, which its own spec
+/// already allows for ("degrades to a single-exchange transcript when its
+/// first response refuses reuse"), and at two it serves both and the
+/// second is the one capped.
+fn deriveKeepaliveRequests(clean: bool, random: std.Random) u32 {
+    if (clean) return 0;
+    if (random.uintLessThan(u8, 3) != 0) return 0;
+    return 1 + random.uintLessThan(u32, 2);
 }
 
 fn deriveMaxInflight(clean: bool, random: std.Random) ?u32 {

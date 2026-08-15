@@ -553,6 +553,8 @@ const Http1Bed = struct {
         head_timeout_ms: ?u32 = null,
         /// The #236 request-body cap; 0 accepts any size.
         max_body_bytes: u64 = constants.request_body_bytes_default,
+        /// The #237 keep-alive request cap; 0 is unlimited.
+        keepalive_requests: u32 = constants.keepalive_requests_default,
         /// Put an endpoint nothing listens on *ahead* of the origin, so
         /// the first pick of an `rr` cluster is always the one that
         /// refuses and the retry is the only way to reach the origin.
@@ -686,6 +688,11 @@ const Http1Bed = struct {
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
+            // The #237 cap is read off the *config*, which is where the
+            // loader puts it; `InitOptions` sizes the pools. The bed keeps
+            // the rest of `limits` at its struct defaults, which is what
+            // every test before this one was measuring against.
+            .limits = .{ .keepalive_requests = options.keepalive_requests },
             .connect_timeout_ms = connect_timeout_ms,
             .idle_timeout_ms = idle_timeout_ms,
             // Mirrors the idle window unless a test is about the split
@@ -5270,5 +5277,130 @@ test "l7: a chunked body that outgrows the cap while streaming is cut" {
     // well-formed and simply outgrew what this listener carries.
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_body_over_limit"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_request"));
+    try bed.expectDrained();
+}
+
+test "l7: the request cap announces its close on the last response it serves" {
+    // #237. The cap has to bite where the response's persistence is
+    // decided, not at the turnaround: §8's rule is that a close is
+    // announced rather than silent, so the last request a connection
+    // serves must be the one carrying the header that says so. A client
+    // that read a reset where a status was due reports an error it cannot
+    // attribute.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 330,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .keepalive_requests = 1,
+    });
+    defer bed.tearDown();
+
+    // The client asks to keep the connection; the cap says this is the
+    // one and only request it gets.
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_keepalive_requests_capped"),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
+}
+
+test "l7: a connection under the cap keeps serving, and 0 is unlimited" {
+    // Two requests over one connection with the cap at 2: the first must
+    // keep, and the counter must stay still — a cap that fired early
+    // would churn the population it exists to bound.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 331,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .keepalive_requests = 2,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /b HTTP/1.1\r\nHost: o\r\n\r\n";
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    // First keeps, second is capped and says so.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" ++
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_keepalive_requests_capped"),
+    );
+    try std.testing.expectEqual(@as(u32, 2), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: a client that asked to close is not counted against the cap" {
+    // The counter must name the cap's own effect. A connection already
+    // closing — because the client asked, or pressure or a drain decided
+    // — did not need this rung, and counting it would read as churn the
+    // cap caused.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 332,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .keepalive_requests = 1,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("l7_keepalive_requests_capped"),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
+}
+
+test "l7: the request cap binds a statically-answered connection too" {
+    // The hole review found: the cap first landed only on the proxied
+    // response path, so a client whose every request met a filter reject,
+    // a 404 or a redirect kept its conn slot indefinitely — the exact
+    // population the cap exists to bound, relocated rather than fixed.
+    // A static answer holds a slot exactly as firmly as a proxied one.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin" },
+        .actions = &[_]filter.Action{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 333,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .request_filters = &rules,
+        .keepalive_requests = 1,
+    });
+    defer bed.tearDown();
+
+    // A rejected request never reaches an origin, so nothing on the
+    // proxied path could have applied the cap to it.
+    try bed.exchange("GET /admin HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bed.client.response(),
+        "HTTP/1.1 403 Forbidden\r\n",
+    ));
+    // Announced, not silent: the client is told this connection is done.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bed.client.response(),
+        "Connection: close",
+    ) != null);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_keepalive_requests_capped"),
+    );
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
     try bed.expectDrained();
 }

@@ -231,6 +231,13 @@ pub const Counters = struct {
     /// only the declared case would be bypassed by an encoding any client
     /// can choose, which is worse than none for reading as protection.
     l7_body_cut_mid_stream: Value = Value.init(0),
+    /// Connections whose response announced `Connection: close` because
+    /// they had served the §5 request cap (#237). Counted only where the
+    /// cap is the *binding* reason — a connection already closing for
+    /// pressure, a drain or the client's own ask did not need this rung —
+    /// so a rising count is the cap doing its job rather than churn it
+    /// merely coincided with.
+    l7_keepalive_requests_capped: Value = Value.init(0),
     /// Interim `1xx` responses relayed to the client (#232). Forwarded
     /// rather than absorbed, which is what both references do: a `103` is
     /// worthless to a client that never sees it, and a `100` the client is

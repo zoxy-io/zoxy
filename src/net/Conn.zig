@@ -383,6 +383,10 @@ pub fn Conn(comptime IoType: type) type {
         /// The listener's #236 request-body cap, handed over at admission
         /// like the tables beside it; `0` accepts any size.
         max_body_bytes: u64,
+        /// Requests this connection has served, for the #237 cap. On the
+        /// connection rather than in `l7`, which resets at every
+        /// turnaround — the whole point is a total that survives them.
+        requests_served: u32,
         request_filters: []const filter.Rule,
         /// The listener's #175 response filter rules, same lifetime:
         /// matched against the origin's parsed response head at the
@@ -740,6 +744,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.response_filters = &.{};
             conn.upgrades = .{};
             conn.max_body_bytes = 0;
+            conn.requests_served = 0;
             conn.forwarded = null;
             conn.upstream = null;
             conn.charged_endpoint = LogState.endpoint_none;

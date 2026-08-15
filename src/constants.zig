@@ -504,6 +504,25 @@ pub const cluster_name_bytes_max: u16 = 64;
 /// not a share.
 pub const endpoint_weight_max: u16 = 256;
 
+/// Default cap on requests one client connection may serve (#237) —
+/// nginx's `keepalive_requests`, which also ships on. `0` is unlimited.
+///
+/// Unlike a body cap this one zoxy *can* honestly answer, and that is
+/// what earns it a default: it bounds this proxy's own slot occupancy
+/// rather than stating anything about an origin. `idle_ms` reaps a
+/// connection that stops speaking and `max_lifetime_ms` one that has been
+/// open too long; neither bounds a connection that is *busy* — and a busy
+/// connection is exactly the one holding a conn slot and, on every
+/// request, a head-ring buffer and an upstream lease. §8's watermark
+/// biases all aim at shedding *idle* capacity, so a population that is
+/// never idle is the shape none of them reach.
+///
+/// A count rather than more time, because it is the bound that is fair
+/// under an adversarial client: it costs the same reconnect whether a
+/// client is fast or slow, where a time cap punishes the slow-but-honest
+/// one and lets a fast abusive one hold its slot indefinitely.
+pub const keepalive_requests_default: u32 = 1000;
+
 /// Default cap on one request's body (#236), per listener. One MiB —
 /// nginx's `client_max_body_size`, which ships on by default and is the
 /// figure most application stacks are deployed assuming something in
@@ -1288,6 +1307,9 @@ comptime {
     // and the first byte re-bases the idle deadline *down* to this — a
     // timer never moves later once armed, so an inversion either way
     // would silently leave the wider value in force.
+    // The two #236/#237 client-side caps: each must be a real bound, or
+    // the default would spell the "unlimited" its own zero already does.
+    assert(keepalive_requests_default >= 1);
     assert(request_body_bytes_default >= 1);
     assert(request_body_bytes_default <= request_body_bytes_max);
     assert(connect_ms_default < head_ms_default);
