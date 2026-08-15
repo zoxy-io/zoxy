@@ -191,6 +191,17 @@ pub const Config = struct {
         /// terminates TLS, and the struct default is the off state on the
         /// same terms as `head_buffers`.
         tls_engines: u32 = 0,
+        /// Requests one client connection may serve before the next
+        /// response announces `Connection: close` (#237); `0` is
+        /// unlimited.
+        ///
+        /// In `limits` rather than beside a listener's policy, and the
+        /// distinction is the one `max_body_bytes` draws from the other
+        /// side: a body cap states what an *origin* should be asked to
+        /// carry, while this bounds what one client may occupy *here*.
+        /// `cq_fill_eighths` sits in this block on the same terms — not a
+        /// pool size, but a knob about this process's own resources.
+        keepalive_requests: u32 = constants.keepalive_requests_default,
         /// The §5 tunnel pool (#180): how many upgraded connections may be
         /// carried at once, each holding its own relay buffer and upstream
         /// socket for its whole life rather than drawing from the shared
@@ -1235,6 +1246,8 @@ fn resolveLimits(
         .head_buffer_bytes = head_buffer_bytes,
         .tls_engines = tls_engines,
         .tunnels = tunnels,
+        .keepalive_requests = limits_json.keepalive_requests orelse
+            constants.keepalive_requests_default,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
     };
@@ -1614,6 +1627,9 @@ pub const LimitsJson = struct {
     head_buffer_bytes: ?u32 = null,
     tls_engines: ?u32 = null,
     tunnels: ?u32 = null,
+    /// Optional #237 keep-alive request cap; absent means nginx's 1000,
+    /// `0` is unlimited.
+    keepalive_requests: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 
@@ -1667,6 +1683,13 @@ pub const LimitsJson = struct {
                 "follows. Zero exactly when no listener terminates TLS.",
             .minimum = 1,
             .maximum = constants.tls_engines_max,
+        },
+        .keepalive_requests = .{
+            .desc = "Requests one client connection may serve before the next " ++
+                "response announces Connection: close; absent means 1000, " ++
+                "0 is unlimited.",
+            .minimum = 0,
+            .maximum = std.math.maxInt(u32),
         },
         .tunnels = .{
             .desc = "Concurrent tunnelled upgrades (#180). Each holds its own relay " ++

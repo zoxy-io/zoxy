@@ -913,7 +913,8 @@ reserves nor demands the ceiling's resources.
     "head_buffers": 1024,
     "upstream_head_buffers": 512,
     "head_buffer_bytes": 16384,
-    "tunnels": 512
+    "tunnels": 512,
+    "keepalive_requests": 1000
 }
 ```
 
@@ -946,6 +947,25 @@ it is **required**, since no default can be derived for it. Each costs one
 relay-buffer pair (8200 bytes), held for the tunnel's whole life rather than
 for the duration of a request, which is why they are reserved apart from
 `relay_buffers` instead of drawn from it.
+
+`keepalive_requests` bounds how many requests one client connection may
+serve — **1000 by default**, nginx's figure, and `0` is unlimited. It is
+the one bound that reaches a *busy* connection: `idle_ms` reaps one that
+stops speaking and `max_lifetime_ms` one that has been open too long, but
+neither touches a connection that keeps asking, which is exactly the one
+holding a conn slot and, on every request, a head buffer and an upstream
+lease. Past the cap the next response announces `Connection: close` — the
+same announced close every other rung uses, never a silent reset — and
+the client reconnects, which every HTTP client treats as routine.
+`zoxy_l7_keepalive_requests_capped` counts it, and only where the cap is
+the *binding* reason, so a rising count is the cap working rather than
+churn it merely coincided with.
+
+A parked *upstream* connection is deliberately not capped, where nginx
+caps both. One is shared across clients and carries the reuse win the
+design rests on, so churning it has a directly visible cost — and the occupancy this
+bounds is a client's, not an origin's. An origin that wants its own bound
+can announce it, and zoxy honours what an origin says about persistence.
 
 `cq_fill_eighths` trades connection ceiling for `io_uring` completion-queue
 burst headroom; `access_log_buffer_bytes` sizes the access log's staging

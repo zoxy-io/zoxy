@@ -1004,6 +1004,27 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   this proxy asked for it (#180) and a failed exchange when it did not,
   because relaying it as interim would carry on reading bytes that are no
   longer HTTP.
+- **One client connection serves a bounded number of requests** (#237).
+  `limits.keepalive_requests`, 1000 by default — nginx's figure, and one
+  zoxy can honestly borrow because unlike a body cap it bounds *this
+  proxy's* slot occupancy rather than stating anything about an origin.
+  It is the only bound that reaches a **busy** connection: `idle_ms`
+  reaps one that stopped speaking, `max_lifetime_ms` one open too long,
+  and neither touches one that keeps asking — which is exactly the
+  connection holding a conn slot and, per request, a head buffer and an
+  upstream lease. That matters more here than it would elsewhere,
+  because §5's pools are sized for concurrent *activity* and §8's
+  watermark biases all shed **idle** capacity, so a population that is
+  never idle is the shape none of those levers reach. A count rather
+  than more time, because it is the bound that is fair under an
+  adversarial client: the same reconnect whether it is fast or slow,
+  where a time cap punishes the slow-but-honest one and lets a fast
+  abusive one hold its slot indefinitely. Enforced where the response's
+  persistence is decided, so the last request a connection serves is the
+  one whose header announces the close — never a silent reset. A parked
+  *upstream* connection is deliberately uncapped: it is shared across
+  clients and carries the reuse win §3 cites, so churning it has a cost
+  churning a client's does not.
 - **A request body is bounded, and the bound is the origin's** (#236).
   Nothing here needs it: §6's strict recv → send → recv relay keeps
   per-connection memory constant whatever the stream size, so an

@@ -769,6 +769,11 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_reading_head);
             assert(request.head_len <= conn.head_len);
             recordRequestFacts(server, conn, request);
+            // Counted where a request becomes real (#237): a head that
+            // parsed and will be answered. A malformed one never reaches
+            // here, which is right — the cap bounds work this connection
+            // asked for, not bytes it fumbled.
+            conn.requests_served +|= 1;
             armRequestDeadline(server, conn);
             if (request.method == .connect) {
                 return respond(server, conn, 501, "l7_not_implemented");
@@ -1925,6 +1930,49 @@ pub fn Proxy(comptime IoType: type) type {
             renderResponse(server, conn, &response);
         }
 
+        /// Whether this connection has served all the requests the §5 cap
+        /// allows (#237).
+        ///
+        /// Deliberately not applied to a *parked upstream* connection,
+        /// which nginx does cap. A parked upstream is shared across
+        /// clients (§3) and carries the reuse win §3 cites — measured by
+        /// the previous iteration at ~3x req/s, not by this one — so
+        /// churning it has a directly visible cost where churning a client
+        /// connection has none — and the occupancy this bounds is a client's, not an
+        /// origin's. If an origin wants its own bound it can announce it,
+        /// and §7 already honors what an origin says about persistence.
+        fn requestsCapReached(server: *const ServerType, conn: *const ConnType) bool {
+            // Every caller answers a request that `routeRequest` already
+            // counted, so a zero here would mean the cap was consulted for
+            // a request nobody served.
+            assert(conn.requests_served >= 1);
+            const cap = server.config.limits.keepalive_requests;
+            if (cap == 0) return false; // Unlimited.
+            return conn.requests_served >= cap;
+        }
+
+        /// The #237 cap as the last brake on any persistence decision that
+        /// would otherwise keep.
+        ///
+        /// One helper rather than a predicate each site remembers to
+        /// consult, because there are four such decisions — the proxied
+        /// response, a static answer, a #159 page and a #176 redirect —
+        /// and the cap is meaningless if it binds only the first. A client
+        /// whose every request lands on a filter reject or a 404 holds its
+        /// slot exactly as firmly as one being proxied, which is the
+        /// occupancy this bounds.
+        ///
+        /// It also owns the counter, so "the cap is why this closed" is
+        /// recorded once and only where it is the *binding* reason: a
+        /// connection already closing for pressure, a drain or the
+        /// client's own ask never reaches the check.
+        fn applyRequestCap(server: *ServerType, conn: *const ConnType, would_keep: bool) bool {
+            if (!would_keep) return false;
+            if (!requestsCapReached(server, conn)) return true;
+            server.counters.increment("l7_keepalive_requests_capped");
+            return false;
+        }
+
         /// The §8 persistence decision, made once and honored: keep the
         /// client's connection unless pipelining, pressure, or drain says
         /// otherwise — then announce whatever was decided (§7).
@@ -2426,7 +2474,16 @@ pub fn Proxy(comptime IoType: type) type {
             // an interim and an uninvited switch all divert first.
             if (!dispatchByStatus(server, conn, response)) return;
 
-            const keep_downstream = downstreamKeepAlive(server, conn, response);
+            // The #237 cap applies where the response's persistence is
+            // decided, not at the turnaround: §8's rule is that a close is
+            // announced rather than silent, so the last request a
+            // connection serves has to be the one carrying the header that
+            // says so.
+            const keep_downstream = applyRequestCap(
+                server,
+                conn,
+                downstreamKeepAlive(server, conn, response),
+            );
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
             const verdict = stickyVerdict(server, conn);
@@ -2464,22 +2521,38 @@ pub fn Proxy(comptime IoType: type) type {
                 excess[0..feed.consumed],
             );
 
+            commitResponse(server, conn, response, verdict, head_write_len);
+        }
+
+        /// The point of no return: from here the origin's answer is *this
+        /// exchange's* answer and no verdict may intervene (§7).
+        ///
+        /// Split from the render because everything here is a commitment
+        /// rather than a decision, and because each line is credited
+        /// deliberately *late*. The sticky stamp is counted only now —
+        /// the malformed-excess bail above can still discard a rendered
+        /// head, and a discarded try must not count (`l7_redirected`'s
+        /// placement rule). The status is recorded so a line can report
+        /// what the origin said even if the exchange never finishes,
+        /// while whether the client *got* it stays a separate fact:
+        /// `outcome` remains `aborted` until `finishExchange` earns `ok`
+        /// (§8). And the #140 response headers are captured at this same
+        /// moment because the origin's head is live now and this render is
+        /// what writes over it.
+        fn commitResponse(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+            verdict: StickyVerdict,
+            head_write_len: u32,
+        ) void {
+            assert(conn.state == .l7_exchanging);
+            assert(!conn.l7.response_started);
+            assert(head_write_len >= 1);
             conn.l7.response_leg = .sending_head;
-            // Committed to answering: no verdict may intervene from here (§7).
             conn.l7.response_started = true;
-            // Credited only here, at the point of no return — the
-            // malformed-excess bail above can still discard a rendered
-            // head, and a discarded try must not count (`l7_redirected`'s
-            // placement rule).
             creditSticky(server, verdict);
-            // What the origin said, so a line can report it even if the
-            // exchange never finishes. Whether the client *got* it is a
-            // separate fact, and `outcome` stays `aborted` until
-            // `finishExchange` earns `ok` (§8).
             conn.log.status = response.status;
-            // The #140 response headers, captured here for the same
-            // reason and at the same moment: the origin's head is live
-            // now, and this render is what writes over it.
             server.captureResponseLogHeaders(conn, response.headers);
             armClientWrite(server, conn, headBytes(server, conn)[0..head_write_len], .response_excess);
         }
@@ -3398,10 +3471,12 @@ pub fn Proxy(comptime IoType: type) type {
             // shedding, and how a transient overshoot locks itself in as a
             // reconnect loop. Keeping is one send.
             //
-            // The same three brakes the render-time persistence decision
+            // The same four brakes the render-time persistence decision
             // honors apply here (§7, §8): the client's own ask, the drain,
-            // and relay pressure — a proxy shedding buffers should not also
-            // be holding connections open for their next request.
+            // relay pressure — a proxy shedding buffers should not also be
+            // holding connections open for their next request — and the
+            // #237 request cap, which binds a connection answered
+            // statically exactly as firmly as one being proxied.
             // The head-shed rung can never keep, structurally: nothing was
             // read (the ring was empty, so no buffer was ever bound), the
             // request's bytes wait unread in the socket, and a kept
@@ -3409,7 +3484,7 @@ pub fn Proxy(comptime IoType: type) type {
             // forever. Comptime, so the resync rule — whose asserts require
             // at least one byte read — is never consulted on that rung.
             const may_keep = comptime !std.mem.eql(u8, counter, "l7_shed_head_buffers");
-            const keep = may_keep and staticResponseResyncable(conn) and
+            const keep = applyRequestCap(server, conn, may_keep and staticResponseResyncable(conn)) and
                 conn.l7.client_keep_alive and
                 !server.draining and
                 !server.keepAliveSuppressed();
@@ -3521,9 +3596,9 @@ pub fn Proxy(comptime IoType: type) type {
             server.counters.increment("l7_responded");
             conn.log.status = page.status;
             conn.log.outcome = .responded;
-            // The same three brakes every static answer honors (§7, §8):
+            // The same four brakes every static answer honors (§7, §8):
             // the client's own ask, the drain, and relay pressure.
-            const keep = staticResponseResyncable(conn) and
+            const keep = applyRequestCap(server, conn, staticResponseResyncable(conn)) and
                 conn.l7.client_keep_alive and
                 !server.draining and
                 !server.keepAliveSuppressed();
@@ -3631,9 +3706,9 @@ pub fn Proxy(comptime IoType: type) type {
                     // answer requires.
                     error.NoHost => return respond(server, conn, 400, "l7_bad_request"),
                 };
-            // The same three brakes `respond` honors, decided before the
+            // The same four brakes `respond` honors, decided before the
             // render because the close is announced inside it (§7).
-            const keep = staticResponseResyncable(conn) and
+            const keep = applyRequestCap(server, conn, staticResponseResyncable(conn)) and
                 conn.l7.client_keep_alive and
                 !server.draining and
                 !server.keepAliveSuppressed();
