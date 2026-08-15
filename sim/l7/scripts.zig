@@ -156,6 +156,15 @@ pub const Spec = struct {
     /// Every other routed request is assigned or repicked and owes the
     /// pinned cookie.
     sticky_request_pinned: bool = false,
+    /// This script routes to an origin and its 200 is the canonical body
+    /// with the standard stamps — nothing about the response tells it
+    /// apart from a plain `get`'s. That is what lets the terminating
+    /// population (#215) follow one with a second request and judge the
+    /// pair by a single spec; a script whose response is a static, a
+    /// redirect, a rejection or an un-stamped 200 cannot be paired that
+    /// way, because one spec cannot describe both halves. Held to its
+    /// meaning by the comptime block below rather than trusted.
+    routed_canonical: bool = false,
 };
 
 const post_body = "request-body-24-bytes-ab";
@@ -268,6 +277,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     .post_sized = .{
         .request = post_request,
@@ -276,6 +286,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .post,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     .post_big = .{
         .request = "POST /big HTTP/1.1\r\nHost: sim\r\n" ++
@@ -285,6 +296,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .post,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     .post_chunked = .{
         .request = "POST /sim HTTP/1.1\r\nHost: sim\r\n" ++
@@ -294,6 +306,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .post,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     .post_chunked_malformed = .{
         // "Z" is no chunk-size digit: the framing violation is in the
@@ -388,6 +401,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     // §7 filter scripts: a distinct path per action so the listener's
     // rules fire only for these, never the others.
@@ -438,6 +452,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     .filter_rewrite = .{
         .request = "GET /rewrite HTTP/1.1\r\nHost: sim\r\n\r\n",
@@ -446,6 +461,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     // §7 client-address forwarding: both route and forward like a plain
     // GET, so the §8 rungs and a killed dial can precede the 200. What
@@ -462,6 +478,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     .forwarded_oversize = .{
         .request = forwarded_oversize_head,
@@ -470,6 +487,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
     // #178: both route and forward like a plain GET, so the §8 rungs and
     // a killed dial can precede the 200. What they change is the sticky
@@ -495,6 +513,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 200,
         .method = .get,
         .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
     },
 });
 
@@ -532,6 +551,58 @@ comptime {
     assert(!terminating_pair.sticky_request_pinned);
 }
 
+/// What the §4 terminating population may draw (#215). Every script but
+/// two: this client sends the drawn request over a terminated listener,
+/// so the filter, redirect, static, rejection and sticky paths finally
+/// ride the transform instead of only the plaintext listener.
+///
+/// `silent` is out because it sends nothing — a session with no request
+/// completes no exchange, never closes, and would test only the
+/// scenario-end reaper the L4 population already exercises.
+///
+/// `keepalive_pair` is out because its second request is a *runtime*
+/// decision: the plaintext client sends it only once the first response
+/// settles reusable, read off its own walk. The terminating client's
+/// follow-up is unconditional, so drawing that script would send a second
+/// request into a connection the first response may have closed. The
+/// turnaround it exists for is covered anyway — every `routed_canonical`
+/// draw takes a follow-up.
+pub const terminating_scripts = [_]Script{
+    .get,
+    .post_sized,
+    .post_big,
+    .post_chunked,
+    .post_chunked_malformed,
+    .malformed_head,
+    .oversize_uri,
+    .connect_method,
+    .pipelined,
+    .confusion,
+    .filter_reject,
+    .filter_redirect,
+    .filter_respond,
+    .filter_edit,
+    .filter_rewrite,
+    .forwarded_inbound,
+    .forwarded_oversize,
+    .sticky_follow,
+    .sticky_repick,
+};
+
+comptime {
+    // Every script is either drawable there or one of the two named
+    // exceptions, so a script added to the table cannot quietly skip the
+    // terminating population — someone has to decide which it is.
+    for (std.enums.values(Script)) |script| {
+        const excepted = script == .silent or script == .keepalive_pair;
+        var drawable = false;
+        for (terminating_scripts) |candidate| {
+            if (candidate == script) drawable = true;
+        }
+        assert(drawable != excepted);
+    }
+}
+
 pub fn spec(script: Script) Spec {
     return specs.get(script);
 }
@@ -558,5 +629,23 @@ comptime {
         // that routes, which a page never does.
         if (entry.respond_page) assert(entry.golden_status == 200);
         if (entry.respond_page) assert(!entry.sticky_request_pinned);
+        // "Judged exactly as a plain GET is", spelled out: same legal
+        // status set, same golden outcome, neither render exception, and
+        // one response per request. A script that drifts from any of
+        // those stops being pairable and has to say so here first.
+        if (entry.routed_canonical) {
+            assert(std.mem.eql(u16, entry.allowed_statuses, statuses_routed));
+            assert(entry.golden_status == 200);
+            assert(entry.expected_responses == 1);
+            assert(entry.transcript_cap == 1);
+            assert(!entry.respond_page);
+            assert(!entry.sticky_request_pinned);
+            // And the one bound the substitution rests on: a paired
+            // transcript is judged by `terminating_pair`'s method, so a
+            // script whose responses parse under a *different* body rule
+            // cannot be paired. GET and POST share theirs; HEAD does not,
+            // and would have its bodiless responses read as truncated.
+            assert(entry.method != .head);
+        }
     }
 }
