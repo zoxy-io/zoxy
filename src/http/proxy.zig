@@ -776,6 +776,16 @@ pub fn Proxy(comptime IoType: type) type {
             if (parser.headerValue(request.headers, "upgrade")) |token| {
                 if (!admitUpgrade(server, conn, token)) return;
             }
+            // A declared body over the listener's cap is knowable now, so
+            // it is refused now (#236) — the §8 tunnel rung's own
+            // reasoning: admitting first and shedding after would spend an
+            // origin connection to produce a worse answer. The connection
+            // closes rather than keeps, because the body it declared is
+            // still unread in the socket and draining it only to reject it
+            // is the wrong trade at the size this triggers on.
+            if (bodyOverLimit(conn, request)) {
+                return respond(server, conn, 413, "l7_body_over_limit");
+            }
 
             // §7: canonicalize the host and path once, then apply filters
             // and routing to that one view before acquiring any resource,
@@ -856,6 +866,31 @@ pub fn Proxy(comptime IoType: type) type {
                     return .{ .endpoint = identity };
                 },
             }
+        }
+
+        /// Whether a chunked request body has outgrown the listener's cap
+        /// (#236). Only `chunked` can reach here: a length-delimited body
+        /// was refused before the dial on the number its own head
+        /// declared, and the other framings carry no body to measure.
+        fn streamOverLimit(conn: *const ConnType) bool {
+            assert(conn.state == .l7_exchanging);
+            if (conn.max_body_bytes == 0) return false; // Opted out.
+            return switch (conn.l7.request_framing) {
+                .chunked => |scanner| scanner.body_bytes > conn.max_body_bytes,
+                .none, .content_length, .until_close => false,
+            };
+        }
+
+        /// Whether this request's *declared* body exceeds the listener's
+        /// cap (#236). Only the length-delimited case is knowable here; a
+        /// chunked body announces no size and is caught as it streams.
+        fn bodyOverLimit(conn: *const ConnType, request: *const parser.RequestHead) bool {
+            assert(conn.state == .l7_reading_head);
+            if (conn.max_body_bytes == 0) return false; // Opted out.
+            return switch (request.framing) {
+                .content_length => |length| length > conn.max_body_bytes,
+                .none, .chunked, .until_close => false,
+            };
         }
 
         /// Decide an `Upgrade` request's fate before a byte of it is
@@ -1484,6 +1519,16 @@ pub fn Proxy(comptime IoType: type) type {
                 respond(server, conn, 400, "l7_bad_request");
                 return;
             }
+            // A chunked body that arrived coalesced with its head is over
+            // the cap *here*, before the response leg is armed — so it
+            // still earns a status rather than the teardown the streaming
+            // case can only take (#236). Same rung, better answer, and the
+            // reason the check lives at both sites rather than only in the
+            // pump: a small over-cap body never reaches the pump at all.
+            if (streamOverLimit(conn)) {
+                respond(server, conn, 413, "l7_body_over_limit");
+                return;
+            }
             // The response leg starts recving now — before the request body
             // finishes — so an early response cannot wedge both TCP windows
             // (§7). Its render into conn.head waits until the request head
@@ -1667,7 +1712,22 @@ pub fn Proxy(comptime IoType: type) type {
             }
 
             pub fn feed(conn: *ConnType, chunk: []const u8) pump.FeedResult {
-                return feedFraming(&conn.l7.request_framing, chunk);
+                const fr = feedFraming(&conn.l7.request_framing, chunk);
+                if (fr.malformed) return fr;
+                // A chunked body announces no size, so the cap can only be
+                // read off what has actually arrived (#236). Checked after
+                // the feed, on the scanner's own payload total rather than
+                // the wire bytes — sizes, terminators and trailers are
+                // framing, and a documented byte limit that counted them
+                // would refuse a body under its own cap.
+                if (!streamOverLimit(conn)) return fr;
+                conn.server.counters.increment("l7_body_cut_mid_stream");
+                return .{
+                    .consumed = fr.consumed,
+                    .done = false,
+                    .malformed = false,
+                    .over_limit = true,
+                };
             }
 
             pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
@@ -3628,6 +3688,10 @@ pub fn Proxy(comptime IoType: type) type {
             for (rejects) |name| {
                 if (std.mem.eql(u8, counter, name)) return .rejected;
             }
+            // A body over the listener's cap is a policy reject like a
+            // filter's (#236), not a shed: nothing of this proxy's ran
+            // out, and the operator wrote the rule that refused it.
+            if (std.mem.eql(u8, counter, "l7_body_over_limit")) return .rejected;
             if (std.mem.eql(u8, counter, "l7_shed_relay_buffers")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_upstream_slots")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_head_buffers")) return .shed;

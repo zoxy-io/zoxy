@@ -214,6 +214,23 @@ pub const Counters = struct {
     /// says an operator's deadline expired, this one says a deadline
     /// they never named was supplied for them (§8).
     tunnels_drained: Value = Value.init(0),
+    /// Requests refused for a body over the listener's cap (#236).
+    /// Distinct from `l7_body_too_large` beside it, which answers the
+    /// same `413` for a different question — that one is a *buffer*
+    /// verdict, a head that fit whose payload overran the head buffer in
+    /// the same delivery. This one is policy: a body the operator said
+    /// their origin should not be asked to carry.
+    l7_body_over_limit: Value = Value.init(0),
+    /// Chunked requests cut mid-body for outgrowing the listener's cap
+    /// (#236). Its own counter beside `l7_body_over_limit`, because the
+    /// two answer differently and an operator reading either wants to
+    /// know which: a declared length is refused `413` before the origin
+    /// is dialed, while a chunked body announces no size and can only be
+    /// caught as it streams — by which point the response leg is armed
+    /// and no status can be sent, so it is a teardown. A cap that caught
+    /// only the declared case would be bypassed by an encoding any client
+    /// can choose, which is worse than none for reading as protection.
+    l7_body_cut_mid_stream: Value = Value.init(0),
     /// Interim `1xx` responses relayed to the client (#232). Forwarded
     /// rather than absorbed, which is what both references do: a `103` is
     /// worthless to a client that never sees it, and a `100` the client is

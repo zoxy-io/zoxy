@@ -264,6 +264,7 @@ pub fn Server(comptime IoType: type) type {
             /// reason as the tables above: an admitted connection asks its
             /// own socket what it may carry.
             upgrades: config_module.Config.Listener.Upgrades,
+            max_body_bytes: u64,
             /// The listener's §7 client-address forwarding mode (null = off),
             /// handed over the same way: trust depends on what is in front
             /// of this socket, so it cannot live on the cluster.
@@ -696,6 +697,7 @@ pub fn Server(comptime IoType: type) type {
                     .cluster_index = listener_config.routes[0].cluster_index,
                     .routes = listener_config.routes,
                     .upgrades = listener_config.upgrades,
+                    .max_body_bytes = listener_config.max_body_bytes,
                     .request_filters = listener_config.request_filters,
                     .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
@@ -1482,6 +1484,7 @@ pub fn Server(comptime IoType: type) type {
             conn.request_filters = listener.request_filters;
             conn.response_filters = listener.response_filters;
             conn.upgrades = listener.upgrades;
+            conn.max_body_bytes = listener.max_body_bytes;
             conn.forwarded = listener.forwarded;
             // The #140 captures live in a side table addressed by pool
             // slot, so a slot's bytes outlive the connection that wrote

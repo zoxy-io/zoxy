@@ -202,6 +202,10 @@ retries_http: u16,
 /// a tunnel pool to carry it. Off on most seeds, so the handshake script
 /// keeps proving the `501` every config had before the feature.
 upgrades_http: bool,
+/// The seed's #236 request-body cap on the plaintext http listener; `0`
+/// on every clean seed, since a `413` is a status its scripts did not ask
+/// for.
+max_body_bytes: u64,
 /// The seed's http origin prefixes an interim `100 Continue` to every
 /// answer (#232). Drawn once per seed rather than per accept, so a clean
 /// seed's transcript stays exact — which is the point: the golden oracle
@@ -645,6 +649,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.endpoints_http = .{ httpOriginAddress(), httpOriginAddress() };
     deriveRetries(harness, random);
     deriveUpgrades(harness, random);
+    harness.max_body_bytes = deriveMaxBodyBytes(harness.clean, random);
     // A quarter of seeds. Clean ones included, deliberately: an
     // adversarial seed only holds the transcript to a legal *prefix*, so
     // a proxy that settled on the interim and dropped the real answer
@@ -901,6 +906,22 @@ fn deriveSticky(harness: *Harness, random: std.Random) zoxy.config.Config.Cluste
 /// at one or two against up to six clients, both refusal paths run
 /// against real contention, and every seed still crosses back under the
 /// cap as connections finish — so the recovery side runs too.
+/// The #236 body cap, drawn only under the adversary and for the same
+/// reason `deriveMaxInflight` caps only there: a `413` is a status an L7
+/// script did not ask for, and a clean seed's golden outcomes forbid it.
+/// Drawn in the single-byte range so the rung is reached by ordinary
+/// scheduling rather than a coincidence of sizes: `post_big`'s few
+/// thousand bytes and `post_sized`'s twenty-four are over it on every
+/// draw. `post_chunked`'s eight-byte payload is the one that is not —
+/// roughly half the range leaves it under the cap — which is legal and
+/// which the directed tests cover regardless; the claim here is that the
+/// cap *bites*, not that it bites everything.
+fn deriveMaxBodyBytes(clean: bool, random: std.Random) u64 {
+    if (clean) return 0;
+    if (random.uintLessThan(u8, 3) != 0) return 0;
+    return 1 + random.uintLessThan(u64, 16);
+}
+
 fn deriveMaxInflight(clean: bool, random: std.Random) ?u32 {
     if (clean) return null;
     if (random.uintLessThan(u8, 3) != 0) return null;
@@ -1235,9 +1256,20 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .protocol = .http,
             .forwarded = forwarded,
             .upgrades = .{ .websocket = harness.upgrades_http },
+            .max_body_bytes = harness.max_body_bytes,
         },
         .{
             .bind_address = tlsBindAddress(),
+            // No #236 body cap, stated rather than inherited. The draw is
+            // a *plaintext-leg* one, and that is exactly what makes
+            // `routed_canonical`'s per-leg argument in `scripts.zig`
+            // exact: a terminated run of a body-carrying script is judged
+            // by `terminating_pair`'s spec, whose legal set omits `413`.
+            // Left to the struct default this listener would silently
+            // carry the one-MiB production cap — never firing today, and
+            // turning the first script whose body outgrew it into an
+            // oracle failure that looked unrelated to its cause.
+            .max_body_bytes = 0,
             // Its own route, so a terminated connection's origin conn is
             // one `verifyUpstreamIdentities` can tell from a plaintext
             // client's. Which cluster it points at follows the protocol:
@@ -2582,6 +2614,11 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         // in the same sum — added while it is free rather than on the
         // first seed that reaches it.
         "l7_body_too_large",
+        // The #236 cap's answered half. Its sibling
+        // `l7_body_cut_mid_stream` is deliberately absent: that one tears
+        // the exchange down without a status, so its line is an abort and
+        // counting it here would explain the same line twice.
+        "l7_body_over_limit",
         "l7_not_implemented",
         "l7_no_route",
         "l7_filtered",
