@@ -60,7 +60,6 @@ const tls_token_bytes: u8 = 24;
 /// an idle timeout. Between them is the keep-alive turnaround — the L7
 /// state re-entered on a terminated connection, which is where the head
 /// source's first defect lived (#204).
-const tls_http_request = l7.scripts.post_request;
 const tls_http_followup = l7.scripts.get_request_close;
 /// "203.0.113.255:65535" is 19 bytes; the slack is headroom, not hope.
 const announced_bytes_max: u8 = 32;
@@ -153,8 +152,16 @@ scenario_ended: bool,
 /// What the terminating listener speaks once the handshake hands over.
 tls_protocol: zoxy.config.Config.Listener.Protocol,
 /// What each terminating client sends, distinct per client so the echo
-/// oracle can tell one session's bytes from another's.
+/// oracle can tell one session's bytes from another's. Read only by the
+/// l4 draw; an http terminator sends its script's request instead.
 tls_tokens: [tls_client_slots][tls_token_bytes]u8,
+/// The script each terminating client sends over an http terminator
+/// (#215), one per storage slot including the resuming client's. Drawn
+/// rather than fixed so the filter, redirect, static, rejection and
+/// sticky paths ride the transform too — the population used to send one
+/// POST-then-GET pair, which exercised the response render's happy path
+/// and nothing else.
+tls_scripts: [tls_client_slots]l7.Script,
 tls_credentials: [3]?zoxy.tls.Credentials,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
@@ -614,6 +621,11 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
         harness.force_exhaustion,
     );
     harness.listeners_count = if (harness.tls_clients >= 1) 3 else 2;
+    for (&harness.tls_scripts) |*script| {
+        script.* = l7.scripts.terminating_scripts[
+            random.uintLessThan(usize, l7.scripts.terminating_scripts.len)
+        ];
+    }
     harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
     harness.drop_mode = deriveDropMode(harness.clean, random);
     assert(harness.listeners_count <= harness.listener_configs.len);
@@ -1410,6 +1422,14 @@ fn startTlsClient(
 ) void {
     assert(index < harness.tls_clients_live);
     const client = &harness.tls_clients_storage[index];
+    // What this slot drew, and the one property of it the session's shape
+    // turns on: a script whose response is judged exactly as a plain
+    // GET's can be followed by one (#204's keep-alive turnaround, judged
+    // as `terminating_pair`), and one whose response is a static, a
+    // redirect, a rejection or an un-stamped 200 cannot — a single spec
+    // could not describe both halves of that pair.
+    const entry = l7.scripts.spec(harness.tls_scripts[index]);
+    const pairs = harness.tls_protocol == .http and entry.routed_canonical;
     client.start(&harness.io, Harness.tlsBindAddress(), .{
         .host_name = zoxy.tls.testdata.host_name,
         .resume_with = resume_with,
@@ -1418,7 +1438,7 @@ fn startTlsClient(
         // listener behind it expects, or the head parser answers 400
         // and the transform is never exercised at all.
         .app_data = if (harness.tls_protocol == .http)
-            tls_http_request
+            entry.request
         else
             harness.tls_tokens[index][0..tls_token_bytes],
         // How each population knows its peer answered. A relayed
@@ -1435,16 +1455,21 @@ fn startTlsClient(
         // The second request, on the connection the first left open —
         // only the proxied population has one, since an echo has no
         // turnaround to take.
-        .followup_data = if (harness.tls_protocol == .http)
-            tls_http_followup
-        else
-            &.{},
+        .followup_data = if (pairs) tls_http_followup else &.{},
         // A relayed session closes in protocol once its echo is back:
         // an in-band EOF no socket EOF follows, which is the §6
         // half-close a terminated relay can only learn from a decrypt.
-        // A proxied one lets its second request's `Connection: close`
-        // end the connection instead, and finishes on the EOF.
-        .close_after_echo = harness.tls_protocol == .l4,
+        // A paired one lets its second request's `Connection: close` end
+        // the connection instead, and finishes on the EOF.
+        //
+        // An unpaired proxied session takes the relayed shape, and has
+        // to: its script's request carries no `Connection: close`, so
+        // without this the answered connection would sit in keep-alive
+        // until the drain reaped it — holding a conn slot for the rest of
+        // the scenario on a fifth of the terminating clients. Closing in
+        // protocol instead is the §6 half-close arriving mid-keep-alive,
+        // which nothing else in the sweep produces.
+        .close_after_echo = !pairs,
         .x25519_seed = seeds[0],
         .p256_seed = seeds[1],
         .random = seeds[2],
@@ -2051,15 +2076,24 @@ fn verifyTlsSessions(harness: *Harness) !void {
     for (harness.tls_clients_storage[0..harness.tls_clients_live], 0..) |*client, index| {
         const back = client.app_received[0..client.app_received_len];
         if (harness.tls_protocol == .http) {
-            // The spec the walk judges by describes the pair this
-            // population sends, so what went out cannot exceed it — the
-            // check that catches the two drifting apart, since a wider
-            // send would be judged against a transcript that never
-            // mentions it.
-            assert(client.requestsSent() <= l7.scripts.terminating_pair.expected_responses);
+            // What this slot drew, and the same pairing rule
+            // `startTlsClient` sent it under: a `routed_canonical` script
+            // took a follow-up GET, so its transcript is the pair's;
+            // anything else sent one request and owes its own script's
+            // transcript exactly.
+            const drawn = l7.scripts.spec(harness.tls_scripts[index]);
+            const entry = if (drawn.routed_canonical)
+                l7.scripts.terminating_pair
+            else
+                drawn;
+            // The spec the walk judges by describes what this session was
+            // asked to send, so what went out cannot exceed it — the check
+            // that catches the two drifting apart, since a wider send
+            // would be judged against a transcript that never mentions it.
+            assert(client.requestsSent() <= entry.expected_responses);
             const walk = HttpClient.walkResponses(
                 back,
-                l7.scripts.terminating_pair,
+                entry,
                 .{ .sticky = harness.sticky_http, .terminated = true },
             );
             if (walk.violation) |violation| return violation;
