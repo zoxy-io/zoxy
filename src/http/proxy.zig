@@ -39,6 +39,7 @@ const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const conn_module = @import("../net/Conn.zig");
 const pump = @import("../net/pump.zig");
+const relay = @import("../net/relay.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
 const render = @import("render.zig");
@@ -765,8 +766,8 @@ pub fn Proxy(comptime IoType: type) type {
             if (request.method == .connect) {
                 return respond(server, conn, 501, "l7_not_implemented");
             }
-            if (parser.headerValue(request.headers, "upgrade") != null) {
-                return respond(server, conn, 501, "l7_not_implemented");
+            if (parser.headerValue(request.headers, "upgrade")) |token| {
+                if (!admitUpgrade(server, conn, token)) return;
             }
 
             // §7: canonicalize the host and path once, then apply filters
@@ -848,6 +849,42 @@ pub fn Proxy(comptime IoType: type) type {
                     return .{ .endpoint = identity };
                 },
             }
+        }
+
+        /// Decide an `Upgrade` request's fate before a byte of it is
+        /// forwarded (#180). True means it may proceed as a would-be
+        /// tunnel; false means this function already answered.
+        ///
+        /// Two refusals saying different things. A token the listener
+        /// does not allow is `501` — the answer every `Upgrade` got
+        /// before this existed, and the honest one: it fails *here*, with
+        /// a status meaning what happened, rather than at an origin that
+        /// never saw a handshake. A token it does allow but no capacity
+        /// to carry is `503`, and the ordering *is* the §8 rung: checking
+        /// before the handshake is forwarded is what makes a refusal cost
+        /// nothing, where admitting first and shedding later would spend
+        /// an origin connection to produce a worse answer.
+        ///
+        /// The token must match whole and alone. RFC 9110 lets `Upgrade`
+        /// carry a comma-separated list with versions; anything but a
+        /// single token this proxy knows is refused rather than parsed
+        /// generously, because after `101` no rule of ours applies to
+        /// another byte and a loose reading here is the one thing that
+        /// cannot be taken back.
+        fn admitUpgrade(server: *ServerType, conn: *ConnType, token: []const u8) bool {
+            assert(conn.state == .l7_reading_head);
+            assert(conn.tunnel_buffer == null);
+            assert(!conn.l7.upgrade_requested);
+            if (!conn.upgrades.websocket or !std.ascii.eqlIgnoreCase(token, "websocket")) {
+                respond(server, conn, 501, "l7_not_implemented");
+                return false;
+            }
+            conn.tunnel_buffer = server.acquireTunnelBuffer() orelse {
+                respond(server, conn, 503, "l7_shed_tunnels");
+                return false;
+            };
+            conn.l7.upgrade_requested = true;
+            return true;
         }
 
         /// Picks a live endpoint under the §8 per-endpoint inflight cap
@@ -1270,7 +1307,18 @@ pub fn Proxy(comptime IoType: type) type {
             // connection is a parking candidate (§5), and stripping the
             // client's Connection header already made persistence the wire
             // default.
-            const rendered = render.renderRequestHead(request, plan.target, plan.edits, false, forwarded, upstreamHeadBytes(upstream)) catch {
+            const rendered = render.renderRequestHead(
+                request,
+                plan.target,
+                plan.edits,
+                false,
+                forwarded,
+                // The participating `Upgrade` travels only when this
+                // listener agreed to carry it (#180); the gate already
+                // refused every other spelling.
+                conn.l7.upgrade_requested,
+                upstreamHeadBytes(upstream),
+            ) catch {
                 // Valid on arrival but no longer fits after edits: the §7
                 // oversize-after-edits verdict.
                 return respond(server, conn, 431, "l7_headers_too_large");
@@ -1982,6 +2030,140 @@ pub fn Proxy(comptime IoType: type) type {
             }
         }
 
+        /// The origin agreed: render its `101` to the client, with every
+        /// trailing byte it arrived with, and hand the connection to the
+        /// relay once the client has it (#180).
+        ///
+        /// The trailing bytes are why this cannot reuse the response
+        /// machinery. There, excess past the head is fed through the
+        /// framing tracker and forwarded as *body*; here the response is
+        /// bodiless by status and the bytes past the head are the origin's
+        /// first frames — payload of a protocol this proxy does not read.
+        /// So they are copied verbatim behind the rendered head, and the
+        /// head buffer is what bounds them: an origin that sent more than
+        /// fits is not a client error but an origin this proxy cannot
+        /// carry, answered like any other unrenderable head.
+        fn renderUpgradeAccepted(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+        ) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.upgrade_requested);
+            assert(response.status == 101);
+            assert(conn.tunnel_buffer != null);
+            const upstream = conn.upstream.?;
+            // No edits and no sticky stamp: #175 and #178 both describe a
+            // response an origin *served*, and this one only announces
+            // that serving has stopped being HTTP. A `Set-Cookie` naming
+            // the endpoint of a session about to become opaque would be a
+            // statement about a request that no longer exists.
+            const rendered = render.renderResponseHead(
+                response,
+                false,
+                &.{},
+                true,
+                headBytes(server, conn),
+            ) catch {
+                upstreamFailed(server, conn);
+                return;
+            };
+            assert(rendered.len >= 1);
+            const trailing = upstreamHeadBytes(upstream)[response.head_len..upstream.head_len];
+            if (rendered.len + trailing.len > headBytes(server, conn).len) {
+                upstreamFailed(server, conn);
+                return;
+            }
+            @memcpy(headBytes(server, conn)[rendered.len..][0..trailing.len], trailing);
+            const head_write_len: u32 = @intCast(rendered.len + trailing.len);
+            conn.l7.response_leg = .sending_head;
+            conn.l7.response_started = true;
+            conn.log.status = response.status;
+            server.captureResponseLogHeaders(conn, response.headers);
+            armClientWrite(server, conn, headBytes(server, conn)[0..head_write_len], .tunnel_start);
+        }
+
+        /// The handshake reached the client, so this connection stops
+        /// speaking HTTP and starts relaying (#180).
+        ///
+        /// What changes hands here is the whole point of the feature. The
+        /// shared relay buffer, the head buffer and the *upstream slot*
+        /// all go back to the pools ordinary traffic draws on — a tunnel
+        /// that kept them would be the starvation §5 refuses — while the
+        /// origin socket stays open and the endpoint stays charged, now
+        /// the way an L4 connection charges it (`chargeEndpoint`). Slot
+        /// and socket are separable, and separating them is what lets a
+        /// tunnel be counted against `max_inflight` for its whole life
+        /// without pinning capacity ordinary exchanges shed against.
+        ///
+        /// Client bytes that arrived behind the handshake are staged into
+        /// the tunnel buffer and framed as this direction's debt, exactly
+        /// as a payload behind a PROXY header is (#142) — so `Relay.start`
+        /// sends them before it reads another byte, and a client that
+        /// pipelined its first frame is not left waiting for an echo of
+        /// something this proxy dropped.
+        fn beginTunnel(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.upgrade_requested);
+            assert(conn.upstream_socket != null);
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(conn.l7.request_head_len <= conn.head_len);
+            const pipelined = conn.head_len - conn.l7.request_head_len;
+            // `tunnel_buffer` stays set: it is what marks which pool this
+            // buffer belongs to. `relay_buffer` only *aliases* it, so the
+            // relay reads one field like every other connection while the
+            // release paths still know where to give it back — the two
+            // pools hold the same element type, so nothing but this marker
+            // could tell them apart.
+            const buffer = conn.tunnel_buffer.?;
+            // Staged before the head buffer goes back, since that is where
+            // the client's own trailing bytes still live.
+            if (pipelined >= 1) {
+                assert(pipelined <= buffer.client_to_upstream.len);
+                @memcpy(
+                    buffer.client_to_upstream[0..pipelined],
+                    headBytes(server, conn)[conn.l7.request_head_len..conn.head_len],
+                );
+            }
+            const leased = conn.upstream.?;
+            const cluster_index = leased.cluster_index;
+            const endpoint_index = leased.endpoint_index;
+            server.releaseUpstream(leased);
+            conn.upstream = null;
+            // Both held for certain here, unlike at the static-response
+            // rungs where either may never have been acquired: this runs
+            // only after a rendered head went out, which needed the head
+            // buffer, and every routed exchange holds a relay buffer.
+            assert(conn.relay_buffer != null);
+            assert(conn.head_buffer_id != ConnType.head_buffer_none);
+            server.releaseRelayBuffer(conn.relay_buffer.?);
+            server.returnHeadBuffer(conn);
+            conn.head_len = 0;
+            conn.relay_buffer = buffer;
+            conn.directions = .{ .{}, .{} };
+            // Charged while this is still an exchange, so the charge and
+            // the slot it replaces never both count the same work: the
+            // release above gave the lease back, and this takes its place
+            // in the same view (§7) before anything can read it.
+            server.chargeEndpoint(conn, cluster_index, endpoint_index);
+            conn.state = .relaying;
+            if (pipelined >= 1) {
+                const direction = &conn.directions[0];
+                direction.phase = .receiving;
+                direction.owe(pipelined);
+            }
+            server.counters.increment("tunnels_established");
+            // The tunnel's own clock replaces the three that would each
+            // cut a healthy session (§8). Stored, not re-based: a rebase
+            // exists to pull a deadline *earlier* than the armed timer,
+            // and this one moves the other way — the armed timer fires at
+            // the exchange's old target, reads the later stored one and
+            // re-arms, which is how the L4 relay start hands over too.
+            server.storeDeadline(conn, server.config.tunnel_timeout_ms);
+            relay.Relay(IoType).start(server, conn);
+        }
+
         fn renderResponse(
             server: *ServerType,
             conn: *ConnType,
@@ -1991,6 +2173,33 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.response_leg == .awaiting_head);
             assert(conn.l7.request_head_vacated);
             const upstream = conn.upstream.?;
+            // `101` on a carried upgrade is terminal, not interim (#180),
+            // and diverts before any of the ordinary response machinery
+            // below. Two reasons it cannot share that path: the framing
+            // tracker reads a sub-200 status as bodiless and would consume
+            // none of the trailing bytes, when for a tunnel every trailing
+            // byte is payload; and the state machine would treat the
+            // exchange as complete and go read another request, which is
+            // the desynchronisation §7 exists to prevent. An unrequested
+            // `101` is *not* diverted — an origin cannot upgrade a
+            // connection this proxy never asked to upgrade.
+            if (conn.l7.upgrade_requested and response.status == 101) {
+                return renderUpgradeAccepted(server, conn, response);
+            }
+            // The origin declined. Answering an upgrade request with an
+            // ordinary response is legal and common — an origin that does
+            // not speak WebSocket just serves the request — and the
+            // exchange from here is an ordinary one, so the tunnel claimed
+            // at the gate goes back *now* rather than at teardown. This
+            // connection is very likely kept: `conn.l7` resets at the
+            // turnaround while the claim lives on the connection, so
+            // holding it would pin a pool slot nothing is using for as
+            // long as the client stays, and a second `Upgrade` over the
+            // same connection would find one already held.
+            if (conn.l7.upgrade_requested) {
+                conn.l7.upgrade_requested = false;
+                releaseTunnelClaim(server, conn);
+            }
 
             const keep_downstream = downstreamKeepAlive(server, conn, response);
             conn.l7.downstream_close_announced = !keep_downstream;
@@ -2002,6 +2211,7 @@ pub fn Proxy(comptime IoType: type) type {
                 response,
                 !keep_downstream,
                 responseEditsWithStamp(server, conn, response, verdict, &edit_buffer, &cookie_scratch),
+                false,
                 headBytes(server, conn),
             ) catch {
                 // The head no longer fits — after the #175 edits or the
@@ -2113,6 +2323,15 @@ pub fn Proxy(comptime IoType: type) type {
             then: conn_module.ClientWrite.Then,
         ) void {
             switch (then) {
+                // The handshake is out and nothing has been relayed yet:
+                // still the exchange, still no verdict, and the tunnel
+                // buffer claimed at the gate is still in hand (#180).
+                .tunnel_start => {
+                    assert(conn.state == .l7_exchanging);
+                    assert(conn.l7.pending_verdict == .none);
+                    assert(conn.l7.upgrade_requested);
+                    assert(conn.tunnel_buffer != null);
+                },
                 .response_excess, .response_body => {
                     // `response_started` blocks a verdict, so none can be
                     // pending once response bytes are flowing (negative
@@ -2225,6 +2444,9 @@ pub fn Proxy(comptime IoType: type) type {
             }
             assertWriteContinuation(conn, write.then);
             switch (write.then) {
+                // The origin's `101` has reached the client, so the HTTP
+                // conversation on this connection is over (#180).
+                .tunnel_start => beginTunnel(server, conn),
                 .response_excess => sendResponseExcess(server, conn),
                 .response_body => {
                     assert(conn.l7.response_leg == .sending_body_excess);
@@ -2846,6 +3068,11 @@ pub fn Proxy(comptime IoType: type) type {
                 server.releaseRelayBuffer(buffer);
                 conn.relay_buffer = null;
             }
+            // The tunnel this request asked for and did not get (#180).
+            // A live tunnel never reaches here — it answers no static
+            // response — so this is always an unspent claim.
+            assert(conn.state != .relaying);
+            releaseTunnelClaim(server, conn);
             if (conn.upstream) |leased| {
                 if (conn.upstream_socket) |socket| {
                     server.io.closeNow(socket);
@@ -2857,6 +3084,24 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.relay_buffer == null);
             assert(conn.upstream == null);
             assert(conn.upstream_socket == null);
+        }
+
+        /// Undo an unspent tunnel claim (#180): the gate takes a buffer
+        /// before the handshake is forwarded, and every ending other than
+        /// the origin's `101` has to give it back.
+        ///
+        /// One chokepoint because the claim outlives `conn.l7`. The
+        /// per-exchange state resets at every keep-alive turnaround, but
+        /// this lives on the connection, so a path that forgot would pin a
+        /// pool slot no session is using for as long as the client stays —
+        /// and the next `Upgrade` on that connection would meet a claim
+        /// already held. A no-op when nothing is claimed, so callers do
+        /// not each re-test it.
+        fn releaseTunnelClaim(server: *ServerType, conn: *ConnType) void {
+            const buffer = conn.tunnel_buffer orelse return;
+            assert(conn.relay_buffer != buffer); // Not yet swapped in: no live tunnel here.
+            server.releaseTunnelBuffer(buffer);
+            conn.tunnel_buffer = null;
         }
 
         /// Answer a comptime static error response, then keep the
@@ -3199,6 +3444,11 @@ pub fn Proxy(comptime IoType: type) type {
             // origin, and the line should read the same as the rungs
             // that refuse to protect this proxy (§8).
             if (std.mem.eql(u8, counter, "l7_shed_endpoint_inflight")) return .shed;
+            // A refused tunnel reads to a client like any other shed
+            // (#180): admitted, answered, refused for a resource. Which
+            // resource changes what an operator widens, not what the line
+            // says happened.
+            if (std.mem.eql(u8, counter, "l7_shed_tunnels")) return .shed;
             if (std.mem.eql(u8, counter, "l7_bad_gateway")) return .upstream_failed;
             if (std.mem.eql(u8, counter, "l7_gateway_timeout")) return .timed_out;
             @compileError("static-response counter with no access-log outcome: " ++ counter);

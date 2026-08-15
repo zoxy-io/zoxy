@@ -56,9 +56,9 @@ pub fn main() void {
         // address forwarding is opt-in per listener, so the case that must
         // not regress is the one where it is off and the render's
         // suppression test is pure overhead.
-        const upstream = render.renderRequestHead(&request, target, no_edits, false, null, &upstream_head) catch unreachable;
+        const upstream = render.renderRequestHead(&request, target, no_edits, false, null, false, &upstream_head) catch unreachable;
         const response = parser.parseResponseHead(response_head, false, &response_storage, request.method) catch unreachable;
-        const downstream = render.renderResponseHead(&response, true, no_edits, &downstream_head) catch unreachable;
+        const downstream = render.renderResponseHead(&response, true, no_edits, false, &downstream_head) catch unreachable;
 
         // Consume the outputs so nothing is dead-code-eliminated.
         checksum +%= upstream[upstream.len - 1];

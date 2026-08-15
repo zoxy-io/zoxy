@@ -2496,6 +2496,7 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_redirected",
         "l7_responded",
         "l7_shed_relay_buffers",
+        "l7_shed_tunnels",
         "l7_shed_upstream_slots",
         "l7_shed_endpoint_inflight",
         "l7_bad_gateway",

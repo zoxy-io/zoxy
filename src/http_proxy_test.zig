@@ -498,6 +498,10 @@ const Http1Bed = struct {
         origin_response: []const u8 = "",
         /// The #181 dial-retry budget on the bed's one cluster.
         retries: u16 = 0,
+        /// The #180 upgrade allowlist and tunnel pool. Both off by
+        /// default, which is the shape every pre-#180 config has.
+        upgrades: config_module.Config.Listener.Upgrades = .{},
+        tunnels: u32 = 0,
         /// Put an endpoint nothing listens on *ahead* of the origin, so
         /// the first pick of an `rr` cluster is always the one that
         /// refuses and the retry is the only way to reach the origin.
@@ -615,6 +619,7 @@ const Http1Bed = struct {
             .request_filters = options.request_filters,
             .response_filters = options.response_filters,
             .protocol = .http,
+            .upgrades = options.upgrades,
             .forwarded = options.forwarded,
             // Paths nothing reads: the bed embeds the PEMs, so what this
             // states is only that the listener terminates.
@@ -650,6 +655,7 @@ const Http1Bed = struct {
             else
                 0,
             .tls_engines = if (options.tls) options.conn_slots else 0,
+            .tunnels = options.tunnels,
         });
         try bed.loadTlsCredentials(arena, options.tls);
         try bed.server.start();
@@ -4694,5 +4700,155 @@ test "l7: a dial that times out does not retry, because it spent the budget" {
     try std.testing.expect(elapsed_ms < 2 * Http1Bed.connect_timeout_ms);
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_retried"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try bed.expectDrained();
+}
+
+test "l7: an allowed upgrade becomes a tunnel and relays both ways" {
+    // #180 end to end: the handshake reaches the origin, its 101 reaches
+    // the client, and the connection then carries opaque bytes in both
+    // directions — the L4 relay of §6 entered from an L7 exchange.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 200,
+        .origin_response = "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        .upgrades = .{ .websocket = true },
+        .tunnels = 2,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /ws HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+
+    // The client sees the origin's own 101, with the participating pair
+    // intact: stripping either would leave it told it succeeded without
+    // being told to what.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bed.client.response(),
+        "HTTP/1.1 101 Switching Protocols\r\n",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, bed.client.response(), "Upgrade: websocket") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bed.client.response(), "Connection: upgrade") != null);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tunnels_established"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_tunnels"));
+    try bed.expectDrained();
+}
+
+test "l7: an upgrade this listener does not allow keeps its 501" {
+    // The default, and what every config predating #180 keeps getting.
+    // Refused here rather than at an origin that never saw a handshake.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 201,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /ws HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bed.client.response(),
+        "HTTP/1.1 501 Not Implemented\r\n",
+    ));
+    // No origin was contacted: the refusal is this proxy's own.
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tunnels_established"));
+    try bed.expectDrained();
+}
+
+test "l7: a token the allowlist does not name is refused by name" {
+    // `h2c` is the sharp case: tunnelling it would carry HTTP/2 to an
+    // origin this proxy cannot parse, past every rule the config
+    // expresses — and after 101 no rule of ours applies to another byte.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 202,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .upgrades = .{ .websocket = true },
+        .tunnels = 2,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET / HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: h2c\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bed.client.response(),
+        "HTTP/1.1 501 Not Implemented\r\n",
+    ));
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+    // The pool is untouched: a token refused at the gate claims nothing.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_tunnels"));
+    try bed.expectDrained();
+}
+
+test "l7: an upgrade with no tunnel capacity is shed before the handshake" {
+    // The §8 rung, and the ordering is the rung: refused up front, so no
+    // origin connection is spent to produce a worse answer later.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 203,
+        .origin_response = "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        .upgrades = .{ .websocket = true },
+        .tunnels = 1,
+    });
+    defer bed.tearDown();
+
+    // The first upgrade takes the only tunnel and holds it for the rest
+    // of the run; the second arrives once it is held and finds the pool
+    // empty, which is the whole point — a tunnel does not give its buffer
+    // back at the end of an exchange, because it has no end of exchange.
+    bed.client.drain_on_finish = false;
+    bed.client2.send_delay_ms = 100;
+    bed.client2.request = "GET /ws HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n";
+    bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
+    try bed.exchange("GET /ws HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tunnels_established"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_shed_tunnels"));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bed.client2.response(),
+        "HTTP/1.1 503 Service Unavailable\r\n",
+    ));
+}
+
+test "l7: an origin that declines an upgrade gives the tunnel back" {
+    // Answering an `Upgrade` with an ordinary response is legal and
+    // common — an origin that does not speak WebSocket just serves the
+    // request. The claim taken at the gate has to come back at that
+    // moment, not at teardown: this connection is kept, and a claim left
+    // held would pin a pool slot nothing is using for as long as the
+    // client stays. `tunnels: 1` is what makes the leak visible — the
+    // second upgrade can only be served if the first gave its slot back.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 204,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .upgrades = .{ .websocket = true },
+        .tunnels = 1,
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /ws HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n";
+    try bed.exchange("GET /ws HTTP/1.1\r\nHost: o\r\n" ++
+        "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+
+    // Both requests were served by the origin, and neither was shed: the
+    // second proves the first released its claim, since one tunnel is all
+    // the pool has. A leak here would answer the second with a 503.
+    try std.testing.expectEqual(@as(u32, 2), bed.origin.requests_served);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_shed_tunnels"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tunnels_established"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_responses"));
     try bed.expectDrained();
 }

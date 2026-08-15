@@ -198,6 +198,16 @@ pub const Counters = struct {
     /// single-endpoint cluster it fires on every dial failure, which is
     /// the honest reading — a retry budget there can never be spent.
     upstream_retries_exhausted: Value = Value.init(0),
+    /// Upgrade requests refused for want of a §5 tunnel (#180). Its own
+    /// rung rather than a share of the other sheds: each of those says
+    /// "widen this pool", and they name different pools. Counted before
+    /// the handshake is forwarded, so a refusal here contacted no origin.
+    l7_shed_tunnels: Value = Value.init(0),
+    /// Upgrades carried through to `101` and handed to the relay (#180).
+    /// The live count is a gauge read off the pool, not a counter: this
+    /// is how many sessions were *established*, which is the number that
+    /// answers "is the feature being used" long after they closed.
+    tunnels_established: Value = Value.init(0),
     /// Parked upstream connections reaped by the idle sweep (§5).
     upstream_idle_reaped: Value = Value.init(0),
     /// §7 active health probes dispatched — one per checked endpoint per
