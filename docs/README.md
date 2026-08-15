@@ -122,6 +122,14 @@ How long the old process lingers is `timeouts.drain_deadline_ms`; with the
 default `0` it waits for its last connection to finish. Its exit prints the
 final counters, so the run it just ended is still accountable.
 
+[Tunnels](#tunnelled-upgrades-websocket) are the exception, and they have to
+be: a WebSocket has no message boundary to finish at, so "wait for the last
+connection" would mean waiting for a client that may never disconnect. A
+draining process refuses new upgrades with `503` and cuts the live ones — at
+`drain_deadline_ms` where you set one, and five seconds in where you did not.
+Without that, one idle session would hold every rolling restart open until
+your supervisor's `SIGKILL`. `zoxy_tunnels_drained` counts the ones cut.
+
 The same two commands are how you *add* capacity rather than replace it —
 start N processes on the same port and signal none of them. That is the
 supported way to use more than one core, and a replacement is just the case
@@ -234,6 +242,72 @@ full handshake.
 > parity, ~20k req/s at a p50 within a few µs of each other. Bulk
 > transfer is the one band zoxy trails on, by a third to two-fifths:
 > 507–542 µs against 383–385 µs at the same 100 MiB/s.
+
+#### Tunnelled upgrades (WebSocket)
+
+By default any request carrying `Upgrade` is answered `501` — the same as
+`CONNECT`, and what every config that does not name an allowlist keeps
+getting. An `http` listener opts in by naming the tokens it will carry:
+
+```json
+"listeners": [
+    { "bind": "0.0.0.0:80", "protocol": "http", "cluster": "web",
+      "upgrades": ["websocket"] }
+],
+"limits": { "tunnels": 512 }
+```
+
+zoxy does not speak WebSocket. It forwards the handshake, recognises the
+origin's `101 Switching Protocols`, and from that point relays bytes both
+ways until one side closes — the same byte relay an `l4` listener runs,
+entered from an HTTP exchange. Routing, filters and health checks apply to
+the handshake exactly as they do to any request.
+
+> [!IMPORTANT]
+> **After `101` the connection is opaque.** Filters, routes, header rules
+> and canonicalisation stop applying to every byte that follows, because
+> there are no more HTTP messages to apply them to. That is why the token
+> list is an allowlist and not a switch: `websocket` is the only token
+> zoxy accepts, and anything else — `h2c` in particular, which would carry
+> HTTP/2 to an origin zoxy cannot parse — is refused by name at load.
+
+**`limits.tunnels` is required, and has no default.** Every other pool
+derives one, because their fallbacks can only be too generous; how many
+long-lived sessions your origins should carry is a capacity decision zoxy
+cannot infer from a connection count, so a listener that allows an upgrade
+without one is refused at startup rather than shedding later. It may not
+exceed `conn_slots`.
+
+The pool is separate from the buffers ordinary traffic uses, and that is
+the point. Every other pool is sized for concurrent *activity* — an idle
+keep-alive connection holds no head buffer — while a tunnel pins its relay
+buffer for its whole life and never returns it. Sharing one pool would let
+idle WebSockets consume what live requests need; a separate one means
+tunnels cannot starve HTTP, and costs 8200 bytes each, printed in the
+startup banner.
+
+When the pool is full the upgrade is refused with `503` **before** the
+handshake reaches your origin, so a refusal costs no backend connection.
+`zoxy_l7_shed_tunnels` counts those; `zoxy_tunnels_established` counts the
+ones that became sessions.
+
+Two further consequences worth knowing:
+
+- **`timeouts.tunnel_ms` replaces the other deadlines** once a connection
+  becomes a tunnel. It has to: `idle_ms` defaults to 60 s and a WebSocket
+  is legitimately idle for hours, its keepalive being application-level
+  ping/pong zoxy cannot see through opaque bytes. Default one hour, floor
+  one second, ceiling one day — and unlike `request_ms` there is no `0`
+  for "no cap", because a tunnel holds a pool slot for its whole life.
+- **The upgraded upstream connection leaves the keep-alive pool** and is
+  never reused for another client. It still counts against the cluster's
+  `max_inflight` for as long as the tunnel lives, which is honest: your
+  backend really is carrying it.
+
+The access log writes one line when the tunnel closes — `kind` `http`,
+`status` `101`, the request facts that opened it, and `bytes_in`/`bytes_out`
+for the whole session. A line at the handshake would name a transfer that
+had not happened yet.
 
 ### Routing
 
@@ -744,6 +818,7 @@ the other. Statuses are `200` plus the error set.
     "drain_deadline_ms": 10000,
     "max_lifetime_ms": 0,
     "request_ms": 0,
+    "tunnel_ms": 3600000,
     "health_interval_ms": 2000
 }
 ```
@@ -769,6 +844,7 @@ dial or idle budget is a mistake rather than a policy.
 | `drain_deadline_ms` | `0` | how long a `SIGTERM` drain waits before reaping stragglers; `0` waits for the last connection |
 | `max_lifetime_ms` | `0` | absolute connection-age cap regardless of activity; `0` disables |
 | `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity — bounds a request that is merely slow, where `idle_ms` only bounds one that has stalled; `0` disables |
+| `tunnel_ms` | `3600000` | whole life of a [tunnelled upgrade](#tunnelled-upgrades-websocket), replacing the three above once one is established; 1 s to 1 day, and `0` is **not** legal |
 | `health_interval_ms` | `2000` | pause between health-probe sweeps |
 
 `drain_deadline_ms` defaults to waiting indefinitely because there is no
@@ -791,7 +867,8 @@ reserves nor demands the ceiling's resources.
     "upstream_slots": 4096,
     "head_buffers": 1024,
     "upstream_head_buffers": 512,
-    "head_buffer_bytes": 16384
+    "head_buffer_bytes": 16384,
+    "tunnels": 512
 }
 ```
 
@@ -817,6 +894,13 @@ per-connection object zoxy holds, about 132 KiB plus a 32 KiB plaintext
 buffer, so 1024 of them is roughly 170 MiB. It defaults to your connection
 slots capped at 1024, and the startup banner prints the total either way —
 lower it if that is more concurrent TLS than you serve.
+
+`tunnels` bounds concurrent [tunnelled upgrades](#tunnelled-upgrades-websocket)
+and is zero unless some listener names an `upgrades` allowlist — in which case
+it is **required**, since no default can be derived for it. Each costs one
+relay-buffer pair (8200 bytes), held for the tunnel's whole life rather than
+for the duration of a request, which is why they are reserved apart from
+`relay_buffers` instead of drawn from it.
 
 `cq_fill_eighths` trades connection ceiling for `io_uring` completion-queue
 burst headroom; `access_log_buffer_bytes` sizes the access log's staging
@@ -879,7 +963,9 @@ timeouts included) and one per L4 connection:
 `outcome` is what `status` cannot tell you: an origin answering `503` and
 zoxy shedding a request with `503` are the same three digits and opposite
 events. It reads `ok`, `rejected`, `shed`, `timed_out`, `upstream_failed`,
-`aborted`, or — for L4 — `closed`.
+`aborted`, or `closed` — the last for L4 connections and for
+[tunnels](#tunnelled-upgrades-websocket), which end the way a relay ends
+rather than the way an exchange does.
 
 Logging never blocks the event loop, so a sink that stalls costs dropped
 lines rather than latency; `zoxy_access_log_dropped` counts them exactly.
@@ -959,6 +1045,10 @@ dies.** Every limit has a defined answer rather than an unbounded queue.
   constant memory, and the connection is *kept* when the client's byte stream
   is still on a message boundary, because closing costs more than the work
   being shed.
+- **A tunnel is refused before it costs anything.** No tunnel slot → the
+  upgrade is answered `503` *before* the handshake is forwarded, so a
+  refusal never spends an origin connection to produce a worse answer once
+  the session is already live.
 - **Watermarks before walls.** Each pool raises a pressure flag at 3/4
   occupancy and lowers it again only once it has drained back to 1/2 — the gap
   is what stops the flag flapping around a single threshold. While it is
