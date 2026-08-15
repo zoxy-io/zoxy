@@ -256,33 +256,15 @@ const uncovered = [_]Uncovered{
             "src/http_proxy_test.zig exhausts the upstream pool directly",
     },
     .{
-        .name = "l7_shed_tunnels",
-        .why = .unreached,
-        .reason = "no seed configures an `upgrades` allowlist, so no scenario " ++
-            "can request the tunnel this rung refuses. Teaching the harness " ++
-            "to script an upgrade — an origin that answers 101 and then " ++
-            "echoes, and a client that expects it — is #180's next slice; " ++
-            "src/http_proxy_test.zig exhausts the tunnel pool directly in " ++
-            "the meantime",
-    },
-    .{
-        .name = "tunnels_established",
-        .why = .unreached,
-        .reason = "same gap as l7_shed_tunnels above, and the same remedy: " ++
-            "until a seed can allow an upgrade, no scenario reaches 101 at " ++
-            "all. src/http_proxy_test.zig carries a tunnel end to end, " ++
-            "including the participating Upgrade pair and the relay after " ++
-            "the handshake",
-    },
-    .{
         .name = "tunnels_drained",
         .why = .unreached,
-        .reason = "the third of #180's counters, unreachable for the same one " ++
-            "reason as the two above: no seed allows an upgrade, so no " ++
-            "scenario has a tunnel for a drain to cut. All three retire " ++
-            "together when the harness learns to script one; " ++
+        .reason = "structural rather than a gap in ambition: the production " ++
+            "bound is `tunnel_drain_ms` (5 s) and a whole scenario is 2 s of " ++
+            "virtual time, so no schedule this sweep can produce reaches it. " ++
+            "Seeds do establish tunnels and do drain with them live — the " ++
+            "tunnel dies with its client rather than at the bound. " ++
             "src/http_proxy_test.zig drains a live tunnel under a zero " ++
-            "drain_deadline_ms directly",
+            "drain_deadline_ms directly, and asserts the loop reached idle",
     },
     .{
         .name = "l7_shed_upstream_head_buffers",

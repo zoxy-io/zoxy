@@ -2087,7 +2087,10 @@ pub fn Proxy(comptime IoType: type) type {
             const head_write_len: u32 = @intCast(rendered.len + trailing.len);
             conn.l7.response_leg = .sending_head;
             conn.l7.response_started = true;
-            conn.log.status = response.status;
+            // The status is recorded at `beginTunnel`, not here: a `101`
+            // in the log means a tunnel the client actually got, so a
+            // handshake whose write never landed reports the teardown it
+            // really was rather than a session that never existed.
             server.captureResponseLogHeaders(conn, response.headers);
             armClientWrite(server, conn, headBytes(server, conn)[0..head_write_len], .tunnel_start);
         }
@@ -2163,6 +2166,10 @@ pub fn Proxy(comptime IoType: type) type {
                 direction.owe(pipelined);
             }
             server.counters.increment("tunnels_established");
+            // Recorded here, where the client provably has the handshake
+            // (§8): the one line this connection writes at close is the
+            // tunnel's, and `101` is what identifies it as one.
+            conn.log.status = 101;
             // The tunnel's own clock replaces the three that would each
             // cut a healthy session (§8). Stored, not re-based: a rebase
             // exists to pull a deadline *earlier* than the armed timer,
@@ -2968,6 +2975,15 @@ pub fn Proxy(comptime IoType: type) type {
                 // Dropping it here would silently uncap the rest of the
                 // exchange, since `storeDeadline` stops clamping at zero.
                 .request_deadline_ns = conn.l7.request_deadline_ns,
+                // The #180 claim rides across, and must: the tunnel
+                // buffer is held on the connection, so a rebuild that
+                // dropped this flag would re-render the head *without*
+                // its participating `Upgrade` — the origin would answer
+                // an ordinary request, the client would get a `200` it
+                // never asked for, and the claim would sit unspent until
+                // the connection closed. Found by the simulator, on a
+                // seed where a stale checkout replayed a handshake.
+                .upgrade_requested = conn.l7.upgrade_requested,
                 // upstream_was_reused stays default-false: the replay try
                 // is a fresh dial, and a second early failure answers 502.
             };

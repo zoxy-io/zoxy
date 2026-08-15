@@ -81,7 +81,12 @@ pub const Outcome = enum(u8) {
     /// straggler. The default outcome, so any teardown path that skips
     /// setting a more specific one lands here too.
     aborted,
-    /// L4 only: both directions drained and the connection closed cleanly.
+    /// Both directions drained and the connection closed cleanly. L4 —
+    /// and, since #180, a tunnel: after `101` the connection ends the way
+    /// a relay ends rather than the way an exchange does, so a graceful
+    /// tunnel's line carries this on a `"kind":"http"` record. `ok` is
+    /// unreachable for one, because only `finishExchange` sets it and a
+    /// tunnel never returns there.
     closed,
 };
 

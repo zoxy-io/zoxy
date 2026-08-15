@@ -35,6 +35,9 @@ pub const ClientError = error{
     ResponseCorrupted,
     /// A complete response carried a status outside the script's set.
     ResponseStatusUnexpected,
+    /// A `101` reached the client without the participating
+    /// `Upgrade`/`Connection` pair §7 exists to let through (#180).
+    UpgradePairMissing,
     /// A 200 body diverged from every canonical origin body.
     ResponseBodyCorrupted,
     /// More response bytes than any legal transcript contains.
@@ -86,6 +89,12 @@ pub fn Client(comptime IoType: type) type {
         /// Clean seeds harden the prefix oracle to the exact golden
         /// outcome — nothing may be cut, shed, or silently torn down.
         clean: bool = false,
+        /// This client's listener allows the #180 upgrade token, which
+        /// decides what its handshake script is *entitled* to: the `101`
+        /// and a tunnel, or the `501` every config had before the
+        /// feature. A property of the listener rather than the script,
+        /// which is why it rides the client and not the spec.
+        upgrades: bool = false,
         /// The seed drew the #178 cookie-keyed http cluster, so the
         /// stamp oracle runs over every parsed response head.
         sticky: bool = false,
@@ -141,12 +150,14 @@ pub fn Client(comptime IoType: type) type {
             address: std.Io.net.IpAddress,
             script: Script,
             clean: bool,
+            upgrades: bool,
             sticky: bool,
         ) void {
             client.io = io;
             client.address = address;
             client.script = script;
             client.clean = clean;
+            client.upgrades = upgrades;
             client.sticky = sticky;
             const bytes = scripts.spec(script).request;
             assert(bytes.len <= client.request.len);
@@ -364,8 +375,16 @@ pub fn Client(comptime IoType: type) type {
                 if (walk.offset != client.received_len) {
                     return ClientError.GoldenOutcomeMissed;
                 }
+                // A handshake earns the `101` only where the listener
+                // allows the token; everywhere else it earns the refusal
+                // the spec's own golden cannot name, because which of the
+                // two is right is the listener's fact (#180).
+                const golden: u16 = if (client.script == .upgrade_request and !client.upgrades)
+                    501
+                else
+                    entry.golden_status;
                 for (walk.statuses[0..walk.complete_count]) |status| {
-                    if (status != entry.golden_status) {
+                    if (status != golden) {
                         return ClientError.GoldenOutcomeMissed;
                     }
                 }
@@ -436,6 +455,23 @@ pub fn Client(comptime IoType: type) type {
                 if (response.status == 301) {
                     if (!headerEquals(response.headers, "Location", canon.redirect_location)) {
                         walk.violation = ClientError.RedirectLocationWrong;
+                        return walk;
+                    }
+                }
+                // The #180 oracle, and the mirror of the redirect check
+                // above: §7 lets the participating `Upgrade` survive
+                // hop-by-hop stripping precisely so the client is told
+                // *what* it was upgraded to, and the proxy writes its own
+                // `Connection: upgrade` rather than echoing whatever
+                // arrived. A status check alone cannot see either — a
+                // render that dropped or corrupted the pair would still
+                // produce a `101` and pass — so the headers are demanded
+                // by name, byte for byte.
+                if (response.status == 101) {
+                    if (!headerEquals(response.headers, "upgrade", "websocket") or
+                        !headerEquals(response.headers, "connection", "upgrade"))
+                    {
+                        walk.violation = ClientError.UpgradePairMissing;
                         return walk;
                     }
                 }
@@ -630,6 +666,15 @@ pub fn Client(comptime IoType: type) type {
         /// every legal non-200 is a static with Content-Length 0 — so a
         /// corrupted length fails even before its body arrives.
         fn walkBody(response: parser.ResponseHead, body: []const u8, entry: Spec) ?BodyVerdict {
+            // A `101` is bodiless by status, not by header (#180): the
+            // bytes after it are the tunnel's, and belong to no response
+            // at all. The framing arm below reads `.none` as corruption
+            // because until upgrades existed nothing legal could carry
+            // it — every canonical 200 has a body and every static an
+            // explicit `Content-Length: 0`.
+            if (response.status == 101) {
+                return .{ .body_len = 0, .violation = null };
+            }
             const page_body = pageBodyFor(entry, response.status);
             switch (response.framing) {
                 .content_length => |length| {

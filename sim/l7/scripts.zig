@@ -44,6 +44,12 @@ pub const Script = enum(u8) {
     oversize_uri,
     /// CONNECT is a §1 non-goal; 501.
     connect_method,
+    /// A WebSocket handshake (#180). What it earns depends on the
+    /// listener: `101` and a tunnel where the config allows the token,
+    /// the unchanged `501` where it does not — so one script covers both
+    /// halves of the gate, and the seeds that never enable upgrades keep
+    /// proving the refusal that every config had before the feature.
+    upgrade_request,
     /// Two sequential GETs on one connection: the §5 parking/checkout
     /// path — the second is sent only after the first 200 settles
     /// reusable.
@@ -356,6 +362,30 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         // Only the §5 head ring's 503 precedes the parse the 501 rides on.
         .allowed_statuses = &.{ 501, 503 },
     },
+    .upgrade_request = .{
+        .request = "GET /ws HTTP/1.1\r\nHost: origin\r\n" ++
+            "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        // The allowed answer, which a seed that enables upgrades demands.
+        // A seed that does not is held to `501` instead — the client
+        // carries that fact, because it is the *listener's* config and
+        // not the script's (`Client.upgrades`).
+        .golden_status = 101,
+        .method = .get,
+        // 101 where carried, 501 where the token is not allowed, 503
+        // where the tunnel pool or a pool before it had nothing left —
+        // and 502/504 because a handshake is forwarded like any request
+        // and meets the same origin fates on the way.
+        //
+        // 200 because an origin may *decline*, which is legal and which
+        // the adversary reaches through the instant modes: those answer
+        // at accept, before reading, so they refuse an upgrade they never
+        // saw. A clean seed's origin always reads first and always
+        // answers `101`, which is why the golden above can still be
+        // exact.
+        .allowed_statuses = &.{ 101, 200, 501, 502, 503, 504 },
+    },
     .keepalive_pair = .{
         // The second GET is appended at run time, only after the first
         // 200 settles reusable.
@@ -590,11 +620,19 @@ pub const terminating_scripts = [_]Script{
 };
 
 comptime {
-    // Every script is either drawable there or one of the two named
+    // Every script is either drawable there or one of the three named
     // exceptions, so a script added to the table cannot quietly skip the
     // terminating population — someone has to decide which it is.
+    //
+    // `upgrade_request` is excepted because the terminating listener
+    // allows no upgrade token, so drawing it there could only ever prove
+    // the `501` a second time. Both halves of that gate are already
+    // covered on the plaintext listener, which is the one the #180 draw
+    // configures — and an upgrade over a terminated connection is its
+    // own feature, not this script run through a different socket.
     for (std.enums.values(Script)) |script| {
-        const excepted = script == .silent or script == .keepalive_pair;
+        const excepted = script == .silent or script == .keepalive_pair or
+            script == .upgrade_request;
         var drawable = false;
         for (terminating_scripts) |candidate| {
             if (candidate == script) drawable = true;
