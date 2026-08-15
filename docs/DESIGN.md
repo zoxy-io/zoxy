@@ -1758,6 +1758,27 @@ state that landed outside it would be a counter bug wearing a feature's
 clothes. What the tunnel-only bound needs is a name and a value in
 `constants.zig`, not a place in that sum.
 
+Two consequences worth stating, because the machinery above does not
+cover them and silence would read as an oversight. The gate **refuses a
+new upgrade once the drain has begun** — a proxy on its way out does not
+open the longest-lived thing it has, and the refusal is the pool rung's
+`503` rather than a `501`, since the listener does allow the token and
+there is simply nowhere to put it. And a handshake admitted just before
+the drain that completes *during* it takes the drain's bound rather than
+`tunnel_ms`, because the timer above is a single shot that may already
+have passed; without that, the sessions established late would be
+exactly the ones nothing bounded.
+
+**Layers 2 and 3 stay unarmed here, and that is deliberate.** Cutting a
+tunnel forces a teardown, and a teardown whose ops a wedged backend never
+delivers is the failure those layers exist to report — so it is fair to
+ask why this path does not arm them. Because a `drain_deadline_ms` of `0`
+still means the supervisor owns the upper bound, and it would be an odd
+contract that declined to kill the process for an uncapped drain but
+exited 4 for one. The tunnel bound makes the common case fast; the
+pathological one falls back to precisely the behaviour a zero deadline
+already asks for.
+
 Cutting rather than waiting is also the honest reading of what a tunnel
 is. The replacement instance has already bound the port, every WebSocket
 client reconnects — it is the protocol's expected failure mode — and

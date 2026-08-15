@@ -208,6 +208,12 @@ pub const Counters = struct {
     /// is how many sessions were *established*, which is the number that
     /// answers "is the feature being used" long after they closed.
     tunnels_established: Value = Value.init(0),
+    /// Tunnels cut by the #180 drain bound — the connections a zero
+    /// `drain_deadline_ms` could otherwise wait on forever. Its own
+    /// counter rather than a share of `drained_at_deadline`: that one
+    /// says an operator's deadline expired, this one says a deadline
+    /// they never named was supplied for them (§8).
+    tunnels_drained: Value = Value.init(0),
     /// Parked upstream connections reaped by the idle sweep (§5).
     upstream_idle_reaped: Value = Value.init(0),
     /// §7 active health probes dispatched — one per checked endpoint per

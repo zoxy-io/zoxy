@@ -879,6 +879,15 @@ pub fn Proxy(comptime IoType: type) type {
                 respond(server, conn, 501, "l7_not_implemented");
                 return false;
             }
+            // A draining proxy does not open new sessions, and a tunnel is
+            // the longest-lived thing it could open (§8). Refused as a
+            // shed rather than a 501: the listener does allow this token,
+            // there is simply nowhere to put it — the same sentence the
+            // pool rung says, for the same reason.
+            if (server.draining) {
+                respond(server, conn, 503, "l7_shed_tunnels");
+                return false;
+            }
             conn.tunnel_buffer = server.acquireTunnelBuffer() orelse {
                 respond(server, conn, 503, "l7_shed_tunnels");
                 return false;
@@ -2160,7 +2169,20 @@ pub fn Proxy(comptime IoType: type) type {
             // and this one moves the other way — the armed timer fires at
             // the exchange's old target, reads the later stored one and
             // re-arms, which is how the L4 relay start hands over too.
-            server.storeDeadline(conn, server.config.tunnel_timeout_ms);
+            //
+            // A tunnel that completes its handshake *during* a drain takes
+            // the drain's bound instead, and it has to: the gate refuses
+            // new upgrades once draining, but one admitted just before it
+            // began is still in flight, and the drain's own timer is a
+            // single shot that may already have passed. Without this the
+            // failure #180 exists to close reopens for exactly the
+            // sessions that established late — an hour-long deadline on a
+            // process trying to exit.
+            const draining_bound = server.draining and server.config.drain_deadline_ms == 0;
+            server.storeDeadline(conn, if (draining_bound)
+                constants.tunnel_drain_ms
+            else
+                server.config.tunnel_timeout_ms);
             relay.Relay(IoType).start(server, conn);
         }
 

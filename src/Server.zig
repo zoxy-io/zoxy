@@ -747,6 +747,64 @@ pub fn Server(comptime IoType: type) type {
                     onDrainDeadline,
                 );
                 server.armDrainWatchdog();
+            } else {
+                if (server.tunnel_buffers.slots.len >= 1) {
+                    // A zero deadline says "wait for the last connection",
+                    // and a tunnel has no message boundary to be the last
+                    // thing it does — so one idle session would hold the
+                    // drain open until the supervisor's SIGKILL, turning a
+                    // millisecond drain into every rolling restart waiting
+                    // out `TimeoutStopSec` (§8, #180). Tunnels alone are
+                    // bounded here; `drain_deadline_ms` keeps its exact
+                    // present meaning for every other connection, which is
+                    // why this arms only when the branch above did not.
+                    //
+                    // The same completion the configured deadline would have
+                    // used, so the ring budget is unchanged: the two are
+                    // mutually exclusive by construction.
+                    // Mutually exclusive with the branch above by
+                    // construction, and stated so: both arm the same
+                    // completion, and arming it twice would double-arm a
+                    // ring op the drain then has to account for.
+                    assert(server.config.drain_deadline_ms == 0);
+                    server.io.timerStart(
+                        &server.drain_deadline_completion,
+                        @as(u64, constants.tunnel_drain_ms) * std.time.ns_per_ms,
+                        Self,
+                        server,
+                        onTunnelDrainDeadline,
+                    );
+                }
+            }
+            server.maybeStopAfterDrain();
+        }
+
+        /// The #180 tunnel-only drain bound fired: cut the tunnels and
+        /// leave everything else alone.
+        ///
+        /// The difference from `onDrainDeadline` is the whole point of
+        /// having a second handler. That one tears down every live
+        /// connection because the operator named a deadline for the
+        /// drain; this one fires when they named *none*, so it may only
+        /// end the connections that can never end themselves. An ordinary
+        /// exchange still finishes on its own terms, and a zero
+        /// `drain_deadline_ms` still means what it has always meant for
+        /// it.
+        fn onTunnelDrainDeadline(server: *Self, result: Io.TimerError!void) void {
+            assert(server.draining);
+            assert(server.config.drain_deadline_ms == 0);
+            // Nothing ever cancels this timer, the same as its sibling.
+            result catch unreachable;
+            for (server.conns.slots) |*conn| {
+                if (!server.conns.isAcquired(conn)) continue;
+                if (conn.state != .relaying) continue;
+                // Relaying and holding a tunnel: an L4 connection is also
+                // `.relaying` and is deliberately untouched, because it
+                // *can* end on its own when its peers do.
+                if (conn.tunnel_buffer == null) continue;
+                if (conn.isTearingDown()) continue;
+                server.counters.increment("tunnels_drained");
+                server.beginTeardown(conn);
             }
             server.maybeStopAfterDrain();
         }
