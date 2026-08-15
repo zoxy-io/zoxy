@@ -2091,5 +2091,97 @@ bench/                // micro benches (poop) + loopback harness (zrk), §9
   load generator (wrk2 model, coordinated-omission-corrected); the bench
   driver. [zoxy-io/benchmark](https://github.com/zoxy-io/benchmark) — the
   multi-host comparison fleet (Tier 3).
-- [RFC 9112](https://www.rfc-editor.org/rfc/rfc9112) — HTTP/1.1 framing
-  (§6.3) and close announcement (§9.6).
+
+The specifications are §12's, not this list's — one place owns them, so
+a reader asking "what is this proxy held to" gets a register rather than
+a scattering.
+
+## 12. Conformance — what binds, and the deviations that are decisions
+
+There is no list to inherit. RFC 9110 §3.7 defines the *roles* an
+intermediary can take — a reverse proxy is a **gateway** — and the
+requirements that bind one are then scattered across the core specs
+wherever a rule happens to concern an intermediary. The IETF never
+defined a conformance class for the shape, and there is no suite that
+answers whether an implementation meets it.
+
+So the register below is assembled rather than cited, and assembling it
+is the point: a MUST this proxy does not meet is a **decision** when it
+is written down here and an accident when it is not. Both kinds are
+listed.
+
+**The core, and every one of them binds.** These are the June 2022
+revision; they obsoleted RFC 7230–7235 wholesale, so an older reference
+is a trap rather than a synonym.
+
+| spec | what binds a gateway | here |
+|---|---|---|
+| **9110** Semantics | §3.7 roles; §4.2.3 host comparison; §6.6.1 `Date`; §7.6.1 hop-by-hop; §7.6.2 `Max-Forwards`; §7.6.3 `Via`; §15.2.1 `100 Continue` | §7, with three deviations below |
+| **9112** HTTP/1.1 | §3.2 target forms; §6.3 body length; §7 transfer codings; §9 connection management | §7 framing, §8 close announcement |
+| **6585** additional statuses | defines `429` and `431` — **9110 did not absorb these**, the registry still points here | §8's static set |
+| **8297** early hints | defines `103` | §7's interim relay (#232) |
+| **3986** URI syntax | §2.3 unreserved, §5.2.4 dot-segments | §7 canonical path |
+
+RFC 9111 (caching) binds only an implementation that caches, which §1
+rules out — a non-caching gateway inherits nothing from it. RFC 9113,
+9114 and 9204 arrive with #173 and #197 and not before.
+
+**TLS, because this proxy terminates it** (§4). RFC 8446 is the protocol
+and §4.6.1 its resumption tickets; **6066** §3 is SNI, which is what a
+terminating proxy selects credentials on; **7301** is ALPN, which is how
+`http/1.1` is advertised and the gate #173 opens behind. Two BCPs are
+prescriptive rather than definitional and are treated as binding anyway:
+**9325** (secure use) and **8996** (TLS 1.0/1.1 deprecated). **9525** —
+service identity in certificates, which obsoleted 6125 in 2023 — binds
+only an implementation that *originates* TLS to its upstreams, which
+this one does not; it becomes load-bearing the day it does.
+
+**Per feature.** RFC **6455** §4 is the opening handshake #180
+recognises — tunnelling means never implementing the protocol, but
+identifying its handshake correctly is still 6455's rules. RFC **6265**
+is #178's cookie.
+
+Two conventions this proxy speaks have no RFC behind them at all, and
+that is worth stating rather than discovering. **`X-Forwarded-For` is
+standardized by nothing**: RFC 7239's `Forwarded` is the standards-track
+answer that the ecosystem did not adopt, so §7 implements the de-facto
+header because that is what origins read. And the **PROXY protocol**
+(§6) is HAProxy's own versioned document, not an RFC — which is why §6
+pins its two writers to its parser by round-trip test: there is no
+independent text to be conformant *to*.
+
+**The deviations.** Four requirements this proxy does not meet today.
+The first is settled; the rest are open, and the issue is where each
+decision is being taken rather than here.
+
+- **`Via` is not sent** (9110 §7.6.3, a MUST for intermediaries). The
+  cost is real and worth naming: a request that loops through this proxy
+  twice has nothing to detect itself with, and a chain carries no record
+  of the hops it crossed. It is nonetheless a **settled** deviation —
+  neither nginx nor HAProxy sends one by default either, so the header
+  is absent from the chains this proxy actually sits in, and emitting it
+  alone would add a field no downstream reads. It returns as a decision
+  if a deployment ever needs loop detection this proxy can see.
+- **`Max-Forwards` is ignored and `TRACE` is forwarded** (§7.6.2, two
+  MUSTs) — #240. Refusing `TRACE` closes half of it for one predicate;
+  the remaining `OPTIONS` half needs a header whose value this proxy
+  *computes*, which the render machinery has exactly one instance of
+  (`X-Forwarded-For`) and no general mechanism for.
+- **Proxy-generated responses carry no `Date`** (§6.6.1, a MUST for a
+  server with a clock, which this one has) — #234. §8's static
+  responses are comptime bytes; a `Date` makes them a written region,
+  which is a change to what that section claims.
+- **Absolute-form request-targets are rejected** (9112 §3.2.2, a MUST
+  for servers) — #233. `validateTarget` accepts origin-form and
+  `OPTIONS *` only.
+
+**There is no conformance suite**, official or otherwise, and §9's gates
+are internal by construction — the fuzzer asserts *this* parser never
+panics and never admits a third outcome, which is a different claim from
+agreeing with everyone else's. The external counterpart is
+[HTTP Garden](https://github.com/narfindustries/http-garden), a
+differential fuzzer that runs adversarial requests through many servers
+and proxies and diffs the parses; it is how most of the recent
+request-smuggling class was found, and it tests exactly the property
+§7's strictness claims. h2spec answers the same question for #173 and
+arrives with it.
