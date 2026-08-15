@@ -267,6 +267,20 @@ const uncovered = [_]Uncovered{
             "drain_deadline_ms directly, and asserts the loop reached idle",
     },
     .{
+        .name = "l7_body_cut_mid_stream",
+        .why = .unreached,
+        .reason = "the #236 cap's streaming half, and the sweep cannot reach it " ++
+            "for a reason that is a property of the draw rather than a gap in " ++
+            "ambition: the harness draws the cap in the single-byte range so " ++
+            "every body-carrying script trips it, which means the bytes " ++
+            "coalesced with the head are already over it and the *answered* " ++
+            "rung fires first. Reaching this one needs a cap above the first " ++
+            "delivery's excess and a body that outgrows it only later — a " ++
+            "combination the draw would have to be widened to produce, at the " ++
+            "cost of the answered rung's own coverage. src/http_proxy_test.zig " ++
+            "sends a 24 KiB chunked body under a 10 KiB cap directly",
+    },
+    .{
         .name = "l7_shed_upstream_head_buffers",
         .why = .unreached,
         .reason = "same shadow as l7_shed_upstream_slots: the relay rung " ++

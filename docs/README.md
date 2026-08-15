@@ -309,6 +309,45 @@ The access log writes one line when the tunnel closes — `kind` `http`,
 for the whole session. A line at the handshake would name a transfer that
 had not happened yet.
 
+#### Bounding a request body
+
+An `http` listener caps how large a request body it will carry. **One MiB
+by default** — nginx's `client_max_body_size`, which also ships on — and
+`0` accepts any size:
+
+```json
+{ "bind": "0.0.0.0:80", "protocol": "http", "cluster": "api",
+  "max_body_bytes": 5242880 }
+```
+
+zoxy itself is unharmed by a large upload: the strict recv → send → recv
+relay means per-connection memory is constant whatever the stream size, so
+an unbounded body costs one relay buffer and no more. **The exposure this
+bounds is your origin's** — and "the proxy in front bounds it" is the
+assumption most application stacks are deployed under.
+
+Per listener rather than in `limits`, because `limits` sizes what the
+process *reserves* and a body cap reserves nothing: it states policy, the
+same footing `forwarded` and `upgrades` stand on. One listener fronting an
+upload endpoint and another fronting an API want different numbers.
+
+Where the body's length is **declared**, the refusal costs nothing: a
+`Content-Length` over the cap is answered `413` before your origin is
+dialed, and the connection closes — the declared body is still unread in
+the socket, and draining it only to reject it is the wrong trade at the
+size this triggers on. A **chunked** body announces no size, so it is
+measured as it arrives: caught before the response leg is armed it earns
+the same `413`, and caught later it can only be a teardown, since by then
+no status can be sent. Both are counted —
+`zoxy_l7_body_over_limit` and `zoxy_l7_body_cut_mid_stream` — and the
+split matters when reading them: the first is a client told why, the
+second a client that just lost its connection.
+
+> [!IMPORTANT]
+> This is a change in behaviour from 0.3.0, which bounded nothing. A
+> deployment proxying uploads larger than 1 MiB needs `max_body_bytes`
+> raised, or set to `0`, before upgrading.
+
 ### Routing
 
 `"cluster"` is sugar for a single catch-all route. An `http` listener can

@@ -162,6 +162,12 @@ pub const Spec = struct {
     /// Every other routed request is assigned or repicked and owes the
     /// pinned cookie.
     sticky_request_pinned: bool = false,
+    /// This script sends a request body, so the #236 cap can refuse it
+    /// where a listener draws one. Stated rather than sniffed out of the
+    /// request bytes: the property decides which oracle the script is
+    /// entitled to, and a table that inferred it would let a bodyless
+    /// script widen its own legal set by accident.
+    carries_body: bool = false,
     /// This script routes to an origin and its 200 is the canonical body
     /// with the standard stamps — nothing about the response tells it
     /// apart from a plain `get`'s. That is what lets the terminating
@@ -268,6 +274,12 @@ comptime {
 /// response byte sent. Clean seeds pin the origin to `sized` and never
 /// stall, so `golden_status` still demands exact outcomes there.
 const statuses_routed: []const u16 = &.{ 200, 502, 503, 504 };
+/// The routed set plus the #236 body cap's `413`, for the scripts that
+/// carry a body. Only an adversarial seed draws a cap — a clean seed's
+/// script asked for a `200` and a refusal is not it — so the golden
+/// outcome is unchanged and this only widens what a cut seed may legally
+/// show.
+const statuses_routed_body: []const u16 = &.{ 200, 413, 502, 503, 504 };
 /// The head routes and forwards before its body is validated, so several
 /// outcomes can precede the 400: the §8 rungs, a killed dial, and — the
 /// subtlety — an early origin response. An instant origin answers 200
@@ -291,7 +303,8 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 200,
         .method = .post,
-        .allowed_statuses = statuses_routed,
+        .allowed_statuses = statuses_routed_body,
+        .carries_body = true,
         .routed_canonical = true,
     },
     .post_big = .{
@@ -301,7 +314,8 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 200,
         .method = .post,
-        .allowed_statuses = statuses_routed,
+        .allowed_statuses = statuses_routed_body,
+        .carries_body = true,
         .routed_canonical = true,
     },
     .post_chunked = .{
@@ -311,7 +325,8 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 200,
         .method = .post,
-        .allowed_statuses = statuses_routed,
+        .allowed_statuses = statuses_routed_body,
+        .carries_body = true,
         .routed_canonical = true,
     },
     .post_chunked_malformed = .{
@@ -672,7 +687,20 @@ comptime {
         // one response per request. A script that drifts from any of
         // those stops being pairable and has to say so here first.
         if (entry.routed_canonical) {
-            assert(std.mem.eql(u16, entry.allowed_statuses, statuses_routed));
+            // The legal set is a plain GET's — or that set plus the #236
+            // cap's `413`, and only for a script that actually carries a
+            // body. The two differ by *leg*, which is the truth rather
+            // than a weakening: the harness draws a body cap on the
+            // plaintext listener only, so a terminated run of the same
+            // script cannot earn a `413`, and a terminated run is judged
+            // by `terminating_pair`'s spec rather than this one. The
+            // body test is what keeps a bodyless script from taking the
+            // exception and quietly widening its own oracle.
+            if (std.mem.eql(u16, entry.allowed_statuses, statuses_routed_body)) {
+                assert(entry.carries_body);
+            } else {
+                assert(std.mem.eql(u16, entry.allowed_statuses, statuses_routed));
+            }
             assert(entry.golden_status == 200);
             assert(entry.expected_responses == 1);
             assert(entry.transcript_cap == 1);

@@ -1004,6 +1004,28 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   this proxy asked for it (#180) and a failed exchange when it did not,
   because relaying it as interim would carry on reading bytes that are no
   longer HTTP.
+- **A request body is bounded, and the bound is the origin's** (#236).
+  Nothing here needs it: §6's strict recv → send → recv relay keeps
+  per-connection memory constant whatever the stream size, so an
+  unbounded upload costs one relay buffer and no more. What it protects
+  is the backend, and "the proxy in front bounds it" is what most
+  application stacks assume — which is why the default is borrowed from
+  the reference that also ships one on (nginx's `client_max_body_size`,
+  one MiB) rather than derived from anything in this process. It is a
+  *listener* field, not a `limits` one: §5's line is that `limits` sizes
+  what the process reserves, and this reserves nothing.
+  Two paths, one cap, and the difference is what the head declared. A
+  `Content-Length` over the cap is knowable before the dial and refused
+  there — the §8 tunnel rung's reasoning, that admitting first and
+  shedding after spends an origin connection to produce a worse answer —
+  and the connection closes, because the declared body is unread in the
+  socket and draining it only to reject it is the wrong trade at this
+  size. A chunked body declares nothing, so it is measured as it
+  arrives: over the cap before the response leg is armed it still earns
+  the `413`, and over it later it can only be a teardown, since §7 has
+  no status left to send. Catching only the declared case would leave a
+  limit any client bypasses by choosing an encoding, which reads as
+  protection and is not.
 - **Early responses are legal.** An origin may answer before the request
   body finishes (RFC 9110 — e.g. 413 mid-upload): the response head is
   forwarded when it arrives, and the remaining request body is drained or

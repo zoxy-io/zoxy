@@ -279,6 +279,15 @@ pub const Config = struct {
         /// listener applies to another byte of it, so which sockets may
         /// hand out that exemption is a property of the socket.
         upgrades: Upgrades = .{},
+        /// Cap on one request's body (#236), or `0` to accept any size.
+        ///
+        /// Per listener rather than in `limits`, and the distinction is
+        /// §5's own: `limits` sizes what this process *reserves*, and a
+        /// body cap reserves nothing — it states policy, which is the
+        /// footing `forwarded` and `upgrades` already stand on. One
+        /// listener fronting an upload endpoint and another fronting an
+        /// API want different numbers, and neither is a pool.
+        max_body_bytes: u64 = constants.request_body_bytes_default,
 
         /// The upgrade tokens a listener may allow, as a set rather than
         /// a list: the vocabulary is closed, so membership is a field
@@ -569,6 +578,8 @@ pub const ValidationError = error{
     ListenerL4ResponseFilters,
     ListenerL4Forwarded,
     ListenerL4Upgrades,
+    ListenerL4MaxBodyBytes,
+    ListenerMaxBodyBytesOutOfRange,
     ListenerUpgradesEmpty,
     ListenerUpgradeTokenUnknown,
     ListenerForwardedModeUnknown,
@@ -1709,6 +1720,9 @@ pub const ListenerJson = struct {
     /// `Upgrade` stays the 501 it has always been. HTTP-only — an l4
     /// relay parses no handshake to recognise.
     upgrades: ?[]const []const u8 = null,
+    /// Optional #236 request-body cap; absent means one MiB, `0` means
+    /// no cap. HTTP-only — an l4 relay has no request to measure.
+    max_body_bytes: ?u64 = null,
 
     pub const schema_doc =
         "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
@@ -1744,6 +1758,14 @@ pub const ListenerJson = struct {
             .desc = "Terminate TLS on this listener with the given certificate " ++
                 "and key; absent is a plaintext socket. Inbound only — the " ++
                 "upstream leg stays plaintext.",
+        },
+        .max_body_bytes = .{
+            .desc = "Cap on one request body in bytes (http listeners only); " ++
+                "absent means 1 MiB, 0 accepts any size. A body over the cap is " ++
+                "refused 413 before the origin is dialed where its length was " ++
+                "declared, and the connection closes.",
+            .minimum = 0,
+            .maximum = constants.request_body_bytes_max,
         },
         .upgrades = .{
             .desc = "Protocol upgrades this listener will carry as tunnels (http " ++
@@ -2935,6 +2957,7 @@ fn resolveListener(
         .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
         .tls = try resolveTls(listener_json.tls, protocol),
         .upgrades = try resolveUpgrades(listener_json.upgrades, protocol),
+        .max_body_bytes = try resolveMaxBodyBytes(listener_json.max_body_bytes, protocol),
     };
     if (protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
@@ -3770,6 +3793,29 @@ fn resolveRetries(retries: u16) ParseError!u16 {
         return error.ClusterRetriesOutOfRange;
     }
     return retries;
+}
+
+/// Resolve a listener's #236 body cap. Absent takes the default, `0`
+/// opts out, and either on an `l4` listener is refused rather than
+/// ignored: a byte relay parses no request to measure, so a cap there
+/// describes a proxy that is not running — the same refusal `forwarded`
+/// and `upgrades` get, for the same reason.
+fn resolveMaxBodyBytes(
+    max_body_bytes: ?u64,
+    protocol: Config.Listener.Protocol,
+) ValidationError!u64 {
+    const cap = max_body_bytes orelse {
+        // An l4 listener never reads the field, so absence is not a
+        // statement about it — only an explicit one is.
+        return if (protocol == .l4) 0 else constants.request_body_bytes_default;
+    };
+    if (protocol == .l4) {
+        return error.ListenerL4MaxBodyBytes;
+    }
+    if (cap > constants.request_body_bytes_max) {
+        return error.ListenerMaxBodyBytesOutOfRange;
+    }
+    return cap;
 }
 
 /// Resolve a listener's #180 upgrade allowlist. Absent allows none, so

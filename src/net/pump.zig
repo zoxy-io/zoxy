@@ -98,10 +98,19 @@ const assert = std.debug.assert;
 /// How many of a received chunk belong to the current message. `consumed`
 /// < chunk.len means the message ended mid-buffer (the rest is a pipelined
 /// tail); `done` means no more body follows; `malformed` fails the framing.
+///
+/// `over_limit` is a *policy* stop rather than a framing one (#236): the
+/// bytes were well-formed and the message simply outgrew what this
+/// listener said it would carry. Named apart from `malformed` because the
+/// two end the exchange the same way and mean opposite things — one is
+/// the client speaking badly, the other is the client speaking too much —
+/// and a counter that could not tell them apart would send an operator
+/// looking for a broken client that does not exist.
 pub const FeedResult = struct {
     consumed: u32,
     done: bool,
     malformed: bool,
+    over_limit: bool = false,
 };
 
 pub fn Pump(
@@ -258,7 +267,11 @@ pub fn Pump(
                 return;
             }
             const fr = Policy.feed(conn, chunk);
-            if (fr.malformed) {
+            if (fr.malformed or fr.over_limit) {
+                // Both end the exchange here and for the same reason: the
+                // response leg is already armed by now, so no status can
+                // be sent (§7) — the policy has already counted which of
+                // the two it was.
                 server.beginTeardown(conn);
                 return;
             }

@@ -380,6 +380,9 @@ pub fn Conn(comptime IoType: type) type {
         /// admission like the filter tables beside it, so the gate asks
         /// what *this* socket allows rather than consulting the config.
         upgrades: config_module.Config.Listener.Upgrades,
+        /// The listener's #236 request-body cap, handed over at admission
+        /// like the tables beside it; `0` accepts any size.
+        max_body_bytes: u64,
         request_filters: []const filter.Rule,
         /// The listener's #175 response filter rules, same lifetime:
         /// matched against the origin's parsed response head at the
@@ -736,6 +739,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.request_filters = &.{};
             conn.response_filters = &.{};
             conn.upgrades = .{};
+            conn.max_body_bytes = 0;
             conn.forwarded = null;
             conn.upstream = null;
             conn.charged_endpoint = LogState.endpoint_none;

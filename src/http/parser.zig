@@ -428,6 +428,14 @@ pub const ChunkedScanner = struct {
     state: State = .size,
     /// Chunk-data bytes still to pass through in the current chunk.
     data_remaining: u64 = 0,
+    /// Payload bytes this message has carried so far, across every chunk
+    /// (#236). Distinct from the wire bytes the caller feeds: sizes,
+    /// extensions, terminators and trailers are framing, not body, and a
+    /// documented byte limit that counted them would refuse a body under
+    /// its own cap. The only running total either framing keeps — a
+    /// `Content-Length` body is bounded by a number the head already
+    /// declared, and needs none.
+    body_bytes: u64 = 0,
     /// Chunk-size value accumulating while in `.size`.
     size: u64 = 0,
     /// True once the current size line has at least one hex digit.
@@ -564,6 +572,7 @@ pub const ChunkedScanner = struct {
         const consumed: u32 = @intCast(wanted);
         assert(consumed >= 1);
         scanner.data_remaining -= wanted;
+        scanner.body_bytes += wanted;
         if (scanner.data_remaining == 0) {
             scanner.state = .data_cr;
         }

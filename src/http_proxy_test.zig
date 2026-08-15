@@ -291,6 +291,9 @@ const HttpOrigin = struct {
         /// Total bytes expected for the current request (head + framed
         /// body), known once its head parses. 0 means not parsed yet.
         request_expected: u32 = 0,
+        /// The request in flight is chunked, so its total is unknown and
+        /// this connection only drains (#236).
+        chunked_request: bool = false,
         response_sent: u32 = 0,
 
         fn armRecv(oconn: *OConn) void {
@@ -335,9 +338,25 @@ const HttpOrigin = struct {
                 };
                 const body_length: u32 = switch (request.framing) {
                     .content_length => |length| @intCast(length),
+                    // A chunked body has no length to expect (#236's
+                    // streaming half is the only thing that sends one
+                    // here). Read whatever arrives and let the proxy's own
+                    // verdict — a teardown at the cap — end the exchange;
+                    // the assert below would otherwise fire on the first
+                    // body byte, since nothing was expected past the head.
+                    .chunked => {
+                        oconn.chunked_request = true;
+                        oconn.request_expected = request.head_len;
+                        oconn.armRecv();
+                        return;
+                    },
                     else => 0,
                 };
                 oconn.request_expected = request.head_len + body_length;
+            }
+            if (oconn.chunked_request) {
+                oconn.armRecv();
+                return;
             }
             const current_len = oconn.request_len - oconn.request_offset;
             assert(current_len <= oconn.request_expected);
@@ -532,6 +551,8 @@ const Http1Bed = struct {
         drain_deadline_ms: u32 = 1000,
         /// The #235 head-read budget; absent mirrors the bed's idle window.
         head_timeout_ms: ?u32 = null,
+        /// The #236 request-body cap; 0 accepts any size.
+        max_body_bytes: u64 = constants.request_body_bytes_default,
         /// Put an endpoint nothing listens on *ahead* of the origin, so
         /// the first pick of an `rr` cluster is always the one that
         /// refuses and the retry is the only way to reach the origin.
@@ -653,6 +674,7 @@ const Http1Bed = struct {
             .response_filters = options.response_filters,
             .protocol = .http,
             .upgrades = options.upgrades,
+            .max_body_bytes = options.max_body_bytes,
             .forwarded = options.forwarded,
             // Paths nothing reads: the bed embeds the PEMs, so what this
             // states is only that the listener terminates.
@@ -5131,5 +5153,122 @@ test "l7: an idle kept connection still gets the whole idle window" {
     // slowloris, and treating it as one is the churn the split avoids.
     try std.testing.expect(elapsed_ms > 500);
     try std.testing.expect(elapsed_ms < 2000);
+    try bed.expectDrained();
+}
+
+test "l7: a declared body over the cap is refused before the origin is dialed" {
+    // #236. The length is in the head, so the verdict is knowable before
+    // anything is spent on it — the §8 tunnel rung's own reasoning, that
+    // admitting first and shedding after would spend an origin connection
+    // to produce a worse answer.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 320,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .max_body_bytes = 8,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
+        "Content-Length: 64\r\n\r\n" ++ ("x" ** 64));
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    // No origin was contacted: the refusal is this proxy's own, decided
+    // from the head alone.
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_over_limit"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_body_cut_mid_stream"));
+    try bed.expectDrained();
+}
+
+test "l7: a chunked body cannot slip past the cap by announcing no size" {
+    // The half that decides whether the cap is protection or theatre: a
+    // client that does not want to declare its length simply does not,
+    // and any HTTP client can choose chunked. Caught on the scanner's own
+    // payload total as it streams — by which point the response leg is
+    // armed, so it is a teardown rather than a status (#236).
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 321,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .max_body_bytes = 8,
+    });
+    defer bed.tearDown();
+
+    // Two 16-byte chunks: the first already passes the 8-byte cap.
+    try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n" ++
+        "10\r\n" ++ ("x" ** 16) ++ "\r\n" ++
+        "10\r\n" ++ ("y" ** 16) ++ "\r\n0\r\n\r\n");
+
+    // Coalesced with its head, so the cap is met before the response leg
+    // is armed and the client still earns a status. A body large enough
+    // to stream takes the teardown instead — same rung, later verdict.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bed.client.response(),
+        "HTTP/1.1 413 Content Too Large\r\n",
+    ));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_over_limit"));
+    // Counted apart from a framing violation: the body was well-formed,
+    // it was simply larger than this listener carries.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_request"));
+    try bed.expectDrained();
+}
+
+test "l7: a body under the cap, and an opted-out listener, are untouched" {
+    // The cap must not reach an ordinary request, and `0` must genuinely
+    // opt out — a listener fronting an upload endpoint wants its origin's
+    // own limit to be the only one.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 322,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .max_body_bytes = 0,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
+        "Content-Length: 64\r\nConnection: close\r\n\r\n" ++ ("x" ** 64));
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_body_over_limit"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_body_cut_mid_stream"));
+    try bed.expectDrained();
+}
+
+test "l7: a chunked body that outgrows the cap while streaming is cut" {
+    // The streaming half of #236, and the one the coalesced test above
+    // does *not* reach: a body small enough to arrive with its head is
+    // measured before the response leg is armed, so it earns a status. A
+    // body larger than the head buffer cannot be — by the time the
+    // overrun is visible the response recv is armed, no status can be
+    // sent (§7), and the only honest end is a teardown.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 323,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        // Above what arrives coalesced with the head, below the body.
+        .max_body_bytes = 10_000,
+    });
+    defer bed.tearDown();
+
+    // One 24 KiB chunk: far past the 8 KiB head buffer, so most of it
+    // reaches the body pump rather than riding in with the head.
+    try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n" ++
+        "6000\r\n" ++ ("z" ** 24576) ++ "\r\n0\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_cut_mid_stream"));
+    // Not the answered rung, and not a framing verdict: the body was
+    // well-formed and simply outgrew what this listener carries.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_body_over_limit"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_request"));
     try bed.expectDrained();
 }

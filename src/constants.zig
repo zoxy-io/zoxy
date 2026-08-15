@@ -504,6 +504,29 @@ pub const cluster_name_bytes_max: u16 = 64;
 /// not a share.
 pub const endpoint_weight_max: u16 = 256;
 
+/// Default cap on one request's body (#236), per listener. One MiB —
+/// nginx's `client_max_body_size`, which ships on by default and is the
+/// figure most application stacks are deployed assuming something in
+/// front enforces.
+///
+/// zoxy itself is unharmed by a large body: the strict recv → send → recv
+/// relay (§6) means per-connection memory is constant whatever the stream
+/// size, so an unbounded upload costs one relay buffer and no more. The
+/// exposure this bounds is entirely the *origin's*, which is why the
+/// figure is borrowed from the reference whose default protects the same
+/// thing rather than derived from anything here. `0` opts out, for a
+/// listener fronting an upload endpoint that wants its origin's own limit
+/// to be the only one.
+pub const request_body_bytes_default: u64 = 1 << 20;
+
+/// Ceiling on a configured request-body cap (#236) — one TiB. Not a
+/// resource bound: nothing here reserves per body, and the relay carries
+/// any size in constant memory (§6). It is the units-mistake bound, the
+/// same job `timeout_ms_max` does for a duration — a cap above this is a
+/// operator meaning MiB and writing bytes, and `0` already spells "no
+/// cap" for anyone who genuinely wants none.
+pub const request_body_bytes_max: u64 = 1 << 40;
+
 /// Default budget for reading one request head (#235) — from the
 /// client's first byte to a complete head, which is exactly a slowloris's
 /// window (§7: "a slowloris meets the clock or `head_buffer_bytes`,
@@ -1265,6 +1288,8 @@ comptime {
     // and the first byte re-bases the idle deadline *down* to this — a
     // timer never moves later once armed, so an inversion either way
     // would silently leave the wider value in force.
+    assert(request_body_bytes_default >= 1);
+    assert(request_body_bytes_default <= request_body_bytes_max);
     assert(connect_ms_default < head_ms_default);
     assert(head_ms_default <= idle_ms_default);
     assert(cluster_retries_max >= 1);
