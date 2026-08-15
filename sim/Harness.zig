@@ -83,6 +83,19 @@ const health_interval_floor_ms: u32 = 100;
 const probe_sweeps_max: u64 =
     scenario_end_ns / (health_interval_floor_ms * std.time.ns_per_ms) + 1;
 
+/// Where a stranding seed places its drop (#206). Two hooks, because the
+/// two halves of the class need different instants: `wind_down` takes ops
+/// already armed when the drain begins, `teardown` waits for the first
+/// cancel submitted once it is under way. Neither is a superset of the
+/// other — see `maybeStrandOps` and `armTeardownStrand`.
+const DropMode = enum { wind_down, teardown };
+
+/// What the teardown latch waits for. `beginTeardown` arms exactly these
+/// two — a pending dial's `connect_cancel` and a live deadline's
+/// `timer_cancel` — and it arms them *after* a wind-down drop has already
+/// landed, which is what puts them out of that hook's reach.
+const teardown_strand_kinds = [_]SimIo.OpKind{ .timer_cancel, .connect_cancel };
+
 comptime {
     // Passing probes consume origin conn slots (accept-and-vanish, never
     // recycled), on top of each origin's client-driven worst case: one
@@ -193,15 +206,18 @@ http_origin_stop_at_ns: u64,
 /// move nothing while shifting the whole sweep's stream position.
 clock_jump_wanted: bool,
 clock_jumped: bool,
-/// Whether this seed strands ops at its wind-down (#206), and — once it
-/// has — which kind it stranded. Two fields for the reason the pair above
-/// is two: what a seed drew and what it did are different facts, and
-/// `verify` needs the second one to decide whether a stuck drain was
-/// asked for. The kind is not part of the draw: it is chosen at the
-/// wind-down from the kinds actually armed there, so a strand never
-/// stands for ops that were not there to take.
-drop_wanted: bool,
+/// Where this seed strands an op, or null for the seeds that strand none
+/// (#206) — and, once one has been taken at the wind-down, which kind it
+/// was. Separate fields for the reason the pair above is two: what a seed
+/// drew and what it did are different facts, and `verify` needs the
+/// second to decide whether a stuck drain was asked for. The kind is
+/// never part of the draw; both modes take what the schedule armed rather
+/// than what a die named (`drawStrandKind`, `armDropNext`).
+drop_mode: ?DropMode,
 drop_kind: ?SimIo.OpKind,
+/// Whether the teardown mode's latch has been armed, so the second
+/// wind-down a scenario can have does not arm it twice.
+drop_latch_armed: bool,
 http_origin_stop_completion: SimIo.Completion,
 /// Virtual instant at which the drain begins, or 0 for "at the
 /// scenario's end like every other seed".
@@ -420,6 +436,7 @@ fn deriveDrainDeadlineMs(drain_at_ns: u64, random: std.Random) u32 {
 fn onDrainStart(harness: *Harness, result: Io.TimerError!void) void {
     result catch return;
     harness.server.beginDrain();
+    harness.armTeardownStrand();
 }
 
 /// The one-shot faults the sweep would otherwise never pull (§9).
@@ -598,7 +615,7 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     );
     harness.listeners_count = if (harness.tls_clients >= 1) 3 else 2;
     harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
-    harness.drop_wanted = deriveDropWanted(harness.clean, random);
+    harness.drop_mode = deriveDropMode(harness.clean, random);
     assert(harness.listeners_count <= harness.listener_configs.len);
     assert(harness.tls_clients >= 1 or !harness.clock_jump_wanted);
 }
@@ -1172,6 +1189,7 @@ fn populateTlsClients(harness: *Harness, random: std.Random) void {
     harness.scenario_ended = false;
     harness.clock_jumped = false;
     harness.drop_kind = null;
+    harness.drop_latch_armed = false;
     assert(harness.tls_clients <= tls_clients_max);
     // One token past the drawn count, for the resuming client's slot.
     const token_count = if (harness.tls_clients >= 1)
@@ -1481,11 +1499,11 @@ fn clientEnded(harness: *Harness) void {
     }
 }
 
-/// #206, on the seeds that drew it: take every armed op of one kind and
-/// never deliver it, at the instant the wind-down begins. That is the
-/// class of defect no other seed can reach — everything else this
-/// simulator does completes, which is faithful to io_uring and blind to
-/// what a readiness backend did in #203.
+/// #206's first hook, on the seeds that drew `.wind_down`: take every
+/// armed op of one kind and never deliver it, at the instant the
+/// wind-down begins. That is the class of defect no other seed can reach
+/// — everything else this simulator does completes, which is faithful to
+/// io_uring and blind to what a readiness backend did in #203.
 ///
 /// At the wind-down because that is where the ops worth stranding are
 /// armed. Measured over a 4096-seed sweep, the share of wind-downs
@@ -1510,31 +1528,9 @@ fn clientEnded(harness: *Harness) void {
 /// random op would spend nearly every strand on those two and reach
 /// recv_group about once in a sweep.
 fn maybeStrandOps(harness: *Harness) void {
-    if (!harness.drop_wanted) return;
+    if (harness.drop_mode != .wind_down) return;
     if (harness.drop_kind != null) return;
-    // A zero `drain_deadline_ms` is "no cap" (§5), and the deadline timer
-    // is the only thing that ever arms the give-up: `onDrainStuck` is
-    // started by `onDrainDeadline`, so a drain with no deadline has no
-    // backstop to provoke. Stranding an op there asks the proxy for a
-    // report the configuration deliberately declined — the drain waits
-    // for the last connection however long that takes, by design — and
-    // the run ends in `SimIo`'s own deadlock with no diagnostic, which is
-    // the same shape the excluded `timer` kind has and just as much a
-    // true statement about the backstop's reach rather than a defect.
-    //
-    // Skipped at the strand rather than at the draw because the draw runs
-    // in `deriveTerminatingDraws` and the deadline is settled one call
-    // later in `deriveServerConfig`. Gating the draw needs the deadline
-    // first, and swapping two calls re-rolls every draw after them for the
-    // whole sweep, taking the §9 census margins with it. The skip leaves
-    // `drop_kind` null, so `verify` holds this seed to the ordinary
-    // invariants — exactly what a seed that stranded nothing is for.
-    //
-    // Found by the nightly soak (run #18, 2026-08-13). All four shards hit
-    // the 16-failure cap early in their slices — shard 0 at 36k — and every
-    // named seed had drawn both a mid-scenario drain with the no-cap
-    // deadline and a drop.
-    if (harness.config.drain_deadline_ms == 0) return;
+    if (!harness.giveUpCanExist()) return;
     const kind = harness.drawStrandKind() orelse return;
     const dropped = harness.io.dropPendingOps(kind);
     // The kind came out of the armed set, so a strand that took nothing is
@@ -1549,6 +1545,99 @@ fn maybeStrandOps(harness: *Harness) void {
     // after the drop rather than before it, because the excuse it grants
     // ("this run may end at the give-up") is earned by stranding.
     harness.drop_kind = kind;
+}
+
+/// #206's second hook, on the seeds that drew `.teardown`: strand the
+/// first cancel submitted once the drain is already under way, rather
+/// than one that was in flight when it began.
+///
+/// This is the half a wind-down drop cannot reach, and the issue's own
+/// argument for it was wrong the first time round, so it is worth being
+/// exact. It is *not* that a slot which can never be released is
+/// otherwise unreachable — stranding any conn-armed op leaves one, 76
+/// runs a sweep do it. It is that `beginTeardown` arms `connect_cancel`
+/// and `deadline_cancel` *after* a wind-down drop has landed, so those
+/// two are the only ops in a connection's armed set no drop placed at the
+/// wind-down can be holding. #203 was a cancel submitted and never
+/// delivered; this hook models it where it happened.
+///
+/// It waits rather than takes, which is the difference from
+/// `drawStrandKind`: an op armed later is in no table to be read now, so
+/// this hook cannot know whether it will find anything. Measured over a
+/// 4096-seed sweep, 246 of the 784 runs that draw it find a cancel to
+/// take; the other 538 are held to the ordinary invariants, having taken
+/// nothing. That is the price of reaching an op that does not exist yet,
+/// and the mode is drawn twice as often as `.wind_down` to pay it.
+///
+/// What it buys is the sharpest signal in this issue: **all 246 reach the
+/// §8 give-up**, against 112 of the 316 wind-down strands, and 168 of
+/// them leave the *connection* plane stuck. A cancel armed during
+/// teardown and never delivered leaves that connection's armed set
+/// non-empty forever, and `continueTeardown` returns early for as long as
+/// that is true — a connection stuck in teardown with its slot held,
+/// which is #203 exactly. The other 78 are the prober's, which cancels a
+/// dial of its own when the drain stops it.
+///
+/// **Where it is armed decides what it catches**, which took two
+/// measurements to get right and is the sort of thing that rots quietly.
+/// Per run that drew the mode, and per strand it took:
+///
+///   - Armed *before* the doubles' `cancelIfStuck` burst: 82% strand, but
+///     a fifth of those took a client double's cancel — the server's
+///     drain never waits on one, so the run drained clean and the strand
+///     bought nothing.
+///   - Armed after the doubles and *before* `beginDrain` returns: 75%
+///     strand, and 7% of those land on conns. The prober's stop-cancel is
+///     submitted first, from inside the drain, and takes the other 93%.
+///   - Armed after `beginDrain` returns: 31% strand, and 68% of those land
+///     on conns.
+///
+/// The last is what ships. It strands on fewer runs because the cancels
+/// submitted from inside the drain are gone by then, and that is the
+/// point: what is left is the teardown of a connection that was still
+/// working when the drain started. Armed at both drain entries, since a
+/// seed that drains mid-scenario tears its connections down there.
+fn armTeardownStrand(harness: *Harness) void {
+    if (harness.drop_mode != .teardown) return;
+    if (harness.drop_latch_armed) return;
+    if (!harness.giveUpCanExist()) return;
+    // Nothing can have been stranded yet: the wind-down hook does not run
+    // in this mode, and the latch itself takes nothing until a submit
+    // answers it.
+    assert(harness.strandedKind() == null);
+    harness.drop_latch_armed = true;
+    // Both kinds at once, not one drawn of the two: `beginTeardown` arms
+    // whichever the connection's state calls for, and a latch naming the
+    // other spends the whole scenario waiting for an op that never comes.
+    harness.io.armDropNext(&teardown_strand_kinds);
+}
+
+/// Whether this seed's drain has a give-up to provoke at all. A zero
+/// `drain_deadline_ms` is "no cap" (§5), and the deadline timer is the
+/// only thing that ever arms one: `onDrainStuck` is started by
+/// `onDrainDeadline`, so a drain with no deadline has no backstop.
+/// Stranding an op there asks the proxy for a report the configuration
+/// deliberately declined — the drain waits for the last connection
+/// however long that takes, by design — and the run ends in `SimIo`'s own
+/// deadlock with no diagnostic, which is the same shape the excluded
+/// `timer` kind has and just as much a true statement about the
+/// backstop's reach rather than a defect.
+///
+/// Asked at the strand rather than at the draw because the draw runs in
+/// `deriveTerminatingDraws` and the deadline is settled one call later in
+/// `deriveServerConfig`. Gating the draw needs the deadline first, and
+/// swapping two calls re-rolls every draw after them for the whole sweep,
+/// taking the §9 census margins with it. Skipping here leaves both hooks
+/// having taken nothing, so `verify` holds the seed to the ordinary
+/// invariants — exactly what a seed that stranded nothing is for.
+///
+/// Found by the nightly soak (run #18, 2026-08-13). All four shards hit
+/// the 16-failure cap early in their slices — shard 0 at 36k — and every
+/// named seed had drawn both a mid-scenario drain with the no-cap
+/// deadline and a drop.
+fn giveUpCanExist(harness: *const Harness) bool {
+    assert(harness.drop_mode != null);
+    return harness.config.drain_deadline_ms != 0;
 }
 
 /// One kind out of those armed at this wind-down, or null when the
@@ -1635,7 +1724,7 @@ fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void
     // including one a future release bug produced with every op
     // delivered, which is the exact defect this backstop exists to catch
     // and the last thing the sweep should swallow.
-    if (harness.drop_kind == null) return error.DrainStuckWithoutStrand;
+    if (harness.strandedKind() == null) return error.DrainStuckWithoutStrand;
     // The give-up is allowed to leave work unfinished. It is not allowed
     // to have freed a slot an op still points at: that is the §5
     // corruption the generation counter exists to catch, and this is the
@@ -1644,6 +1733,25 @@ fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void
     // for this oracle by name.
     if (!pending_ops_live) return error.SlotReleasedUnderPendingOp;
     if (!harness.strandCanExplainStuck()) return error.StrandCannotExplainStuck;
+}
+
+/// What this seed actually stranded, by whichever hook took it, or null
+/// for the seeds that stranded nothing — the fact `verify` reads when it
+/// decides whether a stuck drain was asked for. The wind-down drop
+/// records its kind on the harness; the teardown latch records its in the
+/// backend, because what it took was decided by a submit that happened
+/// long after the hook ran.
+fn strandedKind(harness: *const Harness) ?SimIo.OpKind {
+    const latched = harness.io.droppedNextOp();
+    // The modes are alternatives, never both: one draw picks one hook, so
+    // a seed with two strands would mean a hook ran outside its mode.
+    assert(harness.drop_kind == null or latched == null);
+    if (harness.drop_kind != null) assert(harness.drop_mode == .wind_down);
+    if (latched) |kind| {
+        assert(harness.drop_mode == .teardown);
+        assert(kind == .timer_cancel or kind == .connect_cancel);
+    }
+    return harness.drop_kind orelse latched;
 }
 
 /// Whether the strand this seed took could account for a plane the
@@ -1660,13 +1768,15 @@ fn verifyGaveUp(harness: *const Harness, code: u8, pending_ops_live: bool) !void
 /// outcome the configuration had declined.
 ///
 /// Measured over a 4096-seed sweep, for the shape rather than the rule —
-/// which plane each stranded kind left stuck, in runs: `recv` conns 46,
+/// which plane each wind-down strand left stuck, in runs: `recv` conns 46,
 /// `log_write` the log 24, `timer_cancel` conns 12 and conns+health 2,
 /// `connect` health 10 and conns 4, `recv_group` conns 10, `send` conns 2,
 /// `connect_cancel` conns 2. `accept` never leaves anything stuck at all —
-/// 88 strands, no give-up — and admin is never the stuck plane.
+/// 88 strands, no give-up — and admin is never the stuck plane. The
+/// teardown latch adds 246 runs of its own: 168 on conns, the shape it
+/// exists for, and 78 on the prober's dial cancel.
 fn strandCanExplainStuck(harness: *const Harness) bool {
-    const kind = harness.drop_kind.?;
+    const kind = harness.strandedKind().?;
     // Only `verifyGaveUp` calls this, and only after both of its own
     // gates: the run ended at an abort, and this seed stranded something.
     assert(harness.io.abortedWith() != null);
@@ -1710,21 +1820,35 @@ fn strandCanExplainStuck(harness: *const Harness) bool {
     };
 }
 
-/// Whether this seed strands anything at its wind-down: one in sixteen
-/// adversarial ones. A small fraction on purpose — a stranded run trades
-/// every other oracle for the one it exists to check, since a drain that
-/// cannot finish leaves pools held and counters unreconciled by design.
-/// Which kind it takes is not decided here; `drawStrandKind` picks that
-/// from what the wind-down actually holds.
-fn deriveDropWanted(clean: bool, random: std.Random) bool {
+/// Where this seed strands, or null for the thirteen in sixteen
+/// adversarial seeds that strand nowhere. A small fraction on purpose — a
+/// stranded run trades every other oracle for the one it exists to check,
+/// since a drain that cannot finish leaves pools held and counters
+/// unreconciled by design. Which kind is taken is not decided here;
+/// `drawStrandKind` and `armDropNext` take what the schedule armed.
+///
+/// One draw for both modes, and `.wind_down` keeps the value that used to
+/// mean "strand": the sweep's whole stream position hangs off how many
+/// values are drawn here, so widening this into a second draw would
+/// re-roll every seed after it and take the §9 census margins with it.
+/// `.teardown` gets two of the sixteen values to `.wind_down`'s one,
+/// because it strands on under a third of the seeds that draw it — see
+/// `armTeardownStrand` for why that is a property of what it waits for
+/// rather than a fixable one. The two hooks end up perturbing comparable
+/// numbers of runs: 316 wind-down strands a sweep against 246.
+fn deriveDropMode(clean: bool, random: std.Random) ?DropMode {
     // Adversarial seeds only, for the reason every sibling draw states:
     // a clean seed's oracle is each script's exact golden outcome, and a
     // stranded op ends the run at the give-up before those oracles are
     // reached — for every client in the scenario, not just the one the
     // strand touched. A silently unanswered exchange passing as "the
     // backstop worked" is precisely what clean seeds exist to forbid.
-    if (clean) return false;
-    return random.uintLessThan(u8, 16) == 0;
+    if (clean) return null;
+    return switch (random.uintLessThan(u8, 16)) {
+        0 => .wind_down,
+        1, 2 => .teardown,
+        else => null,
+    };
 }
 
 /// #202, on the seeds that drew it: step the wall clock past a sealing
@@ -1782,6 +1906,7 @@ fn endScenario(harness: *Harness) void {
         client.cancelIfStuck();
     }
     harness.server.beginDrain();
+    harness.armTeardownStrand();
     harness.origin.stopListening();
     harness.origin_http.stopListening();
 }

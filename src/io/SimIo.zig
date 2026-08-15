@@ -177,6 +177,13 @@ group_free: []bool,
 group_count: u32,
 group_bytes: u32,
 group_in_use: u32,
+/// The kinds `armDropNext` is waiting for, one bit per `OpKind`, and the
+/// kind that finally matched (#206). Zero and null on every scenario that
+/// does not ask. A latch rather than a count: one op is the whole
+/// perturbation, and clearing it on the first match is what keeps a
+/// stranded scenario reporting *which* op it took.
+drop_next_kinds: u16,
+drop_next_taken: ?OpKind,
 
 const blackholed_addresses_max: u8 = 4;
 const connect_error_addresses_max: u8 = 4;
@@ -509,6 +516,8 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.group_count = options.buffer_group_count;
     io.group_bytes = options.buffer_group_bytes;
     io.group_in_use = 0;
+    io.drop_next_kinds = 0;
+    io.drop_next_taken = null;
     assert(io.sockets.isFullyReleased());
 }
 
@@ -1085,6 +1094,46 @@ pub fn dropPendingOps(io: *SimIo, kind: OpKind) u32 {
     return dropped;
 }
 
+/// Strand the next op this scenario submits of any kind in `kinds`, and
+/// only that one (#206). Where `dropPendingOps` takes what is armed
+/// *now*, this waits for an arming that has not happened yet — the only
+/// way to reach an op that teardown arms after the strand instant has
+/// gone by, which is what the two cancels `beginTeardown` submits are and
+/// the shape #203 took.
+///
+/// A set rather than one kind because the wait is on the future: which
+/// cancel a teardown reaches for is the schedule's business, and a latch
+/// naming one of the two would spend most of its scenarios waiting for an
+/// op that never comes.
+pub fn armDropNext(io: *SimIo, kinds: []const OpKind) void {
+    assert(io.drop_next_kinds == 0);
+    assert(io.drop_next_taken == null);
+    assert(kinds.len >= 1);
+    for (kinds) |kind| {
+        assert(kind != .none);
+        io.drop_next_kinds |= kindBit(kind);
+    }
+    assert(io.drop_next_kinds != 0);
+    // Into the trace: a run waiting for a different set is a different
+    // run, whether or not the wait is ever answered.
+    io.mix(io.drop_next_kinds);
+}
+
+/// Which kind the latch took, or null when nothing it waited for was ever
+/// submitted — the same distinction `dropPendingOps` draws with its
+/// count, between a scenario that stranded something and one that quietly
+/// stranded nothing.
+pub fn droppedNextOp(io: *const SimIo) ?OpKind {
+    if (io.drop_next_taken) |kind| assert(kind != .none);
+    return io.drop_next_taken;
+}
+
+fn kindBit(kind: OpKind) u16 {
+    comptime assert(std.enums.values(OpKind).len <= @bitSizeOf(u16));
+    assert(kind != .none);
+    return @as(u16, 1) << @intCast(@intFromEnum(kind));
+}
+
 /// Whether any op of `kind` is pending and still deliverable — what a
 /// caller about to strand one asks first, so it picks a kind the schedule
 /// actually armed instead of spending its seed on a kind that is not
@@ -1345,10 +1394,30 @@ fn dumpPendingOps(io: *const SimIo) void {
 fn enqueue(io: *SimIo, completion: *Completion) void {
     assert(io.pending_count < pending_ops_max);
     assert(completion.op != .none);
+    io.maybeDropOnSubmit(completion);
     io.pending[io.pending_count] = completion;
     completion.pending_index = io.pending_count;
     completion.state = .pending;
     io.pending_count += 1;
+}
+
+/// The submit-time half of the strand (`armDropNext`): an op the latch
+/// was waiting for is born dropped. Every submit path assigns the
+/// completion a fresh struct first, so `dropped` is false here on an op
+/// that has never been taken — a completion still dropped from an earlier
+/// strand is pending forever and can never be re-armed.
+fn maybeDropOnSubmit(io: *SimIo, completion: *Completion) void {
+    assert(completion.op != .none);
+    assert(!completion.dropped);
+    if (io.drop_next_kinds == 0) return;
+    const kind: OpKind = completion.op;
+    if (io.drop_next_kinds & kindBit(kind) == 0) return;
+    completion.dropped = true;
+    // One op is the whole perturbation: the latch closes on the first
+    // match, so the rest of the teardown proceeds as the schedule wrote it.
+    io.drop_next_kinds = 0;
+    io.drop_next_taken = kind;
+    io.mix(@intFromEnum(kind));
 }
 
 fn unlink(io: *SimIo, completion: *Completion) void {

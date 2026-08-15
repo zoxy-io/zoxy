@@ -701,6 +701,66 @@ test "simio: a stranded timer has nothing left to report it" {
     try std.testing.expectEqual(@as(?u8, null), sim_io.abortedWith());
 }
 
+const LatchedCancel = struct {
+    timer: SimIo.Completion = .{},
+    cancel: SimIo.Completion = .{},
+    timer_delivered: bool = false,
+    cancel_delivered: bool = false,
+
+    fn onTimer(self: *LatchedCancel, result: Io.TimerError!void) void {
+        result catch {};
+        self.timer_delivered = true;
+    }
+
+    fn onCancel(self: *LatchedCancel) void {
+        self.cancel_delivered = true;
+    }
+};
+
+// #206's second strand, pinned: `armDropNext` waits for an op that is in
+// no table yet — the cancel a teardown arms once the drain is already
+// under way — where `dropPendingOps` can only take what is armed now.
+//
+// The end state is what makes it the #203 shape. The cancel never lands,
+// so the caller's armed set never empties and its slot is never released;
+// the timer it was cancelling completes on its own schedule, so nothing
+// about the run *looks* stuck from the inside. Only a backstop that
+// notices the drain never finished can report it.
+test "simio: a latched cancel is stranded when it is finally submitted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{
+        .seed = 23,
+        // The deadlock is the assertion; its forensics are noise here.
+        .dump_on_deadlock = false,
+    });
+
+    var state: LatchedCancel = .{};
+    sim_io.timerStart(
+        &state.timer,
+        std.time.ns_per_ms,
+        LatchedCancel,
+        &state,
+        LatchedCancel.onTimer,
+    );
+    // Armed while the only pending op is one the latch is not waiting for:
+    // nothing is taken until the cancel below is submitted.
+    sim_io.armDropNext(&[_]SimIo.OpKind{ .timer_cancel, .connect_cancel });
+    try std.testing.expectEqual(@as(?SimIo.OpKind, null), sim_io.droppedNextOp());
+
+    sim_io.timerCancel(&state.timer, &state.cancel, LatchedCancel, &state, LatchedCancel.onCancel);
+    try std.testing.expectEqual(@as(?SimIo.OpKind, .timer_cancel), sim_io.droppedNextOp());
+
+    try std.testing.expectError(error.Deadlock, sim_io.run());
+    // The cancel never delivered, so whoever armed it still counts it as
+    // in flight — and the timer it named ran to completion instead of
+    // being cancelled, which is why nothing else looks wrong.
+    try std.testing.expect(!state.cancel_delivered);
+    try std.testing.expect(state.timer_delivered);
+}
+
 // #202: some bounds are measured in hours against scenarios that run for
 // a virtual second. XevIo has no counterpart and needs none — this is
 // scenario control like `injectLogWriteError`, not a seam decl.
