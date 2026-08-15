@@ -962,6 +962,32 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   requirement rather than an intention: a counter no scenario reaches
   fails the sweep, so the simulator has to carry the L7→L4 transition
   and the trailing-bytes case before any of this can land.
+- **A `1xx` is interim: it is relayed, and the exchange goes on** (#232).
+  The state machine had no status branch at all on the response path, so a
+  `100 Continue` parsed as a complete bodiless keep-alive response and the
+  exchange *settled* on it. Which way that broke depended only on whether
+  the request body had finished. Mid-body — `Expect: 100-continue`, which
+  curl sends automatically for any body over 1 KiB and nginx honours — the
+  client got the interim and then a close. Body already sent, the interim
+  was rendered as the answer and the upstream **parked with the real
+  response still unread in its socket**, so the next checkout read one
+  client's answer as another's. The stale check at checkout detects a FIN,
+  not pending data, so nothing caught it.
+  Relayed rather than absorbed, which is what nginx and HAProxy both do
+  and the only useful half to copy: a `103 Early Hints` is worthless to a
+  client that never sees it, and a `100` is precisely what a client
+  blocked on `Expect` is waiting for. `Expect` itself needs no handling —
+  it travels to the origin like any other header and the origin decides.
+  Answering `100` locally would commit this proxy to admitting a body the
+  origin may be about to refuse, which is the worse trade.
+  **Bounded, which neither reference is.** An origin streaming `103`s
+  forever is an unbounded loop on the one thread (§3), so
+  `interim_responses_max` caps them per exchange and the overrun takes the
+  same path an unparseable origin head does. `101` is the exception at
+  both ends: a protocol switch rather than a continuation, terminal when
+  this proxy asked for it (#180) and a failed exchange when it did not,
+  because relaying it as interim would carry on reading bytes that are no
+  longer HTTP.
 - **Early responses are legal.** An origin may answer before the request
   body finishes (RFC 9110 — e.g. 413 mid-upload): the response head is
   forwarded when it arrives, and the remaining request body is drained or

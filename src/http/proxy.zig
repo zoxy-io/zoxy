@@ -2193,6 +2193,159 @@ pub fn Proxy(comptime IoType: type) type {
             relay.Relay(IoType).start(server, conn);
         }
 
+        /// Relay an interim `1xx` to the client and leave the exchange
+        /// exactly where it was (#232).
+        ///
+        /// Forwarded rather than absorbed, which is both references'
+        /// behaviour and the only useful one: a `103 Early Hints` is
+        /// worthless to a client that never sees it, and a `100 Continue`
+        /// is precisely what a client sending `Expect: 100-continue` is
+        /// blocked waiting for. `Expect` itself needs no handling — it
+        /// travels to the origin like any other header, and the origin
+        /// decides. Answering `100` locally would commit this proxy to a
+        /// body the origin may be about to refuse.
+        ///
+        /// Nothing about the exchange is committed here: no edits, no
+        /// #178 stamp, no `response_started`, no logged status. An
+        /// interim is not the answer, and every one of those would
+        /// describe the answer.
+        fn forwardInterim(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+        ) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.response_leg == .awaiting_head);
+            assert(response.status >= 100);
+            assert(response.status < 200);
+            assert(response.status != 101); // The caller diverts both 101 cases.
+            if (conn.l7.interims_seen >= constants.interim_responses_max) {
+                // An origin that keeps promising and never answers is an
+                // unbounded loop on the one thread (§3), which no legal
+                // response justifies. Counted apart from a malformed head
+                // because nothing was malformed — the bound is what ran
+                // out.
+                server.counters.increment("l7_interim_overrun");
+                upstreamFailed(server, conn);
+                return;
+            }
+            conn.l7.interims_seen += 1;
+            const upstream = conn.upstream.?;
+            const rendered = render.renderResponseHead(
+                response,
+                false,
+                &.{},
+                false,
+                headBytes(server, conn),
+            ) catch {
+                upstreamFailed(server, conn);
+                return;
+            };
+            assert(rendered.len >= 1);
+            // Drop the interim from the origin's buffer and keep whatever
+            // followed it: the final response's head may already be
+            // sitting behind this one in the same read, and discarding it
+            // would strand the exchange waiting for bytes it already has.
+            const consumed = response.head_len;
+            assert(consumed <= upstream.head_len);
+            const rest = upstream.head_len - consumed;
+            if (rest >= 1) {
+                std.mem.copyForwards(
+                    u8,
+                    upstreamHeadBytes(upstream)[0..rest],
+                    upstreamHeadBytes(upstream)[consumed..upstream.head_len],
+                );
+            }
+            upstream.head_len = rest;
+            conn.l7.response_head_len_marker = 0;
+            server.counters.increment("l7_interim_forwarded");
+            armClientWrite(server, conn, headBytes(server, conn)[0..rendered.len], .interim_sent);
+        }
+
+        /// The interim reached the client; carry on waiting for the real
+        /// answer (#232). Either it is already buffered — an origin that
+        /// sent `100` and its `200` in one write — or the socket owes it.
+        fn resumeAfterInterim(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_exchanging);
+            assert(conn.l7.response_leg == .awaiting_head);
+            assert(!conn.l7.response_started);
+            assert(conn.l7.interims_seen >= 1);
+            const upstream = conn.upstream.?;
+            if (upstream.head_len >= 1) {
+                parseResponseAndDispatch(server, conn);
+                return;
+            }
+            armResponseHeadRecv(server, conn);
+        }
+
+        /// What kind of response this is, before any of the machinery
+        /// that assumes it is *the* response runs. Returns false when it
+        /// has taken the exchange somewhere else.
+        ///
+        /// Three answers hide behind a status here, and each breaks the
+        /// ordinary path differently. A requested `101` is terminal and
+        /// becomes a tunnel (#180). Any other `1xx` is interim: relayed,
+        /// with the exchange left exactly where it was (#232) — settling
+        /// on one either closes on a client still sending its body, or
+        /// parks an upstream whose real answer is still unread. And a
+        /// `101` nobody asked for is an origin switching a protocol it
+        /// was not invited to switch, which cannot be relayed as interim
+        /// because what follows it is no longer HTTP.
+        fn dispatchByStatus(
+            server: *ServerType,
+            conn: *ConnType,
+            response: *const parser.ResponseHead,
+        ) bool {
+            assert(conn.state == .l7_exchanging);
+            assert(response.status >= 100);
+            if (conn.l7.upgrade_requested and response.status == 101) {
+                renderUpgradeAccepted(server, conn, response);
+                return false;
+            }
+            if (response.status >= 200) {
+                // The origin declined an upgrade it was offered, which is
+                // legal and ordinary — hand the claim back before the
+                // exchange carries on as any other (#180).
+                if (conn.l7.upgrade_requested) {
+                    conn.l7.upgrade_requested = false;
+                    releaseTunnelClaim(server, conn);
+                }
+                return true;
+            }
+            if (response.status == 101) {
+                upstreamFailed(server, conn);
+                return false;
+            }
+            forwardInterim(server, conn, response);
+            return false;
+        }
+
+        /// Append the origin's coalesced body excess to the rendered head
+        /// when both fit, and return how many bytes the head write covers.
+        ///
+        /// The common small response arrives from the origin in one piece;
+        /// forwarding it in one piece trades a bounded memcpy for a whole
+        /// ring round trip per response. When it does not fit, the excess
+        /// stays in the upstream head and leaves as the channel's next
+        /// write instead.
+        fn coalesceResponseExcess(
+            server: *ServerType,
+            conn: *ConnType,
+            rendered_len: u32,
+            excess: []const u8,
+        ) u32 {
+            assert(rendered_len >= 1);
+            const head = headBytes(server, conn);
+            assert(rendered_len <= head.len);
+            if (rendered_len + excess.len > head.len) {
+                conn.l7.response_excess_len = @intCast(excess.len);
+                return rendered_len;
+            }
+            @memcpy(head[rendered_len..][0..excess.len], excess);
+            conn.l7.response_excess_len = 0; // It rides the head write.
+            return rendered_len + @as(u32, @intCast(excess.len));
+        }
+
         fn renderResponse(
             server: *ServerType,
             conn: *ConnType,
@@ -2202,33 +2355,9 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.response_leg == .awaiting_head);
             assert(conn.l7.request_head_vacated);
             const upstream = conn.upstream.?;
-            // `101` on a carried upgrade is terminal, not interim (#180),
-            // and diverts before any of the ordinary response machinery
-            // below. Two reasons it cannot share that path: the framing
-            // tracker reads a sub-200 status as bodiless and would consume
-            // none of the trailing bytes, when for a tunnel every trailing
-            // byte is payload; and the state machine would treat the
-            // exchange as complete and go read another request, which is
-            // the desynchronisation §7 exists to prevent. An unrequested
-            // `101` is *not* diverted — an origin cannot upgrade a
-            // connection this proxy never asked to upgrade.
-            if (conn.l7.upgrade_requested and response.status == 101) {
-                return renderUpgradeAccepted(server, conn, response);
-            }
-            // The origin declined. Answering an upgrade request with an
-            // ordinary response is legal and common — an origin that does
-            // not speak WebSocket just serves the request — and the
-            // exchange from here is an ordinary one, so the tunnel claimed
-            // at the gate goes back *now* rather than at teardown. This
-            // connection is very likely kept: `conn.l7` resets at the
-            // turnaround while the claim lives on the connection, so
-            // holding it would pin a pool slot nothing is using for as
-            // long as the client stays, and a second `Upgrade` over the
-            // same connection would find one already held.
-            if (conn.l7.upgrade_requested) {
-                conn.l7.upgrade_requested = false;
-                releaseTunnelClaim(server, conn);
-            }
+            // Not every status reaching here is *the* response: a tunnel,
+            // an interim and an uninvited switch all divert first.
+            if (!dispatchByStatus(server, conn, response)) return;
 
             const keep_downstream = downstreamKeepAlive(server, conn, response);
             conn.l7.downstream_close_announced = !keep_downstream;
@@ -2261,22 +2390,12 @@ pub fn Proxy(comptime IoType: type) type {
                 upstreamFailed(server, conn);
                 return;
             }
-            // The common small response arrives from the origin in one
-            // piece; forward it in one piece too. Appending the excess to
-            // the rendered head trades a bounded memcpy for a whole ring
-            // round trip per response. The fallback writes the head, then
-            // the excess from upstream.head as the channel's next write.
-            var head_write_len: u32 = @intCast(rendered.len);
-            if (rendered.len + feed.consumed <= headBytes(server, conn).len) {
-                @memcpy(
-                    headBytes(server, conn)[rendered.len..][0..feed.consumed],
-                    excess[0..feed.consumed],
-                );
-                head_write_len = @intCast(rendered.len + feed.consumed);
-                conn.l7.response_excess_len = 0; // It rides the head write.
-            } else {
-                conn.l7.response_excess_len = feed.consumed;
-            }
+            const head_write_len = coalesceResponseExcess(
+                server,
+                conn,
+                @intCast(rendered.len),
+                excess[0..feed.consumed],
+            );
 
             conn.l7.response_leg = .sending_head;
             // Committed to answering: no verdict may intervene from here (§7).
@@ -2352,6 +2471,15 @@ pub fn Proxy(comptime IoType: type) type {
             then: conn_module.ClientWrite.Then,
         ) void {
             switch (then) {
+                // An interim is out and the origin still owes an answer:
+                // the exchange is untouched, nothing has been committed to
+                // as the response, and no verdict can be pending (#232).
+                .interim_sent => {
+                    assert(conn.state == .l7_exchanging);
+                    assert(conn.l7.pending_verdict == .none);
+                    assert(!conn.l7.response_started);
+                    assert(conn.l7.response_leg == .awaiting_head);
+                },
                 // The handshake is out and nothing has been relayed yet:
                 // still the exchange, still no verdict, and the tunnel
                 // buffer claimed at the gate is still in hand (#180).
@@ -2476,6 +2604,8 @@ pub fn Proxy(comptime IoType: type) type {
                 // The origin's `101` has reached the client, so the HTTP
                 // conversation on this connection is over (#180).
                 .tunnel_start => beginTunnel(server, conn),
+                // The interim is out and the exchange continues (#232).
+                .interim_sent => resumeAfterInterim(server, conn),
                 .response_excess => sendResponseExcess(server, conn),
                 .response_body => {
                     assert(conn.l7.response_leg == .sending_body_excess);
@@ -2919,6 +3049,18 @@ pub fn Proxy(comptime IoType: type) type {
             if (conn.upstream.?.head_len != 0) {
                 return false; // A response byte arrived: the origin spoke.
             }
+            // And an interim means it spoke *and the client heard it*
+            // (#232). The check above cannot see that: `forwardInterim`
+            // compacts the interim out of the head buffer, so `head_len`
+            // is commonly back at zero by the time a later failure asks.
+            // Replaying here would re-send a request the origin may
+            // already have begun processing — the exact reading §7
+            // settles "may have begun processing" against — to a second
+            // origin, after this proxy has already told the client to go
+            // ahead.
+            if (conn.l7.interims_seen != 0) {
+                return false;
+            }
             if (conn.l7.request_body_pumped) {
                 return false; // Relay chunks flowed; not reconstructible.
             }
@@ -2939,6 +3081,12 @@ pub fn Proxy(comptime IoType: type) type {
             // fresh. So the rebuild below defaulting the tried set to
             // empty is the truth, not a reset.
             assert(conn.l7.tried_count == 0);
+            // No interim was relayed, so the rebuild below defaulting
+            // `interims_seen` to zero is the truth rather than a reset —
+            // `replayEligible` refuses a replay once one has gone out
+            // (#232), and this is what would trip if that ever stopped
+            // being true.
+            assert(conn.l7.interims_seen == 0);
             assert(!conn.armed.data_client_to_upstream);
             assert(!conn.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);

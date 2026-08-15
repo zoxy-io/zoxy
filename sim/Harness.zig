@@ -202,6 +202,12 @@ retries_http: u16,
 /// a tunnel pool to carry it. Off on most seeds, so the handshake script
 /// keeps proving the `501` every config had before the feature.
 upgrades_http: bool,
+/// The seed's http origin prefixes an interim `100 Continue` to every
+/// answer (#232). Drawn once per seed rather than per accept, so a clean
+/// seed's transcript stays exact — which is the point: the golden oracle
+/// is what has teeth over the interim path, and it only runs on clean
+/// seeds.
+interim_http: bool,
 tunnels: u32,
 /// Decided before `io.init` (the ring the sim registers must equal the
 /// limit the server accounts against — Server.init asserts the match),
@@ -639,6 +645,11 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.endpoints_http = .{ httpOriginAddress(), httpOriginAddress() };
     deriveRetries(harness, random);
     deriveUpgrades(harness, random);
+    // A quarter of seeds. Clean ones included, deliberately: an
+    // adversarial seed only holds the transcript to a legal *prefix*, so
+    // a proxy that settled on the interim and dropped the real answer
+    // would pass there. The exact-outcome oracle is the one that notices.
+    harness.interim_http = random.uintLessThan(u8, 4) == 0;
     // Each cluster draws its pick policy independently so mixed configs
     // (one cluster each way) flow through the balancer under the schedule
     // fuzz, not just the uniform pairings. Single-endpoint clusters
@@ -2685,6 +2696,9 @@ fn pickOriginMode(context: ?*anyopaque) zoxy.testing.Mode {
 /// outcomes stay exact.
 fn pickHttpOriginMode(context: ?*anyopaque) l7.OriginMode {
     const harness: *Harness = @ptrCast(@alignCast(context.?));
-    if (harness.clean) return .sized;
+    if (harness.clean) {
+        return if (harness.interim_http) .interim_then_sized else .sized;
+    }
+    if (harness.interim_http) return .interim_then_sized;
     return harness.scenario_prng.random().enumValue(l7.OriginMode);
 }
