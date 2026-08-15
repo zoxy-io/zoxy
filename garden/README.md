@@ -45,6 +45,30 @@ containers at all. Clone it as anything else and every target, zoxy included,
 reports as "not running" while sitting there running. (`docker compose -p
 http-garden` works too.)
 
+### On macOS
+
+The Garden says it is Linux-only, and this is where that bites: the REPL runs
+on the host and dials container IPs directly, which routes across the Docker
+bridge on Linux but not through Docker Desktop's VM. Every probe fails with
+`OSError: [Errno 65] No route to host`.
+
+`tools/targets.py` honours `x-props: {address, port}` per service, so
+publishing each target's `:80` and naming the published address makes the
+same REPL work from the host:
+
+```yaml
+  zoxy:
+    ports:
+    - 127.0.0.1:18001:80
+    x-props:
+      address: 127.0.0.1
+      port: 18001
+```
+
+Do that for every target in the comparison, each on its own host port. It is
+a local edit to the checkout's `docker-compose.yml`, not something to
+upstream — on Linux none of it is needed.
+
 ## Two things this target needs that others do not
 
 **seccomp must be unconfined.** zoxy is io_uring-native on Linux (§4), and
