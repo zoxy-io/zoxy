@@ -43,6 +43,7 @@ const no_edits: []const zoxy.http.filter.AppliedHeaderEdit = &.{};
 pub fn main() void {
     var request_storage: parser.HeaderStorage = undefined;
     var response_storage: parser.HeaderStorage = undefined;
+    var head_scratch: render.HeadScratch = undefined;
     var path_scratch: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
     var upstream_head: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
     var downstream_head: [zoxy.constants.head_buffer_bytes_default]u8 = undefined;
@@ -65,10 +66,18 @@ pub fn main() void {
             null,
             null,
             false,
+            &head_scratch,
             &upstream_head,
         ) catch unreachable;
         const response = parser.parseResponseHead(response_head, false, &response_storage, request.method) catch unreachable;
-        const downstream = render.renderResponseHead(&response, true, no_edits, false, &downstream_head) catch unreachable;
+        const downstream = render.renderResponseHead(
+            &response,
+            true,
+            no_edits,
+            false,
+            &head_scratch,
+            &downstream_head,
+        ) catch unreachable;
 
         // Consume the outputs so nothing is dead-code-eliminated.
         checksum +%= upstream[upstream.len - 1];

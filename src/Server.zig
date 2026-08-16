@@ -195,6 +195,15 @@ pub fn Server(comptime IoType: type) type {
         /// Whether `header_scratch` is out on loan (see the field). Only
         /// ever true inside one parse-and-consume window.
         header_scratch_lent: bool,
+        /// The serving path's render scratches, on exactly the terms
+        /// `header_scratch` sets out and for the same measured reason:
+        /// these are the locals the render path was still filling once the
+        /// parse path stopped. See `proxy.RenderScratch` for what a render
+        /// borrows and why one aggregate covers both hops.
+        render_scratch: proxy.RenderScratch,
+        /// Whether `render_scratch` is out on loan (see the field). Only
+        /// ever true inside one render-and-send window.
+        render_scratch_lent: bool,
         /// The §8 static responses in writable memory, because each now
         /// carries a `Date` slot (#234). Comptime-sized and held inline:
         /// a closed status set times two persistence variants, so this is
@@ -584,6 +593,29 @@ pub fn Server(comptime IoType: type) type {
             server.header_scratch_lent = false;
         }
 
+        /// Lend the serving path's render scratches for one head render
+        /// and the send it feeds. The window ends where the callback does,
+        /// same as the header scratch, and for the same §7 reason: the
+        /// rendered bytes are copied into the upstream head buffer (or the
+        /// client's) before this returns, so nothing here outlives it.
+        ///
+        /// A request render and a response render are each reached from
+        /// their own completion callback and neither suspends, so the two
+        /// are never live together — which is what lets one aggregate
+        /// serve both hops. The assert is what says so if that changes.
+        pub fn borrowRenderScratch(server: *Self) *proxy.RenderScratch {
+            assert(!server.render_scratch_lent);
+            server.render_scratch_lent = true;
+            return &server.render_scratch;
+        }
+
+        /// Return what `borrowRenderScratch` lent (see `returnHeaderScratch`
+        /// for why the bytes are left as they are).
+        pub fn returnRenderScratch(server: *Self) void {
+            assert(server.render_scratch_lent);
+            server.render_scratch_lent = false;
+        }
+
         /// The §4 engine pool and the one slab its plaintext destinations
         /// carve out of. Both are empty on a deployment where no listener
         /// terminates TLS — the whole feature reserving nothing, which is
@@ -720,6 +752,8 @@ pub fn Server(comptime IoType: type) type {
             // this one, at startup, instead of one per parse.
             server.header_scratch = undefined;
             server.header_scratch_lent = false;
+            server.render_scratch = undefined;
+            server.render_scratch_lent = false;
             server.armed_ops_peak = 0;
             server.last_pressure_errno = 0;
             server.drain_deadline_completion = .{};
