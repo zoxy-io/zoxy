@@ -459,13 +459,6 @@ pub fn Proxy(comptime IoType: type) type {
             // the parse: a slowloris that dribbles for the whole head-read
             // deadline must report the time it spent doing it (§8).
             server.beginLogRequest(conn);
-            // The idle window ends where the head read begins (#235). Until
-            // this byte the connection was quiet and bounded by `idle_ms`;
-            // from here it is a client mid-sentence, bounded by the much
-            // tighter head budget — which is the slowloris's whole window,
-            // and the reason the two stopped being one number.
-            server.storeDeadline(conn, server.config.head_timeout_ms);
-            server.rebaseDeadline(conn);
             conn.log.bytes_in += bound.len;
             fillHead(conn, bound.len, headBytes(server, conn).len);
             parseAndDispatch(server, conn);
@@ -516,6 +509,7 @@ pub fn Proxy(comptime IoType: type) type {
                     // converts it to the oversize verdicts below — so here
                     // there is room to read more.
                     assert(!head_is_full);
+                    installHeadBudget(server, conn);
                     if (conn.tls != null) {
                         armTlsHeadRecv(server, conn);
                     } else {
@@ -528,6 +522,40 @@ pub fn Proxy(comptime IoType: type) type {
                 error.HeadTooLarge => return respond(server, conn, 431, "l7_headers_too_large"),
             };
             routeRequest(server, conn, &request);
+        }
+
+        /// Start this head's #235 slowloris clock: the idle window ends
+        /// where the head read stops being instantaneous, and from here
+        /// the client is bounded by the much tighter head budget.
+        ///
+        /// Installed on the first `Incomplete`, not on the first byte.
+        /// Reaching that branch is what makes a client *mid-sentence* —
+        /// a head that arrives whole in one recv was never slow, and
+        /// bounding it bought nothing while costing a timer cancel and a
+        /// re-arm (§4's lazy timer cannot move earlier on its own) on
+        /// every request of every keep-alive connection. The budget the
+        /// cancel installed then lived for the microseconds until routing
+        /// and the render stored the idle window over it again.
+        ///
+        /// Once per head, never once per fragment: a budget a dribbling
+        /// client could push out by dribbling would bound nothing, which
+        /// is the whole failure #235 exists to answer.
+        ///
+        /// Narrowed against the *effective* idle window rather than the
+        /// configured one. `idleTimeoutMs` divides by
+        /// `pressure_idle_divisor` under downstream pressure (§8) while
+        /// the budget is a flat config value the loader only ever related
+        /// to `idle_ms` as written — so under pressure the budget can be
+        /// the wider of the two, and taking it unclamped would hand a
+        /// slowloris a longer window in exactly the load condition the
+        /// bias exists for.
+        fn installHeadBudget(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_reading_head);
+            if (conn.l7.head_budget_installed) return;
+            conn.l7.head_budget_installed = true;
+            const budget_ms = @min(server.config.head_timeout_ms, server.idleTimeoutMs());
+            assert(budget_ms >= 1);
+            server.narrowDeadline(conn, budget_ms);
         }
 
         /// The §7 canonical routing keys for `request`: the canonical host

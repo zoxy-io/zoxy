@@ -574,6 +574,25 @@ pub fn Conn(comptime IoType: type) type {
             /// across by hand — a replay is the same request retrying, not
             /// a new one earning a fresh budget.
             request_deadline_ns: u64 = 0,
+            /// Whether this request's #235 head budget is already
+            /// installed. Set on the first parse that comes back
+            /// `Incomplete` — the moment a client is provably mid-sentence
+            /// — and read so the *next* fragment does not install it
+            /// again: a budget a dribbling client could push out by
+            /// dribbling would bound nothing at all.
+            ///
+            /// In `l7` rather than on the connection because the budget is
+            /// one head's, and the wholesale clear at every keep-alive
+            /// turnaround is what makes the next request earn its own.
+            ///
+            /// Unlike `request_deadline_ns` above, the §7 replay does *not*
+            /// carry this across its rebuild, and does not need to: a
+            /// replay runs from `.l7_exchanging` and moves to
+            /// `.l7_dialing`, so it never re-enters the `.l7_reading_head`
+            /// state `installHeadBudget` asserts on. There is no second
+            /// head to budget, so a flag reset to false is inert rather
+            /// than a budget silently reissued.
+            head_budget_installed: bool = false,
             /// The endpoint identity this request's stickiness cookie
             /// named (#178), or null when the cluster is not
             /// cookie-keyed or the request carried nothing usable.

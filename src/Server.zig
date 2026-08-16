@@ -180,7 +180,7 @@ pub fn Server(comptime IoType: type) type {
         /// response is stamped from, and the second it renders. Cached
         /// because the calendar arithmetic is per-second work and the
         /// responses that need it arrive per-request; re-rendered lazily,
-        /// on the first stamp of a new second.
+        /// on the first tick of a new second.
         ///
         /// Never read by a send — only ever copied *out of*, into a
         /// response's own slot — so unlike those slots this one is safe
@@ -1522,10 +1522,12 @@ pub fn Server(comptime IoType: type) type {
         /// Not the head budget, and the distinction is #235's: a connection
         /// that has connected and not spoken is quiet, not slow, and
         /// bounding it as a slowloris would reap the honest client that
-        /// opened early. The slowloris clock starts at its first byte,
-        /// where `onHeadGroupRecv` re-bases this down to
-        /// `head_timeout_ms` — a client mid-sentence meets that or
-        /// `limits.head_buffer_bytes`, whichever comes first (§7).
+        /// opened early. The slowloris clock starts where the head proves
+        /// to be *fragmented* — `installHeadBudget`, on the first parse
+        /// that returns Incomplete — and narrows this to the head budget
+        /// or this same window, whichever is tighter. A client mid-sentence
+        /// meets that or `limits.head_buffer_bytes`, whichever comes first
+        /// (§7); a head that arrived whole never needed either.
         fn entryTimeoutMs(
             server: *const Self,
             protocol: config_module.Config.Listener.Protocol,
@@ -3234,6 +3236,42 @@ pub fn Server(comptime IoType: type) type {
             );
         }
 
+        /// Store a target and re-base only if it actually moved *earlier*
+        /// — `storeDeadline` and `rebaseDeadline` as one step, for the
+        /// caller that cannot prove the narrowing statically.
+        ///
+        /// The two callers that can prove it — the dial's per-try connect
+        /// budget and the routing cap — say so by calling the pair
+        /// directly. #235's head budget cannot: it is a config value
+        /// compared against a window that shrinks under pressure, so
+        /// whether it narrows anything is a runtime fact. Asking here
+        /// keeps the cancel off the keep-alive hot path in the common
+        /// case, where the head budget is already the wider of the two and
+        /// §4's lazy tick-and-compare re-arms for a later target for free.
+        pub fn narrowDeadline(server: *Self, conn: *ConnType, timeout_ms: u32) void {
+            assert(timeout_ms >= 1);
+            // A connection with no deadline stored has none to narrow:
+            // every state that reaches here was given one on entry.
+            assert(conn.deadline_ns != 0);
+            const previous_ns = conn.deadline_ns;
+            server.storeDeadline(conn, timeout_ms);
+            assert(conn.deadline_ns != 0);
+            // Compared against the previously *stored* target, not the
+            // armed timer's — which is never recorded. That is sound for
+            // this caller because nothing stores a deadline between the
+            // entry window and the head budget: in `.l7_reading_head` the
+            // only prior store is the idle window, and the armed timer is
+            // aimed at it. Said that narrowly on purpose — "the armed
+            // target is always at or before the stored one" is *not* a
+            // general §4 fact, since `storeDeadline`'s max-lifetime clamp
+            // can move the stored target earlier with no rebase and leave
+            // `onDeadline` to self-heal a tick late. Where the two can
+            // diverge, this comparison would only ever decline a cancel
+            // that was unnecessary, never skip one that was needed.
+            if (conn.deadline_ns >= previous_ns) return;
+            server.rebaseDeadline(conn);
+        }
+
         /// Re-base the armed deadline to the freshly stored (earlier) target
         /// (§8): the single lazy timer never moves *earlier* once armed (§4),
         /// so an L7 dial needing a tighter per-try connect budget than the
@@ -3247,10 +3285,13 @@ pub fn Server(comptime IoType: type) type {
             // timer. The dial's per-try connect budget (`.l7_dialing`); the
             // request deadline installed at routing (`.l7_reading_head`,
             // §8), which must re-base here because the reuse path never
-            // reaches the dial; and the #235 head budget, installed at the
-            // client's first byte — also from `.l7_reading_head`, but a
-            // different narrowing: routing tightens to the *exchange* cap,
-            // this one tightens the idle window to the head read.
+            // reaches the dial; and the #235 head budget, installed on the
+            // first parse that comes back Incomplete — also from
+            // `.l7_reading_head`, but a different narrowing: routing
+            // tightens to the *exchange* cap, this one tightens the idle
+            // window to the head read. That third one reaches here through
+            // `narrowDeadline`, which is what establishes "earlier" for it
+            // rather than assuming it.
             assert(conn.state == .l7_dialing or conn.state == .l7_reading_head);
             // A prior dial's rebase cancel can still be draining if the
             // exchange outran it across a keep-alive turnaround. It re-arms
