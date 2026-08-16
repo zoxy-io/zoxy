@@ -395,7 +395,22 @@ const Suppress = struct {
     /// must not travel beside it.
     max_forwards: bool = false,
 
+    /// Whether this hop writes any of the three. Hoisted out of the
+    /// header walk for the same reason `has_suppressing_edit` is: all
+    /// three are off for an ordinary forwarded request — forwarding is
+    /// opt-in per listener, absolute-form is rare and a hop budget rarer
+    /// — and that case should cost one predictable branch for the whole
+    /// walk rather than a tag dispatch on every header (§9: the render is
+    /// the top user-CPU cost under load).
+    fn any(suppress: Suppress) bool {
+        return suppress.forwarded_for or suppress.host or suppress.max_forwards;
+    }
+
     fn claims(suppress: Suppress, tag: parser.HeaderName) bool {
+        // Only reached when `any` already said one of the three is on, so
+        // the common answer here is "some *other* header" rather than
+        // "nothing is suppressed at all".
+        assert(suppress.any());
         return switch (tag) {
             .x_forwarded_for => suppress.forwarded_for,
             .host => suppress.host,
@@ -455,6 +470,10 @@ fn appendEndToEndHeaders(
             break;
         }
     }
+    // The same decision for the proxy's own three, and made here for the
+    // same reason: a request this hop writes none of them for skips the
+    // per-header tag dispatch entirely.
+    const has_suppression = suppress.any();
 
     for (headers) |*header| {
         assert(header.name.len >= 1);
@@ -466,7 +485,7 @@ fn appendEndToEndHeaders(
             const participating = keep_upgrade and header.tag == .upgrade;
             if (!participating) continue;
         }
-        if (suppress.claims(header.tag)) {
+        if (has_suppression and suppress.claims(header.tag)) {
             continue;
         }
         if (has_suppressing_edit and suppressedByEdit(header.name, edits)) {
