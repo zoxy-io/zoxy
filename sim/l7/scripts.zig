@@ -66,6 +66,13 @@ pub const Script = enum(u8) {
     /// `/sim` would; the origin's canonical oracle catches a raw-path
     /// forward, and a router matching raw bytes would route it elsewhere.
     confusion,
+    /// A GET whose request line is absolute-form (#233), beside a `Host`
+    /// naming somewhere else. RFC 9112 §3.2.2 has the authority win, so
+    /// this must route, forward and log exactly as `get` does — the
+    /// request the origin sees is `get`'s, byte for byte. What proves it
+    /// is the origin's own oracle: it refuses any forwarded head still
+    /// in absolute-form, and any carrying the overridden Host.
+    absolute_form,
     /// A GET under `/reject`: a §7 filter rejects it with 403 before any
     /// resource is acquired or origin dialed. The golden outcome is exactly
     /// that 403, and the origin must never see the request.
@@ -198,6 +205,24 @@ pub const get_request = "GET /sim HTTP/1.1\r\nHost: sim\r\n" ++ trace_line ++ "\
 /// left to say.
 pub const get_request_close = "GET /sim HTTP/1.1\r\nHost: sim\r\nConnection: close\r\n" ++
     trace_line ++ "\r\n";
+/// The #233 absolute-form spelling of `get_request`: the same resource,
+/// named the way a client with `http.proxyHost` set names it, with a
+/// `Host` that disagrees. Once the split and the override are right,
+/// what the proxy forwards is `get_request` — the comptime block below
+/// pins the two halves the render assembles it from, so an edit to
+/// either spelling has to keep them in step.
+pub const absolute_form_request = "GET http://sim/sim HTTP/1.1\r\n" ++
+    "Host: " ++ canon.overridden_host ++ "\r\n" ++ trace_line ++ "\r\n";
+comptime {
+    // The authority names the same host the origin-form script sends, so
+    // the two route identically and any difference the sweep sees comes
+    // from the form alone.
+    assert(std.mem.indexOf(u8, absolute_form_request, "http://sim/sim") != null);
+    assert(std.mem.indexOf(u8, get_request, "Host: sim\r\n") != null);
+    // And the Host it carries is the one no origin may ever see.
+    assert(std.mem.indexOf(u8, absolute_form_request, canon.overridden_host) != null);
+}
+
 /// A keep-alive POST for the same caller (#204): the request-body leg,
 /// which a GET cannot reach, on a connection the exchange leaves open so
 /// a second request can follow it. Byte-identical to `post_sized`'s
@@ -448,6 +473,18 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .allowed_statuses = statuses_routed,
         .routed_canonical = true,
     },
+    .absolute_form = .{
+        // Absolute-form, so what routes is the request line's authority
+        // rather than the Host beside it (#233). Indistinguishable from
+        // `get` from here on: same route, same forwarded head, same 200.
+        .request = absolute_form_request,
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
+    },
     // §7 filter scripts: a distinct path per action so the listener's
     // rules fire only for these, never the others.
     .filter_reject = .{
@@ -623,6 +660,7 @@ pub const terminating_scripts = [_]Script{
     .connect_method,
     .pipelined,
     .confusion,
+    .absolute_form,
     .filter_reject,
     .filter_redirect,
     .filter_respond,

@@ -244,6 +244,22 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 return std.mem.eql(u8, target[canonical.path.len..], canonical.query);
             }
 
+            /// The §7 promise an absolute-form request must not weaken
+            /// (#233): the forwarded request line is origin-form, and the
+            /// single `Host` it carries is the name that routed. A proxy
+            /// that forwarded the client's target verbatim would fail the
+            /// first test; one that routed on the authority but forwarded
+            /// the Host beside it would fail the second, which is the
+            /// disagreement RFC 9112 §3.2.2 exists to settle.
+            fn forwardedNamesOneAuthority(conn: *Conn, request: *const parser.RequestHead) bool {
+                _ = conn;
+                if (request.authority != null) {
+                    return false;
+                }
+                const host = request.host orelse return true;
+                return !std.mem.eql(u8, host, canon.overridden_host);
+            }
+
             /// Returns true when the head is parsed and the phase moved
             /// on; false when it armed a recv or closed on a violation.
             fn parseHead(conn: *Conn) bool {
@@ -286,6 +302,17 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 // A raw dot-segment or decodable escape here would mean the
                 // router and the origin could disagree about the resource.
                 if (!conn.targetIsCanonical(request.target)) {
+                    conn.origin.violations += 1;
+                    conn.close();
+                    return false;
+                }
+                // #233: whatever form a client used to name the resource,
+                // the origin is spoken to in origin-form, and the Host it
+                // reads is the authority that routed — never the one an
+                // absolute-form request line overruled. Checked for every
+                // script because only one can produce either shape, which
+                // makes a blanket check an exact one.
+                if (!conn.forwardedNamesOneAuthority(&request)) {
                     conn.origin.violations += 1;
                     conn.close();
                     return false;

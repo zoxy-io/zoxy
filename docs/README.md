@@ -374,6 +374,14 @@ origin receives, so the router and the backend cannot disagree about which
 resource was named. Structure-changing escapes (`%2F`, `%00`, truncated
 escapes) are rejected with `400`; no matching route is a `404`.
 
+A request may also name its authority in the request line itself —
+`GET http://api.example.com/v2/x HTTP/1.1` — which is what a client sends
+when it thinks it is talking to a forward proxy. That form is accepted
+(RFC 9112 requires it), and the authority in the target **wins over the
+`Host` header**: it is what routes, what filters match, what the access
+log records, and what the origin receives as the request's `Host`. Only
+`http` and `https` targets are accepted; any other scheme is a `400`.
+
 ### Clusters and load balancing
 
 A cluster is a named set of endpoints — static `IP:port` literals, resolved

@@ -905,13 +905,37 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   9110 §4.2.3 makes `Host` case-insensitive, and the authority's port is
   not part of the routing name) — computed once in the trust boundary
   like the path. Unlike the path, the `Host` header is **forwarded
-  verbatim**: an origin virtual-host may legitimately be case- or
+  verbatim** (with the one absolute-form exception below): an origin
+  virtual-host may legitimately be case- or
   port-sensitive, and the proxy has no per-origin knowledge to justify
   rewriting it — the canonical form is a routing *key*, not a
   replacement. A request with no `Host` (legal in HTTP/1.0) or an empty
   one matches only the any-host routes; config hosts must themselves be
   canonical (rejected at load otherwise), so a request host compares
   byte-for-byte against them.
+- **An absolute-form target names its own authority, and that authority
+  wins** (#233). RFC 9112 §3.2.2 makes accepting `GET
+  http://api.example/v2/x HTTP/1.1` a MUST for a server, and it arrives
+  from clients that believe they are talking to a forward proxy — a JVM
+  with `http.proxyHost` set, a synthetic-check agent, an old cache. The
+  target is split at the same trust boundary that validates every other
+  form: the authority comes off, and the origin-form remainder goes
+  through the same canonicalization as any other path (an absent path is
+  the root). Only `http` and `https` are admitted — §7 speaks those two,
+  and a target naming another scheme is refused 400 rather than routed
+  by its path alone — and the authority must be a bare host, so a
+  userinfo prefix or a fragment is a 400 too.
+  The authority then **replaces the `Host`**: it is what routes, what
+  filters match, what the access log records, and what the forwarded
+  request carries as its one `Host` line. That is the RFC's own
+  prescription (a recipient ignores the received Host in favour of the
+  target's authority) and it is the only reading that keeps this
+  section's promise — the router and the origin cannot disagree about
+  which resource a request names — when a request names one twice. It is
+  also the single place the proxy rewrites a `Host`, which is why the
+  verbatim-forwarding rule above names it as its exception. An HTTP/1.1
+  request must still carry a `Host` at all (RFC 9112 §3.2, a separate
+  rule); the authority overrides its *value*, not the requirement.
 - **An allowed upgrade becomes a tunnel** (#180). The proxy does not
   speak WebSocket and will not: it forwards the handshake, recognises
   `101 Switching Protocols`, and relays bytes both ways for the rest of
@@ -2209,9 +2233,11 @@ header because that is what origins read. And the **PROXY protocol**
 pins its two writers to its parser by round-trip test: there is no
 independent text to be conformant *to*.
 
-**The deviations.** Four requirements this proxy does not meet today.
+**The deviations.** Three requirements this proxy does not meet today.
 The first is settled; the rest are open, and the issue is where each
-decision is being taken rather than here.
+decision is being taken rather than here. Absolute-form request-targets
+(9112 §3.2.2) left this list with #233: they are accepted, and §7 states
+what their authority does to the `Host` beside them.
 
 - **`Via` is not sent** (9110 §7.6.3, a MUST for intermediaries). The
   cost is real and worth naming: a request that loops through this proxy
@@ -2230,9 +2256,6 @@ decision is being taken rather than here.
   server with a clock, which this one has) — #234. §8's static
   responses are comptime bytes; a `Date` makes them a written region,
   which is a change to what that section claims.
-- **Absolute-form request-targets are rejected** (9112 §3.2.2, a MUST
-  for servers) — #233. `validateTarget` accepts origin-form and
-  `OPTIONS *` only.
 
 **There is no conformance suite**, official or otherwise, and §9's gates
 are internal by construction — the fuzzer asserts *this* parser never

@@ -88,6 +88,19 @@ pub const Counters = struct {
     /// path, where a read cannot deliver more than the buffer holds.
     l7_body_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
+    /// A request whose target arrived in absolute-form (RFC 9112 §3.2.2,
+    /// #233), counted where the parser's split is read. Neither a reject
+    /// nor an outcome: the request goes on to be routed, filtered or
+    /// refused exactly like an origin-form one, and this records only
+    /// that the client named its own authority in the request line.
+    ///
+    /// It earns a counter because it is the single signal that something
+    /// is addressing this listener as though it were a forward proxy —
+    /// a JVM client with `http.proxyHost` set, a synthetic-check agent,
+    /// an old cache. The form is one a server MUST accept, so this is
+    /// not an error; a *rate* of it is still nearly always a client
+    /// misconfiguration worth finding.
+    l7_absolute_form: Value = Value.init(0),
     /// No route matched the request's canonical path (§7), answered 404.
     /// A valid head, so the connection keeps serving when its stream is
     /// still on a message boundary — see `l7_shed_*` below.

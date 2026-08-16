@@ -215,12 +215,24 @@ pub const RequestHead = struct {
     /// The method's raw token bytes ("GET", "PROPFIND", ...) — what the
     /// renderer writes into the upstream request line, whatever the tag.
     method_token: []const u8,
+    /// The request-target in the form §7 routes and forwards. Absolute-form
+    /// is split at the trust boundary (RFC 9112 §3.2.2), so this is its
+    /// origin-form remainder — "/" when the target named no path, and a
+    /// bare "?query" when it named only a query. Asterisk-form and
+    /// CONNECT's authority-form keep their own spelling; every other
+    /// admitted target begins with '/'.
     target: []const u8,
     version: Version,
     headers: []const Header,
     /// Non-null whenever `version == .http_1_1` (exactly-one-Host is
     /// enforced); HTTP/1.0 may omit it.
     host: ?[]const u8,
+    /// The authority an absolute-form request line carried, verbatim and
+    /// including any port — null for every other form. It *overrides*
+    /// `host`: RFC 9112 §3.2.2 has the recipient ignore the Host header
+    /// field and use this instead, which `routingAuthority` states once
+    /// for every consumer.
+    authority: ?[]const u8,
     framing: BodyFraming,
     /// Whether the downstream connection may serve another request after
     /// this exchange, per version defaults and Connection tokens.
@@ -229,6 +241,22 @@ pub const RequestHead = struct {
     /// from the analysis pass so rendering need not re-split the value.
     connection_nominates_header: bool,
     head_len: u32,
+
+    /// The authority this request names, which is what §7 routes on and
+    /// what the forwarded request must carry as its `Host` — the
+    /// absolute-form's when the request line carried one, the Host
+    /// header's otherwise (RFC 9112 §3.2.2: a recipient MUST ignore the
+    /// received Host when the target is absolute-form). Null only when
+    /// an HTTP/1.0 request named neither, which routes to any-host
+    /// routes alone.
+    ///
+    /// One function rather than an `orelse` at each of the three call
+    /// sites: the router, the filter view and the renderer must agree
+    /// about which name this request gave, or the origin can be sent to
+    /// a vhost the policy never saw.
+    pub fn routingAuthority(request: *const RequestHead) ?[]const u8 {
+        return request.authority orelse request.host;
+    }
 };
 
 /// A fully parsed and validated response head. Same slice lifetime rules
@@ -324,7 +352,7 @@ pub fn parseRequestHead(
     const method_token = raw.method_token.?; // Same contract as the target.
     assert(method_token.len >= 1);
     const method = methodFromRaw(raw.method);
-    try validateTarget(target, method);
+    const split = try validateTarget(target, method);
     const version = versionFromRaw(raw.version);
 
     const analysis = try analyzeHeaders(raw_headers[0..raw.header_count], headers_storage);
@@ -341,10 +369,11 @@ pub fn parseRequestHead(
     return .{
         .method = method,
         .method_token = method_token,
-        .target = target,
+        .target = split.target,
         .version = version,
         .headers = headers_storage[0..raw.header_count],
         .host = analysis.host,
+        .authority = split.authority,
         .framing = framing,
         .keep_alive = keepAliveDefault(version, &analysis),
         .connection_nominates_header = analysis.connection_nominates_header,
@@ -944,6 +973,10 @@ pub const CanonicalTarget = struct {
 /// and so is a path that climbs above the root. Routing matches this
 /// form and the renderer forwards it, so the router and the origin can
 /// never disagree about which resource a request names.
+///
+/// The input is origin-form, or the query-only remainder an
+/// absolute-form target leaves when it names no path (#233) — whose
+/// empty path is the root, so the canonical form still begins with '/'.
 pub fn canonicalTarget(
     target: []const u8,
     /// Caller-owned decode target, at least `target.len` wide — a slice
@@ -955,11 +988,19 @@ pub fn canonicalTarget(
     // validateTarget admitted only origin-form here; asterisk-form and
     // CONNECT never route by path and stay with the caller.
     assert(target.len >= 1);
-    assert(target[0] == '/');
+    assert(target[0] == '/' or target[0] == '?');
     assert(target.len <= out.len);
     const question = std.mem.indexOfScalar(u8, target, '?');
     const raw_path = target[0 .. question orelse target.len];
     const query = target[question orelse target.len ..];
+    if (raw_path.len == 0) {
+        // The one target that reaches here without a path: an
+        // absolute-form "http://host?q", whose empty path-abempty names
+        // the root (RFC 3986 §3.3). Nothing to decode or collapse.
+        assert(target[0] == '?');
+        out[0] = '/';
+        return .{ .path = out[0..1], .query = query };
+    }
     const decoded_len = try decodeTargetPath(raw_path, out);
     const path_len = try collapseDotSegments(out[0..decoded_len]);
     // Canonicalization only ever shrinks; both stages keep the leading
@@ -1134,26 +1175,110 @@ pub fn canonicalHost(host: []const u8, out: *[constants.host_bytes_max]u8) ?[]co
     return out[0..authority_end];
 }
 
+/// What one request-target resolved to: the form §7 routes, plus the
+/// authority an absolute-form one carried.
+const TargetSplit = struct {
+    target: []const u8,
+    authority: ?[]const u8 = null,
+};
+
 /// A reverse proxy routes origin-form targets (§7 routes host/path);
 /// asterisk-form is legal for OPTIONS. CONNECT's authority-form passes
 /// through so the proxy can answer it with 501 rather than 400.
-fn validateTarget(target: []const u8, method: Method) error{Malformed}!void {
+/// Absolute-form is split into authority and origin-form remainder here,
+/// at the one boundary that sees the raw target, so nothing downstream
+/// has to know the request line had two spellings (#233).
+fn validateTarget(target: []const u8, method: Method) error{Malformed}!TargetSplit {
     if (target.len == 0) {
         return error.Malformed;
     }
     assert(target.len >= 1);
     if (method == .connect) {
-        return;
+        return .{ .target = target };
     }
     if (target[0] == '/') {
-        return;
+        return .{ .target = target };
     }
     if (method == .options) {
         if (std.mem.eql(u8, target, "*")) {
-            return;
+            return .{ .target = target };
         }
     }
-    return error.Malformed;
+    return splitAbsoluteForm(target);
+}
+
+/// The absolute-form split (RFC 9112 §3.2.2, which makes accepting the
+/// form a MUST for servers): `scheme "://" authority path-abempty
+/// [ "?" query ]`. Only http and https are admitted — §7 speaks those
+/// two and a target naming any other scheme is a request this proxy
+/// cannot honor, so it is refused at the boundary rather than routed by
+/// its path alone.
+///
+/// The authority is returned verbatim, port included, because it becomes
+/// the forwarded `Host` value; the routing key is folded from it later
+/// by `canonicalHost`, exactly as a Host header's would be.
+fn splitAbsoluteForm(target: []const u8) error{Malformed}!TargetSplit {
+    assert(target.len >= 1);
+    assert(target[0] != '/');
+    const mark = std.mem.indexOf(u8, target, "://") orelse return error.Malformed;
+    const scheme = target[0..mark];
+    // RFC 3986 §3.1: scheme comparison is case-insensitive.
+    const known = std.ascii.eqlIgnoreCase(scheme, "http") or
+        std.ascii.eqlIgnoreCase(scheme, "https");
+    if (!known) {
+        return error.Malformed;
+    }
+    const rest = target[mark + 3 ..];
+    const authority_end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
+    const authority = rest[0..authority_end];
+    if (authority.len == 0) {
+        return error.Malformed; // A scheme naming no host routes nowhere.
+    }
+    if (!authorityIsWellFormed(authority)) {
+        return error.Malformed;
+    }
+    const remainder = rest[authority_end..];
+    return .{
+        // "http://host" names the root, and the origin-form request line
+        // this proxy forwards must say so (RFC 9112 §3.2.1). A remainder
+        // that is only a query keeps its leading '?' — it cannot be given
+        // a '/' without a buffer to build one in, so `canonicalTarget`
+        // reads the empty path as the root instead.
+        .target = if (remainder.len == 0) "/" else remainder,
+        .authority = authority,
+    };
+}
+
+/// Whether an absolute-form authority is one this proxy will both route
+/// on and write back out as a `Host` line: a positive charset — RFC 3986
+/// reg-name, IP-literal brackets, percent-escapes and the port colon.
+///
+/// Positive rather than a list of rejects because these bytes are
+/// *emitted*, not just matched: hparse's target charset already excludes
+/// CR, LF and controls, and this closes the rest of the gap. It also
+/// settles two cases by construction — a userinfo prefix ("user@host",
+/// which RFC 9110 §4.2.1 forbids a sender from generating) and a
+/// fragment, neither of which belongs in a request-target.
+///
+/// A charset, deliberately, and not the RFC 3986 host grammar: `a:b:c%zz`
+/// passes here despite being no host at all. That is the same latitude
+/// `canonicalHost` already takes with a `Host` header — an authority is a
+/// routing *key*, and a key that spells nothing matches no configured
+/// host, so it reaches the any-host routes and no further. What the
+/// charset is for is the byte-level guarantee the grammar would not add:
+/// these bytes are written into a header line.
+fn authorityIsWellFormed(authority: []const u8) bool {
+    assert(authority.len >= 1);
+    for (authority) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) {
+            continue;
+        }
+        switch (byte) {
+            '-', '.', '_', '~', '%', ':', '[', ']' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 /// 1*DIGIT (RFC 9112 §6.2): digits only — no sign, no whitespace, no
@@ -1434,24 +1559,101 @@ test "http parser: extension methods parse with their raw token" {
     );
 }
 
-test "http parser: request targets must be origin-form (or OPTIONS *)" {
-    // Absolute-form belongs to forward proxies.
-    try expectRequestError(
-        error.Malformed,
-        "GET http://other/ HTTP/1.1\r\nHost: a\r\n\r\n",
-        false,
-    );
+test "http parser: request targets are origin-form, OPTIONS *, or absolute-form" {
     try expectRequestError(error.Malformed, "GET * HTTP/1.1\r\nHost: a\r\n\r\n", false);
     var storage: HeaderStorage = undefined;
     const options = try parseRequestHead("OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n", false, &storage);
     try testing.expectEqualStrings("*", options.target);
-    // CONNECT's authority-form parses so the proxy can answer 501 itself.
+    try testing.expectEqual(@as(?[]const u8, null), options.authority);
+    // CONNECT's authority-form parses so the proxy can answer 501 itself,
+    // and is not an absolute-form authority: it names a tunnel endpoint,
+    // not the resource's origin.
     const connect = try parseRequestHead(
         "CONNECT origin:443 HTTP/1.1\r\nHost: origin\r\n\r\n",
         false,
         &storage,
     );
     try testing.expectEqual(Method.connect, connect.method);
+    try testing.expectEqual(@as(?[]const u8, null), connect.authority);
+}
+
+test "http parser: absolute-form splits into authority and origin-form" {
+    const Case = struct {
+        line: []const u8,
+        /// null means Malformed — the whole head is rejected.
+        authority: ?[]const u8,
+        target: []const u8 = "",
+    };
+    const cases = [_]Case{
+        // The form RFC 9112 §3.2.2 makes a MUST, with and without a path.
+        .{ .line = "GET http://api.example/v2/x", .authority = "api.example", .target = "/v2/x" },
+        .{ .line = "GET https://api.example/v2/x", .authority = "api.example", .target = "/v2/x" },
+        .{ .line = "GET http://api.example/", .authority = "api.example", .target = "/" },
+        // An empty path names the root; the forwarded request line must
+        // say "/" rather than nothing at all.
+        .{ .line = "GET http://api.example", .authority = "api.example", .target = "/" },
+        // A query with no path keeps its '?' — canonicalTarget reads the
+        // empty path as the root, which is where the '/' appears.
+        .{ .line = "GET http://api.example?q=1", .authority = "api.example", .target = "?q=1" },
+        .{ .line = "GET http://api.example/a?q=1", .authority = "api.example", .target = "/a?q=1" },
+        // A port travels with the authority: it is the Host value to be.
+        .{ .line = "GET http://api.example:8080/x", .authority = "api.example:8080", .target = "/x" },
+        // Case is the scheme's own business (RFC 3986 §3.1); the
+        // authority's case is folded later, by the same `canonicalHost`
+        // a Host header goes through.
+        .{ .line = "GET HTTP://API.Example/x", .authority = "API.Example", .target = "/x" },
+        // An IPv6 literal wears brackets and colons.
+        .{ .line = "GET http://[2001:db8::1]:80/x", .authority = "[2001:db8::1]:80", .target = "/x" },
+        // Rejects. A scheme §7 does not speak, whatever its path says.
+        .{ .line = "GET ftp://files.example/x", .authority = null },
+        .{ .line = "GET gopher://files.example/x", .authority = null },
+        // A scheme with no authority routes nowhere.
+        .{ .line = "GET http:///x", .authority = null },
+        .{ .line = "GET http://", .authority = null },
+        // Userinfo (RFC 9110 §4.2.1 forbids generating it) and a fragment
+        // (no request-target carries one) both fall out of the charset.
+        .{ .line = "GET http://user@api.example/x", .authority = null },
+        .{ .line = "GET http://api.example#frag", .authority = null },
+        // Not absolute-form at all, and not any other admitted form.
+        .{ .line = "GET api.example/x", .authority = null },
+        .{ .line = "GET //api.example/x", .authority = null, .target = "//api.example/x" },
+    };
+    for (cases) |case| {
+        var storage: HeaderStorage = undefined;
+        var buffer: [256]u8 = undefined;
+        const head = try std.fmt.bufPrint(
+            &buffer,
+            "{s} HTTP/1.1\r\nHost: sent-by-the-client\r\n\r\n",
+            .{case.line},
+        );
+        const parsed = parseRequestHead(head, false, &storage) catch |err| {
+            try testing.expectEqual(@as(?[]const u8, null), case.authority);
+            try testing.expectEqual(HeadError.Malformed, err);
+            continue;
+        };
+        // "//api.example/x" is origin-form with an empty first segment:
+        // admitted, no authority, and it routes by path like any other.
+        if (case.authority) |authority| {
+            try testing.expectEqualStrings(authority, parsed.authority.?);
+            try testing.expectEqualStrings(authority, parsed.routingAuthority().?);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), parsed.authority);
+            try testing.expectEqualStrings("sent-by-the-client", parsed.routingAuthority().?);
+        }
+        try testing.expectEqualStrings(case.target, parsed.target);
+    }
+}
+
+test "http parser: an absolute-form request still needs its Host on HTTP/1.1" {
+    // The authority overrides the Host for routing, but RFC 9112 §3.2's
+    // "a client MUST send a Host in every HTTP/1.1 request" is a separate
+    // rule and this proxy still holds the client to it.
+    try expectRequestError(error.Malformed, "GET http://api.example/x HTTP/1.1\r\n\r\n", false);
+    var storage: HeaderStorage = undefined;
+    // HTTP/1.0 may omit it, and then the authority is the only name given.
+    const parsed = try parseRequestHead("GET http://api.example/x HTTP/1.0\r\n\r\n", false, &storage);
+    try testing.expectEqual(@as(?[]const u8, null), parsed.host);
+    try testing.expectEqualStrings("api.example", parsed.routingAuthority().?);
 }
 
 test "http parser: partial heads are Incomplete until the buffer fills" {
@@ -1804,6 +2006,10 @@ test "canonicalTarget: table of canonical forms and rejects" {
         .{ .target = "/a?", .path = "/a", .query = "?" },
         .{ .target = "/?a", .path = "/", .query = "?a" },
         .{ .target = "/a?%2F%zz/../", .path = "/a", .query = "?%2F%zz/../" },
+        // The query-only remainder an absolute-form target leaves behind
+        // (#233): an empty path names the root.
+        .{ .target = "?q=1", .path = "/", .query = "?q=1" },
+        .{ .target = "?", .path = "/", .query = "?" },
         // Unreserved escapes decode; others keep uppercased hex.
         .{ .target = "/%61%2D%5F%7E", .path = "/a-_~" },
         .{ .target = "/caf%c3%a9", .path = "/caf%C3%A9" },

@@ -128,12 +128,24 @@ pub fn renderRequestHead(
         .http_1_0 => " HTTP/1.0\r\n",
         .http_1_1 => " HTTP/1.1\r\n",
     });
+    // An absolute-form request line named its own authority, and that
+    // authority is what routed (#233). RFC 9112 §3.2.2 has a recipient
+    // ignore the Host header field and use it instead — so this proxy
+    // writes the Host the origin will see, rather than forwarding a
+    // header the router already overruled. Written here, ahead of the
+    // source headers, because that is where a client would have put it;
+    // the inbound copies are suppressed as the headers are walked.
+    if (request.authority) |authority| {
+        assert(authority.len >= 1);
+        try staging.appendHeaderLine("Host", authority);
+    }
     try appendEndToEndHeaders(
         &staging,
         request.headers,
         request.connection_nominates_header,
         edits,
         forwarded_for != null,
+        request.authority != null,
         keep_upgrade,
     );
     if (forwarded_for) |value| {
@@ -199,6 +211,9 @@ pub fn renderResponseHead(
         response.headers,
         response.connection_nominates_header,
         edits,
+        false,
+        // Both suppressions are request-side: a response carries neither
+        // an X-Forwarded-For this proxy wrote nor a Host at all.
         false,
         keep_upgrade,
     );
@@ -334,6 +349,13 @@ fn appendEndToEndHeaders(
     /// because the caller already folded it into the line it will write.
     /// Either way the header must appear exactly once downstream.
     suppress_forwarded_for: bool,
+    /// True when the request render has already written its own `Host`
+    /// line from an absolute-form authority (#233), so the client's
+    /// inbound copy must not be forwarded beside it. RFC 9112 §3.2.2 has
+    /// the received Host ignored in favour of the target's authority, and
+    /// a forwarded request carrying both would hand the origin the very
+    /// disagreement that rule exists to settle.
+    suppress_host: bool,
     /// True when this hop is *participating* in a protocol upgrade
     /// (#180), which is the one case where `Upgrade` must travel.
     ///
@@ -385,6 +407,9 @@ fn appendEndToEndHeaders(
             if (!participating) continue;
         }
         if (suppress_forwarded_for and header.tag == .x_forwarded_for) {
+            continue;
+        }
+        if (suppress_host and header.tag == .host) {
             continue;
         }
         if (has_suppressing_edit and suppressedByEdit(header.name, edits)) {
@@ -521,6 +546,35 @@ test "render: request strips hop-by-hop and nominated, keeps the rest" {
         "GET /p HTTP/1.1\r\nHost: a\r\nX-Keep: yes\r\nConnection: close\r\n\r\n",
         closed,
     );
+}
+
+test "render: an absolute-form authority replaces the client's Host" {
+    // RFC 9112 §3.2.2: the received Host is ignored and the target's
+    // authority used instead — so exactly one Host reaches the origin,
+    // and it is the one that routed (#233).
+    const head = "GET http://api.example:8080/v2/x HTTP/1.1\r\n" ++
+        "Host: stale.example\r\nX-Keep: yes\r\n\r\n";
+    var storage: parser.HeaderStorage = undefined;
+    const request = try parser.parseRequestHead(head, false, &storage);
+    var buffer: [oracle_buffer_bytes]u8 = undefined;
+    const rendered = try renderRequestHead(
+        &request,
+        .{ .path = "/v2/x", .query = "" },
+        &.{},
+        false,
+        null,
+        false,
+        &buffer,
+    );
+    try testing.expectEqualStrings(
+        "GET /v2/x HTTP/1.1\r\nHost: api.example:8080\r\nX-Keep: yes\r\n\r\n",
+        rendered,
+    );
+    // The request line is origin-form downstream, whatever form arrived.
+    var reparse_storage: parser.HeaderStorage = undefined;
+    const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage);
+    try testing.expectEqual(@as(?[]const u8, null), reparsed.authority);
+    try testing.expectEqualStrings("api.example:8080", reparsed.host.?);
 }
 
 test "render: filter edits set, add, and remove headers" {
@@ -762,20 +816,37 @@ test "render: a head that no longer fits is Oversize" {
 // turn into a head the parser accepts again, with routing and framing
 // intact and hop-by-hop headers gone.
 
+/// The `targetViews` gate (§7), mirrored once for all three oracles
+/// below: an origin-form target that will not canonicalize is a 400 and
+/// never reaches the renderer (null here), while OPTIONS asterisk-form
+/// has no path and forwards verbatim.
+///
+/// The discriminator is the *authority*, not the target's first byte,
+/// for the same reason `targetViews` uses it (#233): an absolute-form
+/// target that named only a query leaves a remainder beginning with '?',
+/// which is origin-form's business to canonicalize and asterisk-form's
+/// to be mistaken for. Kept in one function because three copies of this
+/// gate is how the oracles came to mirror a rule production no longer
+/// had — and an oracle that diverges panics on input the proxy accepts.
+fn oracleTarget(
+    request: *const parser.RequestHead,
+    scratch: []u8,
+) ?parser.CanonicalTarget {
+    assert(request.target.len >= 1);
+    if (request.authority == null and request.target[0] != '/') {
+        return .{ .path = request.target, .query = "" };
+    }
+    return parser.canonicalTarget(request.target, scratch) catch null;
+}
+
 fn checkRequestRender(input: []const u8) void {
     var storage: parser.HeaderStorage = undefined;
     const request = parser.parseRequestHead(input, false, &storage) catch return;
     if (request.method == .connect) {
         return; // Never rendered: the proxy answers CONNECT itself.
     }
-    // Mirror the routeRequest gate (§7): an origin-form target that will
-    // not canonicalize is a 400 and never reaches the renderer; OPTIONS
-    // asterisk-form has no path and forwards verbatim.
     var scratch: [constants.head_buffer_bytes_default]u8 = undefined;
-    const target: parser.CanonicalTarget = if (request.target[0] == '/')
-        (parser.canonicalTarget(request.target, &scratch) catch return)
-    else
-        .{ .path = request.target, .query = "" };
+    const target = oracleTarget(&request, &scratch) orelse return;
 
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = renderRequestHead(&request, target, &.{}, false, null, false, &buffer) catch unreachable;
@@ -801,8 +872,14 @@ fn checkRequestRender(input: []const u8) void {
     assert(std.mem.eql(u8, reparsed.target[target.path.len..], target.query));
     assert(reparsed.version == request.version);
     assert(std.meta.eql(reparsed.framing, request.framing));
-    if (request.host) |host| {
-        assert(std.mem.eql(u8, reparsed.host.?, host));
+    // The Host the origin reads is the name the request *routed* on, and
+    // exactly one of them reaches it: the absolute-form authority where
+    // the request line carried one, the client's own header otherwise
+    // (#233). Stated as `routingAuthority` rather than as `request.host`,
+    // which is what this asserted before absolute-form existed — an
+    // oracle demanding the overruled name would forbid the override.
+    if (request.routingAuthority()) |expected| {
+        assert(std.mem.eql(u8, reparsed.host.?, expected));
     }
     for (reparsed.headers) |header| {
         for (hop_by_hop_names) |hop_name| {
@@ -822,10 +899,7 @@ fn checkRequestRenderEdited(input: []const u8) void {
         return;
     }
     var scratch: [constants.head_buffer_bytes_default]u8 = undefined;
-    const target: parser.CanonicalTarget = if (request.target[0] == '/')
-        (parser.canonicalTarget(request.target, &scratch) catch return)
-    else
-        .{ .path = request.target, .query = "" };
+    const target = oracleTarget(&request, &scratch) orelse return;
 
     // Names the fuzzed input cannot collide with a proxy-managed header on;
     // config forbids editing those, so the renderer never sees them.
@@ -881,8 +955,36 @@ test "fuzz: parse-render-reparse keeps routing and framing intact" {
             "POST /submit HTTP/1.1\r\nHost: origin\r\nContent-Length: 5\r\n\r\nhello",
             "GET /p HTTP/1.1\r\nHost: a\r\nConnection: close, X-N\r\nX-N: v\r\nTE: t\r\n\r\n",
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+            // Absolute-form, and the one shape of it whose remainder is
+            // not origin-form (#233): the oracles' gate must read the
+            // authority rather than the first byte, or this renders a
+            // request line the reparse cannot accept.
+            "GET http://a?q HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET http://a HTTP/1.1\r\nHost: elsewhere\r\nX-Forwarded-For: 1.1.1.1\r\n\r\n",
         },
     });
+}
+
+test "render: the fuzz oracles hold for every target form the parser admits" {
+    // The oracles mirror `targetViews`, and a mirror is only worth
+    // something while it still matches. When these three drifted from it
+    // (#233), an absolute-form target whose remainder is query-only took
+    // the asterisk-form branch, rendered `GET ?q HTTP/1.1`, and panicked
+    // the oracle's own reparse — on input the proxy itself handles fine.
+    // Reached from here rather than from the corpus, because the corpus
+    // feeds the Smith's entropy rather than arriving as an input verbatim.
+    const inputs = [_][]const u8{
+        "GET http://a?q HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET http://a HTTP/1.1\r\nHost: elsewhere\r\n\r\n",
+        "GET http://a/p?q HTTP/1.1\r\nHost: a\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /p?q HTTP/1.1\r\nHost: a\r\n\r\n",
+    };
+    for (inputs) |input| {
+        checkRequestRender(input);
+        checkRequestRenderEdited(input);
+        checkRequestRenderForwarded(input);
+    }
 }
 
 fn fuzzRenderInputs(context: void, smith: *std.testing.Smith) !void {
@@ -914,10 +1016,7 @@ fn checkRequestRenderForwarded(input: []const u8) void {
         return;
     }
     var scratch: [constants.head_buffer_bytes_default]u8 = undefined;
-    const target: parser.CanonicalTarget = if (request.target[0] == '/')
-        (parser.canonicalTarget(request.target, &scratch) catch return)
-    else
-        .{ .path = request.target, .query = "" };
+    const target = oracleTarget(&request, &scratch) orelse return;
 
     // A fixed value stands in for the caller's assembled one: what varies
     // here is the *input head*, and the value's own assembly is bounded
