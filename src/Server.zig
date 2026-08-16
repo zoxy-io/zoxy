@@ -187,6 +187,20 @@ pub fn Server(comptime IoType: type) type {
         /// to rewrite at any moment.
         date_line: [shed.date_bytes]u8,
         date_second: u64,
+        /// The `nowNs` tick this pair was last refreshed on, which is what
+        /// keeps the wall clock *off* the per-response path (§9).
+        ///
+        /// `nowWallNs` is deliberately precise and deliberately uncached —
+        /// it exists for access-log durations, where a coarse granule
+        /// would report 0 µs and a per-tick cache would give every request
+        /// in one batch the same start. Neither property is worth paying
+        /// for here: a `Date` is a *second*, and a shed storm answers a
+        /// whole completion batch from this one line. So the wall clock is
+        /// read at most once per tick — §4 guarantees `nowNs` returns one
+        /// value for the whole of a tick — rather than once per response,
+        /// and what a batch of responses shares is a date that is at worst
+        /// one tick old.
+        date_tick_ns: u64,
         /// How many static responses are on the wire right now (#234):
         /// armed and not yet fully written, counting the whole span
         /// because a partial write re-arms on the same shared bytes.
@@ -437,13 +451,17 @@ pub fn Server(comptime IoType: type) type {
             server.io = io;
             server.config = config;
             // The static answers, and the clock they will be stamped from
-            // (#234). Both start at the epoch rather than at `nowWallNs`:
-            // the second and the line then agree by construction, so the
-            // first stamp of any real second re-renders instead of
-            // trusting whatever the field happened to hold.
+            // (#234). Seeded from the real clock here rather than left at
+            // the epoch, because `currentDate` now re-reads the wall clock
+            // only when the `nowNs` tick advances: a table stamped by
+            // `initDateSlots` before the first advance must already hold a
+            // real date, not 1970. The three fields are written together
+            // so the line, the second it renders and the tick it was taken
+            // on cannot disagree.
             server.static_responses.init();
-            server.date_second = 0;
-            shed.formatHttpDate(0, &server.date_line);
+            server.date_tick_ns = server.io.nowNs();
+            server.date_second = server.nowUnix();
+            shed.formatHttpDate(server.date_second, &server.date_line);
             server.static_sends_inflight = 0;
             server.initDateSlots();
             try server.conns.init(arena, options.conn_slots);
@@ -727,20 +745,39 @@ pub fn Server(comptime IoType: type) type {
             return @divFloor(server.io.nowWallNs(), std.time.ns_per_s);
         }
 
-        /// The current second as a `Date` value, re-rendered only when
-        /// the second has turned over (#234). Safe to call at any moment:
-        /// nothing sends these bytes, they are only ever copied into a
-        /// response's own slot.
+        /// The current second as a `Date` value (#234). Safe to call at
+        /// any moment: nothing sends these bytes, they are only ever
+        /// copied into a response's own slot.
+        ///
+        /// Two nested caches, and the outer one is the point. The inner
+        /// skips the calendar arithmetic while the second has not turned
+        /// over; the outer skips the *clock read itself* while the tick
+        /// has not. Without it a shed storm — the load this path exists
+        /// for (§8) — would pay one precise `CLOCK_REALTIME` read per
+        /// response, on the path that is otherwise one send from memory
+        /// that is neither assembled nor copied. `nowNs` is the coarse,
+        /// tick-cached clock §4 already refreshes once per tick, so the
+        /// gate costs a load and a compare and a whole completion batch
+        /// reads the wall clock once between them.
         pub fn currentDate(server: *Self) *const [shed.date_bytes]u8 {
-            const second = server.nowUnix();
-            if (second != server.date_second) {
-                shed.formatHttpDate(second, &server.date_line);
-                server.date_second = second;
+            const tick_ns = server.io.nowNs();
+            if (tick_ns != server.date_tick_ns) {
+                server.date_tick_ns = tick_ns;
+                const second = server.nowUnix();
+                if (second != server.date_second) {
+                    shed.formatHttpDate(second, &server.date_line);
+                    server.date_second = second;
+                }
             }
-            // The pair is the whole cache: a line rendered from one second
-            // and a field claiming another would hand every later response
-            // a date nothing ever measured.
-            assert(server.date_second == second);
+            // Both caches, stated as the cheap invariants they are — this
+            // runs per response in a ReleaseSafe binary, so an assertion
+            // that re-rendered the line to compare it would cost more than
+            // the clock read this function exists to avoid.
+            assert(server.date_tick_ns == tick_ns);
+            // Seeded from a real clock at `init` and only ever moved
+            // forward by one, so a zero here means a slot is about to be
+            // stamped from a second nothing measured.
+            assert(server.date_second >= 1);
             return &server.date_line;
         }
 
