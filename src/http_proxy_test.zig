@@ -5440,6 +5440,78 @@ test "l7: a partial head is reaped at the head budget, not the idle window" {
     try bed.expectDrained();
 }
 
+test "l7: under pressure the head budget cannot outlive the shrunk idle window" {
+    // The head budget is a flat config value; the idle window divides by
+    // `pressure_idle_divisor` under downstream pressure (§8). The loader
+    // only ever relates the two as *written*, so a budget legal at rest
+    // can be the wider of the pair once pressure engages — and narrowing
+    // to it would then hand a slowloris a longer window in exactly the
+    // load condition the bias exists for. It is a min, not an assignment.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 312,
+        // Legal at rest: 400 <= the bed's 1000 ms idle window. Under
+        // pressure that window becomes 250 ms, and 400 would widen it.
+        .head_timeout_ms = 400,
+    });
+    defer bed.tearDown();
+
+    bed.server.relay_pressure = true;
+    try std.testing.expectEqual(@as(u32, 1000 / 4), bed.server.idleTimeoutMs());
+
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("GET /slow HTTP/1.1\r\nHost: o\r\n");
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+    // The pressured window, not the budget. Anything at or past 400 means
+    // the first byte widened a deadline it was installed to tighten.
+    try std.testing.expect(elapsed_ms >= 250);
+    try std.testing.expect(elapsed_ms < 400);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try bed.expectDrained();
+}
+
+test "l7: a terminated listener's partial head meets the head budget too" {
+    // The budget used to be installed in `onHeadGroupRecv`, which is the
+    // plaintext arm alone — a terminated connection reads ciphertext
+    // through `armTlsHeadRecv` and reached the parse by another road. So
+    // #235 protected exactly the listeners least likely to be facing the
+    // internet, and an HTTPS slowloris kept the whole idle window.
+    // Installing at the parse rather than at the read covers both arms
+    // because both arrive there.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 313,
+        .tls = true,
+        .head_timeout_ms = 100,
+    });
+    defer bed.tearDown();
+
+    // A head that never finishes, inside a real TLS session.
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET /slow HTTP/1.1\r\nHost: o\r\n",
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    const start_ns = bed.sim_io.nowNs();
+    try bed.sim_io.run();
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("tls_handshakes_completed"),
+    );
+    // The head budget, not the 1000 ms idle window. The handshake spends
+    // sim time before the first head byte, so the floor is the budget and
+    // the ceiling is well short of the window it must not have inherited.
+    try std.testing.expect(elapsed_ms >= 100);
+    try std.testing.expect(elapsed_ms < 500);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try bed.expectDrained();
+}
+
 test "l7: an idle kept connection still gets the whole idle window" {
     // The other half of the split, and the reason it is a split rather
     // than a tightening: between requests a connection is quiet and
