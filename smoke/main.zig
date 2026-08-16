@@ -1180,12 +1180,14 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // page rather than the empty static it would have been.
     const not_found = try single_client.get(unrouted_host, "/", .keep_alive, null);
     var passed = expectBodyResponse(not_found, 404, not_found_body.len, "error page");
+    if (!expectProxyDate(not_found, "error page")) passed = false;
 
     // The respond action, off the file arm: the body zoxy read at
     // startup, byte count and all, on a request that never reached an
     // origin.
     const robots = try single_client.get(host, "/robots.txt", .close, null);
     if (!expectBodyResponse(robots, 200, robots_body.len, "respond")) passed = false;
+    if (!expectProxyDate(robots, "respond")) passed = false;
 
     const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
     const responded = counterOf(&scrape, "l7_responded") orelse return false;
@@ -1210,6 +1212,88 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         passed = false;
     }
     return passed;
+}
+
+/// The #234 stamp on a response zoxy answered itself, against this
+/// gate's own clock.
+///
+/// The simulator proves the slot is patched and well-formed, but its
+/// clock is the same one the proxy reads, so it cannot prove the value
+/// *means* anything. Here the two are genuinely separate — a real
+/// `nowWallNs` on the far side of a socket — so agreement to the minute
+/// is a real check: it catches a date stamped from the wrong clock, a
+/// slot left at a stale second, and the epoch a never-stamped one would
+/// carry.
+fn expectProxyDate(response: client_module.Response, role: []const u8) bool {
+    assert(role.len >= 1);
+    if (!response.from_proxy) {
+        std.debug.print("FAIL: the {s} response named no Server\n", .{role});
+        return false;
+    }
+    const date = response.date orelse {
+        std.debug.print("FAIL: the {s} response carried no Date\n", .{role});
+        return false;
+    };
+    var wall: std.posix.timespec = undefined;
+    // Through `posix.system` so the return convention matches the
+    // `posix.errno` that reads it — the #184 lesson, which cost a macOS
+    // live-gate panic the one time the two were mixed.
+    const rc = std.posix.system.clock_gettime(std.posix.CLOCK.REALTIME, &wall);
+    if (std.posix.errno(rc) != .SUCCESS) {
+        std.debug.print("FAIL: this gate could not read its own clock\n", .{});
+        return false;
+    }
+    assert(wall.sec >= 0);
+    const now: u64 = @intCast(wall.sec);
+    // A minute either side. The two clocks are the same system clock, so
+    // this bounds the seconds between the stamp and this comparison, not
+    // any drift — and the loop is bounded by that window, not by a match.
+    var offset: u64 = 0;
+    while (offset <= 120) : (offset += 1) {
+        var buffer: [64]u8 = undefined;
+        const rendered = imfFixdate((now -| 60) + offset, &buffer) orelse {
+            std.debug.print("FAIL: this gate could not render a date to compare\n", .{});
+            return false;
+        };
+        if (std.mem.eql(u8, rendered, &date)) return true;
+    }
+    std.debug.print(
+        "FAIL: the {s} response is dated {s}, which is not within a minute of now\n",
+        .{ role, date },
+    );
+    return false;
+}
+
+/// This gate's own IMF-fixdate (RFC 9110 §5.6.7), assembled here rather
+/// than imported for the reason every other spelling in this file is:
+/// the gate must read what the binary wrote, and a formatter shared with
+/// it would agree with a wrong weekday, an off-by-one month or a missing
+/// zero-pad as readily as with a right one. Null only if the format
+/// outgrew the buffer, which four-digit years cannot.
+fn imfFixdate(second: u64, buffer: []u8) ?[]const u8 {
+    const weekdays = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const months = [_][]const u8{
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = second };
+    const epoch_day = epoch.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    return std.fmt.bufPrint(
+        buffer,
+        "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT",
+        .{
+            weekdays[(epoch_day.day + 4) % 7],
+            @as(u32, month_day.day_index) + 1,
+            months[month_day.month.numeric() - 1],
+            year_day.year,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    ) catch null;
 }
 
 /// One #159 response: the status the config asked for, and a body of

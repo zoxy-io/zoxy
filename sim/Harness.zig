@@ -916,16 +916,48 @@ fn deriveSticky(harness: *Harness, random: std.Random) zoxy.config.Config.Cluste
 /// The #236 body cap, drawn only under the adversary and for the same
 /// reason `deriveMaxInflight` caps only there: a `413` is a status an L7
 /// script did not ask for, and a clean seed's golden outcomes forbid it.
-/// Drawn in the single-byte range so the rung is reached by ordinary
-/// scheduling rather than a coincidence of sizes: `post_big`'s few
+/// Drawn in two ranges, because the cap has two rungs and a single range
+/// only ever reaches one of them.
+///
+/// The **single-byte** range reaches the *answered* rung: `post_big`'s few
 /// thousand bytes and `post_sized`'s twenty-four are over it on every
-/// draw. `post_chunked`'s eight-byte payload is the one that is not —
-/// roughly half the range leaves it under the cap — which is legal and
-/// which the directed tests cover regardless; the claim here is that the
-/// cap *bites*, not that it bites everything.
+/// draw, and they are over it in the bytes coalesced with the head — so
+/// the request is refused `413` before a byte is pumped.
+/// `post_chunked`'s eight-byte payload is the one that is not — roughly
+/// half the range leaves it under the cap — which is legal and which the
+/// directed tests cover regardless.
+///
+/// The **kilobyte** range reaches the *streaming* rung, which the first
+/// cannot. Cutting a body mid-stream needs three things at once: a body
+/// whose head declares no length (a declared one is refused before a
+/// byte is pumped), a cap the first delivery does not already exceed,
+/// and a total that outgrows it later. `post_chunked_big` is the body,
+/// and this range is the cap — starting just above the widest a single
+/// delivery can be, so the first always passes under it, and staying a
+/// kilobyte wide so it stays far below that script's six thousand.
+/// The widest a single delivery can be: the simulator's default socket
+/// ring, which this harness never widens. A cap at or above it cannot be
+/// exceeded by the bytes that arrive alongside the head, whatever the
+/// schedule chops them into.
+const first_delivery_bytes_max: u64 = 4096;
+
+/// How wide the streaming range is. Named because the two bounds below
+/// are one claim, not two: the cap must land above every byte a first
+/// delivery can carry and below what `post_chunked_big` sends, and a
+/// script whose body stopped clearing that gap would make the streaming
+/// rung silently unreachable rather than fail here.
+const body_cap_stream_span: u64 = 1024;
+comptime {
+    assert(l7.scripts.chunked_big_body_bytes >
+        first_delivery_bytes_max + body_cap_stream_span);
+}
+
 fn deriveMaxBodyBytes(clean: bool, random: std.Random) u64 {
     if (clean) return 0;
     if (random.uintLessThan(u8, 3) != 0) return 0;
+    if (random.boolean()) {
+        return first_delivery_bytes_max + random.uintLessThan(u64, body_cap_stream_span);
+    }
     return 1 + random.uintLessThan(u64, 16);
 }
 
@@ -1161,9 +1193,11 @@ fn deriveClockJump(tls_clients: u8, random: std.Random) bool {
 /// loader's exact byte layout, which `config.zig`'s own tests pin
 /// instead (`bodies render into complete pages`). Same trade, same
 /// reason, as `src/http_proxy_test.zig`'s hand-spelled page.
-const error_page: zoxy.config.Config.StaticPage = renderSimPage(403, l7.canon.error_page_body);
-const respond_page: zoxy.config.Config.StaticPage = renderSimPage(200, l7.canon.respond_body);
-const error_pages = [_]*const zoxy.config.Config.StaticPage{&error_page};
+const ErrorPage = SimPage(403, l7.canon.error_page_body);
+const RespondPage = SimPage(200, l7.canon.respond_body);
+const error_page = &ErrorPage.page;
+const respond_page = &RespondPage.page;
+const error_pages = [_]*const zoxy.config.Config.StaticPage{error_page};
 
 /// The #140 names every seed's config logs, already lowercased the way
 /// the loader would leave them (the simulator builds its `Config` by
@@ -1171,28 +1205,45 @@ const error_pages = [_]*const zoxy.config.Config.StaticPage{&error_page};
 const log_request_headers = [_][]const u8{l7.canon.log_request_header};
 const log_response_headers = [_][]const u8{l7.canon.log_response_header};
 
-fn renderSimPage(comptime status: u16, comptime body: []const u8) zoxy.config.Config.StaticPage {
-    // The loader's own preconditions, restated where the loader is
-    // being stood in for: a status a page may carry, and a body the
-    // client oracle can demand.
-    comptime assert(zoxy.shed.isPageStatus(status));
-    comptime assert(body.len >= 1);
-    const head = std.fmt.comptimePrint(
-        "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\n",
-        .{ status, zoxy.shed.reasonPhrase(status), body.len, l7.canon.page_content_type },
-    );
-    const keep = head ++ "\r\n" ++ body;
-    const close = head ++ "Connection: close\r\n\r\n" ++ body;
-    // `renderStaticPage`'s postcondition: the head is a real prefix, so
-    // the HEAD slice the serve path takes is never the whole response.
-    comptime assert(keep.len > body.len);
-    comptime assert(close.len > keep.len);
-    return .{
-        .status = status,
-        .keep = keep,
-        .close = close,
-        .keep_head_len = keep.len - body.len,
-        .close_head_len = close.len - body.len,
+/// One #159 page as the loader would have rendered it — storage rather
+/// than a constant, because a page now carries a `Date` slot the serving
+/// path stamps in place (#234). A type per page, so each owns its bytes
+/// the way two arena allocations would.
+fn SimPage(comptime status: u16, comptime body: []const u8) type {
+    return struct {
+        // The loader's own preconditions, restated where the loader is
+        // being stood in for: a status a page may carry, and a body the
+        // client oracle can demand.
+        comptime {
+            assert(zoxy.shed.isPageStatus(status));
+            assert(body.len >= 1);
+        }
+        const head = std.fmt.comptimePrint(
+            "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nDate: ",
+            .{ status, zoxy.shed.reasonPhrase(status), body.len, l7.canon.page_content_type },
+        );
+        const keep_template = head ++ zoxy.shed.date_placeholder ++ "\r\n" ++
+            zoxy.shed.server_line ++ "\r\n" ++ body;
+        const close_template = head ++ zoxy.shed.date_placeholder ++ "\r\n" ++
+            zoxy.shed.server_line ++ "Connection: close\r\n\r\n" ++ body;
+        // `renderStaticPage`'s postcondition: the head is a real prefix, so
+        // the HEAD slice the serve path takes is never the whole response.
+        comptime {
+            assert(keep_template.len > body.len);
+            assert(close_template.len > keep_template.len);
+        }
+
+        var keep: [keep_template.len]u8 = keep_template.*;
+        var close: [close_template.len]u8 = close_template.*;
+        var page: zoxy.config.Config.StaticPage = .{
+            .status = status,
+            .keep = &keep,
+            .close = &close,
+            .keep_head_len = keep_template.len - body.len,
+            .close_head_len = close_template.len - body.len,
+            .keep_date = keep[head.len..][0..zoxy.shed.date_bytes],
+            .close_date = close[head.len..][0..zoxy.shed.date_bytes],
+        };
     };
 }
 
@@ -1222,7 +1273,7 @@ fn wireFilters(harness: *Harness) void {
             // origin. The page is pre-rendered like the loader's, so
             // the sweep exercises the static path's body-carrying arm.
             .match = .{ .path_prefix = "/respond" },
-            .actions = &.{.{ .respond = &respond_page }},
+            .actions = &.{.{ .respond = respond_page }},
         },
         .{
             .match = .{ .path_prefix = "/edit" },

@@ -88,6 +88,18 @@ pub const Counters = struct {
     /// path, where a read cannot deliver more than the buffer holds.
     l7_body_too_large: Value = Value.init(0),
     l7_not_implemented: Value = Value.init(0),
+    /// A proxy-generated response that went out carrying a `Date` older
+    /// than the current second (#234), because another static answer was
+    /// already on the wire when this one was armed.
+    ///
+    /// That is the deliberate cost of stamping a shared slot only while
+    /// nothing is reading it: a submitted send holds a pointer the kernel
+    /// may read at any moment, so patching under one could put a *torn*
+    /// date on the wire. Stale is the trade, and this is what makes the
+    /// trade visible rather than merely argued — a rate of these says how
+    /// concurrent this proxy's own answers are, and the §9 census is what
+    /// keeps the branch reachable rather than dead.
+    l7_static_date_stale: Value = Value.init(0),
     /// A request whose target arrived in absolute-form (RFC 9112 §3.2.2,
     /// #233), counted where the parser's split is read. Neither a reject
     /// nor an outcome: the request goes on to be routed, filtered or

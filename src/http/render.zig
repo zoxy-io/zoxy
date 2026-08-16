@@ -14,6 +14,7 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const parser = @import("parser.zig");
 const filter = @import("filter.zig");
+const shed = @import("../shed.zig");
 
 const assert = std.debug.assert;
 
@@ -245,6 +246,14 @@ pub fn renderRedirectHead(
     status: u16,
     location: []const u8,
     inject_close: bool,
+    /// The current second as an IMF-fixdate (#234). Passed in rather than
+    /// read here: this file assembles bytes and owns no clock, which is
+    /// the same split `X-Forwarded-For` is written on.
+    ///
+    /// Unlike the static answers, a redirect is rendered per response
+    /// into the connection's own head buffer, so it shares nothing and
+    /// its date is always the current one — no slot, no claim.
+    date: *const [shed.date_bytes]u8,
     buffer: []u8,
 ) error{Oversize}![]const u8 {
     assert(filter.isRedirectStatus(status));
@@ -257,7 +266,10 @@ pub fn renderRedirectHead(
     try staging.append(redirectReason(status));
     try staging.append("\r\nLocation: ");
     try staging.append(location);
-    try staging.append("\r\nContent-Length: 0\r\n");
+    try staging.append("\r\nContent-Length: 0\r\nDate: ");
+    try staging.append(date);
+    try staging.append("\r\n");
+    try staging.append(shed.server_line);
     if (inject_close) {
         try staging.append("Connection: close\r\n");
     }

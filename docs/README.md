@@ -827,6 +827,12 @@ config, so **changing one needs a restart**.
 `403`, `404`, `414`, `429`, `431`, `501`, `502`, `503`, `504` — and a
 page for anything else is refused at load.
 
+Every response zoxy answers *itself* — those pages, the empty defaults,
+the redirects — carries a `Date` and `Server: zoxy`. Responses that come
+from an origin are forwarded with the origin's own headers and gain
+neither, so `Server: zoxy` on a `503` tells you the proxy raised it and
+the backend was never asked.
+
 Bodies live in memory, and that is the point rather than a shortcut: a
 `503` is raised *because* something ran out, so an error page whose
 delivery needed a resource would fail exactly when it is needed. The
