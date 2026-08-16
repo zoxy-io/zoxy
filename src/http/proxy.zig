@@ -81,6 +81,66 @@ fn bareAddress(
     return text[0..colon];
 }
 
+/// The widest a decremented `Max-Forwards` can render to: the field is
+/// 1*DIGIT and `parseDecimal` refuses past nineteen, so nineteen digits is
+/// the whole range a decrement can land in.
+///
+/// At file scope for the same reason as `RenderScratch` below, which sizes
+/// a field from it: it depends on no backend.
+const max_forwards_digits_max: u32 = 19;
+
+/// The #178 sticky cookie's attributes, and the widest value composed from
+/// them. `Secure` rides along only where zoxy terminates TLS and so knows
+/// the scheme is https; on a plaintext listener something in front may
+/// have terminated it, and a `Secure` cookie the client can only return
+/// over http is one it will never return at all.
+///
+/// At file scope beside the buffer they size (see `max_forwards_digits_max`).
+const sticky_attributes = "; Path=/; HttpOnly";
+const sticky_attributes_secure = sticky_attributes ++ "; Secure";
+const sticky_value_bytes_max = constants.pick_name_bytes_max + 1 +
+    Balancer.endpoint_tag_len + sticky_attributes_secure.len;
+
+/// The serving path's render scratches, held as one aggregate so the
+/// render borrows once rather than six times (`Server.render_scratch`).
+///
+/// Same reasoning as `parser.HeaderStorage`, and the same measurement:
+/// under ReleaseSafe an `= undefined` local is 0xaa-filled on every call,
+/// which §9's flamegraph found is what the render path costs once the
+/// parse path stopped paying it. Every field was a local of some function
+/// on that path, each running once per exchange: most of
+/// `renderRequestAndStartLegs` or `renderResponse`, `route_host` of
+/// `routeRequest`, and `head` of a function private to the render module.
+///
+/// One aggregate, not two, because no render of a request and a render of
+/// a response are ever live together: each is reached from its own
+/// completion callback, and neither suspends. `head` is the render
+/// module's own, threaded through `renderRequestHead`/`renderResponseHead`
+/// because the array it holds is a local of a function private to it.
+///
+/// At file scope: it names no backend, so `Server` can hold one without
+/// instantiating `Proxy`.
+pub const RenderScratch = struct {
+    /// `routeRequest`'s host scratch, kept distinct from `host` below on
+    /// the same grounds as `target_scratch` vs `rewrite_scratch`: the
+    /// routed keys alias this one across the call that writes the other.
+    ///
+    /// Conservative rather than forced. Every present reader of
+    /// `keys.host` — the log capture, which copies; the filter match; the
+    /// route lookup — has finished before `planForward` writes `host`, so
+    /// one field would work today. Two means a render write cannot
+    /// invalidate a routing view at all, which is a property worth holding
+    /// rather than a trace worth re-deriving whenever either side moves.
+    route_host: [constants.host_bytes_max]u8,
+    host: [constants.host_bytes_max]u8,
+    request_edits: [constants.header_edits_max]filter.AppliedHeaderEdit,
+    response_edits: [constants.response_edits_max]filter.AppliedHeaderEdit,
+    forwarded: [constants.forwarded_value_bytes_max]u8,
+    hops: [max_forwards_digits_max]u8,
+    sticky: [sticky_value_bytes_max]u8,
+    head: render.HeadScratch,
+};
+
 pub fn Proxy(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const ConnType = conn_module.Conn(IoType);
@@ -656,11 +716,6 @@ pub fn Proxy(comptime IoType: type) type {
             unreachable;
         }
 
-        /// The widest a decremented `Max-Forwards` can render to: the
-        /// field is 1*DIGIT and `parseDecimal` refuses past nineteen, so
-        /// nineteen digits is the whole range a decrement can land in.
-        const max_forwards_digits_max: u32 = 19;
-
         /// The `Max-Forwards` this hop forwards, or null to leave the
         /// header exactly as it arrived (#240) — which is every request
         /// but an `OPTIONS` that carried a budget.
@@ -923,8 +978,11 @@ pub fn Proxy(comptime IoType: type) type {
             // single-threaded, and the window (through routing into the
             // checkout path's render) neither suspends nor re-enters.
             const scratch = server.target_scratch;
-            var host_scratch: [constants.host_bytes_max]u8 = undefined;
-            const keys = requestKeys(request, scratch, &host_scratch) catch {
+            // Borrowed here rather than in the render it feeds: this frame
+            // holds `keys`, which alias `route_host`, across the call.
+            const render_scratch = server.borrowRenderScratch();
+            defer server.returnRenderScratch();
+            const keys = requestKeys(request, scratch, &render_scratch.route_host) catch {
                 captureTarget(conn, null, request.target);
                 return respond(server, conn, 400, "l7_bad_request");
             };
@@ -954,7 +1012,7 @@ pub fn Proxy(comptime IoType: type) type {
             conn.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, conn, 503, "l7_shed_relay_buffers");
             };
-            beginUpstream(server, conn, request, &keys.views);
+            beginUpstream(server, conn, request, &keys.views, render_scratch);
         }
 
         /// The request-derived half of this exchange's pick (#178): what
@@ -1124,6 +1182,10 @@ pub fn Proxy(comptime IoType: type) type {
             conn: *ConnType,
             request: *const parser.RequestHead,
             views: *const TargetViews,
+            /// The caller's render scratches, carried through to the reuse
+            /// path's render (see `RenderScratch`). The dial path re-parses
+            /// in its own callback and borrows there instead.
+            scratch: *RenderScratch,
         ) void {
             assert(conn.state == .l7_reading_head);
             assert(conn.relay_buffer != null);
@@ -1168,7 +1230,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // the hot one — skips the re-parse the dial path needs,
                 // and hands over the canonical target it already built
                 // rather than having it decoded and collapsed again.
-                renderRequestAndStartLegs(server, conn, request, views);
+                renderRequestAndStartLegs(server, conn, request, views, scratch);
                 return;
             }
             dialUpstream(server, conn, pick, .fresh);
@@ -1454,7 +1516,9 @@ pub fn Proxy(comptime IoType: type) type {
             // Same bytes routeRequest already canonicalized, so this cannot
             // fail — the §7 single-source-of-truth rule again.
             const views = targetViews(&request, server.target_scratch) catch unreachable;
-            renderRequestAndStartLegs(server, conn, &request, &views);
+            const render_scratch = server.borrowRenderScratch();
+            defer server.returnRenderScratch();
+            renderRequestAndStartLegs(server, conn, &request, &views, render_scratch);
         }
 
         /// Render the request head into the upstream slot's staging
@@ -1474,6 +1538,10 @@ pub fn Proxy(comptime IoType: type) type {
             /// (§9). Origin-form aliases the caller's stack scratch, so both
             /// are read out entirely before this returns.
             views: *const TargetViews,
+            /// The caller's render scratches. Borrowed by the caller rather
+            /// than here because `routeRequest` holds keys aliasing
+            /// `route_host` across this call (see `RenderScratch`).
+            scratch: *RenderScratch,
         ) void {
             assert(conn.state == .l7_dialing);
             assert(request.head_len == conn.l7.request_head_len);
@@ -1487,8 +1555,6 @@ pub fn Proxy(comptime IoType: type) type {
             // Apply the listener's filters (empty when none): a rewrite of
             // the forwarded path and any header edits, against the same
             // canonical view the reject/route phase used.
-            var host_scratch: [constants.host_bytes_max]u8 = undefined;
-            var edit_buffer: [constants.header_edits_max]filter.AppliedHeaderEdit = undefined;
             // The rewrite scratch is the server's, distinct from the
             // target scratch: on the checkout path the routed views still
             // alias that one while the rewrite runs.
@@ -1496,18 +1562,16 @@ pub fn Proxy(comptime IoType: type) type {
                 conn,
                 request,
                 views,
-                &host_scratch,
+                &scratch.host,
                 server.rewrite_scratch,
-                &edit_buffer,
+                &scratch.request_edits,
             ) catch {
                 // A rewritten path too long to forward: the §7 oversize
                 // verdict, answered like an oversize head.
                 return respond(server, conn, 431, "l7_headers_too_large");
             };
-            var forwarded_scratch: [constants.forwarded_value_bytes_max]u8 = undefined;
-            const forwarded = planForwarded(server, conn, request, &forwarded_scratch);
-            var hops_scratch: [max_forwards_digits_max]u8 = undefined;
-            const hops = planMaxForwards(request, &hops_scratch);
+            const forwarded = planForwarded(server, conn, request, &scratch.forwarded);
+            const hops = planMaxForwards(request, &scratch.hops);
             // No close announcement upstream (the `false` below): the
             // connection is a parking candidate (§5), and stripping the
             // client's Connection header already made persistence the wire
@@ -1523,6 +1587,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // listener agreed to carry it (#180); the gate already
                 // refused every other spelling.
                 conn.l7.upgrade_requested,
+                &scratch.head,
                 upstreamHeadBytes(upstream),
             ) catch {
                 // Valid on arrival but no longer fits after edits: the §7
@@ -2221,11 +2286,6 @@ pub fn Proxy(comptime IoType: type) type {
         /// something in front may have terminated TLS, and `Secure` on a
         /// cookie the client can only ever return over http is a cookie
         /// it will never return at all.
-        const sticky_attributes = "; Path=/; HttpOnly";
-        const sticky_attributes_secure = sticky_attributes ++ "; Secure";
-        const sticky_value_bytes_max = constants.pick_name_bytes_max + 1 +
-            Balancer.endpoint_tag_len + sticky_attributes_secure.len;
-
         /// This render's full edit set: the #175 filter edits, plus —
         /// when the verdict owes the client an announcement — the #178
         /// stamp in the one buffer slot reserved past the filter budget.
@@ -2334,11 +2394,14 @@ pub fn Proxy(comptime IoType: type) type {
             // that serving has stopped being HTTP. A `Set-Cookie` naming
             // the endpoint of a session about to become opaque would be a
             // statement about a request that no longer exists.
+            const scratch = server.borrowRenderScratch();
+            defer server.returnRenderScratch();
             const rendered = render.renderResponseHead(
                 response,
                 false,
                 &.{},
                 true,
+                &scratch.head,
                 headBytes(server, conn),
             ) catch {
                 upstreamFailed(server, conn);
@@ -2498,11 +2561,14 @@ pub fn Proxy(comptime IoType: type) type {
             }
             conn.l7.interims_seen += 1;
             const upstream = conn.upstream.?;
+            const scratch = server.borrowRenderScratch();
+            defer server.returnRenderScratch();
             const rendered = render.renderResponseHead(
                 response,
                 false,
                 &.{},
                 false,
+                &scratch.head,
                 headBytes(server, conn),
             ) catch {
                 upstreamFailed(server, conn);
@@ -2639,13 +2705,21 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.downstream_close_announced = !keep_downstream;
             conn.l7.upstream_reusable = response.keep_alive;
             const verdict = stickyVerdict(server, conn);
-            var edit_buffer: [constants.response_edits_max]filter.AppliedHeaderEdit = undefined;
-            var cookie_scratch: [sticky_value_bytes_max]u8 = undefined;
+            const scratch = server.borrowRenderScratch();
+            defer server.returnRenderScratch();
             const rendered = render.renderResponseHead(
                 response,
                 !keep_downstream,
-                responseEditsWithStamp(server, conn, response, verdict, &edit_buffer, &cookie_scratch),
+                responseEditsWithStamp(
+                    server,
+                    conn,
+                    response,
+                    verdict,
+                    &scratch.response_edits,
+                    &scratch.sticky,
+                ),
                 false,
+                &scratch.head,
                 headBytes(server, conn),
             ) catch {
                 // The head no longer fits — after the #175 edits or the
