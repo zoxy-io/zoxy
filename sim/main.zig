@@ -16,6 +16,35 @@ const assert = std.debug.assert;
 const Counters = zoxy.counters.Counters;
 const SimIo = zoxy.Io.SimIo;
 
+/// The seed `checkSeed` is currently running, for the panic handler
+/// below. A plain global because that is what a panic handler can read:
+/// by the time one runs, every frame that knew the seed is gone.
+var running_seed: u64 = 0;
+
+/// Name the seed on the way down (#253).
+///
+/// An oracle failure returns an error and `checkSeed` prints the seed it
+/// belongs to. An *assert* does neither: the process aborts inside
+/// `io.run()`, and what reaches the operator is a stack trace with no
+/// seed in it — which is how a nightly soak came to report a panic it
+/// could not reproduce, and why finding the schedule that caused one
+/// meant bisecting a million-seed shard by hand. §9's whole claim is
+/// that a failure replays from its seed; a failure that cannot name one
+/// is outside it.
+pub const panic = std.debug.FullPanic(panicWithSeed);
+
+fn panicWithSeed(message: []const u8, first_trace_address: ?usize) noreturn {
+    // Printed before the default handler runs, so it survives however the
+    // trace itself is truncated. A zero here is not a seed but an answer:
+    // the panic happened outside any run — during setup, the census, or
+    // the failure report — and no schedule replays it.
+    std.debug.print("sim: PANIC seed={d} — replay with: zig build sim -- {d} 1\n", .{
+        running_seed,
+        running_seed,
+    });
+    std.debug.defaultPanic(message, first_trace_address);
+}
+
 const default_seed: u64 = 1;
 /// What `zig build sim` (and so `ci`) sweeps. Sized by census, not by
 /// feel: at 64 the gate left three scripts — `post_chunked_malformed`,
@@ -715,6 +744,13 @@ fn reportFailures(options: *const Sweep, failed: []const u64, swept_last: u64) v
 /// feeds the census — the replay would double every total, and a census
 /// is a claim about what one pass over the range reached.
 fn checkSeed(arena_state: *std.heap.ArenaAllocator, seed: u64, census: ?*Census) !void {
+    running_seed = seed;
+    // Cleared on the way out, so the seed the handler prints is only ever
+    // one a run was *inside*. A panic does not run this — which is the
+    // point — but the census and the failure report that follow the sweep
+    // do, and a panic in either would otherwise name the last seed swept
+    // as though its schedule were the cause.
+    defer running_seed = 0;
     const first = runSeed(arena_state, seed, census) catch |err| {
         std.debug.print("sim: FAILURE seed={d} error={t}\n", .{ seed, err });
         return err;

@@ -3028,6 +3028,74 @@ test "l7: a respond action answers from memory and never dials (#159)" {
     try bed.expectDrained();
 }
 
+test "l7: a retry whose deadline rebase is still draining still has a clock (#253)" {
+    // The window a million-seed soak found and a 4096-seed sweep never
+    // did. A dial re-bases the head-read timer to the tighter connect
+    // budget by *cancelling* it (§4's lazy timer never moves earlier on
+    // its own), and two completions then race: the timer's own
+    // `Canceled`, and the cancel op's. Whichever lands second re-arms at
+    // the stored target. Between them the timer is legitimately down —
+    // and a `Refused` delivered in that gap brings a retry to a
+    // connection whose clock is microseconds from being re-armed.
+    //
+    // `dialUpstream` used to assert the timer was armed outright, which
+    // read that legal state as a bug and aborted the process. Seed 16
+    // under partial delivery lands the three completions in exactly that
+    // order; before the fix this test panics rather than fails.
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 16,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            .refusing_endpoint_first = true,
+            .retries = 1,
+            .pick = .rr,
+            .partial_io = true,
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+        // The retry ran and reached the origin: the window is survivable,
+        // not merely un-asserted.
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+        try bed.expectDrained();
+    }
+    {
+        // And the clock the retry carried is a *real* one, which is the
+        // half an assert-only fix would leave unproven: relaxing the
+        // assert would look identical here if the timer were simply gone.
+        // The retried dial goes to a blackholed address, so nothing but
+        // the carried budget can end it — the §8 504 arriving is the
+        // re-arm, observed from outside.
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 16,
+            .refusing_endpoint_first = true,
+            .retries = 1,
+            .pick = .rr,
+            .partial_io = true,
+        });
+        defer bed.tearDown();
+        bed.sim_io.blackholeAddress(Http1Bed.originAddress());
+
+        try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\n\r\n");
+
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++
+                expected_date ++ "Connection: close\r\n\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+        try bed.expectDrained();
+    }
+}
+
 test "l7: a hung dial fires 504 at the connect budget, not the idle timeout" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{ .seed = 74, .origin_listens = false });

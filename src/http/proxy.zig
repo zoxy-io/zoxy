@@ -1218,12 +1218,36 @@ pub fn Proxy(comptime IoType: type) type {
                 server.rebaseDeadline(conn);
             } else {
                 // Stated rather than assumed: the budget being carried is
-                // only a budget if it is still running. It must be, since
-                // a fired deadline reaches `onUpstreamConnect` as a
-                // pending verdict and answers 504 before any failure could
-                // ask to retry — but a future path that disarmed it would
-                // otherwise leave this dial with no clock at all.
-                assert(conn.armed.deadline);
+                // only a budget if it is still running, and what makes it
+                // running is that *something* will fire on it. Two states
+                // qualify, and both have to be named or a legal one reads
+                // as a bug.
+                //
+                // The timer is armed — the ordinary case. Or it is down
+                // with the first dial's rebase cancel still draining: that
+                // dial tightened the head-read timer to the connect budget
+                // by cancelling it (§4's lazy timer never moves earlier on
+                // its own), and the cancel and the timer's own `Canceled`
+                // both land, whichever is second re-arming at the stored
+                // target. In between, the timer is legitimately down with a
+                // re-arm already on its way — at exactly the target this
+                // carried budget is counting on, because `deadline_ns` is
+                // shared. A `Refused` delivered inside that window is what
+                // brings a retry here, and it is rare enough that a
+                // 4096-seed sweep never produced one; a million-seed soak
+                // did (#253).
+                //
+                // This is not a new relaxation but the spelling the rest
+                // of the file already uses: `resetForNextRequest` and the
+                // keep-alive turnaround both assert this same disjunction,
+                // for this same straggler, and `rebaseDeadline` opens by
+                // deferring to a draining cancel. The retry path was the
+                // one place that asked for the stricter half alone. What
+                // it still refuses is the state that would be a bug:
+                // neither armed nor about to be, which is a dial with no
+                // clock at all, where a hung origin would never reach its
+                // §8 504.
+                assert(conn.armed.deadline or conn.armed.deadline_cancel);
             }
             conn.arm(&conn.op_connect, "connect");
             server.io.connect(
