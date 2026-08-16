@@ -5782,3 +5782,85 @@ test "l7: the request cap binds a statically-answered connection too" {
     try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
     try bed.expectDrained();
 }
+
+test "l7: a static answer to a client that asked to close is not counted either" {
+    // The proxied path already held to this — `downstreamKeepAlive` folds
+    // the client's ask in before the cap is consulted. The three static
+    // sites spelled the four brakes out themselves and put the cap
+    // *first*, `and`-ing the rest after, so the counter named the cap for
+    // a connection the client had already closed. Same rule, same
+    // scenario, the other path.
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/admin" },
+        .actions = &[_]filter.Action{.{ .reject = 403 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 334,
+        .request_filters = &rules,
+        .keepalive_requests = 1,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /admin HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        bed.client.response(),
+        "HTTP/1.1 403 Forbidden\r\n",
+    ));
+    // The connection still closes — it was always going to. What must not
+    // happen is the cap taking credit for it.
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("l7_keepalive_requests_capped"),
+    );
+    try bed.expectDrained();
+}
+
+test "l7: a redirect discarded for an oversize head counts the cap once" {
+    // Two verdicts, one request. `respondRedirect` decides persistence
+    // before the render because the close is announced inside it, then the
+    // render finds the head does not fit and hands the request to
+    // `respond`, which weighs the cap again for the same request. Counted
+    // at both, one client's one request read as two capped connections.
+    //
+    // #234 made the fallback easier to reach, not the bug: a `Location`
+    // that fit before now shares the head with a `Date` and a `Server`.
+    const rules = [_]filter.Rule{
+        .{ .match = .{}, .actions = &.{
+            .{ .redirect = .{ .status = 301, .target = .{ .composed = .{ .scheme = .https } } } },
+        } },
+    };
+    const head_buffer_bytes: u32 = 1024;
+    const prefix = "GET /";
+    // Keep-alive, deliberately: the cap must be the binding reason, which
+    // it cannot be for a client that already asked to close.
+    const suffix = " HTTP/1.1\r\nHost: o\r\n\r\n";
+    var request: [prefix.len + 960 + suffix.len]u8 = undefined;
+    @memcpy(request[0..prefix.len], prefix);
+    @memset(request[prefix.len..][0..960], 'p');
+    @memcpy(request[prefix.len + 960 ..][0..suffix.len], suffix);
+    comptime assert(prefix.len + 960 + suffix.len <= head_buffer_bytes);
+
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 335,
+        .request_filters = &rules,
+        .head_buffer_bytes = head_buffer_bytes,
+        .keepalive_requests = 1,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange(&request);
+
+    // The 414 is the answer that went out, so the 414 is the answer that
+    // counts — exactly once.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_uri_too_long"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_redirected"));
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_keepalive_requests_capped"),
+    );
+    try bed.expectDrained();
+}
