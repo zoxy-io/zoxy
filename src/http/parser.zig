@@ -194,10 +194,24 @@ pub const Header = struct {
     }
 };
 
-/// Header storage for one parsed head. A stack local at every call site —
-/// nothing parsed survives the callback that parsed it (§7 detect-and-retry
-/// re-parses from byte 0), so this costs frame, not a connection slot.
-pub const HeaderStorage = [constants.headers_max]Header;
+/// Header storage for one parsed head: the mapped headers a caller reads,
+/// and the raw span hparse fills on the way to them. Nothing parsed
+/// survives the callback that parsed it (§7 detect-and-retry re-parses
+/// from byte 0), so one of these serves a whole parse and no more.
+///
+/// Both arrays live in the one aggregate so that a caller lends a single
+/// buffer rather than two, and so the raw span stops being a local of
+/// `parseRequestHead`/`parseResponseHead` — which is what makes the
+/// serving path's long-lived scratch (`Server.header_scratch`) cover the
+/// whole cost. Under ReleaseSafe an `= undefined` local is 0xaa-filled on
+/// every call, and §9's flamegraph put that fill at 62% of zoxy's user
+/// cycles under L7 load: ~9.2 KiB per request across the four frames a
+/// keep-alive exchange parses. A cold call site may still declare one on
+/// the stack; the serving path may not.
+pub const HeaderStorage = struct {
+    headers: [constants.headers_max]Header,
+    raw: [constants.headers_max]hparse.Header,
+};
 
 /// How the message body is delimited (RFC 9112 §6.3). `until_close` is
 /// legal only on responses; requests are always length-delimited.
@@ -364,8 +378,7 @@ pub fn parseRequestHead(
     }
 
     var raw: RawRequest = .{};
-    var raw_headers: [constants.headers_max]hparse.Header = undefined;
-    const head_len = try parseRequestRaw(head, head_is_full, &raw, &raw_headers);
+    const head_len = try parseRequestRaw(head, head_is_full, &raw, &headers_storage.raw);
 
     const target = raw.target.?; // A successful parse always sets the target.
     const method_token = raw.method_token.?; // Same contract as the target.
@@ -374,7 +387,7 @@ pub fn parseRequestHead(
     const split = try validateTarget(target, method);
     const version = versionFromRaw(raw.version);
 
-    const analysis = try analyzeHeaders(raw_headers[0..raw.header_count], headers_storage);
+    const analysis = try analyzeHeaders(raw.header_count, headers_storage);
     // An HTTP/1.1 request must carry exactly one Host (RFC 9112 §3.2);
     // duplicates were already rejected during analysis.
     if (version == .http_1_1) {
@@ -390,7 +403,7 @@ pub fn parseRequestHead(
         .method_token = method_token,
         .target = split.target,
         .version = version,
-        .headers = headers_storage[0..raw.header_count],
+        .headers = headers_storage.headers[0..raw.header_count],
         .host = analysis.host,
         .authority = split.authority,
         .framing = framing,
@@ -416,14 +429,13 @@ pub fn parseResponseHead(
     var raw_version: hparse.Version = .@"1.0";
     var raw_status: u16 = 0;
     var raw_status_message: ?[]const u8 = null;
-    var raw_headers: [constants.headers_max]hparse.Header = undefined;
     var raw_header_count: usize = 0;
     const head_len = hparse.parseResponse(
         head,
         &raw_version,
         &raw_status,
         &raw_status_message,
-        &raw_headers,
+        &headers_storage.raw,
         &raw_header_count,
     ) catch |err| switch (err) {
         // No 414-class verdict on the origin side: an oversize response
@@ -450,14 +462,14 @@ pub fn parseResponseHead(
     }
     const version = versionFromRaw(raw_version);
 
-    const analysis = try analyzeHeaders(raw_headers[0..raw_header_count], headers_storage);
+    const analysis = try analyzeHeaders(raw_header_count, headers_storage);
     const framing = try responseFraming(request_method, raw_status, version, &analysis);
 
     return .{
         .status = raw_status,
         .status_message = raw_status_message,
         .version = version,
-        .headers = headers_storage[0..raw_header_count],
+        .headers = headers_storage.headers[0..raw_header_count],
         .framing = framing,
         .keep_alive = keepAliveDefault(version, &analysis) and framing != .until_close,
         .connection_nominates_header = analysis.connection_nominates_header,
@@ -787,11 +799,16 @@ const HeaderAnalysis = struct {
     connection_nominates_header: bool,
 };
 
+/// Maps the `header_count` raw headers hparse left in `headers_storage.raw`
+/// into the tagged `headers_storage.headers`, in place. The count rather
+/// than a slice: both spans are fields of the one aggregate now, and
+/// handing this a slice of `raw` while it writes `headers` would state an
+/// aliasing relation the caller cannot check.
 fn analyzeHeaders(
-    raw_headers: []const hparse.Header,
+    header_count: usize,
     headers_storage: *HeaderStorage,
 ) error{Malformed}!HeaderAnalysis {
-    assert(raw_headers.len <= headers_storage.len);
+    assert(header_count <= headers_storage.headers.len);
     var analysis = HeaderAnalysis{
         .host = null,
         .content_length = null,
@@ -801,12 +818,12 @@ fn analyzeHeaders(
         .connection_keep_alive = false,
         .connection_nominates_header = false,
     };
-    for (raw_headers, 0..) |raw_header, index| {
+    for (headers_storage.raw[0..header_count], 0..) |raw_header, index| {
         assert(raw_header.key.len >= 1);
         // The one name comparison this header will cost: every later §7
         // decision, here and in the render walk, tests the tag instead.
         const header: Header = .init(raw_header.key, raw_header.value);
-        headers_storage[index] = header;
+        headers_storage.headers[index] = header;
         switch (header.tag) {
             .host => {
                 // A second Host changes routing depending on who reads which —

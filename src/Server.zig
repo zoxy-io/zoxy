@@ -170,6 +170,31 @@ pub fn Server(comptime IoType: type) type {
         /// Empty on an L4-only config, which never canonicalizes.
         target_scratch: []u8,
         rewrite_scratch: []u8,
+        /// The serving path's one header scratch, on the same terms as the
+        /// two above and for a sharper reason: a `parser.HeaderStorage`
+        /// local is 0xaa-filled on every call under ReleaseSafe, and §9's
+        /// flamegraph put that fill at 62% of user cycles under L7 load —
+        /// ~9.2 KiB per request across the four frames a keep-alive
+        /// exchange parses. Lent once per parse and filled once at init.
+        ///
+        /// One, not two, and the argument has two halves. Across callbacks:
+        /// §4 runs each to completion and never nests one inside another,
+        /// so two borrows cannot interleave that way. Within a callback: no
+        /// synchronous chain from a borrow site reaches a second one —
+        /// `parseAndDispatch`'s borrow stays live through `routeRequest`
+        /// into `beginUpstream`'s reuse path and on into
+        /// `renderRequestAndStartLegs`, none of which parse again, and the
+        /// paths that do parse again are the ones reached *after* an await,
+        /// where §7 re-parses from byte 0 precisely because nothing parsed
+        /// survives its callback. `header_scratch_lent` makes the whole of
+        /// that a checked fact rather than a reviewed one.
+        ///
+        /// Comptime-sized, so inline like `drain_sink`: part of no budget
+        /// term, and never under-counted.
+        header_scratch: parser.HeaderStorage,
+        /// Whether `header_scratch` is out on loan (see the field). Only
+        /// ever true inside one parse-and-consume window.
+        header_scratch_lent: bool,
         /// The §8 static responses in writable memory, because each now
         /// carries a `Date` slot (#234). Comptime-sized and held inline:
         /// a closed status set times two persistence variants, so this is
@@ -533,6 +558,32 @@ pub fn Server(comptime IoType: type) type {
             try server.initLogHeaders(arena, options);
         }
 
+        /// Lend the serving path's header scratch for one parse and the
+        /// window that reads it (§7: nothing parsed survives its callback,
+        /// so that window ends where the callback does — hence the `defer
+        /// returnHeaderScratch` at every call site).
+        ///
+        /// The assert is the whole safety argument. A borrow that outlives
+        /// its parse was always wrong; what is new is that a *second*
+        /// borrow taken while the first is live would hand two parses the
+        /// same array, and the first one's `headers` slice would change
+        /// under it. Nothing reaches that today, and this is what says so
+        /// if something ever does.
+        pub fn borrowHeaderScratch(server: *Self) *parser.HeaderStorage {
+            assert(!server.header_scratch_lent);
+            server.header_scratch_lent = true;
+            return &server.header_scratch;
+        }
+
+        /// Return what `borrowHeaderScratch` lent. The bytes stay as the
+        /// parse left them: the next borrow overwrites the prefix it fills
+        /// and reads no further, which is what makes one buffer reusable
+        /// without a clear between loans.
+        pub fn returnHeaderScratch(server: *Self) void {
+            assert(server.header_scratch_lent);
+            server.header_scratch_lent = false;
+        }
+
         /// The §4 engine pool and the one slab its plaintext destinations
         /// carve out of. Both are empty on a deployment where no listener
         /// terminates TLS — the whole feature reserving nothing, which is
@@ -664,6 +715,11 @@ pub fn Server(comptime IoType: type) type {
             // Deliberately not zeroed: a discard sink's contents are never
             // read, the same argument the head buffers make (§5).
             server.drain_sink = undefined;
+            // Same argument, and the reason the scratch exists: every parse
+            // writes the prefix it then reads. The one fill this costs is
+            // this one, at startup, instead of one per parse.
+            server.header_scratch = undefined;
+            server.header_scratch_lent = false;
             server.armed_ops_peak = 0;
             server.last_pressure_errno = 0;
             server.drain_deadline_completion = .{};

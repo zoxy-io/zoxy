@@ -217,11 +217,12 @@ pub fn Proxy(comptime IoType: type) type {
         fn answerHeadOverflow(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
             assert(conn.tls != null);
-            var storage: parser.HeaderStorage = undefined;
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
             if (parser.parseRequestHead(
                 headBytes(server, conn)[0..conn.head_len],
                 true,
-                &storage,
+                storage,
             )) |_| {
                 // The head completed inside the buffer, so what overran it
                 // was payload.
@@ -502,8 +503,9 @@ pub fn Proxy(comptime IoType: type) type {
             const head = bytes[0..conn.head_len];
             const head_is_full = conn.head_len == bytes.len;
 
-            var storage: parser.HeaderStorage = undefined;
-            const request = parser.parseRequestHead(head, head_is_full, &storage) catch |err| switch (err) {
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
+            const request = parser.parseRequestHead(head, head_is_full, storage) catch |err| switch (err) {
                 error.Incomplete => {
                     // A full buffer never yields Incomplete — the parser
                     // converts it to the oversize verdicts below — so here
@@ -1408,11 +1410,12 @@ pub fn Proxy(comptime IoType: type) type {
             // pool cannot have been emptied in between.
             server.releaseUpstream(failed);
             conn.upstream = null;
-            var storage: parser.HeaderStorage = undefined;
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
             const request = parser.parseRequestHead(
                 headBytes(server, conn)[0..conn.head_len],
                 false,
-                &storage,
+                storage,
             ) catch unreachable;
             // Re-derived rather than remembered, like the replay's
             // framing: same bytes, same key. A cookie cluster's #178
@@ -1433,14 +1436,15 @@ pub fn Proxy(comptime IoType: type) type {
         /// calls `renderRequestAndStartLegs` directly instead.
         fn renderAndStartLegs(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_dialing);
-            var storage: parser.HeaderStorage = undefined;
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
             // The same bytes parsed successfully in routeRequest (§7:
             // bytes are the single source of truth), so a failure here is
             // an invariant violation, not an input condition.
             const request = parser.parseRequestHead(
                 headBytes(server, conn)[0..conn.head_len],
                 false,
-                &storage,
+                storage,
             ) catch unreachable;
             assert(request.head_len == conn.l7.request_head_len);
             // Only this path pays for canonicalization twice, and it has
@@ -2023,11 +2027,12 @@ pub fn Proxy(comptime IoType: type) type {
             const head = upstreamHeadBytes(upstream)[0..upstream.head_len];
             const head_is_full = upstream.head_len == upstreamHeadBytes(upstream).len;
 
-            var storage: parser.HeaderStorage = undefined;
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
             const response = parser.parseResponseHead(
                 head,
                 head_is_full,
-                &storage,
+                storage,
                 conn.l7.request_method,
             ) catch |err| switch (err) {
                 error.Incomplete => {
@@ -2065,11 +2070,12 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.response_leg == .awaiting_head);
             assert(conn.l7.request_head_vacated);
             const upstream = conn.upstream.?;
-            var storage: parser.HeaderStorage = undefined;
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
             const response = parser.parseResponseHead(
                 upstreamHeadBytes(upstream)[0..upstream.head_len],
                 false,
-                &storage,
+                storage,
                 conn.l7.request_method,
             ) catch unreachable;
             assert(response.head_len == conn.l7.response_head_len_marker);
@@ -3396,11 +3402,12 @@ pub fn Proxy(comptime IoType: type) type {
             // cannot fail; the framing tracker MUST re-derive from the
             // parse — the coalesced excess was already fed once and will
             // be fed again on the fresh try.
-            var storage: parser.HeaderStorage = undefined;
+            const storage = server.borrowHeaderScratch();
+            defer server.returnHeaderScratch();
             const request = parser.parseRequestHead(
                 headBytes(server, conn)[0..conn.head_len],
                 false,
-                &storage,
+                storage,
             ) catch unreachable;
             assert(request.head_len == conn.l7.request_head_len);
             conn.l7 = .{
