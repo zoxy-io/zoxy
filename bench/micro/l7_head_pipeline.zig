@@ -52,11 +52,21 @@ pub fn main() void {
     while (index < iterations) : (index += 1) {
         const request = parser.parseRequestHead(request_head, false, &request_storage) catch unreachable;
         const target = parser.canonicalTarget(request.target, &path_scratch) catch unreachable;
-        // `null` forwarding is the shape to hold steady here: §7 client
-        // address forwarding is opt-in per listener, so the case that must
-        // not regress is the one where it is off and the render's
-        // suppression test is pure overhead.
-        const upstream = render.renderRequestHead(&request, target, no_edits, false, null, false, &upstream_head) catch unreachable;
+        // Both `null`s are the shape to hold steady here: §7 client
+        // address forwarding is opt-in per listener and a hop budget is
+        // rarer still, so the case that must not regress is the one where
+        // both are off and the render's suppression tests are pure
+        // overhead.
+        const upstream = render.renderRequestHead(
+            &request,
+            target,
+            no_edits,
+            false,
+            null,
+            null,
+            false,
+            &upstream_head,
+        ) catch unreachable;
         const response = parser.parseResponseHead(response_head, false, &response_storage, request.method) catch unreachable;
         const downstream = render.renderResponseHead(&response, true, no_edits, false, &downstream_head) catch unreachable;
 

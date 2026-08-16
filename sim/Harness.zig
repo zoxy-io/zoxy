@@ -2705,6 +2705,9 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_filtered",
         "l7_redirected",
         "l7_responded",
+        // The #240 final-recipient answer: served, so it owes a line like
+        // every other answered exchange.
+        "l7_max_forwards_exhausted",
         "l7_shed_relay_buffers",
         "l7_shed_tunnels",
         // A tunnel is an *answered* exchange like any other here (#180):

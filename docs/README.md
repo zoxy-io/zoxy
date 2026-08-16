@@ -374,6 +374,19 @@ origin receives, so the router and the backend cannot disagree about which
 resource was named. Structure-changing escapes (`%2F`, `%00`, truncated
 escapes) are rejected with `400`; no matching route is a `404`.
 
+`CONNECT` and `TRACE` are answered `501` and never reach a backend.
+`CONNECT` asks the proxy to open an arbitrary destination, which is
+forward-proxy behaviour; `TRACE` echoes a request back, which is the
+Cross-Site Tracing vector and, through a proxy that has already rewritten
+the request, an echo of a message nobody sent.
+
+`OPTIONS` honours `Max-Forwards`. At `0` zoxy answers it — `200` with an
+`Allow` describing zoxy itself, since that is what the client asked for —
+and never dials a backend; above `0` the request is forwarded with the
+value decremented, as an intermediary is required to. The field is read
+only for `OPTIONS`, so it changes nothing about ordinary traffic, and
+CORS preflights are unaffected: those carry no `Max-Forwards` at all.
+
 A request may also name its authority in the request line itself —
 `GET http://api.example.com/v2/x HTTP/1.1` — which is what a client sends
 when it thinks it is talking to a forward proxy. That form is accepted

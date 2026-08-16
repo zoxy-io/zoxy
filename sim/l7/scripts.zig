@@ -73,6 +73,19 @@ pub const Script = enum(u8) {
     /// `/sim` would; the origin's canonical oracle catches a raw-path
     /// forward, and a router matching raw bytes would route it elsewhere.
     confusion,
+    /// A `TRACE` with a hop budget (#240). §7 answers it `501` and never
+    /// forwards it, whatever the budget says — the refusal precedes
+    /// routing, so the origin must never see one.
+    trace_method,
+    /// An `OPTIONS` whose `Max-Forwards` is already zero (#240). RFC 9110
+    /// §7.6.2 makes this proxy the final recipient: it answers `200` with
+    /// an `Allow` describing itself, and no origin is dialed.
+    options_final,
+    /// An `OPTIONS` with a budget left to spend (#240). It routes and
+    /// forwards like any other request, except that the header the origin
+    /// reads is this hop's decrement rather than the client's value — the
+    /// origin's own oracle is what checks that.
+    options_hop,
     /// A GET whose request line is absolute-form (#233), beside a `Host`
     /// naming somewhere else. RFC 9112 §3.2.2 has the authority win, so
     /// this must route, forward and log exactly as `get` does — the
@@ -164,6 +177,13 @@ pub const Spec = struct {
     /// the pipelined shape: the proxy serves the first request and
     /// refuses to look at the second.
     golden_first_announces_close: bool = false,
+    /// This script's 200 is this proxy's own answer rather than an
+    /// origin's, and carries no body at all (#240): the final-recipient
+    /// `OPTIONS`. Like a #159 page it crosses neither response-side
+    /// render, but unlike one it has no configured body to demand — so
+    /// the two flags are separate, and a script claiming both would be
+    /// claiming a bodiless response with a body.
+    answered_here: bool = false,
     /// This script's 200 is answered from a configured page (#159) rather
     /// than proxied, so it crosses neither response-side render — no #175
     /// stamp, no #178 cookie — and its body is the page's, byte for byte.
@@ -506,6 +526,42 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .allowed_statuses = statuses_routed,
         .routed_canonical = true,
     },
+    .trace_method = .{
+        // The 501 verdict precedes routing, like CONNECT's. The method
+        // context maps to GET: the refusal carries no body either way.
+        .request = "TRACE /sim HTTP/1.1\r\nHost: sim\r\nMax-Forwards: " ++
+            canon.max_forwards_sent ++ "\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 501,
+        .method = .get,
+        // Only the §5 head ring's 503 precedes the parse the 501 rides on.
+        .allowed_statuses = &.{ 501, 503 },
+    },
+    .options_final = .{
+        // Answered here, so the only rung that can precede it is the head
+        // ring's — nothing past the parse is ever acquired.
+        .request = "OPTIONS * HTTP/1.1\r\nHost: sim\r\nMax-Forwards: 0\r\n" ++
+            trace_line ++ "\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .options,
+        .allowed_statuses = &.{ 200, 503 },
+        // A `200` from this proxy's own memory, not from an origin: it
+        // crosses neither response-side render, and carries no body.
+        .answered_here = true,
+    },
+    .options_hop = .{
+        .request = "OPTIONS /sim HTTP/1.1\r\nHost: sim\r\nMax-Forwards: " ++
+            canon.max_forwards_sent ++ "\r\n" ++ trace_line ++ "\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .options,
+        .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
+    },
     .absolute_form = .{
         // Absolute-form, so what routes is the request line's authority
         // rather than the Host beside it (#233). Indistinguishable from
@@ -694,6 +750,9 @@ pub const terminating_scripts = [_]Script{
     .connect_method,
     .pipelined,
     .confusion,
+    .trace_method,
+    .options_final,
+    .options_hop,
     .absolute_form,
     .filter_reject,
     .filter_redirect,

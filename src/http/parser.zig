@@ -78,12 +78,22 @@ pub const HeaderName = enum(u8) {
     /// copies in O(1) like every other managed header, rather than
     /// comparing this spelling against every header of every request.
     x_forwarded_for,
+    /// RFC 9110 §7.6.2's hop budget, which an intermediary must check
+    /// and *rewrite* rather than forward (#240). Tagged for the same
+    /// reason `x_forwarded_for` is: the render suppresses the inbound
+    /// copy and writes the decremented one itself, so the two spellings
+    /// can never both reach the origin.
+    max_forwards,
 
     /// Connection-specific headers (RFC 9110 §7.6.1): never forwarded.
     pub fn hopByHop(tag: HeaderName) bool {
         return switch (tag) {
             .connection, .keep_alive, .proxy_connection, .te, .upgrade => true,
-            .other, .host, .content_length, .transfer_encoding, .x_forwarded_for => false,
+            // `max_forwards` is deliberately not here. It is end-to-end —
+            // it travels the whole chain — and what each hop owes it is a
+            // *decrement*, not removal (#240); stripping it would tell the
+            // next hop the budget was never set.
+            .other, .host, .content_length, .transfer_encoding, .x_forwarded_for, .max_forwards => false,
         };
     }
 
@@ -93,7 +103,14 @@ pub const HeaderName = enum(u8) {
     pub fn protected(tag: HeaderName) bool {
         return switch (tag) {
             .host, .content_length, .transfer_encoding => true,
-            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for => false,
+            // Not protected: a client nominating its own `Max-Forwards`
+            // away through `Connection` is asking for the budget to be
+            // dropped, which loses it nothing this proxy owes it — an
+            // absent budget is one no hop has to check. It desynchronizes
+            // no framing and unroutes nothing, which is what this list is
+            // for. What a filter must not do to it is a different rule,
+            // enforced where filters are compiled.
+            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => false,
         };
     }
 
@@ -111,6 +128,7 @@ pub const HeaderName = enum(u8) {
             .te => "te",
             .upgrade => "upgrade",
             .x_forwarded_for => "x-forwarded-for",
+            .max_forwards => "max-forwards",
         };
     }
 };
@@ -126,6 +144,7 @@ pub fn classifyHeaderName(name: []const u8) HeaderName {
         2 => if (eql(name, "te")) .te else .other,
         4 => if (eql(name, "host")) .host else .other,
         7 => if (eql(name, "upgrade")) .upgrade else .other,
+        12 => if (eql(name, "max-forwards")) .max_forwards else .other,
         10 => length_10: {
             if (eql(name, "connection")) break :length_10 .connection;
             if (eql(name, "keep-alive")) break :length_10 .keep_alive;
@@ -806,7 +825,7 @@ fn analyzeHeaders(
                 if (analysis.content_length != null) {
                     return error.Malformed;
                 }
-                analysis.content_length = try parseContentLength(raw_header.value);
+                analysis.content_length = try parseDecimal(raw_header.value);
             },
             .transfer_encoding => {
                 // A second Transfer-Encoding header is the list form in
@@ -825,10 +844,15 @@ fn analyzeHeaders(
                 // Multiple Connection headers combine as one list (RFC 9110).
                 scanConnectionTokens(raw_header.value, &analysis);
             },
-            // `x_forwarded_for` joins the no-analysis set: the tag exists
-            // so the *render* can find it cheaply (§7), and nothing about
-            // framing, routing or persistence reads it here.
-            .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for => {},
+            // `x_forwarded_for` and `max_forwards` join the no-analysis
+            // set: their tags exist so the *render* can find them cheaply
+            // (§7), and nothing about framing, routing or persistence
+            // reads either here. `Max-Forwards` in particular is read
+            // only for the two methods RFC 9110 §7.6.2 names, by
+            // `maxForwards` below — parsing it for every request would
+            // let a garbage value on a POST reject a request the spec
+            // says may ignore the field entirely (#240).
+            .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => {},
         }
     }
     assert(!(analysis.te_chunked and analysis.te_other));
@@ -1281,10 +1305,55 @@ fn authorityIsWellFormed(authority: []const u8) bool {
     return true;
 }
 
-/// 1*DIGIT (RFC 9112 §6.2): digits only — no sign, no whitespace, no
-/// comma list. 19 digits bound the value below 10^19 < 2^64, so the
-/// accumulation cannot overflow.
-fn parseContentLength(value: []const u8) error{Malformed}!u64 {
+/// What a request's `Max-Forwards` says, for the two methods RFC 9110
+/// §7.6.2 binds an intermediary on (#240).
+///
+/// `absent` is the common case and the one every other method takes: the
+/// field MAY be ignored elsewhere, so it is read here rather than during
+/// header analysis — a garbage value on a POST must not reject a request
+/// the spec never asked this proxy to look at.
+///
+/// `malformed` is a value that is not 1*DIGIT, or a second header of the
+/// same name. The RFC does not say what to do with either, and this
+/// proxy answers the way it answers every other unparseable field it
+/// *does* read: a `400`, rather than a guess about which of two budgets
+/// the client meant.
+pub const MaxForwards = union(enum) {
+    absent,
+    malformed,
+    hops: u64,
+};
+
+pub fn maxForwards(headers: []const Header) MaxForwards {
+    assert(headers.len <= constants.headers_max);
+    var found: ?u64 = null;
+    for (headers) |header| {
+        if (header.tag != .max_forwards) {
+            continue;
+        }
+        if (found != null) {
+            return .malformed; // Two budgets are no budget.
+        }
+        found = parseDecimal(header.value) catch return .malformed;
+    }
+    const hops = found orelse return .absent;
+    // The grammar's whole range, restated where the value leaves the
+    // parser: `parseDecimal` admits at most nineteen digits, and the
+    // decrement downstream renders back into a slot sized for exactly
+    // that. A budget wider than the grammar would overrun it.
+    assert(hops < 10_000_000_000_000_000_000);
+    return .{ .hops = hops };
+}
+
+/// 1*DIGIT: digits only — no sign, no whitespace, no comma list. 19
+/// digits bound the value below 10^19 < 2^64, so the accumulation cannot
+/// overflow.
+///
+/// One parser for the two fields that share the grammar: `Content-Length`
+/// (RFC 9112 §6.2) and `Max-Forwards` (RFC 9110 §7.6.2). They are read at
+/// different times and mean different things, but a second copy of this
+/// would be a second chance to disagree about what a digit is.
+fn parseDecimal(value: []const u8) error{Malformed}!u64 {
     if (value.len == 0) {
         return error.Malformed;
     }
@@ -1321,15 +1390,52 @@ fn oversizeRequestError(head: []const u8) HeadError {
 /// the canonical uppercase spelling matches — filters name registered
 /// methods this way; an extension method (`.extension`) is not selectable
 /// by token here (§7).
+const method_table = .{
+    .{ "GET", Method.get },         .{ "POST", Method.post },
+    .{ "HEAD", Method.head },       .{ "PUT", Method.put },
+    .{ "DELETE", Method.delete },   .{ "CONNECT", Method.connect },
+    .{ "OPTIONS", Method.options }, .{ "TRACE", Method.trace },
+    .{ "PATCH", Method.patch },
+};
+
+/// The methods this proxy will carry, as an `Allow` field value (RFC 9110
+/// §10.2.1) — every registered method except the two §7 answers itself:
+/// CONNECT, a §1 non-goal, and TRACE, refused as the Cross-Site Tracing
+/// vector (#240). Built from the same table `methodFromToken` reads, so a
+/// method added there is advertised here without a second list to keep in
+/// step.
+///
+/// It describes *this hop*, which is the only thing a final-recipient
+/// answer is entitled to describe. An extension method still forwards —
+/// §7 carries whatever token it was given — so this is what the proxy
+/// supports by name, not the whole of what it will pass along.
+pub const allow_value = blk: {
+    var value: []const u8 = "";
+    for (method_table) |entry| {
+        if (entry[1] == .connect or entry[1] == .trace) {
+            continue;
+        }
+        value = if (value.len == 0) entry[0] else value ++ ", " ++ entry[0];
+    }
+    const frozen = value;
+    break :blk frozen;
+};
+
+comptime {
+    // The advertised set is the registered set minus the two refusals —
+    // said as a count, so a method added to the table without a decision
+    // about whether this hop offers it fails here rather than silently
+    // appearing in, or vanishing from, what clients are told.
+    var offered: u32 = 0;
+    for (method_table) |entry| {
+        if (entry[1] != .connect and entry[1] != .trace) offered += 1;
+    }
+    assert(offered == method_table.len - 2);
+    assert(allow_value.len >= 1);
+}
+
 pub fn methodFromToken(token: []const u8) ?Method {
-    const table = .{
-        .{ "GET", Method.get },         .{ "POST", Method.post },
-        .{ "HEAD", Method.head },       .{ "PUT", Method.put },
-        .{ "DELETE", Method.delete },   .{ "CONNECT", Method.connect },
-        .{ "OPTIONS", Method.options }, .{ "TRACE", Method.trace },
-        .{ "PATCH", Method.patch },
-    };
-    inline for (table) |entry| {
+    inline for (method_table) |entry| {
         if (std.mem.eql(u8, token, entry[0])) {
             return entry[1];
         }

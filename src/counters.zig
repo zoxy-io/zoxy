@@ -100,6 +100,16 @@ pub const Counters = struct {
     /// concurrent this proxy's own answers are, and the §9 census is what
     /// keeps the branch reachable rather than dead.
     l7_static_date_stale: Value = Value.init(0),
+    /// An `OPTIONS` this proxy answered as the final recipient, because
+    /// its `Max-Forwards` had reached zero (RFC 9110 §7.6.2, #240).
+    ///
+    /// An answer, not a refusal: the client asked to be told about this
+    /// hop rather than the origin, and was. It is counted apart from
+    /// `l7_responded` — which is a configured body, the operator's
+    /// content — because this one is the proxy describing *itself*, and
+    /// the two say different things about a deployment. A rate of these
+    /// at all is worth noticing: almost nothing sends the field.
+    l7_max_forwards_exhausted: Value = Value.init(0),
     /// A request whose target arrived in absolute-form (RFC 9112 §3.2.2,
     /// #233), counted where the parser's split is read. Neither a reject
     /// nor an outcome: the request goes on to be routed, filtered or

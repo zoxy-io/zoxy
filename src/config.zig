@@ -3561,6 +3561,14 @@ fn validateEditableHeaderName(name: []const u8) ParseError!void {
     if (std.ascii.eqlIgnoreCase(name, render.forwarded_for_name)) {
         return error.FilterHeaderNameReserved;
     }
+    // Reserved for the same reason and a stricter one (#240): the value
+    // is not merely computed but *required* to be — RFC 9110 §7.6.2 has
+    // each hop forward its own decrement, so a rule writing a constant
+    // here would restate a number this proxy recomputes per request and
+    // hand the next hop a budget that never counts down.
+    if (std.ascii.eqlIgnoreCase(name, render.max_forwards_name)) {
+        return error.FilterHeaderNameReserved;
+    }
 }
 
 /// A header value must be an RFC 9110 field-value: VCHAR / SP / HTAB /
@@ -4712,6 +4720,11 @@ test "config: filter schema rejects malformed rules" {
     try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Host\",\"value\":\"evil\"}}]}]}]," ++ tail);
     try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_remove\":\"content-length\"}]}]}]," ++ tail);
     try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_add\":{\"name\":\"Connection\",\"value\":\"close\"}}]}]}]," ++ tail);
+    // The two headers this proxy writes on the client's behalf: a
+    // constant here would restate a value it computes per request (§7,
+    // #240).
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-For\",\"value\":\"1.2.3.4\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"max-forwards\",\"value\":\"9\"}}]}]}]," ++ tail);
     // A matched header predicate may still name a managed header (read-only).
     try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"Host\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
 }

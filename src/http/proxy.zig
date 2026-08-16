@@ -626,6 +626,53 @@ pub fn Proxy(comptime IoType: type) type {
             unreachable;
         }
 
+        /// The widest a decremented `Max-Forwards` can render to: the
+        /// field is 1*DIGIT and `parseDecimal` refuses past nineteen, so
+        /// nineteen digits is the whole range a decrement can land in.
+        const max_forwards_digits_max: u32 = 19;
+
+        /// The `Max-Forwards` this hop forwards, or null to leave the
+        /// header exactly as it arrived (#240) — which is every request
+        /// but an `OPTIONS` that carried a budget.
+        ///
+        /// RFC 9110 §7.6.2 has each intermediary in an OPTIONS or TRACE
+        /// chain send the received value decremented by one. TRACE never
+        /// reaches here (§7 answers it 501), and a zero budget never
+        /// reaches here either — `routeRequest` answered it as the final
+        /// recipient before anything was acquired — so what is left is
+        /// arithmetic on a value already checked.
+        ///
+        /// Re-read from the head rather than carried on the connection,
+        /// deliberately: a replayed try (§7) rebuilds its render from the
+        /// same head, and per-exchange state that has to survive that
+        /// rebuild is exactly what #232 got wrong. The head is identical,
+        /// so the two reads cannot disagree.
+        fn planMaxForwards(request: *const parser.RequestHead, scratch: []u8) ?[]const u8 {
+            assert(scratch.len >= max_forwards_digits_max);
+            if (request.method != .options) {
+                return null;
+            }
+            switch (parser.maxForwards(request.headers)) {
+                .absent => return null,
+                // Both were settled before the dial: a malformed budget is
+                // a 400 and a zero one is answered here, so neither can
+                // reach a render.
+                .malformed => unreachable,
+                .hops => |hops| {
+                    assert(hops >= 1);
+                    // Nineteen digits is the whole range `parseDecimal`
+                    // admits, and the scratch is that wide: the format
+                    // cannot overrun it, which is why the error is
+                    // unreachable rather than absorbed into a null that
+                    // would silently forward the budget unchanged.
+                    const text = std.fmt.bufPrint(scratch, "{d}", .{hops - 1}) catch unreachable;
+                    assert(text.len >= 1);
+                    assert(text.len <= max_forwards_digits_max);
+                    return text;
+                },
+            }
+        }
+
         /// The forwarded target and header edits after applying the
         /// listener's §7 filters to `request` — `base` unchanged and no
         /// edits when the listener has no filters (the common path pays
@@ -787,8 +834,40 @@ pub fn Proxy(comptime IoType: type) type {
                 server.counters.increment("l7_absolute_form");
             }
             armRequestDeadline(server, conn);
-            if (request.method == .connect) {
+            // The two methods this proxy answers rather than forwards
+            // (§7). CONNECT is a §1 non-goal; TRACE is refused because
+            // reflecting a request back is the Cross-Site Tracing vector
+            // and because a gateway has nothing truthful to reflect —
+            // by the time the message would come back it has had its
+            // request line rewritten, its hop-by-hop headers stripped
+            // and an `X-Forwarded-For` added, so the echo is not the
+            // request the client sent (#240). Refusing it also makes
+            // this proxy the final recipient of every TRACE chain
+            // unconditionally, which is half of RFC 9110 §7.6.2.
+            if (request.method == .connect or request.method == .trace) {
                 return respond(server, conn, 501, "l7_not_implemented");
+            }
+            // RFC 9110 §7.6.2's hop budget, checked before anything is
+            // acquired because a budget that ran out means no origin is
+            // involved at all (#240). Only OPTIONS reaches this: TRACE is
+            // refused above, and for every other method the field MAY be
+            // ignored — so it is not even parsed, and a garbage value on
+            // a POST cannot reject a request the spec never asked this
+            // proxy to look at.
+            if (request.method == .options) {
+                switch (parser.maxForwards(request.headers)) {
+                    .absent => {},
+                    // Unparseable, or two of them. The RFC says nothing
+                    // about either; this proxy answers the way it answers
+                    // every other field it reads and cannot parse, rather
+                    // than guessing which budget was meant.
+                    .malformed => return respond(server, conn, 400, "l7_bad_request"),
+                    .hops => |hops| {
+                        if (hops == 0) {
+                            return respondMaxForwardsExhausted(server, conn);
+                        }
+                    },
+                }
             }
             if (parser.headerValue(request.headers, "upgrade")) |token| {
                 if (!admitUpgrade(server, conn, token)) return;
@@ -1371,6 +1450,8 @@ pub fn Proxy(comptime IoType: type) type {
             };
             var forwarded_scratch: [constants.forwarded_value_bytes_max]u8 = undefined;
             const forwarded = planForwarded(server, conn, request, &forwarded_scratch);
+            var hops_scratch: [max_forwards_digits_max]u8 = undefined;
+            const hops = planMaxForwards(request, &hops_scratch);
             // No close announcement upstream (the `false` below): the
             // connection is a parking candidate (§5), and stripping the
             // client's Connection header already made persistence the wire
@@ -1381,6 +1462,7 @@ pub fn Proxy(comptime IoType: type) type {
                 plan.edits,
                 false,
                 forwarded,
+                hops,
                 // The participating `Upgrade` travels only when this
                 // listener agreed to carry it (#180); the gate already
                 // refused every other spelling.
@@ -3464,22 +3546,53 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!conn.armed.data_client_to_upstream);
             assert(!conn.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
+            // The head-shed rung can never keep, structurally: nothing was
+            // read (the ring was empty, so no buffer was ever bound), the
+            // request's bytes wait unread in the socket, and a kept
+            // connection would re-arm onto those same bytes and shed them
+            // forever. Comptime, so the resync rule — whose asserts require
+            // at least one byte read — is never consulted on that rung.
+            const may_keep = comptime !std.mem.eql(u8, counter, "l7_shed_head_buffers");
+            const keep = commitStaticVerdict(server, conn, status, counter, may_keep);
+            conn.state = .l7_responding;
+            armStaticAnswer(server, conn, status, keep);
+        }
+
+        /// Everything a static verdict does before its bytes are chosen:
+        /// release what the request held, retire the §8 request deadline
+        /// so it cannot expire the connection out from under the write
+        /// that delivers the answer, count it, record what the access log
+        /// will say, and decide persistence. Returns whether the
+        /// connection survives the answer.
+        ///
+        /// Shared by `respond` and the #240 `OPTIONS` answer, which are
+        /// opposite verdicts — a refusal and a request served on its own
+        /// terms — reached through the same machinery. The alternative
+        /// was a second copy of the deadline handling and the four
+        /// brakes, which is precisely the parity #237's review found had
+        /// already been lost once.
+        fn commitStaticVerdict(
+            server: *ServerType,
+            conn: *ConnType,
+            status: u16,
+            comptime counter: []const u8,
+            may_keep: bool,
+        ) bool {
+            assert(!conn.l7.response_started);
             releaseForStaticResponse(server, conn);
-            // A rung committed to an answer: retire the §8 request deadline
-            // so it cannot expire the connection out from under the write
-            // that delivers it (`clearRequestDeadline` owns the rule).
-            // Retiring the *cap* is only half of it — `conn.deadline_ns` is
-            // still standing wherever the cap clamped it, and the armed
-            // timer is still aimed there, so widen it back to the idle
-            // budget that owns a slow-reading client. No arm: whatever
-            // timer is already out re-arms itself for the remainder once it
-            // sees the later target (§4's lazy tick-and-compare).
+            // Retiring the *cap* is only half of it — `conn.deadline_ns`
+            // is still standing wherever the cap clamped it, and the
+            // armed timer is still aimed there, so widen it back to the
+            // idle budget that owns a slow-reading client. No arm:
+            // whatever timer is already out re-arms itself for the
+            // remainder once it sees the later target (§4's lazy
+            // tick-and-compare).
             ServerType.clearRequestDeadline(conn);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment(counter);
             // What the line will say, recorded here where the verdict is
-            // made; it is written once the response is on the wire, so the
-            // byte count includes the answer itself (§8).
+            // made; it is written once the response is on the wire, so
+            // the byte count includes the answer itself (§8).
             conn.log.status = status;
             conn.log.outcome = comptime outcomeOfCounter(counter);
             // §8's "then keep or close per pressure". Closing is not free:
@@ -3490,24 +3603,42 @@ pub fn Proxy(comptime IoType: type) type {
             // reconnect loop. Keeping is one send.
             //
             // The same four brakes the render-time persistence decision
-            // honors apply here (§7, §8): the client's own ask, the drain,
-            // relay pressure — a proxy shedding buffers should not also be
+            // honors (§7, §8): the client's own ask, the drain, relay
+            // pressure — a proxy shedding buffers should not also be
             // holding connections open for their next request — and the
             // #237 request cap, which binds a connection answered
             // statically exactly as firmly as one being proxied.
-            // The head-shed rung can never keep, structurally: nothing was
-            // read (the ring was empty, so no buffer was ever bound), the
-            // request's bytes wait unread in the socket, and a kept
-            // connection would re-arm onto those same bytes and shed them
-            // forever. Comptime, so the resync rule — whose asserts require
-            // at least one byte read — is never consulted on that rung.
-            const may_keep = comptime !std.mem.eql(u8, counter, "l7_shed_head_buffers");
-            const keep = applyRequestCap(server, conn, may_keep and staticResponseResyncable(conn)) and
+            return applyRequestCap(server, conn, may_keep and staticResponseResyncable(conn)) and
                 conn.l7.client_keep_alive and
                 !server.draining and
                 !server.keepAliveSuppressed();
+        }
+
+        /// Answer an `OPTIONS` whose `Max-Forwards` reached zero: this
+        /// proxy is the final recipient, and says so about itself (RFC
+        /// 9110 §7.6.2, #240). Reached before anything is acquired, so
+        /// like the #176 redirect it sits clear of every rung past the
+        /// head ring — the origin is deliberately never dialed, which is
+        /// the whole meaning of a budget that ran out here.
+        fn respondMaxForwardsExhausted(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_reading_head);
+            assert(!conn.armed.data_client_to_upstream);
+            assert(!conn.armed.data_upstream_to_client);
+            assert(conn.relay_buffer == null);
+            assert(conn.upstream == null);
+            const keep = commitStaticVerdict(server, conn, 200, "l7_max_forwards_exhausted", true);
+            const persistence: shed.Persistence = if (keep) .keep else .close;
+            const answer = server.static_responses.getOptions(persistence);
+            server.stampStaticDate(answer.date);
+            server.claimStaticSend(conn);
             conn.state = .l7_responding;
-            armStaticAnswer(server, conn, status, keep);
+            // The answer is bodiless, so a HEAD would take the same bytes
+            // — and a HEAD never reaches here anyway: this is the OPTIONS
+            // path alone.
+            assert(conn.l7.request_method == .options);
+            const then: conn_module.ClientWrite.Then =
+                if (keep) .next_request else .lingering_close;
+            armClientWrite(server, conn, answer.bytes, then);
         }
 
         /// Send one static answer: the #159 configured page for this
@@ -3798,6 +3929,11 @@ pub fn Proxy(comptime IoType: type) type {
             // filter's (#236), not a shed: nothing of this proxy's ran
             // out, and the operator wrote the rule that refused it.
             if (std.mem.eql(u8, counter, "l7_body_over_limit")) return .rejected;
+            // The #240 final-recipient answer is this proxy responding as
+            // the origin, which is exactly what `.responded` means — the
+            // counter keeps it apart from a configured body, the log does
+            // not need to.
+            if (std.mem.eql(u8, counter, "l7_max_forwards_exhausted")) return .responded;
             if (std.mem.eql(u8, counter, "l7_shed_relay_buffers")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_upstream_slots")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_head_buffers")) return .shed;

@@ -39,6 +39,14 @@ pub const response_edit_name = "X-Sim-Response";
 pub const response_edit_value = "on";
 pub const response_never_name = "X-Sim-Never";
 
+/// The #240 hop budget `options_hop` sends, and the one the origin must
+/// read. RFC 9110 §7.6.2 has each intermediary forward the received value
+/// decremented by one, so these two numbers are the whole property: a
+/// proxy that forwarded the header verbatim would show the first, and one
+/// that dropped it would show neither.
+pub const max_forwards_sent = "3";
+pub const max_forwards_forwarded = "2";
+
 /// The Host header the `absolute_form` script sends beside a request
 /// line that names a different authority (#233). RFC 9112 §3.2.2 has the
 /// authority win, so these bytes must never reach an origin — the origin

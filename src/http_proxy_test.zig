@@ -1080,7 +1080,7 @@ test "l7: an unsupported absolute-form scheme is 400" {
 
 // Both heads parse cleanly and carry no body, so the 501 keeps the
 // connection (§8) — the method is refused, not the framing.
-test "l7: CONNECT and Upgrade are answered 501" {
+test "l7: CONNECT, TRACE and Upgrade are answered 501" {
     {
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{ .seed = 4 });
@@ -1094,6 +1094,28 @@ test "l7: CONNECT and Upgrade are answered 501" {
         try bed.expectDrained();
     }
     {
+        // TRACE reflects the request back, which is the Cross-Site
+        // Tracing vector and, through a gateway, an echo of a message
+        // the client never sent (#240). Refused here rather than
+        // forwarded, whatever `Max-Forwards` says — the header is read
+        // only where the request would otherwise travel.
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 45,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+        try bed.exchange("TRACE /echo HTTP/1.1\r\nHost: o\r\nMax-Forwards: 5\r\n\r\n");
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
+        // The refusal precedes routing, so no origin was ever dialed.
+        try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+        try bed.expectDrained();
+    }
+    {
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{ .seed = 5 });
         defer bed.tearDown();
@@ -1103,6 +1125,123 @@ test "l7: CONNECT and Upgrade are answered 501" {
             bed.client.response(),
         );
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
+        try bed.expectDrained();
+    }
+}
+
+test "l7: a zero Max-Forwards stops at this proxy and describes it (#240)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 46,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // RFC 9110 §7.6.2: at zero the intermediary MUST NOT forward, and
+    // MUST respond as the final recipient. What it has to say about
+    // itself is `Allow`, which names this hop rather than the origin's
+    // resource — the origin was deliberately never asked.
+    try bed.exchange("OPTIONS * HTTP/1.1\r\nHost: o\r\nMax-Forwards: 0\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" ++
+            "Allow: " ++ parser.allow_value ++ "\r\n" ++ expected_date ++
+            "Connection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("l7_max_forwards_exhausted"),
+    );
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.accepted_count);
+    // Neither refused nor forwarded: CONNECT and TRACE are the 501s, and
+    // this is the opposite verdict reached through the same machinery.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_not_implemented"));
+    try bed.expectDrained();
+}
+
+test "l7: a non-zero Max-Forwards travels decremented (#240)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 47,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("OPTIONS /x HTTP/1.1\r\nHost: o\r\nMax-Forwards: 5\r\n\r\n");
+
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try forwardedRequest(&bed, &storage);
+    // Exactly one budget reaches the origin, and it counts down: the
+    // inbound copy is suppressed by tag and this hop writes its own.
+    var seen: u32 = 0;
+    for (forwarded.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "max-forwards")) {
+            seen += 1;
+            try std.testing.expectEqualStrings("4", header.value);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1), seen);
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("l7_max_forwards_exhausted"),
+    );
+    try bed.expectDrained();
+}
+
+test "l7: Max-Forwards is read for OPTIONS alone, and must parse there (#240)" {
+    {
+        // Garbage on a method the field MAY be ignored for is ignored —
+        // and travels untouched, because this hop is not in its chain.
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 48,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /x HTTP/1.1\r\nHost: o\r\nMax-Forwards: not-a-number\r\n\r\n");
+
+        var storage: parser.HeaderStorage = undefined;
+        const forwarded = try forwardedRequest(&bed, &storage);
+        try std.testing.expectEqualStrings(
+            "not-a-number",
+            parser.headerValue(forwarded.headers, "max-forwards").?,
+        );
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_request"));
+        try bed.expectDrained();
+    }
+    {
+        // The same value on the method that binds this hop is a 400: two
+        // readings of one budget is not something to guess between.
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .seed = 49 });
+        defer bed.tearDown();
+
+        try bed.exchange("OPTIONS /x HTTP/1.1\r\nHost: o\r\nMax-Forwards: not-a-number\r\n\r\n");
+
+        // Kept, not closed — the distinction `l7_bad_request` documents:
+        // the head *parsed*, so the message boundary is known and the
+        // connection can serve the next request. Only a head the parser
+        // could not frame closes.
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
+        try bed.expectDrained();
+    }
+    {
+        // Two of them, on OPTIONS: same verdict, same reason.
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .seed = 50 });
+        defer bed.tearDown();
+
+        try bed.exchange(
+            "OPTIONS /x HTTP/1.1\r\nHost: o\r\nMax-Forwards: 1\r\nMax-Forwards: 9\r\n\r\n",
+        );
+
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
         try bed.expectDrained();
     }
 }
