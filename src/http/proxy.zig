@@ -2168,26 +2168,97 @@ pub fn Proxy(comptime IoType: type) type {
             return conn.requests_served >= cap;
         }
 
-        /// The #237 cap as the last brake on any persistence decision that
-        /// would otherwise keep.
+        /// The #237 cap as the last brake on the *proxied* response's
+        /// persistence decision, and the counter that goes with it.
         ///
-        /// One helper rather than a predicate each site remembers to
-        /// consult, because there are four such decisions — the proxied
-        /// response, a static answer, a #159 page and a #176 redirect —
-        /// and the cap is meaningless if it binds only the first. A client
+        /// One path, not four. The cap binds a connection answered
+        /// statically exactly as firmly as one being proxied — a client
         /// whose every request lands on a filter reject or a 404 holds its
-        /// slot exactly as firmly as one being proxied, which is the
-        /// occupancy this bounds.
+        /// slot the same way — but the other three reach it through
+        /// `staticPersistence` below, which separates the verdict from the
+        /// count for the reason its own doc gives. This one is safe to
+        /// keep coupled because nothing between the decision and the
+        /// answer can discard it: `renderResponse` can still fail after
+        /// counting, but its fallback runs from `.l7_exchanging`, and
+        /// `staticResponseResyncable` gates the static path on
+        /// `.l7_reading_head` — so the cap is never weighed twice for one
+        /// request. A future path that *could* be discarded after deciding
+        /// wants `staticPersistence`, not this.
         ///
-        /// It also owns the counter, so "the cap is why this closed" is
-        /// recorded once and only where it is the *binding* reason: a
-        /// connection already closing for pressure, a drain or the
-        /// client's own ask never reaches the check.
+        /// The counter records "the cap is why this closed" only where it
+        /// is the *binding* reason. `downstreamKeepAlive` is what earns
+        /// that here: it folds in the client's own ask, the drain and
+        /// relay pressure before this is consulted, so a connection
+        /// already closing for one of those never reaches the check.
         fn applyRequestCap(server: *ServerType, conn: *const ConnType, would_keep: bool) bool {
             if (!would_keep) return false;
             if (!requestsCapReached(server, conn)) return true;
             server.counters.increment("l7_keepalive_requests_capped");
             return false;
+        }
+
+        /// Whether a static answer keeps its connection, and whether the
+        /// #237 cap is *why* it does not.
+        ///
+        /// The four brakes in one place because the three static sites had
+        /// each spelled them out, and spelled them in an order that made
+        /// the counter say something untrue: the cap was consulted first
+        /// and the other three `and`-ed after it, so a client sending
+        /// `Connection: close` on its capped request — or any static
+        /// answer served while draining or relay-pressured — counted the
+        /// cap as the reason it closed when the reason was the client's,
+        /// the drain's or the pool's. `applyRequestCap` says it records
+        /// "only where it is the binding reason"; only the proxied path,
+        /// whose `downstreamKeepAlive` folds the others in itself, was
+        /// holding to that.
+        ///
+        /// The verdict and the counter are separated because one caller
+        /// can still fail between them: the #176 redirect needs `keep` to
+        /// render its head and may then find the head does not fit, and a
+        /// discarded answer must not leave a count behind
+        /// (`l7_redirected`'s placement rule, applied to the cap).
+        const StaticPersistence = struct {
+            keep: bool,
+            /// True only where `keep` is false *and* the cap is the reason
+            /// — which is exactly what the counter claims to measure.
+            capped: bool,
+        };
+
+        fn staticPersistence(
+            server: *const ServerType,
+            conn: *const ConnType,
+            may_keep: bool,
+        ) StaticPersistence {
+            const would_keep = may_keep and
+                staticResponseResyncable(conn) and
+                conn.l7.client_keep_alive and
+                !server.draining and
+                !server.keepAliveSuppressed();
+            if (!would_keep) return .{ .keep = false, .capped = false };
+            const persistence: StaticPersistence = blk: {
+                const capped = requestsCapReached(server, conn);
+                break :blk .{ .keep = !capped, .capped = capped };
+            };
+            // The negative space the struct's doc promises, checked on the
+            // value rather than argued from how it was built — `capped`
+            // names the cap as the reason a connection closed, so it can
+            // never ride alongside one that stayed open. True by
+            // construction today; the assert is what makes a future
+            // construction that breaks it fail here instead of quietly
+            // teaching the counter to lie again.
+            assert(!(persistence.keep and persistence.capped));
+            return persistence;
+        }
+
+        /// The verdict for a caller that commits to its answer straight
+        /// away, so the count can be taken with it.
+        fn staticKeepAlive(server: *ServerType, conn: *const ConnType, may_keep: bool) bool {
+            const persistence = staticPersistence(server, conn, may_keep);
+            if (persistence.capped) {
+                assert(!persistence.keep);
+                server.counters.increment("l7_keepalive_requests_capped");
+            }
+            return persistence.keep;
         }
 
         /// The §8 persistence decision, made once and honored: keep the
@@ -3741,10 +3812,7 @@ pub fn Proxy(comptime IoType: type) type {
             // holding connections open for their next request — and the
             // #237 request cap, which binds a connection answered
             // statically exactly as firmly as one being proxied.
-            return applyRequestCap(server, conn, may_keep and staticResponseResyncable(conn)) and
-                conn.l7.client_keep_alive and
-                !server.draining and
-                !server.keepAliveSuppressed();
+            return staticKeepAlive(server, conn, may_keep);
         }
 
         /// Answer an `OPTIONS` whose `Max-Forwards` reached zero: this
@@ -3891,11 +3959,9 @@ pub fn Proxy(comptime IoType: type) type {
             conn.log.status = page.status;
             conn.log.outcome = .responded;
             // The same four brakes every static answer honors (§7, §8):
-            // the client's own ask, the drain, and relay pressure.
-            const keep = applyRequestCap(server, conn, staticResponseResyncable(conn)) and
-                conn.l7.client_keep_alive and
-                !server.draining and
-                !server.keepAliveSuppressed();
+            // the client's own ask, the drain, relay pressure and the
+            // #237 cap.
+            const keep = staticKeepAlive(server, conn, true);
             conn.state = .l7_responding;
             armPageWrite(server, conn, page, keep);
         }
@@ -4001,22 +4067,35 @@ pub fn Proxy(comptime IoType: type) type {
                     error.NoHost => return respond(server, conn, 400, "l7_bad_request"),
                 };
             // The same four brakes `respond` honors, decided before the
-            // render because the close is announced inside it (§7).
-            const keep = applyRequestCap(server, conn, staticResponseResyncable(conn)) and
-                conn.l7.client_keep_alive and
-                !server.draining and
-                !server.keepAliveSuppressed();
+            // render because the close is announced inside it (§7) — but
+            // *counted* after it. This is the one static answer that can
+            // still be discarded once its persistence is known: an
+            // oversize head sends the request to `respond`, which reaches
+            // `commitStaticVerdict` and weighs the cap again for the same
+            // request. Counting here too would record one request twice,
+            // and #234's added `Date` and `Server` lines made that
+            // fallback measurably easier to reach — a `Location` that used
+            // to fit may not now.
+            const persistence = staticPersistence(server, conn, true);
             const rendered = render.renderRedirectHead(
                 redirect.status,
                 location,
-                !keep,
+                !persistence.keep,
                 server.currentDate(),
                 headBytes(server, conn),
             ) catch {
                 // The Location fit the scratch but head + Location does
-                // not fit the buffer: same fault, same status.
+                // not fit the buffer: same fault, same status. No count
+                // taken: the answer this decided for is not the one going
+                // out, and `respond` weighs the cap for the one that is.
                 return respond(server, conn, 414, "l7_uri_too_long");
             };
+            // Committed to the redirect, so the verdict earns its count.
+            const keep = persistence.keep;
+            if (persistence.capped) {
+                assert(!keep);
+                server.counters.increment("l7_keepalive_requests_capped");
+            }
             ServerType.clearRequestDeadline(conn);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment("l7_redirected");
