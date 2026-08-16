@@ -55,6 +55,11 @@ pub const ClientError = error{
     /// anywhere (the scripted origin answers no 5xx) — either way a
     /// predicate fired where it could not have.
     ResponseEditForged,
+    /// A `200` this proxy answered as the final recipient of an
+    /// `OPTIONS` (#240) carried no `Allow`, or one naming methods this
+    /// hop does not offer — which is the whole of what the answer was
+    /// asked for.
+    AllowMissing,
     /// A response this proxy originated arrived without the `Date` and
     /// `Server` lines RFC 9110 §6.6.1 requires of it (#234) — or with a
     /// `Date` still holding the un-stamped placeholder, which is the
@@ -497,6 +502,16 @@ pub fn Client(comptime IoType: type) type {
                         return walk;
                     }
                 }
+                // The #240 oracle: a final-recipient answer's whole
+                // content is what it says about this hop, so a `200` that
+                // reached the client without an exact `Allow` answered
+                // the question with nothing.
+                if (response.status == 200 and entry.answered_here) {
+                    if (!headerEquals(response.headers, "Allow", parser.allow_value)) {
+                        walk.violation = ClientError.AllowMissing;
+                        return walk;
+                    }
+                }
                 // The #180 oracle, and the mirror of the redirect check
                 // above: §7 lets the participating `Upgrade` survive
                 // hop-by-hop stripping precisely so the client is told
@@ -555,7 +570,8 @@ pub fn Client(comptime IoType: type) type {
             // is sent from immutable memory and never crosses the
             // response render, so the stamp on one would mean a
             // configured body had grown filter edits.
-            const from_memory = pageBodyFor(entry, response.status) != null;
+            const from_memory = pageBodyFor(entry, response.status) != null or
+                (response.status == 200 and entry.answered_here);
             if (response.status == 200 and !from_memory) {
                 if (!stamped) {
                     return ClientError.ResponseEditMissing;
@@ -591,7 +607,8 @@ pub fn Client(comptime IoType: type) type {
         /// raised — the §8 ladder's, a filter's reject, a redirect.
         fn dateViolation(entry: Spec, response: *const parser.ResponseHead) ?ClientError {
             assert(response.status >= 100);
-            const from_memory = pageBodyFor(entry, response.status) != null;
+            const from_memory = pageBodyFor(entry, response.status) != null or
+                (response.status == 200 and entry.answered_here);
             const forwarded = !from_memory and
                 (response.status == 200 or response.status == 101);
             const stamped_server = headerEquals(response.headers, "Server", "zoxy");
@@ -644,11 +661,13 @@ pub fn Client(comptime IoType: type) type {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
-            // Same rule as the #175 stamp, one mechanism over: a page
-            // reaches no origin and runs no response render, so a
-            // cookie on one would be the stamp path firing for an
-            // exchange that never happened.
-            if (response.status != 200 or pageBodyFor(entry, response.status) != null) {
+            // Same rule as the #175 stamp, one mechanism over: an answer
+            // this proxy raised itself — a configured page (#159) or the
+            // final-recipient `OPTIONS` (#240) — reaches no origin and
+            // runs no response render, so a cookie on one would be the
+            // stamp path firing for an exchange that never happened.
+            const raised_here = pageBodyFor(entry, response.status) != null or entry.answered_here;
+            if (response.status != 200 or raised_here) {
                 if (named) return ClientError.StickyStampForged;
                 return null;
             }
@@ -776,6 +795,16 @@ pub fn Client(comptime IoType: type) type {
                         }
                         return prefixVerdict(body, expected, @intCast(length));
                     }
+                    // The #240 final-recipient answer: the one 200 in the
+                    // sweep that is neither an origin's canonical body nor
+                    // a configured page's, because "stop here and describe
+                    // yourself" is answered in headers alone.
+                    if (response.status == 200 and entry.answered_here) {
+                        if (length != 0) {
+                            return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
+                        }
+                        return .{ .body_len = 0, .violation = null };
+                    }
                     if (response.status == 200) {
                         if (length != canon.sized_body.len) {
                             return .{ .body_len = 0, .violation = ClientError.ResponseBodyCorrupted };
@@ -791,13 +820,13 @@ pub fn Client(comptime IoType: type) type {
                 // renders it that way — so either streaming framing on
                 // one is the render inventing a shape.
                 .chunked => {
-                    if (response.status != 200 or page_body != null) {
+                    if (response.status != 200 or page_body != null or entry.answered_here) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
                     }
                     return prefixVerdict(body, canon.chunked_wire, canon.chunked_wire.len);
                 },
                 .until_close => {
-                    if (response.status != 200 or page_body != null) {
+                    if (response.status != 200 or page_body != null or entry.answered_here) {
                         return .{ .body_len = 0, .violation = ClientError.ResponseCorrupted };
                     }
                     // The FIN delimits this body, so it is transcript-

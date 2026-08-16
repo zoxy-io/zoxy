@@ -6,6 +6,8 @@
 
 const std = @import("std");
 
+const parser = @import("http/parser.zig");
+
 const assert = std.debug.assert;
 
 /// Whether the downstream connection survives a static response. `close`
@@ -79,6 +81,34 @@ fn staticTemplate(comptime status: u16, comptime persistence: Persistence) Templ
     };
 }
 
+/// The `200` this proxy answers an `OPTIONS` with when it becomes the
+/// final recipient — a `Max-Forwards: 0` that stops here (RFC 9110
+/// §7.6.2, #240).
+///
+/// It sits beside the error statuses rather than among them: the closed
+/// set above is refusals, and this is the opposite — a request answered
+/// on its own terms, by the hop the client asked about. `Allow` is the
+/// answer's whole content, since "stop here and describe yourself" is
+/// what a zero budget means, and it names this proxy rather than the
+/// origin's resource because the origin was deliberately never asked.
+fn optionsTemplate(comptime persistence: Persistence) Template {
+    const prefix = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" ++
+        "Allow: " ++ parser.allow_value ++ "\r\nDate: ";
+    const suffix = "\r\n" ++ server_line ++ switch (persistence) {
+        .keep => "",
+        .close => "Connection: close\r\n",
+    } ++ "\r\n";
+    return .{
+        .bytes = prefix ++ date_placeholder ++ suffix,
+        .date_offset = prefix.len,
+    };
+}
+
+const options_templates: [2]Template = .{
+    optionsTemplate(.keep),
+    optionsTemplate(.close),
+};
+
 /// The widest static response any status and persistence can render to,
 /// which is what one table slot must hold. Comptime, so the table is
 /// sized by the responses themselves rather than by a guess that a new
@@ -91,6 +121,13 @@ pub const static_response_bytes_max: u32 = blk: {
             if (template.bytes.len > widest) {
                 widest = @intCast(template.bytes.len);
             }
+        }
+    }
+    // The OPTIONS answer shares the table's slot width, and being the one
+    // response carrying an `Allow` it is the one that sets it.
+    for (options_templates) |template| {
+        if (template.bytes.len > widest) {
+            widest = @intCast(template.bytes.len);
         }
     }
     break :blk widest;
@@ -150,6 +187,11 @@ pub const StaticResponse = struct {
 /// no submitted send is reading them.
 pub const StaticTable = struct {
     storage: [static_statuses.len][2][static_response_bytes_max]u8,
+    /// The #240 `OPTIONS` final-recipient answer, in the same writable
+    /// memory and under the same `Date` rule. A field of its own because
+    /// it is the one static this proxy sends that is not a refusal, so it
+    /// has no place in a table keyed by `static_statuses`.
+    options: [2][static_response_bytes_max]u8,
 
     pub fn init(table: *StaticTable) void {
         for (&table.storage, 0..) |*variants, index| {
@@ -159,6 +201,22 @@ pub const StaticTable = struct {
                 @memcpy(slot[0..template.bytes.len], template.bytes);
             }
         }
+        for (&table.options, 0..) |*slot, persistence| {
+            const template = options_templates[persistence];
+            assert(template.bytes.len <= slot.len);
+            @memcpy(slot[0..template.bytes.len], template.bytes);
+        }
+    }
+
+    /// The #240 answer for one persistence choice.
+    pub fn getOptions(table: *StaticTable, persistence: Persistence) StaticResponse {
+        const template = options_templates[@intFromEnum(persistence)];
+        const slot = &table.options[@intFromEnum(persistence)];
+        assert(template.date_offset + date_bytes <= template.bytes.len);
+        return .{
+            .bytes = slot[0..template.bytes.len],
+            .date = slot[template.date_offset..][0..date_bytes],
+        };
     }
 
     /// Write `date` into every slot at once — what startup does, so no
@@ -168,6 +226,9 @@ pub const StaticTable = struct {
             for ([_]Persistence{ .keep, .close }) |persistence| {
                 @memcpy(table.get(status, persistence).date, date);
             }
+        }
+        for ([_]Persistence{ .keep, .close }) |persistence| {
+            @memcpy(table.getOptions(persistence).date, date);
         }
     }
 
@@ -470,7 +531,6 @@ test "shed: every static response parses as a valid bodiless head" {
     // Round-trip through zoxy's own parser: each response must be a
     // complete, correctly framed head whose persistence matches the
     // requested one — the same verdict a strict client would reach.
-    const parser = @import("http/parser.zig");
     var table: StaticTable = undefined;
     table.init();
     // A real date, so the head under test is the one that ships rather
@@ -489,5 +549,25 @@ test "shed: every static response parses as a valid bodiless head" {
             try std.testing.expectEqual(persistence == .keep, head.keep_alive);
             try std.testing.expectEqual(@as(u32, @intCast(bytes.len)), head.head_len);
         }
+    }
+    // The #240 answer shares the table's memory and the same contract,
+    // so it is held to the same round trip — including the `keep`
+    // variant, which no directed test spells out byte for byte. It
+    // differs in exactly two ways, and both are checked: a `200` rather
+    // than a refusal, and an `Allow` that is the whole of what a
+    // final-recipient answer has to say.
+    inline for ([_]Persistence{ .keep, .close }) |persistence| {
+        formatHttpDate(1_577_836_800, table.getOptions(persistence).date);
+        const bytes = table.getOptions(persistence).bytes;
+        var storage: parser.HeaderStorage = undefined;
+        const head = try parser.parseResponseHead(bytes, false, &storage, .options);
+        try std.testing.expectEqual(@as(u16, 200), head.status);
+        try std.testing.expectEqual(parser.BodyFraming{ .content_length = 0 }, head.framing);
+        try std.testing.expectEqual(persistence == .keep, head.keep_alive);
+        try std.testing.expectEqual(@as(u32, @intCast(bytes.len)), head.head_len);
+        try std.testing.expectEqualStrings(
+            parser.allow_value,
+            parser.headerValue(head.headers, "allow").?,
+        );
     }
 }

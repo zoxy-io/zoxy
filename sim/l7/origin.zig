@@ -260,6 +260,25 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 return !std.mem.eql(u8, host, canon.overridden_host);
             }
 
+            /// RFC 9110 §7.6.2 seen from the far end (#240): whatever
+            /// budget a request arrived with, the one this origin reads
+            /// is a hop shorter — and a `TRACE` never arrives at all,
+            /// because §7 answers it rather than forwarding it.
+            ///
+            /// The exact value is checkable because one script sends the
+            /// header and the numbers are canon's: a proxy forwarding it
+            /// verbatim shows the sent value, one dropping it shows none,
+            /// and either is a rule this hop did not apply.
+            fn forwardedSpentAHop(conn: *Conn, request: *const parser.RequestHead) bool {
+                _ = conn;
+                if (request.method == .trace) {
+                    return false;
+                }
+                const budget = parser.headerValue(request.headers, "max-forwards") orelse
+                    return true;
+                return std.mem.eql(u8, budget, canon.max_forwards_forwarded);
+            }
+
             /// Returns true when the head is parsed and the phase moved
             /// on; false when it armed a recv or closed on a violation.
             fn parseHead(conn: *Conn) bool {
@@ -313,6 +332,11 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 // script because only one can produce either shape, which
                 // makes a blanket check an exact one.
                 if (!conn.forwardedNamesOneAuthority(&request)) {
+                    conn.origin.violations += 1;
+                    conn.close();
+                    return false;
+                }
+                if (!conn.forwardedSpentAHop(&request)) {
                     conn.origin.violations += 1;
                     conn.close();
                     return false;

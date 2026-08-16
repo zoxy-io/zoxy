@@ -913,6 +913,41 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   one matches only the any-host routes; config hosts must themselves be
   canonical (rejected at load otherwise), so a request host compares
   byte-for-byte against them.
+- **`TRACE` is refused, and `Max-Forwards` is spent** (#240). RFC 9110
+  §7.6.2 is one of the few places the spec names intermediaries
+  directly: a hop in an `OPTIONS` or `TRACE` chain MUST check the
+  budget, MUST answer as the final recipient at zero, and MUST forward
+  its own decrement otherwise.
+  `TRACE` closes half of it by being refused outright — `501`, the
+  answer `CONNECT` already earns and for a related reason. Reflecting a
+  request back is the Cross-Site Tracing vector, and a gateway has
+  nothing truthful to reflect anyway: by the time the echo returned, the
+  request line would have been rewritten, the hop-by-hop headers
+  stripped and an `X-Forwarded-For` added, so what came back would not
+  be the message the client sent. Refusing it makes this proxy the final
+  recipient of every `TRACE` chain unconditionally.
+  That leaves `OPTIONS`, where the budget is read and spent. Zero is
+  answered here — `200` with an `Allow` naming *this hop*, since "stop
+  here and describe yourself" is what a zero budget means and the origin
+  is deliberately never dialled — and anything higher travels
+  decremented. The value is checked before any resource is acquired, so
+  a budget that ran out costs no origin connection.
+  The field is read for `OPTIONS` alone. RFC 9110 lets a recipient
+  ignore it elsewhere, and reading it everywhere would let a garbage
+  value on a `POST` reject a request the spec never asked this proxy to
+  look at. Where it *is* read, an unparseable or duplicated budget is a
+  `400`: two readings of one number is not something to guess between.
+  Decrementing means **rewriting a header's value**, which the §7 render
+  could not do — filter edits write constants by design. `Max-Forwards`
+  therefore becomes the second header this proxy writes on the client's
+  behalf, on `X-Forwarded-For`'s pattern: a parser tag, suppression of
+  the inbound copy by tag during the render, one computed value
+  appended, and the name barred from filter edits so a rule cannot
+  restate a number that must count down.
+  Both references ignore this requirement entirely. That is a reason to
+  weigh it, not to skip it: §12 exists so a MUST is a decision written
+  down, and this one was cheap enough that recording a deviation would
+  have cost more argument than the code.
 - **An absolute-form target names its own authority, and that authority
   wins** (#233). RFC 9112 §3.2.2 makes accepting `GET
   http://api.example/v2/x HTTP/1.1` a MUST for a server, and it arrives
@@ -2227,7 +2262,7 @@ is a trap rather than a synonym.
 
 | spec | what binds a gateway | here |
 |---|---|---|
-| **9110** Semantics | §3.7 roles; §4.2.3 host comparison; §5.6.7 date format; §6.6.1 `Date`; §7.6.1 hop-by-hop; §7.6.2 `Max-Forwards`; §7.6.3 `Via`; §15.2.1 `100 Continue` | §7, §8's `Date`, with two deviations below |
+| **9110** Semantics | §3.7 roles; §4.2.3 host comparison; §5.6.7 date format; §6.6.1 `Date`; §7.6.1 hop-by-hop; §7.6.2 `Max-Forwards`; §7.6.3 `Via`; §10.2.1 `Allow`; §15.2.1 `100 Continue` | §7, §8's `Date`, with one deviation below |
 | **9112** HTTP/1.1 | §3.2 target forms; §6.3 body length; §7 transfer codings; §9 connection management | §7 framing, §8 close announcement |
 | **6585** additional statuses | defines `429` and `431` — **9110 did not absorb these**, the registry still points here | §8's static set |
 | **8297** early hints | defines `103` | §7's interim relay (#232) |
@@ -2261,13 +2296,14 @@ header because that is what origins read. And the **PROXY protocol**
 pins its two writers to its parser by round-trip test: there is no
 independent text to be conformant *to*.
 
-**The deviations.** Two requirements this proxy does not meet today.
-The first is settled; the second is open, and the issue is where that
-decision is being taken rather than here. Two left this list together:
-absolute-form request-targets (9112 §3.2.2) with #233 — §7 states what
-their authority does to the `Host` beside them — and the missing `Date`
-(9110 §6.6.1) with #234, which §8 states, along with what carrying one
-costs a response that used to be immutable.
+**The deviation.** One requirement this proxy does not meet today, and
+it is settled rather than open. Three left this list in quick
+succession: absolute-form request-targets (9112 §3.2.2) with #233 — §7
+states what their authority does to the `Host` beside them — the missing
+`Date` (9110 §6.6.1) with #234, which §8 states along with what carrying
+one costs a response that used to be immutable, and `Max-Forwards`
+(§7.6.2) with #240, which §7 states beside the `TRACE` refusal that
+closed the other half of it.
 
 - **`Via` is not sent** (9110 §7.6.3, a MUST for intermediaries). The
   cost is real and worth naming: a request that loops through this proxy
@@ -2277,11 +2313,6 @@ costs a response that used to be immutable.
   is absent from the chains this proxy actually sits in, and emitting it
   alone would add a field no downstream reads. It returns as a decision
   if a deployment ever needs loop detection this proxy can see.
-- **`Max-Forwards` is ignored and `TRACE` is forwarded** (§7.6.2, two
-  MUSTs) — #240. Refusing `TRACE` closes half of it for one predicate;
-  the remaining `OPTIONS` half needs a header whose value this proxy
-  *computes*, which the render machinery has exactly one instance of
-  (`X-Forwarded-For`) and no general mechanism for.
 
 **There is no conformance suite**, official or otherwise, and §9's gates
 are internal by construction — the fuzzer asserts *this* parser never
