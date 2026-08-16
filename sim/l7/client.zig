@@ -60,6 +60,11 @@ pub const ClientError = error{
     /// hop does not offer — which is the whole of what the answer was
     /// asked for.
     AllowMissing,
+    /// A hop-by-hop header the origin sent survived the hop (RFC 9110
+    /// §7.6.1, §7): `Keep-Alive`, the header the origin's `Connection`
+    /// nominated, or a `Connection` carrying anything but this proxy's own
+    /// close announcement.
+    ResponseHopByHopLeaked,
     /// A response this proxy originated arrived without the `Date` and
     /// `Server` lines RFC 9110 §6.6.1 requires of it (#234) — or with a
     /// `Date` still holding the un-stamped placeholder, which is the
@@ -488,6 +493,10 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = violation;
                     return walk;
                 }
+                if (hopByHopViolation(&response)) |violation| {
+                    walk.violation = violation;
+                    return walk;
+                }
                 if (stickyViolation(connection, entry, &response)) |violation| {
                     walk.violation = violation;
                     return walk;
@@ -583,6 +592,44 @@ pub fn Client(comptime IoType: type) type {
             }
             if (headerPresent(response.headers, canon.response_never_name)) {
                 return ClientError.ResponseEditForged;
+            }
+            return null;
+        }
+
+        /// The §7 strip oracle over one parsed response head: nothing the
+        /// origin sent as hop-by-hop may reach the client.
+        ///
+        /// The sized origin answers with `Keep-Alive`, a `Connection` that
+        /// both is hop-by-hop itself and nominates a third header, and that
+        /// nominated header (`canon.hop_by_hop_lines`). Two of the three can
+        /// be demanded absent outright: this proxy writes no header called
+        /// either, so a sighting can only be a forward.
+        ///
+        /// `Connection` needs the narrower rule, because it is the one such
+        /// name this proxy writes itself — to announce a close (§7), which
+        /// several scripts earn. So any value but `close` is a leak: the
+        /// origin's `keep-alive` above all, which is what a verbatim
+        /// forward produces. A `101` is exempt and checked elsewhere
+        /// (`UpgradePairMissing`): there the participating pair travels on
+        /// purpose, which is §7's one hop-by-hop exemption (#180).
+        fn hopByHopViolation(response: *const parser.ResponseHead) ?ClientError {
+            assert(response.status >= 100);
+            assert(response.headers.len <= zoxy.constants.headers_max);
+            if (response.status == 101) return null;
+            if (headerPresent(response.headers, "Keep-Alive")) {
+                return ClientError.ResponseHopByHopLeaked;
+            }
+            if (headerPresent(response.headers, canon.hop_nominated_header)) {
+                return ClientError.ResponseHopByHopLeaked;
+            }
+            // Every `Connection` line, not the first: a leaked one and this
+            // proxy's own announcement can both be present, and which lands
+            // first is the renderer's business rather than this oracle's.
+            for (response.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+                if (!std.ascii.eqlIgnoreCase(header.value, "close")) {
+                    return ClientError.ResponseHopByHopLeaked;
+                }
             }
             return null;
         }

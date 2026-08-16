@@ -19,9 +19,32 @@ pub const log_request_value = "sim-trace-1";
 pub const log_response_header = "x-sim-origin";
 pub const log_response_value = "sized";
 
+/// The hop-by-hop headers the sized origin answers with, and the one it
+/// nominates through `Connection` (RFC 9110 §7.6.1, §7). All three must
+/// die at this hop: two because they are hop-by-hop by name, the third
+/// because the connection option names it.
+///
+/// They ride the *canonical* response rather than a script of their own so
+/// that every seed, every schedule and both populations exercise the strip
+/// — and because a response whose headers are all removed leaves the
+/// client's bytes exactly as they were, so this costs no other oracle a
+/// change. The nominated name is lowercase on the wire and matched
+/// case-insensitively, so a proxy that only strips the spelling it was
+/// sent still fails.
+///
+/// The gap this closes was found by measurement, not review: a build that
+/// forwarded the origin's response head verbatim — hop-by-hop headers
+/// included — passed `zig build ci` in full, 4096 seeds and the live gate,
+/// because nothing here had ever sent one.
+pub const hop_nominated_header = "x-sim-nominated";
+pub const hop_by_hop_lines = "Connection: keep-alive, " ++ hop_nominated_header ++ "\r\n" ++
+    "Keep-Alive: timeout=5\r\n" ++
+    hop_nominated_header ++ ": dropme\r\n";
+
 pub const sized_body = "canonical-sized-response-body-00";
 pub const sized_head = "HTTP/1.1 200 OK\r\nContent-Length: 32\r\n" ++
-    log_response_header ++ ": " ++ log_response_value ++ "\r\n\r\n";
+    log_response_header ++ ": " ++ log_response_value ++ "\r\n" ++
+    hop_by_hop_lines ++ "\r\n";
 pub const sized_response = sized_head ++ sized_body;
 pub const chunked_wire = "10\r\nchunked-body-16b\r\n0\r\n\r\n";
 pub const chunked_head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -121,8 +144,20 @@ pub const interim_continue = "HTTP/1.1 100 Continue\r\n\r\n";
 pub const interim_hints = "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n";
 
 comptime {
+    // The scans below walk whole heads at comptime; the default quota is
+    // spent before the last of them finishes.
+    @setEvalBranchQuota(20_000);
     assert(sticky_tag.len == 16);
     assert(sized_body.len == 32);
+    // The strip oracle is only as good as what the origin actually sends:
+    // pin all three lines here so a tidy-up of `sized_head` that drops one
+    // fails the build rather than quietly retiring a check.
+    assert(std.mem.indexOf(u8, sized_head, "Connection: keep-alive") != null);
+    assert(std.mem.indexOf(u8, sized_head, "Keep-Alive: timeout=5") != null);
+    assert(std.mem.indexOf(u8, sized_head, hop_nominated_header ++ ": dropme") != null);
+    // The connection option must name the third header, or it is stripped
+    // for being unknown rather than for being nominated.
+    assert(std.mem.indexOf(u8, sized_head, "keep-alive, " ++ hop_nominated_header) != null);
     assert(chunked_wire[0] == '1' and chunked_wire[1] == '0');
     assert(chunked_wire.len == 4 + 16 + 2 + 5);
     assert(oversize_head.len == 8190);
