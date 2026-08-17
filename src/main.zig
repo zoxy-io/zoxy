@@ -5,6 +5,13 @@
 //! sigaction allowlist by lint), then hand the process to the event loop
 //! until a drain completes. `--help` and `--version` are answered before any
 //! of that and exit immediately.
+//!
+//! This file is the *application* — the CLI, the filesystem, and the two
+//! process-level syscalls. Everything an embedder would need identically
+//! is the library's (§13): the budget's closed form and banner live in
+//! `budget.zig`, the serving path in `Server`. What is left here is what
+//! only a program owning a process may do — raise a resource limit,
+//! install a signal disposition, decide what argv means.
 
 const std = @import("std");
 
@@ -13,6 +20,7 @@ const build_options = @import("build_options");
 
 const XevIo = zoxy.Io.XevIo;
 const ServerXev = zoxy.Server(XevIo);
+const BudgetXev = zoxy.Budget(XevIo);
 
 const assert = std.debug.assert;
 
@@ -128,40 +136,27 @@ pub fn main(init: std.process.Init) !void {
     server.dumpMetrics();
 }
 
-/// The §5/§8 startup budget gauntlet: fds and the ring are sized to the
-/// *effective* config, not the compiled ceilings — a lean deployment
-/// neither demands the c10k RLIMIT_NOFILE nor asks the kernel for a
-/// 65536-deep ring. Derives both demands, raises RLIMIT_NOFILE to the
-/// fd one, prints the banner, and returns the CQ depth the ring must be
+/// The §5/§8 startup budget gauntlet. The closed form and the banner are
+/// the library's (`budget.zig`, §13) — they have to price exactly what
+/// `Server.init` reserves, and a second derivation here would be a copy
+/// that could drift. What stays is what only an application may do: raise
+/// `RLIMIT_NOFILE` to the demand. Returns the CQ depth the ring must be
 /// created with.
 fn resolveBudgets(
     config: *const zoxy.config.Config,
     config_arena_bytes: u64,
 ) !u32 {
-    const listeners_count: u32 = @intCast(config.listeners.len);
-    assert(listeners_count >= 1);
-    const access_log_files: u32 = if (config.access_log_sink) |sink|
-        @intFromBool(sink == .file)
-    else
-        0;
-    const fds_required = zoxy.constants.fdsRequired(
-        config.limits.conn_slots,
-        config.limits.upstream_slots,
-        listeners_count,
-        access_log_files,
-    );
-    const cq_entries = zoxy.constants.completionQueueDepthFor(
-        config.limits.conn_slots,
-        config.limits.upstream_slots,
-        listeners_count,
-        config.limits.cq_fill_eighths,
-    );
-    // The effective config never exceeds the compiled ceilings (§8): the
-    // pools, the ring, and the fd demand all fit what the constants proved.
-    assert(cq_entries <= zoxy.constants.completion_queue_entries);
-    try ensureFdBudget(fds_required);
-    printBudgets(config, fds_required, cq_entries, config_arena_bytes);
-    return cq_entries;
+    assert(config.listeners.len >= 1);
+    const demands = BudgetXev.demandsFor(config);
+    try ensureFdBudget(demands.fds);
+    BudgetXev.print(config, demands, config_arena_bytes, .{
+        .version = build_options.version,
+        .id_suffix = build_id_suffix,
+    });
+    // What the ring is created with, so a zero would be a loop that can
+    // complete nothing — the closed form broke upstream of here.
+    assert(demands.cq_entries > 0);
+    return demands.cq_entries;
 }
 
 /// The §8 access-log sink as the fd `XevIo` will write: the inherited
@@ -464,193 +459,6 @@ fn ensureFdBudget(fds_required: u32) !void {
     }
     limits.cur = required;
     try std.posix.setrlimit(.NOFILE, limits);
-}
-
-/// The §5 pool-size vector for the effective config — split from
-/// `printBudgets` for the length limit, and so the composition reads as
-/// one thing: every term the closed form takes, sourced from the limit
-/// or `@sizeOf` that owns it.
-fn poolSizesFor(config: *const zoxy.config.Config) zoxy.constants.PoolSizes {
-    const limits = config.limits;
-    const UpstreamType = zoxy.UpstreamPool(XevIo).Upstream;
-    // The head-sized side buffers (§5): Server owns the closed form and
-    // asserts its own allocations against it, so printing it here cannot
-    // drift from what init actually reserves.
-    const head_scratch_bytes = ServerXev.headScratchBytes(limits);
-    assert(head_scratch_bytes >= limits.head_buffer_bytes);
-    return .{
-        .conn_slots = limits.conn_slots,
-        .conn_bytes = @sizeOf(ServerXev.ConnType),
-        .relay_buffers = limits.relay_buffers,
-        .relay_buffer_pair_bytes = @sizeOf(zoxy.RelayBuffer),
-        .upstream_slots = limits.upstream_slots,
-        .upstream_bytes = @sizeOf(UpstreamType),
-        .access_log_bytes = zoxy.constants.accessLogBytes(limits.access_log_buffer_bytes),
-        .log_header_bytes = ServerXev.logHeaderBytes(config, limits.conn_slots),
-        .endpoint_table_bytes = ServerXev.endpointTableBytes(config),
-        .metrics_bytes = ServerXev.metricsBytes(config),
-        .head_buffers = limits.head_buffers,
-        .head_buffer_bytes = limits.head_buffer_bytes,
-        .upstream_head_buffers = limits.upstream_head_buffers,
-        // The pool element (the free-list header and the slab slice) plus
-        // its share of the slab itself.
-        .upstream_head_buffer_bytes = @sizeOf(zoxy.UpstreamHeadBuffer) + limits.head_buffer_bytes,
-        .head_scratch_bytes = head_scratch_bytes,
-        // Zero unless a listener allows an upgrade, on the same terms as
-        // the TLS terms below: a feature nobody asked for costs nothing.
-        // Same element as a shared relay buffer, reserved apart from it
-        // (§5) — the point of the pool, not an accident of it.
-        .tunnels = limits.tunnels,
-        .tunnel_buffer_pair_bytes = if (limits.tunnels == 0)
-            0
-        else
-            @sizeOf(zoxy.RelayBuffer),
-        // Zero unless a listener terminates TLS, which is what makes the
-        // whole feature free to a deployment that did not ask for it. The
-        // three terms move together: `limits.tls_engines` is zero exactly
-        // when no listener has a `tls` block.
-        .tls_engines = limits.tls_engines,
-        .tls_engine_bytes = if (limits.tls_engines == 0) 0 else @sizeOf(zoxy.tls.Engine),
-        .tls_plaintext_bytes = if (limits.tls_engines == 0)
-            0
-        else
-            zoxy.tls.Engine.plaintextBytesFor(limits.head_buffer_bytes),
-        // The whole compiled reservation, not this config's share of it:
-        // the storage is one static array sized at `tls_engines_max` (it
-        // must outlive the arena — see `libcrypto_heap_storage`), so that
-        // is what the process holds for its life whatever `tls_engines`
-        // says, and §5 prices what is held.
-        .libcrypto_heap_bytes = if (limits.tls_engines == 0)
-            0
-        else
-            zoxy.constants.libcrypto_heap_bytes,
-    };
-}
-
-/// The §5 banner, to **stderr**: the banner is diagnostics, and stdout
-/// belongs to the data an operator may point there — the access log's
-/// `stdout` sink must stay one uncontaminated JSON line per event.
-/// Stderr is where the counter dump already goes, and via the same
-/// `std.debug.print` plain-write path, so the two interleave whole-lines
-/// even when both land in one redirected file (a positional writer here
-/// would be silently overwritten by the dump's shared-offset writes).
-fn printBudgets(
-    config: *const zoxy.config.Config,
-    fds_required: u32,
-    cq_entries: u32,
-    /// What the config text and its parsed structures took from the
-    /// startup arena, measured (§5). Not closed-form like the pools —
-    /// it is whatever the operator's config file needed — which is
-    /// exactly why it is reported rather than derived.
-    config_arena_bytes: u64,
-) void {
-    const constants = zoxy.constants;
-    // Every budget reflects the *effective* config (§5, §8): the config may
-    // shrink the pools, the fd demand, and the requested ring below the
-    // compiled ceilings, and all three are shown as actually sized.
-    const limits = config.limits;
-    const in_flight = constants.inFlightOps(
-        limits.conn_slots,
-        limits.upstream_slots,
-        @intCast(config.listeners.len),
-    );
-    const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
-    const sizes = poolSizesFor(config);
-    // §5's promise is that the printed total covers everything this
-    // process holds for its life. The config arena qualifies — it is
-    // never freed — so it joins the total even though it is the one term
-    // measured rather than derived from constants.
-    const memory_total = constants.memoryBytesTotal(&sizes) + config_arena_bytes;
-    // A banner that could print a zero total or zero fd demand would be
-    // reporting a proxy that reserved nothing — the closed form broke.
-    assert(memory_total > 0);
-    assert(fds_required > 0);
-    printMemoryBanner(config, &sizes, memory_total, access_log_bytes, config_arena_bytes);
-    std.debug.print(
-        \\  fds     {d} required (asserted against RLIMIT_NOFILE)
-        \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
-        \\  config  {d} listener(s), {d} cluster(s), {d} error page(s), access log {s}
-        \\
-    , .{
-        fds_required,
-        constants.ring_entries,
-        cq_entries,
-        in_flight,
-        config.listeners.len,
-        config.clusters.len,
-        // Their rendered bytes live in the config arena term above —
-        // read and pre-rendered at load (#159), so the measured number
-        // already covers them; this count is what says why it grew.
-        config.error_pages.len,
-        if (config.access_log_sink) |sink| @tagName(sink) else "off",
-    });
-}
-
-/// The banner's version and memory lines — the §5 closed form itemized.
-/// Split from `printBudgets` for the length limit; the two prints are
-/// sequential same-thread writes to stderr, so nothing interleaves.
-fn printMemoryBanner(
-    config: *const zoxy.config.Config,
-    sizes: *const zoxy.constants.PoolSizes,
-    memory_total: u64,
-    access_log_bytes: u64,
-    config_arena_bytes: u64,
-) void {
-    assert(memory_total > 0);
-    assert(config.listeners.len >= 1);
-    const limits = config.limits;
-    // The version leads, because this banner is what a bug report pastes
-    // and `--version` is what it does not think to run.
-    std.debug.print(
-        \\zoxy {s}{s}
-        \\budgets (DESIGN.md §5/§8; closed-form except where marked):
-        \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
-        \\          + upstream slots {d} x {d} B + head buffers {d} x {d} B (+ ring {d} B)
-        \\          + upstream head buffers {d} x {d} B + head scratch {d} B
-        \\          + access log {d} KiB (+ logged headers {d} B)
-        \\          + endpoint tables {d} B ({d} cluster(s) x {d} wide)
-        \\          + labeled metrics {d} B (tables, labels and render buffers)
-        \\          + tunnels {d} x {d} B (their own relay buffers, never HTTP's)
-        \\          + tls engines {d} x {d} B (+ plaintext {d} B each, libcrypto heap {d} KiB)
-        \\          + config arena {d} KiB (measured, not closed-form)
-        \\
-    , .{
-        build_options.version,
-        build_id_suffix,
-        memory_total / 1024,
-        limits.conn_slots,
-        @sizeOf(ServerXev.ConnType),
-        limits.relay_buffers,
-        @sizeOf(zoxy.RelayBuffer),
-        limits.upstream_slots,
-        sizes.upstream_bytes,
-        limits.head_buffers,
-        // The +1 ownership byte stays out of the banner's per-unit figure;
-        // the closed-form total above carries it.
-        limits.head_buffer_bytes,
-        zoxy.constants.bufferGroupDescriptorBytes(limits.head_buffers),
-        limits.upstream_head_buffers,
-        sizes.upstream_head_buffer_bytes,
-        sizes.head_scratch_bytes,
-        access_log_bytes / 1024,
-        sizes.log_header_bytes,
-        ServerXev.endpointTableBytes(config),
-        config.clusters.len,
-        ServerXev.endpointKeysFor(config).stride,
-        ServerXev.metricsBytes(config),
-        // Both read zero unless a listener allows an upgrade — printed
-        // rather than omitted, on the same terms as the TLS line below.
-        limits.tunnels,
-        sizes.tunnel_buffer_pair_bytes,
-        // All four read zero on a plaintext deployment, which is the line
-        // saying "you are not paying for this" rather than omitting itself
-        // and leaving the reader to wonder.
-        limits.tls_engines,
-        sizes.tls_engine_bytes,
-        sizes.tls_plaintext_bytes,
-        sizes.libcrypto_heap_bytes / 1024,
-        config_arena_bytes / 1024,
-    });
 }
 
 fn installSignalHandlers() void {

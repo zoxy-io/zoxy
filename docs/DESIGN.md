@@ -2185,9 +2185,11 @@ data path" from prose into CI.
 
 ```
 src/
-  main.zig            // startup: config → reserve pools → print memory → run loop
+  main.zig            // the application: argv, files, rlimit, signals, run loop
   Server.zig          // composition root: pools, listeners, admission, teardown;
                       // generic over Io so the simulator instantiates it whole
+  budget.zig          // §5/§8 closed form: pool sizes, fd and ring demands, banner;
+                      // generic over Io like Server, so an embedder inherits it (§13)
   constants.zig       // every static limit; pool memory is f(these)
   config.zig          // strict JSON → arena-owned immutable Config
   io/
@@ -2324,3 +2326,56 @@ and proxies and diffs the parses; it is how most of the recent
 request-smuggling class was found, and it tests exactly the property
 §7's strictness claims. h2spec answers the same question for #173 and
 arrives with it.
+
+## 13. Embedding — the library seam
+
+zoxy is a Zig module before it is a binary, and that is not an
+aspiration: `build.zig` publishes `zoxy`, and the serving path takes a
+`Config` **struct**, never a config *file*. `Server(Io).init` is handed
+`*const Config`, so JSON is one way to produce one and not the only way.
+
+The seam already carries its own proof. `sim/Harness.zig` builds a
+`Config` field by field from a seeded PRNG — listeners, clusters, picks,
+filters, TLS, error pages — and instantiates `Server(SimIo)` whole, with
+no JSON anywhere; the directed suites do the same over `SimIo`, and
+`main.zig` does it over `XevIo`. §9's entire claim rests on that being a
+real seam rather than a described one: the simulator runs the *real*
+data path because it is an embedder.
+
+**What the module offers** is what `src/root.zig` exports: `config.Config`
+and its loader, `Server(Io)`, `Budget(Io)` (§5's closed form, the fd and
+ring demands, the banner), the `Io` seam with both backends, and the
+parsing/rendering/routing pieces the phases are built from. `Server`
+carries many other `pub` declarations; those are module visibility for
+`http/proxy.zig` and `shed.zig`, not surface — pool acquires and static-
+send claims are mechanics an embedder has no business holding.
+
+**What stays in `main.zig` is the application**, and the split is drawn
+at what only a program owning a process may do: interpret argv, read the
+filesystem, raise `RLIMIT_NOFILE`, install signal dispositions. That is
+also why the fd-boundary lint's allowlist (§9) still names exactly one
+file. `Budget` moved out from under it because the closed form has to
+price precisely what `Server.init` reserves — a second derivation in an
+embedder's tree would break §5's promise while still looking right —
+whereas an `rlimit` call is twelve lines an application should own.
+
+**Extension stays compile-time**, which §7 already states as the phase
+model: `admit`, `route`, `upstream_pick`, `settle` are plain calls into
+the owning modules, and programmability means adding a Zig function
+there, not registering a callback. A runtime hook seam is deliberately
+**not** offered, and the reasons are this document's own promises rather
+than taste. §1's zero-allocation guarantee is proven by a gate over
+*this* code, and a hook can allocate. §9's coverage census — every
+counter fired at least once across a sweep — is a claim about the
+simulator's build, which an embedder's is not. TIGER_STYLE's bounded
+loops and assertion density do not cross a seam either. Pingora makes
+the opposite trade and is right to: it has years of production
+consumers, and it does not promise what §1 promises.
+
+So the seam is **published, not frozen**. There is no external consumer
+yet, and #173 will change the exchange model from one request per
+connection to multiplexed streams — the exact internal shape a stability
+promise would pin. Naming it here is what stops it being rediscovered,
+not a commitment that it cannot move. The related idea — specializing a
+`Config` at comptime to buy performance — is a **settled no**, measured
+three ways in `IMPLEMENTATION_NOTES.md`.
