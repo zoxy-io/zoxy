@@ -1038,6 +1038,55 @@ work disappearing. compiler_rt's own dispatch is already good; the call
 around it is not worth beating by hand. Do not re-propose without a
 workload whose header values are genuinely short.
 
+## Comptime config — rejected as a performance lever (2026-08-17, #261)
+
+The proposal was Pingora-shaped: expose a library API for building
+relays, make the JSON config one consumer of it, and specialize the
+config at comptime — filters named as the example — to harvest
+performance. The API half is a separate question with a separate
+justification (§13). The performance half is answered *no*, and it is
+answered by three measurements already in this file rather than by a new
+one.
+
+- **zoxy user code is 1.26% of cycles** ("Loop profile at the Tier-1
+  band", above): 98.6% sit inside one `io_uring_enter`, and the profile's
+  own conclusion is "do not optimize the Zig side". Constant-folding
+  config takes a fraction of that fraction.
+- **The head pipeline has already been made faster to no effect**
+  ("Hand-rolled short copy in the head render", directly above). That
+  change measured 8.3–8.8% faster on `bench/micro/l7_head_pipeline` — the
+  same code a comptime config would specialize — and 3149 ± 194 against
+  3193 ± 68 cycles/request at the proxy level, overlapping bands. A
+  comptime win would have to beat a real 8% micro win that vanished.
+- **The reverse experiment is already run and priced** ("Config shape is
+  the operator's to size", below). Eight compile-time ceilings became
+  runtime shape for **0.055%** of the printed budget, and the recorded
+  finding was that they were a capability ceiling, not a memory cost.
+  Reintroducing comptime config for speed reverses that decision against
+  its own evidence.
+
+What would be specialized is already the cheap shape: `filter.firstVerdict`
+and `router.route` are bounded scans over arena slices, called once per
+request each, inside the 1.26%. On the TLS path the bound is asymmetric
+crypto (~47% of the profile, "Profile share is not throughput headroom"),
+which comptime config does not touch at all.
+
+The cost side is not zero either, which is what makes this a rejection
+rather than a shelving. The JSON path is the product and cannot go away,
+so a comptime path is additive — and it would put a second comptime
+dimension on a `Server` already generic over `Io`. That hazard is
+measured too: the admin-listener bug ("What a ceiling was quietly holding
+up", below) was invisible to the whole suite because `Server(XevIo)` is
+instantiated only by `main.zig` while `admin_test` runs over `SimIo`.
+Doubling the matrix doubles the surface that no gate walks.
+
+Revisit condition, and it is deliberately a profile rather than an
+opinion: a workload in which zoxy user code is not a rounding error —
+which today means after `splice`/`send_zc` (§4, "Open questions") or
+#173 changes the shape of the data path. Even then the verdict is a
+proxy-level band, never a micro-bench delta; that mistake is what the
+section above this one is about.
+
 ## io_uring op upgrades — evaluated, deferred (2026-07-16)
 
 §4's "plain ops only" holds: on the loop profile above (latency-bound,
