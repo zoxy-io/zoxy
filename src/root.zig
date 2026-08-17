@@ -6,6 +6,11 @@ const std = @import("std");
 
 pub const access_log = @import("access_log.zig");
 pub const balancer = @import("balancer.zig");
+/// The §5/§8 startup budget: pool sizes, fd and ring demands, the banner.
+/// Generic over the Io backend like `Server`, and the reason it is here
+/// rather than in `main` is §13 — the closed form must price exactly what
+/// `Server.init` reserves, so an embedder inherits it instead of copying it.
+pub const Budget = @import("budget.zig").Budget;
 pub const config = @import("config.zig");
 pub const config_schema = @import("config_schema.zig");
 pub const constants = @import("constants.zig");
@@ -61,6 +66,7 @@ pub const testing = struct {
 test {
     _ = access_log;
     _ = balancer;
+    _ = @import("budget.zig");
     _ = config;
     _ = config_schema;
     _ = constants;
