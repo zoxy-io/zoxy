@@ -477,6 +477,30 @@ pub fn parseResponseHead(
     };
 }
 
+/// One past the longest name `HeaderName` spells. That "one past" is what
+/// makes a truncated trailer name safe to classify: a name that fills the
+/// buffer is already longer than every managed spelling, so it and the
+/// prefix kept for it both classify `.other` — the same answer, which is
+/// why no "this name was truncated" flag is needed anywhere.
+const trailer_name_bytes_max: u8 = trailer_name_bytes: {
+    var longest: u8 = 0;
+    for (@typeInfo(HeaderName).@"enum".fields) |field| {
+        const tag: HeaderName = @enumFromInt(field.value);
+        longest = @max(longest, tag.text().len);
+    }
+    break :trailer_name_bytes longest + 1;
+};
+
+comptime {
+    // The property above, said where a reviewer can check it: every
+    // managed spelling fits with a byte to spare, so "the buffer filled"
+    // and "longer than any managed name" are the same statement.
+    for (@typeInfo(HeaderName).@"enum".fields) |field| {
+        const tag: HeaderName = @enumFromInt(field.value);
+        assert(tag.text().len < trailer_name_bytes_max);
+    }
+}
+
 /// Incremental delimiter for chunked bodies (RFC 9112 §7.1) relayed
 /// verbatim: zoxy forwards the encoded bytes untouched and only needs to
 /// know where the message ends, so this scanner validates framing and
@@ -484,6 +508,13 @@ pub fn parseResponseHead(
 /// be forwarded, in any split; whole-buffer and byte-at-a-time feeding
 /// reach identical outcomes. CRLF-strict everywhere: a bare LF anywhere in
 /// the framing is malformed (§7's smuggling posture).
+///
+/// The trailer section is held to `trailer-section = *( field-line CRLF )`
+/// (RFC 9112 §7.1.2) rather than scanned as bytes, and a field naming a
+/// header §7 decides is refused (#244). Both halves are here, in the one
+/// place both directions share, because the relay forwards a *prefix* of
+/// what it consumed — there is no seam at which a trailer could be
+/// stripped instead.
 pub const ChunkedScanner = struct {
     state: State = .size,
     /// Chunk-data bytes still to pass through in the current chunk.
@@ -506,6 +537,11 @@ pub const ChunkedScanner = struct {
     /// Bytes consumed by the trailer section, bounded by
     /// `constants.chunked_trailer_bytes_max`.
     trailer_bytes: u32 = 0,
+    /// The trailer field name being read, kept only as far as
+    /// `trailer_name_bytes_max` reaches. Reset at each field, so no name
+    /// can carry into the next one.
+    name_bytes: [trailer_name_bytes_max]u8 = undefined,
+    name_len: u8 = 0,
 
     pub const State = enum(u8) {
         size,
@@ -515,7 +551,8 @@ pub const ChunkedScanner = struct {
         data_cr,
         data_lf,
         trailer_start,
-        trailer_field,
+        trailer_name,
+        trailer_value,
         trailer_lf,
         final_lf,
         done,
@@ -566,7 +603,12 @@ pub const ChunkedScanner = struct {
             .size, .extension, .size_lf => scanner.stepSizeLine(bytes[0]),
             .data => scanner.stepData(bytes),
             .data_cr, .data_lf => scanner.stepDataEnd(bytes[0]),
-            .trailer_start, .trailer_field, .trailer_lf, .final_lf => scanner.stepTrailer(bytes[0]),
+            .trailer_start,
+            .trailer_name,
+            .trailer_value,
+            .trailer_lf,
+            .final_lf,
+            => scanner.stepTrailer(bytes[0]),
             .done => unreachable, // feed() never steps a finished scanner.
         };
     }
@@ -667,13 +709,36 @@ pub const ChunkedScanner = struct {
             .trailer_start => switch (byte) {
                 '\r' => scanner.state = .final_lf,
                 else => {
-                    if (!isForwardableByte(byte)) {
+                    // A trailer line starts with a field name or it ends
+                    // the section; RFC 9112 §7.1.2's grammar has no third
+                    // production. That is what refuses an obs-fold
+                    // continuation and the empty name in `: value`.
+                    if (!isTokenByte(byte)) {
                         return error.Malformed;
                     }
-                    scanner.state = .trailer_field;
+                    scanner.name_len = 0;
+                    scanner.appendNameByte(byte);
+                    scanner.state = .trailer_name;
                 },
             },
-            .trailer_field => switch (byte) {
+            .trailer_name => switch (byte) {
+                ':' => {
+                    if (scanner.nameIsManaged()) {
+                        return error.Malformed;
+                    }
+                    scanner.state = .trailer_value;
+                },
+                else => {
+                    // A space here is `X-Bad : v`, the smuggling shape the
+                    // head parser already refuses — the trailer section is
+                    // held to the same syntax, not a looser one (#244).
+                    if (!isTokenByte(byte)) {
+                        return error.Malformed;
+                    }
+                    scanner.appendNameByte(byte);
+                },
+            },
+            .trailer_value => switch (byte) {
                 '\r' => scanner.state = .trailer_lf,
                 else => {
                     if (!isForwardableByte(byte)) {
@@ -712,6 +777,32 @@ pub const ChunkedScanner = struct {
         if (scanner.trailer_bytes > constants.chunked_trailer_bytes_max) {
             return error.Oversize;
         }
+    }
+
+    /// Keeps the trailer name as far as the buffer reaches and drops the
+    /// rest, which `trailer_name_bytes_max` explains is free: the verdict
+    /// on a name that long is `.other` either way.
+    fn appendNameByte(scanner: *ChunkedScanner, byte: u8) void {
+        assert(isTokenByte(byte));
+        assert(scanner.name_len <= trailer_name_bytes_max);
+        if (scanner.name_len == trailer_name_bytes_max) {
+            return;
+        }
+        scanner.name_bytes[scanner.name_len] = byte;
+        scanner.name_len += 1;
+        assert(scanner.name_len <= trailer_name_bytes_max);
+    }
+
+    /// True when the trailer names a header §7 makes a decision about —
+    /// protected, hop-by-hop, or one this proxy writes itself. RFC 9110
+    /// §6.5.1 forbids a sender to generate any of them in a trailer (no
+    /// such definition permits it), and forwarding one would hand the far
+    /// side a framing, routing or address field this proxy already
+    /// settled in the header section (#244).
+    fn nameIsManaged(scanner: *const ChunkedScanner) bool {
+        assert(scanner.name_len >= 1);
+        assert(scanner.name_len <= trailer_name_bytes_max);
+        return classifyHeaderName(scanner.name_bytes[0..scanner.name_len]) != .other;
     }
 };
 
@@ -1493,6 +1584,19 @@ pub fn isForwardableByte(byte: u8) bool {
     return byte == '\t' or (byte >= ' ' and byte != 0x7f);
 }
 
+/// True for a byte legal in an RFC 9110 token — a field name, a method, a
+/// `Connection` nomination. Public for the same reason
+/// `isForwardableByte` is: the config compiler validates the names an
+/// operator writes against the exact set the parser enforces on the wire,
+/// one definition for both.
+pub fn isTokenByte(byte: u8) bool {
+    return switch (byte) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'a'...'z', 'A'...'Z' => true,
+        else => false,
+    };
+}
+
 fn hexDigitValue(byte: u8) u4 {
     return @intCast(hexNibble(byte) orelse unreachable); // Caller matched a hex digit.
 }
@@ -1965,6 +2069,82 @@ test "chunked: extensions and trailers are forwarded, bounded, and end cleanly" 
     }
 }
 
+test "chunked: a trailer naming a header §7 decides is refused (#244)" {
+    // Every managed name, in a spelling no header-section rule would let
+    // a client choose either: `Connection` may not nominate the protected
+    // three away, a filter edit may not name them, and the render writes
+    // `X-Forwarded-For` and `Max-Forwards` itself. A trailer was the one
+    // path to the far side that checked none of it.
+    const names = [_][]const u8{
+        "Content-Length",
+        "transfer-encoding", // Case is not a way around it.
+        "Host",
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Connection",
+        "TE",
+        "Upgrade",
+        "X-Forwarded-For",
+        "Max-Forwards",
+    };
+    inline for (names) |name| {
+        const body = "0\r\n" ++ name ++ ": v\r\n\r\n";
+        for ([_]usize{ 1, body.len }) |feed_bytes_max| {
+            const outcome = chunkedOutcome(body, feed_bytes_max);
+            try testing.expectEqual(
+                @as(?ChunkedScanner.Error, error.Malformed),
+                outcome.failure,
+            );
+        }
+    }
+}
+
+test "chunked: a trailer field is held to the header field's syntax (#244)" {
+    const refused = [_][]const u8{
+        "0\r\nX-Bad : v\r\n\r\n", // Space before the colon.
+        "0\r\nX-Bad\t: v\r\n\r\n", // …and the tab spelling of it.
+        "0\r\nnocolon\r\n\r\n", // Not a field-line at all.
+        "0\r\n: novalue\r\n\r\n", // An empty field name.
+        "0\r\n X-Fold: v\r\n\r\n", // An obs-fold continuation.
+        "0\r\nX(Bad): v\r\n\r\n", // A non-token byte in the name.
+    };
+    for (refused) |body| {
+        for ([_]usize{ 1, body.len }) |feed_bytes_max| {
+            const outcome = chunkedOutcome(body, feed_bytes_max);
+            try testing.expectEqual(
+                @as(?ChunkedScanner.Error, error.Malformed),
+                outcome.failure,
+            );
+        }
+    }
+}
+
+test "chunked: an ordinary trailer still forwards, however long its name (#244)" {
+    // The right-hand case is what `trailer_name_bytes_max` is for: a name
+    // past the buffer keeps only a prefix, and the prefix must classify
+    // `.other` exactly as the whole name does — a truncation that could
+    // collide with a managed spelling would refuse a legal trailer.
+    const long_name = "X-" ++ ("a" ** (trailer_name_bytes_max * 2));
+    const bodies = [_][]const u8{
+        "0\r\nX-Checksum: 3f21\r\n\r\n",
+        "0\r\nX-Checksum: 3f21\r\nX-Signature: ab\r\n\r\n",
+        "0\r\nX-Empty:\r\n\r\n",
+        "0\r\n" ++ long_name ++ ": v\r\n\r\n",
+        // The managed names are the whole names, not substrings of them:
+        // a longer name that merely starts with one is nobody's framing.
+        "0\r\nContent-Length-Hint: 9\r\n\r\n",
+        "0\r\nX-Host: a\r\n\r\n",
+    };
+    for (bodies) |body| {
+        for ([_]usize{ 1, body.len }) |feed_bytes_max| {
+            const outcome = chunkedOutcome(body, feed_bytes_max);
+            try testing.expectEqual(@as(?ChunkedScanner.Error, null), outcome.failure);
+            try testing.expect(outcome.done);
+            try testing.expectEqual(@as(u64, body.len), outcome.consumed);
+        }
+    }
+}
+
 test "chunked: pipelined bytes after the terminator are left unconsumed" {
     const body = "1\r\na\r\n0\r\n\r\n";
     const stream = body ++ "GET";
@@ -2072,6 +2252,10 @@ const fuzz_corpus_request = "POST /submit HTTP/1.1\r\nHost: origin\r\nContent-Le
 const fuzz_corpus_extension = "PROPFIND /dav HTTP/1.1\r\nHost: origin\r\nDepth: 1\r\n\r\n";
 const fuzz_corpus_response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
 const fuzz_corpus_chunked = "5\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n";
+/// The refused trailer shapes (#244), seeded beside the accepted one so
+/// the fuzzer starts either side of the verdict rather than having to
+/// discover a whole trailer section byte by byte.
+const fuzz_corpus_chunked_trailer = "0\r\nContent-Length: 100\r\nX-Bad : v\r\n\r\n";
 
 test "fuzz: heads and chunked framing — parse or reject, no third outcome" {
     try std.testing.fuzz({}, fuzzParserInputs, .{
@@ -2080,6 +2264,7 @@ test "fuzz: heads and chunked framing — parse or reject, no third outcome" {
             fuzz_corpus_extension,
             fuzz_corpus_response,
             fuzz_corpus_chunked,
+            fuzz_corpus_chunked_trailer,
         },
     });
 }

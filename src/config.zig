@@ -3587,13 +3587,10 @@ fn validateHeaderValue(value: []const u8) ParseError!void {
     }
 }
 
-fn isTokenByte(byte: u8) bool {
-    return switch (byte) {
-        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-        '0'...'9', 'a'...'z', 'A'...'Z' => true,
-        else => false,
-    };
-}
+/// The parser owns the token alphabet, so a name this config accepts and
+/// a name the wire accepts can never drift apart (#244 moved the one
+/// definition there, beside `isForwardableByte`).
+const isTokenByte = parser.isTokenByte;
 
 /// Resolve a listener's route table (§7). `"cluster": "x"` is sugar for a
 /// single catch-all route; `"routes": [...]` is the explicit table.
