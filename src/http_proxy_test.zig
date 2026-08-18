@@ -881,6 +881,36 @@ test "l7: a malformed chunked body coalesced with the head is answered 400" {
     try bed.expectDrained();
 }
 
+test "l7: a trailer naming a framing header is answered 400, never forwarded (#244)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 7,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    // The shape HTTP Garden found: framing this proxy committed to in the
+    // head, restated by the client in the trailer section, where no §7
+    // rule used to look. It is refused as framing rather than stripped,
+    // because the relay forwards a prefix of what it consumed and has no
+    // seam at which a trailer could be removed instead — so the verdict is
+    // the parser's, and this is the operator-visible half of it: a body
+    // that arrives with its head still earns a status.
+    try bed.exchange(
+        "POST /x HTTP/1.1\r\nHost: o\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "0\r\nContent-Length: 100\r\n\r\n",
+    );
+
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
+    try bed.expectDrained();
+}
+
 test "l7: oversize request line is 414, oversize header section is 431" {
     {
         var bed: Http1Bed = undefined;

@@ -868,6 +868,30 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   ways; `Connection: close` injected when the proxy will close — announced,
   not silent, or a client pipelines into the close and reads the reset as
   an error instead of a clean end.
+- **A chunked trailer is a field section, not relay bytes** (#244). RFC
+  9112 §7.1.2 spells it `*( field-line CRLF )`, and the scanner holds it
+  to exactly that: a token name, a colon, a forwardable value. So the
+  `X-Bad : v` shape a head earns a 400 for is refused here too, and a
+  line that is no field-line at all never reaches the far side. A
+  trailer *naming* a header §7 decides — protected, hop-by-hop, or one
+  the render writes itself (`X-Forwarded-For`, `Max-Forwards`) — is
+  refused outright; RFC 9110 §6.5.1 already forbids the sender to
+  generate one. Refused rather than stripped, and that is the design
+  point rather than a shortcut: the relay forwards a *prefix* of what
+  framing consumed, so there is no seam at which a trailer could be
+  removed instead — stripping would mean a compacting transform in both
+  body legs, over the TLS transform already in each, to suppress a field
+  the sender was told not to send. One scanner serves both directions,
+  so one verdict covers both: a client cannot hand the origin a
+  `Content-Length` this proxy never committed to, and an origin cannot
+  hand one to the client. Ordinary trailers — the checksums and
+  signatures the section exists for — still forward untouched. The
+  visible shape follows §7's usual rule that a status needs a leg which
+  has not committed: a request body arriving with its head earns a 400
+  and a streamed one a teardown; a response earns a 502 while nothing
+  has reached the client, and past that the client's connection ends
+  with the chunked body unterminated, which is how a truncation is
+  meant to read.
 - **Path routing on the canonical path only** (settled 2026-07-19). An
   `http` listener maps the request path to a cluster through a
   per-listener longest-prefix route table (`"routes": [{ "prefix":
@@ -2264,8 +2288,8 @@ is a trap rather than a synonym.
 
 | spec | what binds a gateway | here |
 |---|---|---|
-| **9110** Semantics | §3.7 roles; §4.2.3 host comparison; §5.6.7 date format; §6.6.1 `Date`; §7.6.1 hop-by-hop; §7.6.2 `Max-Forwards`; §7.6.3 `Via`; §10.2.1 `Allow`; §15.2.1 `100 Continue` | §7, §8's `Date`, with one deviation below |
-| **9112** HTTP/1.1 | §3.2 target forms; §6.3 body length; §7 transfer codings; §9 connection management | §7 framing, §8 close announcement |
+| **9110** Semantics | §3.7 roles; §4.2.3 host comparison; §5.6.7 date format; §6.5.1 trailer limits; §6.6.1 `Date`; §7.6.1 hop-by-hop; §7.6.2 `Max-Forwards`; §7.6.3 `Via`; §10.2.1 `Allow`; §15.2.1 `100 Continue` | §7, §8's `Date`, with one deviation below |
+| **9112** HTTP/1.1 | §3.2 target forms; §6.3 body length; §7 transfer codings and §7.1.2's trailer section; §9 connection management | §7 framing, §8 close announcement |
 | **6585** additional statuses | defines `429` and `431` — **9110 did not absorb these**, the registry still points here | §8's static set |
 | **8297** early hints | defines `103` | §7's interim relay (#232) |
 | **3986** URI syntax | §2.3 unreserved, §5.2.4 dot-segments | §7 canonical path |
@@ -2324,8 +2348,10 @@ agreeing with everyone else's. The external counterpart is
 differential fuzzer that runs adversarial requests through many servers
 and proxies and diffs the parses; it is how most of the recent
 request-smuggling class was found, and it tests exactly the property
-§7's strictness claims. h2spec answers the same question for #173 and
-arrives with it.
+§7's strictness claims — the first differential run against it produced
+#244, the one payload in twenty-one where this proxy was the permissive
+side, and §7's trailer rule above is that run's verdict. h2spec answers
+the same question for #173 and arrives with it.
 
 ## 13. Embedding — the library seam
 
