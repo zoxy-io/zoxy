@@ -227,10 +227,13 @@ pub fn Budget(comptime IoType: type) type {
             const sizes = poolSizesFor(config);
             const memory_total = totalBytesFor(&sizes, config_arena_bytes);
             printMemoryBanner(config, &sizes, memory_total, access_log_bytes, config_arena_bytes, build);
+            // A stack temporary in a function that runs once at startup,
+            // not a reservation (§5).
+            var fact_buffer: [failure_detection_fact_bytes]u8 = undefined;
             std.debug.print(
                 \\  fds     {d} required (asserted against RLIMIT_NOFILE)
                 \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
-                \\  config  {d} listener(s), {d} cluster(s), {d} error page(s), access log {s}
+                \\  config  {d} listener(s), {d} cluster(s), {d} error page(s), access log {s}{s}
                 \\
             , .{
                 demands.fds,
@@ -245,7 +248,56 @@ pub fn Budget(comptime IoType: type) type {
                 // what says why it grew.
                 config.error_pages.len,
                 if (config.access_log_sink) |sink| @tagName(sink) else "off",
+                failureDetectionFact(config, &fact_buffer),
             });
+        }
+
+        /// The rendering `failure_detection_fact_bytes` is the width of.
+        /// One literal, used by the format below *and* by the buffer that
+        /// holds it, so a reworded fact cannot silently outgrow its
+        /// buffer — the two used to agree only by a copied string.
+        const failure_detection_fact_format = ", {d} cluster(s) without failure detection";
+
+        /// The widest that fact can render: the literal with a `u32` at
+        /// full width in place of `{d}`.
+        const failure_detection_fact_bytes =
+            failure_detection_fact_format.len - "{d}".len +
+            std.fmt.count("{d}", .{std.math.maxInt(u32)});
+
+        /// The §7 failure-detection fact (#230), appended to the config
+        /// line: how many clusters could lose an endpoint and never
+        /// notice.
+        ///
+        /// Empty when there are none, which is deliberately unlike the
+        /// tunnel and TLS terms above — those print their zeros to say
+        /// "you are not paying for this", where a *pool* at zero is a
+        /// standing fact about the deployment. This is not a pool; it is
+        /// a count of a gap, and a gap that does not exist has nothing to
+        /// report rather than a zero worth reading.
+        ///
+        /// This is the whole visibility answer #230 asked for, and it is
+        /// deliberately not a warning. The banner is what a bug report
+        /// pastes, so "why did traffic keep going to a dead backend?"
+        /// becomes answerable without a round trip; a warning on a valid
+        /// config would decay into noise and take the rest of stderr with
+        /// it. §8's own line for the same idea: the budget is printed,
+        /// not hoped for.
+        fn failureDetectionFact(
+            config: *const config_module.Config,
+            buffer: []u8,
+        ) []const u8 {
+            // The claim the `catch unreachable` below rests on, checked
+            // rather than argued: this buffer is the one `print` sized.
+            assert(buffer.len == failure_detection_fact_bytes);
+            const count = config.clustersWithoutFailureDetection();
+            if (count == 0) return "";
+            const rendered = std.fmt.bufPrint(
+                buffer,
+                failure_detection_fact_format,
+                .{count},
+            ) catch unreachable; // The assert above covers every u32.
+            assert(rendered.len <= failure_detection_fact_bytes);
+            return rendered;
         }
 
         /// The banner's version and memory lines — the §5 closed form
