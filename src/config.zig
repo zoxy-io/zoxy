@@ -418,6 +418,14 @@ pub const Config = struct {
         /// cluster, so absent means the balancer never skips anything
         /// here and the prober never dials it.
         check: ?Check = null,
+        /// §7 passive ejection for this cluster (#230), or null to leave
+        /// it off. Independent of `check`: the two compose rather than
+        /// overlap, since real traffic is the only signal that catches a
+        /// backend whose kernel still completes the handshake while the
+        /// application behind it never answers — a wedged process, an
+        /// exhausted thread pool, a GC stall. That is precisely what a
+        /// `tcp` probe cannot see, because the backlog accepts for it.
+        passive_ejection: ?PassiveEjection = null,
         /// The §8 concurrency cap protecting each of this cluster's
         /// endpoints, or null for uncapped. **Per endpoint, not per
         /// cluster**: it is a statement about what one origin can carry,
@@ -541,6 +549,36 @@ pub const Config = struct {
                 expect_status: u16 = 200,
             };
         };
+
+        /// One cluster's resolved passive-ejection policy (§7, #230):
+        /// eject an endpoint that real traffic says is dead, rather than
+        /// only one a probe caught.
+        ///
+        /// Opt-in for the same reason `check` is. It removes capacity by
+        /// inference: the failure it prevents is visible and diagnosable,
+        /// while the failure it can cause — ejecting a healthy backend
+        /// during a blip — is subtle and worse. That is an operator's
+        /// call, not a default.
+        ///
+        /// The two signals it acts on are the endpoint's own fault in a
+        /// way a `5xx` is not: a dial that failed, and an exchange that
+        /// produced no response byte before the deadline. A bad deploy
+        /// answering 500s is a software bug, not an unhealthy endpoint,
+        /// and conflating them would eject a whole cluster for it.
+        pub const PassiveEjection = struct {
+            /// Consecutive failed requests that eject. An absolute count
+            /// is sufficient here where Envoy needs success-rate
+            /// outlier detection, because §7 fail-open already answers
+            /// the correlated-failure objection: a cluster with every
+            /// endpoint ejected balances as if none were.
+            fall: u8 = constants.passive_ejection_fall_default,
+            /// How long an ejected endpoint stays out before traffic is
+            /// admitted again to re-judge it. Passive detection needs
+            /// traffic to learn anything and an ejected endpoint gets
+            /// none, so recovery cannot be passive too — this cooldown
+            /// is what makes it observable at all.
+            recovery_ms: u32 = constants.passive_ejection_recovery_ms_default,
+        };
     };
 };
 
@@ -566,6 +604,8 @@ pub const ValidationError = error{
     ClusterCheckPathNotCanonical,
     ClusterCheckHostInvalid,
     ClusterCheckStatusInvalid,
+    ClusterPassiveEjectionFallOutOfRange,
+    ClusterPassiveEjectionRecoveryOutOfRange,
     ClusterMaxInflightOutOfRange,
     ClusterRetriesOutOfRange,
     ClusterPickKeyMissing,
@@ -2172,6 +2212,8 @@ pub const ClusterJson = struct {
     /// Optional §7 active health checks; absent means off, so an
     /// unprobed cluster reserves nothing and is never skipped.
     check: ?CheckJson = null,
+    /// Optional §7 passive ejection (#230); absent leaves it off.
+    passive_ejection: ?PassiveEjectionJson = null,
     /// Optional §8 per-endpoint concurrency cap; absent means uncapped.
     max_inflight: ?u32 = null,
     /// Optional #181 dial retries across this cluster's endpoints;
@@ -2197,6 +2239,9 @@ pub const ClusterJson = struct {
         },
         .check = .{
             .desc = "Active health checks for every endpoint in this cluster; absent leaves them off.",
+        },
+        .passive_ejection = .{
+            .desc = "Eject endpoints that real traffic reports dead; absent leaves passive ejection off.",
         },
         .max_inflight = .{
             .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
@@ -2577,6 +2622,33 @@ pub const CheckJson = struct {
     };
 };
 
+/// One cluster's passive-ejection block (§7, #230). Two numbers and no
+/// mode switch: what the signals are is settled by the design, not by
+/// the operator, because the choice worth making is *whether* to remove
+/// capacity by inference — not which inference to draw.
+pub const PassiveEjectionJson = struct {
+    fall: u8 = constants.passive_ejection_fall_default,
+    recovery_ms: u32 = constants.passive_ejection_recovery_ms_default,
+
+    pub const schema_doc =
+        "Eject an endpoint that real traffic reports as dead — a failed dial, " ++
+        "or an exchange that produced no response byte before the deadline. " ++
+        "Absent leaves it off. Origin 5xx responses are never a signal: a bad " ++
+        "deploy is a software bug, not an unhealthy endpoint.";
+    pub const schema_fields = .{
+        .fall = .{
+            .desc = "Consecutive failed requests that eject an endpoint from balancing.",
+            .minimum = 1,
+            .maximum = constants.health_probe_threshold_max,
+        },
+        .recovery_ms = .{
+            .desc = "How long an ejected endpoint stays out before traffic re-judges it.",
+            .minimum = 1,
+            .maximum = constants.timeout_ms_max,
+        },
+    };
+};
+
 pub const TimeoutsJson = struct {
     /// Optional: nginx ships 60 s for the same budget and HAProxy's
     /// `timeout connect` is conventionally single-digit seconds, so a
@@ -2784,13 +2856,13 @@ pub fn assert_meta_matches(comptime T: type) void {
 /// block below runs `assert_meta_matches` on each at comptime, so the
 /// metadata cannot drift from the fields whether or not the emitter builds.
 pub const dto_types = .{
-    ConfigJson,         ListenerJson,      RouteJson,                FilterJson,
-    MatchJson,          HeaderMatchJson,   ActionJson,               HeaderEditJson,
-    RewriteJson,        ClusterJson,       TimeoutsJson,             LimitsJson,
-    AdminJson,          AccessLogJson,     CheckJson,                PickJson,
-    ForwardedJson,      ProxyProtocolJson, ClusterProxyProtocolJson, EndpointJson,
-    ResponseFilterJson, ResponseMatchJson, RedirectJson,             BodyJson,
-    TlsJson,
+    ConfigJson,         ListenerJson,        RouteJson,                FilterJson,
+    MatchJson,          HeaderMatchJson,     ActionJson,               HeaderEditJson,
+    RewriteJson,        ClusterJson,         TimeoutsJson,             LimitsJson,
+    AdminJson,          AccessLogJson,       CheckJson,                PickJson,
+    ForwardedJson,      ProxyProtocolJson,   ClusterProxyProtocolJson, EndpointJson,
+    ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
+    TlsJson,            PassiveEjectionJson,
 };
 
 comptime {
@@ -2853,6 +2925,7 @@ fn resolveClusters(
             .weights = endpoints.weights,
             .pick = picked.pick,
             .check = try resolveCheck(entry.cluster.check, connect_timeout_ms),
+            .passive_ejection = try resolvePassiveEjection(entry.cluster.passive_ejection),
             .hash_key = picked.hash_key,
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
             .retries = try resolveRetries(entry.cluster.retries),
@@ -3788,6 +3861,28 @@ fn validateRoutePrefix(prefix: []const u8, head_buffer_bytes: u32) ParseError!vo
 /// path for a check that will never request it is describing something
 /// the process is not doing, which is exactly the negative space this
 /// loader exists to refuse.
+/// Resolve one cluster's §7 passive-ejection block (#230). Absent leaves
+/// it off, the same shape `check` uses: a feature nobody asked for costs
+/// nothing and changes nothing.
+///
+/// A single-endpoint cluster is *allowed* to configure this even though
+/// §7 fail-open makes the ejection a no-op there. Rejecting it would
+/// punish the config that is about to grow a second endpoint, and the
+/// operator's intent is unambiguous either way. The banner is where that
+/// shows up as a fact, not the loader as an error.
+fn resolvePassiveEjection(passive_ejection_json: ?PassiveEjectionJson) ParseError!?Config.Cluster.PassiveEjection {
+    const passive_ejection = passive_ejection_json orelse return null;
+    if (passive_ejection.fall < 1 or passive_ejection.fall > constants.health_probe_threshold_max) {
+        return error.ClusterPassiveEjectionFallOutOfRange;
+    }
+    // Zero would re-admit inside the same tick that ejected, which is not
+    // a fast recovery but an ejection that never happened.
+    if (passive_ejection.recovery_ms < 1 or passive_ejection.recovery_ms > constants.timeout_ms_max) {
+        return error.ClusterPassiveEjectionRecoveryOutOfRange;
+    }
+    return .{ .fall = passive_ejection.fall, .recovery_ms = passive_ejection.recovery_ms };
+}
+
 fn resolveCheck(
     check_json: ?CheckJson,
     connect_timeout_ms: u32,
@@ -5085,6 +5180,46 @@ test "config: an http check resolves its request and expected status" {
         try std.testing.expectEqual(@as(?[]const u8, null), http.host);
         try std.testing.expectEqual(@as(u16, 200), http.expect_status);
     }
+}
+
+test "config: a passive_ejection block rejects the thresholds it cannot act on" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"passive_ejection":
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // Zero would eject on no evidence; the ceiling is what keeps the u8
+    // streak from wrapping, shared with the probe thresholds.
+    try expectParseError(error.ClusterPassiveEjectionFallOutOfRange, head ++ "{\"fall\":0}" ++ tail);
+    try expectParseError(error.ClusterPassiveEjectionFallOutOfRange, head ++ "{\"fall\":65}" ++ tail);
+    // A zero cooldown re-admits in the tick that ejected — not a fast
+    // recovery but an ejection that never happened.
+    try expectParseError(error.ClusterPassiveEjectionRecoveryOutOfRange, head ++ "{\"recovery_ms\":0}" ++ tail);
+
+    // The defaults are what an operator who writes `"passive_ejection":{}` gets,
+    // and they are the whole point of the block being two optional
+    // numbers: opting in should not require picking them.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const config = try expectParseOk(&arena_state, head ++ "{}" ++ tail);
+    const passive_ejection = config.clusters[0].passive_ejection.?;
+    try std.testing.expectEqual(constants.passive_ejection_fall_default, passive_ejection.fall);
+    try std.testing.expectEqual(constants.passive_ejection_recovery_ms_default, passive_ejection.recovery_ms);
+
+    // Absent is off, and off is not "defaults" — an unconfigured cluster
+    // must be distinguishable from one that opted in and took them.
+    const bare =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    var bare_arena: std.heap.ArenaAllocator = undefined;
+    defer bare_arena.deinit();
+    const bare_config = try expectParseOk(&bare_arena, bare);
+    try std.testing.expect(bare_config.clusters[0].passive_ejection == null);
 }
 
 test "config: a check block rejects every shape it cannot run" {
