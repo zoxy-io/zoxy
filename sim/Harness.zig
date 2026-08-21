@@ -787,8 +787,8 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
         const drawn = l7.scripts.terminating_scripts[
             random.uintLessThan(usize, l7.scripts.terminating_scripts.len)
         ];
-        // The same clean-seed exclusion the plaintext draw makes, and
-        // for the same reason — see `drawScript`.
+        // The same clean-seed exclusion the plaintext draw makes, and for
+        // the same reason — see `drawScript`.
         script.* = if (harness.clean and drawn == .dribbled_head) .get else drawn;
     }
     harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
@@ -1578,20 +1578,22 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
 /// position — and so the whole sweep's plaintext coverage — exactly
 /// where it was before TLS existed.
 /// One client's script, drawn uniformly except that a clean seed never
-/// gets `dribbled_head` (#258).
+/// gets `dribbled_head`.
 ///
-/// That script exists to leave a request unfinished, which *is* an
-/// abort — and `verifyAccessLog`'s sharpest claim is that a clean seed
-/// aborts nothing. The claim is worth more than the coverage would be:
-/// it is an equality rather than a bound, and it is what fails on seed
-/// 10 when #129's phantom-line bug is put back. Teaching it an
-/// exception would blunt it on every seed to reach one axis on some.
+/// The *original* reason is gone. #258 excluded it because an unfinished
+/// request was an abort, and `verifyAccessLog`'s sharpest claim is that
+/// a clean seed aborts nothing — an equality, and the one that fails on
+/// seed 10 when #129's phantom-line bug is put back. #247 made the reap
+/// answer `408`, so a dribbled head is now an ordinary answered exchange
+/// and that objection no longer applies.
 ///
-/// The axis is reached on adversary seeds instead, where an abort is
-/// already ordinary and the surrounding equality still holds. `.get` is
-/// the substitute because it is the canonical script; the small bias it
-/// adds to clean populations is the price, and it is stated rather than
-/// hidden in a re-draw loop that could in principle spin.
+/// A different one does, and it was measured rather than assumed: clean
+/// seeds pin the head budget to the idle window (`deriveHeadTimeoutMs`),
+/// which can outlast the scenario's own backstop — so the reap does not
+/// reliably land inside the run and seed 486 misses its golden `408`.
+/// Including it here would want the clean budget drawn tight enough to
+/// observe, which is a change to a value every clean seed shares for the
+/// benefit of one script. Adversary seeds reach the axis already.
 fn drawScript(random: std.Random, clean: bool) l7.Script {
     const drawn = random.enumValue(l7.Script);
     if (clean and drawn == .dribbled_head) return .get;
@@ -2818,6 +2820,12 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_shed_endpoint_inflight",
         "l7_bad_gateway",
         "l7_gateway_timeout",
+        // The #247 head-read verdict. It answers `408` and so owes a
+        // line, exactly like the `504` above it — the difference between
+        // them is which side ran out of time, which the status says and
+        // this sum does not care about. Before #247 the same reap wrote
+        // an *abort* line and belonged on the other side of the equality.
+        "l7_request_timeout",
     };
     var total: u64 = 0;
     inline for (answered) |name| {

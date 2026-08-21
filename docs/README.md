@@ -886,7 +886,7 @@ guessed from a filename. Files are read at startup like the rest of the
 config, so **changing one needs a restart**.
 
 `error_pages` accepts only the statuses zoxy actually sends — `400`,
-`403`, `404`, `414`, `429`, `431`, `501`, `502`, `503`, `504` — and a
+`403`, `404`, `408`, `413`, `414`, `429`, `431`, `501`, `502`, `503`, `504` — and a
 page for anything else is refused at load.
 
 Every response zoxy answers *itself* — those pages, the empty defaults,
@@ -960,7 +960,7 @@ dial or idle budget is a mistake rather than a policy.
 | field | default | meaning |
 |---|---|---|
 | `connect_ms` | `5000` | per-try upstream connect budget |
-| `head_ms` | derived | budget for reading one request head — what a slowloris meets. 10 s, clamped between `connect_ms` and `idle_ms` so it never changes a config that predates it |
+| `head_ms` | derived | budget for reading one request head — what a slowloris meets, and is answered `408` for. A connection that has said nothing at all is not under it, so a monitoring probe that connects and leaves earns silence. 10 s, clamped between `connect_ms` and `idle_ms` so it never changes a config that predates it |
 | `idle_ms` | `60000` | how long a connection may stay quiet — between requests, or before its first byte |
 | `drain_deadline_ms` | `0` | how long a `SIGTERM` drain waits before reaping stragglers; `0` waits for the last connection |
 | `max_lifetime_ms` | `0` | absolute connection-age cap regardless of activity; `0` disables |

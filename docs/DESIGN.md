@@ -292,8 +292,9 @@ primitives trusted institutionally.
   a "quick" direct `write` could stall the whole loop. That choice is
   kept: O_NONBLOCK is never set. The control ops the design needs are
   seam methods instead — `setNodelay`, `setLingerRst` (§8's
-  accept-and-RST), `shutdown(.both)` (which must bypass
-  `xev.TCP.shutdown`, hardcoded to SHUT_WR, for the low-level op) —
+  accept-and-RST), `shutdown(.both)` and `shutdown(.read)` (both of
+  which must bypass `xev.TCP.shutdown`, hardcoded to SHUT_WR, for the
+  low-level op) —
   direct non-blocking syscalls in `XevIo`, virtual-socket state changes
   in `SimIo`, so the simulator can witness RST-on-shed and half-close
   (§9). A build-time lint enforces the boundary (§9).
@@ -1287,7 +1288,17 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   transparency is that leg's whole claim.
 - **Resilience is minimal by design:** per-request and per-try deadlines
   (head-read gets its own deadline, so a slowloris meets the clock or
-  `limits.head_buffer_bytes`, whichever comes first; each dial — the
+  `limits.head_buffer_bytes`, whichever comes first — the buffer answers
+  `431`, and the clock is **answered `408`** rather than reset, §8's
+  rule being that a client reading a reset
+  where a status was due reports an error it cannot attribute. That
+  answer is why §4 has a read-half shutdown at all: the op in the way is
+  a recv on the socket the answer goes out on, ops are never cancelled
+  but forced (§5), and `.both` would take the write half the verdict
+  needs. A connection that said *nothing* is owed no status and gets
+  none — it was never under the budget, which starts mid-head, and that
+  is the distinction HAProxy needed `option http-ignore-probes` to make
+  after monitoring agents earned a `408` apiece; each dial — the
   first try and the replay's — runs under its own connect deadline);
   one free replay of a request that hit a stale pooled connection —
   only when the
@@ -1655,6 +1666,7 @@ the loop thread.
 | **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) |
 | tunnels | the upgrade request, **before** it is forwarded | static `503`, then keep or close per pressure |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
+| head-read budget | timer completion | `408` for a client that began a head and stopped; **silence earns none** — a connection that said nothing was never under the budget |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
 
 Most rungs shed on a *resource of this proxy's* running out. That was
