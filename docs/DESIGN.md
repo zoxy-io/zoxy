@@ -497,21 +497,22 @@ a raised `RLIMIT_NOFILE`:
 
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
-| conn slots | 1386 | 11466 | ~1.7 KiB state |
-| relay buffers | 1386 | 11466 | 2 × 4 KiB |
-| upstream slots | 1311 | 11466 | ~48 B state |
-| head buffers (ring) | = conn slots | 11466 | `head_buffer_bytes` + 1 B |
-| upstream head buffers | = upstream slots | 11466 | `head_buffer_bytes` + 24 B |
+| conn slots | 1386 | 11457 | ~1.7 KiB state |
+| relay buffers | 1386 | 11457 | 2 × 4 KiB |
+| upstream slots | 1311 | 11457 | ~48 B state |
+| head buffers (ring) | = conn slots | 11457 | `head_buffer_bytes` + 1 B |
+| upstream head buffers | = upstream slots | 11457 | `head_buffer_bytes` + 24 B |
 | tls engines | 0, or min(conn slots, 1024) | 1024 | ~132 KiB + plaintext |
-| tunnels | 0 (off) | 11466 | 2 × 4 KiB |
+| tunnels | 0 (off) | 11457 | 2 × 4 KiB |
 | **pool memory** | **~34 MiB** | **~384 MiB** | |
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
 (oversize → 414/431, §7), with a 1 KiB floor and a 1 MiB ceiling: a size
-knob is operator-visible behaviour, not only memory. Three head-sized
-side buffers ride the same knob — the serving path's two
-canonicalization scratches and the health prober's response buffer — and
-appear in the banner as their own term.
+knob is operator-visible behaviour, not only memory. The head-sized side
+buffers ride the same knob — the serving path's two canonicalization
+scratches, and one response buffer for each of the health prober's
+concurrent probes (§7, #132) — and appear in the banner as their own
+term.
 
 The **tunnel pool** (§7, #180) is the one that exists because a tunnel
 has the opposite shape to everything else here. Every pool above is
@@ -644,7 +645,7 @@ closed-form in `src/constants.zig`.
 The ceilings sit on one completion-queue line — a conn slot costs
 `conn_ops_max` ring ops, an upstream slot one — and the upstream ceiling
 is **pinned to the conn ceiling**, so that line has a single divisor:
-`conn_ops_max + 1` ring ops per admitted connection, 11466 of them. On
+`conn_ops_max + 1` ring ops per admitted connection, 11457 of them. On
 the L7 path a connection that is mid-exchange holds an upstream slot as
 well as its conn slot, and at saturation every admitted connection can be
 mid-exchange at once — so an upstream ceiling below the conn ceiling is
@@ -1507,12 +1508,31 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
                       "expect_status": 200, "fall": 3, "rise": 2 } }
   ```
 
-  One prober per server sweeps every checked endpoint with a **single
-  probe in flight**, budgeted like the admin plane (§8:
-  `health_probe_ops_max` ring ops and one fd, reserved unconditionally).
-  Sweeps pace sweep-end to sweep-start on `timeouts.health_interval_ms`;
-  one probe is bounded by the check's `timeout_ms`, which defaults to
-  `connect_ms`.
+  One prober per server sweeps every checked endpoint, with **as many
+  probes in flight as the config has endpoints to check**, capped at
+  `health_probe_concurrency_max` (#132). Sweeps pace sweep-end to
+  sweep-start on `timeouts.health_interval_ms`; one probe is bounded by
+  the check's `timeout_ms`, which defaults to `connect_ms`.
+
+  The concurrency is derived rather than configured, because how many
+  probes to run at once is not a question an operator can answer while
+  how many endpoints to check is one they have already answered. It
+  matters most where a serial sweep is worst: a **black-holed** endpoint
+  — accepted by no one, refused by no one — costs a probe its whole
+  budget, and swept in sequence ten of them add ten budgets to every
+  pass. Detection time was therefore a function of endpoint count, which
+  was tolerable only while a compiled ceiling bounded that count; #133
+  removed it.
+
+  Budgeted like the admin plane (§8: `health_probe_ops_max` ring ops and
+  one fd *per probe*), except that the count is the config's rather than
+  a constant. The compiled ceilings reserve
+  `health_probe_concurrency_max` probes' worth — that is what
+  `conn_slots_max` is derived against — while the fd and ring demands a
+  process actually makes are computed from the endpoints this config
+  checks. A deployment with no `check` block anywhere reserves one
+  probe, exactly as it did before the ceiling existed, which is what
+  keeps "reserved unconditionally" true of it.
 
   What a probe proves is the operator's choice. A **`tcp`** check dials:
   a SYN/ACK passes, and refused, unreachable, timed out or kernel
@@ -2091,6 +2111,17 @@ equalities a shared runner's noise cannot move.
    census covers the §4 seam as well as the §8 ladder — an op no seed ever
    carries is a slice of the seam the gate has never run, and no counter's
    silence would name it.
+   What none of that reads is *when*. Counters and transcripts say what
+   happened, so a deadline that fires late still produces a completely
+   legal seed (#258). The sweep cannot fix this — its schedule is the
+   randomized thing — but a **scripted** scenario can, because the clock
+   is virtual and deterministic: a test may end a run at a chosen
+   instant and assert what must already have happened by then. §7's
+   concurrent health sweep is gated that way, on a cluster of black-holed
+   endpoints where a serial prober and a concurrent one reach identical
+   verdicts and differ only in when. Both kinds of oracle are needed:
+   the sweep for reach, a scripted clock for the properties reach cannot
+   express.
    `zig build sim -- fuzz` runs forever on entropy-derived seeds.
 2. **Fuzzing — `zig build test --fuzz`.** `std.testing.fuzz` on every
    parser edge: HTTP/1.1 head parser, chunked decoder, config parser.

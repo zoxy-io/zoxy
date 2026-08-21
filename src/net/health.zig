@@ -1,6 +1,6 @@
 //! Active health checks (DESIGN.md §7, HAProxy's `check` model): one
 //! prober per server sweeps every endpoint of every checked cluster,
-//! probing each in turn under the check's own `timeout_ms`. What a probe
+//! probing each under the check's own `timeout_ms`. What a probe
 //! proves is the cluster's choice: a `tcp` check dials and takes the
 //! SYN/ACK as its answer, while an `http` check goes on to send a
 //! request and require the configured status — the difference between
@@ -15,19 +15,31 @@
 //! permanently healthy, so the balancer applies the mask unconditionally
 //! (§7 fail-open lives there, not here).
 //!
-//! One probe is in flight at a time, and its legs run in sequence — dial,
-//! then send, then recv — which is what keeps the prober's reservation
-//! closed-form whichever kind is configured (`health_probe_ops_max` ring
-//! ops, one fd, §8): the peak is one leg, the deadline, and at most one
-//! cancel. Sweeps serialize endpoint-by-endpoint and the interval paces
-//! sweep-end to sweep-start.
+//! A sweep runs `constants.healthProbeConcurrency` probes at once — one
+//! per checked endpoint, capped at `health_probe_concurrency_max` — all
+//! drawing from one cursor, and the interval paces sweep-end to
+//! sweep-start (#132). Serially was the shape until #133 removed the
+//! endpoint ceilings: detection time is `fall × (sweep + interval)`, and
+//! a serial sweep makes the first term the endpoint count times a whole
+//! `timeout_ms` whenever the endpoints are black-holed rather than
+//! refused. What a probe costs did not change, only how many of them the
+//! prober waits for at once.
+//!
+//! One probe's legs still run in sequence — dial, then send, then recv —
+//! which is what keeps the reservation closed-form whichever kind is
+//! configured (`health_probe_ops_max` ring ops and one fd *per probe*,
+//! §8): a probe's peak is one leg, the deadline, and at most one cancel.
+//! The rest timer and the cancel the drain spends on it are disjoint
+//! from every probe, so they add nothing to that.
 //!
 //! What is per-probe and what is per-prober is drawn as a type boundary:
 //! `Probe` owns a target, a verdict, a socket, the two buffers and every
 //! op it may arm, while the checker owns what a sweep shares — the mask,
-//! the streaks, the cursor and the rest timer. The checker holds exactly
-//! one probe today, and that count is the only thing that stands between
-//! this shape and a concurrent sweep (#132).
+//! the streaks, the cursor and the rest timer. The cursor is the whole
+//! coordination story: `takeNextTarget` claims an endpoint and advances
+//! in one step, so no two probes are ever handed the same one, and a
+//! verdict is applied against the probe's own target rather than a
+//! cursor that has long since moved on.
 //!
 //! Ending a probe early depends on which leg is armed, because data ops
 //! are never canceled (§4, §5). A dial takes the one legal cancel; a
@@ -107,7 +119,8 @@ pub fn Checker(comptime IoType: type) type {
             probing,
             /// Between sweeps: the rest timer is armed for the interval.
             resting,
-            /// Drain (§8): canceling whatever is armed, serially.
+            /// Drain (§8): canceling whatever is armed — one cancel at a
+            /// time per probe, all probes advancing together.
             stopping,
             /// Quiescent; never re-arms.
             stopped,
@@ -748,9 +761,9 @@ pub fn Checker(comptime IoType: type) type {
             checker.startSweep();
         }
 
-        /// Drain (§8): discard any in-flight probe's verdict and cancel
-        /// the armed ops, serially. `maybeStopAfterDrain` fires once the
-        /// armed set empties.
+        /// Drain (§8): discard every in-flight probe's verdict and cancel
+        /// the armed ops — serially within a probe, together across them.
+        /// `maybeStopAfterDrain` fires once the armed set empties.
         pub fn beginStop(checker: *Self) void {
             if (checker.state == .stopping or checker.state == .stopped) return;
             if (checker.state == .off) {
