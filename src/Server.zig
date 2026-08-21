@@ -2756,6 +2756,17 @@ pub fn Server(comptime IoType: type) type {
                 // here — and wants the opposite response. The dial counter
                 // cannot tell them apart, so witness the pressure too (§8).
                 server.witnessKernelPressure(.connect, err);
+                // #230's dial signal, on the same split and for the same
+                // reason as the L7 path: an L4 cluster's endpoints share
+                // the one health mask, so a refusing backend an operator
+                // asked to have detected must be detected whichever
+                // protocol found it.
+                if (err != error.Unexpected) {
+                    server.health.witnessPassiveFailure(
+                        conn.charged_cluster,
+                        conn.charged_endpoint,
+                    );
+                }
                 server.beginTeardown(conn);
                 return;
             };
@@ -3133,6 +3144,7 @@ pub fn Server(comptime IoType: type) type {
                 .upstream_head_buffers_capacity = server.upstream_head_buffers.capacity(),
                 .kernel_pressure_last_errno = server.last_pressure_errno,
                 .health_endpoints_checked = server.health.checked_count,
+                .health_endpoints_ejectable = server.health.ejectable_count,
                 .health_endpoints_unhealthy = server.health.unhealthy_count,
             };
             // Asserted at the producer, not in the renderer: a level past

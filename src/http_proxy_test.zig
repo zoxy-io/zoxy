@@ -660,6 +660,9 @@ const Http1Bed = struct {
         /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
         check: ?config_module.Config.Cluster.Check = null,
+        /// §7 passive ejection on the one cluster (#230); null by default
+        /// so no pre-existing scenario can have an endpoint removed under it.
+        passive_ejection: ?config_module.Config.Cluster.PassiveEjection = null,
         /// §8 per-endpoint concurrency cap; null leaves the cluster
         /// uncapped, which is what every pre-existing scenario wants.
         max_inflight: ?u32 = null,
@@ -701,7 +704,7 @@ const Http1Bed = struct {
         else
             .{ originAddress(), originAddress() };
         bed.endpoints_count = if (options.refusing_endpoint_first) 2 else 1;
-        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries }};
+        bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{
             .bind_address = bindAddress(),
@@ -3333,6 +3336,99 @@ test "l7: a dial re-basing an already-expired deadline defers past the cancel" {
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
         try bed.expectDrained();
     }
+}
+
+test "l7: passive ejection removes an endpoint real traffic reports dead" {
+    // #230's core: an origin that accepts and then answers nothing is the
+    // wedged-application case a `tcp` probe is blind to, because the
+    // kernel completes the handshake on the application's behalf. Here
+    // nothing probes at all — `check` is absent — which is the default
+    // deployment the issue was opened about.
+    // `fall` is one because a 504 answers `Connection: close`, so one
+    // client connection carries one failure — the threshold's *counting*
+    // is what the next test covers, on a connection that survives.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 230,
+        .origin_mute = true,
+        .request_timeout_ms = 20,
+        .passive_ejection = .{ .fall = 1, .recovery_ms = 60_000 },
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(!bed.server.health.healthy[0]);
+
+    // The cause partition, which is the whole reason `reconcile` could
+    // keep asserting anything about ejections once the mask grew a second
+    // writer: this one was traffic's verdict, and no probe was involved.
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        bed.server.counters.get("health_endpoint_down_passive"),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        bed.server.counters.get("health_endpoint_down_probe"),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_sent"));
+    // Ejectable without being checked — the gap #230 exists to fill, and
+    // the reason the gauge capacity could not stay `checked`.
+    try std.testing.expectEqual(@as(u32, 0), bed.server.health.checked_count);
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.ejectable_count);
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.unhealthy_count);
+    try bed.expectDrained();
+}
+
+test "l7: one failure is a blip, and a served response ends the streak" {
+    // The other half of the threshold's meaning, on a keep-alive
+    // connection so both requests fit one scenario: the origin answers
+    // the first and goes mute for the second. That is a flapping backend,
+    // not a dead one, and `fall` of two must not be reached — neither by
+    // the single failure alone, nor by counting it against a streak the
+    // served response should already have cleared.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 231,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .origin_mute_after_served = 1,
+        .request_timeout_ms = 20,
+        .passive_ejection = .{ .fall = 2, .recovery_ms = 60_000 },
+    });
+    defer bed.tearDown();
+
+    bed.client.second_request = "GET /mute HTTP/1.1\r\nHost: o\r\n\r\n";
+    try bed.exchange("GET /served HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    try bed.expectDrained();
+}
+
+test "l7: a cluster that did not opt in is never passively ejected" {
+    // The opt-in claim, stated as a test rather than trusted: the same
+    // scenario that ejects above must leave the mask untouched with no
+    // `passive_ejection` block, however many requests answer nothing.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 232,
+        .origin_mute = true,
+        .request_timeout_ms = 20,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /one HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    // Not merely un-ejected: not even a candidate, which is what keeps a
+    // deployment that never asked for this paying nothing for it.
+    try std.testing.expectEqual(@as(u32, 0), bed.server.health.ejectable_count);
+    try bed.expectDrained();
 }
 
 test "l7: the request deadline fires 504 ahead of the connect and idle budgets" {

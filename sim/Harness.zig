@@ -735,6 +735,7 @@ fn wireClusters(
             .weights = if (random.boolean()) &harness.weights_l4 else null,
             .pick = picks.l4,
             .check = health.check_l4,
+            .passive_ejection = health.passive_l4,
             .max_inflight = deriveMaxInflight(harness.clean, random),
             .proxy_protocol_send = harness.proxy_protocol_send_l4,
         },
@@ -748,6 +749,7 @@ fn wireClusters(
             .pick = picks.http,
             .hash_key = picks.http_hash_key,
             .check = health.check_http,
+            .passive_ejection = health.passive_http,
             .max_inflight = deriveMaxInflight(harness.clean, random),
             .retries = harness.retries_http,
         },
@@ -1000,11 +1002,44 @@ fn checkHttpDraw(
 const HealthDraw = struct {
     check_l4: ?Check,
     check_http: ?Check,
+    /// #230 passive ejection, drawn independently of the probes: the two
+    /// compose rather than overlap, so a scenario must be able to run
+    /// either alone as well as both.
+    passive_l4: ?PassiveEjection,
+    passive_http: ?PassiveEjection,
     interval_ms: u32,
     http_origin_stop_at_ns: u64,
 };
 
 const Check = zoxy.config.Config.Cluster.Check;
+const PassiveEjection = zoxy.config.Config.Cluster.PassiveEjection;
+
+/// A cluster's #230 passive-ejection draw. A third of adversary seeds
+/// opt in, and never a clean one: the signals are a failed dial and an
+/// exchange that answered nothing, and a clean seed produces neither —
+/// so configuring it there would cost every clean seed a stream shift to
+/// exercise a code path that cannot fire.
+///
+/// `fall` is drawn tight because a scenario is tens of virtual
+/// milliseconds long and the adversary refuses at most a fifth of dials:
+/// a threshold of five would leave the ejection unreachable on most
+/// seeds, which is the axis being unreachable rather than covered — the
+/// #258 lesson. `recovery_ms` is drawn short for the same reason, so the
+/// re-admission it gates is reachable inside a scenario too.
+fn derivePassiveEjection(clean: bool, random: std.Random) ?PassiveEjection {
+    if (clean) return null;
+    if (random.uintLessThan(u8, 3) != 0) return null;
+    const draw: PassiveEjection = .{
+        .fall = 1 + random.uintAtMost(u8, 2),
+        .recovery_ms = 1 + random.uintAtMost(u32, 20),
+    };
+    // The bounds the reachability argument above depends on, stated
+    // where they are drawn rather than only in prose.
+    assert(draw.fall >= 1 and draw.fall <= 3);
+    assert(draw.recovery_ms >= 1);
+    assert(draw.recovery_ms < health_interval_floor_ms);
+    return draw;
+}
 
 /// An eighth of adversarial seeds are outage seeds: the HTTP origin
 /// stops listening while clients are still live and parked connections
@@ -1045,6 +1080,8 @@ fn deriveHealthChecks(clean: bool, random: std.Random, timeout_ms: u32) HealthDr
         // the dial check is meaningful against it.
         .check_l4 = if (!outage and random.boolean()) tcp_check else null,
         .check_http = checkHttpDraw(checked_http, outage, random, tcp_check, http_check),
+        .passive_l4 = derivePassiveEjection(clean, random),
+        .passive_http = derivePassiveEjection(clean, random),
         .interval_ms = if (outage)
             5 + random.uintAtMost(u32, 10)
         else

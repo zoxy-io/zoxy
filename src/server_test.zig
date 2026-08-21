@@ -286,6 +286,9 @@ pub const TestBed = struct {
         /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
         check: ?config_module.Config.Cluster.Check = null,
+        /// §7 passive ejection on the one cluster (#230); null by default,
+        /// so no pre-existing scenario can lose an endpoint under it.
+        passive_ejection: ?config_module.Config.Cluster.PassiveEjection = null,
         /// §8 per-endpoint concurrency cap; null leaves the cluster
         /// uncapped, which is what every pre-existing scenario wants.
         max_inflight: ?u32 = null,
@@ -368,6 +371,7 @@ pub const TestBed = struct {
             .name = "origin",
             .endpoints = bed.endpoints[0..bed.endpoints_count],
             .check = options.check,
+            .passive_ejection = options.passive_ejection,
             .max_inflight = options.max_inflight,
             .proxy_protocol_send = options.proxy_protocol_send,
         }};
@@ -979,6 +983,38 @@ test "server: refused upstream tears the connection down and is counted" {
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
+    try bed.expectDrained();
+}
+
+test "l4: a refused dial passively ejects the endpoint it was for" {
+    // #230 on the L4 path. The two "answered nothing" signals are L7
+    // shapes — there is no response head to be missing from a byte relay
+    // — but a *dial* fails identically whichever protocol asked for it,
+    // and both protocols pick through the one health mask. An operator
+    // who configures `passive_ejection` on a cluster an l4 listener
+    // routes to must get detection, not a knob that quietly does
+    // nothing.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .server = .{ .conn_slots = 2, .relay_buffers = 1 },
+        .sim = .{ .seed = 234 },
+        .origin_listens = false, // every dial is refused
+        .passive_ejection = .{ .fall = 1, .recovery_ms = 60_000 },
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, false);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_connect_failed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down_passive"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down_probe"));
+    try std.testing.expect(!bed.server.health.healthy[0]);
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.unhealthy_count);
+    // Nothing probes here, and the endpoint is still ejectable — the
+    // whole point of the feature for a cluster with no `check` block.
+    try std.testing.expectEqual(@as(u32, 0), bed.server.health.checked_count);
+    try std.testing.expectEqual(@as(u32, 1), bed.server.health.ejectable_count);
     try bed.expectDrained();
 }
 
