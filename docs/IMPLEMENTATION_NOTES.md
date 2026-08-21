@@ -593,7 +593,8 @@ shipped and DESIGN.md §5 and CLAUDE.md already say it. What is left of
 this question is only the conn/upstream pair itself, and it no longer has
 an invariant to spend: the wording above is the state of the code, not a
 price still to be paid. Two details there are now stale — the pair reads
-11466/11466, not 11464, and `SimIo` sizes its buffer from its own
+11457/11457, not 11464 (11466 until #132 widened the health
+reservation), and `SimIo` sizes its buffer from its own
 `listeners_max` rather than from the deleted `in_flight_ops_max`.
 
 Entry gate: demonstrate a workload that actually saturates the
@@ -1086,6 +1087,67 @@ which today means after `splice`/`send_zc` (§4, "Open questions") or
 #173 changes the shape of the data path. Even then the verdict is a
 proxy-level band, never a micro-bench delta; that mistake is what the
 section above this one is about.
+
+## Health prober concurrency — the two options that were already answered (2026-08-21, #132)
+
+#132 offered three fixes for a serial sweep whose detection time scales
+with endpoint count. Only one was work.
+
+**Bounded probe concurrency — taken.** The reason it was not done first,
+per the issue, was that in-flight probes cost ring ops and the design's
+appeal was a single fixed reservation. That still holds, and the answer
+is the shape the conn and upstream *pools* already have rather than a
+new idea: the compiled ceilings reserve
+`health_probe_concurrency_max` probes' worth, the fd and ring demands a
+process makes are computed from the endpoints its config checks, and a
+config with no `check` block reserves the one probe it always did.
+
+It is worth being exact about which precedent this is, because the
+nearer-looking one is wrong. Listeners are *also* a config-chosen term
+evaluated at load, but they have no compiled ceiling left at all —
+`completion_queue_entries` is derived at zero listeners precisely
+because there is no worst case to reserve for, so their split costs the
+ceilings nothing. The prober's does: `health_probe_concurrency_max` is a
+real worst case baked into `conn_slots_max`'s derivation, which is why
+the paragraph below has a cost to report at all. The pools are the
+precedent — a compiled ceiling bounding any config, the budget then
+evaluated on the config at hand.
+
+Reserving the ceiling unconditionally would have
+been a much smaller change and was rejected for a specific cost — it
+moves `upstream_slots_default` from 1311 to 1296, because the default is
+derived as the largest value clearing the stock 4096 `RLIMIT_NOFILE`, so
+15 unused probe fds come straight off a pool every deployment has,
+including every one that never asked for a health check.
+
+**A probe deadline shorter than `connect_ms` — already shipped.** The
+issue lists this as an option; `check.timeout_ms` has existed since the
+`check` block did, defaulting to `connect_ms` and settable per cluster.
+Nothing to do but notice.
+
+**Per-cluster interval budgeting — deferred, and probably moot.** The
+idea was to sweep a large cluster at a rate derived from its size rather
+than sharing one global cadence. Concurrency addresses the same
+complaint — a sweep no longer takes endpoint-count × probe-time — so
+what would remain is fairness between clusters of very different sizes
+under one interval. That is a real question and a different one; it
+wants a demonstrated need, not a pre-emptive knob (§7's standing rule
+for this area).
+
+**What the ceiling costs, measured against the derivation rather than
+guessed:** at `health_probe_concurrency_max = 16` the worst-case
+reservation is 48 ring ops instead of 3, which moves `conn_slots_max`
+from 11466 to 11457. Nine slots out of eleven thousand, against turning
+ten black-holed endpoints at a 5 s budget from 50 s of added sweep into
+5 s.
+
+**A note on what proved it works.** The 4096-seed sweep's census was
+byte-identical before and after the change, which proves nothing here:
+it records which counters fired, not how any seed was ordered, and the
+harness configures at most three checked endpoints. The evidence is a
+`health_probes_concurrent` counter (the census then moves 71 → 72) plus
+scripted scenarios that assert *when* an ejection lands — see §9 on why
+a scripted clock can carry a timing oracle the sweep cannot (#258).
 
 ## io_uring op upgrades — evaluated, deferred (2026-07-16)
 

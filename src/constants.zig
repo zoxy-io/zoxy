@@ -630,7 +630,15 @@ pub const health_probe_concurrency_max: u32 = 16;
 /// moved when this ceiling arrived. The ring and fd budgets take the
 /// effective value (the config's), while the comptime ceilings below
 /// take `health_probe_concurrency_max` (the worst case any config could
-/// ask for) — the same split `listeners` already uses.
+/// ask for).
+///
+/// That is the *pool* shape — a compiled ceiling bounding what any
+/// config may ask for, with the budget then evaluated on what this one
+/// did — and deliberately not the listener shape, which is the nearer
+/// thing to reach for and the wrong one: listeners have no compiled
+/// ceiling left at all, so `completion_queue_entries` is derived at zero
+/// of them and their whole demand is met at load. This ceiling is real,
+/// and `conn_slots_max` is nine slots smaller for it.
 pub fn healthProbeConcurrency(checked_endpoints: u32) u32 {
     const probes = @max(1, @min(checked_endpoints, health_probe_concurrency_max));
     assert(probes >= 1);

@@ -308,10 +308,10 @@ pub fn Server(comptime IoType: type) type {
         /// ring op and two staging buffers, both reserved unconditionally
         /// in the budgets and allocated only when it is on.
         access_log: AccessLogType,
-        /// The §7 active health prober: one probe in flight, budgeted
-        /// separately (`constants.health_probe_ops_max`). Off unless a
-        /// cluster sets `check`; its `healthy` mask is what the balancer
-        /// picks through.
+        /// The §7 active health prober: `config.healthProbes()` probes in
+        /// flight, budgeted separately (`constants.health_probe_ops_max`
+        /// each). Off unless a cluster sets `check`; its `healthy` mask
+        /// is what the balancer picks through.
         health: health_module.Checker(IoType),
 
         const Self = @This();
