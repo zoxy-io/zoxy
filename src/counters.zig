@@ -318,6 +318,20 @@ pub const Counters = struct {
     /// holds the prober, and this counter is the difference between the
     /// race happening occasionally and it happening every time (#130).
     health_probe_deadline_raced: Value = Value.init(0),
+    /// Probes dispatched while a sibling probe was already in flight
+    /// (§7, #132) — the witness that the sweep is concurrent and not
+    /// serial-in-disguise. Zero is the correct value for any deployment
+    /// whose clusters check one endpoint between them, and for one whose
+    /// origins answer faster than the prober can hand out the next
+    /// target; it rises with the checked-endpoint count, which is the
+    /// case the concurrency exists for.
+    ///
+    /// It is a witness rather than a health signal: nothing is wrong at
+    /// any value. What it protects against is a regression that quietly
+    /// re-serializes the sweep — every verdict would still be correct,
+    /// and only detection *time* would regress, which no counter or
+    /// transcript oracle in the tree can see.
+    health_probes_concurrent: Value = Value.init(0),
     /// §8 rung: ENOBUFS/ENOMEM-class op failures, one per treated op —
     /// across every completion (accept, connect, setNodelay, and the relay
     /// recv/send data path). The total; `kernel_pressure_by_op` below

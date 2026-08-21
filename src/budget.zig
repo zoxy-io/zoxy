@@ -71,17 +71,24 @@ pub fn Budget(comptime IoType: type) type {
                 @intFromBool(sink == .file)
             else
                 0;
+            // The prober's effective probe count (§7, #132): a config
+            // with no `check` block anywhere reserves the one probe's
+            // worth it always did, so this term moves nothing for a
+            // deployment that did not ask for health checks.
+            const health_probes = config.healthProbes();
             const demands: Demands = .{
                 .fds = constants.fdsRequired(
                     config.limits.conn_slots,
                     config.limits.upstream_slots,
                     listeners_count,
                     access_log_files,
+                    health_probes,
                 ),
                 .cq_entries = constants.completionQueueDepthFor(
                     config.limits.conn_slots,
                     config.limits.upstream_slots,
                     listeners_count,
+                    health_probes,
                     config.limits.cq_fill_eighths,
                 ),
             };
@@ -102,7 +109,7 @@ pub fn Budget(comptime IoType: type) type {
             // The head-sized side buffers (§5): Server owns the closed
             // form and asserts its own allocations against it, so
             // pricing it here cannot drift from what init reserves.
-            const head_scratch_bytes = ServerType.headScratchBytes(limits);
+            const head_scratch_bytes = ServerType.headScratchBytes(limits, config.healthProbes());
             assert(head_scratch_bytes >= limits.head_buffer_bytes);
             assert(limits.conn_slots >= 1);
             return .{
@@ -214,6 +221,7 @@ pub fn Budget(comptime IoType: type) type {
                 limits.conn_slots,
                 limits.upstream_slots,
                 @intCast(config.listeners.len),
+                config.healthProbes(),
             );
             const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
             const sizes = poolSizesFor(config);
