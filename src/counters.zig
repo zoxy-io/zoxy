@@ -273,6 +273,23 @@ pub const Counters = struct {
     /// so a rising count is the cap doing its job rather than churn it
     /// merely coincided with.
     l7_keepalive_requests_capped: Value = Value.init(0),
+    /// Connections reaped by the #235 head-read budget — a client that
+    /// began a request and stopped mid-sentence (#258).
+    ///
+    /// It exists because that reap is otherwise *invisible*. Every other
+    /// deadline verdict answers something a transcript can show; this one
+    /// tears down silently (#247), so a budget that fired at the wrong
+    /// moment, or that was never installed at all, produces a run
+    /// indistinguishable from one where the idle window did the work.
+    /// Both of #235's defects reached 0.4.0 that way, found by reading
+    /// rather than by the gate.
+    ///
+    /// A witness, not a health signal: a proxy on a hostile network
+    /// should see this rise. What it protects is the *reachability* of
+    /// the axis — the census fails if no seed ever gets a head
+    /// outstanding long enough to be reaped, which was true of every
+    /// sweep before `dribbled_head` existed.
+    l7_head_budget_expired: Value = Value.init(0),
     /// Interim `1xx` responses relayed to the client (#232). Forwarded
     /// rather than absorbed, which is what both references do: a `103` is
     /// worthless to a client that never sees it, and a `100` the client is
