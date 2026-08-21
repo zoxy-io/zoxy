@@ -290,6 +290,13 @@ pub const Counters = struct {
     /// outstanding long enough to be reaped, which was true of every
     /// sweep before `dribbled_head` existed.
     l7_head_budget_expired: Value = Value.init(0),
+    /// Head-budget reaps answered `408` rather than reset (#247) — a
+    /// client that began a request and stopped, told why it is being
+    /// closed. A subset of `l7_head_budget_expired`: the reaps it does
+    /// *not* count are the ones no status was due for, which today is
+    /// none of them, and `reconcile` holds the inequality so a future
+    /// unanswerable shape cannot pass unnoticed.
+    l7_request_timeout: Value = Value.init(0),
     /// Interim `1xx` responses relayed to the client (#232). Forwarded
     /// rather than absorbed, which is what both references do: a `103` is
     /// worthless to a client that never sees it, and a `100` the client is
@@ -821,6 +828,13 @@ pub const Counters = struct {
         // Every 504 verdict rides a deadline expiry (§8) — the verdict
         // path increments both, the teardown path only the expiry.
         assert(counters.get("l7_gateway_timeout") <= counters.get("deadline_expired"));
+        // Every `408` rides a head-budget reap (#247): the verdict is
+        // reached from that expiry and nowhere else. The inequality
+        // rather than an equality, because a reap that cannot be
+        // answered is legal — today none exist, and this is what would
+        // notice if one arrived.
+        assert(counters.get("l7_request_timeout") <=
+            counters.get("l7_head_budget_expired"));
         // Every §7 replay rides a checkout: only a reused connection's
         // early failure is blamed on staleness.
         assert(counters.get("upstream_replayed") <= counters.get("upstream_reused"));

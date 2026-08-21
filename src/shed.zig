@@ -315,7 +315,7 @@ fn writeTwoDigits(out: *[2]u8, value: u32) void {
 /// (§7) send as static responses — the statuses `error_pages` may
 /// configure a body for (#159): a page for a status this proxy never
 /// sends is a config the operator misread, refused at load.
-pub const static_statuses = [_]u16{ 400, 403, 404, 413, 414, 429, 431, 501, 502, 503, 504 };
+pub const static_statuses = [_]u16{ 400, 403, 404, 408, 413, 414, 429, 431, 501, 502, 503, 504 };
 
 /// Every status a configured page may carry (#159): the error set
 /// above, plus `200` — which no rung raises, but a `respond` filter
@@ -394,6 +394,7 @@ pub fn reasonPhrase(status: u16) []const u8 {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
         413 => "Content Too Large",
         414 => "URI Too Long",
         429 => "Too Many Requests",

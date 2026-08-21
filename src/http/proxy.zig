@@ -216,6 +216,18 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_reading_head);
+            // The head budget's verdict forced this op (#247) — the same
+            // divert `onHeadRecv` makes, and it must be here too because
+            // a terminated connection reads *only* through this arm.
+            // #235 shipped its budget into the plaintext arm alone and
+            // left HTTPS slowlorises the whole idle window; answering in
+            // one arm and resetting in the other would be that defect
+            // again, wearing the fix's clothes.
+            if (conn.l7.pending_verdict != .none) {
+                assert(conn.l7.pending_verdict == .request_timeout);
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const received = result catch |err| {
                 // A client that leaves before finishing its head has
                 // nothing to be answered; the §7 head deadline handles the
@@ -533,6 +545,18 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_reading_head);
+            // The head budget's verdict forced this op (#247): the read
+            // half was shut down precisely to end it, so its result is
+            // accounting rather than news — an EndOfStream we caused, or
+            // a delivery that raced the shutdown. Diverted before the
+            // error handling below so a forced EOF never reaches the
+            // kernel-pressure witness, the same order `settlePendingVerdict`
+            // relies on for the upstream verdicts.
+            if (conn.l7.pending_verdict != .none) {
+                assert(conn.l7.pending_verdict == .request_timeout);
+                settlePendingVerdict(server, conn);
+                return;
+            }
             const received = result catch |err| {
                 // A client that closes or resets mid-head simply leaves —
                 // there is nothing to answer. The §7 head-read deadline
@@ -3470,6 +3494,52 @@ pub fn Proxy(comptime IoType: type) type {
             );
         }
 
+        /// Whether the #235 head budget's expiry can be *answered* rather
+        /// than reset (#247).
+        ///
+        /// Only a client mid-sentence is owed one. A connection that has
+        /// said nothing at all was never under the budget — it sits on
+        /// the idle window — so `head_budget_installed` already draws the
+        /// line HAProxy needed `option http-ignore-probes` to draw: a
+        /// monitoring agent that opens a connection and closes it without
+        /// speaking earns silence, not a `408` per probe.
+        ///
+        /// The head recv is the one op that must be armed, since it is
+        /// what the verdict forces. A response leg cannot be, because
+        /// nothing has been answered yet in this state.
+        pub fn headExpiryAnswerable(conn: *const ConnType) bool {
+            assert(conn.state == .l7_reading_head);
+            // Stated positively rather than tested: `response_started` is
+            // set only inside `.l7_exchanging` and cleared on every entry
+            // to this state, so a conditional here would read as live and
+            // never be.
+            assert(!conn.l7.response_started);
+            if (!conn.l7.head_budget_installed) return false;
+            return conn.armed.data_client_to_upstream;
+        }
+
+        /// Begin the #247 head-read verdict: force the armed head recv and
+        /// answer `408` once it settles.
+        ///
+        /// The force is a **read-half** shutdown, which is the whole
+        /// reason §4 grew a variant for it. `.both` would end the recv and
+        /// take with it the write half the answer needs; `.write` would
+        /// leave the recv armed on a client that has already stopped
+        /// speaking. This ends exactly the op in the way, and leaves the
+        /// connection able to say why it is closing — §8's own rule, that
+        /// a client reading a reset where a status was due reports an
+        /// error it cannot attribute.
+        ///
+        /// The connection never survives the answer: a shut read half
+        /// cannot carry another request, so the `408` announces close.
+        pub fn beginHeadExpiry(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .l7_reading_head);
+            assert(conn.l7.pending_verdict == .none);
+            assert(headExpiryAnswerable(conn));
+            conn.l7.pending_verdict = .request_timeout;
+            server.io.shutdown(conn.client_socket, .read);
+        }
+
         /// Begin the §8 request-deadline verdict. Ops are never canceled
         /// (§5) — they are *forced*: shutting the upstream socket down
         /// makes each armed op on it complete with an error its handler
@@ -3494,7 +3564,14 @@ pub fn Proxy(comptime IoType: type) type {
         /// divert runs before any error handling, a forced EPIPE never
         /// pollutes the kernel-pressure witness.
         fn settlePendingVerdict(server: *ServerType, conn: *ConnType) void {
-            assert(conn.state == .l7_exchanging);
+            // The #247 verdict settles from `.l7_reading_head`, where the
+            // op it forced is the head recv; the other two settle from an
+            // exchange. One function because the discipline is identical —
+            // act only once every forced op has drained — and splitting it
+            // would be two copies of that rule to keep in step.
+            assert(conn.state == .l7_exchanging or
+                (conn.state == .l7_reading_head and
+                    conn.l7.pending_verdict == .request_timeout));
             assert(conn.l7.pending_verdict != .none);
             if (conn.armed.data_client_to_upstream or
                 conn.armed.data_upstream_to_client)
@@ -3510,6 +3587,7 @@ pub fn Proxy(comptime IoType: type) type {
                     respond(server, conn, 504, "l7_gateway_timeout");
                 },
                 .replay => beginReplay(server, conn),
+                .request_timeout => respond(server, conn, 408, "l7_request_timeout"),
             }
         }
 
@@ -4223,6 +4301,13 @@ pub fn Proxy(comptime IoType: type) type {
             if (std.mem.eql(u8, counter, "l7_shed_tunnels")) return .shed;
             if (std.mem.eql(u8, counter, "l7_bad_gateway")) return .upstream_failed;
             if (std.mem.eql(u8, counter, "l7_gateway_timeout")) return .timed_out;
+            // A head that never finished is a timeout like the exchange
+            // deadline's, and reads as one (#247). Which side ran out of
+            // time is the status's to say — `408` names the client, `504`
+            // the origin — where the log line is about the outcome, and
+            // the outcome is the same: nothing was served, because time
+            // ran out.
+            if (std.mem.eql(u8, counter, "l7_request_timeout")) return .timed_out;
             @compileError("static-response counter with no access-log outcome: " ++ counter);
         }
 
