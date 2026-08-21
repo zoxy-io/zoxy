@@ -69,14 +69,15 @@ pub const Script = enum(u8) {
     silent,
     /// Begins a head and never finishes it — a request line and one
     /// header, no terminating blank line — then holds the connection
-    /// open. Any response byte is a violation, exactly as for `silent`.
+    /// open. Earns the #247 `408`.
     ///
-    /// The two are not the same wait, and the difference is the whole
+    /// Not `silent` with fewer bytes, and the difference is the whole
     /// reason this exists (#258). `silent` says nothing at all, so it
-    /// sits on the *idle* window; the #235 head budget starts at the
-    /// client's first byte, so only a client mid-sentence is ever under
-    /// it. Before this script no seed in the sweep had a head
-    /// outstanding at all — the axis was unreachable, which is why
+    /// sits on the *idle* window and is owed nothing; the #235 head
+    /// budget starts at the client's first byte, so only a client
+    /// mid-sentence is ever under it — and only such a client is owed a
+    /// status. Before this script no seed in the sweep had a head
+    /// outstanding at all: the axis was unreachable, which is why
     /// forcing every adversary seed to a one-millisecond head budget
     /// changed nothing and two defects in that budget reached 0.4.0 by
     /// way of a reader rather than the gate.
@@ -369,19 +370,19 @@ comptime {
 /// stall any of them) earns the 504 once the deadline expires with no
 /// response byte sent. Clean seeds pin the origin to `sized` and never
 /// stall, so `golden_status` still demands exact outcomes there.
-const statuses_routed: []const u16 = &.{ 200, 502, 503, 504 };
+const statuses_routed: []const u16 = &.{ 200, 408, 502, 503, 504 };
 /// The routed set plus the #236 body cap's `413`, for the scripts that
 /// carry a body. Only an adversarial seed draws a cap — a clean seed's
 /// script asked for a `200` and a refusal is not it — so the golden
 /// outcome is unchanged and this only widens what a cut seed may legally
 /// show.
-const statuses_routed_body: []const u16 = &.{ 200, 413, 502, 503, 504 };
+const statuses_routed_body: []const u16 = &.{ 200, 408, 413, 502, 503, 504 };
 /// The head routes and forwards before its body is validated, so several
 /// outcomes can precede the 400: the §8 rungs, a killed dial, and — the
 /// subtlety — an early origin response. An instant origin answers 200
 /// before the proxy ever pumps the malformed body (which it then
 /// contains, never forwarding it: the origin's §7 oracle still holds).
-const statuses_body_reject: []const u16 = &.{ 400, 200, 502, 503, 504 };
+const statuses_body_reject: []const u16 = &.{ 400, 200, 408, 502, 503, 504 };
 
 const specs = std.enums.EnumArray(Script, Spec).init(.{
     .get = .{
@@ -460,7 +461,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 400,
         .method = .get,
-        .allowed_statuses = &.{ 400, 503 },
+        .allowed_statuses = &.{ 400, 408, 503 },
     },
     .oversize_uri = .{
         // The request line alone must overflow the proxy's 8 KiB head
@@ -472,7 +473,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 414,
         .method = .get,
-        .allowed_statuses = &.{ 414, 503 },
+        .allowed_statuses = &.{ 414, 408, 503 },
     },
     .connect_method = .{
         // The 501 verdict precedes routing. The method context maps to
@@ -485,7 +486,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 501,
         .method = .get,
         // Only the §5 head ring's 503 precedes the parse the 501 rides on.
-        .allowed_statuses = &.{ 501, 503 },
+        .allowed_statuses = &.{ 501, 408, 503 },
     },
     .upgrade_request = .{
         .request = "GET /ws HTTP/1.1\r\nHost: origin\r\n" ++
@@ -509,7 +510,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         // saw. A clean seed's origin always reads first and always
         // answers `101`, which is why the golden above can still be
         // exact.
-        .allowed_statuses = &.{ 101, 200, 501, 502, 503, 504 },
+        .allowed_statuses = &.{ 101, 200, 408, 501, 502, 503, 504 },
     },
     .keepalive_pair = .{
         // The second GET is appended at run time, only after the first
@@ -559,21 +560,22 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         // (#247). Should this proxy ever learn to answer `408`, this is
         // the spec that fails and has to be told about it.
         .request = "GET /sim HTTP/1.1\r\nHost: sim\r\n",
-        .expected_responses = 0,
-        // An adversary seed may show exactly one, and only a `503`: the
-        // head never completes, so nothing routes and neither 200, 502
-        // nor 504 is reachable — but the *first byte* of a partial head
-        // still meets §8's head-buffer rung, which answers 503 before
-        // the parse. That is the whole difference from `silent`, which
-        // sends no byte and so meets no rung at all. Found by seed 778
-        // rather than reasoned out in advance.
+        // One, and it is the point: the head-read budget answers `408`
+        // rather than resetting (#247). This entry read zero until that
+        // landed, with a note saying it would have to be told — and it
+        // was, by seed 796, which is the spec doing its job rather than
+        // the change being caught late.
+        .expected_responses = 1,
         .transcript_cap = 1,
-        .golden_status = 0,
+        .golden_status = 408,
         .method = .get,
-        .allowed_statuses = &.{503},
-        // One payload out, no answer owed — the coincidence every
-        // other script relies on, broken on purpose.
-        .payloads_sent = 1,
+        // `503` remains legal beside it: the *first byte* of a partial
+        // head meets §8's head-buffer rung, which answers before the
+        // parse and so before any budget is installed. That is the whole
+        // difference from `silent`, which sends no byte and meets no rung
+        // at all — and it is why this script has two legal answers where
+        // most have one.
+        .allowed_statuses = &.{ 408, 503 },
     },
     .confusion = .{
         // Canonicalizes to /sim (the `/deep` segment is popped by the
@@ -596,7 +598,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .golden_status = 501,
         .method = .get,
         // Only the §5 head ring's 503 precedes the parse the 501 rides on.
-        .allowed_statuses = &.{ 501, 503 },
+        .allowed_statuses = &.{ 501, 408, 503 },
     },
     .options_final = .{
         // Answered here, so the only rung that can precede it is the head
@@ -607,7 +609,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 200,
         .method = .options,
-        .allowed_statuses = &.{ 200, 503 },
+        .allowed_statuses = &.{ 200, 408, 503 },
         // A `200` from this proxy's own memory, not from an origin: it
         // crosses neither response-side render, and carries no body.
         .answered_here = true,
@@ -647,7 +649,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 403,
         .method = .get,
-        .allowed_statuses = &.{ 403, 503 },
+        .allowed_statuses = &.{ 403, 408, 503 },
     },
     .filter_redirect = .{
         // `filter_reject`'s timing exactly — answered before any
@@ -660,7 +662,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 301,
         .method = .get,
-        .allowed_statuses = &.{ 301, 503 },
+        .allowed_statuses = &.{ 301, 408, 503 },
     },
     .filter_respond = .{
         // `filter_reject`'s timing exactly — the answer precedes every
@@ -671,7 +673,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .transcript_cap = 1,
         .golden_status = 200,
         .method = .get,
-        .allowed_statuses = &.{ 200, 503 },
+        .allowed_statuses = &.{ 200, 408, 503 },
         .respond_page = true,
     },
     .filter_edit = .{
