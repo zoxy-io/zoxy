@@ -700,6 +700,14 @@ pub fn Conn(comptime IoType: type) type {
                 none,
                 gateway_timeout,
                 replay,
+                /// The #235 head budget expired on a client mid-sentence,
+                /// and it is owed a `408` (#247). The odd one out: the
+                /// armed op it waits on is a recv on the **client**
+                /// socket, so the force is a read-half shutdown rather
+                /// than the upstream teardown the other two use — the
+                /// connection has to survive writable to carry the
+                /// answer.
+                request_timeout,
             };
         };
 

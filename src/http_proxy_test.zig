@@ -3222,7 +3222,24 @@ test "l7: the head-read deadline reaps a slowloris that never completes" {
     // goes silent, so only the head-read deadline can end the connection.
     try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\n");
 
-    try std.testing.expectEqual(@as(usize, 0), bed.client.response().len);
+    // Answered, not reset (#247). This assertion read `len == 0` until
+    // the seam grew a read-half shutdown: the budget's reap could not
+    // say anything, because the recv it had to force was on the socket
+    // the answer goes out on. §8's rule is that a client reading a reset
+    // where a status was due reports an error it cannot attribute.
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    // The `Date` is a second past every other scenario's and spelled out
+    // rather than shared, for the reason the 504 test gives: the budget
+    // this waits out is a virtual second long, so the stamp moving with
+    // it is the cheapest proof the slot reads a live clock (#234).
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n" ++
+            "Date: Wed, 01 Jan 2020 00:00:01 GMT\r\nServer: zoxy\r\n" ++
+            "Connection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_request_timeout"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_head_budget_expired"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     try bed.expectDrained();
@@ -5810,6 +5827,15 @@ test "l7: a terminated listener's partial head meets the head budget too" {
     try std.testing.expect(elapsed_ms >= 100);
     try std.testing.expect(elapsed_ms < 500);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    // And it is *answered*, through the transform, not reset (#247). This
+    // arm needed saying separately: a terminated connection reads only
+    // through `onTlsHeadRecv`, so the verdict's divert has to be in two
+    // places, and the first version of #247 put it in one — which is
+    // #235's own defect repeated, the budget wired into the plaintext arm
+    // alone. The sweep could not have caught it: `dribbled_head` is drawn
+    // on the terminating population by adversary seeds only, and there
+    // the lenient oracle reads zero bytes as a legal cut.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_request_timeout"));
     try bed.expectDrained();
 }
 

@@ -3549,8 +3549,26 @@ pub fn Server(comptime IoType: type) type {
             // the state: a connection in `.l7_reading_head` may still be
             // on the idle window, because the budget is installed at the
             // first `Incomplete` and not at the first byte.
-            if (conn.state == .l7_reading_head and conn.l7.head_budget_installed) {
+            if (conn.state == .l7_reading_head and conn.l7.head_budget_installed and
+                conn.l7.pending_verdict == .none)
+            {
+                // Gated on the verdict, not merely on the state: the
+                // grace window this branch installs could in principle
+                // fire again before the forced recv's completion lands,
+                // and counting that would be two reaps for one. The same
+                // re-entrancy the exchange and dial branches above guard,
+                // guarded the same way.
                 server.counters.increment("l7_head_budget_expired");
+                if (Proxy.headExpiryAnswerable(conn)) {
+                    // The same fixed grace the other two verdicts take:
+                    // the pressure-biased window can collapse toward 1 ms
+                    // and tear the verdict down before its forced
+                    // completion lands.
+                    server.storeDeadline(conn, server.config.idle_timeout_ms);
+                    server.armDeadline(conn);
+                    Proxy.beginHeadExpiry(server, conn);
+                    return;
+                }
             }
             server.beginTeardown(conn);
         }
