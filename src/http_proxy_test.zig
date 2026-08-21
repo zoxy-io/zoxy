@@ -3408,6 +3408,43 @@ test "l7: one failure is a blip, and a served response ends the streak" {
     try bed.expectDrained();
 }
 
+test "l7: a passive ejection ends when its cooldown does, with nothing probing" {
+    // #230's recovery half, on the config the feature exists for: no
+    // `check` block, so nothing probes and only the cooldown can bring
+    // the endpoint back. Passive detection needs traffic and an ejected
+    // endpoint gets none — which is exactly why recovery cannot also be
+    // passive, and why the health loop runs here despite having nothing
+    // to probe. It costs no ring op beyond the rest timer the prober
+    // already reserved.
+    //
+    // The client must not drain on finish, or the scenario would end at
+    // the 504 and never reach the cooldown.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 235,
+        .origin_mute = true,
+        .request_timeout_ms = 20,
+        .passive_ejection = .{ .fall = 1, .recovery_ms = 40 },
+        .health_interval_ms = 10,
+    });
+    defer bed.tearDown();
+
+    bed.client.drain_on_finish = false;
+    bed.armDrainTimer(200);
+    try bed.exchange("GET /mute HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down_passive"));
+    // Back exactly once — not once per sweep, which is what `restore`
+    // clearing the deadline buys, and the reason the sweep can be a plain
+    // scan rather than a queue.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_up"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    try std.testing.expectEqual(@as(u32, 0), bed.server.health.unhealthy_count);
+    // The recovery was the cooldown's, not a `rise`: nothing probed at all.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_sent"));
+    try bed.expectDrained();
+}
+
 test "l7: a cluster that did not opt in is never passively ejected" {
     // The opt-in claim, stated as a test rather than trusted: the same
     // scenario that ejects above must leave the mask untouched with no
