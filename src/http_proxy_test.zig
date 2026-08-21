@@ -103,6 +103,12 @@ const HttpClient = struct {
     fn onConnect(client: *HttpClient, result: Io.ConnectError!SimIo.Socket) void {
         client.socket = result catch unreachable;
         client.armRecv();
+        // An empty request is a client that connects and says nothing —
+        // a legal shape the proxy has its own answer for (the idle
+        // window, never the #235 head budget), and one the simulator's
+        // own l7 client has always been able to express. Guarded here
+        // rather than asserted against, so a bed can state that boundary.
+        if (client.request.len == 0) return;
         if (client.send_delay_ms == 0) {
             client.armSend();
             return;
@@ -5629,6 +5635,108 @@ test "l7: a partial head is reaped at the head budget, not the idle window" {
     // state this fix found.
     try std.testing.expect(elapsed_ms >= 100);
     try std.testing.expect(elapsed_ms < 500);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try bed.expectDrained();
+}
+
+test "l7: a partial head is reaped at min(head budget, effective idle window)" {
+    // #258's second half. The three tests below this one each pin one
+    // *shape* of the #235 budget with a hand-written band; this states
+    // the rule itself, across the space, and checks the reap instant as
+    // an **equality** rather than a bound.
+    //
+    // The equality is what makes it an oracle rather than a sanity
+    // check. `elapsed_ms >= 100 and < 500` — the shape the point tests
+    // use — passes just as happily on a budget that fires four times
+    // late, and "fires late" is precisely the defect class no counter or
+    // transcript can see (§9). Measured rather than hoped for: every
+    // case below lands on its predicted millisecond exactly, and does so
+    // across four unrelated seed bases, because the deadline is a timer
+    // the virtual clock advances *to* rather than past.
+    //
+    // The rule is `min(head_timeout_ms, idleTimeoutMs())`, and the second
+    // term is the awkward one — it divides by `pressure_idle_divisor`
+    // under downstream pressure (§8), so which of the pair binds changes
+    // with load rather than with config alone. Both orders appear here.
+    const Case = struct {
+        head_ms: u32,
+        pressured: bool,
+        /// `min(head_ms, effective idle)`, restated per case rather than
+        /// computed: a helper sharing the implementation's arithmetic
+        /// would agree with a wrong implementation.
+        reaped_at_ms: u64,
+    };
+    const cases = [_]Case{
+        // The budget binds, an order of magnitude under the window.
+        .{ .head_ms = 100, .pressured = false, .reaped_at_ms = 100 },
+        // Still the budget, but close enough to the window that an
+        // off-by-one in which term wins would be invisible at 100.
+        .{ .head_ms = 800, .pressured = false, .reaped_at_ms = 800 },
+        // Pressure shrinks the window (1000/4) *under* a budget that was
+        // legal at rest, so the window binds — the inversion #235 shipped.
+        .{ .head_ms = 400, .pressured = true, .reaped_at_ms = 250 },
+        // Pressured, but the budget is tighter still: the min must not
+        // simply prefer whichever term pressure touched.
+        .{ .head_ms = 100, .pressured = true, .reaped_at_ms = 100 },
+    };
+    comptime assert(Http1Bed.idle_timeout_ms == 1000);
+    for (cases, 0..) |case, index| {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = @intCast(320 + index),
+            .head_timeout_ms = case.head_ms,
+        });
+        defer bed.tearDown();
+        bed.server.relay_pressure = case.pressured;
+
+        const start_ns = bed.sim_io.nowNs();
+        try bed.exchange("GET /slow HTTP/1.1\r\nHost: o\r\n");
+        const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+        try std.testing.expectEqual(case.reaped_at_ms, elapsed_ms);
+        // *Which* deadline reaped it, which no instant can say on its
+        // own: at case 2 the budget and the window are both plausible
+        // explanations of 250 ms until this names one (#258).
+        try std.testing.expectEqual(
+            @as(u64, 1),
+            bed.server.counters.get("l7_head_budget_expired"),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+        try bed.expectDrained();
+    }
+}
+
+test "l7: silence waits out the idle window, because the budget starts mid-head" {
+    // The boundary the whole axis rests on, and the reason it went
+    // unreachable for so long (#258). The head budget is installed on the
+    // first `Incomplete` — a client *mid-sentence* — not on connect and
+    // not on the first byte. A connection that says nothing at all has
+    // begun no head, so it is the idle window's to reap, and the sweep's
+    // `silent` script therefore never touched the budget however tight
+    // the config made it.
+    //
+    // Stated as a test because it is indistinguishable from a bug: a
+    // budget that did start at connect would reap this at 100 ms and
+    // look like a tighter, better slowloris defence, while actually
+    // capping how long any client may stay connected before speaking.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 324,
+        .head_timeout_ms = 100,
+    });
+    defer bed.tearDown();
+
+    const start_ns = bed.sim_io.nowNs();
+    try bed.exchange("");
+    const elapsed_ms = (bed.sim_io.nowNs() - start_ns) / std.time.ns_per_ms;
+
+    try std.testing.expectEqual(@as(u64, Http1Bed.idle_timeout_ms), elapsed_ms);
+    // And the budget was never installed, so its witness stays silent —
+    // the categorical half of the same claim.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_head_budget_expired"));
+    // The client's own view, so the claim does not rest on the proxy's
+    // account of itself: it was reaped, not answered.
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try bed.expectDrained();
 }
