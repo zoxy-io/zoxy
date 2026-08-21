@@ -3538,6 +3538,20 @@ pub fn Server(comptime IoType: type) type {
                 server.armConnectCancel(conn);
                 return;
             }
+            // The #235 head budget's own reap, witnessed (#258). Every
+            // path above answers *something*; this one tears down
+            // silently, so without a counter the budget firing and the
+            // idle window firing are the same event to every oracle the
+            // simulator has — which is exactly how two defects in that
+            // budget reached 0.4.0.
+            //
+            // `head_budget_installed` is the discriminator rather than
+            // the state: a connection in `.l7_reading_head` may still be
+            // on the idle window, because the budget is installed at the
+            // first `Incomplete` and not at the first byte.
+            if (conn.state == .l7_reading_head and conn.l7.head_budget_installed) {
+                server.counters.increment("l7_head_budget_expired");
+            }
             server.beginTeardown(conn);
         }
 

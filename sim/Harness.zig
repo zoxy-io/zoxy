@@ -784,9 +784,12 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     );
     harness.listeners_count = if (harness.tls_clients >= 1) 3 else 2;
     for (&harness.tls_scripts) |*script| {
-        script.* = l7.scripts.terminating_scripts[
+        const drawn = l7.scripts.terminating_scripts[
             random.uintLessThan(usize, l7.scripts.terminating_scripts.len)
         ];
+        // The same clean-seed exclusion the plaintext draw makes, and
+        // for the same reason — see `drawScript`.
+        script.* = if (harness.clean and drawn == .dribbled_head) .get else drawn;
     }
     harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
     harness.drop_mode = deriveDropMode(harness.clean, random);
@@ -1543,6 +1546,27 @@ fn startServerAndOrigins(harness: *Harness, arena: std.mem.Allocator, random: st
 /// A plaintext seed draws nothing here, which is what keeps its stream
 /// position — and so the whole sweep's plaintext coverage — exactly
 /// where it was before TLS existed.
+/// One client's script, drawn uniformly except that a clean seed never
+/// gets `dribbled_head` (#258).
+///
+/// That script exists to leave a request unfinished, which *is* an
+/// abort — and `verifyAccessLog`'s sharpest claim is that a clean seed
+/// aborts nothing. The claim is worth more than the coverage would be:
+/// it is an equality rather than a bound, and it is what fails on seed
+/// 10 when #129's phantom-line bug is put back. Teaching it an
+/// exception would blunt it on every seed to reach one axis on some.
+///
+/// The axis is reached on adversary seeds instead, where an abort is
+/// already ordinary and the surrounding equality still holds. `.get` is
+/// the substitute because it is the canonical script; the small bias it
+/// adds to clean populations is the price, and it is stated rather than
+/// hidden in a re-draw loop that could in principle spin.
+fn drawScript(random: std.Random, clean: bool) l7.Script {
+    const drawn = random.enumValue(l7.Script);
+    if (clean and drawn == .dribbled_head) return .get;
+    return drawn;
+}
+
 fn populateTlsClients(harness: *Harness, random: std.Random) void {
     harness.tls_clients_storage = @splat(undefined);
     harness.tls_clients_live = harness.tls_clients;
@@ -1599,7 +1623,10 @@ fn populateClients(harness: *Harness, random: std.Random) void {
             client.prepare(
                 &harness.io,
                 httpBindAddress(),
-                if (forced_upgrade) .upgrade_request else random.enumValue(l7.Script),
+                if (forced_upgrade)
+                    .upgrade_request
+                else
+                    drawScript(random, harness.clean),
                 harness.clean,
                 harness.upgrades_http,
                 harness.sticky_http,
@@ -2445,7 +2472,7 @@ fn verifyTlsSessions(harness: *Harness) !void {
             // asked to send, so what went out cannot exceed it — the check
             // that catches the two drifting apart, since a wider send
             // would be judged against a transcript that never mentions it.
-            assert(client.requestsSent() <= entry.expected_responses);
+            assert(client.requestsSent() <= entry.payloadsSent());
             const walk = HttpClient.walkResponses(
                 back,
                 entry,

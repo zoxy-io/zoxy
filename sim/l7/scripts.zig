@@ -67,6 +67,20 @@ pub const Script = enum(u8) {
     /// Connects and sends nothing: the head-read deadline reaps it;
     /// any response byte is a violation.
     silent,
+    /// Begins a head and never finishes it — a request line and one
+    /// header, no terminating blank line — then holds the connection
+    /// open. Any response byte is a violation, exactly as for `silent`.
+    ///
+    /// The two are not the same wait, and the difference is the whole
+    /// reason this exists (#258). `silent` says nothing at all, so it
+    /// sits on the *idle* window; the #235 head budget starts at the
+    /// client's first byte, so only a client mid-sentence is ever under
+    /// it. Before this script no seed in the sweep had a head
+    /// outstanding at all — the axis was unreachable, which is why
+    /// forcing every adversary seed to a one-millisecond head budget
+    /// changed nothing and two defects in that budget reached 0.4.0 by
+    /// way of a reader rather than the gate.
+    dribbled_head,
     /// A GET whose path only reaches the routable resource after
     /// canonicalization — an encoded `..` that collapses a segment away
     /// (`/deep/%2e%2e/sim` → `/sim`). It must route and forward exactly as
@@ -168,6 +182,17 @@ pub const Spec = struct {
     /// Statuses a complete response may legally carry under the
     /// adversary. Empty means any complete response is a violation.
     allowed_statuses: []const u16,
+    /// Application-data payloads this script puts on the wire, where
+    /// that differs from `expected_responses`. Null means the two are
+    /// equal, which is true of every script that *finishes* what it
+    /// starts: one request earns one answer.
+    ///
+    /// `dribbled_head` is why the override exists (#258). It sends a
+    /// payload and is owed nothing, so the terminating oracle's "what
+    /// went out cannot exceed what the spec describes" check needs to
+    /// be told about the request rather than about the answer — the two
+    /// having always coincided is what let one number stand for both.
+    payloads_sent: ?u8 = null,
     /// Append a second GET once the first response settles reusable —
     /// the §5 parked-connection checkout under schedule fuzz. Such a
     /// script degrades to a single-exchange transcript when its first
@@ -211,6 +236,13 @@ pub const Spec = struct {
     /// way, because one spec cannot describe both halves. Held to its
     /// meaning by the comptime block below rather than trusted.
     routed_canonical: bool = false,
+
+    /// How many application-data payloads this script puts on the wire.
+    /// The same number as `expected_responses` unless a script overrides
+    /// it, which only one does — see `payloads_sent`.
+    pub fn payloadsSent(entry: Spec) u8 {
+        return entry.payloads_sent orelse entry.expected_responses;
+    }
 };
 
 const post_body = "request-body-24-bytes-ab";
@@ -515,6 +547,34 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .method = .get,
         .allowed_statuses = &.{},
     },
+    .dribbled_head = .{
+        // A request line and one header, and deliberately no terminating
+        // blank line: the parser returns Incomplete and the proxy waits
+        // under the head budget rather than the idle window. The client
+        // sends exactly this and never sends more, so what ends the
+        // connection is always a deadline of the proxy's.
+        //
+        // Zero responses today, and that is a claim about behaviour
+        // rather than a shrug: a head-read timeout tears down silently
+        // (#247). Should this proxy ever learn to answer `408`, this is
+        // the spec that fails and has to be told about it.
+        .request = "GET /sim HTTP/1.1\r\nHost: sim\r\n",
+        .expected_responses = 0,
+        // An adversary seed may show exactly one, and only a `503`: the
+        // head never completes, so nothing routes and neither 200, 502
+        // nor 504 is reachable — but the *first byte* of a partial head
+        // still meets §8's head-buffer rung, which answers 503 before
+        // the parse. That is the whole difference from `silent`, which
+        // sends no byte and so meets no rung at all. Found by seed 778
+        // rather than reasoned out in advance.
+        .transcript_cap = 1,
+        .golden_status = 0,
+        .method = .get,
+        .allowed_statuses = &.{503},
+        // One payload out, no answer owed — the coincidence every
+        // other script relies on, broken on purpose.
+        .payloads_sent = 1,
+    },
     .confusion = .{
         // Canonicalizes to /sim (the `/deep` segment is popped by the
         // decoded `..`), so it routes and forwards as /sim.
@@ -763,6 +823,14 @@ pub const terminating_scripts = [_]Script{
     .forwarded_oversize,
     .sticky_follow,
     .sticky_repick,
+    // Drawn here deliberately, where `silent` is not (#258). The two
+    // 0.4.0 defects were both about *where* the head budget is
+    // installed, and one of them was that the terminating arm installed
+    // it somewhere else — so a slowloris that only ever ran plaintext
+    // would miss the half that was actually broken. Unlike `silent` this
+    // one sends bytes, so the session it opens is a real one that the
+    // proxy's own deadline ends.
+    .dribbled_head,
 };
 
 comptime {
@@ -843,6 +911,26 @@ comptime {
             // cannot be paired. GET and POST share theirs; HEAD does not,
             // and would have its bodiless responses read as truncated.
             assert(entry.method != .head);
+        }
+    }
+
+    // `payloads_sent` held to its meaning too (#258), rather than left
+    // as the one conditional field on trust. Two claims:
+    //
+    // A script is never owed more answers than it asks questions — that
+    // is what the terminating oracle reads it for, and an entry
+    // declaring otherwise would make a *wider* transcript legal than the
+    // session could produce.
+    //
+    // And an override equal to the default is noise: it would read as a
+    // deliberate statement while saying exactly what null already says,
+    // which is how a field like this quietly spreads to entries that do
+    // not need it.
+    for (std.enums.values(Script)) |script| {
+        const entry = specs.get(script);
+        assert(entry.payloadsSent() >= entry.expected_responses);
+        if (entry.payloads_sent) |override| {
+            assert(override != entry.expected_responses);
         }
     }
 }
