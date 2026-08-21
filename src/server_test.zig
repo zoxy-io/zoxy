@@ -254,7 +254,13 @@ pub const Client = struct {
 pub const TestBed = struct {
     arena_state: std.heap.ArenaAllocator,
     sim_io: SimIo,
-    endpoints: [1]std.Io.net.IpAddress,
+    /// The origin at index 0, then `blackholed_endpoints` addresses no
+    /// dial ever completes against (#132). Four is what the concurrency
+    /// scenarios need — enough endpoints that a serial sweep and a
+    /// concurrent one finish at times a test can tell apart — and it
+    /// fits `SimIo`'s own `blackholed_addresses_max`.
+    endpoints: [4]std.Io.net.IpAddress,
+    endpoints_count: u16,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
     listeners: [1]config_module.Config.Listener,
@@ -286,6 +292,11 @@ pub const TestBed = struct {
         /// Probe pacing for `check` scenarios — tight, so fall/rise fit
         /// inside a short virtual run.
         health_interval_ms: u32 = 20,
+        /// Endpoints appended after the origin whose dials never complete
+        /// — not refused, *silent* (#132). This is the case a `tcp` check
+        /// is slowest on and a serial sweep is worst at: each one costs
+        /// the check's whole `timeout_ms` before it can be called a miss.
+        blackholed_endpoints: u8 = 0,
         /// The #142 receive gate on the one listener; null for everyone
         /// but the PROXY protocol scenarios.
         proxy_protocol: ?config_module.Config.Listener.ProxyProtocol = null,
@@ -309,6 +320,34 @@ pub const TestBed = struct {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") catch unreachable;
     }
 
+    /// The cluster's endpoint list: the origin, then `blackholed` more
+    /// that answer nothing at all (#132). Black-holed in the backend
+    /// rather than merely left unlistened, because an unlistened address
+    /// is *refused* — a verdict a probe reaches in one round trip, where
+    /// the case a serial sweep is worst at is the endpoint that never
+    /// answers and costs the check's whole `timeout_ms`.
+    fn initEndpoints(
+        bed: *TestBed,
+        arena: std.mem.Allocator,
+        blackholed: u8,
+    ) !void {
+        assert(blackholed <= bed.endpoints.len - 1);
+        bed.endpoints = .{ originAddress(), undefined, undefined, undefined };
+        bed.endpoints_count = 1 + blackholed;
+        for (bed.endpoints[1..bed.endpoints_count], 0..) |*endpoint, index| {
+            const literal = try std.fmt.allocPrintSentinel(
+                arena,
+                "127.0.0.1:{d}",
+                .{9001 + index},
+                0,
+            );
+            // The format is fixed and every port in range renders valid,
+            // unlike the allocation above, which can genuinely fail.
+            endpoint.* = std.Io.net.IpAddress.parseLiteral(literal) catch unreachable;
+            bed.sim_io.blackholeAddress(endpoint.*);
+        }
+    }
+
     pub fn setUp(bed: *TestBed, gpa: std.mem.Allocator, options: SetUpOptions) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer bed.arena_state.deinit();
@@ -324,10 +363,10 @@ pub const TestBed = struct {
         // size whether or not a ring was registered.
         sim_options.buffer_group_bytes = options.server.head_buffer_bytes;
         try bed.sim_io.init(arena, sim_options);
-        bed.endpoints = .{originAddress()};
+        try bed.initEndpoints(arena, options.blackholed_endpoints);
         bed.clusters = .{.{
             .name = "origin",
-            .endpoints = &bed.endpoints,
+            .endpoints = bed.endpoints[0..bed.endpoints_count],
             .check = options.check,
             .max_inflight = options.max_inflight,
             .proxy_protocol_send = options.proxy_protocol_send,
@@ -1271,6 +1310,108 @@ test "proxy protocol: the received identity is the sent identity — the chain h
         .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 4711 } };
     const announced_out = bed.scenario.origin.conns[0].announced.?;
     try std.testing.expect(announced_in.eql(&announced_out));
+}
+
+test "health: black-holed endpoints are ejected in one probe budget, not one each" {
+    // #132's sharp edge, and the one oracle in the tree that can see a
+    // *detection-time* regression rather than a wrong verdict.
+    //
+    // Four checked endpoints: the live origin plus three that answer
+    // nothing. `fall: 1` makes one miss an ejection, and a black-holed
+    // dial can only miss by spending the check's whole 50 ms budget.
+    //
+    //   serial (pre-#132): the origin passes at once, then the three
+    //     silent dials cost 50 ms *each* — the third endpoint is not
+    //     ejected until ~150 ms.
+    //   concurrent: all four are handed out at the sweep's start, so the
+    //     three deadlines expire together and every ejection has landed
+    //     by ~50 ms.
+    //
+    // Ending the scenario at 90 ms sits between those, so this test fails
+    // against a serial prober with one endpoint ejected instead of three.
+    // Every verdict is correct either way, which is exactly why a counter
+    // or transcript oracle cannot tell the two apart (#258).
+    //
+    // `health_interval_ms` is 100 rather than the bed's tight default so
+    // that exactly one sweep fits in the window: the interval paces
+    // sweep-*end* to sweep-start, so a 20 ms one would open a second
+    // sweep at ~70 ms and this test would quietly also be exercising the
+    // mid-sweep drain that the next test exists to cover. One sweep is
+    // what makes the concurrency counter below an exact number.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 132 },
+        .check = .{ .timeout_ms = 50, .fall = 1 },
+        .health_interval_ms = 100,
+        .blackholed_endpoints = 3,
+    });
+    defer bed.tearDown();
+
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 90 * std.time.ns_per_ms);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u32, 4), bed.server.health.checked_count);
+    // The live origin keeps its place; the three silent ones are gone.
+    try std.testing.expect(bed.server.health.healthy[0]);
+    try std.testing.expect(!bed.server.health.healthy[1]);
+    try std.testing.expect(!bed.server.health.healthy[2]);
+    try std.testing.expect(!bed.server.health.healthy[3]);
+    try std.testing.expectEqual(@as(u32, 3), bed.server.health.unhealthy_count);
+    // The overlap itself, not merely its consequence: of the one sweep's
+    // four hand-offs the first found the prober idle and the other three
+    // each found a sibling already in flight. Exact rather than `>=`,
+    // because a bound here would hide a second sweep having run.
+    try std.testing.expectEqual(
+        @as(u64, 3),
+        bed.server.counters.get("health_probes_concurrent"),
+    );
+    try bed.expectDrained();
+}
+
+test "health: a drain reaches quiescence with every probe still in flight" {
+    // The K-probe drain ladder (#132): `Checker.continueStop` advances
+    // every probe per pass. Terminating 25 ms into a sweep whose three
+    // black-holed dials each have a 50 ms budget lands the signal with
+    // three connects and three deadlines armed at once.
+    //
+    // What this pins, precisely: that the ladder *reaches* all of them.
+    // It does not pin that it drains them in parallel — the simulator
+    // advances its clock until everything resolves, so a ladder that
+    // walked the probes one at a time would still finish, just later, as
+    // `continueStop`'s own comment says. Nor is the counter below a drain
+    // assertion: `health_probes_concurrent` is stamped at hand-off, long
+    // before the signal, so it states the *precondition* — that the drain
+    // really did find more than one probe armed — and nothing else.
+    //
+    // The teardown is the oracle. A ladder that only ever advanced
+    // `probes[0]` leaves its siblings' connects armed forever, and
+    // `expectDrained` fails; that mutation is what substantiates this
+    // test, not the `probe_count = 1` one, which is degenerate here
+    // because with one probe there is no sibling to skip.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 133 },
+        .check = .{ .timeout_ms = 50, .fall = 1 },
+        .health_interval_ms = 20,
+        .blackholed_endpoints = 3,
+    });
+    defer bed.tearDown();
+
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 25 * std.time.ns_per_ms);
+    try bed.sim_io.run();
+
+    // The precondition: four probes, so the ladder had siblings to reach.
+    try std.testing.expectEqual(@as(usize, 4), bed.server.health.probes.len);
+    try std.testing.expectEqual(
+        @as(u64, 3),
+        bed.server.counters.get("health_probes_concurrent"),
+    );
+    // Mid-sweep: the silent dials had not reached their deadline, so the
+    // drain — not a verdict — is what ended them, and nothing was ejected.
+    try std.testing.expectEqual(@as(u32, 0), bed.server.health.unhealthy_count);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.server.health.isQuiescent());
+    try bed.expectDrained();
 }
 
 test "health: probes against a listening origin keep the endpoint healthy" {
