@@ -133,6 +133,55 @@ pub const Config = struct {
         return constants.healthProbeConcurrency(config.checkedEndpoints());
     }
 
+    /// Clusters that could lose an endpoint and would never notice: more
+    /// than one endpoint, and neither `check` nor `passive_ejection`
+    /// (§7, #230). The §5 banner states this as a fact, not a warning,
+    /// and that is the point — a multi-endpoint cluster with no failure
+    /// detection is legitimate behind a mesh, or when the endpoints are
+    /// themselves VIPs, so warning every startup would teach operators
+    /// to ignore the stream the banner and the `SIGUSR1` dump share.
+    ///
+    /// Clusters with fewer than two endpoints a request could actually
+    /// be sent to are excluded deliberately: there is nowhere to eject
+    /// *to*, and §7 fail-open makes the ejection a no-op there, so
+    /// counting them would make the number noise on exactly the configs
+    /// it has nothing to say about.
+    ///
+    /// "Could be sent to" means weight, not list length. A weight of `0`
+    /// **drains** an endpoint — it never enters the eligible set — and
+    /// config is loaded once and never reloaded, so a two-endpoint
+    /// cluster at weights `[1, 0]` has exactly one reachable endpoint
+    /// for the life of the process. That is the single-endpoint case
+    /// under a different spelling, and flagging it would be the same
+    /// noise by a longer route.
+    pub fn clustersWithoutFailureDetection(config: *const Config) u32 {
+        var total: u32 = 0;
+        for (config.clusters) |cluster| {
+            if (cluster.check != null or cluster.passive_ejection != null) continue;
+            if (reachableEndpoints(&cluster) < 2) continue;
+            total += 1;
+        }
+        assert(total <= config.clusters.len);
+        return total;
+    }
+
+    /// Endpoints of a cluster that any pick may return — those left
+    /// undrained by a non-zero weight (§7). An absent `weights` list is
+    /// the homogeneous case, where every endpoint carries weight one.
+    fn reachableEndpoints(cluster: *const Cluster) u32 {
+        const weights = cluster.weights orelse return @intCast(cluster.endpoints.len);
+        assert(weights.len == cluster.endpoints.len);
+        var reachable: u32 = 0;
+        for (weights) |weight| {
+            if (weight != 0) reachable += 1;
+        }
+        // The loader rejects an all-zero cluster, so a cluster always
+        // has somewhere to send a request even if not somewhere to eject
+        // to (`EndpointWeightsAllZero`).
+        assert(reachable >= 1);
+        return reachable;
+    }
+
     /// Where the access log writes (§8). `stdout` is the process's own
     /// standard output, inherited rather than opened, so it costs no file
     /// descriptor and carries no rotation story of its own — an operator
@@ -5180,6 +5229,37 @@ test "config: an http check resolves its request and expected status" {
         try std.testing.expectEqual(@as(?[]const u8, null), http.host);
         try std.testing.expectEqual(@as(u16, 200), http.expect_status);
     }
+}
+
+test "config: the failure-detection fact counts only clusters it can be true of" {
+    // What the §5 banner states (#230). The rule has two halves and both
+    // are judgement calls worth pinning: detection of *either* kind
+    // clears a cluster, and a single-endpoint cluster is never counted
+    // however undetected it is — there is nowhere to eject to, and §7
+    // fail-open makes the ejection a no-op, so counting it would put
+    // noise on exactly the configs the number has nothing to say about.
+    const json =
+        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"bare"}],
+        \\ "clusters":{
+        \\  "bare":{"endpoints":["127.0.0.1:2","127.0.0.1:3"]},
+        \\  "alone":{"endpoints":["127.0.0.1:4"]},
+        \\  "probed":{"endpoints":["127.0.0.1:5","127.0.0.1:6"],"check":{"type":"tcp"}},
+        \\  "watched":{"endpoints":["127.0.0.1:7","127.0.0.1:8"],"passive_ejection":{}},
+        \\  "both":{"endpoints":["127.0.0.1:9","127.0.0.1:10"],
+        \\          "check":{"type":"tcp"},"passive_ejection":{}},
+        \\  "drained":{"endpoints":[{"address":"127.0.0.1:11","weight":1},
+        \\                          {"address":"127.0.0.1:12","weight":0}]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const config = try expectParseOk(&arena_state, json);
+
+    // Only `bare`. `alone` is single-endpoint; three have a detector of
+    // one kind or the other; and `drained` has two endpoints but only
+    // one a request can reach, which is the single-endpoint case wearing
+    // a longer spelling — config never reloads, so that weight is final.
+    try std.testing.expectEqual(@as(u32, 1), config.clustersWithoutFailureDetection());
 }
 
 test "config: a passive_ejection block rejects the thresholds it cannot act on" {
