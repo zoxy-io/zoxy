@@ -519,9 +519,9 @@ rate means backends are flapping under a sticky population.
 
 ### Health checks
 
-Per-cluster and opt-in. A prober dials each endpoint in turn; `fall`
-consecutive failures eject it from balancing and close its pooled
-connections, and `rise` consecutive successes restore it.
+Per-cluster and opt-in. A prober sweeps every checked endpoint, several
+at a time; `fall` consecutive failures eject one from balancing and close
+its pooled connections, and `rise` consecutive successes restore it.
 
 ```json
 "api": {
@@ -537,6 +537,55 @@ budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
 
 If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
 all — routing nowhere would turn a probe verdict into an outage of its own.
+
+### Detecting a dead backend from real traffic
+
+A `tcp` check passes whenever the kernel accepts, and the kernel accepts
+from the backlog even when the application behind it never does. A wedged
+process, an exhausted thread pool and a GC-stalled backend therefore look
+healthy to it while every real request against them times out. An `http`
+check catches that, but it needs a path you have to know.
+
+`passive_ejection` uses the traffic you already have.
+
+```json
+"api": {
+    "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080"],
+    "passive_ejection": { "fall": 5, "recovery_ms": 30000 }
+}
+```
+
+`fall` consecutive **failed requests** eject the endpoint — a dial that
+failed, or an exchange that returned no response byte before its deadline.
+A response with a `5xx` status is *not* a failure: a bad deploy answering
+500s is a software bug, not an unhealthy backend, and ejecting for it would
+take out a whole cluster. Any response resets the count, so the failures
+must be consecutive.
+
+After `recovery_ms` the endpoint is let back in and traffic judges it
+again; if it is still dead, `fall` more failures eject it once more. That
+is why the two features compose rather than overlap — **passive detection
+finds the failure, active checks find the recovery** — and why a cluster
+that would rather re-test with one probe than with up to `fall` real
+requests should configure both.
+
+Defaults: `fall` 5 (higher than a probe's 3, because real traffic carries
+transient failures a probe never sees) and `recovery_ms` 30000. Ejection,
+fail-open and the closing of pooled connections work exactly as they do for
+active checks — it is the same rotation, reached by a different verdict.
+
+If no cluster has either kind of detection, the startup banner says so:
+
+```
+config  1 listener(s), 3 cluster(s), 0 error page(s), access log off, 1 cluster(s) without failure detection
+```
+
+It is a statement, not a warning — a multi-endpoint cluster with no checks
+is perfectly reasonable behind a service mesh, or when the endpoints are
+themselves load balancers. A cluster is counted only when two of its
+endpoints are reachable, so a single-endpoint cluster never is, and neither
+is one whose second endpoint is drained with `"weight": 0`. In both there is
+nowhere to eject to.
 
 ### Protecting a backend from overload
 

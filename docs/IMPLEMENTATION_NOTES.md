@@ -1088,6 +1088,76 @@ which today means after `splice`/`send_zc` (§4, "Open questions") or
 proxy-level band, never a micro-bench delta; that mistake is what the
 section above this one is about.
 
+## Passive ejection — three of four questions answered by the code (2026-08-21, #230)
+
+#230 listed four "points to settle" before any code. Reading the tree
+answered three of them, and that is worth recording so nobody re-opens
+them as design work.
+
+**Retry double-counting — impossible by construction.** The worry was
+that one bad request could count several times against one endpoint.
+`candidateEndpoints` skips `alreadyTried`, so a request can never dial
+the same endpoint twice; `beginRetry` reassigns `conn.upstream` to an
+untried one before the next dial. A first-endpoint failure is credited
+once, a retry's failure credits the *second* endpoint, and neither can
+credit the first twice.
+
+**Drained endpoints — impossible by construction.** A weight-`0`
+endpoint is filtered before health is even consulted, so it sees no
+traffic and can accrue no passive verdict. Nothing to build.
+
+**Fail-open — no code change.** The balancer already fails open when the
+healthy set empties. Passive ejection only makes that rung reachable in
+a config with no prober, which wanted stating in §7 rather than
+implementing.
+
+**Mask ownership — the one real question**, and `counters.zig` already
+had the answer. Kernel pressure runs a total with two partitions, both
+asserted against it in `reconcile`. Ejection took the same shape: one
+event, `health_endpoint_down`, with `_probe`/`_passive` partitioning it.
+The mask is one bit and the balancer reads one thing, so *how* an
+endpoint left rotation is a fact about the verdict rather than about the
+state. `reconcile`'s `health_endpoint_down <= health_probes_failed` —
+which *was* the assertion "ejections come only from probes" — narrowed
+to `_probe` and still holds.
+
+**The signals needed less work than the issue expected.** Both are
+already precisely delimited: `expiryAnswerable` refuses to answer `504`
+once a response has started, so every `504` is already a
+no-response-byte `504`, and the issue's hard requirement that origin
+`5xx` never be a signal holds without a status check —
+`commitResponse` sets `response_started` before the status is looked at.
+
+**Half-open probation — considered, not built.** Recovery could admit
+exactly one request after the cooldown and restore on success, costing
+one request per cooldown instead of up to `fall`. It was rejected for
+its blast radius rather than its benefit: it needs a third endpoint
+state the balancer must understand plus in-flight tracking to admit
+exactly one, which is a change to `candidateEndpoints` and the pick
+path. A plain cooldown keeps the mask one bool and the balancer
+untouched, and the cost it trades away is bounded and stated at
+`passive_ejection_recovery_ms_default`. A cluster that wants the cheaper
+re-test configures `check`, whose `rise` already does exactly this from
+probe traffic.
+
+**Recovery rides the existing loop.** A dedicated re-admission timer
+would have cost two ring ops — unlike the prober's rest timer it can
+co-arm with probes, so it is disjoint from nothing — plus a state
+machine running while the prober is `.off`. Instead the health loop runs
+for a passive-only config, where a sweep dispatches nothing and rests
+immediately; `readmitExpired` runs at the top of each sweep. Zero new
+ops, zero budget change. The cost is that re-admission is granular to
+`health_interval_ms`.
+
+**What the sweep caught that the unit tests did not.** Seed 1918: a
+cluster configuring `check` *and* `passive_ejection` can have a cooldown
+expire while probes have a partial `rise` built up. `restore` cleared
+the passive residue but not `ok_streaks`, and the next passing probe met
+`witnessPass`'s "healthy implies no streak" invariant. The fix is the
+honest rule — every streak against an endpoint stops meaning anything
+the moment it is back in rotation — and the lesson is that the
+interleaving of two mask writers has two directions, not one.
+
 ## Health prober concurrency — the two options that were already answered (2026-08-21, #132)
 
 #132 offered three fixes for a serial sweep whose detection time scales

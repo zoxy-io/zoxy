@@ -1366,7 +1366,9 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
 - **A pick chooses among the endpoints that are both healthy and under
   capacity**, in that order, and the two filters differ in what an empty
   result means. Health fails **open**: a cluster with every endpoint
-  ejected balances as if none were. `max_inflight` (§8) fails **closed**:
+  ejected balances as if none were — and since #230 that rung is
+  reachable in a config with no prober at all, because real traffic can
+  eject too. `max_inflight` (§8) fails **closed**:
   every endpoint at its cap refuses the request rather than dialing one.
   The asymmetry is the point — an ejection says *we do not know whether
   these work*, so trying beats refusing, while a cap says *we know they
@@ -1549,13 +1551,91 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   it. Endpoints start healthy — probing demotes, it never gates startup
   — and the pick **fails open**: a cluster with every endpoint ejected
   balances as if none were, because routing nowhere would turn a probe
-  verdict into an outage of its own. Circuit breakers, outlier ejection
-  and *aggregate* retry budgets stay deferred — the previous iteration
-  proved them buildable in this architecture; simplicity says they wait
-  for a demonstrated need. The per-request dial retry above is not one
-  of them: it bounds itself per request and per connect deadline, where
-  a retry budget is the cluster-wide cap that keeps a partial outage
-  from pushing its whole load onto the endpoints still answering.
+  verdict into an outage of its own.
+
+- **Passive ejection** (a `passive_ejection` block, #230) ejects an
+  endpoint that *real traffic* reports dead, and it is the load-bearing
+  detector rather than an optimisation over probes. A `tcp` check passes
+  whenever the kernel accepts — which it does from the backlog even when
+  the application never calls `accept()` — so a wedged process, an
+  exhausted thread pool and a GC-stalled backend all look perfectly
+  healthy to it while every real request against them times out. An
+  `http` check catches that but cannot be a default: there is no path to
+  guess. Real traffic is the only ground truth, and a probe tests one
+  path with one method.
+
+  ```json
+  "api": { "endpoints": ["10.0.0.1:80", "10.0.0.2:80"],
+           "passive_ejection": { "fall": 5, "recovery_ms": 30000 } }
+  ```
+
+  Two signals, both the endpoint's own fault: a **dial that failed** for
+  its reasons rather than ours, and an exchange that produced **no
+  response byte**. An origin `5xx` is never a signal — a bad deploy
+  answering 500s is a software bug, not an unhealthy endpoint, and
+  conflating the two ejects healthy backends for it. That exclusion is
+  structural rather than a rule to remember: this proxy will not answer
+  `504` once a response has started, so a status that arrived cannot
+  reach the path. `error.Unexpected` is excluded for the mirror-image
+  reason — that is *this* process out of sockets or memory, and ejecting
+  a backend for it turns our exhaustion into their outage.
+
+  An **absolute consecutive count** suffices where Envoy needs
+  success-rate outlier detection with a panic threshold, and fail-open
+  is why: a cluster with every endpoint ejected balances as if none
+  were, so the correlated-failure objection is already answered. That is
+  what keeps this two numbers rather than a windowed statistics model.
+
+  **Recovery is where active checks earn their place.** Passive
+  detection needs traffic and an ejected endpoint receives none, so it
+  cannot observe its own recovery: `recovery_ms` is a cooldown, after
+  which traffic is let back to judge the endpoint again and `fall` more
+  failures put it straight out. The cooldown is checked once per health
+  interval, so it is honoured to within one interval and never expires
+  early. A cluster that would rather spend one probe than up to `fall`
+  requests re-testing a still-dead backend configures `check` as well,
+  and its `rise` restores from probe traffic. Hence the division of
+  labour: **passive detects failure, active detects recovery** — not
+  redundant, and why a deployment wants both without either being a
+  workaround for the other.
+
+  Both verdicts write one mask through one ejection path, so an endpoint
+  is out or it is not and `health_endpoint_down` counts either, with a
+  cause partition saying which. A **drained** endpoint (weight `0`)
+  accrues no passive verdict at all: it is never picked, so it sees no
+  traffic to be judged by — the drain filter running before health is
+  what makes that true rather than a special case.
+
+  Opt-in, like `check`, and for a reason worth stating: passive ejection
+  removes capacity by *inference*. The failure it prevents is visible
+  and diagnosable; the failure it can cause — ejecting a healthy backend
+  during a blip — is subtle and worse. That is an operator's call. The
+  consequence is that a default deployment still has the gap, so the §5
+  banner **states** it as a fact rather than warning about it:
+
+  ```
+  config  1 listener(s), 3 cluster(s), 0 error page(s), access log off, 1 cluster(s) without failure detection
+  ```
+
+  A cluster counts only if two of its endpoints are actually reachable
+  — undrained, weight non-zero. One reachable endpoint means nowhere to
+  eject *to*, fail-open makes the ejection a no-op, and flagging it
+  would be noise on the config the number has nothing to tell; weights
+  are final because config never reloads (§1), so `[1, 0]` is the
+  single-endpoint case under a longer spelling. A warning on a valid
+  config would decay into noise and take the rest of stderr with it;
+  the banner is what a bug report pastes, so "why did traffic keep going
+  to a dead backend?" becomes answerable without a round trip.
+
+- **Still deferred**: circuit breakers, Envoy-style *outlier detection*
+  (success-rate and stddev maths, panic thresholds) and *aggregate*
+  retry budgets. The previous iteration proved them buildable here;
+  simplicity says they wait for a demonstrated need, and fail-open plus
+  a consecutive count is why the simple thing sufficed. The per-request
+  dial retry above is not one of them: it bounds itself per request and
+  per connect deadline, where a retry budget is the cluster-wide cap
+  that keeps a partial outage from pushing its whole load onto the
+  endpoints still answering.
 
 ## 8. Load shedding — the exhaustion ladder
 
