@@ -657,11 +657,34 @@ pub const health_probe_fall_default: u8 = 3;
 /// HAProxy's `rise` default: recovery must prove itself twice.
 pub const health_probe_rise_default: u8 = 2;
 
-/// Upper bound on a configured `fall`/`rise`. The streak counters are
-/// `u8`, so this is what keeps them from wrapping; it is also far past
-/// any useful tuning — a threshold in the dozens means the *interval* is
-/// the wrong knob, since detection latency is `fall × interval`.
+/// Upper bound on a configured `fall`/`rise`, and on passive ejection's
+/// own `fall` (#230) — one bound because all three are streaks counted
+/// in a `u8`, and this is what keeps them from wrapping. It is also far
+/// past any useful tuning: a probe threshold in the dozens means the
+/// *interval* is the wrong knob, since detection latency is
+/// `fall × interval`.
 pub const health_probe_threshold_max: u8 = 64;
+
+/// Consecutive failed *requests* that passively eject an endpoint (§7,
+/// #230), when a cluster's `passive_ejection` block omits `fall`.
+/// Higher than the probe's three on purpose: a probe is one synthetic
+/// request the operator chose, where this counts real traffic, which
+/// carries transient failures a probe never sees. Envoy's
+/// `consecutive_5xx` default is the same five.
+pub const passive_ejection_fall_default: u8 = 5;
+
+/// How long a passively-ejected endpoint stays out before traffic is let
+/// back to judge it again (§7, #230), when `passive_ejection` omits
+/// `recovery_ms`. Envoy's `base_ejection_time`.
+///
+/// Recovery is a plain cooldown rather than a half-open probation, and
+/// the cost of that choice is bounded and lives here: each cooldown ends
+/// with up to `fall` requests spent on an endpoint that may still be
+/// dead. Thirty seconds keeps that rate negligible against any real
+/// traffic level while still restoring a recovered backend promptly. A
+/// cluster that wants a single request spent instead of `fall` configures
+/// `check`, whose `rise` restores from probe traffic rather than real.
+pub const passive_ejection_recovery_ms_default: u32 = 30_000;
 
 /// Default `timeouts.health_interval_ms`: the pause between health-probe
 /// sweeps when the config omits it (§7). HAProxy's `inter` default. What
@@ -1388,6 +1411,17 @@ comptime {
     assert(health_probe_rise_default >= 1);
     assert(health_probe_fall_default <= health_probe_threshold_max);
     assert(health_probe_rise_default <= health_probe_threshold_max);
+    // Passive ejection's threshold shares the bound for the same reason
+    // (a `u8` streak), and its cooldown is a configurable duration like
+    // any other, so it sits inside `timeout_ms_max` — the ceiling that
+    // exists to catch a units mistake, not a §8 shedding rung.
+    assert(passive_ejection_fall_default >= 1);
+    assert(passive_ejection_fall_default <= health_probe_threshold_max);
+    // Real traffic is noisier than a probe, so the passive threshold
+    // should never be the *twitchier* of the two.
+    assert(passive_ejection_fall_default >= health_probe_fall_default);
+    assert(passive_ejection_recovery_ms_default >= 1);
+    assert(passive_ejection_recovery_ms_default <= timeout_ms_max);
     assert(health_interval_ms_default >= 1);
     assert(health_interval_ms_default <= timeout_ms_max);
     // The rendered probe request must fit its buffer whatever a config
