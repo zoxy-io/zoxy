@@ -88,13 +88,18 @@ pub fn Checker(comptime IoType: type) type {
         eject_deadline_ns: []u64,
         /// Endpoints under checks — static after `init` (the sum of
         /// `endpoints.len` over every `check` cluster); zero leaves the
-        /// prober `.off` forever.
+        /// prober `.off` forever unless some cluster opted into passive
+        /// ejection, which needs the loop for its cooldowns (#230).
         checked_count: u32,
         /// Endpoints any failure detection may remove — `check`,
         /// `passive_ejection`, or both (#230). The bound `unhealthy_count`
         /// is held against, and no longer `checked_count`: passive
         /// ejection can remove an endpoint no probe ever dialled.
         ejectable_count: u32,
+        /// Whether any cluster opted into passive ejection. Distinct from
+        /// `ejectable_count > checked_count`, which a cluster configuring
+        /// both would make false while still needing the loop to run.
+        passive_configured: bool,
         /// Endpoints currently ejected; the gauge level (§8).
         unhealthy_count: u32,
         state: State,
@@ -129,7 +134,8 @@ pub fn Checker(comptime IoType: type) type {
         const Self = @This();
 
         pub const State = enum(u8) {
-            /// Not started, or no cluster sets `check`: nothing ever arms.
+            /// Not started, or no cluster configures `check` or
+            /// `passive_ejection`: nothing ever arms.
             off,
             /// A sweep is running: up to `probes.len` of them in flight,
             /// each against an endpoint the cursor has already handed out.
@@ -732,6 +738,7 @@ pub fn Checker(comptime IoType: type) type {
             @memset(checker.eject_deadline_ns, 0);
             checker.checked_count = 0;
             checker.ejectable_count = 0;
+            checker.passive_configured = false;
             checker.unhealthy_count = 0;
             checker.state = .off;
             checker.cursor_cluster = 0;
@@ -760,8 +767,17 @@ pub fn Checker(comptime IoType: type) type {
             // the prober sizes itself from it, and §5's closed form is
             // only closed while there is exactly one reading of it.
             checker.checked_count = server.config.checkedEndpoints();
+            const ejectable = ejectableEndpoints(clusters);
+            checker.ejectable_count = ejectable.count;
+            checker.passive_configured = ejectable.passive_configured;
+            checker.assertSized(probe_count);
+        }
+
+        /// What `init` must leave true about the tables it just sized —
+        /// split out because it is the part that grows every time a new
+        /// verdict learns to write the mask, and `init` has no room left.
+        fn assertSized(checker: *const Self, probe_count: u32) void {
             assert(checker.checked_count <= checker.healthy.len);
-            checker.ejectable_count = ejectableEndpoints(clusters);
             // Every checked endpoint is ejectable; the reverse does not
             // hold, and that gap is exactly what #230 adds.
             assert(checker.checked_count <= checker.ejectable_count);
@@ -769,25 +785,39 @@ pub fn Checker(comptime IoType: type) type {
             // What `Server.initHeadBuffers` priced the prober's scratch
             // at, checked where the probes are actually allocated.
             assert(probe_count == constants.healthProbeConcurrency(checker.checked_count));
-            // Never more probes than there are endpoints to hand them:
-            // an idle probe would be a reservation nothing can spend.
-            // The floor of one is the exception, and only when nothing
-            // is checked at all — the prober stays `.off` then.
+            assert(checker.probes.len == probe_count);
+            // Never more probes than there are endpoints to hand them: an
+            // idle probe is a reservation nothing can spend. The floor of
+            // one is the exception, and it goes unused whether the prober
+            // stays `.off` or runs for cooldowns alone (#230).
             assert(checker.probes.len <= @max(1, checker.checked_count));
             assert(checker.armedCount() == 0);
         }
 
-        /// Endpoints any failure detection may remove: `check`,
-        /// `passive_ejection`, or both (#230). The union rather than
-        /// either count, because one mask serves both verdicts and it is
-        /// the mask's capacity `unhealthy_count` is bounded by.
-        fn ejectableEndpoints(clusters: []const config_module.Config.Cluster) u32 {
-            var total: u32 = 0;
+        /// What one walk of the cluster table tells the checker about
+        /// what it may remove (#230).
+        const Ejectable = struct {
+            /// Endpoints any failure detection may remove: `check`,
+            /// `passive_ejection`, or both. The union rather than either
+            /// count, because one mask serves both verdicts and it is
+            /// the mask's capacity `unhealthy_count` is bounded by.
+            count: u32,
+            /// Whether the loop must run at all for passive ejection's
+            /// cooldowns — which `count` cannot answer, since a cluster
+            /// configuring both check and passive contributes to it
+            /// either way.
+            passive_configured: bool,
+        };
+
+        fn ejectableEndpoints(clusters: []const config_module.Config.Cluster) Ejectable {
+            var ejectable: Ejectable = .{ .count = 0, .passive_configured = false };
             for (clusters) |cluster| {
+                if (cluster.passive_ejection != null) ejectable.passive_configured = true;
                 if (cluster.check == null and cluster.passive_ejection == null) continue;
-                total += @intCast(cluster.endpoints.len);
+                ejectable.count += @intCast(cluster.endpoints.len);
             }
-            return total;
+            assert(!ejectable.passive_configured or ejectable.count >= 1);
+            return ejectable;
         }
 
         /// Begin probing, or stay `.off` when no cluster opted in. The
@@ -797,7 +827,14 @@ pub fn Checker(comptime IoType: type) type {
         pub fn start(checker: *Self) void {
             assert(checker.state == .off);
             assert(checker.armedCount() == 0);
-            if (checker.checked_count == 0) return;
+            // Passive ejection needs the loop even with nothing to probe
+            // (#230). Its cooldowns expire on wall-clock time, and an
+            // ejected endpoint receives no traffic to notice with — so
+            // something must tick, and the loop that already ticks is
+            // cheaper than a second one. A sweep with no checked endpoint
+            // dispatches nothing and rests immediately, which makes this
+            // the rest timer alone, on the interval it already had.
+            if (checker.checked_count == 0 and !checker.passive_configured) return;
             checker.startSweep();
         }
 
@@ -814,7 +851,10 @@ pub fn Checker(comptime IoType: type) type {
             // Live states always hold work: probing keeps probe ops armed,
             // resting keeps the rest timer armed.
             assert(checker.armedCount() >= 1);
-            assert(checker.checked_count >= 1);
+            // The same condition `start` runs on: a passive-only config
+            // has a live loop with nothing to probe, ticking the rest
+            // timer for its cooldowns alone (#230).
+            assert(checker.checked_count >= 1 or checker.passive_configured);
             checker.state = .stopping;
             for (checker.probes) |*probe| {
                 probe.pending_verdict = .none;
@@ -854,11 +894,51 @@ pub fn Checker(comptime IoType: type) type {
 
         fn startSweep(checker: *Self) void {
             assert(checker.armedCount() == 0);
-            assert(checker.checked_count >= 1);
+            assert(checker.checked_count >= 1 or checker.passive_configured);
             checker.state = .probing;
+            // Before the probes, because a re-admitted endpoint should be
+            // probed on the sweep that readmitted it rather than wait a
+            // whole interval to be looked at.
+            checker.readmitExpired();
             checker.cursor_cluster = 0;
             checker.cursor_endpoint = 0;
             checker.dispatchNext();
+        }
+
+        /// Return passively ejected endpoints whose cooldown has run out
+        /// (#230). Recovery cannot be passive — an ejected endpoint gets
+        /// no traffic to be judged by — so the cooldown expiring is the
+        /// whole mechanism: traffic is let back and judges it again, and
+        /// `fall` more failures put it straight back out.
+        ///
+        /// Checked once per sweep rather than on its own timer, which
+        /// costs the §8 budget nothing and makes `health_interval_ms` the
+        /// granularity of re-admission as well as of probing. So a
+        /// cooldown is honoured to within one interval and never expires
+        /// early — the same "never move a timer earlier" rule every other
+        /// deadline here follows (§4). An operator who wants a 1 s
+        /// cooldown observed to the second wants a 1 s interval too, and
+        /// that is one knob rather than two that can disagree.
+        ///
+        /// A bounded scan of the endpoint table, on a tick that already
+        /// walks every cluster.
+        fn readmitExpired(checker: *Self) void {
+            assert(checker.state == .probing);
+            if (checker.unhealthy_count == 0) return;
+            const now = checker.server.io.nowNs();
+            var restored: u32 = 0;
+            for (checker.eject_deadline_ns, 0..) |deadline_ns, index| {
+                if (deadline_ns == 0) continue; // Not passively ejected.
+                if (deadline_ns > now) continue;
+                const key: u32 = @intCast(index);
+                // A passive ejection is the only writer of a non-zero
+                // deadline, and `restore` clears it — so a deadline
+                // standing means the endpoint is still out.
+                assert(!checker.healthy[key]);
+                checker.restore(key);
+                restored += 1;
+                assert(restored <= checker.ejectable_count);
+            }
         }
 
         /// One endpoint of a sweep, claimed from the cursor.
@@ -966,21 +1046,29 @@ pub fn Checker(comptime IoType: type) type {
             checker.ok_streaks[key] += 1;
             assert(checker.ok_streaks[key] <= rise);
             if (checker.ok_streaks[key] < rise) return;
-            checker.ok_streaks[key] = 0;
             checker.restore(key);
         }
 
         /// Return an endpoint to balancing (§7). The one writer of the
         /// mask's rising edge, for the same reason `eject` is of the
-        /// falling one — and the reason it takes no cause: a restore is
-        /// a restore, and the passive residue must be cleared whichever
-        /// verdict lifted it. A probe's `rise` can lift an endpoint that
-        /// real traffic ejected, and leaving its cooldown behind would
-        /// let the re-admission sweep "restore" an endpoint that is
-        /// already in rotation.
+        /// falling one — and the reason it takes no cause: a restore is a
+        /// restore, and **every** streak against this endpoint stops
+        /// meaning anything the moment it is back in rotation.
+        ///
+        /// That completeness is load-bearing, not tidiness. A cluster may
+        /// configure `check` and `passive_ejection` together, and then the
+        /// two verdicts interleave: a cooldown can expire while probes
+        /// have a partial `rise` built up, and a probe's `rise` can lift
+        /// an endpoint that traffic ejected while a cooldown is still
+        /// standing. Leaving either behind desynchronises the next cycle
+        /// — found by the simulator at seed 1918, where a cooldown
+        /// restored an endpoint mid-`rise` and the next passing probe met
+        /// `witnessPass`'s "healthy implies no streak" invariant.
         fn restore(checker: *Self, key: u32) void {
             assert(!checker.healthy[key]);
             checker.healthy[key] = true;
+            checker.fail_streaks[key] = 0;
+            checker.ok_streaks[key] = 0;
             checker.passive_streaks[key] = 0;
             checker.eject_deadline_ns[key] = 0;
             assert(checker.unhealthy_count >= 1);
