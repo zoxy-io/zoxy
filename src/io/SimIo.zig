@@ -1013,13 +1013,13 @@ fn takeSetOptionError(io: *SimIo) ?Io.SetOptionError {
 
 pub fn shutdown(io: *SimIo, socket: Socket, how: Io.ShutdownHow) void {
     const entry = io.socketEntry(socket);
-    if (!entry.write_shutdown) {
+    if (how != .read and !entry.write_shutdown) {
         entry.write_shutdown = true;
         if (entry.peer != peer_none) {
             io.peerEntry(entry).fin_received = true;
         }
     }
-    if (how == .both) {
+    if (how != .write) {
         entry.read_shutdown = true;
     }
 }
