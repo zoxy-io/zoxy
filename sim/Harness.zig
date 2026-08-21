@@ -823,19 +823,12 @@ fn deriveServerConfig(
         // loader rejects the other order (§5), so an independent draw would
         // spend seeds on a config production cannot load.
         .idle_timeout_ms = idle_timeout_ms,
-        // Mirrors the idle window (#235), which is also what the loader
-        // would derive at this scale: the sim draws its timeouts in tens
-        // of milliseconds, and `defaultHeadMs` clamps its ten seconds down
-        // to `idle_ms` for exactly such a config.
-        //
-        // A known gap, stated rather than left implicit: equal values mean
-        // no seed exercises the first-byte re-base under a *tighter* head
-        // budget, so that call site's randomized coverage is deferred to
-        // the two scripted tests in `src/http_proxy_test.zig`. Drawing the
-        // two apart is a scenario for the split, and wants the head budget
-        // to be a drawn value the response oracles can still live with —
-        // more than this line.
-        .head_timeout_ms = idle_timeout_ms,
+        .head_timeout_ms = deriveHeadTimeoutMs(
+            harness.clean,
+            random,
+            connect_timeout_ms,
+            idle_timeout_ms,
+        ),
         .drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random),
         // The §6 age cap: measured from the connection's birth, so the
         // clamp sometimes reaps an actively-relaying connection.
@@ -977,6 +970,44 @@ fn deriveKeepaliveRequests(clean: bool, random: std.Random) u32 {
     if (clean) return 0;
     if (random.uintLessThan(u8, 3) != 0) return 0;
     return 1 + random.uintLessThan(u32, 2);
+}
+
+/// The #235 head budget, drawn *apart* from the idle window on a third
+/// of adversary seeds (#258).
+///
+/// It was pinned equal to `idle_timeout_ms` until the sweep had a client
+/// that could reach it, and that was the right call at the time rather
+/// than an oversight: with every head arriving whole, the two values
+/// being equal cost nothing, while drawing them apart shifted every
+/// seed's random stream to exercise an axis no seed could observe. The
+/// issue measured exactly that — forcing every adversary seed to the
+/// tightest legal budget changed nothing at all.
+///
+/// What changed is that `dribbled_head` now holds a head open and
+/// `l7_head_budget_expired` witnesses the reap, so a tighter budget is a
+/// genuinely different schedule rather than the same one wearing a
+/// different number.
+///
+/// The band is the loader's own invariant, restated: strictly above
+/// `connect_ms`, because a dial re-bases the deadline to that and a
+/// budget beneath it would be spent before the hand-off; and never wider
+/// than the window it exists to narrow.
+fn deriveHeadTimeoutMs(
+    clean: bool,
+    random: std.Random,
+    connect_ms: u32,
+    idle_ms: u32,
+) u32 {
+    assert(connect_ms >= 1);
+    assert(connect_ms < idle_ms);
+    if (clean) return idle_ms;
+    if (random.uintLessThan(u8, 3) != 0) return idle_ms;
+    const span = idle_ms - connect_ms;
+    assert(span >= 1);
+    const drawn = connect_ms + 1 + random.uintLessThan(u32, span);
+    assert(drawn > connect_ms);
+    assert(drawn <= idle_ms);
+    return drawn;
 }
 
 fn deriveMaxInflight(clean: bool, random: std.Random) ?u32 {
