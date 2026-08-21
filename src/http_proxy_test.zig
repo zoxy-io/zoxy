@@ -28,6 +28,7 @@ const expected_date = "Date: Wed, 01 Jan 2020 00:00:00 GMT\r\nServer: zoxy\r\n";
 /// silently replaced.
 const origin_date = "Date: Tue, 31 Dec 2019 23:59:59 GMT\r\nServer: origin/1.0\r\n";
 const constants = @import("constants.zig");
+const counters_module = @import("counters.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const Io = @import("io/io.zig");
@@ -503,6 +504,22 @@ const HttpOrigin = struct {
 
 /// Single-listener L7 harness: one http listener, a scripted origin, one
 /// client.
+/// One per-endpoint labeled value (#179). `Labeled`'s read path is the
+/// exposition, so nothing exposes a single value — a test that wants
+/// *attribution* rather than a total has to index the table. Named here
+/// so the passive-ejection work (#230), which asks "which endpoint" of
+/// nearly every signal it adds, does not spread raw field access through
+/// these tests.
+fn endpointCounter(
+    server: anytype,
+    comptime family: counters_module.Labeled.EndpointFamily,
+    cluster_index: u16,
+    endpoint_index: u16,
+) u64 {
+    const table = @field(server.labeled, @tagName(family));
+    return table[server.upstreams.keys.key(cluster_index, endpoint_index)].load(.monotonic);
+}
+
 const Http1Bed = struct {
     arena_state: std.heap.ArenaAllocator,
     sim_io: SimIo,
@@ -3148,6 +3165,14 @@ test "l7: a hung dial fires 504 at the connect budget, not the idle timeout" {
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    // The labeled twin (#230) names *which* endpoint answered nothing.
+    // `reconciles` already holds the family's total equal to the counter
+    // above on every seed; what it cannot say is that the credit landed
+    // on the endpoint the request actually dialled, which is the whole
+    // basis a passive verdict would rest on. This is the *dial* budget's
+    // 504; the exchange deadline's is covered separately, because "both
+    // sites" is the claim the partition identity rests on.
+    try std.testing.expectEqual(@as(u64, 1), endpointCounter(&bed.server, .no_response, 0, 0));
     // A timeout is not a dial failure: the counters stay orthogonal.
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_connect_failed"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_gateway"));
@@ -3340,6 +3365,11 @@ test "l7: the request deadline fires 504 ahead of the connect and idle budgets" 
     );
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    // The other half of #230's signal: an origin that accepted and then
+    // said nothing is attributed to the endpoint that accepted, exactly
+    // as a dial that never completed is. Both 504 sites credit an
+    // endpoint or the family is a sample rather than a partition.
+    try std.testing.expectEqual(@as(u64, 1), endpointCounter(&bed.server, .no_response, 0, 0));
     // The dial *worked*: this is a slow exchange, not a hung or refused
     // one, which is exactly the case no other rung covers.
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_connect_failed"));

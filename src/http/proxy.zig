@@ -1377,6 +1377,7 @@ pub fn Proxy(comptime IoType: type) type {
                     conn.upstream.?.socket = socket;
                     conn.upstream_socket = socket;
                 } else |_| {}
+                witnessNoResponse(server, conn);
                 respond(server, conn, 504, "l7_gateway_timeout");
                 return;
             }
@@ -3425,6 +3426,22 @@ pub fn Proxy(comptime IoType: type) type {
             return true;
         }
 
+        /// The labeled twin of a `504` (#179, #230): this endpoint was
+        /// dialled and produced no response byte before the deadline.
+        ///
+        /// Called at both `504` sites and only there, which is what makes
+        /// the family a *partition* of `l7_gateway_timeout` rather than a
+        /// sample of it (`Labeled.reconciles`). The endpoint is always
+        /// known: a deadline can only be answered against a try, and a
+        /// try is a pick.
+        fn witnessNoResponse(server: *ServerType, conn: *const ConnType) void {
+            assert(conn.upstream != null);
+            server.labeled.incrementEndpoint(.no_response, server.upstreams.keys.key(
+                conn.upstream.?.cluster_index,
+                conn.upstream.?.endpoint_index,
+            ));
+        }
+
         /// Begin the §8 request-deadline verdict. Ops are never canceled
         /// (§5) — they are *forced*: shutting the upstream socket down
         /// makes each armed op on it complete with an error its handler
@@ -3460,7 +3477,10 @@ pub fn Proxy(comptime IoType: type) type {
             conn.l7.pending_verdict = .none;
             switch (verdict) {
                 .none => unreachable,
-                .gateway_timeout => respond(server, conn, 504, "l7_gateway_timeout"),
+                .gateway_timeout => {
+                    witnessNoResponse(server, conn);
+                    respond(server, conn, 504, "l7_gateway_timeout");
+                },
                 .replay => beginReplay(server, conn),
             }
         }

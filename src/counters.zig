@@ -841,6 +841,18 @@ pub const Labeled = struct {
     /// like-named process total — see `reconciles`.
     connect_failed: []Value,
     responses: []Value,
+    /// Exchanges this endpoint was picked for that produced **no response
+    /// byte** before the deadline — the `504` path, per endpoint (#230).
+    ///
+    /// The pair `connect_failed`/`no_response` is what tells a wedged
+    /// backend from a refusing one: a refused dial is answered in a round
+    /// trip, where an accepted-but-silent origin costs a whole budget and
+    /// is exactly what a `tcp` probe cannot see. Both are the endpoint's
+    /// own fault in a way a `5xx` is not, which is why *this* is the
+    /// signal passive ejection may act on: `expiryAnswerable` refuses to
+    /// answer `504` once a response has started, so an origin that
+    /// returned 500s can never land here.
+    no_response: []Value,
     health_down: []Value,
     health_up: []Value,
     /// Per-cluster counters: the inflight sheds fire precisely because
@@ -876,6 +888,7 @@ pub const Labeled = struct {
     pub const EndpointFamily = enum {
         connect_failed,
         responses,
+        no_response,
         health_down,
         health_up,
 
@@ -885,6 +898,7 @@ pub const Labeled = struct {
             return switch (family) {
                 .connect_failed => "endpoint_connect_failed",
                 .responses => "endpoint_responses",
+                .no_response => "endpoint_no_response",
                 .health_down => "endpoint_health_down",
                 .health_up => "endpoint_health_up",
             };
@@ -928,6 +942,7 @@ pub const Labeled = struct {
         labeled.cluster_checked = try arena.alloc(bool, cluster_count);
         labeled.connect_failed = try allocValues(arena, keys.count);
         labeled.responses = try allocValues(arena, keys.count);
+        labeled.no_response = try allocValues(arena, keys.count);
         labeled.health_down = try allocValues(arena, keys.count);
         labeled.health_up = try allocValues(arena, keys.count);
         labeled.l7_shed_inflight = try allocValues(arena, cluster_count);
@@ -1307,6 +1322,10 @@ pub const Labeled = struct {
     pub fn reconciles(labeled: *const Labeled, counters: *const Counters) void {
         assert(tableTotal(labeled.connect_failed) == counters.get("upstream_connect_failed"));
         assert(tableTotal(labeled.responses) == counters.get("l7_responses"));
+        // Both `504` sites — the dial that outlived its budget and the
+        // exchange that did — know the endpoint they were dialling, so
+        // the partition is total (#230).
+        assert(tableTotal(labeled.no_response) == counters.get("l7_gateway_timeout"));
         assert(tableTotal(labeled.health_down) == counters.get("health_endpoint_down"));
         assert(tableTotal(labeled.health_up) == counters.get("health_endpoint_up"));
         assert(tableTotal(labeled.l7_shed_inflight) ==
@@ -1687,7 +1706,7 @@ test "counters: labeled render speaks the exposition dialect" {
         type_lines += 1;
         search = at + "# TYPE ".len;
     }
-    try std.testing.expectEqual(@as(usize, 8), type_lines);
+    try std.testing.expectEqual(@as(usize, 9), type_lines);
 }
 
 test "counters: labeled render bound is exact at the maximum values" {
@@ -1700,8 +1719,9 @@ test "counters: labeled render bound is exact at the maximum values" {
 
     for ([_][]Counters.Value{
         labeled.connect_failed,   labeled.responses,
-        labeled.health_down,      labeled.health_up,
-        labeled.l7_shed_inflight, labeled.l4_shed_inflight,
+        labeled.no_response,      labeled.health_down,
+        labeled.health_up,        labeled.l7_shed_inflight,
+        labeled.l4_shed_inflight,
     }) |table| {
         for (table) |*value| value.store(std.math.maxInt(u64), .monotonic);
     }
