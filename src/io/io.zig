@@ -82,6 +82,11 @@ pub const Signal = enum(u8) {
 };
 
 pub const ShutdownHow = enum(u8) {
+    /// Force an armed *recv* to completion while the connection stays
+    /// writable (#247). The write half is untouched, which is the whole
+    /// point: a verdict that must answer cannot shut the socket it is
+    /// answering on.
+    read,
     write,
     both,
 };

@@ -1354,6 +1354,7 @@ pub fn setLingerRst(io: *XevIo, socket: Socket) Io.SetOptionError!void {
 pub fn shutdown(io: *XevIo, socket: Socket, how: Io.ShutdownHow) void {
     _ = io;
     const posix_how: i32 = switch (how) {
+        .read => posix.SHUT.RD,
         .write => posix.SHUT.WR,
         .both => posix.SHUT.RDWR,
     };

@@ -1458,3 +1458,79 @@ test "xevio: the listener table reserves a slot for the admin listener" {
     // And the reservation is exactly one — not open-ended.
     try std.testing.expectError(error.AddressUnavailable, xev_io.listen(loopback));
 }
+
+/// The §4 contract a head-read verdict rests on (#247): a read-half
+/// shutdown forces an armed recv to completion **and leaves the socket
+/// writable**.
+///
+/// Both halves matter and neither is obvious. Answering `408` to a client
+/// that stopped mid-head means writing on the very socket a recv is armed
+/// on, and §5 never cancels a data op — it forces one. `.both` would
+/// force it and take the write half with it, which is the one thing the
+/// verdict cannot afford; `.write` leaves the recv armed forever. So the
+/// whole feature turns on a variant that does exactly one of the two, and
+/// on both backends agreeing about it.
+///
+/// Asked of the kernel rather than reasoned about: on io_uring the armed
+/// recv completes `EndOfStream`, which is the shape `SimIo` already
+/// modelled for a FIN.
+fn runReadShutdownContract(comptime IoType: type, io: *IoType) !void {
+    const Contract = GroupContract(IoType);
+    var c: Contract = .{ .io = io };
+    const listener = try io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+    defer io.listenClose(listener);
+    const client, const server = try c.pair(listener);
+    defer io.closeNow(client);
+    defer io.closeNow(server);
+
+    // Armed with the peer silent, so nothing but the shutdown can end it.
+    var buffer: [64]u8 = undefined;
+    var recv_outcome: ?Io.RecvError!u32 = null;
+    var recv_completion: IoType.Completion = .{};
+    io.recv(client, &buffer, &recv_completion, @TypeOf(recv_outcome), &recv_outcome, (struct {
+        fn onRecv(state: *?Io.RecvError!u32, result: Io.RecvError!u32) void {
+            state.* = result;
+        }
+    }).onRecv);
+
+    io.shutdown(client, .read);
+    try io.run();
+
+    const recv_result = recv_outcome orelse return error.RecvNeverCompleted;
+    try std.testing.expectError(error.EndOfStream, recv_result);
+
+    // And the half the verdict answers through is still open. Without
+    // this the first half would be satisfied by `.both`, which is the
+    // variant #247 could not use.
+    var send_outcome: ?Io.SendError!u32 = null;
+    var send_completion: IoType.Completion = .{};
+    const payload = "still-writable";
+    io.send(client, payload, &send_completion, @TypeOf(send_outcome), &send_outcome, (struct {
+        fn onSend(state: *?Io.SendError!u32, result: Io.SendError!u32) void {
+            state.* = result;
+        }
+    }).onSend);
+    try io.run();
+    const sent = try (send_outcome orelse return error.SendNeverCompleted);
+    try std.testing.expect(sent >= 1);
+    try std.testing.expect(sent <= payload.len);
+}
+
+test "contract: a read-half shutdown forces an armed recv on SimIo" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var sim_io: SimIo = undefined;
+    try sim_io.init(arena_state.allocator(), .{ .seed = 247 });
+    try runReadShutdownContract(SimIo, &sim_io);
+}
+
+test "contract: a read-half shutdown forces an armed recv on XevIo" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var xev_io: XevIo = undefined;
+    try initTestIo(&xev_io, arena_state.allocator(), 0);
+    defer xev_io.deinit();
+    try runReadShutdownContract(XevIo, &xev_io);
+}
