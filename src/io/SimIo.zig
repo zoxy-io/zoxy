@@ -54,6 +54,7 @@ const pending_ops_max: u32 = constants.inFlightOps(
     constants.conn_slots_max,
     constants.upstream_slots_max,
     listeners_max,
+    constants.health_probe_concurrency_max,
 );
 const pending_signals_max: u8 = 8;
 /// The clock starts at one virtual second, not zero, so code that would

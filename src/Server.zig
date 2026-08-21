@@ -562,8 +562,16 @@ pub fn Server(comptime IoType: type) type {
                 if (options.head_buffers >= 1) options.head_buffer_bytes else 0;
             server.target_scratch = try arena.alloc(u8, scratch_bytes);
             server.rewrite_scratch = try arena.alloc(u8, scratch_bytes);
+            // The prober's share is one head buffer per probe. Taken from
+            // the config rather than from `server.health.probes`, which
+            // `Checker.init` has not sized yet at this point in startup —
+            // and which is sourced from this same `healthProbes()`, so
+            // the two cannot disagree.
+            const health_probes = server.config.healthProbes();
+            const probe_scratch_bytes: u64 =
+                @as(u64, health_probes) * options.head_buffer_bytes;
             assert(server.target_scratch.len + server.rewrite_scratch.len +
-                options.head_buffer_bytes == headScratchBytes(options.*));
+                probe_scratch_bytes == headScratchBytes(options.*, health_probes));
             try server.initLogHeaders(arena, options);
         }
 
@@ -1943,13 +1951,17 @@ pub fn Server(comptime IoType: type) type {
         }
 
         /// The head-sized side buffers' closed form (§5): the two serving
-        /// scratches (only where a head can exist) plus the health
-        /// prober's response buffer (always). The budget banner prints
+        /// scratches (only where a head can exist) plus one response
+        /// buffer for each of the prober's concurrent probes (§7, #132) —
+        /// always at least one, because the prober reserves a floor of
+        /// one probe whatever the config checks. The budget banner prints
         /// this; `init` asserts its allocations sum to it, so the printed
         /// number cannot drift from what is actually reserved.
-        pub fn headScratchBytes(options: InitOptions) u64 {
+        pub fn headScratchBytes(options: InitOptions, health_probes: u32) u64 {
+            assert(health_probes >= 1);
+            assert(health_probes <= constants.health_probe_concurrency_max);
             const serving: u64 = if (options.head_buffers >= 1) 2 else 0;
-            return (serving + 1) * options.head_buffer_bytes;
+            return (serving + health_probes) * options.head_buffer_bytes;
         }
 
         /// Named headers one connection can be holding values for (#140):

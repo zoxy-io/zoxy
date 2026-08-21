@@ -78,12 +78,16 @@ pub fn Checker(comptime IoType: type) type {
         /// rather than by reading a cursor that has already moved on.
         cursor_cluster: u16,
         cursor_endpoint: u16,
-        /// The single in-flight probe (§7).
-        probe: Probe,
+        /// The probes drawing from the cursor (§7, #132):
+        /// `constants.healthProbeConcurrency` of them, so a config with
+        /// two checked endpoints allocates two and only a large one pays
+        /// for the ceiling. Never empty — the floor of one is what keeps
+        /// the prober's reservation unconditional (§8).
+        probes: []Probe,
         /// The between-sweeps timer, and the cancel the drain spends on
-        /// it. Neither ever co-arms with a probe — `.resting` and
-        /// `.probing` are disjoint — so these two plus a probe's three
-        /// still peak at `health_probe_ops_max`, not five.
+        /// it. Neither ever co-arms with any probe — `.resting` and
+        /// `.probing` are disjoint — so these two never add to the
+        /// per-probe `health_probe_ops_max` the budget reserves.
         armed_rest: bool,
         armed_rest_cancel: bool,
         /// Whether the drain has already spent its cancel on the rest
@@ -98,7 +102,8 @@ pub fn Checker(comptime IoType: type) type {
         pub const State = enum(u8) {
             /// Not started, or no cluster sets `check`: nothing ever arms.
             off,
-            /// A sweep is running: one probe in flight at the cursor.
+            /// A sweep is running: up to `probes.len` of them in flight,
+            /// each against an endpoint the cursor has already handed out.
             probing,
             /// Between sweeps: the rest timer is armed for the interval.
             resting,
@@ -242,6 +247,13 @@ pub fn Checker(comptime IoType: type) type {
                 probe.target_cluster = cluster_index;
                 probe.target_endpoint = endpoint_index;
                 server.counters.increment("health_probes_sent");
+                // The concurrency witness (#132): this probe is starting
+                // beside a sibling that has not settled. Counted at the
+                // hand-off, where the overlap is a fact rather than an
+                // inference from timings nothing records.
+                if (checker.busyProbes() >= 1) {
+                    server.counters.increment("health_probes_concurrent");
+                }
                 probe.canceled = .{};
                 // One budget covers the whole probe (§7) — the dial alone for
                 // a tcp check, dial + request + response for an http one —
@@ -263,7 +275,7 @@ pub fn Checker(comptime IoType: type) type {
                     probe,
                     onProbeConnect,
                 );
-                assert(checker.armedCount() <= constants.health_probe_ops_max);
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
             }
 
             fn onProbeConnect(probe: *Probe, result: Io.ConnectError!IoType.Socket) void {
@@ -367,7 +379,7 @@ pub fn Checker(comptime IoType: type) type {
                     probe,
                     onProbeSend,
                 );
-                assert(checker.armedCount() <= constants.health_probe_ops_max);
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
             }
 
             fn onProbeSend(probe: *Probe, result: Io.SendError!u32) void {
@@ -425,7 +437,7 @@ pub fn Checker(comptime IoType: type) type {
                     probe,
                     onProbeRecv,
                 );
-                assert(checker.armedCount() <= constants.health_probe_ops_max);
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
             }
 
             fn onProbeRecv(probe: *Probe, result: Io.RecvError!u32) void {
@@ -564,7 +576,10 @@ pub fn Checker(comptime IoType: type) type {
             /// here the armed set is empty, so nothing is left to deliver
             /// against this fd (§5).
             fn closeSocket(probe: *Probe) void {
-                assert(probe.checker.armedCount() == 0);
+                // This probe's own ops, not the prober's: a sibling probe
+                // may still be mid-flight against a different endpoint,
+                // and its armed op says nothing about this fd.
+                assert(probe.armedCount() == 0);
                 assert(probe.checker.state == .probing or probe.checker.state == .stopping);
                 if (probe.socket) |socket| {
                     probe.checker.server.io.closeNow(socket);
@@ -615,7 +630,7 @@ pub fn Checker(comptime IoType: type) type {
                     probe,
                     onProbeCancel,
                 );
-                assert(probe.checker.armedCount() <= constants.health_probe_ops_max);
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
             }
 
             fn armCancelConnect(probe: *Probe) void {
@@ -630,7 +645,7 @@ pub fn Checker(comptime IoType: type) type {
                     probe,
                     onProbeCancel,
                 );
-                assert(probe.checker.armedCount() <= constants.health_probe_ops_max);
+                assert(probe.armedCount() <= constants.health_probe_ops_max);
             }
 
             /// This probe's rung of the drain ladder: spend a cancel on the
@@ -691,7 +706,13 @@ pub fn Checker(comptime IoType: type) type {
             checker.canceled_rest = false;
             checker.op_rest = .{};
             checker.op_rest_cancel = .{};
-            try checker.probe.init(arena, checker, response_bytes);
+            const probe_count = server.config.healthProbes();
+            assert(probe_count >= 1);
+            assert(probe_count <= constants.health_probe_concurrency_max);
+            checker.probes = try arena.alloc(Probe, probe_count);
+            for (checker.probes) |*probe| {
+                try probe.init(arena, checker, response_bytes);
+            }
             const clusters = server.config.clusters;
             assert(clusters.len >= 1);
             // Same pairing check the balancer makes: `keys` must describe
@@ -699,12 +720,20 @@ pub fn Checker(comptime IoType: type) type {
             // for another. `clusters.len <= healthy.len` does *not* say
             // that — it holds for any `stride >= 1`.
             assert(keys.count == @as(u32, @intCast(clusters.len)) * keys.stride);
-            for (clusters) |cluster| {
-                if (cluster.check != null) {
-                    checker.checked_count += @intCast(cluster.endpoints.len);
-                }
-            }
+            // The config's own count, not a second walk of the same
+            // clusters: the budget prices the prober from this number and
+            // the prober sizes itself from it, and §5's closed form is
+            // only closed while there is exactly one reading of it.
+            checker.checked_count = server.config.checkedEndpoints();
             assert(checker.checked_count <= checker.healthy.len);
+            // What `Server.initHeadBuffers` priced the prober's scratch
+            // at, checked where the probes are actually allocated.
+            assert(probe_count == constants.healthProbeConcurrency(checker.checked_count));
+            // Never more probes than there are endpoints to hand them:
+            // an idle probe would be a reservation nothing can spend.
+            // The floor of one is the exception, and only when nothing
+            // is checked at all — the prober stays `.off` then.
+            assert(checker.probes.len <= @max(1, checker.checked_count));
             assert(checker.armedCount() == 0);
         }
 
@@ -734,7 +763,9 @@ pub fn Checker(comptime IoType: type) type {
             assert(checker.armedCount() >= 1);
             assert(checker.checked_count >= 1);
             checker.state = .stopping;
-            checker.probe.pending_verdict = .none;
+            for (checker.probes) |*probe| {
+                probe.pending_verdict = .none;
+            }
             checker.continueStop();
         }
 
@@ -747,9 +778,25 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         pub fn armedCount(checker: *const Self) u32 {
-            return @as(u32, @intFromBool(checker.armed_rest)) +
-                @as(u32, @intFromBool(checker.armed_rest_cancel)) +
-                checker.probe.armedCount();
+            const rest_ops: u32 = @as(u32, @intFromBool(checker.armed_rest)) +
+                @as(u32, @intFromBool(checker.armed_rest_cancel));
+            var probe_ops: u32 = 0;
+            for (checker.probes) |*probe| {
+                const armed = probe.armedCount();
+                assert(armed <= constants.health_probe_ops_max);
+                probe_ops += armed;
+            }
+            // The disjointness itself, not merely a bound loose enough to
+            // survive it: the rest timer and every probe are never armed
+            // at the same moment, which is *why* the reservation is
+            // `probes.len × health_probe_ops_max` and not that plus two.
+            // A bound alone would let a co-armed rest timer hide inside
+            // the slack of an idle probe (§8).
+            assert(rest_ops == 0 or probe_ops == 0);
+            assert(probe_ops <=
+                @as(u32, @intCast(checker.probes.len)) * constants.health_probe_ops_max);
+            assert(rest_ops <= 2);
+            return rest_ops + probe_ops;
         }
 
         fn startSweep(checker: *Self) void {
@@ -761,21 +808,21 @@ pub fn Checker(comptime IoType: type) type {
             checker.dispatchNext();
         }
 
-        /// Hand the next checked endpoint to the idle probe and dial it,
-        /// or — with the cursor exhausted — end the sweep and rest for
-        /// the interval. The cursor advances *before* the hand-off, so a
-        /// probe that reached its verdict without ever yielding to the
-        /// loop cannot be handed the endpoint it just answered for.
-        /// Bounded: the walk visits each cluster at most once past the
-        /// cursor.
-        fn dispatchNext(checker: *Self) void {
+        /// One endpoint of a sweep, claimed from the cursor.
+        const Target = struct {
+            cluster: *const config_module.Config.Cluster,
+            cluster_index: u16,
+            endpoint_index: u16,
+        };
+
+        /// Claim the next checked endpoint, or null once the sweep has
+        /// handed out every one. The cursor advances *here*, as part of
+        /// the claim and before the caller arms anything, which is what
+        /// makes it impossible for two probes to be handed the same
+        /// endpoint. Bounded: the walk visits each cluster at most once
+        /// past the cursor.
+        fn takeNextTarget(checker: *Self) ?Target {
             assert(checker.state == .probing);
-            assert(checker.probe.armedCount() == 0);
-            assert(checker.probe.pending_verdict == .none);
-            // Same disjointness `Probe.begin` states, at the other end of
-            // the hand-off: a sweep never dispatches beside a live rest
-            // timer.
-            assert(!checker.armed_rest and !checker.armed_rest_cancel);
             const clusters = checker.server.config.clusters;
             while (checker.cursor_cluster < clusters.len) {
                 const cluster = &clusters[checker.cursor_cluster];
@@ -784,13 +831,64 @@ pub fn Checker(comptime IoType: type) type {
                     checker.cursor_endpoint = 0;
                     continue;
                 }
-                const cluster_index = checker.cursor_cluster;
-                const endpoint_index = checker.cursor_endpoint;
+                const target: Target = .{
+                    .cluster = cluster,
+                    .cluster_index = checker.cursor_cluster,
+                    .endpoint_index = checker.cursor_endpoint,
+                };
                 checker.cursor_endpoint += 1;
-                checker.probe.begin(cluster, cluster_index, endpoint_index);
-                return;
+                return target;
             }
-            checker.rest();
+            return null;
+        }
+
+        /// Probes with an op still armed — the ones that own an endpoint
+        /// whose verdict has not landed yet.
+        fn busyProbes(checker: *const Self) u32 {
+            var busy: u32 = 0;
+            for (checker.probes) |*probe| {
+                if (probe.armedCount() != 0) busy += 1;
+            }
+            assert(busy <= checker.probes.len);
+            return busy;
+        }
+
+        /// Fill every idle probe from the cursor, and — once the cursor
+        /// is exhausted and no probe is still working — end the sweep
+        /// and rest for the interval.
+        ///
+        /// Resting is gated on the probes rather than on the cursor
+        /// alone: a probe still in flight owns an endpoint whose verdict
+        /// has not been applied, and starting the interval on top of it
+        /// would pace the next sweep against a mask this one had not
+        /// finished writing.
+        fn dispatchNext(checker: *Self) void {
+            assert(checker.state == .probing);
+            // The disjointness the op reservation rests on, at the end of
+            // the hand-off where it could break: a sweep never dispatches
+            // beside a live rest timer.
+            assert(!checker.armed_rest and !checker.armed_rest_cancel);
+            var dispatched: u32 = 0;
+            for (checker.probes) |*probe| {
+                if (probe.armedCount() != 0) continue;
+                assert(probe.pending_verdict == .none);
+                const target = checker.takeNextTarget() orelse break;
+                probe.begin(target.cluster, target.cluster_index, target.endpoint_index);
+                // The §4 seam never delivers a completion inside the call
+                // that arms it — XevIo routes a would-be-synchronous one
+                // through a zero-delay timer precisely so it cannot. This
+                // loop is where that guarantee earns its keep: a
+                // reentrant delivery would run `settle` and then this
+                // function again from inside this frame, and the next
+                // iteration would arm against a state the inner call had
+                // already moved to `.resting`. Stated as an assert rather
+                // than trusted, because the single-probe sweep would only
+                // have misbehaved locally where this one trips.
+                assert(checker.state == .probing);
+                dispatched += 1;
+                assert(dispatched <= checker.probes.len);
+            }
+            if (checker.busyProbes() == 0) checker.rest();
         }
 
         /// The cluster's resolved check policy. Only a checked cluster is
@@ -905,9 +1003,14 @@ pub fn Checker(comptime IoType: type) type {
             checker.continueStop();
         }
 
-        /// One cancel at a time toward quiescence: the rest timer first,
-        /// then the probe's own ladder, then — once every delivery has
-        /// drained — stop.
+        /// Toward quiescence: the rest timer first, then every probe's
+        /// own ladder, then — once every delivery has drained — stop.
+        ///
+        /// The probes advance together rather than one at a time. Each
+        /// owns its cancel completion, so "cancels are serialized" is a
+        /// per-probe rule (`Probe.armed.cancel`) and never a per-prober
+        /// one; draining them in sequence would only make a drain take
+        /// as long as the slowest chain of them.
         fn continueStop(checker: *Self) void {
             assert(checker.state == .stopping);
             if (checker.armed_rest_cancel) return;
@@ -921,15 +1024,23 @@ pub fn Checker(comptime IoType: type) type {
                     checker,
                     onRestCancel,
                 );
-                assert(checker.armedCount() <= constants.health_probe_ops_max);
+                // The rest timer and its cancel are the only ops a
+                // resting prober holds, and no probe co-arms with them.
+                assert(checker.armedCount() <= 2);
                 return;
             }
-            if (checker.probe.continueStop()) return;
+            var outstanding = false;
+            for (checker.probes) |*probe| {
+                if (probe.continueStop()) outstanding = true;
+            }
+            if (outstanding) return;
             if (checker.armedCount() != 0) return;
             assert(checker.isQuiescent());
-            // Nothing can reference the probe's fd once every op has
-            // drained, which is what makes closing it here safe (§5).
-            checker.probe.closeSocket();
+            // Nothing can reference a probe's fd once every op has
+            // drained, which is what makes closing them here safe (§5).
+            for (checker.probes) |*probe| {
+                probe.closeSocket();
+            }
             checker.state = .stopped;
             checker.server.maybeStopAfterDrain();
         }

@@ -115,6 +115,24 @@ pub const Config = struct {
     /// is configured — the log stays off and reserves nothing.
     access_log_sink: ?AccessLogSink = null,
 
+    /// Endpoints under §7 active checks: the sum of `endpoints.len` over
+    /// every cluster that set a `check` block. Both the prober's own
+    /// `checked_count` and — through `constants.healthProbeConcurrency`
+    /// — its ring and fd reservations are functions of this, so it is
+    /// derived in one place rather than counted separately by the prober
+    /// and the budget, which is exactly the drift §5 warns the closed
+    /// form must not have.
+    pub fn checkedEndpoints(config: *const Config) u32 {
+        return checkedEndpointsOf(config.clusters);
+    }
+
+    /// The prober's effective probe count for this config (§7, #132) —
+    /// what the ring and fd budgets reserve, and how many `Probe`s
+    /// `health.Checker` allocates.
+    pub fn healthProbes(config: *const Config) u32 {
+        return constants.healthProbeConcurrency(config.checkedEndpoints());
+    }
+
     /// Where the access log writes (§8). `stdout` is the process's own
     /// standard output, inherited rather than opened, so it costs no file
     /// descriptor and carries no rotation story of its own — an operator
@@ -763,6 +781,11 @@ pub fn parseWithFiles(
         upgrade_listeners_count,
         access_log_sink != null,
         log_headers.count(),
+        // The prober's share of the ring, which `resolveCqFill` has to
+        // know before it can accept a fill (#132). Available here
+        // because clusters resolve before limits do — the `check` blocks
+        // are already settled by the time the budget is priced.
+        constants.healthProbeConcurrency(checkedEndpointsOf(clusters)),
     );
     // Bodies before listeners (#159): a `respond` action names one, and
     // both consumers render through the same load-time cache — so the
@@ -1206,8 +1229,11 @@ fn resolveLimits(
     upgrade_listeners_count: u32,
     access_log_on: bool,
     log_header_count: u32,
+    health_probes: u32,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
+    assert(health_probes >= 1);
+    assert(health_probes <= constants.health_probe_concurrency_max);
     assert(http_listeners_count <= listeners_count);
     assert(tls_listeners_count <= listeners_count);
     assert(upgrade_listeners_count <= listeners_count);
@@ -1241,6 +1267,7 @@ fn resolveLimits(
         conn_slots,
         upstream_slots,
         listeners_count,
+        health_probes,
     );
     // Zero exactly when the log is off, so the one number says both how
     // big the staging buffers are and whether there are any (§8). A
@@ -1319,16 +1346,24 @@ fn resolveCqFill(
     conn_slots: u32,
     upstream_slots: u32,
     listeners_count: u32,
+    health_probes: u32,
 ) ValidationError!u32 {
     assert(conn_slots >= 1);
     assert(listeners_count >= 1);
+    assert(health_probes >= 1);
     const cq_fill_eighths = requested orelse constants.cq_fill_eighths_default;
     if (cq_fill_eighths < constants.cq_fill_eighths_min or
         cq_fill_eighths > constants.cq_fill_eighths_max)
     {
         return error.LimitCqFillOutOfRange;
     }
-    if (!constants.cqFillFits(conn_slots, upstream_slots, listeners_count, cq_fill_eighths)) {
+    if (!constants.cqFillFits(
+        conn_slots,
+        upstream_slots,
+        listeners_count,
+        health_probes,
+        cq_fill_eighths,
+    )) {
         return error.LimitConnSlotsOverCqFill;
     }
     return cq_fill_eighths;
@@ -2760,6 +2795,23 @@ pub const dto_types = .{
 
 comptime {
     for (dto_types) |T| assert_meta_matches(T);
+}
+
+/// Endpoints under §7 active checks in a resolved cluster table. A free
+/// function rather than only a `Config` method because the loader needs
+/// the count *before* the `Config` exists: `resolveCqFill` prices the
+/// prober's share of the ring, and clusters are resolved by then while
+/// the config is not yet assembled. `Config.checkedEndpoints` delegates
+/// here so the two can never disagree.
+fn checkedEndpointsOf(clusters: []const Config.Cluster) u32 {
+    var total: u32 = 0;
+    for (clusters) |cluster| {
+        if (cluster.check == null) continue;
+        // Bounded by the endpoint count the loader already accepted, and
+        // every endpoint index in the tree is a `u16` per cluster.
+        total += @intCast(cluster.endpoints.len);
+    }
+    return total;
 }
 
 fn resolveClusters(
@@ -5639,22 +5691,32 @@ test "config: listeners are bounded by the ring budget, not by a count" {
 test "config: listeners that overflow the ring budget are refused at load" {
     // The comptime `assert(in_flight_ops_max <= completion_queue_entries)`
     // this replaces could only ever speak about the ceilings. This is the
-    // same arithmetic against a real config: conn slots at the ceiling
-    // leave no room for a listener's two ops, so the pair is refused —
-    // the startup rejection that the removed ceiling used to pre-empt.
-    // Both pools at their ceilings leaves 3 of the 57344-op fill budget
-    // spare at zero listeners — which is exactly what `conn_slots_max` is
-    // derived to leave — so the second listener is already one too many.
+    // same arithmetic against a real config: past some listener count the
+    // conn slots leave no room for a listener's two ops, and the config is
+    // refused — the startup rejection that the removed ceiling used to
+    // pre-empt.
+    //
+    // Where that line falls says something about the budget worth pinning.
+    // `conn_slots_max` is derived against the *worst case* the prober can
+    // ask for (`health_probe_concurrency_max` probes, #132), which leaves
+    // 3 ops of the 57344-op fill budget spare at zero listeners. This
+    // config sets no `check` block anywhere, so its prober reserves the
+    // floor of one probe and the other 45 ops are slack it may spend on
+    // listeners: 24 fit, and the 25th is one too many. A config that did
+    // configure 16 checked endpoints would find that slack already spent
+    // and be refused at two — which is the effective-versus-ceiling split
+    // (§5, §8) showing up as a real difference between two configs, not
+    // an accounting detail.
     const at_ceiling = std.fmt.comptimePrint(
         "\"limits\":{{\"conn_slots\":{d},\"upstream_slots\":{d}}},",
         .{ constants.conn_slots_max, constants.upstream_slots_max },
     );
-    try expectParseError(error.LimitConnSlotsOverCqFill, comptime listenersJson(2, at_ceiling));
-    // One listener still fits, so the refusal above is the budget talking
+    try expectParseError(error.LimitConnSlotsOverCqFill, comptime listenersJson(25, at_ceiling));
+    // Twenty-four still fit, so the refusal above is the budget talking
     // and not the pools alone.
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    _ = try expectParseOk(&arena_state, comptime listenersJson(1, at_ceiling));
+    _ = try expectParseOk(&arena_state, comptime listenersJson(24, at_ceiling));
 }
 
 var fuzz_arena_buffer: [1 << 20]u8 = undefined;
