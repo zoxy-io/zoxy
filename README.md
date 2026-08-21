@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml)
 [![Coverage Status](https://coveralls.io/repos/github/zoxy-io/zoxy/badge.svg?branch=main)](https://coveralls.io/github/zoxy-io/zoxy?branch=main)
+[![Discord](https://img.shields.io/discord/1530882611159760956)](https://discord.gg/BGbb7VtYA)
 [![Project stage: Experimental][project-stage-badge: Experimental]][project-stage-page]
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
