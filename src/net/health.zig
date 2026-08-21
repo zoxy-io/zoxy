@@ -22,6 +22,13 @@
 //! cancel. Sweeps serialize endpoint-by-endpoint and the interval paces
 //! sweep-end to sweep-start.
 //!
+//! What is per-probe and what is per-prober is drawn as a type boundary:
+//! `Probe` owns a target, a verdict, a socket, the two buffers and every
+//! op it may arm, while the checker owns what a sweep shares — the mask,
+//! the streaks, the cursor and the rest timer. The checker holds exactly
+//! one probe today, and that count is the only thing that stands between
+//! this shape and a concurrent sweep (#132).
+//!
 //! Ending a probe early depends on which leg is armed, because data ops
 //! are never canceled (§4, §5). A dial takes the one legal cancel; a
 //! send or recv is ended by shutting the socket down, which makes it
@@ -62,51 +69,29 @@ pub fn Checker(comptime IoType: type) type {
         /// Checked endpoints currently ejected; the gauge level (§8).
         unhealthy_count: u32,
         state: State,
-        /// The sweep cursor: the cluster and endpoint the in-flight (or
-        /// next) probe targets. Valid while `.probing`.
+        /// The sweep cursor: the *next* endpoint to hand out, not the one
+        /// being probed. It advances at the hand-off (`dispatchNext`) and
+        /// never when a verdict lands, so an endpoint is handed out once
+        /// per sweep no matter how many probes are drawing from it. Which
+        /// endpoint a verdict belongs to is therefore the probe's own
+        /// question, answered by `Probe.target_cluster`/`target_endpoint`
+        /// rather than by reading a cursor that has already moved on.
         cursor_cluster: u16,
         cursor_endpoint: u16,
-        /// The in-flight probe's outcome, decided by whichever of the
-        /// dial, its data legs, or its deadline lands first; applied only
-        /// once every armed op has drained (the §5 release discipline).
-        pending_verdict: Verdict,
-        /// The http probe's socket, held across its send and recv legs.
-        /// Null for a tcp probe, which closes inline in the dial's own
-        /// delivery — it wanted the SYN/ACK, not a connection.
-        probe_socket: ?IoType.Socket,
-        /// Whether this probe's socket has been shut down already. Data
-        /// ops are never canceled (§4/§5): a deadline or a drain that
-        /// must end an armed send or recv shuts the socket down instead,
-        /// which makes the op complete — and must do so exactly once.
-        probe_shutdown: bool,
-        /// The rendered request, and how much of it has gone out.
-        request: [constants.health_check_request_bytes_max]u8,
-        request_len: u32,
-        request_sent: u32,
-        /// The response head as it accumulates. Sized at init to what the
-        /// data path's own parser accepts (`limits.head_buffer_bytes`),
-        /// so a head this proxy would forward is never one the probe
-        /// rejects for being too big — a relation that followed the size
-        /// into the config.
-        response: []u8,
-        response_len: u32,
-        armed: Armed,
-        /// Ops a cancel was already spent on (never `.cancel` itself):
-        /// what keeps the serialized drain from re-canceling an op whose
-        /// terminal delivery is still in flight.
-        canceled: Armed,
+        /// The single in-flight probe (§7).
+        probe: Probe,
+        /// The between-sweeps timer, and the cancel the drain spends on
+        /// it. Neither ever co-arms with a probe — `.resting` and
+        /// `.probing` are disjoint — so these two plus a probe's three
+        /// still peak at `health_probe_ops_max`, not five.
+        armed_rest: bool,
+        armed_rest_cancel: bool,
+        /// Whether the drain has already spent its cancel on the rest
+        /// timer; the same "never re-cancel an op whose delivery is still
+        /// in flight" rule `Probe.canceled` keeps for the probe's ops.
+        canceled_rest: bool,
         op_rest: IoType.Completion,
-        op_connect: IoType.Completion,
-        /// The http probe's two data legs. They never co-arm — the
-        /// request goes out in full before a byte is read — so one
-        /// completion each is the whole story.
-        op_send: IoType.Completion,
-        op_recv: IoType.Completion,
-        op_deadline: IoType.Completion,
-        /// The one cancel completion, reused across targets — legal
-        /// because cancels are serialized (`armed.cancel` gates every
-        /// submission).
-        op_cancel: IoType.Completion,
+        op_rest_cancel: IoType.Completion,
 
         const Self = @This();
 
@@ -129,20 +114,553 @@ pub fn Checker(comptime IoType: type) type {
             fail,
         };
 
-        /// One bit per embedded op; the prober is quiescent only when
-        /// clear. At most three are ever set (`health_probe_ops_max`):
-        /// rest never co-arms with a probe, the probe's own legs run one
-        /// at a time (dial, then send, then recv), and the cancel is
-        /// serialized — so the peak is one leg + the deadline + one
-        /// cancel however far an http probe gets.
-        pub const Armed = packed struct(u8) {
-            rest: bool = false,
-            connect: bool = false,
-            send: bool = false,
-            recv: bool = false,
-            deadline: bool = false,
-            cancel: bool = false,
-            _pad: u2 = 0,
+        /// One probe: the endpoint it was handed, the verdict it has
+        /// reached, and every op it may arm. It is the callback context
+        /// for all of them, so a delivery knows which probe it belongs to
+        /// without consulting the checker's cursor — which is exactly
+        /// what lets the cursor run ahead of the verdicts.
+        pub const Probe = struct {
+            checker: *Self,
+            /// The endpoint `dispatchNext` handed this probe. Valid while
+            /// the probe is busy, and the key a settled verdict is
+            /// applied against.
+            target_cluster: u16,
+            target_endpoint: u16,
+            /// This probe's outcome, decided by whichever of the dial,
+            /// its data legs, or its deadline lands first; applied only
+            /// once every armed op has drained (the §5 release
+            /// discipline).
+            pending_verdict: Verdict,
+            /// The http probe's socket, held across its send and recv legs.
+            /// Null for a tcp probe, which closes inline in the dial's own
+            /// delivery — it wanted the SYN/ACK, not a connection.
+            socket: ?IoType.Socket,
+            /// Whether this probe's socket has been shut down already. Data
+            /// ops are never canceled (§4/§5): a deadline or a drain that
+            /// must end an armed send or recv shuts the socket down instead,
+            /// which makes the op complete — and must do so exactly once.
+            shutdown_done: bool,
+            /// The rendered request, and how much of it has gone out.
+            request: [constants.health_check_request_bytes_max]u8,
+            request_len: u32,
+            request_sent: u32,
+            /// The response head as it accumulates. Sized at init to what the
+            /// data path's own parser accepts (`limits.head_buffer_bytes`),
+            /// so a head this proxy would forward is never one the probe
+            /// rejects for being too big — a relation that followed the size
+            /// into the config.
+            response: []u8,
+            response_len: u32,
+            armed: Armed,
+            /// Ops a cancel was already spent on (never `.cancel` itself):
+            /// what keeps the serialized drain from re-canceling an op whose
+            /// terminal delivery is still in flight.
+            canceled: Armed,
+            op_connect: IoType.Completion,
+            /// The http probe's two data legs. They never co-arm — the
+            /// request goes out in full before a byte is read — so one
+            /// completion each is the whole story.
+            op_send: IoType.Completion,
+            op_recv: IoType.Completion,
+            op_deadline: IoType.Completion,
+            /// The one cancel completion, reused across this probe's
+            /// targets — legal because a probe's cancels are serialized
+            /// (`armed.cancel` gates every submission).
+            op_cancel: IoType.Completion,
+
+            /// One bit per op this probe may arm; the probe is quiescent
+            /// only when clear. At most three are ever set
+            /// (`health_probe_ops_max`): the legs run one at a time
+            /// (dial, then send, then recv), and the cancel is serialized
+            /// — so the peak is one leg + the deadline + one cancel
+            /// however far an http probe gets.
+            pub const Armed = packed struct(u8) {
+                connect: bool = false,
+                send: bool = false,
+                recv: bool = false,
+                deadline: bool = false,
+                cancel: bool = false,
+                _pad: u3 = 0,
+            };
+
+            fn init(
+                probe: *Probe,
+                arena: std.mem.Allocator,
+                checker: *Self,
+                /// The probe's response buffer size — `limits.head_buffer_bytes`,
+                /// so the probe accepts exactly the heads the data path does.
+                response_bytes: u32,
+            ) error{OutOfMemory}!void {
+                assert(response_bytes >= constants.head_buffer_bytes_min);
+                probe.checker = checker;
+                probe.response = try arena.alloc(u8, response_bytes);
+                probe.target_cluster = 0;
+                probe.target_endpoint = 0;
+                probe.pending_verdict = .none;
+                probe.socket = null;
+                probe.shutdown_done = false;
+                probe.request_len = 0;
+                probe.request_sent = 0;
+                probe.response_len = 0;
+                probe.armed = .{};
+                probe.canceled = .{};
+                probe.op_connect = .{};
+                probe.op_send = .{};
+                probe.op_recv = .{};
+                probe.op_deadline = .{};
+                probe.op_cancel = .{};
+                assert(probe.armedCount() == 0);
+            }
+
+            fn armedCount(probe: *const Probe) u32 {
+                return @popCount(@as(u8, @bitCast(probe.armed)));
+            }
+
+            /// Take the endpoint the sweep just handed out and dial it.
+            fn begin(
+                probe: *Probe,
+                cluster: *const config_module.Config.Cluster,
+                cluster_index: u16,
+                endpoint_index: u16,
+            ) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(probe.armedCount() == 0);
+                // The disjointness the op budget rests on, asserted where
+                // it could break rather than argued in the field comment:
+                // a probe never starts beside a live rest timer, which is
+                // what keeps the peak at `health_probe_ops_max` (§8). It
+                // is stated on the probe's own bits rather than on
+                // `checker.armedCount() == 0`, which a concurrent sweep
+                // would make false for a reason that is not a defect.
+                assert(!checker.armed_rest and !checker.armed_rest_cancel);
+                assert(cluster.check != null);
+                assert(endpoint_index < cluster.endpoints.len);
+                assert(probe.pending_verdict == .none);
+                const server = checker.server;
+                const check = &cluster.check.?;
+                probe.target_cluster = cluster_index;
+                probe.target_endpoint = endpoint_index;
+                server.counters.increment("health_probes_sent");
+                probe.canceled = .{};
+                // One budget covers the whole probe (§7) — the dial alone for
+                // a tcp check, dial + request + response for an http one —
+                // because what an operator cares about is how long an
+                // endpoint may take to prove itself, not which leg was slow.
+                probe.armed.deadline = true;
+                server.io.timerStart(
+                    &probe.op_deadline,
+                    @as(u64, check.timeout_ms) * std.time.ns_per_ms,
+                    Probe,
+                    probe,
+                    onProbeDeadline,
+                );
+                probe.armed.connect = true;
+                server.io.connect(
+                    cluster.endpoints[endpoint_index],
+                    &probe.op_connect,
+                    Probe,
+                    probe,
+                    onProbeConnect,
+                );
+                assert(checker.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            fn onProbeConnect(probe: *Probe, result: Io.ConnectError!IoType.Socket) void {
+                const checker = probe.checker;
+                assert(probe.armed.connect);
+                probe.armed.connect = false;
+                const http_check = checker.state == .probing and
+                    probe.pending_verdict == .none and
+                    checker.checkOf(probe.target_cluster).kind == .http;
+                if (result) |socket| {
+                    if (http_check) {
+                        // The http probe's dial is the beginning of the
+                        // probe, not its verdict: the socket is stored and
+                        // carries the request and response legs.
+                        probe.socket = socket;
+                        probe.beginRequest(socket);
+                        probe.settle();
+                        return;
+                    }
+                    // A tcp probe wanted the SYN/ACK, not a connection — and
+                    // a socket that was never stored cannot leak (§9). The
+                    // same holds for a dial that lands after its own verdict
+                    // or into a drain: there is nothing left to send it.
+                    checker.server.io.closeNow(socket);
+                } else |_| {}
+                if (checker.state == .stopping) {
+                    checker.continueStop();
+                    return;
+                }
+                assert(checker.state == .probing);
+                if (result) |_| {
+                    // First outcome wins: a dial landing after its deadline
+                    // already failed the probe keeps the fail — a late
+                    // answer is no answer (§7).
+                    if (probe.pending_verdict == .none) {
+                        probe.pending_verdict = .pass;
+                    }
+                } else |err| switch (err) {
+                    // The deadline fired first and canceled the dial; the
+                    // fail verdict is already pending.
+                    error.Canceled => assert(probe.pending_verdict == .fail),
+                    else => {
+                        if (probe.pending_verdict == .none) {
+                            probe.pending_verdict = .fail;
+                        }
+                        // Typed refusals are the origin's verdict; only
+                        // kernel pressure on our side is witnessed (§8) —
+                        // the same split the data-path dial makes.
+                        checker.server.witnessKernelPressure(.connect, err);
+                    },
+                }
+                probe.settle();
+            }
+
+            /// Render this probe's request and start writing it. The render
+            /// cannot fail: `health_check_request_bytes_max` is derived from
+            /// the path and Host bounds the loader already enforced (§5).
+            fn beginRequest(probe: *Probe, socket: IoType.Socket) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(!probe.armed.send);
+                assert(!probe.armed.recv);
+                const check = checker.checkOf(probe.target_cluster);
+                assert(check.kind == .http);
+                const http = check.http.?;
+                const cluster = &checker.server.config.clusters[probe.target_cluster];
+                const endpoint = cluster.endpoints[probe.target_endpoint];
+                // `Connection: close` because the probe never reuses this
+                // socket: it asks one question and hangs up, which also frees
+                // the origin from parking a connection nobody will return to.
+                const rendered = if (http.host) |host|
+                    std.fmt.bufPrint(
+                        &probe.request,
+                        "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+                        .{ http.path, host },
+                    ) catch unreachable
+                else
+                    std.fmt.bufPrint(
+                        &probe.request,
+                        "GET {s} HTTP/1.1\r\nHost: {f}\r\nConnection: close\r\n\r\n",
+                        .{ http.path, endpoint },
+                    ) catch unreachable;
+                probe.request_len = @intCast(rendered.len);
+                probe.request_sent = 0;
+                probe.response_len = 0;
+                assert(probe.request_len >= 1);
+                probe.armSend(socket);
+            }
+
+            fn armSend(probe: *Probe, socket: IoType.Socket) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(!probe.armed.send);
+                assert(probe.request_sent < probe.request_len);
+                probe.armed.send = true;
+                checker.server.io.send(
+                    socket,
+                    probe.request[probe.request_sent..probe.request_len],
+                    &probe.op_send,
+                    Probe,
+                    probe,
+                    onProbeSend,
+                );
+                assert(checker.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            fn onProbeSend(probe: *Probe, result: Io.SendError!u32) void {
+                const checker = probe.checker;
+                assert(probe.armed.send);
+                probe.armed.send = false;
+                if (checker.state == .stopping) {
+                    checker.continueStop();
+                    return;
+                }
+                assert(checker.state == .probing);
+                const sent = result catch |err| {
+                    // Never a cancel: data ops are ended by the shutdown in
+                    // `endArmedLeg`, never by one (§4, §5). A Canceled here
+                    // would mean some path reached for a cancel op that this
+                    // design says does not exist for a data leg.
+                    assert(err != error.Canceled);
+                    // The origin hung up on the request, or the deadline shut
+                    // this socket down. Either way the probe has its answer.
+                    if (probe.pending_verdict == .none) {
+                        probe.pending_verdict = .fail;
+                        checker.server.witnessKernelPressure(.send, err);
+                    }
+                    probe.settle();
+                    return;
+                };
+                probe.request_sent += sent;
+                assert(probe.request_sent <= probe.request_len);
+                // A verdict already reached (the deadline fired and shut this
+                // socket down) ends the probe here: arming another leg would
+                // only spend an op to be told what is already known.
+                if (probe.pending_verdict == .none) {
+                    const socket = probe.socket.?;
+                    if (probe.request_sent < probe.request_len) {
+                        // A short write is ordinary (§6): resume where it left off.
+                        probe.armSend(socket);
+                    } else {
+                        probe.armRecv(socket);
+                    }
+                }
+                probe.settle();
+            }
+
+            fn armRecv(probe: *Probe, socket: IoType.Socket) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                assert(!probe.armed.recv);
+                assert(probe.response_len < probe.response.len);
+                probe.armed.recv = true;
+                checker.server.io.recv(
+                    socket,
+                    probe.response[probe.response_len..],
+                    &probe.op_recv,
+                    Probe,
+                    probe,
+                    onProbeRecv,
+                );
+                assert(checker.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            fn onProbeRecv(probe: *Probe, result: Io.RecvError!u32) void {
+                const checker = probe.checker;
+                assert(probe.armed.recv);
+                probe.armed.recv = false;
+                if (checker.state == .stopping) {
+                    checker.continueStop();
+                    return;
+                }
+                assert(checker.state == .probing);
+                const received = result catch |err| {
+                    assert(err != error.Canceled); // Same rule as the send leg.
+                    // EOF or reset before a whole head arrived: an origin
+                    // that hangs up mid-status has not answered the check.
+                    if (probe.pending_verdict == .none) {
+                        probe.pending_verdict = .fail;
+                        checker.server.witnessKernelPressure(.recv, err);
+                    }
+                    probe.settle();
+                    return;
+                };
+                probe.response_len += received;
+                assert(probe.response_len <= probe.response.len);
+                if (probe.pending_verdict == .none) {
+                    probe.judgeResponse();
+                }
+                if (probe.pending_verdict == .none) {
+                    // The head is still arriving. A full buffer with no head
+                    // in it is the §7 oversize-head verdict, not a shortfall.
+                    if (probe.response_len == probe.response.len) {
+                        probe.pending_verdict = .fail;
+                    } else {
+                        probe.armRecv(probe.socket.?);
+                    }
+                }
+                probe.settle();
+            }
+
+            /// Judge what has arrived so far, leaving the verdict `.none`
+            /// while the head is merely incomplete. The head parser is the
+            /// data path's own (§7), so a probe accepts exactly the responses
+            /// this proxy would forward — and nothing it would reject.
+            fn judgeResponse(probe: *Probe) void {
+                assert(probe.checker.state == .probing);
+                assert(probe.pending_verdict == .none);
+                const expect_status = probe.checker.checkOf(probe.target_cluster).http.?.expect_status;
+                var storage: parser.HeaderStorage = undefined;
+                const head = parser.parseResponseHead(
+                    probe.response[0..probe.response_len],
+                    false,
+                    &storage,
+                    .get,
+                ) catch |err| {
+                    if (err == error.Incomplete) return;
+                    probe.pending_verdict = .fail;
+                    return;
+                };
+                probe.pending_verdict = if (head.status == expect_status) .pass else .fail;
+            }
+
+            fn onProbeDeadline(probe: *Probe, result: Io.TimerError!void) void {
+                const checker = probe.checker;
+                assert(probe.armed.deadline);
+                probe.armed.deadline = false;
+                if (checker.state == .stopping) {
+                    result catch {};
+                    checker.continueStop();
+                    return;
+                }
+                assert(checker.state == .probing);
+                if (result) |_| {
+                    if (probe.pending_verdict == .none) {
+                        // Fired first: the probe outlived its budget. It
+                        // fails, and whatever leg is armed is forced to a
+                        // terminal completion so even a black-holed endpoint
+                        // or a mute origin releases the prober (§5).
+                        probe.pending_verdict = .fail;
+                        probe.endArmedLeg();
+                    } else {
+                        // The fire raced its own cancel (a legal §4 race): the
+                        // outcome is decided, this delivery is op accounting
+                        // only. Counted because "rare race" and "the cancel is
+                        // never issued" produce the same *outcomes* and differ
+                        // only in how much budget each probe burns — which is
+                        // exactly the shape of #130, where every probe idled
+                        // out its whole `timeout_ms` and every check still
+                        // reported the right verdict.
+                        checker.server.counters.increment("health_probe_deadline_raced");
+                    }
+                } else |err| {
+                    assert(err == error.Canceled);
+                    assert(probe.pending_verdict != .none);
+                }
+                probe.settle();
+            }
+
+            fn onProbeCancel(probe: *Probe) void {
+                const checker = probe.checker;
+                assert(probe.armed.cancel);
+                probe.armed.cancel = false;
+                if (checker.state == .stopping) {
+                    checker.continueStop();
+                    return;
+                }
+                assert(checker.state == .probing);
+                probe.settle();
+            }
+
+            /// End whichever leg is armed, by the only means each allows: a
+            /// dial takes the one legal cancel (§4), while a send or recv is
+            /// never canceled (§5) — shutting the socket down is what makes
+            /// it complete. Both are idempotent here, because a deadline and
+            /// a drain can each reach this for the same probe.
+            fn endArmedLeg(probe: *Probe) void {
+                // Only ever called with a leg outstanding: a deadline fires
+                // against the leg it was armed beside, and the drain ladder
+                // reaches here only under its own armed guard.
+                assert(probe.armed.connect or probe.armed.send or probe.armed.recv);
+                assert(probe.checker.state == .probing or probe.checker.state == .stopping);
+                if (probe.armed.connect and !probe.armed.cancel and !probe.canceled.connect) {
+                    probe.armCancelConnect();
+                    return;
+                }
+                if ((probe.armed.send or probe.armed.recv) and !probe.shutdown_done) {
+                    // A data leg exists only for an http probe, which is the
+                    // only kind that holds a socket to shut down.
+                    assert(probe.socket != null);
+                    probe.shutdown_done = true;
+                    probe.checker.server.io.shutdown(probe.socket.?, .both);
+                }
+            }
+
+            /// The probe's socket, once no op can reference it. Closing is
+            /// synchronous for the same reason `continueTeardown`'s is: by
+            /// here the armed set is empty, so nothing is left to deliver
+            /// against this fd (§5).
+            fn closeSocket(probe: *Probe) void {
+                assert(probe.checker.armedCount() == 0);
+                assert(probe.checker.state == .probing or probe.checker.state == .stopping);
+                if (probe.socket) |socket| {
+                    probe.checker.server.io.closeNow(socket);
+                    probe.socket = null;
+                }
+                probe.shutdown_done = false;
+            }
+
+            /// The delivery that empties this probe's armed set applies the
+            /// verdict and moves the sweep along — never earlier, so no
+            /// completion can land on a probe that already advanced (§5).
+            fn settle(probe: *Probe) void {
+                const checker = probe.checker;
+                assert(checker.state == .probing);
+                // A decided probe has no use for its budget. Cancelling here
+                // rather than at each verdict site is what makes every leg —
+                // dial, send, recv — advance the sweep the moment it knows,
+                // instead of idling until the deadline fires: an http probe
+                // that answered in a microsecond must not hold the prober
+                // for the whole `timeout_ms`.
+                if (probe.pending_verdict != .none and
+                    probe.armed.deadline and !probe.armed.cancel)
+                {
+                    probe.armCancelDeadline();
+                }
+                if (probe.armedCount() != 0) return;
+                assert(probe.pending_verdict != .none);
+                probe.closeSocket();
+                const verdict = probe.pending_verdict;
+                probe.pending_verdict = .none;
+                if (verdict == .pass) {
+                    checker.witnessPass(probe.target_cluster, probe.target_endpoint);
+                } else {
+                    checker.witnessFail(probe.target_cluster, probe.target_endpoint);
+                }
+                checker.dispatchNext();
+            }
+
+            fn armCancelDeadline(probe: *Probe) void {
+                assert(probe.armed.deadline);
+                assert(!probe.armed.cancel);
+                probe.armed.cancel = true;
+                probe.canceled.deadline = true;
+                probe.checker.server.io.timerCancel(
+                    &probe.op_deadline,
+                    &probe.op_cancel,
+                    Probe,
+                    probe,
+                    onProbeCancel,
+                );
+                assert(probe.checker.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            fn armCancelConnect(probe: *Probe) void {
+                assert(probe.armed.connect);
+                assert(!probe.armed.cancel);
+                probe.armed.cancel = true;
+                probe.canceled.connect = true;
+                probe.checker.server.io.connectCancel(
+                    &probe.op_connect,
+                    &probe.op_cancel,
+                    Probe,
+                    probe,
+                    onProbeCancel,
+                );
+                assert(probe.checker.armedCount() <= constants.health_probe_ops_max);
+            }
+
+            /// This probe's rung of the drain ladder: spend a cancel on the
+            /// next armed op that has not had one, and report whether the
+            /// checker must now wait for a delivery. An op whose cancel
+            /// already ran but whose own terminal delivery is still in
+            /// flight is waited on, never re-canceled.
+            fn continueStop(probe: *Probe) bool {
+                assert(probe.checker.state == .stopping);
+                if (probe.armed.cancel) return true;
+                if (probe.armed.deadline and !probe.canceled.deadline) {
+                    probe.armCancelDeadline();
+                    return true;
+                }
+                if (probe.armed.connect and !probe.canceled.connect) {
+                    probe.armCancelConnect();
+                    return true;
+                }
+                // A data leg takes no cancel op at all (§5): the shutdown
+                // makes it complete, and its delivery re-enters the ladder.
+                // It therefore reports no wait — the shutdown consumes no
+                // completion to wait on, so the checker's armed check is
+                // what decides whether anything is still outstanding. The
+                // guard lives inside `endArmedLeg`, which is idempotent, so
+                // this states only that a leg is what it is being called for.
+                if (probe.armed.send or probe.armed.recv) {
+                    probe.endArmedLeg();
+                }
+                return false;
+            }
         };
 
         pub fn init(
@@ -157,7 +675,6 @@ pub fn Checker(comptime IoType: type) type {
             assert(keys.count >= 1);
             assert(response_bytes >= constants.head_buffer_bytes_min);
             checker.server = server;
-            checker.response = try arena.alloc(u8, response_bytes);
             checker.healthy = try arena.alloc(bool, keys.count);
             checker.fail_streaks = try arena.alloc(u8, keys.count);
             checker.ok_streaks = try arena.alloc(u8, keys.count);
@@ -169,20 +686,12 @@ pub fn Checker(comptime IoType: type) type {
             checker.state = .off;
             checker.cursor_cluster = 0;
             checker.cursor_endpoint = 0;
-            checker.pending_verdict = .none;
-            checker.probe_socket = null;
-            checker.probe_shutdown = false;
-            checker.request_len = 0;
-            checker.request_sent = 0;
-            checker.response_len = 0;
-            checker.armed = .{};
-            checker.canceled = .{};
+            checker.armed_rest = false;
+            checker.armed_rest_cancel = false;
+            checker.canceled_rest = false;
             checker.op_rest = .{};
-            checker.op_connect = .{};
-            checker.op_send = .{};
-            checker.op_recv = .{};
-            checker.op_deadline = .{};
-            checker.op_cancel = .{};
+            checker.op_rest_cancel = .{};
+            try checker.probe.init(arena, checker, response_bytes);
             const clusters = server.config.clusters;
             assert(clusters.len >= 1);
             // Same pairing check the balancer makes: `keys` must describe
@@ -225,7 +734,7 @@ pub fn Checker(comptime IoType: type) type {
             assert(checker.armedCount() >= 1);
             assert(checker.checked_count >= 1);
             checker.state = .stopping;
-            checker.pending_verdict = .none;
+            checker.probe.pending_verdict = .none;
             checker.continueStop();
         }
 
@@ -238,7 +747,9 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         pub fn armedCount(checker: *const Self) u32 {
-            return @popCount(@as(u8, @bitCast(checker.armed)));
+            return @as(u32, @intFromBool(checker.armed_rest)) +
+                @as(u32, @intFromBool(checker.armed_rest_cancel)) +
+                checker.probe.armedCount();
         }
 
         fn startSweep(checker: *Self) void {
@@ -247,16 +758,24 @@ pub fn Checker(comptime IoType: type) type {
             checker.state = .probing;
             checker.cursor_cluster = 0;
             checker.cursor_endpoint = 0;
-            checker.probeNext();
+            checker.dispatchNext();
         }
 
-        /// Advance the cursor to the next checked endpoint and dial it,
-        /// or end the sweep and rest for the interval. Bounded: the walk
-        /// visits each cluster at most once past the cursor.
-        fn probeNext(checker: *Self) void {
+        /// Hand the next checked endpoint to the idle probe and dial it,
+        /// or — with the cursor exhausted — end the sweep and rest for
+        /// the interval. The cursor advances *before* the hand-off, so a
+        /// probe that reached its verdict without ever yielding to the
+        /// loop cannot be handed the endpoint it just answered for.
+        /// Bounded: the walk visits each cluster at most once past the
+        /// cursor.
+        fn dispatchNext(checker: *Self) void {
             assert(checker.state == .probing);
-            assert(checker.armedCount() == 0);
-            assert(checker.pending_verdict == .none);
+            assert(checker.probe.armedCount() == 0);
+            assert(checker.probe.pending_verdict == .none);
+            // Same disjointness `Probe.begin` states, at the other end of
+            // the hand-off: a sweep never dispatches beside a live rest
+            // timer.
+            assert(!checker.armed_rest and !checker.armed_rest_cancel);
             const clusters = checker.server.config.clusters;
             while (checker.cursor_cluster < clusters.len) {
                 const cluster = &clusters[checker.cursor_cluster];
@@ -265,7 +784,10 @@ pub fn Checker(comptime IoType: type) type {
                     checker.cursor_endpoint = 0;
                     continue;
                 }
-                checker.beginProbe(cluster);
+                const cluster_index = checker.cursor_cluster;
+                const endpoint_index = checker.cursor_endpoint;
+                checker.cursor_endpoint += 1;
+                checker.probe.begin(cluster, cluster_index, endpoint_index);
                 return;
             }
             checker.rest();
@@ -273,374 +795,12 @@ pub fn Checker(comptime IoType: type) type {
 
         /// The cluster's resolved check policy. Only a checked cluster is
         /// ever probed, so the option is settled by the walk in
-        /// `probeNext` before anything here reads it.
+        /// `dispatchNext` before anything here reads it.
         fn checkOf(checker: *const Self, cluster_index: u16) *const config_module.Config.Cluster.Check {
             assert(cluster_index < checker.server.config.clusters.len);
             const check = &checker.server.config.clusters[cluster_index].check;
             assert(check.* != null);
             return &check.*.?;
-        }
-
-        fn beginProbe(checker: *Self, cluster: *const config_module.Config.Cluster) void {
-            assert(checker.state == .probing);
-            assert(checker.armedCount() == 0);
-            assert(cluster.check != null);
-            assert(checker.cursor_endpoint < cluster.endpoints.len);
-            assert(checker.pending_verdict == .none);
-            const server = checker.server;
-            const check = &cluster.check.?;
-            server.counters.increment("health_probes_sent");
-            checker.canceled = .{};
-            // One budget covers the whole probe (§7) — the dial alone for
-            // a tcp check, dial + request + response for an http one —
-            // because what an operator cares about is how long an
-            // endpoint may take to prove itself, not which leg was slow.
-            checker.armed.deadline = true;
-            server.io.timerStart(
-                &checker.op_deadline,
-                @as(u64, check.timeout_ms) * std.time.ns_per_ms,
-                Self,
-                checker,
-                onProbeDeadline,
-            );
-            checker.armed.connect = true;
-            server.io.connect(
-                cluster.endpoints[checker.cursor_endpoint],
-                &checker.op_connect,
-                Self,
-                checker,
-                onProbeConnect,
-            );
-            assert(checker.armedCount() <= constants.health_probe_ops_max);
-        }
-
-        fn onProbeConnect(checker: *Self, result: Io.ConnectError!IoType.Socket) void {
-            assert(checker.armed.connect);
-            checker.armed.connect = false;
-            const http_check = checker.state == .probing and
-                checker.pending_verdict == .none and
-                checker.checkOf(checker.cursor_cluster).kind == .http;
-            if (result) |socket| {
-                if (http_check) {
-                    // The http probe's dial is the beginning of the
-                    // probe, not its verdict: the socket is stored and
-                    // carries the request and response legs.
-                    checker.probe_socket = socket;
-                    checker.beginRequest(socket);
-                    checker.settle();
-                    return;
-                }
-                // A tcp probe wanted the SYN/ACK, not a connection — and
-                // a socket that was never stored cannot leak (§9). The
-                // same holds for a dial that lands after its own verdict
-                // or into a drain: there is nothing left to send it.
-                checker.server.io.closeNow(socket);
-            } else |_| {}
-            if (checker.state == .stopping) {
-                checker.continueStop();
-                return;
-            }
-            assert(checker.state == .probing);
-            if (result) |_| {
-                // First outcome wins: a dial landing after its deadline
-                // already failed the probe keeps the fail — a late
-                // answer is no answer (§7).
-                if (checker.pending_verdict == .none) {
-                    checker.pending_verdict = .pass;
-                }
-            } else |err| switch (err) {
-                // The deadline fired first and canceled the dial; the
-                // fail verdict is already pending.
-                error.Canceled => assert(checker.pending_verdict == .fail),
-                else => {
-                    if (checker.pending_verdict == .none) {
-                        checker.pending_verdict = .fail;
-                    }
-                    // Typed refusals are the origin's verdict; only
-                    // kernel pressure on our side is witnessed (§8) —
-                    // the same split the data-path dial makes.
-                    checker.server.witnessKernelPressure(.connect, err);
-                },
-            }
-            checker.settle();
-        }
-
-        /// Render this probe's request and start writing it. The render
-        /// cannot fail: `health_check_request_bytes_max` is derived from
-        /// the path and Host bounds the loader already enforced (§5).
-        fn beginRequest(checker: *Self, socket: IoType.Socket) void {
-            assert(checker.state == .probing);
-            assert(!checker.armed.send);
-            assert(!checker.armed.recv);
-            const check = checker.checkOf(checker.cursor_cluster);
-            assert(check.kind == .http);
-            const http = check.http.?;
-            const cluster = &checker.server.config.clusters[checker.cursor_cluster];
-            const endpoint = cluster.endpoints[checker.cursor_endpoint];
-            // `Connection: close` because the probe never reuses this
-            // socket: it asks one question and hangs up, which also frees
-            // the origin from parking a connection nobody will return to.
-            const rendered = if (http.host) |host|
-                std.fmt.bufPrint(
-                    &checker.request,
-                    "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
-                    .{ http.path, host },
-                ) catch unreachable
-            else
-                std.fmt.bufPrint(
-                    &checker.request,
-                    "GET {s} HTTP/1.1\r\nHost: {f}\r\nConnection: close\r\n\r\n",
-                    .{ http.path, endpoint },
-                ) catch unreachable;
-            checker.request_len = @intCast(rendered.len);
-            checker.request_sent = 0;
-            checker.response_len = 0;
-            assert(checker.request_len >= 1);
-            checker.armSend(socket);
-        }
-
-        fn armSend(checker: *Self, socket: IoType.Socket) void {
-            assert(checker.state == .probing);
-            assert(!checker.armed.send);
-            assert(checker.request_sent < checker.request_len);
-            checker.armed.send = true;
-            checker.server.io.send(
-                socket,
-                checker.request[checker.request_sent..checker.request_len],
-                &checker.op_send,
-                Self,
-                checker,
-                onProbeSend,
-            );
-            assert(checker.armedCount() <= constants.health_probe_ops_max);
-        }
-
-        fn onProbeSend(checker: *Self, result: Io.SendError!u32) void {
-            assert(checker.armed.send);
-            checker.armed.send = false;
-            if (checker.state == .stopping) {
-                checker.continueStop();
-                return;
-            }
-            assert(checker.state == .probing);
-            const sent = result catch |err| {
-                // Never a cancel: data ops are ended by the shutdown in
-                // `endArmedLeg`, never by one (§4, §5). A Canceled here
-                // would mean some path reached for a cancel op that this
-                // design says does not exist for a data leg.
-                assert(err != error.Canceled);
-                // The origin hung up on the request, or the deadline shut
-                // this socket down. Either way the probe has its answer.
-                if (checker.pending_verdict == .none) {
-                    checker.pending_verdict = .fail;
-                    checker.server.witnessKernelPressure(.send, err);
-                }
-                checker.settle();
-                return;
-            };
-            checker.request_sent += sent;
-            assert(checker.request_sent <= checker.request_len);
-            // A verdict already reached (the deadline fired and shut this
-            // socket down) ends the probe here: arming another leg would
-            // only spend an op to be told what is already known.
-            if (checker.pending_verdict == .none) {
-                const socket = checker.probe_socket.?;
-                if (checker.request_sent < checker.request_len) {
-                    // A short write is ordinary (§6): resume where it left off.
-                    checker.armSend(socket);
-                } else {
-                    checker.armRecv(socket);
-                }
-            }
-            checker.settle();
-        }
-
-        fn armRecv(checker: *Self, socket: IoType.Socket) void {
-            assert(checker.state == .probing);
-            assert(!checker.armed.recv);
-            assert(checker.response_len < checker.response.len);
-            checker.armed.recv = true;
-            checker.server.io.recv(
-                socket,
-                checker.response[checker.response_len..],
-                &checker.op_recv,
-                Self,
-                checker,
-                onProbeRecv,
-            );
-            assert(checker.armedCount() <= constants.health_probe_ops_max);
-        }
-
-        fn onProbeRecv(checker: *Self, result: Io.RecvError!u32) void {
-            assert(checker.armed.recv);
-            checker.armed.recv = false;
-            if (checker.state == .stopping) {
-                checker.continueStop();
-                return;
-            }
-            assert(checker.state == .probing);
-            const received = result catch |err| {
-                assert(err != error.Canceled); // Same rule as the send leg.
-                // EOF or reset before a whole head arrived: an origin
-                // that hangs up mid-status has not answered the check.
-                if (checker.pending_verdict == .none) {
-                    checker.pending_verdict = .fail;
-                    checker.server.witnessKernelPressure(.recv, err);
-                }
-                checker.settle();
-                return;
-            };
-            checker.response_len += received;
-            assert(checker.response_len <= checker.response.len);
-            if (checker.pending_verdict == .none) {
-                checker.judgeResponse();
-            }
-            if (checker.pending_verdict == .none) {
-                // The head is still arriving. A full buffer with no head
-                // in it is the §7 oversize-head verdict, not a shortfall.
-                if (checker.response_len == checker.response.len) {
-                    checker.pending_verdict = .fail;
-                } else {
-                    checker.armRecv(checker.probe_socket.?);
-                }
-            }
-            checker.settle();
-        }
-
-        /// Judge what has arrived so far, leaving the verdict `.none`
-        /// while the head is merely incomplete. The head parser is the
-        /// data path's own (§7), so a probe accepts exactly the responses
-        /// this proxy would forward — and nothing it would reject.
-        fn judgeResponse(checker: *Self) void {
-            assert(checker.state == .probing);
-            assert(checker.pending_verdict == .none);
-            const expect_status = checker.checkOf(checker.cursor_cluster).http.?.expect_status;
-            var storage: parser.HeaderStorage = undefined;
-            const head = parser.parseResponseHead(
-                checker.response[0..checker.response_len],
-                false,
-                &storage,
-                .get,
-            ) catch |err| {
-                if (err == error.Incomplete) return;
-                checker.pending_verdict = .fail;
-                return;
-            };
-            checker.pending_verdict = if (head.status == expect_status) .pass else .fail;
-        }
-
-        fn onProbeDeadline(checker: *Self, result: Io.TimerError!void) void {
-            assert(checker.armed.deadline);
-            checker.armed.deadline = false;
-            if (checker.state == .stopping) {
-                result catch {};
-                checker.continueStop();
-                return;
-            }
-            assert(checker.state == .probing);
-            if (result) |_| {
-                if (checker.pending_verdict == .none) {
-                    // Fired first: the probe outlived its budget. It
-                    // fails, and whatever leg is armed is forced to a
-                    // terminal completion so even a black-holed endpoint
-                    // or a mute origin releases the prober (§5).
-                    checker.pending_verdict = .fail;
-                    checker.endArmedLeg();
-                } else {
-                    // The fire raced its own cancel (a legal §4 race): the
-                    // outcome is decided, this delivery is op accounting
-                    // only. Counted because "rare race" and "the cancel is
-                    // never issued" produce the same *outcomes* and differ
-                    // only in how much budget each probe burns — which is
-                    // exactly the shape of #130, where every probe idled
-                    // out its whole `timeout_ms` and every check still
-                    // reported the right verdict.
-                    checker.server.counters.increment("health_probe_deadline_raced");
-                }
-            } else |err| {
-                assert(err == error.Canceled);
-                assert(checker.pending_verdict != .none);
-            }
-            checker.settle();
-        }
-
-        fn onCancel(checker: *Self) void {
-            assert(checker.armed.cancel);
-            checker.armed.cancel = false;
-            if (checker.state == .stopping) {
-                checker.continueStop();
-                return;
-            }
-            assert(checker.state == .probing);
-            checker.settle();
-        }
-
-        /// End whichever leg is armed, by the only means each allows: a
-        /// dial takes the one legal cancel (§4), while a send or recv is
-        /// never canceled (§5) — shutting the socket down is what makes
-        /// it complete. Both are idempotent here, because a deadline and
-        /// a drain can each reach this for the same probe.
-        fn endArmedLeg(checker: *Self) void {
-            // Only ever called with a leg outstanding: a deadline fires
-            // against the leg it was armed beside, and the drain ladder
-            // reaches here only under its own armed guard.
-            assert(checker.armed.connect or checker.armed.send or checker.armed.recv);
-            assert(checker.state == .probing or checker.state == .stopping);
-            if (checker.armed.connect and !checker.armed.cancel and !checker.canceled.connect) {
-                checker.armCancelConnect();
-                return;
-            }
-            if ((checker.armed.send or checker.armed.recv) and !checker.probe_shutdown) {
-                // A data leg exists only for an http probe, which is the
-                // only kind that holds a socket to shut down.
-                assert(checker.probe_socket != null);
-                checker.probe_shutdown = true;
-                checker.server.io.shutdown(checker.probe_socket.?, .both);
-            }
-        }
-
-        /// The probe's socket, once no op can reference it. Closing is
-        /// synchronous for the same reason `continueTeardown`'s is: by
-        /// here the armed set is empty, so nothing is left to deliver
-        /// against this fd (§5).
-        fn closeProbeSocket(checker: *Self) void {
-            assert(checker.armedCount() == 0);
-            assert(checker.state == .probing or checker.state == .stopping);
-            if (checker.probe_socket) |socket| {
-                checker.server.io.closeNow(socket);
-                checker.probe_socket = null;
-            }
-            checker.probe_shutdown = false;
-        }
-
-        /// The delivery that empties the armed set applies the verdict
-        /// and moves the sweep along — never earlier, so no completion
-        /// can land on a probe that already advanced (§5).
-        fn settle(checker: *Self) void {
-            assert(checker.state == .probing);
-            // A decided probe has no use for its budget. Cancelling here
-            // rather than at each verdict site is what makes every leg —
-            // dial, send, recv — advance the sweep the moment it knows,
-            // instead of idling until the deadline fires: an http probe
-            // that answered in a microsecond must not hold the prober
-            // for the whole `timeout_ms`.
-            if (checker.pending_verdict != .none and
-                checker.armed.deadline and !checker.armed.cancel)
-            {
-                checker.armCancelDeadline();
-            }
-            if (checker.armedCount() != 0) return;
-            assert(checker.pending_verdict != .none);
-            checker.closeProbeSocket();
-            const verdict = checker.pending_verdict;
-            checker.pending_verdict = .none;
-            if (verdict == .pass) {
-                checker.witnessPass(checker.cursor_cluster, checker.cursor_endpoint);
-            } else {
-                checker.witnessFail(checker.cursor_cluster, checker.cursor_endpoint);
-            }
-            checker.cursor_endpoint += 1;
-            checker.probeNext();
         }
 
         fn witnessPass(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
@@ -711,7 +871,7 @@ pub fn Checker(comptime IoType: type) type {
             assert(checker.state == .probing);
             assert(checker.armedCount() == 0);
             checker.state = .resting;
-            checker.armed.rest = true;
+            checker.armed_rest = true;
             checker.server.io.timerStart(
                 &checker.op_rest,
                 @as(u64, checker.server.config.health_interval_ms) * std.time.ns_per_ms,
@@ -722,8 +882,8 @@ pub fn Checker(comptime IoType: type) type {
         }
 
         fn onRest(checker: *Self, result: Io.TimerError!void) void {
-            assert(checker.armed.rest);
-            checker.armed.rest = false;
+            assert(checker.armed_rest);
+            checker.armed_rest = false;
             if (checker.state == .stopping) {
                 result catch {};
                 checker.continueStop();
@@ -736,80 +896,40 @@ pub fn Checker(comptime IoType: type) type {
             checker.startSweep();
         }
 
-        fn armCancelDeadline(checker: *Self) void {
-            assert(checker.armed.deadline);
-            assert(!checker.armed.cancel);
-            checker.armed.cancel = true;
-            checker.canceled.deadline = true;
-            checker.server.io.timerCancel(
-                &checker.op_deadline,
-                &checker.op_cancel,
-                Self,
-                checker,
-                onCancel,
-            );
-            assert(checker.armedCount() <= constants.health_probe_ops_max);
+        fn onRestCancel(checker: *Self) void {
+            assert(checker.armed_rest_cancel);
+            checker.armed_rest_cancel = false;
+            // Nothing but the drain ever cancels the rest timer, and the
+            // drain flips `.stopping` before it does.
+            assert(checker.state == .stopping);
+            checker.continueStop();
         }
 
-        fn armCancelConnect(checker: *Self) void {
-            assert(checker.armed.connect);
-            assert(!checker.armed.cancel);
-            checker.armed.cancel = true;
-            checker.canceled.connect = true;
-            checker.server.io.connectCancel(
-                &checker.op_connect,
-                &checker.op_cancel,
-                Self,
-                checker,
-                onCancel,
-            );
-            assert(checker.armedCount() <= constants.health_probe_ops_max);
-        }
-
-        /// One cancel at a time toward quiescence: cancel the next armed
-        /// op that has not had a cancel spent on it yet, or — once every
-        /// delivery has drained — stop. An op whose cancel already ran
-        /// but whose own terminal delivery is still in flight is waited
-        /// on, never re-canceled.
+        /// One cancel at a time toward quiescence: the rest timer first,
+        /// then the probe's own ladder, then — once every delivery has
+        /// drained — stop.
         fn continueStop(checker: *Self) void {
             assert(checker.state == .stopping);
-            if (checker.armed.cancel) return;
-            if (checker.armed.rest and !checker.canceled.rest) {
-                checker.armed.cancel = true;
-                checker.canceled.rest = true;
+            if (checker.armed_rest_cancel) return;
+            if (checker.armed_rest and !checker.canceled_rest) {
+                checker.armed_rest_cancel = true;
+                checker.canceled_rest = true;
                 checker.server.io.timerCancel(
                     &checker.op_rest,
-                    &checker.op_cancel,
+                    &checker.op_rest_cancel,
                     Self,
                     checker,
-                    onCancel,
+                    onRestCancel,
                 );
                 assert(checker.armedCount() <= constants.health_probe_ops_max);
                 return;
             }
-            if (checker.armed.deadline and !checker.canceled.deadline) {
-                checker.armCancelDeadline();
-                return;
-            }
-            if (checker.armed.connect and !checker.canceled.connect) {
-                checker.armCancelConnect();
-                return;
-            }
-            // A data leg takes no cancel op at all (§5): the shutdown
-            // makes it complete, and its delivery re-enters here. It
-            // therefore does not `return` — the shutdown consumes no
-            // completion to wait on, so the armed check below is what
-            // decides whether anything is still outstanding. The guard
-            // lives inside `endArmedLeg`, which is idempotent, so this
-            // states only that a leg is what it is being called for.
-            if (checker.armed.send or checker.armed.recv) {
-                checker.endArmedLeg();
-            }
+            if (checker.probe.continueStop()) return;
             if (checker.armedCount() != 0) return;
             assert(checker.isQuiescent());
             // Nothing can reference the probe's fd once every op has
             // drained, which is what makes closing it here safe (§5).
-            checker.closeProbeSocket();
+            checker.probe.closeSocket();
             checker.state = .stopped;
             checker.server.maybeStopAfterDrain();
         }
