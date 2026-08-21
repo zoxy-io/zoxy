@@ -1395,6 +1395,18 @@ pub fn Proxy(comptime IoType: type) type {
                 // Same split as the L4 dial: the origin's verdict arrives
                 // typed, our own resource exhaustion does not (§8).
                 server.witnessKernelPressure(.connect, err);
+                // #230's first signal, and it rides that same split: a
+                // refusal or an unreachable host is the endpoint's own
+                // verdict, where `error.Unexpected` is this process
+                // running out of something. Ejecting a backend because
+                // *we* hit ENOBUFS would turn our exhaustion into their
+                // outage.
+                if (err != error.Unexpected) {
+                    server.health.witnessPassiveFailure(
+                        conn.upstream.?.cluster_index,
+                        conn.upstream.?.endpoint_index,
+                    );
+                }
                 if (retryEligible(server, conn, err)) {
                     beginRetry(server, conn);
                     return;
@@ -3269,6 +3281,14 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.upstream.?.cluster_index,
                 conn.upstream.?.endpoint_index,
             ));
+            // #230: a served response ends whatever passive streak was
+            // building. Any response — the status is deliberately not
+            // read, because an origin answering 500 is a software bug
+            // and this counts endpoints, not deployments.
+            server.health.witnessPassiveSuccess(
+                conn.upstream.?.cluster_index,
+                conn.upstream.?.endpoint_index,
+            );
             // The whole response reached the client: the line goes out
             // now, before the turnaround below clears what it reports.
             // This is also the only place `ok` is earned — nothing between
@@ -3440,6 +3460,14 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.upstream.?.cluster_index,
                 conn.upstream.?.endpoint_index,
             ));
+            // #230's second signal. This is the wedged-application case a
+            // `tcp` probe is blind to — the kernel completed a handshake
+            // the application never got to — so it is the one passive
+            // ejection exists for more than any other.
+            server.health.witnessPassiveFailure(
+                conn.upstream.?.cluster_index,
+                conn.upstream.?.endpoint_index,
+            );
         }
 
         /// Begin the §8 request-deadline verdict. Ops are never canceled
@@ -3643,6 +3671,19 @@ pub fn Proxy(comptime IoType: type) type {
                 server.beginTeardown(conn);
                 return;
             }
+            // #230, the third and last shape of "this endpoint said
+            // nothing": the exchange leg failed outright — an RST on the
+            // head send, a hangup mid-request — with no response byte and
+            // no replay left to spend. The two 504 sites reach the same
+            // conclusion by deadline where this one reaches it by
+            // transport error, and an endpoint is no healthier for
+            // failing fast.
+            assert(!conn.l7.response_started);
+            assert(conn.upstream != null);
+            server.health.witnessPassiveFailure(
+                conn.upstream.?.cluster_index,
+                conn.upstream.?.endpoint_index,
+            );
             respond(server, conn, 502, "l7_bad_gateway");
         }
 

@@ -295,12 +295,32 @@ pub const Counters = struct {
     /// case also lands in `kernel_pressure_connect`, same as a data-path
     /// dial.
     health_probes_failed: Value = Value.init(0),
-    /// Endpoints ejected from balancing after `health_probe_fall`
-    /// consecutive failed probes (§7). Their parked connections are
-    /// closed at the transition (§5, `health_parked_closed`).
+    /// Endpoints ejected from balancing (§7), whatever decided it. Their
+    /// parked connections are closed at the transition (§5,
+    /// `health_parked_closed`).
+    ///
+    /// The **total**; the two `_probe`/`_passive` counters below
+    /// partition it by cause, the same shape `kernel_pressure_errors`
+    /// takes. One event with two causes rather than two events, because
+    /// the mask is one bit and the balancer reads one thing: an endpoint
+    /// is out or it is not, and how it got there is a question about the
+    /// verdict, not about the state.
     health_endpoint_down: Value = Value.init(0),
-    /// Ejected endpoints restored to balancing after `health_probe_rise`
-    /// consecutive successful probes (§7).
+    /// Ejections a probe decided, after `check.fall` consecutive failed
+    /// probes (§7). This is the claim `reconcile` used to make of
+    /// `health_endpoint_down` itself, before passive ejection gave the
+    /// mask a second writer (#230).
+    health_endpoint_down_probe: Value = Value.init(0),
+    /// Ejections real traffic decided, after `passive_ejection.fall`
+    /// consecutive failed requests (#230). The signals are a dial that
+    /// failed for the endpoint's own reasons and an exchange that
+    /// produced no response byte — never an origin `5xx`, which is a
+    /// software bug rather than an unhealthy endpoint.
+    health_endpoint_down_passive: Value = Value.init(0),
+    /// Ejected endpoints restored to balancing (§7): after `check.rise`
+    /// consecutive successful probes, or — for a passively ejected one —
+    /// when its `recovery_ms` cooldown expires and traffic is let back to
+    /// judge it again.
     health_endpoint_up: Value = Value.init(0),
     /// Parked upstream connections closed because their endpoint was
     /// ejected (§5): a parked socket to a dead origin is a stale replay
@@ -561,12 +581,21 @@ pub const Counters = struct {
         /// `other_cause` diagnosable instead of merely counted.
         kernel_pressure_last_errno: u32,
         /// Endpoints under §7 active checks — static per config (the
-        /// sum of `endpoints` over every `check` cluster). The capacity
-        /// the unhealthy level below is read against.
+        /// sum of `endpoints` over every `check` cluster).
         health_endpoints_checked: u32,
-        /// Checked endpoints currently ejected from balancing (§7). A
-        /// level, not a counter: `health_endpoint_down`/`_up` carry the
-        /// history; a scrape wants how many are out *now*.
+        /// Endpoints any failure detection may remove — the sum of
+        /// `endpoints` over every cluster with `check`, `passive_ejection`
+        /// or both (#230). The capacity the unhealthy level is read
+        /// against, and no longer the same number as `checked`: passive
+        /// ejection can remove an endpoint no probe ever dialled.
+        ///
+        /// Kept beside `checked` rather than replacing it, so a dashboard
+        /// that has always read "how many are probed" keeps reading
+        /// exactly that.
+        health_endpoints_ejectable: u32,
+        /// Endpoints currently ejected from balancing (§7). A level, not
+        /// a counter: `health_endpoint_down`/`_up` carry the history; a
+        /// scrape wants how many are out *now*.
         health_endpoints_unhealthy: u32,
 
         /// The invariant every producer owes: a level never exceeds its
@@ -576,7 +605,11 @@ pub const Counters = struct {
             if (gauges.relay_buffers_in_use > gauges.relay_buffers_capacity) return false;
             if (gauges.head_buffers_in_use > gauges.head_buffers_capacity) return false;
             if (gauges.upstream_head_buffers_in_use > gauges.upstream_head_buffers_capacity) return false;
-            if (gauges.health_endpoints_unhealthy > gauges.health_endpoints_checked) return false;
+            // Against `ejectable`, not `checked`: a passively ejected
+            // endpoint need never have been probed (#230). `checked` is
+            // still a subset of it, which is its own claim worth holding.
+            if (gauges.health_endpoints_checked > gauges.health_endpoints_ejectable) return false;
+            if (gauges.health_endpoints_unhealthy > gauges.health_endpoints_ejectable) return false;
             const upstream_in_use = @as(u64, gauges.upstream_slots_leased) +
                 gauges.upstream_slots_parked;
             return upstream_in_use <= gauges.upstream_slots_capacity;
@@ -790,7 +823,18 @@ pub const Counters = struct {
         // one failed probe; a restore needs a prior ejection (endpoints
         // start healthy, §7).
         assert(counters.get("health_probes_failed") <= counters.get("health_probes_sent"));
-        assert(counters.get("health_endpoint_down") <= counters.get("health_probes_failed"));
+        // The cause split partitions the ejection total exactly (#230),
+        // the same identity the kernel-pressure split carries. This is
+        // what replaced `health_endpoint_down <= health_probes_failed`:
+        // that assert *was* the claim "ejections come only from probes",
+        // and passive ejection is precisely the thing that makes it
+        // false. Narrowed to the cause it was always about, it still
+        // holds — and now says something the total no longer can.
+        assert(counters.get("health_endpoint_down_probe") +
+            counters.get("health_endpoint_down_passive") ==
+            counters.get("health_endpoint_down"));
+        assert(counters.get("health_endpoint_down_probe") <=
+            counters.get("health_probes_failed"));
         assert(counters.get("health_endpoint_up") <= counters.get("health_endpoint_down"));
         // The op split partitions the total exactly: a witness that
         // incremented one without the other would make the split lie about
@@ -1368,6 +1412,7 @@ const test_gauges: Counters.Gauges = .{
     .upstream_head_buffers_capacity = 6,
     .kernel_pressure_last_errno = 105, // ENOBUFS on Linux
     .health_endpoints_checked = 4,
+    .health_endpoints_ejectable = 6,
     .health_endpoints_unhealthy = 1,
 };
 

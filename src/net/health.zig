@@ -74,11 +74,28 @@ pub fn Checker(comptime IoType: type) type {
         /// Consecutive passed probes toward `health_probe_rise`; tracked
         /// only while the endpoint is ejected, reset by any fail.
         ok_streaks: []u8,
+        /// Consecutive failed *requests* toward `passive_ejection.fall`
+        /// (#230), tracked only while the endpoint is healthy and reset
+        /// by any success — the passive twin of `fail_streaks`, kept
+        /// apart because the two are denominated in different thresholds
+        /// and a cluster may configure either without the other.
+        passive_streaks: []u8,
+        /// When a passively ejected endpoint may be let back, on the §4
+        /// coarse clock; zero for an endpoint that is not passively
+        /// ejected. Recorded at the ejection and consumed by the
+        /// re-admission sweep — recovery cannot itself be passive,
+        /// because an ejected endpoint receives no traffic to learn from.
+        eject_deadline_ns: []u64,
         /// Endpoints under checks — static after `init` (the sum of
         /// `endpoints.len` over every `check` cluster); zero leaves the
         /// prober `.off` forever.
         checked_count: u32,
-        /// Checked endpoints currently ejected; the gauge level (§8).
+        /// Endpoints any failure detection may remove — `check`,
+        /// `passive_ejection`, or both (#230). The bound `unhealthy_count`
+        /// is held against, and no longer `checked_count`: passive
+        /// ejection can remove an endpoint no probe ever dialled.
+        ejectable_count: u32,
+        /// Endpoints currently ejected; the gauge level (§8).
         unhealthy_count: u32,
         state: State,
         /// The sweep cursor: the *next* endpoint to hand out, not the one
@@ -706,10 +723,15 @@ pub fn Checker(comptime IoType: type) type {
             checker.healthy = try arena.alloc(bool, keys.count);
             checker.fail_streaks = try arena.alloc(u8, keys.count);
             checker.ok_streaks = try arena.alloc(u8, keys.count);
+            checker.passive_streaks = try arena.alloc(u8, keys.count);
+            checker.eject_deadline_ns = try arena.alloc(u64, keys.count);
             @memset(checker.healthy, true);
             @memset(checker.fail_streaks, 0);
             @memset(checker.ok_streaks, 0);
+            @memset(checker.passive_streaks, 0);
+            @memset(checker.eject_deadline_ns, 0);
             checker.checked_count = 0;
+            checker.ejectable_count = 0;
             checker.unhealthy_count = 0;
             checker.state = .off;
             checker.cursor_cluster = 0;
@@ -739,6 +761,11 @@ pub fn Checker(comptime IoType: type) type {
             // only closed while there is exactly one reading of it.
             checker.checked_count = server.config.checkedEndpoints();
             assert(checker.checked_count <= checker.healthy.len);
+            checker.ejectable_count = ejectableEndpoints(clusters);
+            // Every checked endpoint is ejectable; the reverse does not
+            // hold, and that gap is exactly what #230 adds.
+            assert(checker.checked_count <= checker.ejectable_count);
+            assert(checker.ejectable_count <= checker.healthy.len);
             // What `Server.initHeadBuffers` priced the prober's scratch
             // at, checked where the probes are actually allocated.
             assert(probe_count == constants.healthProbeConcurrency(checker.checked_count));
@@ -748,6 +775,19 @@ pub fn Checker(comptime IoType: type) type {
             // is checked at all — the prober stays `.off` then.
             assert(checker.probes.len <= @max(1, checker.checked_count));
             assert(checker.armedCount() == 0);
+        }
+
+        /// Endpoints any failure detection may remove: `check`,
+        /// `passive_ejection`, or both (#230). The union rather than
+        /// either count, because one mask serves both verdicts and it is
+        /// the mask's capacity `unhealthy_count` is bounded by.
+        fn ejectableEndpoints(clusters: []const config_module.Config.Cluster) u32 {
+            var total: u32 = 0;
+            for (clusters) |cluster| {
+                if (cluster.check == null and cluster.passive_ejection == null) continue;
+                total += @intCast(cluster.endpoints.len);
+            }
+            return total;
         }
 
         /// Begin probing, or stay `.off` when no cluster opted in. The
@@ -927,7 +967,22 @@ pub fn Checker(comptime IoType: type) type {
             assert(checker.ok_streaks[key] <= rise);
             if (checker.ok_streaks[key] < rise) return;
             checker.ok_streaks[key] = 0;
+            checker.restore(key);
+        }
+
+        /// Return an endpoint to balancing (§7). The one writer of the
+        /// mask's rising edge, for the same reason `eject` is of the
+        /// falling one — and the reason it takes no cause: a restore is
+        /// a restore, and the passive residue must be cleared whichever
+        /// verdict lifted it. A probe's `rise` can lift an endpoint that
+        /// real traffic ejected, and leaving its cooldown behind would
+        /// let the re-admission sweep "restore" an endpoint that is
+        /// already in rotation.
+        fn restore(checker: *Self, key: u32) void {
+            assert(!checker.healthy[key]);
             checker.healthy[key] = true;
+            checker.passive_streaks[key] = 0;
+            checker.eject_deadline_ns[key] = 0;
             assert(checker.unhealthy_count >= 1);
             checker.unhealthy_count -= 1;
             checker.server.counters.increment("health_endpoint_up");
@@ -949,19 +1004,127 @@ pub fn Checker(comptime IoType: type) type {
             checker.fail_streaks[key] += 1;
             if (checker.fail_streaks[key] < fall) return;
             checker.fail_streaks[key] = 0;
+            checker.eject(cluster_index, endpoint_index, .probe);
+        }
+
+        /// What decided an ejection. One event, two causes (#230): the
+        /// mask is a single bit and the balancer reads a single thing, so
+        /// *how* an endpoint left the rotation is a fact about the
+        /// verdict rather than about the state.
+        pub const Cause = enum(u8) { probe, passive };
+
+        /// Remove an endpoint from balancing (§7). The one writer of the
+        /// mask's falling edge, whichever verdict reached it, which is
+        /// what keeps the §5 obligation below from being forgotten on a
+        /// path that grew later: a parked socket to a dead origin is a
+        /// stale replay waiting to be spent.
+        fn eject(
+            checker: *Self,
+            cluster_index: u16,
+            endpoint_index: u16,
+            cause: Cause,
+        ) void {
+            const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
+            assert(checker.healthy[key]);
             checker.healthy[key] = false;
             checker.unhealthy_count += 1;
-            assert(checker.unhealthy_count <= checker.checked_count);
+            assert(checker.unhealthy_count <= checker.ejectable_count);
             checker.server.counters.increment("health_endpoint_down");
+            switch (cause) {
+                // A partial passive streak is deliberately left where it
+                // is: it is inert while the endpoint is out (every
+                // passive witness returns early on an unhealthy key), and
+                // `restore` clears it on the way back in. Clearing here
+                // as well would be two owners for one reset.
+                .probe => checker.server.counters.increment("health_endpoint_down_probe"),
+                .passive => {
+                    checker.server.counters.increment("health_endpoint_down_passive");
+                    // The cooldown starts here, not at the first failure:
+                    // what it bounds is how long the endpoint stays out,
+                    // and a streak that took a minute to build should not
+                    // shorten that.
+                    const passive = checker.passiveOf(cluster_index).?;
+                    checker.eject_deadline_ns[key] = checker.server.io.nowNs() +
+                        @as(u64, passive.recovery_ms) * std.time.ns_per_ms;
+                    assert(checker.eject_deadline_ns[key] > 0);
+                },
+            }
             // The labeled twin (#179), same key the mask just flipped.
+            // Unlabelled by cause: a dashboard asking "which backend is
+            // out" is asking about the endpoint, not about who said so.
             checker.server.labeled.incrementEndpoint(.health_down, key);
             checker.closeParked(cluster_index, endpoint_index);
+        }
+
+        /// The cluster's passive-ejection policy, or null where the
+        /// operator did not opt in — which is the common case, and the
+        /// reason every passive witness below starts by asking.
+        fn passiveOf(
+            checker: *const Self,
+            cluster_index: u16,
+        ) ?*const config_module.Config.Cluster.PassiveEjection {
+            assert(cluster_index < checker.server.config.clusters.len);
+            const passive = &checker.server.config.clusters[cluster_index].passive_ejection;
+            return if (passive.* == null) null else &passive.*.?;
+        }
+
+        /// Real traffic reported this endpoint dead (#230): a dial that
+        /// failed for the endpoint's own reasons, or an exchange that
+        /// produced no response byte before its deadline.
+        ///
+        /// Silently ignored for a cluster that did not opt in, rather
+        /// than asserted against: the call sites are on the data path and
+        /// know nothing about which clusters configured what, and making
+        /// them ask first would put this policy in two places.
+        pub fn witnessPassiveFailure(
+            checker: *Self,
+            cluster_index: u16,
+            endpoint_index: u16,
+        ) void {
+            const passive = checker.passiveOf(cluster_index) orelse return;
+            assert(passive.fall >= 1);
+            const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
+            // Already out: a request in flight when the ejection landed
+            // can still fail afterwards, and counting it would deepen a
+            // streak that no longer means anything.
+            if (!checker.healthy[key]) return;
+            assert(checker.passive_streaks[key] < passive.fall);
+            checker.passive_streaks[key] += 1;
+            if (checker.passive_streaks[key] < passive.fall) return;
+            checker.passive_streaks[key] = 0;
+            checker.eject(cluster_index, endpoint_index, .passive);
+        }
+
+        /// This endpoint served a response (#230), so whatever streak was
+        /// building against it is not a pattern. Consecutive means
+        /// consecutive: one success is the whole reset.
+        pub fn witnessPassiveSuccess(
+            checker: *Self,
+            cluster_index: u16,
+            endpoint_index: u16,
+        ) void {
+            const passive = checker.passiveOf(cluster_index) orelse return;
+            const key = checker.server.upstreams.keys.key(cluster_index, endpoint_index);
+            // A streak that had reached the threshold would already have
+            // ejected and reset, so anything a success lands on is
+            // sub-threshold by construction.
+            assert(checker.passive_streaks[key] < passive.fall);
+            checker.passive_streaks[key] = 0;
         }
 
         /// The §5 obligation: ejection closes the endpoint's parked
         /// pooled connections. Synchronous closes — a parked slot holds
         /// no armed op (§5), so checkout + close + release is one step,
         /// the reap discipline `Server.reapParked` set.
+        ///
+        /// Private, with exactly one caller — `eject` — and that is the
+        /// invariant the obligation's coverage rests on rather than a
+        /// tidiness preference. No directed test proves the *passive*
+        /// verdict discharges it (the signal needs traffic, and that
+        /// traffic leases the very connection that would otherwise be
+        /// parked), so what makes it true for both causes is that there
+        /// is one ejection path and the probe test already walks it.
+        /// A second call site would quietly end that argument.
         fn closeParked(checker: *Self, cluster_index: u16, endpoint_index: u16) void {
             // Only an ejection reaches here: the endpoint was just marked
             // unhealthy by the caller.
