@@ -51,7 +51,12 @@ pub fn main() void {
     var checksum: u64 = 0;
     var index: u64 = 0;
     while (index < iterations) : (index += 1) {
-        const request = parser.parseRequestHead(request_head, false, &request_storage) catch unreachable;
+        const request = parser.parseRequestHead(
+            request_head,
+            false,
+            &request_storage,
+            null,
+        ) catch unreachable;
         const target = parser.canonicalTarget(request.target, &path_scratch) catch unreachable;
         // Both `null`s are the shape to hold steady here: §7 client
         // address forwarding is opt-in per listener and a hop budget is

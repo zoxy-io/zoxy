@@ -4,7 +4,8 @@
 //! L4 path — L7 lives here, never inlined into the L4 relay.
 //!
 //! Lifecycle: `l7_reading_head` accumulates the request head and
-//! re-parses from byte 0 on each recv (§7 detect-and-retry); verdicts
+//! retries the parse on each recv, resuming the terminator search where
+//! the last one stopped (§7 detect-and-retry, via `HeadCursor`); verdicts
 //! answer comptime static responses (§8) with a lingering close (§7). A
 //! valid request acquires its relay buffer and upstream slot (both §8
 //! rungs, 503), dials (`l7_dialing`), then `l7_exchanging` runs two
@@ -291,17 +292,16 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.tls != null);
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
-            if (parser.parseRequestHead(
-                headBytes(server, conn)[0..conn.head_len],
-                true,
-                storage,
-            )) |_| {
+            if (parser.parseRequestHead(headBytes(server, conn)[0..conn.head_len], true, storage, null)) |_| {
                 // The head completed inside the buffer, so what overran it
                 // was payload.
                 respond(server, conn, 413, "l7_body_too_large");
             } else |err| switch (err) {
                 // The same three verdicts `parseAndDispatch` gives, and
-                // for the same reasons: a head that overran is still a
+                // for the same reasons — reached one-shot here, with no
+                // cursor, because this asks a question about the bytes as
+                // they stand rather than continuing a read sequence: a
+                // head that overran is still a
                 // head, and answering 431 for a malformed one or an
                 // oversize request line sends the client after the wrong
                 // thing. `Incomplete` is unreachable — the parser converts
@@ -578,8 +578,9 @@ pub fn Proxy(comptime IoType: type) type {
             parseAndDispatch(server, conn);
         }
 
-        /// Re-parse the accumulated head from byte 0 (§7). Incomplete and
-        /// room left → read more; oversize or malformed → the matching
+        /// Parse the accumulated head (§7), resuming the terminator search
+        /// where the last read left off via `conn.head_cursor`. Incomplete
+        /// and room left → read more; oversize or malformed → the matching
         /// static reject; a valid head → routing.
         fn parseAndDispatch(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
@@ -589,7 +590,14 @@ pub fn Proxy(comptime IoType: type) type {
 
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
-            const request = parser.parseRequestHead(head, head_is_full, storage) catch |err| switch (err) {
+            // The cursor is what keeps a head that arrives in pieces from
+            // being re-parsed from byte 0 on every arrival (§7).
+            const request = parser.parseRequestHead(
+                head,
+                head_is_full,
+                storage,
+                &conn.head_cursor,
+            ) catch |err| switch (err) {
                 error.Incomplete => {
                     // A full buffer never yields Incomplete — the parser
                     // converts it to the oversize verdicts below — so here
@@ -1515,6 +1523,7 @@ pub fn Proxy(comptime IoType: type) type {
                 headBytes(server, conn)[0..conn.head_len],
                 false,
                 storage,
+                null,
             ) catch unreachable;
             // Re-derived rather than remembered, like the replay's
             // framing: same bytes, same key. A cookie cluster's #178
@@ -1544,6 +1553,7 @@ pub fn Proxy(comptime IoType: type) type {
                 headBytes(server, conn)[0..conn.head_len],
                 false,
                 storage,
+                null,
             ) catch unreachable;
             assert(request.head_len == conn.l7.request_head_len);
             // Only this path pays for canonicalization twice, and it has
@@ -2590,6 +2600,7 @@ pub fn Proxy(comptime IoType: type) type {
             server.releaseRelayBuffer(conn.relay_buffer.?);
             server.returnHeadBuffer(conn);
             conn.head_len = 0;
+            conn.head_cursor.reset();
             conn.relay_buffer = buffer;
             conn.directions = .{ .{}, .{} };
             // Charged while this is still an exchange, so the charge and
@@ -3430,6 +3441,7 @@ pub fn Proxy(comptime IoType: type) type {
                 server.returnHeadBuffer(conn);
             }
             conn.head_len = 0;
+            conn.head_cursor.reset();
             conn.l7 = .{};
             conn.log.reset();
             // The #140 captures live in the server's side table, not on
@@ -3679,6 +3691,7 @@ pub fn Proxy(comptime IoType: type) type {
                 headBytes(server, conn)[0..conn.head_len],
                 false,
                 storage,
+                null,
             ) catch unreachable;
             assert(request.head_len == conn.l7.request_head_len);
             conn.l7 = .{

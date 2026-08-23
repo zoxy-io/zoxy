@@ -351,6 +351,7 @@ const HttpOrigin = struct {
                     oconn.request_buffer[oconn.request_offset..oconn.request_len],
                     false,
                     &storage,
+                    null,
                 ) catch |err| {
                     if (err == error.Incomplete) {
                         oconn.armRecv();
@@ -1001,6 +1002,7 @@ fn forwardedRequest(bed: *const Http1Bed, storage: *parser.HeaderStorage) !parse
         bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len],
         false,
         storage,
+        null,
     );
 }
 

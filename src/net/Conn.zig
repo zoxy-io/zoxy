@@ -322,7 +322,8 @@ pub fn Conn(comptime IoType: type) type {
         /// connection never binds one. The bytes live in the ring's slab
         /// (`bufferGroupSlice`); everything the old inline array promised
         /// still holds of them: request/response head accumulates across
-        /// recv retries, parsing is detect-and-retry from byte 0 (§7), the
+        /// recv retries, parsing is detect-and-retry — carried forward by
+        /// `head_cursor` rather than restarted at byte 0 (§7) — the
         /// buffer's content stays the single source of truth while held,
         /// and nothing zeroes it — bytes past `head_len` are never read.
         head_buffer_id: u16,
@@ -336,6 +337,13 @@ pub fn Conn(comptime IoType: type) type {
         /// half — and zeroes it at hand-over, so the relay starts clean
         /// and the L7 meaning is never mixed with the L4 one.
         head_len: u32,
+        /// Carries a partial head parse across recv retries, so a head that
+        /// arrives in pieces is parsed once rather than re-parsed from byte 0
+        /// on every arrival (§7). Zeroed wherever `head_len` is, because the
+        /// two describe the same head; see `http.parser.HeadCursor` for why
+        /// the quadratic version was a denial of service and not merely
+        /// wasteful.
+        head_cursor: parser.HeadCursor = .{},
         /// This connection's TLS session (§4), or null on a plaintext
         /// listener — which is every connection on a deployment without a
         /// `tls` block, and what makes the whole feature cost nothing
@@ -474,8 +482,9 @@ pub fn Conn(comptime IoType: type) type {
             tls_handshaking,
             connecting,
             relaying,
-            // L7 states (§7): `l7_reading_head` accumulates and re-parses
-            // the request head (detect-and-retry); `l7_dialing` awaits the
+            // L7 states (§7): `l7_reading_head` accumulates the request
+            // head and retries the parse, resuming the search where the
+            // last read left off; `l7_dialing` awaits the
             // upstream connect; `l7_exchanging` runs the two legs (request
             // out, response back — each with its own sub-state in `l7`);
             // `l7_responding` writes a static error response (§8); and
@@ -767,6 +776,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.directions = .{ .{}, .{} };
             conn.head_buffer_id = head_buffer_none;
             conn.head_len = 0;
+            conn.head_cursor.reset();
             // A parameter, not a field the caller installs afterwards: a
             // slot is recycled across listeners, so a caller that acquired
             // an engine and then let this reset it would leak one per

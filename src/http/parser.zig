@@ -6,10 +6,16 @@
 //! import to this file.
 //!
 //! Nothing here allocates or copies payload bytes: heads parse zero-copy
-//! into caller-owned storage over the linear head buffer, and "streaming"
-//! is detect-and-retry — a partial head returns `error.Incomplete` and the
-//! caller re-parses from byte 0 once more bytes arrive, bounded by
-//! `limits.head_buffer_bytes`.
+//! into caller-owned storage over the linear head buffer. A partial head
+//! returns `error.Incomplete`; the caller reads more and comes back,
+//! bounded by `limits.head_buffer_bytes`.
+//!
+//! That retry used to re-parse from byte 0, which made head parsing
+//! quadratic in the number of segments a head arrives in — segmentation the
+//! CLIENT chooses. A `HeadCursor` now carries the partial parse forward, so
+//! the total work is linear in the head. The first attempt still uses the
+//! one-shot parser, because a head that arrives whole is cheaper that way;
+//! see `HeadCursor` for the measurements.
 //!
 //! The §7 fork hardening gate is fully cleared at the current pin: the
 //! fork rejects bare-LF line terminators itself (CRLF only) and parses
@@ -330,6 +336,61 @@ const RawRequest = struct {
     header_count: usize = 0,
 };
 
+/// Carries a partial head parse from one read to the next, so a head that
+/// arrives in pieces is not re-parsed from byte 0 every time (§7).
+///
+/// Without it, head parsing is O(N^2) in the number of segments the head
+/// arrives in — and the client picks the segmentation. Measured through
+/// `parseRequestHead` on a 7.6 KiB head, one byte at a time: 5.85 ms of CPU
+/// for a single head, against 18 us with the cursor. On a loop thread that is
+/// also serving other connections, that is CPU burn no shed rung catches — the
+/// shape of #222, not of a resource the ladder can refuse.
+///
+/// A head that arrives whole is unaffected: 1659 ns without, 1568 ns with.
+///
+/// What it does NOT do is carry a partial hparse parse forward, though hparse
+/// now offers one. That API needs the caller's header array to survive between
+/// calls, and `header_scratch` is one server-wide buffer lent per dispatch —
+/// another connection's dispatch overwrites it before this one reads again.
+/// Making it per-connection would cost `headers_max` * 32 bytes on every slot
+/// (§5 prices memory closed-form; that is not a rounding error). So the cursor
+/// carries an OFFSET instead, and the parse still happens exactly once:
+///
+///   * first attempt — straight to the one-shot parser. A head that arrives
+///     whole is the overwhelming majority and pays nothing for any of this.
+///   * once a head has proven partial — resume the search for the terminating
+///     CRLFCRLF from where the last search stopped, and only parse when it is
+///     found. The search is linear across the whole head, and hparse then runs
+///     once over a head already known to be complete.
+///
+/// The wasted work per connection is therefore one scan, not one parse per
+/// arriving segment.
+/// What ends a head, and what the cursor searches for.
+const terminator = "\r\n\r\n";
+
+pub const HeadCursor = struct {
+    /// How far the terminator search has already LOOKED — only a scan may
+    /// advance it. Resumed `terminator.len - 1` bytes back so one split
+    /// across two reads is still found.
+    scanned: u32 = 0,
+    /// The buffer this offset describes. The head is a ring-group slice on the
+    /// plain path and the engine's plaintext on the TLS one; rather than
+    /// assume either is stable across reads, a different base throws the
+    /// offset away instead of trusting it.
+    base: ?[*]const u8 = null,
+    /// A previous attempt returned Incomplete, so scanning first is now
+    /// cheaper than parsing a head that is probably still incomplete.
+    partial: bool = false,
+
+    /// Back to "nothing seen yet". Called when a head completes, when a
+    /// connection is reused, and whenever the buffer moves underneath.
+    pub fn reset(cursor: *HeadCursor) void {
+        cursor.* = .{};
+        assert(cursor.scanned == 0);
+        assert(!cursor.partial);
+    }
+};
+
 /// Runs hparse over the request line and headers, mapping its verdicts
 /// to head errors (§7): a head that cannot complete inside a full buffer
 /// is oversize, not partial (request line still open → 414, else 431);
@@ -339,16 +400,9 @@ fn parseRequestRaw(
     head_is_full: bool,
     raw: *RawRequest,
     raw_headers: *[constants.headers_max]hparse.Header,
+    cursor: ?*HeadCursor,
 ) HeadError!u32 {
-    const head_len = hparse.parseRequest(
-        head,
-        &raw.method,
-        &raw.method_token,
-        &raw.target,
-        &raw.version,
-        raw_headers,
-        &raw.header_count,
-    ) catch |err| switch (err) {
+    const head_len = parseRequestBytes(head, raw, raw_headers, cursor) catch |err| switch (err) {
         error.Incomplete => {
             if (head_is_full) {
                 return oversizeRequestError(head);
@@ -364,6 +418,78 @@ fn parseRequestRaw(
     return @intCast(head_len);
 }
 
+/// One hparse call, through whichever entry point is cheaper right now.
+///
+/// `cursor` null means the caller has no continuity to offer (tests, the
+/// renderer's re-parse), so the one-shot parser is the only sensible choice.
+fn parseRequestBytes(
+    head: []const u8,
+    raw: *RawRequest,
+    raw_headers: *[constants.headers_max]hparse.Header,
+    cursor: ?*HeadCursor,
+) hparse.ParseRequestError!usize {
+    const tracked = cursor orelse return hparse.parseRequest(
+        head,
+        &raw.method,
+        &raw.method_token,
+        &raw.target,
+        &raw.version,
+        raw_headers,
+        &raw.header_count,
+    );
+
+    assert(head.len <= constants.head_buffer_bytes_max);
+    if (tracked.partial) assert(tracked.base != null);
+
+    // A head that moved is a head this cursor knows nothing about. Only the
+    // ADDRESS is compared, so the standing assumption is that a given base
+    // always holds the same bytes at `[0..scanned)` — true because nothing
+    // shifts head content in place; the relay buffer's compaction is a
+    // different buffer.
+    if (tracked.base) |base| {
+        if (base != head.ptr) tracked.reset();
+    }
+    tracked.base = head.ptr;
+    assert(tracked.scanned <= head.len);
+
+    if (tracked.partial) {
+        assert(tracked.scanned <= head.len);
+        // Resume the search rather than re-parsing, rewinding by one less
+        // than the terminator so one split across two reads is still found.
+        const from = tracked.scanned -| (terminator.len - 1);
+        if (std.mem.indexOfPos(u8, head, from, terminator) == null) {
+            // Only a scan may advance `scanned`; see below.
+            tracked.scanned = @intCast(head.len);
+            return error.Incomplete;
+        }
+        // Found — the head is complete, so the parse below runs once.
+    }
+
+    return hparse.parseRequest(
+        head,
+        &raw.method,
+        &raw.method_token,
+        &raw.target,
+        &raw.version,
+        raw_headers,
+        &raw.header_count,
+    ) catch |err| {
+        if (err == error.Incomplete) {
+            tracked.partial = true;
+            // `scanned` means "searched for a terminator up to here", and the
+            // parser is not a search: hparse answers Incomplete from LENGTH
+            // checks that never examine a byte — `slice.len < 16`, and
+            // parseVersion's 9-byte check. Inheriting `head.len` from one of
+            // those marks bytes as searched that nothing looked at, and the
+            // rewind above then steps past the only CRLFCRLF in the head. So
+            // the first real scan starts from zero and costs one pass over a
+            // prefix that has already arrived, once per connection.
+            tracked.scanned = 0;
+        }
+        return err;
+    };
+}
+
 /// Parses and validates one request head from `head`. `head_is_full` says
 /// the head buffer has no room left, turning a partial parse into the 414
 /// vs 431 oversize verdict instead of `error.Incomplete` (§7, §8).
@@ -371,6 +497,9 @@ pub fn parseRequestHead(
     head: []const u8,
     head_is_full: bool,
     headers_storage: *HeaderStorage,
+    /// Carries a partial parse between reads; `null` when the caller has no
+    /// continuity to offer, which is the one-shot behaviour.
+    cursor: ?*HeadCursor,
 ) HeadError!RequestHead {
     assert(head.len <= constants.head_buffer_bytes_max);
     if (head_is_full) {
@@ -378,7 +507,7 @@ pub fn parseRequestHead(
     }
 
     var raw: RawRequest = .{};
-    const head_len = try parseRequestRaw(head, head_is_full, &raw, &headers_storage.raw);
+    const head_len = try parseRequestRaw(head, head_is_full, &raw, &headers_storage.raw, cursor);
 
     const target = raw.target.?; // A successful parse always sets the target.
     const method_token = raw.method_token.?; // Same contract as the target.
@@ -1609,7 +1738,7 @@ const testing = std.testing;
 
 fn expectRequestError(expected: HeadError, head: []const u8, head_is_full: bool) !void {
     var storage: HeaderStorage = undefined;
-    try testing.expectError(expected, parseRequestHead(head, head_is_full, &storage));
+    try testing.expectError(expected, parseRequestHead(head, head_is_full, &storage, null));
 }
 
 fn expectResponseError(expected: HeadError, head: []const u8, request_method: Method) !void {
@@ -1623,7 +1752,7 @@ fn expectResponseError(expected: HeadError, head: []const u8, request_method: Me
 test "http parser: plain GET parses with keep-alive and no body" {
     const head = "GET /path?q=1 HTTP/1.1\r\nHost: origin.example\r\nAccept: */*\r\n\r\n";
     var storage: HeaderStorage = undefined;
-    const request = try parseRequestHead(head, false, &storage);
+    const request = try parseRequestHead(head, false, &storage, null);
     try testing.expectEqual(Method.get, request.method);
     try testing.expectEqualStrings("GET", request.method_token);
     try testing.expectEqualStrings("/path?q=1", request.target);
@@ -1640,7 +1769,7 @@ test "http parser: POST with Content-Length frames the body and marks its start"
     const head = "POST /submit HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n";
     const message = head ++ "hello";
     var storage: HeaderStorage = undefined;
-    const request = try parseRequestHead(message, false, &storage);
+    const request = try parseRequestHead(message, false, &storage, null);
     try testing.expectEqual(BodyFraming{ .content_length = 5 }, request.framing);
     try testing.expectEqual(@as(u32, head.len), request.head_len);
     try testing.expectEqualStrings("hello", message[request.head_len..]);
@@ -1649,7 +1778,7 @@ test "http parser: POST with Content-Length frames the body and marks its start"
 test "http parser: chunked Transfer-Encoding frames the request body" {
     const head = "POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
     var storage: HeaderStorage = undefined;
-    const request = try parseRequestHead(head, false, &storage);
+    const request = try parseRequestHead(head, false, &storage, null);
     try testing.expectEqual(BodyFraming.chunked, request.framing);
 }
 
@@ -1713,6 +1842,7 @@ test "http parser: Content-Length accepts leading zeros and the u64 maximum digi
         "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0123\r\n\r\n",
         false,
         &storage,
+        null,
     );
     try testing.expectEqual(BodyFraming{ .content_length = 123 }, zeros.framing);
     // 20 digits can overflow u64; the parser caps at 19 outright.
@@ -1733,7 +1863,7 @@ test "http parser: Host is mandatory and unique on HTTP/1.1" {
     try expectRequestError(error.Malformed, "GET / HTTP/1.1\r\nHost:\r\n\r\n", false);
     // HTTP/1.0 may omit Host.
     var storage: HeaderStorage = undefined;
-    const request = try parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage);
+    const request = try parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage, null);
     try testing.expectEqual(@as(?[]const u8, null), request.host);
 }
 
@@ -1753,7 +1883,7 @@ test "http parser: keep-alive follows version defaults and Connection tokens" {
     };
     for (cases) |case| {
         var storage: HeaderStorage = undefined;
-        const request = try parseRequestHead(case.head, false, &storage);
+        const request = try parseRequestHead(case.head, false, &storage, null);
         try testing.expectEqual(case.keep_alive, request.keep_alive);
     }
 }
@@ -1773,6 +1903,7 @@ test "http parser: extension methods parse with their raw token" {
         "PROPFIND /dav HTTP/1.1\r\nHost: a\r\nDepth: 1\r\n\r\n",
         false,
         &storage,
+        null,
     );
     try testing.expectEqual(Method.extension, request.method);
     try testing.expectEqualStrings("PROPFIND", request.method_token);
@@ -1789,7 +1920,12 @@ test "http parser: extension methods parse with their raw token" {
 test "http parser: request targets are origin-form, OPTIONS *, or absolute-form" {
     try expectRequestError(error.Malformed, "GET * HTTP/1.1\r\nHost: a\r\n\r\n", false);
     var storage: HeaderStorage = undefined;
-    const options = try parseRequestHead("OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n", false, &storage);
+    const options = try parseRequestHead(
+        "OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n",
+        false,
+        &storage,
+        null,
+    );
     try testing.expectEqualStrings("*", options.target);
     try testing.expectEqual(@as(?[]const u8, null), options.authority);
     // CONNECT's authority-form parses so the proxy can answer 501 itself,
@@ -1799,6 +1935,7 @@ test "http parser: request targets are origin-form, OPTIONS *, or absolute-form"
         "CONNECT origin:443 HTTP/1.1\r\nHost: origin\r\n\r\n",
         false,
         &storage,
+        null,
     );
     try testing.expectEqual(Method.connect, connect.method);
     try testing.expectEqual(@as(?[]const u8, null), connect.authority);
@@ -1853,7 +1990,7 @@ test "http parser: absolute-form splits into authority and origin-form" {
             "{s} HTTP/1.1\r\nHost: sent-by-the-client\r\n\r\n",
             .{case.line},
         );
-        const parsed = parseRequestHead(head, false, &storage) catch |err| {
+        const parsed = parseRequestHead(head, false, &storage, null) catch |err| {
             try testing.expectEqual(@as(?[]const u8, null), case.authority);
             try testing.expectEqual(HeadError.Malformed, err);
             continue;
@@ -1878,7 +2015,12 @@ test "http parser: an absolute-form request still needs its Host on HTTP/1.1" {
     try expectRequestError(error.Malformed, "GET http://api.example/x HTTP/1.1\r\n\r\n", false);
     var storage: HeaderStorage = undefined;
     // HTTP/1.0 may omit it, and then the authority is the only name given.
-    const parsed = try parseRequestHead("GET http://api.example/x HTTP/1.0\r\n\r\n", false, &storage);
+    const parsed = try parseRequestHead(
+        "GET http://api.example/x HTTP/1.0\r\n\r\n",
+        false,
+        &storage,
+        null,
+    );
     try testing.expectEqual(@as(?[]const u8, null), parsed.host);
     try testing.expectEqualStrings("api.example", parsed.routingAuthority().?);
 }
@@ -2204,9 +2346,66 @@ fn sliceWithin(outer: []const u8, inner: []const u8) bool {
         inner_start + inner.len <= outer_start + outer.len;
 }
 
+/// The cursor must not change what a head MEANS, only what it costs.
+///
+/// Fed the same bytes in pieces, `parseRequestHead` has to reach the verdict
+/// it reaches when handed them whole — including which error. This is the gate
+/// the terminator-skip bug slipped past: it was found by review, not here,
+/// because nothing drove the cursor with fuzzer-chosen bytes and splits.
+fn checkCursorAgreesWithOneShot(input: []const u8, step: usize) void {
+    assert(step >= 1);
+
+    var whole_storage: HeaderStorage = undefined;
+    const whole = parseRequestHead(input, false, &whole_storage, null);
+
+    var storage: HeaderStorage = undefined;
+    var cursor: HeadCursor = .{};
+    var have: usize = 0;
+    // Bounded by the input: `have` grows by at least one every pass and the
+    // body returns on the pass that reaches the end. Written as a bounded
+    // loop rather than a marked `while (true)` because the bound is real.
+    while (have < input.len) {
+        have = @min(have + step, input.len);
+        const pieced = parseRequestHead(input[0..have], false, &storage, &cursor);
+        if (have == input.len) {
+            // Same verdict, error or not. Only the head length is compared on
+            // success: the slices point into `input` either way, and the
+            // whole-head parse already proved them well-formed above.
+            if (whole) |expected| {
+                const got = pieced catch unreachable;
+                assert(got.head_len == expected.head_len);
+            } else |expected| {
+                if (pieced) |_| unreachable else |got| assert(got == expected);
+            }
+            return;
+        }
+        // Before the last byte, the only honest answers are "not yet" or the
+        // same rejection the whole head earns.
+        _ = pieced catch |err| {
+            if (err != error.Incomplete) {
+                if (whole) |_| unreachable else |expected| assert(err == expected);
+                return;
+            }
+            continue;
+        };
+        // A complete parse before the last byte means `input` holds a head
+        // plus trailing bytes, which is a legitimate outcome.
+        return;
+    }
+}
+
 fn checkRequestParse(input: []const u8, head_is_full: bool) void {
     var storage: HeaderStorage = undefined;
-    const request = parseRequestHead(input, head_is_full, &storage) catch return;
+
+    // Drive the cursor over the same bytes at several split sizes, including
+    // one byte at a time. Cheap: these inputs are bounded by the head buffer.
+    if (!head_is_full and input.len >= 2) {
+        checkCursorAgreesWithOneShot(input, 1);
+        checkCursorAgreesWithOneShot(input, 7);
+        checkCursorAgreesWithOneShot(input, input.len - 1);
+    }
+
+    const request = parseRequestHead(input, head_is_full, &storage, null) catch return;
     assert(request.head_len >= 1);
     assert(request.head_len <= input.len);
     assert(sliceWithin(input, request.target));
@@ -2267,6 +2466,38 @@ test "fuzz: heads and chunked framing — parse or reject, no third outcome" {
             fuzz_corpus_chunked_trailer,
         },
     });
+}
+
+// The cursor oracle, driven deterministically.
+//
+// `std.testing.fuzz` hands corpus entries to `Smith`, which reads structure
+// out of them, so a seed never reaches the parser as the bytes it was written
+// as — and coverage-guided mode cannot run on Zig 0.16.0. Neither path
+// exercises these shapes, so they are run directly.
+//
+// Every entry is a head whose terminator sits below the point hparse can say
+// anything about it: it answers Incomplete from LENGTH checks that examine no
+// bytes, which is where a cursor can be fooled into thinking it has already
+// searched them.
+test "fuzz oracle: the cursor agrees with one-shot on heads it cannot yet judge" {
+    const shapes = [_][]const u8{
+        // Terminator at 3..6, refused by hparse's 16-byte fast path.
+        "GET\r\n\r\nAAAAAAAAAAAA",
+        // Terminator at 16..19, refused inside `parseVersion`'s 9-byte check.
+        "GET /aaaaaaaaaa \r\n\r\nAAAAAAAAAAAA",
+        // Well-formed, for the same treatment.
+        "GET /p HTTP/1.1\r\nHost: h\r\n\r\n",
+        "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\nbody",
+        // Malformed past the threshold.
+        "GET /p HTTP/9.9\r\nHost: h\r\n\r\n",
+        "\r\n\r\nGET /p HTTP/1.1\r\n\r\n",
+    };
+    for (shapes) |shape| {
+        var step: usize = 1;
+        while (step <= shape.len) : (step += 1) {
+            checkCursorAgreesWithOneShot(shape, step);
+        }
+    }
 }
 
 fn fuzzParserInputs(context: void, smith: *std.testing.Smith) !void {
@@ -2477,4 +2708,141 @@ fn fuzzCanonicalHost(context: void, smith: *std.testing.Smith) !void {
     var out_again: [constants.host_bytes_max]u8 = undefined;
     const again = canonicalHost(canonical, &out_again).?;
     assert(std.mem.eql(u8, again, canonical));
+}
+
+test "head cursor: a head arriving in pieces parses like one that arrives whole" {
+    // The property the cursor exists for. Feeding the same bytes a chunk at a
+    // time must reach the same verdict as handing them over at once — and it
+    // must do so without re-reading the head, which is what made the old
+    // detect-and-retry quadratic in the number of segments the CLIENT chose.
+    const head =
+        "GET /a/b?c=d HTTP/1.1\r\n" ++
+        "Host: origin.example\r\n" ++
+        "User-Agent: probe/1.0\r\n" ++
+        "X-Spaced:  \tvalue with spaces \t\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n";
+
+    var whole_storage: HeaderStorage = undefined;
+    const whole = try parseRequestHead(head, false, &whole_storage, null);
+
+    // Every chunk size, including one byte at a time and sizes that land
+    // inside a header name, inside a value, and between a CR and its LF.
+    for (1..head.len) |step| {
+        var storage: HeaderStorage = undefined;
+        var cursor: HeadCursor = .{};
+        var have: usize = 0;
+        var pieced: ?RequestHead = null;
+
+        while (have < head.len) {
+            have = @min(have + step, head.len);
+            if (parseRequestHead(head[0..have], false, &storage, &cursor)) |request| {
+                pieced = request;
+                break;
+            } else |err| switch (err) {
+                error.Incomplete => continue,
+                else => return err,
+            }
+        }
+
+        const got = pieced orelse return error.NeverCompleted;
+        try testing.expectEqual(whole.method, got.method);
+        try testing.expectEqual(whole.version, got.version);
+        try testing.expectEqual(whole.framing, got.framing);
+        try testing.expectEqual(whole.keep_alive, got.keep_alive);
+        try testing.expectEqualStrings(whole.target, got.target);
+        try testing.expectEqualStrings(whole.host.?, got.host.?);
+        try testing.expectEqual(whole.headers.len, got.headers.len);
+        for (whole.headers, got.headers) |a, b| {
+            try testing.expectEqualStrings(a.name, b.name);
+            try testing.expectEqualStrings(a.value, b.value);
+        }
+    }
+}
+
+test "head cursor: a head buffer that moves is not parsed against stale state" {
+    // hparse's resume contract is that consumed bytes never move. The head
+    // buffer is a ring-group slice on the plain path and the engine's
+    // plaintext on the TLS one, so rather than assume it is stable the cursor
+    // notices a different base and starts over. Same bytes, different address.
+    const head = "GET /x HTTP/1.1\r\nHost: h\r\n\r\n";
+    var first: [64]u8 = undefined;
+    var second: [64]u8 = undefined;
+    @memcpy(first[0..head.len], head);
+    @memcpy(second[0..head.len], head);
+
+    var cursor: HeadCursor = .{};
+    var storage: HeaderStorage = undefined;
+
+    // A partial parse against the first buffer leaves state behind.
+    try testing.expectError(error.Incomplete, parseRequestHead(
+        first[0 .. head.len - 4],
+        false,
+        &storage,
+        &cursor,
+    ));
+    try testing.expect(cursor.base != null);
+
+    // The same request, at a different address, still parses correctly.
+    const moved = try parseRequestHead(second[0..head.len], false, &storage, &cursor);
+    try testing.expectEqualStrings("/x", moved.target);
+    try testing.expectEqual(@as(?[*]const u8, second[0..].ptr), cursor.base);
+}
+
+test "head cursor: a terminator seen before the parser could look is not skipped" {
+    // hparse answers `Incomplete` from LENGTH checks that never examine a
+    // byte: `slice.len < min_request_len` (16), and `parseVersion`'s 9-byte
+    // check. Treating those bytes as "already searched for a terminator" let
+    // the cursor step past the only CRLFCRLF in the head. The head then never
+    // re-entered the parser, so a malformed request stopped being rejected on
+    // the read that carried the bad byte and instead held a conn slot until
+    // the buffer filled — a 400 turning into a 414/431.
+    const cases = [_]struct { first: usize, wire: []const u8 }{
+        // Terminator at 3..6, refused by the fast path having read nothing.
+        .{ .first = 7, .wire = "GET\r\n\r\nAAAAAAAAAAAA" },
+        // Terminator at 16..19, refused inside parseVersion.
+        .{ .first = 20, .wire = "GET /aaaaaaaaaa \r\n\r\nAAAAAAAAAAAA" },
+    };
+
+    for (cases) |case| {
+        var whole_storage: HeaderStorage = undefined;
+        const whole = parseRequestHead(case.wire, false, &whole_storage, null);
+        try testing.expectError(error.Malformed, whole);
+
+        var storage: HeaderStorage = undefined;
+        var cursor: HeadCursor = .{};
+
+        // The read that ends exactly on the terminator, before the parser has
+        // enough bytes to say anything about it.
+        try testing.expectError(error.Incomplete, parseRequestHead(
+            case.wire[0..case.first],
+            false,
+            &storage,
+            &cursor,
+        ));
+
+        // The next read must reach the same verdict the one-shot parser gives
+        // for these bytes, not sit waiting for a terminator it stepped over.
+        try testing.expectError(error.Malformed, parseRequestHead(
+            case.wire,
+            false,
+            &storage,
+            &cursor,
+        ));
+    }
+}
+
+test "witness: an empty request-target is refused" {
+    // §7 keeps fork behaviours witnessed through this wrapper rather than
+    // trusted at the dependency. The pinned hparse now refuses an empty
+    // request-target itself; `validateTarget` refused it before and still
+    // does, so the verdict is 400 from either layer — this pins that it stays
+    // 400 whichever layer answers.
+    var storage: HeaderStorage = undefined;
+    try testing.expectError(error.Malformed, parseRequestHead(
+        "GET  HTTP/1.1\r\nHost: a\r\n\r\n",
+        false,
+        &storage,
+        null,
+    ));
 }
