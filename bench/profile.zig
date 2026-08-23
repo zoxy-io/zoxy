@@ -22,7 +22,7 @@ const affinity = @import("affinity.zig");
 const zrk = @import("zrk");
 const zio = @import("zio");
 const spawn_path = @import("spawn_path.zig");
-const constants = @import("zoxy").constants;
+const constants = @import("zoxy_constants");
 
 const assert = std.debug.assert;
 
