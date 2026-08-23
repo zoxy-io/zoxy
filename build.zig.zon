@@ -123,6 +123,33 @@
             .url = "git+https://github.com/zoxy-io/hparse#65521edfc09f19c5574a3360e2ce236c6dbc3be3",
             .hash = "hparse-0.2.0-IukW0rSOAQAmTPCaHzBakxuRRv6dfMds5OGdGU8nxlXw",
         },
+        // libcrypto, built by Zig rather than found on the system.
+        //
+        // This is what buys back cross-compilation. `linkSystemLibrary("crypto")`
+        // resolved libcrypto out of the *host's* nix store, so every target but
+        // the host's own failed to link — the reason release.yml builds natively
+        // on one runner per target, and the reason x86_64-macos has been absent
+        // since 0.2.0 for want of an Intel runner.
+        //
+        // OpenSSL, not BoringSSL: the BoringSSL family has no
+        // `CRYPTO_set_mem_functions`, so `tls/libcrypto_heap.zig`'s `install`
+        // would return false and `main.zig` would refuse to start (§5's
+        // zero-allocation budget cannot be kept without it). That rules out the
+        // package zrk was using and made this fork the shared answer.
+        //
+        // The fork carries allyourcodebase/openssl#5 — pre-generated perlasm for
+        // aarch64, which upstream has only for x86_64 — on top of a bump from
+        // 3.3.2 to 3.5.7. 3.5 is the LTS line, supported to April 2030. 3.6.3
+        // was measured and rejected: it restructured the provider tree, leaving
+        // 62 sources and 2 templates without a home against 3 for 3.5.7.
+        //
+        // Versus what this build linked before: nixpkgs supplies 3.6.3, so the
+        // libcrypto version steps back one minor release onto a supported LTS
+        // branch, and forward two years from the package's own 3.3.2.
+        .openssl = .{
+            .url = "git+https://github.com/zoxy-io/openssl?ref=openssl-3.5.7#546ec9845fa43013021609a8590e03678cc0fb20",
+            .hash = "openssl-3.5.7-TC9C3eDHfwHNGqKQk63LrMZg6g-YSvctDN8wNP1uktMX",
+        },
         // Audited fork: zoxy-io/ztls branch zoxy-tls = upstream
         // mattrobenolt/ztls 7c5049ec (the audited snapshot) plus four
         // commits of ours:
@@ -214,9 +241,20 @@
         // tests that pinned the old mapping moved with it; zero is the
         // "draw again" case they describe. Still open upstream, so this
         // rides the fork like the other four.
+        // Re-audit for 03c2464, the one commit new since the pin above:
+        // build plumbing only. `git diff 634567a..03c2464` touches build.zig,
+        // build.zig.zon and integrations/ztls-std/src/root.zig and nothing
+        // else — `src/` is byte-identical, so the audited crypto surface is
+        // unchanged and the four commits below still describe it exactly.
+        //
+        // It adds `-Dcrypto-pkg-config`, which is why the pin moves at all.
+        // Default true, i.e. the behaviour this build had before; zoxy now
+        // passes false because it supplies libcrypto itself (see build.zig).
+        // The other two changes — exposing `ztls_std` as a module and shipping
+        // its source — are for zoxy-io/zrk and inert here.
         .ztls = .{
-            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#634567aedb66ed7c8abcd0d6b2e4fefdba6b6cb5",
-            .hash = "ztls-0.0.0-SHHDXm2kFQB_YpgKnzsrxFllS1bq1WTSN-HTr8fAdAYr",
+            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#03c246477370d83bfc38d5168250e10fb235f358",
+            .hash = "ztls-0.0.0-SHHDXrvzFgAxDlPTWEEam3B2YclV_S0hHpOrD3qGFnEp",
         },
     },
     .paths = .{
