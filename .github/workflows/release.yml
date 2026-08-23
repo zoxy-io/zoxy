@@ -91,12 +91,21 @@ jobs:
             static: false
     runs-on: ${{ matrix.os }}
     steps:
-      # A dispatch defaults to the branch it was launched from, which would
-      # build one commit and then label it — and smoke-test it — as another's
-      # version. Build the tag that is being released.
+      # A real release builds the tag. A dispatch would otherwise default to
+      # the branch it was launched from, building one commit and then labelling
+      # it — and smoke-testing it — as another's version.
+      #
+      # A dry run is the exception, and deliberately so: it exists to rehearse
+      # *this file*, so it has to build the branch the change lives on. Pairing
+      # a new workflow with an old tag's source tests a combination that will
+      # never be released, and fails in ways that say nothing about either.
+      # That is not hypothetical — removing the pkg-config machinery here broke
+      # every leg of a dry run against v0.5.1, whose build.zig still wanted it.
+      # The tag still supplies the version, so the artifacts are named and
+      # smoke-tested exactly as a release would name them.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.dry_run == 'true' && github.ref || (github.event.inputs.tag || github.ref) }}
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
@@ -198,12 +207,21 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      # A dispatch defaults to the branch it was launched from, which would
-      # build one commit and then label it — and smoke-test it — as another's
-      # version. Build the tag that is being released.
+      # A real release builds the tag. A dispatch would otherwise default to
+      # the branch it was launched from, building one commit and then labelling
+      # it — and smoke-testing it — as another's version.
+      #
+      # A dry run is the exception, and deliberately so: it exists to rehearse
+      # *this file*, so it has to build the branch the change lives on. Pairing
+      # a new workflow with an old tag's source tests a combination that will
+      # never be released, and fails in ways that say nothing about either.
+      # That is not hypothetical — removing the pkg-config machinery here broke
+      # every leg of a dry run against v0.5.1, whose build.zig still wanted it.
+      # The tag still supplies the version, so the artifacts are named and
+      # smoke-tested exactly as a release would name them.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.dry_run == 'true' && github.ref || (github.event.inputs.tag || github.ref) }}
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
