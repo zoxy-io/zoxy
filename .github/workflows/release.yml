@@ -289,13 +289,36 @@ jobs:
           ( cd dist && sha256sum * > SHA256SUMS.txt )
           ls -la dist
 
+      # Curated notes when `docs/releases/<tag>.md` exists, generated otherwise.
+      #
+      # Generated notes are a commit list. That is the right answer for a patch
+      # release and the wrong one for a release that changes something a reader
+      # would want told: "build: link a Zig-built libcrypto instead of the
+      # host's" says what happened but not that the TLS underneath them is now
+      # a different OpenSSL.
+      - name: Select release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          path="docs/releases/${{ steps.ver.outputs.tag }}.md"
+          if [ -f "$path" ]; then
+            echo "path=$path" >> "$GITHUB_OUTPUT"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+            echo "using curated notes from $path"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+            echo "no $path; generating notes from commits"
+          fi
+
       - name: Publish GitHub Release
         if: steps.ver.outputs.dry == 'false'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: dist/*
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
 
       # A guard that fails closed can fail *silently*: if `dry` were ever
       # anything but the 'false' those two steps test for, a real release would
