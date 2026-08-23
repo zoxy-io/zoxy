@@ -11,6 +11,10 @@ on:
       tag:
         description: 'Release tag (e.g. v0.1.0)'
         required: true
+      dry_run:
+        description: 'Build and package only — publish nothing, touch no tap'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -75,7 +79,12 @@ jobs:
             static: false
     runs-on: ${{ matrix.os }}
     steps:
+      # A dispatch defaults to the branch it was launched from, which would
+      # build one commit and then label it — and smoke-test it — as another's
+      # version. Build the tag that is being released.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
@@ -193,7 +202,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # A dispatch defaults to the branch it was launched from, which would
+      # build one commit and then label it — and smoke-test it — as another's
+      # version. Build the tag that is being released.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
@@ -216,6 +230,19 @@ jobs:
           ref="${{ github.event.inputs.tag || github.ref_name }}"
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
           echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          # On `push` there are no inputs at all, so this is empty and the
+          # release is real. Only an explicit dispatch can ask for a rehearsal.
+          #
+          # The steps below gate on `dry == 'false'` rather than `!= 'true'`,
+          # so this going missing blocks a release instead of publishing one
+          # that was asked to be a rehearsal: a release that did not happen is
+          # a re-run away, one that did cannot be unpublished.
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "dry=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::dry run — building $ref, publishing nothing"
+          else
+            echo "dry=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/download-artifact@v4
         with:
@@ -249,13 +276,41 @@ jobs:
           ls -la dist
 
       - name: Publish GitHub Release
+        if: steps.ver.outputs.dry == 'false'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: dist/*
           generate_release_notes: true
 
+      # A guard that fails closed can fail *silently*: if `dry` were ever
+      # anything but the 'false' those two steps test for, a real release would
+      # skip both and still report success — a green run that shipped nothing.
+      # So check the outcome rather than trusting the condition.
+      #
+      # Deliberately `!= 'true'`: erring towards running a check is the safe
+      # direction, the opposite of erring towards publishing.
+      - name: Verify the release was published
+        if: steps.ver.outputs.dry != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          version="${{ steps.ver.outputs.version }}"
+          gh release view "$tag" --json assets --jq '.assets[].name' | tee assets.txt
+          for label in x86_64-linux aarch64-linux aarch64-macos; do
+            grep -qx "zoxy-$version-$label.tar.gz" assets.txt \
+              || { echo "::error::$tag is missing the $label archive"; exit 1; }
+          done
+          grep -qx 'SHA256SUMS.txt' assets.txt \
+            || { echo "::error::$tag has no SHA256SUMS.txt"; exit 1; }
+          grep -qx "zoxy-$version-config.schema.json" assets.txt \
+            || { echo "::error::$tag has no config schema"; exit 1; }
+          echo "$tag published complete"
+
       - name: Update Homebrew formula
+        if: steps.ver.outputs.dry == 'false'
         env:
           HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
@@ -339,6 +394,7 @@ jobs:
       # reason — a red step is how an expired token gets noticed, and the site's
       # weekly refresh catches the page up in the meantime.
       - name: Notify zoxy-io/site
+        if: steps.ver.outputs.dry == 'false'
         env:
           GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
           TAG: ${{ steps.ver.outputs.tag }}
@@ -350,3 +406,18 @@ jobs:
           jq -n --arg tag "$TAG" \
             '{event_type: "zoxy-release", client_payload: {tag: $tag}}' |
             gh api repos/zoxy-io/site/dispatches --input -
+
+      - name: Dry run summary
+        if: steps.ver.outputs.dry == 'true'
+        run: |
+          {
+            echo "### Dry run — nothing was published"
+            echo
+            echo "Built \`${{ steps.ver.outputs.tag }}\`, smoke-tested each binary on"
+            echo "its own platform, packaged everything, and stopped before the"
+            echo "release and the tap."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
