@@ -56,17 +56,29 @@ jobs:
             # ARMv8-A, so there is no wider portable win to take.
             cpu: ''
             static: true
-          # x86_64-macos is deliberately absent as of 0.2.0. Building it
-          # natively needs an Intel macOS runner, and GitHub's `macos-13`
-          # is retired: the 0.2.0 attempt sat queued for seven hours and
-          # never started. That is the worse failure mode — a wrong runner
-          # label does not fail, it *hangs*, so it blocks every other leg
-          # rather than reporting. Cross-compiling it from Apple Silicon
-          # is what this whole file just stopped doing, and for the same
-          # reason: libcrypto would come from the wrong architecture.
+          # x86_64-macos, back after being absent since 0.2.0.
           #
-          # Intel Macs can build from source until an Intel runner exists
-          # again. Revisit if GitHub ships a supported label.
+          # It was dropped because building it natively needs an Intel macOS
+          # runner and GitHub's `macos-13` is retired — the 0.2.0 attempt sat
+          # queued for seven hours and never started — while cross-compiling
+          # it meant libcrypto from the wrong architecture. That second half
+          # is no longer true: libcrypto is built by Zig for the target, so an
+          # Apple Silicon runner can cross-compile this one.
+          #
+          # It runs on `macos-latest` rather than a Linux runner so the smoke
+          # test below still executes the artifact, under Rosetta 2. That is
+          # also why it takes the default CPU baseline and not `x86_64_v3`
+          # like the Linux leg: Rosetta does not implement AVX, and hparse's
+          # vector width is chosen at *compile* time from the target's
+          # features, so a v3 build would emit AVX2 and die on SIGILL the
+          # moment the smoke test ran it. libcrypto is unaffected either way
+          # — OpenSSL dispatches its AVX paths on cpuid at runtime.
+          - label: x86_64-macos
+            os: macos-latest
+            zig_target: x86_64-macos
+            cpu: ''
+            # Darwin has no static libc; see aarch64-macos below.
+            static: false
           - label: aarch64-macos
             os: macos-latest
             zig_target: aarch64-macos
@@ -79,12 +91,21 @@ jobs:
             static: false
     runs-on: ${{ matrix.os }}
     steps:
-      # A dispatch defaults to the branch it was launched from, which would
-      # build one commit and then label it — and smoke-test it — as another's
-      # version. Build the tag that is being released.
+      # A real release builds the tag. A dispatch would otherwise default to
+      # the branch it was launched from, building one commit and then labelling
+      # it — and smoke-testing it — as another's version.
+      #
+      # A dry run is the exception, and deliberately so: it exists to rehearse
+      # *this file*, so it has to build the branch the change lives on. Pairing
+      # a new workflow with an old tag's source tests a combination that will
+      # never be released, and fails in ways that say nothing about either.
+      # That is not hypothetical — removing the pkg-config machinery here broke
+      # every leg of a dry run against v0.5.1, whose build.zig still wanted it.
+      # The tag still supplies the version, so the artifacts are named and
+      # smoke-tested exactly as a release would name them.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.dry_run == 'true' && github.ref || (github.event.inputs.tag || github.ref) }}
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
@@ -108,20 +129,6 @@ jobs:
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
           echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
 
-      # libcrypto has to come from a *static*, target-ABI build, and the
-      # only lever that reaches every consumer is pkg-config: zig resolves
-      # `-lcrypto` through it, and so does ztls's own build.zig, which is
-      # a pinned dependency this repo cannot reach into. Point pkg-config
-      # at a static openssl and both link the archive; point it anywhere
-      # else and the release links a shared library that is not on the
-      # machines it ships to.
-      - name: Resolve a static libcrypto
-        id: crypto
-        run: |
-          set -euo pipefail
-          dev="$(nix build --no-link --print-out-paths 'nixpkgs#pkgsStatic.openssl^dev')"
-          echo "pkg_config_path=$dev/lib/pkgconfig" >> "$GITHUB_OUTPUT"
-
       - name: Build and package
         run: |
           set -euo pipefail
@@ -134,16 +141,14 @@ jobs:
           # the identifier equal the version, which `zoxy --version`
           # recognises and omits — a release says `zoxy 0.0.7` and
           # nothing else, whatever the checkout depth happens to be.
-          # `env` *inside* the devenv shell, not on the step. `devenv
-          # shell` establishes its own environment and replaces
-          # PKG_CONFIG_PATH with one naming the shell's dynamic openssl,
-          # so a value exported outside is silently discarded — the build
-          # then links the shared library and the artifact fails to start.
-          # That is precisely how the first static-linking attempt
-          # regressed: it was verified by invoking zig directly, where
-          # there is no shell to overwrite anything.
-          devenv shell -- env PKG_CONFIG_PATH="${{ steps.crypto.outputs.pkg_config_path }}" \
-            zig build \
+          # No PKG_CONFIG_PATH: libcrypto is a Zig-built artifact linked
+          # statically for the target on every build, so pkg-config decides
+          # nothing here any more. It used to, and getting it right was
+          # delicate — `devenv shell` replaces PKG_CONFIG_PATH with one
+          # naming its own dynamic openssl, so the value had to be set
+          # *inside* the shell or it was silently discarded and the release
+          # linked a shared library it could not find at runtime.
+          devenv shell -- zig build \
             -Dtarget="${{ matrix.zig_target }}" \
             ${{ matrix.cpu && format('-Dcpu={0}', matrix.cpu) || '' }} \
             ${{ matrix.static && '-Dstatic' || '' }} \
@@ -202,12 +207,21 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      # A dispatch defaults to the branch it was launched from, which would
-      # build one commit and then label it — and smoke-test it — as another's
-      # version. Build the tag that is being released.
+      # A real release builds the tag. A dispatch would otherwise default to
+      # the branch it was launched from, building one commit and then labelling
+      # it — and smoke-testing it — as another's version.
+      #
+      # A dry run is the exception, and deliberately so: it exists to rehearse
+      # *this file*, so it has to build the branch the change lives on. Pairing
+      # a new workflow with an old tag's source tests a combination that will
+      # never be released, and fails in ways that say nothing about either.
+      # That is not hypothetical — removing the pkg-config machinery here broke
+      # every leg of a dry run against v0.5.1, whose build.zig still wanted it.
+      # The tag still supplies the version, so the artifacts are named and
+      # smoke-tested exactly as a release would name them.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.event.inputs.dry_run == 'true' && github.ref || (github.event.inputs.tag || github.ref) }}
 
       - name: Install Nix
         uses: nixbuild/nix-quick-install-action@v35
@@ -260,7 +274,7 @@ jobs:
           # the cross-compile it replaced did on the 0.2.0 tag, and the
           # `fail-fast: false` above means a single broken target no longer
           # cancels the others into looking like they were never tried.
-          for label in x86_64-linux aarch64-linux aarch64-macos; do
+          for label in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
             test -f "dist/zoxy-$version-$label.tar.gz" \
               || { echo "::error::missing artifact for $label"; exit 1; }
           done
@@ -299,7 +313,7 @@ jobs:
           tag="${{ steps.ver.outputs.tag }}"
           version="${{ steps.ver.outputs.version }}"
           gh release view "$tag" --json assets --jq '.assets[].name' | tee assets.txt
-          for label in x86_64-linux aarch64-linux aarch64-macos; do
+          for label in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
             grep -qx "zoxy-$version-$label.tar.gz" assets.txt \
               || { echo "::error::$tag is missing the $label archive"; exit 1; }
           done
@@ -319,6 +333,7 @@ jobs:
           tag="${{ steps.ver.outputs.tag }}"
 
           sha_aarch64_macos=$(grep "zoxy-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
+          sha_x86_64_macos=$(grep  "zoxy-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
           sha_aarch64_linux=$(grep "zoxy-$version-aarch64-linux.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
           sha_x86_64_linux=$(grep  "zoxy-$version-x86_64-linux.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
 
@@ -351,6 +366,10 @@ jobs:
               on_arm do
                 url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-aarch64-macos.tar.gz"
                 sha256 "$sha_aarch64_macos"
+              end
+              on_intel do
+                url "https://github.com/zoxy-io/zoxy/releases/download/$tag/zoxy-$version-x86_64-macos.tar.gz"
+                sha256 "$sha_x86_64_macos"
               end
             end
 
