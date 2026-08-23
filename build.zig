@@ -421,7 +421,29 @@ pub fn build(b: *std.Build) void {
                 // *lowered* ceiling loudly (the config is rejected at
                 // startup) but a *raised* one silently — a profile aimed at
                 // the new maximum would cap below it and say nothing.
-                .{ .name = "zoxy", .module = zoxy_fast_module },
+                //
+                // `src/constants.zig` directly rather than the whole `zoxy`
+                // module, which imports ztls: this executable also imports
+                // zrk, which reaches the same ztls through ztls_std, and the
+                // two instantiations differ in optimize mode — ReleaseSafe
+                // for the zoxy under test, ReleaseFast for the load
+                // generator. Zig treats those as two modules rooted at one
+                // file and refuses to compile:
+                //
+                //     error: file exists in modules 'ztls' and 'ztls0'
+                //     note: files must belong to only one module
+                //
+                // Importing a leaf that depends on nothing but `std` keeps
+                // both of those optimize choices, which are deliberate, and
+                // takes the shared C dependency out of the question. It only
+                // became possible to hit once libcrypto stopped being one
+                // system-wide shared object and became a per-configuration
+                // artifact (#279).
+                .{ .name = "zoxy_constants", .module = b.createModule(.{
+                    .root_source_file = b.path("src/constants.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }) },
             },
         }),
     });
