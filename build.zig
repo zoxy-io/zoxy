@@ -88,11 +88,38 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const libcrypto = openssl_dependency.artifact("openssl");
+    // Zig's C sanitizers off for the vendored C, in every mode — #283, and
+    // not a preference. `sanitize_c` defaults to `.full` in Debug and
+    // `.trap` in ReleaseSafe, and only the `.full` arm passes
+    // `-fno-sanitize=function` (Zig's src/Compilation.zig), whose comment
+    // there calls the pattern it flags "very common, and well-defined" and
+    // whose handler `lib/zig/ubsan_rt.zig` leaves commented out for the same
+    // reason. So the one check Zig deliberately disables is armed *only* in
+    // the mode release.yml ships, as a `ud1` trap: 17242 of them in the
+    // archive, 3499 of those the function check, and the first one a `tls`
+    // listener reaches is `OPENSSL_sk_pop_free` calling its `free_func`
+    // through a cast pointer — the idiom the check exists to flag and
+    // OpenSSL has always used. v0.6.0 SIGILLs there at key load, before
+    // serving anything, on every target it ships.
+    //
+    // `.off` rather than `.full`, and rather than dropping the one check:
+    // libcrypto is built without UBSan everywhere else (0.5.1 shipped
+    // nixpkgs' gcc-built one), the other 13743 traps are a crash surface on
+    // attacker-reachable paths rather than a diagnostic anyone acts on, and
+    // one setting for every mode is what stops the shipped artifact from
+    // differing from the tested one again — which is what this bug *was*,
+    // not a detail of it. Costs no Zig safety: the package gives this module
+    // no root source file, so it is C and nothing else. `smoke-release`
+    // below is the gate for the class.
+    libcrypto.root_module.sanitize_c = .off;
     const openssl_fast_dependency = b.dependency("openssl", .{
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseSafe,
     });
     const libcrypto_fast = openssl_fast_dependency.artifact("openssl");
+    // Same reason, and this is the archive that matters most: the twin
+    // linking it is the one built the way the release is.
+    libcrypto_fast.root_module.sanitize_c = .off;
 
     // ztls asks the linker for `-lcrypto` by name and this package emits
     // `libopenssl.a`. Linking the artifact resolves every symbol, but the
@@ -258,8 +285,12 @@ pub fn build(b: *std.Build) void {
     // one the bench uses: its verdicts are correctness equalities on real
     // output, so what a Debug build's extra checks add is worth more here
     // than the shipped binary's code generation, which Tier 1 is the gate
-    // for. The origin and the load generator both live inside the harness
-    // (smoke/), so the step needs nothing from the dev shell.
+    // for. That reasoning holds for what this leg *tests* and did not
+    // survive #283 as a reason to test only this one — the shipped build
+    // has failure modes a Debug build cannot reproduce, so `smoke-release`
+    // below runs the same harness against the ReleaseSafe twin. The origin
+    // and the load generator both live inside the harness (smoke/), so the
+    // step needs nothing from the dev shell.
     const smoke_exe = b.addExecutable(.{
         .name = "zoxy-smoke",
         .root_module = b.createModule(.{
@@ -349,6 +380,35 @@ pub fn build(b: *std.Build) void {
         }),
     });
     release_zoxy.root_module.addOptions("build_options", build_options);
+
+    // The same Tier-0.5 harness against the ReleaseSafe twin: the gate #283
+    // needed and did not have. `smoke` above drives the *default* build,
+    // which is Debug for every developer and every CI run, and the
+    // `sanitize_c` comment on `libcrypto` above is one worked example of
+    // what that leaves unwatched — a defect visible only in the mode the
+    // artifact is built in, which no amount of *scenario* coverage on the
+    // Debug leg could reach. So this leg runs the same requests, TLS
+    // included, and what it adds is the build configuration release.yml
+    // ships. Cheap: the micro binaries already make `ci` compile the
+    // ReleaseSafe libcrypto, so this is a link and a run on top.
+    //
+    // Ordered after the Debug leg rather than beside it: both harness runs
+    // are the same program and it keeps its work directory at a fixed path
+    // (`.zig-cache/zoxy-smoke`), so left free to run in parallel they would
+    // write each other's config and logs.
+    const smoke_release_run = b.addRunArtifact(smoke_exe);
+    smoke_release_run.addArg("--zoxy");
+    smoke_release_run.addArtifactArg(release_zoxy);
+    if (b.args) |args| {
+        smoke_release_run.addArgs(args);
+    }
+    smoke_release_run.step.dependOn(&smoke_run.step);
+    const smoke_release_step = b.step(
+        "smoke-release",
+        "Tier-0.5 live gate against the ReleaseSafe twin (the shipped build's configuration)",
+    );
+    smoke_release_step.dependOn(&smoke_release_run.step);
+
     // The harness itself (drives zrk against release_zoxy over the wire)
     // stays ReleaseFast for the same reason zrk/zio do above.
     const bench_exe = b.addExecutable(.{
@@ -485,6 +545,12 @@ pub fn build(b: *std.Build) void {
     // every other syscall here. This unconditional line is that fix's
     // acceptance test — kqueue's failure modes only surface at runtime.
     ci_step.dependOn(smoke_step);
+    // And once more against the configuration that ships. This list ran
+    // green on the change that gave zoxy a Zig-built libcrypto (#279) and
+    // on every change after it, while the release those changes produced
+    // had no working TLS at all (#283) — because every gate above builds
+    // at `-Doptimize`'s default and the artifact does not.
+    ci_step.dependOn(smoke_release_step);
     // Compile — never run — every measurement binary. Their verdicts are
     // human-read A/Bs and profiles, so running them here would buy nothing
     // and cost minutes; but they call the same internal APIs the proxy

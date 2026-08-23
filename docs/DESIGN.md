@@ -228,6 +228,16 @@ zoxy's own tree never names a C symbol and `@cImport` stays lint-forbidden
 (§9) — a second C surface opened here would not be behind anyone's audited
 Zig. libcrypto's internal allocations are routed to a fixed startup arena
 (`CRYPTO_set_mem_functions`) so §5's zero-allocation gate keeps its teeth.
+What does *not* backstop this surface, deliberately, is Zig's C
+undefined-behaviour sanitizer: libcrypto is built with `sanitize_c` off in
+every mode (build.zig). Left on, ReleaseSafe compiles ~17000 trap sites
+into it, and the one OpenSSL cannot satisfy — an indirect call through a
+cast function pointer, the idiom `OPENSSL_sk_pop_free` has always used —
+killed v0.6.0 at key load (#283). Every other libcrypto on earth is built
+without it too, which is the point of trusting these primitives
+institutionally rather than instrumenting them; the safety this surface
+does get is the audited Zig above it, the fixed heap beside it, and §9's
+`smoke-release` running the mode that ships.
 And the pinned hash is an *audited commit*, never a branch tip — libxev's
 Zig 0.16 support is a self-described compatibility shim (PR #220) with
 real fixes still unmerged behind it — so a pin moves only after re-audit;
@@ -2275,6 +2285,24 @@ equalities a shared runner's noise cannot move.
    different piece of work from building one. `zig build smoke` runs
    everywhere regardless, and restoring the `ci` wiring on macOS is that
    issue's acceptance test.
+   The harness runs a second time against the ReleaseSafe twin
+   (`zig build smoke-release`), and the difference between the two legs is
+   the build's *configuration*, not its scenario — the same requests, the
+   same TLS listener, the same equalities. It exists because "the shipped
+   binary" above was true of the code and false of the build: every gate
+   in this list builds at `-Doptimize`'s default, which is Debug, and the
+   two modes did not agree about the vendored C. Zig compiled libcrypto
+   against UBSan's runtime handlers in one and against traps in the other,
+   and only the trap set carried a check OpenSSL has never satisfied, so
+   v0.6.0 passed this gate green and then died in libcrypto at key load
+   for anyone who configured a `tls` listener (#283). That particular
+   divergence is closed at its source — §4 records that libcrypto is now
+   built with Zig's C sanitizers off in every mode — and this leg is not
+   here to watch it. It is here because no amount of scenario coverage on
+   the Debug leg could have found it, which is the general shape: a gate
+   that never runs what ships is evidence about a different program. The
+   cost is a link and a run — `ci` already compiles the ReleaseSafe
+   libcrypto for the Tier-0 micro binaries.
 4. **Benchmarks — [zrk](https://github.com/zoxy-io/zrk), three tiers.**
    The load generator is zrk — a pure-Zig wrk2 rewrite: *constant-throughput*
    (open-loop) pacing with coordinated-omission-corrected HdrHistogram
