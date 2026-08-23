@@ -2361,7 +2361,10 @@ fn checkCursorAgreesWithOneShot(input: []const u8, step: usize) void {
     var storage: HeaderStorage = undefined;
     var cursor: HeadCursor = .{};
     var have: usize = 0;
-    while (true) {
+    // Bounded by the input: `have` grows by at least one every pass and the
+    // body returns on the pass that reaches the end. Written as a bounded
+    // loop rather than a marked `while (true)` because the bound is real.
+    while (have < input.len) {
         have = @min(have + step, input.len);
         const pieced = parseRequestHead(input[0..have], false, &storage, &cursor);
         if (have == input.len) {

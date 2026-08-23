@@ -289,7 +289,7 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     return false;
                 }
                 var storage: parser.HeaderStorage = undefined;
-                const request = parser.parseRequestHead(bytes, false, &storage) catch |err| {
+                const request = parser.parseRequestHead(bytes, false, &storage, null) catch |err| {
                     if (err == error.Incomplete and conn.request_len < conn.request_buffer.len) {
                         conn.armRecv();
                         return false;
