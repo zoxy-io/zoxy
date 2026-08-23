@@ -75,11 +75,49 @@ pub fn build(b: *std.Build) void {
     // over libcrypto primitives, which is why every build below links
     // libcrypto: the §4 crypto-primitives exception, and the codebase's one
     // C surface.
-    const ztls_dependency = b.dependency("ztls", .{
+    // libcrypto, built by Zig for the *target* rather than resolved out of the
+    // build machine's nix store. See build.zig.zon for why it is OpenSSL and
+    // why this fork; the short version is that BoringSSL has no
+    // `CRYPTO_set_mem_functions` and `tls/libcrypto_heap.zig` cannot start
+    // without it.
+    //
+    // Two of them, because the ReleaseSafe twin below builds its own ztls at a
+    // different optimize mode and the archive has to match.
+    const openssl_dependency = b.dependency("openssl", .{
         .target = target,
         .optimize = optimize,
     });
+    const libcrypto = openssl_dependency.artifact("openssl");
+    const openssl_fast_dependency = b.dependency("openssl", .{
+        .target = target,
+        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+    });
+    const libcrypto_fast = openssl_fast_dependency.artifact("openssl");
+
+    // ztls asks the linker for `-lcrypto` by name and this package emits
+    // `libopenssl.a`. Linking the artifact resolves every symbol, but the
+    // linker must still *find* a file of that name or it fails before getting
+    // there — so publish a copy under it and point the search path at it. A
+    // copy rather than renaming the artifact, because the artifact's name is
+    // the package's API.
+    const crypto_alias = b.addWriteFiles();
+    _ = crypto_alias.addCopyFile(libcrypto.getEmittedBin(), "libcrypto.a");
+    const crypto_alias_dir = crypto_alias.getDirectory();
+    const crypto_fast_alias = b.addWriteFiles();
+    _ = crypto_fast_alias.addCopyFile(libcrypto_fast.getEmittedBin(), "libcrypto.a");
+    const crypto_fast_alias_dir = crypto_fast_alias.getDirectory();
+
+    const ztls_dependency = b.dependency("ztls", .{
+        .target = target,
+        .optimize = optimize,
+        // We supply libcrypto, so pkg-config must not. Left on, it injects the
+        // system OpenSSL's include path ahead of ours and the C import dies on
+        // typedef collisions — but only where pkg-config knows about OpenSSL,
+        // so it passes CI and breaks on a laptop.
+        .@"crypto-pkg-config" = false,
+    });
     const ztls_module = ztls_dependency.module("ztls");
+    ztls_module.linkLibrary(libcrypto);
 
     const zoxy_module = b.addModule("zoxy", .{
         .root_source_file = b.path("src/root.zig"),
@@ -91,7 +129,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ztls", .module = ztls_module },
         },
     });
-    linkLibcrypto(zoxy_module);
+    linkLibcrypto(zoxy_module, libcrypto, crypto_alias_dir);
     // `src/io/XevIo.zig` reads the backend choice from here.
     zoxy_module.addOptions("io_options", io_options);
     // The shipped example config is embedded so tests and the fuzz corpus
@@ -163,7 +201,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ztls", .module = ztls_module },
         },
     });
-    linkLibcrypto(tls_heap_proof_module);
+    linkLibcrypto(tls_heap_proof_module, libcrypto, crypto_alias_dir);
     const tls_heap_proof_tests = b.addRunArtifact(b.addTest(.{
         .root_module = tls_heap_proof_module,
     }));
@@ -281,7 +319,9 @@ pub fn build(b: *std.Build) void {
     const ztls_fast_dependency = b.dependency("ztls", .{
         .target = target,
         .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .@"crypto-pkg-config" = false,
     });
+    ztls_fast_dependency.module("ztls").linkLibrary(libcrypto_fast);
     const zoxy_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -292,7 +332,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ztls", .module = ztls_fast_dependency.module("ztls") },
         },
     });
-    linkLibcrypto(zoxy_fast_module);
+    linkLibcrypto(zoxy_fast_module, libcrypto_fast, crypto_fast_alias_dir);
     // The ReleaseSafe twin of the library module needs the same backend
     // choice: it is the same `src/root.zig`, so `XevIo` asks it the same
     // question.
@@ -554,37 +594,39 @@ fn resolveBuildId(b: *std.Build) []const u8 {
 
 /// ztls's C surface: the protocol layer is Zig, the primitives are
 /// libcrypto's (DESIGN.md §4's crypto-primitives exception). Every module
-/// that reaches `src/tls/` needs both, and they always travel together —
-/// linking one without the other produces a link error a long way from
-/// here, so they are set in one place rather than repeated per module.
-fn linkLibcrypto(module: *std.Build.Module) void {
+/// that reaches `src/tls/` needs the archive and a search path that makes
+/// ztls's own `-lcrypto` resolvable; they always travel together, so they
+/// are set in one place rather than repeated per module.
+///
+/// Statically, always, and built for the target rather than found on the
+/// build machine. This used to be `linkSystemLibrary("crypto")` with
+/// pkg-config deciding which libcrypto that meant, which cost twice over.
+/// A *release* binary handed to strangers must not want a musl-ABI
+/// `libcrypto.so.3` at runtime — that shipped unnoticed the moment TLS
+/// termination (#125) gave zoxy a C dependency. And pkg-config answers only
+/// for the host, so every other target failed to link, which is why
+/// release.yml builds natively on one runner per target and why
+/// x86_64-macos has been absent since 0.2.0.
+fn linkLibcrypto(
+    module: *std.Build.Module,
+    lib: *std.Build.Step.Compile,
+    alias_dir: std.Build.LazyPath,
+) void {
     module.link_libc = true;
-    // Static where the caller asked for it (`-Dstatic-crypto`), which the
-    // release builds do and nothing else does.
-    //
-    // A dev or CI build links the shared libcrypto its shell provides and
-    // runs on that machine, which is all it needs. A *release* binary is
-    // handed to strangers, and a musl target that dynamically links
-    // libcrypto is not the artifact anyone thinks it is: it wants a musl
-    // loader and a musl-ABI `libcrypto.so.3` at runtime, so a stock
-    // Linux box cannot execute it at all. That shipped unnoticed the
-    // moment TLS termination (#125) gave zoxy a C dependency — before it,
-    // the musl target had nothing to link and was static by default.
-    module.linkSystemLibrary("crypto", .{});
+    module.addLibraryPath(alias_dir);
+    module.linkLibrary(lib);
 }
 
 /// Set from `-Dstatic` in `build`, read where the executable is declared.
 /// A file global because that is the only other place it is needed and a
 /// parameter would have to travel through code that does not care.
 ///
-/// *Which* libcrypto `-lcrypto` resolves to is not decided here. Zig
-/// asks pkg-config, so the answer is whatever `PKG_CONFIG_PATH` names —
-/// which is also the only lever that reaches **ztls's** own
-/// `linkSystemLibrary("crypto")`, since that lives in a pinned dependency
-/// this build cannot reach into. A release therefore points pkg-config at
-/// a static, target-ABI openssl and gets one everywhere; naming an
-/// archive here would have fixed only half the link and left ztls still
-/// pulling in the shared one.
+/// This no longer decides anything about libcrypto. It used to matter that
+/// `-Dstatic` and pkg-config agreed, because pkg-config was the only lever
+/// that reached **ztls's** own `linkSystemLibrary("crypto")` inside a
+/// pinned dependency. `linkLibcrypto` now hands both halves the same
+/// Zig-built archive, so libcrypto is static on every build and
+/// `PKG_CONFIG_PATH` reaches nothing.
 var static_link: bool = false;
 
 /// The `-Dio-backend` choice. `default` is what the platform picks
