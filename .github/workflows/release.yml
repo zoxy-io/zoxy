@@ -194,6 +194,22 @@ jobs:
             *) echo "::error::binary reports '$reported', expected $version"; exit 1 ;;
           esac
 
+          # And it proxies, over TLS, on the platform it was built for.
+          #
+          # Every check above passed for v0.6.0 — static, no nix-store
+          # references, right version — and that release could not terminate
+          # TLS at all: it died in libcrypto at key load for anyone who
+          # configured a `tls` listener (#283). The binary was correct; the
+          # build was not, and `--version` exits before the difference can
+          # show. `zig build ci`'s `smoke-release` leg covers the build
+          # *configuration*; this is the only thing that runs the artifact
+          # being published, which is a separate claim and the one a release
+          # is for.
+          #
+          # Before packaging rather than after, so a binary that cannot serve
+          # never becomes a tarball.
+          bash scripts/release-tls-check.sh ./out/bin/zoxy
+
           tar czf "dist/zoxy-$version-${{ matrix.label }}.tar.gz" -C out/bin zoxy
 
       - uses: actions/upload-artifact@v4
