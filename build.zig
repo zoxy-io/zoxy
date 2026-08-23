@@ -1,5 +1,42 @@
 const std = @import("std");
 
+/// Refuse to build the vendored C against a libc Zig could not find.
+///
+/// Everything here links libcrypto, and libcrypto is C: for a native target
+/// Zig locates the host's libc headers and CRT objects by running the system
+/// C compiler (`cc -E -Wp,-v -xc /dev/null`). With no `cc` on PATH that
+/// detection fails — and the build DOES NOT. It reports its steps as
+/// succeeding and emits binaries that die in `_start`, before `main`, on a
+/// call through a null pointer. Every test in the suite "fails" as one
+/// SIGSEGV with no output, which reads exactly like a bug in the code.
+///
+/// That cost a day of chasing a phantom, so the condition gets a message
+/// instead of a mystery. Attached to libcrypto rather than to a top-level
+/// step because that is the choke point every artifact goes through, and
+/// because failing here leaves `zig build --help` and the steps that touch
+/// no C still working.
+fn guardNativeLibc(b: *std.Build, target: std.Build.ResolvedTarget, libcrypto: *std.Build.Step.Compile) void {
+    // Only native builds probe the host. A cross target uses the libc Zig
+    // ships for it and needs nothing from this machine.
+    if (!target.query.isNative()) return;
+    // An explicit libc description answers the same question `cc` would.
+    if (b.graph.environ_map.get("ZIG_LIBC") != null) return;
+    if (b.findProgram(&.{ "cc", "gcc", "clang" }, &.{})) |_| return else |_| {}
+
+    libcrypto.step.dependOn(&b.addFail(
+        \\no C compiler on PATH, so Zig cannot detect this machine's libc.
+        \\
+        \\Everything here links a libcrypto built from vendored C, and without
+        \\a detected libc that link silently produces binaries which segfault
+        \\in _start before main — a whole test suite dying as one SIGSEGV with
+        \\no output.
+        \\
+        \\Build inside the pinned toolchain: `devenv shell`, or `direnv allow`
+        \\once and let it load. Cross-compiling (-Dtarget=...) needs none of
+        \\this, and ZIG_LIBC overrides the check if you know better.
+    ).step);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -88,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const libcrypto = openssl_dependency.artifact("openssl");
+    guardNativeLibc(b, target, libcrypto);
     // Zig's C sanitizers off for the vendored C, in every mode — #283, and
     // not a preference. `sanitize_c` defaults to `.full` in Debug and
     // `.trap` in ReleaseSafe, and only the `.full` arm passes
