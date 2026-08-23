@@ -639,7 +639,7 @@ test "render: request strips hop-by-hop and nominated, keeps the rest" {
     const head = "GET /p HTTP/1.1\r\nHost: a\r\nConnection: close, X-Nominated\r\n" ++
         "Keep-Alive: timeout=5\r\nTE: trailers\r\nX-Nominated: v\r\nX-Keep: yes\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
 
     const rendered = try renderRequestHead(&request, .{ .path = "/p", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
@@ -662,7 +662,7 @@ test "render: an absolute-form authority replaces the client's Host" {
     const head = "GET http://api.example:8080/v2/x HTTP/1.1\r\n" ++
         "Host: stale.example\r\nX-Keep: yes\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = try renderRequestHead(
         &request,
@@ -681,7 +681,7 @@ test "render: an absolute-form authority replaces the client's Host" {
     );
     // The request line is origin-form downstream, whatever form arrived.
     var reparse_storage: parser.HeaderStorage = undefined;
-    const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage);
+    const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage, null);
     try testing.expectEqual(@as(?[]const u8, null), reparsed.authority);
     try testing.expectEqualStrings("api.example:8080", reparsed.host.?);
 }
@@ -693,7 +693,7 @@ test "render: filter edits set, add, and remove headers" {
     const head = "GET /p HTTP/1.1\r\nHost: a\r\nX-Env: dev\r\nX-Trace: t0\r\n" ++
         "Cookie: sid=1\r\nX-Keep: yes\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     const edits = [_]filter.AppliedHeaderEdit{
         .{ .kind = .set, .name = "X-Env", .value = "prod" },
         .{ .kind = .add, .name = "X-Trace", .value = "t1" },
@@ -711,7 +711,7 @@ test "render: filter edits set, add, and remove headers" {
 
     // The edited head must re-parse as a valid request with the edits live.
     var reparse_storage: parser.HeaderStorage = undefined;
-    const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage);
+    const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage, null);
     try testing.expectEqualStrings("prod", parser.headerValue(reparsed.headers, "x-env").?);
     try testing.expectEqual(@as(?[]const u8, null), parser.headerValue(reparsed.headers, "cookie"));
 }
@@ -722,7 +722,7 @@ test "render: an edit that overflows the buffer is Oversize" {
     // source head.
     const head = "GET /p HTTP/1.1\r\nHost: a\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     const edits = [_]filter.AppliedHeaderEdit{
         .{ .kind = .add, .name = "X-Big", .value = "0123456789" },
     };
@@ -753,7 +753,7 @@ test "render: the edited oracle skips a head that grows past head_buffer_bytes_d
 
     // The source is legal (head.len == head_buffer_bytes_default is within the limit).
     var storage: parser.HeaderStorage = undefined;
-    const parsed = try parser.parseRequestHead(&source, false, &storage);
+    const parsed = try parser.parseRequestHead(&source, false, &storage, null);
     try testing.expectEqual(@as(u32, constants.head_buffer_bytes_default), parsed.head_len);
     // Confirm the edited render genuinely crosses the ceiling — otherwise
     // this test would exercise nothing. (The edit set mirrors the oracle's.)
@@ -775,7 +775,7 @@ test "render: nominating a protected header does not strip it" {
     const head = "POST /u HTTP/1.1\r\nHost: a\r\nConnection: Content-Length, Host\r\n" ++
         "Content-Length: 5\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
     try testing.expectEqualStrings(
@@ -792,7 +792,7 @@ test "render: a nomination on a second Connection line still strips" {
     const head = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n" ++
         "Connection: X-Nominated\r\nX-Nominated: v\r\nX-Keep: k\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     try testing.expect(request.connection_nominates_header);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
@@ -813,7 +813,7 @@ test "render: standard Connection options do not nominate a same-named header" {
     const head = "GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, close\r\n" ++
         "Close: x\r\nKeep-Alive: timeout=5\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
     // Connection stripped (hop-by-hop) and Keep-Alive stripped (a
@@ -828,18 +828,18 @@ test "render: standard Connection options do not nominate a same-named header" {
 test "render: framing headers travel with the body" {
     const head = "POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = try renderRequestHead(&request, .{ .path = "/u", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
 
     var reparse_storage: parser.HeaderStorage = undefined;
-    const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage);
+    const reparsed = try parser.parseRequestHead(rendered, false, &reparse_storage, null);
     try testing.expectEqual(parser.BodyFraming.chunked, reparsed.framing);
 }
 
 test "render: client version is preserved" {
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage);
+    const request = try parser.parseRequestHead("GET / HTTP/1.0\r\n\r\n", false, &storage, null);
     var buffer: [oracle_buffer_bytes]u8 = undefined;
     const rendered = try renderRequestHead(&request, .{ .path = "/", .query = "" }, &.{}, false, null, null, false, &test_head_scratch, &buffer);
     try testing.expectEqualStrings("GET / HTTP/1.0\r\n\r\n", rendered);
@@ -915,7 +915,7 @@ test "render: bare status line without a reason phrase round-trips" {
 test "render: a head that no longer fits is Oversize" {
     const head = "GET /path HTTP/1.1\r\nHost: origin.example\r\n\r\n";
     var storage: parser.HeaderStorage = undefined;
-    const request = try parser.parseRequestHead(head, false, &storage);
+    const request = try parser.parseRequestHead(head, false, &storage, null);
     const target = parser.CanonicalTarget{ .path = "/path", .query = "" };
     var small: [16]u8 = undefined;
     try testing.expectError(error.Oversize, renderRequestHead(&request, target, &.{}, false, null, null, false, &test_head_scratch, &small));
@@ -950,7 +950,7 @@ fn oracleTarget(
 
 fn checkRequestRender(input: []const u8) void {
     var storage: parser.HeaderStorage = undefined;
-    const request = parser.parseRequestHead(input, false, &storage) catch return;
+    const request = parser.parseRequestHead(input, false, &storage, null) catch return;
     if (request.method == .connect) {
         return; // Never rendered: the proxy answers CONNECT itself.
     }
@@ -971,7 +971,7 @@ fn checkRequestRender(input: []const u8) void {
     var reparse_storage: parser.HeaderStorage = undefined;
     // A rendered head failing our own parser would mean the proxy emits
     // requests it would itself reject — the oracle's core claim.
-    const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage) catch unreachable;
+    const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage, null) catch unreachable;
     assert(reparsed.method == request.method);
     assert(std.mem.eql(u8, reparsed.method_token, request.method_token));
     // §7 canonical forwarding: the origin sees the canonical path plus the
@@ -1003,7 +1003,7 @@ fn checkRequestRender(input: []const u8) void {
 /// legitimate oversize-after-edits verdict (431), not an oracle failure.
 fn checkRequestRenderEdited(input: []const u8) void {
     var storage: parser.HeaderStorage = undefined;
-    const request = parser.parseRequestHead(input, false, &storage) catch return;
+    const request = parser.parseRequestHead(input, false, &storage, null) catch return;
     if (request.method == .connect) {
         return;
     }
@@ -1030,7 +1030,7 @@ fn checkRequestRenderEdited(input: []const u8) void {
         return;
     }
     var reparse_storage: parser.HeaderStorage = undefined;
-    const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage) catch return;
+    const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage, null) catch return;
     // set always wins (its source copies are suppressed, one value
     // appended); remove is always absent; add is always present.
     assert(std.mem.eql(u8, parser.headerValue(reparsed.headers, "x-fuzz-set").?, "s"));
@@ -1120,7 +1120,7 @@ fn fuzzRenderInputs(context: void, smith: *std.testing.Smith) !void {
 /// origin and the next hop can read different clients out of one request.
 fn checkRequestRenderForwarded(input: []const u8) void {
     var storage: parser.HeaderStorage = undefined;
-    const request = parser.parseRequestHead(input, false, &storage) catch return;
+    const request = parser.parseRequestHead(input, false, &storage, null) catch return;
     if (request.method == .connect) {
         return;
     }
@@ -1155,7 +1155,7 @@ fn checkRequestRenderForwarded(input: []const u8) void {
     // §7 oversize verdict, which production answers 431, not a head this
     // oracle has anything left to say about. `checkRequestRenderEdited`
     // declines for the same reason: its edits can add lines too.
-    const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage) catch return;
+    const reparsed = parser.parseRequestHead(rendered, false, &reparse_storage, null) catch return;
     var seen: u32 = 0;
     for (reparsed.headers) |header| {
         if (header.tag == .x_forwarded_for) {

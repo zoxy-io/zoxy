@@ -185,8 +185,10 @@ pub fn Server(comptime IoType: type) type {
         /// into `beginUpstream`'s reuse path and on into
         /// `renderRequestAndStartLegs`, none of which parse again, and the
         /// paths that do parse again are the ones reached *after* an await,
-        /// where §7 re-parses from byte 0 precisely because nothing parsed
-        /// survives its callback. `header_scratch_lent` makes the whole of
+        /// where §7 parses the accumulated head afresh precisely because
+        /// nothing parsed survives its callback — which is also why
+        /// `head_cursor` carries an offset and not a partial parse.
+        /// `header_scratch_lent` makes the whole of
         /// that a checked fact rather than a reviewed one.
         ///
         /// Comptime-sized, so inline like `drain_sink`: part of no budget
@@ -2262,6 +2264,7 @@ pub fn Server(comptime IoType: type) type {
                 // as relay debt would send a ClientHello to the origin.
                 assert(leftover_len <= engine.plaintext.len);
                 conn.head_len = 0;
+                conn.head_cursor.reset();
                 server.startTlsPhaseWith(conn, leftover);
                 return;
             }
@@ -2284,6 +2287,7 @@ pub fn Server(comptime IoType: type) type {
                 direction.owe(leftover_len);
             }
             conn.head_len = 0;
+            conn.head_cursor.reset();
             server.startProtocol(conn, .l4);
         }
 

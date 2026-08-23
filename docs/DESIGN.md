@@ -853,8 +853,14 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
 - **Zero-copy head parser: a hardened fork of
   [hparse](https://github.com/nikneym/hparse)** (pure Zig,
   SIMD-vectorized, never allocates or copies — picohttpparser-shaped
-  API; "streaming" means detect-and-retry — partial input re-parses
-  from byte 0, bounded by `limits.head_buffer_bytes`). Upstream was
+  API; "streaming" means detect-and-retry — a partial head returns
+  Incomplete and the caller comes back with more bytes, bounded by
+  `limits.head_buffer_bytes`. That retry used to re-parse from byte 0,
+  which made head parsing quadratic in the number of segments a head
+  arrives in — segmentation the *client* picks, so it was CPU burn the
+  shed ladder had no rung for. `http.parser.HeadCursor` carries the
+  search forward per connection; the parse itself still happens once,
+  over a head already known to be complete). Upstream was
   not adoptable as-is; the fork cleared a recorded hardening gate
   before landing:
   bounds-check the cursor (upstream dereferences one byte past
