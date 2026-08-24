@@ -502,6 +502,7 @@ pub fn Server(comptime IoType: type) type {
             server.initDateSlots();
             try server.conns.init(arena, options.conn_slots);
             try server.relay_buffers.init(arena, options.relay_buffers);
+            try wireRelayHalves(arena, server.relay_buffers.slots, options.relay_buffer_bytes);
             try server.initTunnelBuffers(arena, &options);
             // One index space, derived once and shared by every
             // endpoint-keyed table so they cannot disagree about a key.
@@ -626,9 +627,36 @@ pub fn Server(comptime IoType: type) type {
             server.render_scratch_lent = false;
         }
 
-        /// The §4 engine pool and the one slab its plaintext destinations
-        /// carve out of. Both are empty on a deployment where no listener
-        /// terminates TLS — the whole feature reserving nothing, which is
+        /// Wire a relay pool's halves onto a slab (§5). `Pool` never
+        /// touches these fields, so one pass at init holds for every
+        /// acquire/release afterwards — the same contract
+        /// `initHeadBuffers` relies on.
+        ///
+        /// Deliberately not faulted in: pages become resident as relays
+        /// actually use them, so the printed §5 total stays a ceiling RSS
+        /// approaches under load rather than a startup floor
+        /// (IMPLEMENTATION_NOTES "lazy fault-in"). Nothing reads a byte it
+        /// did not first write, so a fresh page's content is never seen.
+        fn wireRelayHalves(
+            arena: std.mem.Allocator,
+            slots: []relay.RelayBuffer,
+            relay_buffer_bytes: u32,
+        ) error{OutOfMemory}!void {
+            assert(relay_buffer_bytes >= constants.relay_buffer_bytes_min);
+            assert(relay_buffer_bytes <= constants.relay_buffer_bytes_max);
+            if (slots.len == 0) {
+                return;
+            }
+            const half: usize = @as(usize, relay_buffer_bytes);
+            const slab = try arena.alloc(u8, slots.len * 2 * half);
+            for (slots, 0..) |*buffer, index| {
+                const base = index * 2 * half;
+                buffer.client_to_upstream = slab[base..][0..half];
+                buffer.upstream_to_client = slab[base + half ..][0..half];
+            }
+            assert(slots[slots.len - 1].upstream_to_client.len == half);
+        }
+
         /// The §5 tunnel pool (#180), split from `init` for the length
         /// limit like `initHeadBuffers` beside it.
         ///
@@ -654,8 +682,12 @@ pub fn Server(comptime IoType: type) type {
             assert(options.tunnels <= options.conn_slots);
             try server.tunnel_buffers.init(arena, options.tunnels);
             assert(server.tunnel_buffers.slots.len == options.tunnels);
+            try wireRelayHalves(arena, server.tunnel_buffers.slots, options.relay_buffer_bytes);
         }
 
+        /// The §4 engine pool and the one slab its plaintext destinations
+        /// carve out of. Both are empty on a deployment where no listener
+        /// terminates TLS — the whole feature reserving nothing, which is
         /// what `limits.tls_engines == 0` means and what `Pool`'s
         /// zero-slot support is for.
         fn initTlsEngines(
@@ -2254,7 +2286,7 @@ pub fn Server(comptime IoType: type) type {
                 conn.client_address = client;
             }
             const leftover_len = conn.head_len - header.bytes_len;
-            const staging = &conn.relay_buffer.?.client_to_upstream;
+            const staging = conn.relay_buffer.?.client_to_upstream;
             const leftover = staging[header.bytes_len..conn.head_len];
             if (conn.tls) |engine| {
                 // On a terminating listener those leftover bytes are the
@@ -2643,7 +2675,7 @@ pub fn Server(comptime IoType: type) type {
             const direction = &conn.directions[
                 @intFromEnum(ConnType.Direction.client_to_upstream)
             ];
-            const staging = &conn.relay_buffer.?.client_to_upstream;
+            const staging = conn.relay_buffer.?.client_to_upstream;
             const framed = direction.framed_len;
             // Comptime-guaranteed in proxy_protocol: header + the largest
             // receive leftover fit the buffer half together.

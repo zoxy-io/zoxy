@@ -21,16 +21,19 @@ const Io = @import("../io/io.zig");
 
 const assert = std.debug.assert;
 
+/// One connection's pair of relay halves. The bytes live in a slab the
+/// server carves at startup, not inline here: `limits.relay_buffer_bytes`
+/// is the operator's to size, so the element cannot be a comptime shape.
+/// Same move `HeadBuffer` made, and for the same reason.
+///
+/// `Pool` never touches these fields, so the wiring survives every
+/// acquire/release cycle and is done once at init.
 pub const RelayBuffer = struct {
     pool_next: u32,
     generation: u32,
-    client_to_upstream: [constants.relay_buffer_bytes]u8,
-    upstream_to_client: [constants.relay_buffer_bytes]u8,
+    client_to_upstream: []u8,
+    upstream_to_client: []u8,
 };
-
-comptime {
-    assert(@sizeOf(RelayBuffer) >= 2 * constants.relay_buffer_bytes);
-}
 
 /// The bidirectional relay engine. Per direction: recv fills the fixed
 /// buffer, the chunk is sent fully (short sends resume from the offset),
@@ -200,7 +203,7 @@ pub fn Relay(comptime IoType: type) type {
                     if (direction == .client_to_upstream) {
                         if (conn.tls) |engine| return engine.recvBuffer();
                     }
-                    return &@field(conn.relay_buffer.?, @tagName(direction));
+                    return @field(conn.relay_buffer.?, @tagName(direction));
                 }
 
                 /// Decrypt, so framing sees plaintext and never learns a
@@ -261,7 +264,7 @@ pub fn Relay(comptime IoType: type) type {
                         return direction_state.pending(engine.plaintext);
                     }
                     if (direction_state.owed() == 0) return &.{};
-                    return direction_state.pending(&@field(conn.relay_buffer.?, @tagName(direction)));
+                    return direction_state.pending(@field(conn.relay_buffer.?, @tagName(direction)));
                 }
 
                 /// Credit whichever cursor tracks the wire. Only the

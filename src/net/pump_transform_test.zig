@@ -267,7 +267,7 @@ const ToUpstreamPolicy = struct {
         assert(chunk.len >= 1);
         scratch.inbound_len += @intCast(chunk.len);
         assert(scratch.inbound_len <= scratch.inbound.len);
-        const out = &conn.relay_buffer.?.client_to_upstream;
+        const out = conn.relay_buffer.?.client_to_upstream;
         var out_len: u32 = 0;
         // Bounded by the scratch: each turn either consumes a whole frame or
         // breaks out.

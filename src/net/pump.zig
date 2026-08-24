@@ -134,7 +134,7 @@ pub fn Pump(
         }
 
         fn buffer(conn: *ConnType) []u8 {
-            return &@field(conn.relay_buffer.?, direction_tag);
+            return @field(conn.relay_buffer.?, direction_tag);
         }
 
         // -- the transform seam (§4, §6; see the module header) --
