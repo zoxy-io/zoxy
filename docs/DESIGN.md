@@ -866,7 +866,22 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   bounds-check the cursor (upstream dereferences one byte past
   the buffer on partial input — silent UB), accept HTAB in field values
   (RFC 9110), reject bare-LF line terminators (a smuggling ingredient),
-  make header-array overflow distinguishable from malformed input (431
+  hold a header field name to RFC 9110 §5.6.2's `token` grammar (the
+  fork's table listed what was *invalid*, so the separators and every
+  byte 0x80-0xff reached a backend as a field name — a name the backend
+  tokenizes differently is the same smuggling shape as disagreeing about
+  a line terminator, and a denylist is how it got in), hold the
+  request-target to RFC 3986 `pchar` (the same denylist shape, and the
+  same fix: it admitted `"<>\^`{|}` and every byte 0x80-0xff. The one
+  that matters is `\` — IIS, .NET and browser URL parsing normalize it
+  to `/`, so routing on `/public\..\admin` while the origin resolves
+  `/admin` reads two different paths out of one target. `validateTarget`
+  checks the target's *form*, never its character class, so nothing here
+  caught it. Refusing raw 0x80-0xff is the deliberate cost: UTF-8 in a
+  path is common despite the RFC, and those requests now draw 400.
+  This is byte-level agreement only — percent-encoding and dot-segments
+  are still `canonicalTarget`'s job, below), make
+  header-array overflow distinguishable from malformed input (431
   vs 400), and open the closed method enum to extension tokens. The
   fork is vendored by audited commit like every dependency (§4); the
   fallback, had hardening proved costlier than rewriting, was our own

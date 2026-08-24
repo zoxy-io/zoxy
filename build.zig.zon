@@ -136,28 +136,137 @@
             .url = "git+https://github.com/lalinsky/zio?ref=main#df666c286380bf513dfe843f65a8133207ad7373",
             .hash = "zio-0.17.0-xHbVVJPWJwBY3c_AkOFjUCF_pTIMnMc7ia9ujTjAfsbk",
         },
-        // Audited fork: zoxy-io/hparse. Previously pinned at the DESIGN.md §7
-        // hardening gate (PR #3); moved for one correctness fix found by
-        // running the fork's own coverage-guided fuzzer, which CI never ran:
-        // an empty request-target was accepted, so "GET  HTTP/1.1\r\n\r\n"
-        // parsed with an empty target, and — because the shortest legal
-        // request is exactly the parser's 16-byte fast-path threshold — the
-        // verdict on a complete 15-byte "request" depended on whether spare
-        // bytes happened to follow it in the buffer.
+        // Audited fork: zoxy-io/hparse, pinned by content hash; the pin
+        // moves only after re-audit, and the paragraphs below are that
+        // record.
         //
-        // Not a behaviour change HERE: `validateTarget` already refused an
-        // empty target, so zoxy answered 400 either way and the wrapper's
-        // defensive branch stays (§7). What changes is where the refusal
-        // happens — in the fork now, one layer earlier — and the fork no
-        // longer lets the verdict on a complete 15-byte "request" depend on
-        // whether spare bytes happened to follow it in the buffer.
+        // Re-audit for 11e4735, one commit on and performance only. The
+        // entire code delta is two deletions: `matchHeaderValue`'s middle
+        // SWAR tier, and `broadcast()`, which had no callers left after it.
+        // No table changes — checked by filtering comments out of the diff,
+        // because a table edit hiding inside a commit that says "perf" is
+        // the one thing this pin's history says to look for. So no verdict
+        // moves, and the two tests added here for tchar and pchar need no
+        // companion.
         //
-        // The pin does NOT bring hparse's new resume API into use here; see
-        // `HeadCursor` for why this file scans instead. The pin moves only
-        // after re-audit.
+        // Deleting a tier is faster in both builds: 0.99x with vectors on,
+        // 0.70x under `-Duse-vectors=false` where it did all the work. Ours
+        // is the vectors-on figure, so this is worth about 1% on header
+        // values — taken because it removes 30 lines of bit arithmetic
+        // carrying a borrow hazard and a tab special case, and one fewer
+        // tier is one fewer place the tiers can disagree.
+        //
+        // Why it never paid: with vectors on it only ever saw the
+        // 8-to-31-byte window at the tail of the BUFFER (its loop bound is
+        // bytes remaining in the buffer, not in the value), and it could
+        // not express "TAB is legal" in the arithmetic — a borrow from a
+        // genuine sub-0x20 byte perturbs the next byte's high bit — so it
+        // restarted on every tab where the table lookup just says yes.
+        //
+        // It also records that `status_msg_map` rejects HTAB, which RFC
+        // 9112 §4 permits in a reason-phrase: a deliberate deviation in the
+        // strict direction, previously silent. Documentation, not a change
+        // — the table is byte-identical. zoxy never reads a reason-phrase's
+        // bytes, so nothing here depends on it either way.
+        //
+        // Two commits on from 554d9fb, and only one of them is product:
+        // 4c670e6 gives CI's test-runner watchdog room on a cold cache and
+        // touches no file that links here.
+        //
+        // Re-audit for 0c8060a, which is why this pin is at 0c8060a and not
+        // the 554d9fb it sat at for one afternoon. `path_map` had the same
+        // denylist shape `key_map` did — {controls, space, DEL} — so a
+        // request-target could carry `"<>\^`{|}` and every byte from 0x80
+        // up, none of which RFC 3986 admits unencoded. It is a positive
+        // pchar table now, built at comptime from the grammar's own pieces.
+        //
+        // The one that makes this a security fix rather than a conformance
+        // one is `\`. IIS, .NET and browser URL parsing normalize a
+        // backslash to `/`, so zoxy routing on `/public\..\admin` and an
+        // origin resolving `/admin` have read two different paths out of
+        // one target — and §7 routes on paths, which is the fact that
+        // scoped the fix. Verified against this tree before taking the pin:
+        // at 554d9fb that target parsed and reached routing with the
+        // backslash intact, because `validateTarget` checks the target's
+        // *form* and never its character class. NOT introduced by 554d9fb;
+        // v0.6.2 ships it, which is the argument for moving rather than
+        // holding.
+        //
+        // Rejecting 0x80-0xff is the part with an operational cost, and it
+        // is deliberate: raw UTF-8 in a path is common in the wild despite
+        // RFC 3986, and those requests now draw 400. `#`, `[` and `]` are
+        // tolerated against the letter of the grammar — a fragment fails
+        // SAFE (an origin truncating there sees less path than the proxy
+        // did, never more) and brackets are everywhere in query strings.
+        //
+        // `matchPath` KEEPS its vector tier, which is the opposite of the
+        // call `matchHeaderKey` made two commits earlier, and the
+        // difference is length: both regimes were measured, and
+        // scalar-only came out 1.03x on an 8-byte target but 1.30x on a
+        // 165-byte one, because a target with a query string amortizes a
+        // 16-byte setup where a field name never does. Stating the set as
+        // a REJECT mask then landed at 0.99x — one wrapping subtract and
+        // one compare catch controls, space, DEL and all of 0x80-0xff
+        // together, and feed `@ctz` with no inversion. The SWAR tier is
+        // deleted: it expressed the same range compare in integer
+        // arithmetic, and pchar is not a range.
+        //
+        // What this does NOT buy: safe path routing. The dominant
+        // confusions are percent-encoding and dot-segments, and hparse
+        // decodes neither — `canonicalTarget` still owns normalization
+        // (§7), and the fork's README now says so from its side. What the
+        // table buys is that the proxy and the origin cannot read
+        // *different bytes* as different paths.
+        //
+        // Re-audit for 554d9fb, which this passed through: nine commits on
+        // from 87fd39d. Seven of them are harness — an llhttp differential
+        // and its imported corpus, a picohttpparser differential, a
+        // disagreement ledger, a copyright line, a contributor guide — and
+        // touch no file that links into zoxy. Two reach `src/root.zig`, the
+        // parser itself, and only one of those changes a verdict.
+        //
+        // b65ea98 is the correctness fix and the reason to take this pin.
+        // `key_map` was written as a denylist — controls, space, colon, DEL
+        // — so `isValidKeyChar` accepted 144 bytes that are not tchar: the
+        // RFC 9110 §5.6.2 separators `"(),/;<=>?@[\]{}` and every byte
+        // 0x80-0xff. A field name is `token`, the same grammar as a method,
+        // and `method_map` in the same file had been the correct allowlist
+        // all along; `key_map` is now literally that table.
+        //
+        // Unlike the empty-target fix this pin used to carry, this one DOES
+        // change behaviour here. §7's wrapper owns strictness for the
+        // target, the method and the framing, but it never inspected a
+        // field name — the key arrived from hparse already judged. So a
+        // request whose header name carries a separator or a high byte now
+        // draws 400 where it used to be forwarded verbatim. That is the
+        // point: handing a backend a field name the backend tokenizes
+        // differently is the smuggling shape §7's CRLF-only rule already
+        // exists for, and a denylist is how it got in.
+        //
+        // The same commit deletes `matchHeaderKey`'s vector path rather
+        // than fixing it — the `chunk > ' '` range compare is precisely
+        // what admitted the 144 — after measuring an exact tchar classifier
+        // at 1.24x SLOWER than the broken code. Header keys are short
+        // enough that a 16-byte setup never amortizes, so the byte-at-a-time
+        // loop that replaces both is 0.85x: correct and faster, which is
+        // the "performance" half of this bump.
+        //
+        // 8625977 turns `use_vectors` and `vec_size` from hardcoded
+        // constants into `?bool` / `?u16` build options, so the fork can
+        // fuzz a forced-scalar build against the vector one. This build
+        // passes neither, and unset they compute exactly what the constants
+        // computed, so the scan tier zoxy ships is unchanged. Its one
+        // visible consequence is that hparse's root now imports
+        // `build_options`, which its own build.zig supplies — nothing to
+        // wire on this side.
+        //
+        // Still NOT in use here: hparse's resume API, which the 87fd39d pin
+        // brought and this one leaves alone — `HeadCursor` scans for the
+        // terminator and one-shot parses a head already known to be
+        // complete, and the comment there says why.
         .hparse = .{
-            .url = "git+https://github.com/zoxy-io/hparse#87fd39de91192c46807dc22b70f6a340c3b80362",
-            .hash = "hparse-0.2.0-IukW0t5AAgD8yb3LKVDZW2nWDOHP2Z-I6ijF8m6jCFwE",
+            .url = "git+https://github.com/zoxy-io/hparse#11e47352cb402f48ac625276745bc254cb994a9b",
+            .hash = "hparse-0.2.0-IukW0qbOAwD-EYdn93kCU42Z2gfwufpKl7yTf5yk6vRF",
         },
         // libcrypto, built by Zig rather than found on the system.
         //

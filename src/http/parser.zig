@@ -1897,6 +1897,94 @@ test "http parser: bare LF line terminators are malformed" {
     try expectResponseError(error.Malformed, "HTTP/1.1 200 OK\nContent-Length: 0\r\n\r\n", .get);
 }
 
+test "http parser: a header field name is exactly tchar" {
+    // The hardened fork holds a field name to RFC 9110 §5.6.2's `token`,
+    // the same grammar as a method; this witnesses the contract through
+    // the wrapper, which never inspects a key of its own. It walks all
+    // 256 rather than spot-checking, because the pin that brought this
+    // replaced a DENYLIST — one that admitted the separators
+    // `"(),/;<=>?@[\]{}` and every byte 0x80-0xff. Forwarding a field
+    // name the backend tokenizes differently is the smuggling shape the
+    // bare-LF rule above already exists for, so it is pinned here too:
+    // a pin that regressed it would pass the fork's gate and fail this.
+    const tchar = "!#$%&'*+-.^_`|~0123456789" ++
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    var accepted: u16 = 0;
+
+    for (0..256) |index| {
+        const byte: u8 = @intCast(index);
+        const is_tchar = std.mem.indexOfScalar(u8, tchar, byte) != null;
+
+        var buf: [64]u8 = undefined;
+        const head = try std.fmt.bufPrint(
+            &buf,
+            "GET / HTTP/1.1\r\nHost: a\r\nX{c}Y: v\r\n\r\n",
+            .{byte},
+        );
+        var storage: HeaderStorage = undefined;
+        // Malformed specifically, not merely "some error": §7 maps that
+        // one to 400, and the three other HeadError members are the
+        // 414/431 rungs — a regression onto one of those would still be
+        // a rejection, and still be the wrong answer.
+        const parsed = parseRequestHead(head, false, &storage, null) catch |err| {
+            try testing.expectEqual(HeadError.Malformed, err);
+            try testing.expect(!is_tchar);
+            continue;
+        };
+        // A colon does not fail the parse, it ends the key early — so the
+        // key surviving whole is what "legal in a field name" means here.
+        assert(parsed.headers.len >= 1); // Host at least, then the probe.
+        const name = parsed.headers[parsed.headers.len - 1].name;
+        const whole = name.len == 3 and name[1] == byte;
+        try testing.expectEqual(is_tchar, whole);
+        accepted += @intFromBool(whole);
+    }
+
+    try testing.expectEqual(@as(u16, tchar.len), accepted);
+}
+
+test "http parser: a request-target is pchar, and a backslash is not" {
+    // §7 routes on paths, so the bytes zoxy reads as a path and the bytes
+    // the origin reads as one must be the same bytes. IIS, .NET and
+    // browser URL parsing normalize `\` to `/`, so a target the router
+    // reads as `/public\..\admin` and an origin resolves to `/admin` is a
+    // desync of exactly the kind the CRLF rule exists to prevent —
+    // `validateTarget` checks the target's FORM and never its character
+    // class, so nothing on this side caught it before the fork did.
+    const desync = "GET /public\\..\\admin HTTP/1.1\r\nHost: a\r\n\r\n";
+    try expectRequestError(error.Malformed, desync, false);
+
+    // The other eight RFC 3986 refuses unencoded, and a raw high byte.
+    // Raw UTF-8 in a path is common despite the RFC; refusing it is the
+    // deliberate cost of being able to state the rule (see build.zig.zon).
+    for ([_][]const u8{
+        "GET /a\"b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /a<b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /a>b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /a^b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /a`b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /a{b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /a|b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /a}b HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET /caf\xc3\xa9 HTTP/1.1\r\nHost: a\r\n\r\n",
+    }) |head| {
+        try expectRequestError(error.Malformed, head, false);
+    }
+
+    // Percent-encoded, these are ordinary targets — the escape is how a
+    // client was always meant to carry them, and `canonicalTarget` owns
+    // what happens after (§7). This is the half that must NOT regress:
+    // refusing the encoded form too would break every legitimate client.
+    var storage: HeaderStorage = undefined;
+    const encoded = try parseRequestHead(
+        "GET /public%5C..%5Cadmin?q=caf%C3%A9 HTTP/1.1\r\nHost: a\r\n\r\n",
+        false,
+        &storage,
+        null,
+    );
+    try testing.expectEqualStrings("/public%5C..%5Cadmin?q=caf%C3%A9", encoded.target);
+}
+
 test "http parser: extension methods parse with their raw token" {
     var storage: HeaderStorage = undefined;
     const request = try parseRequestHead(
