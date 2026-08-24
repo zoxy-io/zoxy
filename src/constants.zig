@@ -102,14 +102,44 @@ pub const conn_slots_max: u32 = 11457;
 /// acquired.
 pub const relay_buffers_max: u32 = conn_slots_max;
 
-/// Bytes per relay direction; a `RelayBuffer` is a pair of these. Held to
-/// 4 KiB: the strict recv→send→recv relay (§6) is correct at any size, so
-/// the smaller buffer halves relay-pool memory (8 KiB per pair, not 16) —
-/// which matters now the c10k ceiling puts up to `relay_buffers_max` pairs
-/// in the pool — and trades throughput for more round trips only on
-/// high-bandwidth-delay streams, negligible on the loopback and LAN paths
-/// this proxy targets.
-pub const relay_buffer_bytes: u32 = 4 * 1024;
+/// Bytes per relay direction; a `RelayBuffer` is a pair of these. The
+/// operator's to size (`limits.relay_buffer_bytes`), because the right
+/// value is a property of the bodies a deployment moves and nothing here
+/// knows those.
+///
+/// The default is one full TLS record, and that is the measurement rather
+/// than a round number. §6's strict recv→send→recv relay is correct at any
+/// size, so the buffer sets how many round trips a body costs — a 256 KiB
+/// response is 64 of them at 4 KiB and 16 at 16 KiB — and
+/// `tls_app_chunk_bytes` below rides the same number, so a small buffer
+/// also emits quarter-size TLS records against RFC 8446 §5.1's 2^14
+/// ceiling. Held at 4 KiB, both together cost ~40% of bulk latency
+/// (IMPLEMENTATION_NOTES.md, "The relay buffer sets the TLS record size").
+///
+/// The price is `relay_buffers` × 2 × this, which the c10k ceiling
+/// multiplies by 11457 — so a deployment moving small bodies at high
+/// concurrency is exactly who should turn it down, and the knob exists
+/// for them.
+pub const relay_buffer_bytes_default: u32 = 16 * 1024;
+
+/// Floor. Below this a `PROXY` header or a chunked size line could not be
+/// staged in one buffer, which the asserts below pin.
+pub const relay_buffer_bytes_min: u32 = 1024;
+
+/// Ceiling, and it is an IMPLEMENTATION bound rather than a protocol one.
+/// RFC 8446 §5.1 caps a RECORD at 2^14, not a buffer;
+/// `ResponseBodyPolicy.transformOut` hands a whole relay chunk to
+/// `Engine.sendApp` with no loop around it, so one chunk is one record and
+/// a larger buffer has nowhere to go. Two things follow, and neither is
+/// obvious from the number: a plaintext deployment needs no such cap and
+/// would take a larger buffer happily — the limit is global because
+/// `limits` is — and lifting it means chunking inside the transform, or
+/// making the bound conditional on whether any listener terminates TLS.
+///
+/// Keeping this equal to `tls_app_chunk_bytes` is also what lets the
+/// engine's outbox stay comptime-sized while the relay pool became a
+/// runtime slab.
+pub const relay_buffer_bytes_max: u32 = 16 * 1024;
 
 /// Most bytes a PROXY protocol header may occupy before the listener
 /// rejects the peer (#142). The bound is ours, not the spec's: a v2
@@ -220,7 +250,7 @@ pub const tls_read_chunk_bytes: u32 = tls_record_plaintext_bytes_max;
 /// outbound staging a fixed size instead of a function of
 /// `limits.head_buffer_bytes`, which the operator may set to 1 MiB. Set
 /// to the relay buffer's size so an L4 chunk crosses in one record.
-pub const tls_app_chunk_bytes: u32 = relay_buffer_bytes;
+pub const tls_app_chunk_bytes: u32 = relay_buffer_bytes_max;
 
 comptime {
     // A read that could not hold a record header plus something would
@@ -1244,11 +1274,13 @@ comptime {
     assert(relay_buffers_max >= 1);
     assert(inFlightOps(conn_slots_max, upstream_slots_max, 0, health_probe_concurrency_max) <= completion_queue_entries);
     assert(conn_slots_max - 1 <= std.math.maxInt(u16));
-    assert(relay_buffer_bytes >= 512);
+    assert(relay_buffer_bytes_min >= 512);
+    assert(relay_buffer_bytes_min <= relay_buffer_bytes_default);
+    assert(relay_buffer_bytes_default <= relay_buffer_bytes_max);
     // The PROXY header stages in the relay buffer's client→upstream half
     // and must admit the largest header either spec version allows
     // (v2's 16-byte prelude + AF_UNIX's 216-byte block; v1's 107 line).
-    assert(proxy_header_bytes_max <= relay_buffer_bytes);
+    assert(proxy_header_bytes_max <= relay_buffer_bytes_min);
     assert(proxy_header_bytes_max >= 16 + 216);
     assert(proxy_header_bytes_max >= 107);
     assert(clusters_min >= 1);
@@ -1301,7 +1333,7 @@ comptime {
     // the P2C load signal.
     assert(upstream_slots_max <= std.math.maxInt(u16));
     assert(chunked_line_bytes_max >= 32);
-    assert(chunked_line_bytes_max <= relay_buffer_bytes);
+    assert(chunked_line_bytes_max <= relay_buffer_bytes_min);
     assert(chunked_trailer_bytes_max >= chunked_line_bytes_max);
     // The watermarks must leave a hysteresis gap and never engage above
     // the pool's own capacity, checked at the production size.
@@ -1571,7 +1603,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     assert(sizes.upstream_slots >= 1);
     assert(sizes.upstream_slots <= upstream_slots_max);
     assert(sizes.conn_bytes > 0);
-    assert(sizes.relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
+    assert(sizes.relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes_min));
     // Once 8 KiB of head, now scalars: the slot's head moved to the §5
     // upstream head pool, whose own bound is asserted below.
     assert(sizes.upstream_bytes > 0);
@@ -1603,7 +1635,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     if (sizes.tunnels == 0) {
         assert(sizes.tunnel_buffer_pair_bytes == 0);
     } else {
-        assert(sizes.tunnel_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes));
+        assert(sizes.tunnel_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes_min));
     }
     // The TLS terms are all-or-nothing together: a pool with no engines
     // is a plaintext deployment, which reserves no heap and no plaintext
@@ -1661,7 +1693,7 @@ test "pressure: relay watermarks have a hysteresis gap at every capacity" {
 
 test "budgets: memory total matches the closed form" {
     const conn_bytes: u64 = 10240;
-    const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes);
+    const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes_default);
     // Scalars only since the head moved to its own pool (§5).
     const upstream_bytes: u64 = 64;
     const upstream_head_bytes: u64 = head_buffer_bytes_default + 8;

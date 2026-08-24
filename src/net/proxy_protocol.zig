@@ -384,7 +384,7 @@ comptime {
     // receive phase already framed; both must fit the relay buffer half
     // they stage in, together, or the memmove there would clobber.
     assert(send_bytes_max + constants.proxy_header_bytes_max <=
-        constants.relay_buffer_bytes);
+        constants.relay_buffer_bytes_min);
     // "PROXY TCP6 " + 39 + " " + 39 + " 65535 65535\r\n".
     assert(11 + 39 + 1 + 39 + 14 == 104);
     assert(104 <= send_bytes_max);

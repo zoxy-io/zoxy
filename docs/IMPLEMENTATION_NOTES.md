@@ -797,6 +797,64 @@ Three caveats, each of which changes what the table above means.
 
 That gap is now closed — see the next section.
 
+## The relay buffer sets the TLS record size (2026-08-24)
+
+`relay_buffer_bytes` was 4 KiB, and `tls_app_chunk_bytes` was an alias of
+it, so the same constant decided two things: how many round trips a body
+costs, and the plaintext size of every TLS record a terminating listener
+emits. RFC 8446 §5.1 caps a record at 2^14, and haproxy's `tune.bufsize`
+defaults to exactly that — so zoxy was emitting quarter-size records
+against a peer emitting full ones, while already *decrypting* full ones
+(`tls_read_chunk_bytes` was 16 KiB all along). The asymmetry was the tell.
+
+Tier-1 bands, four runs alternating in one session, p50 µs, large body =
+256 KiB per response at 400/s (~100 MiB/s):
+
+| | 4 KiB [A, B] | 16 KiB [A, B] |
+|---|---|---|
+| zoxy L4 | [1081, 1105] | [722, 573] |
+| zoxy L7 | [1069, 1050] | [601, 600] |
+| **zoxy L7 TLS** | **[1248, 1199]** | **[745, 858]** |
+| haproxy https (control) | [788, 777] | [722, 782] |
+
+Non-overlapping on every zoxy row: L7 TLS −35%, L7 −43%, L4 −35..−48%.
+The control holds at [722, 788] across all four, which is what rules out
+session drift — haproxy did not move while zoxy halved. Against haproxy,
+zoxy L7 TLS goes from 58% worse to roughly parity.
+
+**Keep-alive shows nothing, and the first reading of it was wrong.** zoxy
+L7 TLS [68, 92] at 4 KiB against [62, 66] at 16 KiB, inside the control's
+own [55, 68] spread. A single-pair reading had this as a −33% win; the 92
+was one noisy run. Recorded because the mistake is the reusable part: one
+pair is not a band, and the second pair existed to catch exactly this.
+
+Cost, measured and reconciling with the closed form to within 3%:
+
+    RSS  4 KiB: 246,328 KiB      relay pool  1386 × 24576 = 34.1 MiB
+    RSS 16 KiB: 295,416 KiB      TLS outbox  1024 × 15872 = 15.5 MiB
+    delta:       +48.0 MiB       predicted                  49.6 MiB
+
+So `limits.relay_buffer_bytes` is a knob now (#293) rather than a
+constant, defaulting to 16 KiB. The knob is not decoration: the c10k
+ceiling multiplies this term by 11457 pairs, ~358 MiB of relay pool at
+the default against ~90 MiB at 4 KiB, and a deployment moving small
+bodies at high concurrency should turn it down. `tls_app_chunk_bytes` is
+pinned to `relay_buffer_bytes_max` rather than to the runtime value,
+which is what lets the TLS engine's outbox stay comptime-sized while the
+relay pool became a startup slab. The 16 KiB ceiling is an
+implementation bound, not a protocol one — `transformOut` emits one
+record per chunk with no loop, and a plaintext deployment would take a
+larger buffer happily.
+
+**Loopback, one machine, one session.** The direction should hold or
+strengthen on a real network — fewer round trips is fewer syscalls
+whatever the RTT — but the magnitude is not a deployment figure until the
+fleet re-takes it. Note also that no other benched workload would show
+any of this: `zig build bench` and `zig build profile` serve ~20-byte
+bodies and the cloud nightly requests `/1k`, none of which fill even a
+4 KiB buffer. The large-body band is the only place it is visible, which
+is why it went unmeasured for so long.
+
 ## What the kernel time is doing (2026-08-24)
 
 The gap above, measured. `bench/profile.zig` grew a `--kernel` flag that

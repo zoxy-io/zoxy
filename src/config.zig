@@ -247,6 +247,19 @@ pub const Config = struct {
         /// well as lowered — the big-cookie/JWT case is the reason it
         /// exists. Inert when both pools are zero (an L4-only config).
         head_buffer_bytes: u32 = constants.head_buffer_bytes_default,
+        /// Bytes per relay direction (§6); a pair costs twice this, and
+        /// `relay_buffers` + `tunnels` pairs are reserved. Sets how many
+        /// round trips a body costs — a 256 KiB response is 16 at the
+        /// 16 KiB default and 64 at 4 KiB — and, because
+        /// `tls_app_chunk_bytes` rides the same number, the size of the
+        /// TLS records a terminating listener emits.
+        ///
+        /// Lower it when concurrency matters more than bulk: the c10k
+        /// ceiling multiplies this by 11457 pairs, so 4 KiB is ~90 MiB of
+        /// relay pool where the default is ~358. Raising it past one TLS
+        /// record is refused; see `relay_buffer_bytes_max` for why that
+        /// bound is the transform's and not the RFC's.
+        relay_buffer_bytes: u32 = constants.relay_buffer_bytes_default,
         /// The §4 TLS engine pool: how many sessions may be handshaking
         /// or terminated at once. An engine is ~132 KiB plus a plaintext
         /// buffer, far the largest per-connection object here, so this is
@@ -755,6 +768,7 @@ pub const ValidationError = error{
     LimitUpstreamHeadBuffersOverUpstreamSlots,
     LimitUpstreamHeadBuffersWithoutHttpListener,
     LimitHeadBufferBytesOutOfRange,
+    LimitRelayBufferBytesOutOfRange,
     LimitTlsEnginesOutOfRange,
     LimitTlsEnginesOverConnSlots,
     LimitTlsEnginesWithoutTlsListener,
@@ -1341,6 +1355,7 @@ fn resolveLimits(
         http_listeners_count,
     );
     const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
+    const relay_buffer_bytes = try resolveRelayBufferBytes(limits_json.relay_buffer_bytes);
     const tls_engines = try resolveTlsEngines(
         limits_json.tls_engines,
         conn_slots,
@@ -1376,6 +1391,7 @@ fn resolveLimits(
         .head_buffers = head_buffers,
         .upstream_head_buffers = upstream_head_buffers,
         .head_buffer_bytes = head_buffer_bytes,
+        .relay_buffer_bytes = relay_buffer_bytes,
         .tls_engines = tls_engines,
         .tunnels = tunnels,
         .keepalive_requests = limits_json.keepalive_requests orelse
@@ -1608,6 +1624,22 @@ fn resolveHeadBufferBytes(requested: ?u32) ValidationError!u32 {
     return head_buffer_bytes;
 }
 
+/// One relay half's size (§6). Bounded below by what a `PROXY` header and
+/// a chunked size line must stage in one buffer, and above by one TLS
+/// record — `transformOut` hands a whole chunk to `sendApp` as a single
+/// record, so a larger buffer has no legal way across the wire.
+fn resolveRelayBufferBytes(requested: ?u32) ValidationError!u32 {
+    const relay_buffer_bytes = requested orelse constants.relay_buffer_bytes_default;
+    if (relay_buffer_bytes < constants.relay_buffer_bytes_min or
+        relay_buffer_bytes > constants.relay_buffer_bytes_max)
+    {
+        return error.LimitRelayBufferBytesOutOfRange;
+    }
+    assert(relay_buffer_bytes >= constants.relay_buffer_bytes_min);
+    assert(relay_buffer_bytes <= constants.relay_buffer_bytes_max);
+    return relay_buffer_bytes;
+}
+
 fn resolveAccessLogBuffer(
     requested: ?u32,
     access_log_on: bool,
@@ -1765,6 +1797,7 @@ pub const LimitsJson = struct {
     head_buffers: ?u32 = null,
     upstream_head_buffers: ?u32 = null,
     head_buffer_bytes: ?u32 = null,
+    relay_buffer_bytes: ?u32 = null,
     tls_engines: ?u32 = null,
     tunnels: ?u32 = null,
     /// Optional #237 keep-alive request cap; absent means nginx's 1000,
@@ -1815,6 +1848,14 @@ pub const LimitsJson = struct {
                 "raised for big-cookie/JWT traffic as well as lowered.",
             .minimum = constants.head_buffer_bytes_min,
             .maximum = constants.head_buffer_bytes_max,
+        },
+        .relay_buffer_bytes = .{
+            .desc = "Bytes per relay direction; a pair costs twice this. Sets " ++
+                "how many round trips a body costs and the size of the TLS " ++
+                "records a terminating listener emits. Lower it when " ++
+                "concurrency matters more than bulk throughput.",
+            .minimum = constants.relay_buffer_bytes_min,
+            .maximum = constants.relay_buffer_bytes_max,
         },
         .tls_engines = .{
             .desc = "Concurrent TLS sessions — handshaking or terminated. The " ++
@@ -5522,6 +5563,15 @@ test "config: limits shrink pools below the ceilings, never past them" {
         "\"limits\":{\"head_buffer_bytes\":512}}");
     try expectParseError(error.LimitHeadBufferBytesOutOfRange, http_head ++ tail ++
         "\"limits\":{\"head_buffer_bytes\":2097152}}");
+    // Both ends of `relay_buffer_bytes`, on the same terms: below the floor
+    // a PROXY header or a chunked size line could not be staged in one
+    // buffer, and above the ceiling a relay chunk could not cross as one
+    // TLS record (§4). The accepted default is exercised by every other
+    // config in this file, so only the rejections need naming here.
+    try expectParseError(error.LimitRelayBufferBytesOutOfRange, http_head ++ tail ++
+        "\"limits\":{\"relay_buffer_bytes\":512}}");
+    try expectParseError(error.LimitRelayBufferBytesOutOfRange, http_head ++ tail ++
+        "\"limits\":{\"relay_buffer_bytes\":65536}}");
     // The parse-order precedences the limits-before-listeners reorder
     // moved, pinned deliberately (see `parse`): emptiness beats a bad
     // sink; a bad protocol (even on a later listener) beats a bad bind

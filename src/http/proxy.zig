@@ -1919,7 +1919,7 @@ pub fn Proxy(comptime IoType: type) type {
             /// does everywhere else the client speaks.
             pub fn recvBuffer(conn: *ConnType) []u8 {
                 if (conn.tls) |engine| return engine.recvBuffer();
-                return &conn.relay_buffer.?.client_to_upstream;
+                return conn.relay_buffer.?.client_to_upstream;
             }
 
             /// Decrypt so framing — chunked decoding, content-length
@@ -1950,7 +1950,7 @@ pub fn Proxy(comptime IoType: type) type {
                 ];
                 if (state.owed() == 0) return &.{};
                 if (conn.tls) |engine| return state.pending(engine.body_plaintext);
-                return state.pending(&conn.relay_buffer.?.client_to_upstream);
+                return state.pending(conn.relay_buffer.?.client_to_upstream);
             }
 
             pub fn beforeRecv(conn: *ConnType) void {
@@ -3207,7 +3207,7 @@ pub fn Proxy(comptime IoType: type) type {
                     @intFromEnum(ConnType.Direction.upstream_to_client)
                 ];
                 if (state.owed() == 0) return &.{};
-                return state.pending(&conn.relay_buffer.?.upstream_to_client);
+                return state.pending(conn.relay_buffer.?.upstream_to_client);
             }
 
             /// Ciphertext outnumbers the plaintext the debt counts, so the

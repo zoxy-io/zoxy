@@ -509,13 +509,42 @@ a raised `RLIMIT_NOFILE`:
 | pool | default | ceiling (c10k) | unit size |
 |---|---|---|---|
 | conn slots | 1386 | 11457 | ~1.7 KiB state |
-| relay buffers | 1386 | 11457 | 2 × 4 KiB |
+| relay buffers | 1386 | 11457 | 2 × `relay_buffer_bytes` |
 | upstream slots | 1311 | 11457 | ~48 B state |
 | head buffers (ring) | = conn slots | 11457 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11457 | `head_buffer_bytes` + 24 B |
 | tls engines | 0, or min(conn slots, 1024) | 1024 | ~132 KiB + plaintext |
-| tunnels | 0 (off) | 11457 | 2 × 4 KiB |
-| **pool memory** | **~34 MiB** | **~384 MiB** | |
+| tunnels | 0 (off) | 11457 | 2 × `relay_buffer_bytes` |
+| **pool memory** | **~66 MiB** | **~653 MiB** | |
+
+The **pool memory** row excludes tunnels, which are off unless a listener
+allows an upgrade — a feature nobody asked for costing nothing is the
+point of the separate pool, and including a ceiling nobody reaches would
+misprice the common case. A deployment that does configure tunnels at the
+ceiling pays the same `relay_buffer_bytes` term twice. Both figures track
+that knob: measured at the ceiling with tunnels and TLS off, the banner
+prints 290 MiB at 4 KiB against 559 MiB at the 16 KiB default, the
+268.5 MiB difference being the relay pool alone.
+
+`relay_buffer_bytes` defaults to 16 KiB and is the operator's to size, as
+`head_buffer_bytes` below is. It sets how many round trips a body costs —
+§6's strict recv→send→recv relay is correct at any size, so a 256 KiB
+response is 16 round trips at the default and 64 at 4 KiB — and, because
+`tls_app_chunk_bytes` rides the same number, the size of the TLS records
+a terminating listener emits against RFC 8446 §5.1's 2^14 ceiling. Held
+at 4 KiB, the two together measured ~40% of bulk latency
+(IMPLEMENTATION_NOTES.md). It is also the term the c10k ceiling
+multiplies hardest: 11457 pairs is ~358 MiB of relay pool at the default
+against ~90 MiB at 4 KiB, which is why a deployment moving small bodies
+at high concurrency is exactly who should turn it down. The ceiling is
+one TLS
+record, and that is an IMPLEMENTATION bound rather than a protocol one:
+RFC 8446 caps a record, not a buffer, but `transformOut` hands a whole
+chunk to `sendApp` as a single record with no loop around it (§4). A
+plaintext deployment needs no such cap and would take a larger buffer
+happily; the limit is global because `limits` is. Lifting it means
+chunking inside the transform, or making the bound conditional on whether
+any listener terminates TLS — neither done here.
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
 (oversize → 414/431, §7), with a 1 KiB floor and a 1 MiB ceiling: a size
@@ -566,7 +595,9 @@ proxy that cannot exist.
 
 That bound is also what keeps the **fd and ring budgets unchanged**,
 which is worth stating rather than leaving a reader to verify: a tunnel
-pool costs ~90 MiB at the ceiling and nothing else. `fdsRequired`
+pool costs ~358 MiB at the ceiling — the same `relay_buffer_bytes` term
+the relay pool pays, so it moves with that knob — and nothing else.
+`fdsRequired`
 already charges `2 × conn_slots` — a client socket and an upstream one
 for every connection — and a tunnel holds exactly that pair, so its
 upstream socket is an fd the budget has always reserved; the separate

@@ -116,7 +116,11 @@ pub fn Budget(comptime IoType: type) type {
                 .conn_slots = limits.conn_slots,
                 .conn_bytes = @sizeOf(ServerType.ConnType),
                 .relay_buffers = limits.relay_buffers,
-                .relay_buffer_pair_bytes = @sizeOf(RelayBuffer),
+                // The pool element (free-list header and the two slab
+                // slices) plus both halves it points at, the same shape
+                // `upstream_head_buffer_bytes` below uses.
+                .relay_buffer_pair_bytes = @sizeOf(RelayBuffer) +
+                    2 * @as(u64, limits.relay_buffer_bytes),
                 .upstream_slots = limits.upstream_slots,
                 .upstream_bytes = @sizeOf(UpstreamType),
                 .access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes),
@@ -140,7 +144,7 @@ pub fn Budget(comptime IoType: type) type {
                 .tunnel_buffer_pair_bytes = if (limits.tunnels == 0)
                     0
                 else
-                    @sizeOf(RelayBuffer),
+                    @sizeOf(RelayBuffer) + 2 * @as(u64, limits.relay_buffer_bytes),
                 // Zero unless a listener terminates TLS, which is what
                 // makes the whole feature free to a deployment that did
                 // not ask for it. The three terms move together:
