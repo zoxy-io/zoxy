@@ -68,6 +68,30 @@ const Flags = struct {
     /// there to a low floor, so this leaves real margin rather than the
     /// 22 seconds the first version left.
     quiesce_timeout_s: u64 = 300,
+    /// Sample in kernel mode as well as user mode: drop the `u` modifier
+    /// from the cycles event so samples landing inside syscalls, softirq
+    /// and the TCP stack are recorded instead of discarded.
+    ///
+    /// Off by default, and that default is load-bearing: every number in
+    /// IMPLEMENTATION_NOTES.md is a userspace share, and a run that
+    /// silently included kernel time would not be comparable to any of
+    /// them. It is a separate question, so it gets a separate flag.
+    ///
+    /// It answers the gap that file records as unmeasured — what the ~52
+    /// points of kernel time on zoxy's core are doing, against the ~5 the
+    /// profiler can see today. Needs `kernel.perf_event_paranoid <= 1`
+    /// and, to resolve the symbols, `kernel.kptr_restrict = 0`; both are
+    /// checked before a window opens rather than discovered in the output.
+    ///
+    /// KERNEL STACKS ARE NOT UNWOUND. The recording keeps `--call-graph
+    /// lbr`, whose branch filter is user-only, so kernel frames arrive as
+    /// sample leaves with no callers above them. That is deliberate: the
+    /// flat top-symbols table is what answers "where is the time", and
+    /// the alternative — `fp` — would need frame pointers this ReleaseSafe
+    /// binary does not keep, trading the user stacks that do work for
+    /// kernel stacks that might. Read the symbol table, not the
+    /// flamegraph's kernel branches.
+    kernel: bool = false,
     zoxy_path: []const u8 = "zig-out/bin/zoxy-profile",
 
     const Protocol = enum { l4, http };
@@ -105,8 +129,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `dedicate` yields null.
     const zoxy_cpu = affinity.dedicate(io, flags.zoxy_cpu).?;
 
-    const cycles_event = try preflight(io, &flags, zoxy_cpu) orelse
-        return refuseNoPtraceAttach();
+    const cycles_event = try preflight(io, &flags, zoxy_cpu) orelse return 1;
 
     var origin_child = try spawnNginx(arena, io, environ);
     defer origin_child.kill(io);
@@ -123,6 +146,7 @@ pub fn main(init: std.process.Init) !u8 {
         "profile: zoxy pid {d} pinned to cpu {d} ({s}); driving {s} listener; origin + load pinned off it\n",
         .{ zoxy_pid, zoxy_cpu, cycles_event, @tagName(flags.protocol) },
     );
+    if (flags.kernel) announceKernelMode();
 
     // Record only the zoxy pid for the load's duration while zrk saturates it.
     var perf_child = try spawnPerf(arena, io, environ, zoxy_pid, cycles_event, &flags);
@@ -200,6 +224,8 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
                 std.debug.print("profile: --protocol must be l4 or http\n", .{});
                 return error.InvalidArguments;
             }
+        } else if (std.mem.eql(u8, arg, "--kernel")) {
+            flags.kernel = true;
         } else if (!zoxy_path_set and !std.mem.startsWith(u8, arg, "--")) {
             // First bare argument is the zoxy binary (passed by `zig build`).
             flags.zoxy_path = arg;
@@ -208,7 +234,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
             std.debug.print(
                 "usage: profile [zoxy-path] [--rate N] [--connections N] [--threads N] " ++
                     "[--seconds N] [--freq N] [--cpu N] [--quiesce-load F] [--request-ms N] " ++
-                    "[--protocol l4|http]\n",
+                    "[--protocol l4|http] [--kernel]\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -367,7 +393,8 @@ fn cpuListContains(list: []const u8, cpu: u16) bool {
 }
 
 /// The cycles event to sample zoxy with, qualified by the PMU that owns
-/// the dedicated core.
+/// the dedicated core, and scoped to user mode unless `kernel` says
+/// otherwise.
 ///
 /// This matters on a hybrid part. An unqualified `cycles:u` binds to a
 /// single PMU — cpu_atom, as perf resolves it here — while `dedicate`
@@ -376,28 +403,132 @@ fn cpuListContains(list: []const u8, cpu: u16) bool {
 /// a measurement instead of the failure it is. Naming the PMU that owns
 /// the chosen cpu keeps the pairing correct whichever core is picked,
 /// including a `--cpu` override onto an E-core.
-fn cyclesEventFor(io: Io, cpu: u16) []const u8 {
+///
+/// The modifier is the `--kernel` axis: `cpu_core/cycles/u` counts user
+/// mode only, `cpu_core/cycles/` (empty modifier) counts both. Every
+/// figure recorded in IMPLEMENTATION_NOTES.md came off the former, so the
+/// default stays there and the two are never silently mixed.
+fn cyclesEventFor(io: Io, cpu: u16, kernel: bool) []const u8 {
     var buffer: [256]u8 = undefined;
     const event = event: {
         if (readSmallFile(io, "/sys/devices/cpu_core/cpus", &buffer)) |list| {
-            if (cpuListContains(list, cpu)) break :event "cpu_core/cycles/u";
+            if (cpuListContains(list, cpu)) {
+                break :event if (kernel) "cpu_core/cycles/" else "cpu_core/cycles/u";
+            }
         }
         if (readSmallFile(io, "/sys/devices/cpu_atom/cpus", &buffer)) |list| {
-            if (cpuListContains(list, cpu)) break :event "cpu_atom/cycles/u";
+            if (cpuListContains(list, cpu)) {
+                break :event if (kernel) "cpu_atom/cycles/" else "cpu_atom/cycles/u";
+            }
         }
-        break :event "cycles:u";
+        break :event if (kernel) "cycles" else "cycles:u";
     };
     // Every arm names a cycles event, PMU-qualified or plain. An empty or
     // unrelated event is what silently records nothing, which is the bug
     // this function exists to prevent.
     assert(event.len > 0);
     assert(std.mem.indexOf(u8, event, "cycles") != null);
+    // The `u` modifier and `--kernel` are the same decision spelled two
+    // ways; disagreeing would record the opposite of what was asked.
+    assert(kernel != (std.mem.endsWith(u8, event, ":u") or std.mem.endsWith(u8, event, "/u")));
     return event;
 }
 
-/// The remedy for a box whose `ptrace_scope` forbids the attach. Split
-/// out of `main` so the preflight costs it one line, not twelve.
-fn refuseNoPtraceAttach() u8 {
+/// Why a box cannot record kernel-mode samples, or null if it can.
+///
+/// Two independent sysctls, and the second is the one that costs an
+/// afternoon: `perf_event_paranoid` decides whether the samples are taken
+/// at all, `kptr_restrict` decides whether their addresses resolve to
+/// names. With paranoid granted and kptr_restrict left at 1, perf records
+/// a perfectly good profile in which every kernel symbol is `[unknown]` —
+/// a measurement-shaped output carrying no measurement, which is the
+/// failure mode this whole file is written against. Root reads kallsyms
+/// regardless, so it is exempt from the second check only.
+const KernelSampleBlocker = enum { paranoid, kptr_restrict };
+
+fn kernelSampleBlocker(io: Io) ?KernelSampleBlocker {
+    const root = std.os.linux.geteuid() == 0;
+    // `perf_event_paranoid` gates on CAPABILITY at every level, not on a
+    // ceiling: a root process that still holds CAP_PERFMON bypasses all of
+    // them, the Debian/Ubuntu level 3 included. Refusing root at the common
+    // default of 2 would refuse a run that would have worked.
+    if (!root) {
+        if (sysctlLevel(io, "/proc/sys/kernel/perf_event_paranoid")) |level| {
+            if (level > 1) return .paranoid;
+        }
+    }
+    // `kptr_restrict` does NOT work the same way, which is the trap. Level 1
+    // is capability-gated, so root reads real addresses; level 2 hides them
+    // from everyone, root included — `kallsyms_show_value` has no capability
+    // escape there. So root is exempt from 1 and not from 2.
+    if (sysctlLevel(io, "/proc/sys/kernel/kptr_restrict")) |level| {
+        if (level >= 2) return .kptr_restrict;
+        if (level != 0 and !root) return .kptr_restrict;
+    }
+    return null;
+}
+
+/// One small integer sysctl, or null when the box does not answer.
+///
+/// Null covers both ways of not answering, and they are the same answer
+/// here: the file is absent or unreadable, or it is readable and does not
+/// parse. Neither is EVIDENCE OF A RESTRICTION, and this function's
+/// callers refuse a run — so inventing a restriction from an unparseable
+/// file would block a measurement on a box that would have taken it.
+/// The cost of being wrong in this direction is bounded: perf itself
+/// refuses loudly, and `printTopSymbols` reports a zero-sample recording
+/// rather than rendering one.
+fn sysctlLevel(io: Io, path: []const u8) ?i8 {
+    var buffer: [16]u8 = undefined;
+    const content = readSmallFile(io, path, &buffer) orelse return null;
+    assert(content.len <= buffer.len);
+    const text = std.mem.trim(u8, content, " \n\t");
+    assert(text.len <= content.len);
+    if (text.len == 0) return null;
+    return std.fmt.parseInt(i8, text, 10) catch null;
+}
+
+/// The remedy for a box that cannot take kernel-mode samples. Refuses
+/// rather than downgrading to a user-only run: `--kernel` was asked for,
+/// and quietly answering a different question is what the output would
+/// then be.
+fn refuseNoKernelSamples(blocker: KernelSampleBlocker) void {
+    switch (blocker) {
+        .paranoid => std.debug.print(
+            \\profile: --kernel needs kernel.perf_event_paranoid <= 1, so kernel-mode
+            \\  samples would be dropped and the profile would be user-only anyway:
+            \\    sudo sysctl -w kernel.perf_event_paranoid=0
+            \\  (0 rather than 1 also unlocks the syscall tracepoints, which is the
+            \\  other measurement this box cannot currently take.)
+            \\
+        , .{}),
+        .kptr_restrict => std.debug.print(
+            \\profile: --kernel needs kernel.kptr_restrict = 0, or every kernel symbol
+            \\  resolves to [unknown] and the profile looks valid while naming nothing:
+            \\    sudo sysctl -w kernel.kptr_restrict=0
+            \\  or run this profile as root.
+            \\
+        , .{}),
+    }
+}
+
+/// Said in the run's own banner rather than left to whoever reads the
+/// flamegraph later: kernel mode changes what the output means, and what
+/// changes is which half of it can be trusted. The leaves are the answer;
+/// the branches above a kernel leaf are absent, not empty.
+fn announceKernelMode() void {
+    std.debug.print(
+        "profile: kernel-mode samples on — read the symbol table; " ++
+            "LBR does not unwind kernel stacks\n",
+        .{},
+    );
+}
+
+/// The remedy for a box whose `ptrace_scope` forbids the attach. Prints
+/// and returns; `preflight` turns it into the null that stops the run, so
+/// every refusal reaches `main` as one exit code rather than as a message
+/// each call site has to remember to print.
+fn refuseNoPtraceAttach() void {
     std.debug.print(
         \\profile: kernel.yama.ptrace_scope is not 0, so `perf record -p` cannot
         \\  attach to zoxy and the recording would come back empty. Either:
@@ -405,7 +536,6 @@ fn refuseNoPtraceAttach() u8 {
         \\  or run this profile as root.
         \\
     , .{});
-    return 1;
 }
 
 /// Whether `perf record -p` can attach to zoxy at all.
@@ -489,8 +619,20 @@ fn benchConfig(port: u16, rate: u64, connections: u32, threads: u8) zrk.cli.Conf
 /// never went quiet.
 fn preflight(io: Io, flags: *const Flags, zoxy_cpu: u16) !?[]const u8 {
     assert(flags.quiesce_load >= 0);
-    if (!ptraceScopeAllowsAttach(io)) return null;
-    const cycles_event = cyclesEventFor(io, zoxy_cpu);
+    if (!ptraceScopeAllowsAttach(io)) {
+        refuseNoPtraceAttach();
+        return null;
+    }
+    // Kernel samples asked for on a box that cannot take them, refused
+    // here rather than after nginx, zoxy and a whole load window have
+    // been spent producing a user-only profile nobody asked for.
+    if (flags.kernel) {
+        if (kernelSampleBlocker(io)) |blocker| {
+            refuseNoKernelSamples(blocker);
+            return null;
+        }
+    }
+    const cycles_event = cyclesEventFor(io, zoxy_cpu, flags.kernel);
     assert(cycles_event.len >= 1);
     // Before anything is spawned, so the wait is not itself adding load.
     try awaitQuietBox(io, flags);

@@ -616,6 +616,13 @@ chunked L7 bodies fall back to copy regardless. Revisit only under
 genuine CPU/memory-bandwidth saturation — the copy is not the bottleneck
 today (§3's envelope; the loop profile below).
 
+**Now priced, and the price argues against building it** ("What the kernel
+time is doing" below): the copy paths are 4.4% of all cycles and the two
+this op would remove are 2.7%, against skb lifecycle at 7.7% and tcp/ip at
+17.3% which it does not touch. Do not open this without a workload whose
+copy share is materially larger than 2.7% — and measure that share on a
+real NIC, not the loopback box those figures came from.
+
 ### libxev fork queue
 
 The §4 pin policy (DESIGN.md) makes fork changes deliberate, batched
@@ -788,12 +795,85 @@ Three caveats, each of which changes what the table above means.
 - Ops/req measured 4.00 flat at every rate, matching the 4.0 already
   recorded across a 156× connection sweep.
 
-Not measured, and the honest gap: what the 51.9 points of kernel time
-are actually doing. That needs kernel-mode samples, which needs a
-`perf_event_paranoid` this box does not grant by default and a profiler
-event without the `:u` suffix — two changes, neither of which the
-userspace question above required.
+That gap is now closed — see the next section.
 
+## What the kernel time is doing (2026-08-24)
+
+The gap above, measured. `bench/profile.zig` grew a `--kernel` flag that
+drops the `u` modifier from the cycles event, and the box granted
+`perf_event_paranoid=0`, `kptr_restrict=0` and `yama.ptrace_scope=0`.
+L7, 100 k req/s offered, 64 connections, 20 s, zoxy alone on a P-core.
+**73 K samples, 0 lost.**
+
+    kernel  89.3%
+    user    10.5%
+
+**The 10:1 estimate above was right.** It was inferred from `/proc`
+(51.9 kernel against 5.2 user points of a 57.2%-busy core); sampling both
+modes directly says 89.3/10.5. Nothing about the userspace-share warnings
+changes — they were correctly calibrated, and every figure in this file
+that carries one still means what it said.
+
+Grouped, and the groups are what matter rather than any single symbol:
+
+| | share of all cycles |
+|---|---|
+| tcp/ip protocol work | 17.3% |
+| skb lifecycle (alloc, release, defer-free, slab) | 7.7% |
+| **nft + conntrack (this box's firewall)** | **7.2%** |
+| io_uring (`io_submit_sqes` and friends) | 7.0% |
+| spinlocks (`_raw_spin_lock_irqsave`/`_bh`) | 5.4% |
+| copy paths (`_copy_to_iter`, `__skb_datagram_iter`) | 4.4% |
+| all of zoxy's own code | 10.5% |
+
+Top single symbol is `nft_do_chain` at 3.23%, then
+`_raw_spin_lock_irqsave` 2.98%, `skb_release_data` 2.09%,
+`__alloc_skb` 2.05%, `__nf_conntrack_find_get` 1.77%.
+
+Three findings, in order of what they change.
+
+- **This is evidence AGAINST `splice`, not for it.** The copy it removes
+  is the 4.4% row, and `_copy_to_iter` + `__skb_datagram_iter` alone are
+  2.7% of it. Against +4 fds per L4 connection (tripling the fd budget),
+  a `Pool(Pipe)`, a SimIo primitive and a libxev re-audit, that is not a
+  trade worth making. The lever's own entry already said "the copy is not
+  the bottleneck today"; this is the number behind the sentence. What
+  dominates instead — skb lifecycle and TCP protocol work — `splice` does
+  not touch at all.
+- **The largest single cost is not zoxy's.** nft + conntrack is 7.2%,
+  more than every line of zoxy's own code but for a rounding error, and
+  more than any kernel subsystem except TCP itself. The nft loopback
+  bypass recorded above as "environmental work, not zoxy work" is now
+  priced: it would clean ~7 points out of every profile taken here.
+- **zoxy's own code is 10.5%, and the parser is ~2.2% of the total**
+  (`parseResponseHead` 0.75, `analyzeHeaders` 0.66, `parseRequest` 0.53,
+  `classifyHeaderName` 0.28). This is the closing argument for "do not
+  optimize the Zig side", now from the kernel's side of the fence rather
+  than by inference from a 1.26% userspace slice. It also prices the
+  same day's hparse work: a ~19% win on the parser is ~0.4% of total,
+  which is why nothing was expected to move at proxy level and nothing
+  did.
+
+**What it does NOT say, and the limit is severe.** This is loopback, so
+the sender pays the receiver's TCP stack too and the tcp/ip row is
+inflated by an amount nothing here measures; and nft/conntrack is this
+box's configuration, absent on a machine without it. Read the SHAPE —
+protocol and buffer management dominate, copying does not — and re-take
+it on the cloud fleet before any of the rows are quoted as a deployment
+profile. The tooling is in the tree; the sysctls are the only thing a
+fleet run needs that CI does not have.
+
+Reproducibility, since a single profile is not a measurement here: two
+independent 20 s runs gave 89.5/10.3 and 89.3/10.5 with `nft_do_chain`
+at 3.26% and 3.23%. That is tight enough to quote the groups to one
+decimal, and it is the only claim in this section resting on more than
+one run.
+
+The other honest gap is untouched and now matters more: at the 165 k
+req/s ceiling zoxy is at ~55% of its core, latency-bound with CPU
+headroom. Cutting CPU does not raise that ceiling, so the ~45% off-CPU
+residue is the measurement with the most left in it — `perf sched`, and
+the paranoid sysctl this section needed is the one it needs too.
 ## Multishot recv — measured and parked (2026-07-12), closed (2026-07-28)
 
 Best-case echo microbench (pinned cores, ABBA, single-shot vs multishot
