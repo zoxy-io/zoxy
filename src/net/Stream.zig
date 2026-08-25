@@ -24,6 +24,7 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const relay = @import("relay.zig");
+const upstream_module = @import("upstream.zig");
 
 const assert = std.debug.assert;
 
@@ -180,6 +181,8 @@ pub const ClientWrite = struct {
 /// makes it exponential. Passing the type in leaves exactly one
 /// instantiation of each, and `Conn.StreamType` is the one name for it.
 pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
+    const UpstreamType = upstream_module.UpstreamPool(IoType).Upstream;
+
     return struct {
         /// Pool bookkeeping (`mem/Pool.zig`): owned by the pool, and
         /// deliberately untouched by `prepare` — the same rule
@@ -255,6 +258,20 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// The client-directed write in flight, if any (§7, §8) — see
         /// `ClientWrite`. Idle on the L4 path, which relays through the pump.
         client_write: ClientWrite,
+        /// Null until the upstream dial completes; making the socket and
+        /// its presence one field means an unset upstream can never be
+        /// read as a live fd handle.
+        upstream_socket: ?IoType.Socket,
+        /// The cluster to dial. Seeded from the listener at admission; on
+        /// the L7 path `routeRequest` overwrites it with the request
+        /// path's cluster once the head parses (§7).
+        cluster_index: u16,
+        /// The leased upstream slot during an L7 exchange; released at
+        /// teardown alongside the conn slot (§5). Null outside exchanges
+        /// and on the whole L4 path.
+        upstream: ?*UpstreamType,
+        /// L7 exchange bookkeeping (§7); reset per exchange.
+        l7: L7State,
 
         const Self = @This();
 
@@ -267,6 +284,199 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         comptime {
             assert(constants.buffer_group_entries_max <= head_buffer_none);
         }
+
+        /// How a message body is delimited and how much of it remains —
+        /// the §7 framing verdicts turned into countdown state the pumps
+        /// consume chunk by chunk.
+        pub const Framing = union(enum) {
+            none,
+            /// Body bytes still to relay.
+            content_length: u64,
+            /// The scanner owns the end-of-message detection.
+            chunked: parser.ChunkedScanner,
+            /// Responses only: the body runs to the origin's EOF.
+            until_close,
+        };
+
+        /// Per-leg progress of an L7 exchange (§7). The request leg sends
+        /// the rendered head, then pumps the framed body client → origin;
+        /// the response leg starts as soon as the request head is on the
+        /// wire (early responses are legal, §7) and mirrors it back.
+        pub const L7State = struct {
+            request_leg: Leg = .idle,
+            response_leg: Leg = .idle,
+            request_method: parser.Method = .get,
+            request_framing: Framing = .none,
+            response_framing: Framing = .none,
+            /// Bytes of `head` consumed by the request head; body excess
+            /// received with it sits at [request_head_len..head_len].
+            request_head_len: u32 = 0,
+            /// Bytes of `upstream.head` consumed by the response head;
+            /// body excess received with it sits at [marker..head_len].
+            response_head_len_marker: u32 = 0,
+            /// Length of the rendered request head being sent into
+            /// upstream.head, and the cursor over it (short sends resume).
+            /// The response head has no pair here: it goes out through the
+            /// client-write channel, which owns its own cursor
+            /// (`ClientWrite`).
+            rendered_request_len: u32 = 0,
+            request_head_sent: u32 = 0,
+            /// Response body bytes that arrived coalesced with the response
+            /// head and did not fit in `conn.head` beside the rendered head:
+            /// they follow it from `upstream.head[response_head_len_marker..]`
+            /// as the channel's next write. Zero when the excess rode along
+            /// with the head, or when there was none.
+            response_excess_len: u32 = 0,
+            /// Absolute cap on this exchange, set at routing from
+            /// `request_timeout_ms` (§8); `storeDeadline` clamps every
+            /// deadline to it, so unlike the idle timeout no activity can
+            /// push it out. `0` when the timeout is disabled. It lives in
+            /// `l7` rather than beside `birth_ns` precisely so the
+            /// per-request lifetime is structural: every keep-alive
+            /// turnaround clears `l7` wholesale, so the cap cannot outlive
+            /// the exchange that set it even if a rung forgets to retire
+            /// it. Rungs that answer early *do* retire it explicitly, via
+            /// `Server.clearRequestDeadline`. The §7 replay is the one
+            /// place `l7` is rebuilt mid-exchange, so it carries this field
+            /// across by hand — a replay is the same request retrying, not
+            /// a new one earning a fresh budget.
+            request_deadline_ns: u64 = 0,
+            /// Whether this request's #235 head budget is already
+            /// installed. Set on the first parse that comes back
+            /// `Incomplete` — the moment a client is provably mid-sentence
+            /// — and read so the *next* fragment does not install it
+            /// again: a budget a dribbling client could push out by
+            /// dribbling would bound nothing at all.
+            ///
+            /// In `l7` rather than on the connection because the budget is
+            /// one head's, and the wholesale clear at every keep-alive
+            /// turnaround is what makes the next request earn its own.
+            ///
+            /// Unlike `request_deadline_ns` above, the §7 replay does *not*
+            /// carry this across its rebuild, and does not need to: a
+            /// replay runs from `.l7_exchanging` and moves to
+            /// `.l7_dialing`, so it never re-enters the `.l7_reading_head`
+            /// state `installHeadBudget` asserts on. There is no second
+            /// head to budget, so a flag reset to false is inert rather
+            /// than a budget silently reissued.
+            head_budget_installed: bool = false,
+            /// The endpoint identity this request's stickiness cookie
+            /// named (#178), or null when the cluster is not
+            /// cookie-keyed or the request carried nothing usable.
+            /// Recorded at routing — the head bytes are gone by the
+            /// response render (§7 buffer rotation), and the render is
+            /// exactly who asks: it compares this against the endpoint
+            /// that actually served, and stamps a Set-Cookie on any
+            /// mismatch. The replay rebuild re-derives it from its
+            /// re-parse, like the framing.
+            sticky_cookie: ?u64 = null,
+            /// True once the request head has been forwarded off conn.head
+            /// (head sent and any coalesced body excess drained), so the
+            /// response head may render into conn.head (§7 buffer rotation).
+            request_head_vacated: bool = false,
+            /// The origin's head parsed while conn.head was still occupied;
+            /// render it once `request_head_vacated`.
+            response_render_pending: bool = false,
+            /// True once any response byte reached the client — the §8
+            /// verdict split between answering 502 and plain teardown.
+            response_started: bool = false,
+            /// A verdict decided while data ops were still armed, acted on
+            /// when the last one settles: ops are never canceled (§5), they
+            /// are *forced* — the upstream socket is shut down and each
+            /// armed op completes with an error its handler diverts on.
+            pending_verdict: PendingVerdict = .none,
+            /// The armed request-leg op is a recv on the CLIENT socket
+            /// (the body pump). Such an op cannot be forced without closing
+            /// the client the verdict would answer, so expiry stays a
+            /// teardown then — the stall is the client's own body (§8).
+            request_op_on_client: bool = false,
+            /// The client's persistence ask (RFC 9112 §9), captured at
+            /// routing; the render-time decision may still announce close
+            /// (pressure, drain, §8).
+            client_keep_alive: bool = false,
+            /// What the rendered response told the client. The connection
+            /// honors its own announcement: a keep-alive answer keeps
+            /// serving, an announced close closes (§7).
+            downstream_close_announced: bool = true,
+            /// The origin's persistence verdict from its response head;
+            /// parking requires it (§5).
+            upstream_reusable: bool = false,
+            /// The client sent bytes past the request's framing — a
+            /// pipelined next request. Pipelining is unsupported: the
+            /// exchange completes and the connection closes, dropping the
+            /// early bytes (§7 note; clients recover per RFC).
+            client_pipelined: bool = false,
+            /// This try runs over a checked-out parked connection (§5) —
+            /// the precondition for the §7 stale replay: only a *reused*
+            /// connection's early failure is blamed on staleness.
+            upstream_was_reused: bool = false,
+            /// The request leg entered the body pump: relay-buffer chunks
+            /// flowed and were overwritten, so the try is no longer
+            /// reconstructible from conn.head — replay is off the table.
+            request_body_pumped: bool = false,
+            /// The one free replay is spent (§7): a failure on the replay
+            /// try answers 502 like any other, never a second replay.
+            replay_used: bool = false,
+            /// This request asked for an upgrade the listener allows, and
+            /// a tunnel buffer is held for it (#180). What makes `101`
+            /// terminal rather than interim on the response path, and what
+            /// tells the render to let the participating
+            /// `Connection`/`Upgrade` pair travel.
+            upgrade_requested: bool = false,
+            /// Interim `1xx` responses this exchange has already relayed
+            /// (#232). Per exchange, not per connection: the bound is
+            /// about one origin answering one request, and a keep-alive
+            /// turnaround clears `l7` wholesale, so it cannot leak into
+            /// the next request even if a path forgets to reset it.
+            interims_seen: u8 = 0,
+            /// The endpoints this request dialed and had refused or found
+            /// unreachable (#181), in the order it tried them — the
+            /// exclusion set the next pick runs over. Sized for the first
+            /// try plus every retry the largest configured budget allows,
+            /// so it is a fixed field like everything else on this
+            /// connection and never grows.
+            tried: [constants.cluster_retries_max + 1]u16 = @splat(0),
+            /// How many of `tried` are written. Every entry past it is
+            /// stale from an earlier request on this connection and must
+            /// not be read.
+            tried_count: u16 = 0,
+            /// Retries spent against the cluster's budget. Equal to
+            /// `tried_count` between hops, since a retry records the
+            /// endpoint that failed and spends a retry to leave it in the
+            /// same step — and one *behind* it in the terminal state where
+            /// the endpoint set ran out first, because that last failure
+            /// is recorded and then answered rather than retried.
+            retries_used: u16 = 0,
+
+            pub const Leg = enum(u8) {
+                idle,
+                sending_head,
+                awaiting_head,
+                /// Forwarding body bytes that arrived coalesced with the
+                /// head, sent straight from the head buffer (§7) so a body
+                /// larger than a relay buffer is never copied through one.
+                sending_body_excess,
+                pumping_body,
+                done,
+            };
+
+            /// The deferred verdicts: the §8 request-deadline 504 and the
+            /// §7 stale-replay retry, both settled once the last armed
+            /// data op is forced to completion.
+            pub const PendingVerdict = enum(u8) {
+                none,
+                gateway_timeout,
+                replay,
+                /// The #235 head budget expired on a client mid-sentence,
+                /// and it is owed a `408` (#247). The odd one out: the
+                /// armed op it waits on is a recv on the **client**
+                /// socket, so the force is a read-half shutdown rather
+                /// than the upstream teardown the other two use — the
+                /// connection has to survive writable to carry the
+                /// answer.
+                request_timeout,
+            };
+        };
 
         /// Which leg of the exchange, and the index into `directions`.
         pub const Direction = enum(u1) {
@@ -326,10 +536,19 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             stream.head_len = 0;
             stream.head_cursor.reset();
             stream.client_write = .{};
+            stream.upstream_socket = null;
+            stream.upstream = null;
+            stream.l7 = .{};
+            // The listener's, and so not known until the admission tail
+            // resolves one (`finishAdmission`); on the L7 path `routeRequest`
+            // overwrites it per request anyway (§7).
+            stream.cluster_index = 0;
             assert(stream.armedCount() == 0);
             assert(stream.relay_buffer == null);
             assert(stream.head_len == 0);
             assert(stream.client_write.pending.len == 0);
+            assert(stream.upstream == null);
+            assert(stream.l7.request_leg == .idle);
         }
 
         /// Records the arm in the op and the armed set; call immediately

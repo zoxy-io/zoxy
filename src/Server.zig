@@ -1755,7 +1755,7 @@ pub fn Server(comptime IoType: type) type {
                 .l4 => {
                     // A recv must always have a buffer posted (§6).
                     assert(conn.stream.relay_buffer != null);
-                    server.armConnect(conn, conn.cluster_index);
+                    server.armConnect(conn, conn.stream.cluster_index);
                 },
                 .http => {
                     // An idle L7 connection holds no relay buffer (§5).
@@ -1852,7 +1852,6 @@ pub fn Server(comptime IoType: type) type {
                 client_socket,
                 engine,
                 entryState(listener.protocol),
-                listener.cluster_index,
                 listener.protocol,
                 // Asked once, here, and kept: at log time the socket may
                 // already be closed (§8).
@@ -1872,6 +1871,10 @@ pub fn Server(comptime IoType: type) type {
             conn.upgrades = listener.upgrades;
             conn.max_body_bytes = listener.max_body_bytes;
             conn.forwarded = listener.forwarded;
+            // The exchange's starting cluster, from the same listener and
+            // for the same reason as the tables above — the L7 path
+            // overwrites it at routing once the head parses (§7).
+            conn.stream.cluster_index = listener.cluster_index;
             // The L4 relay buffer is claimed after the conn slot, so it
             // arrives after the stream that will carry it — installed
             // here rather than threaded through `Stream.prepare`, which
@@ -2870,7 +2873,7 @@ pub fn Server(comptime IoType: type) type {
                 // The teardown raced the dial. A socket that arrived
                 // anyway must still be shut down and closed.
                 if (result) |socket| {
-                    conn.upstream_socket = socket;
+                    conn.stream.upstream_socket = socket;
                     server.io.shutdown(socket, .both);
                 } else |_| {}
                 server.continueTeardown(conn);
@@ -2908,7 +2911,7 @@ pub fn Server(comptime IoType: type) type {
                 server.beginTeardown(conn);
                 return;
             };
-            conn.upstream_socket = socket;
+            conn.stream.upstream_socket = socket;
             server.io.setNodelay(socket) catch |err| {
                 server.witnessKernelPressure(.set_option, err);
             };
@@ -2926,7 +2929,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.isLive());
             conn.state = .tearing_down;
             server.io.shutdown(conn.client_socket, .both);
-            if (conn.upstream_socket) |socket| {
+            if (conn.stream.upstream_socket) |socket| {
                 server.io.shutdown(socket, .both);
             }
             // A dial-timeout verdict (§8) may already have a cancel in
@@ -2964,7 +2967,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.stream.armedCount() == 0);
             // Both fds are shut: nothing here may reference a socket, and
             // the upstream one is the field the caller cleared.
-            assert(conn.upstream_socket == null);
+            assert(conn.stream.upstream_socket == null);
             // The §5 tunnel buffer first, and the order matters: a live
             // tunnel's `relay_buffer` *aliases* its `tunnel_buffer`
             // (#180), so releasing the shared way would hand one pool's
@@ -2999,9 +3002,9 @@ pub fn Server(comptime IoType: type) type {
             // The leased upstream slot rides the same release rule: its
             // socket (if any) was closed by the caller, so the slot is
             // inert (§5). Parking replaces this with reuse later.
-            if (conn.upstream) |leased| {
+            if (conn.stream.upstream) |leased| {
                 server.releaseUpstream(leased);
-                conn.upstream = null;
+                conn.stream.upstream = null;
             }
             // The L4 endpoint charge rides the same rule: the socket that
             // made this connection work against an origin is closed, so
@@ -3019,7 +3022,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls == null);
             assert(conn.stream.relay_buffer == null);
             assert(conn.tunnel_buffer == null);
-            assert(conn.upstream == null);
+            assert(conn.stream.upstream == null);
             assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
         }
 
@@ -3051,9 +3054,9 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.armedCount() == 0);
             assert(conn.stream.armedCount() == 0);
             server.io.closeNow(conn.client_socket);
-            if (conn.upstream_socket) |socket| {
+            if (conn.stream.upstream_socket) |socket| {
                 server.io.closeNow(socket);
-                conn.upstream_socket = null;
+                conn.stream.upstream_socket = null;
             }
             server.releasePooledResources(conn);
             // The last chance to say anything about this connection (§8).
@@ -3102,8 +3105,8 @@ pub fn Server(comptime IoType: type) type {
             // carried since routing; a stale one would name another
             // operator's backend in the line, so they are checked here
             // rather than left to Zig's bounds check to turn into a panic.
-            assert(conn.cluster_index < server.config.clusters.len);
-            const cluster = server.config.clusters[conn.cluster_index];
+            assert(conn.stream.cluster_index < server.config.clusters.len);
+            const cluster = server.config.clusters[conn.stream.cluster_index];
             if (conn.log.endpoint_index != conn_module.LogState.endpoint_none) {
                 assert(conn.log.endpoint_index < cluster.endpoints.len);
             }
@@ -3132,8 +3135,8 @@ pub fn Server(comptime IoType: type) type {
                 .host = conn.log.hostSlice(),
                 .path = conn.log.pathSlice(),
                 .status = conn.log.status,
-                .upstream_reused = conn.l7.upstream_was_reused,
-                .upstream_replayed = conn.l7.replay_used,
+                .upstream_reused = conn.stream.l7.upstream_was_reused,
+                .upstream_replayed = conn.stream.l7.replay_used,
                 .request_headers = logged.request,
                 .response_headers = logged.response,
             };
@@ -3480,8 +3483,8 @@ pub fn Server(comptime IoType: type) type {
             // turnaround clears `l7`), so the clamp is inert outside an
             // exchange. Its arming side re-bases the armed timer, which is
             // what makes it fire *on* time rather than at the next tick.
-            if (conn.l7.request_deadline_ns != 0) {
-                deadline_ns = @min(deadline_ns, conn.l7.request_deadline_ns);
+            if (conn.stream.l7.request_deadline_ns != 0) {
+                deadline_ns = @min(deadline_ns, conn.stream.l7.request_deadline_ns);
             }
             conn.deadline_ns = deadline_ns;
         }
@@ -3504,7 +3507,7 @@ pub fn Server(comptime IoType: type) type {
         /// widens to the idle budget; `expireDeadline`'s two verdict
         /// branches store their fixed grace window.
         pub fn clearRequestDeadline(conn: *ConnType) void {
-            conn.l7.request_deadline_ns = 0;
+            conn.stream.l7.request_deadline_ns = 0;
         }
 
         fn armDeadline(server: *Self, conn: *ConnType) void {
@@ -3682,7 +3685,7 @@ pub fn Server(comptime IoType: type) type {
             // clamp them straight back to this already-expired cap.
             clearRequestDeadline(conn);
             if (conn.state == .l7_exchanging and
-                conn.l7.pending_verdict == .none and
+                conn.stream.l7.pending_verdict == .none and
                 Proxy.expiryAnswerable(conn))
             {
                 // The verdict grace bounds the escape hatch, not idle
@@ -3694,13 +3697,13 @@ pub fn Server(comptime IoType: type) type {
                 Proxy.beginExpiry(server, conn);
                 return;
             }
-            if (conn.state == .l7_dialing and conn.l7.pending_verdict == .none) {
+            if (conn.state == .l7_dialing and conn.stream.l7.pending_verdict == .none) {
                 // At loop-rest a dialing L7 connection always has its
                 // connect in flight, no data ops, and no response byte.
                 assert(conn.stream.armed.connect);
                 assert(!conn.stream.armed.connect_cancel);
-                assert(!conn.l7.response_started);
-                conn.l7.pending_verdict = .gateway_timeout;
+                assert(!conn.stream.l7.response_started);
+                conn.stream.l7.pending_verdict = .gateway_timeout;
                 // Same fixed grace as the exchange verdict above.
                 server.storeDeadline(conn, server.config.idle_timeout_ms);
                 server.armDeadline(conn);
@@ -3718,8 +3721,8 @@ pub fn Server(comptime IoType: type) type {
             // the state: a connection in `.l7_reading_head` may still be
             // on the idle window, because the budget is installed at the
             // first `Incomplete` and not at the first byte.
-            if (conn.state == .l7_reading_head and conn.l7.head_budget_installed and
-                conn.l7.pending_verdict == .none)
+            if (conn.state == .l7_reading_head and conn.stream.l7.head_budget_installed and
+                conn.stream.l7.pending_verdict == .none)
             {
                 // Gated on the verdict, not merely on the state: the
                 // grace window this branch installs could in principle
@@ -3776,7 +3779,7 @@ pub fn Server(comptime IoType: type) type {
             // connect completion's divert clears it, and that divert
             // leaves .l7_dialing in the same callback.
             if (conn.state == .l7_dialing) {
-                assert(conn.l7.pending_verdict == .gateway_timeout);
+                assert(conn.stream.l7.pending_verdict == .gateway_timeout);
             }
         }
 

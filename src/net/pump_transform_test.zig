@@ -125,7 +125,7 @@ fn Base(comptime direction: Direction) type {
 
         fn targetSocket(conn: *const ConnSim) SimIo.Socket {
             return switch (direction) {
-                .client_to_upstream => conn.upstream_socket.?,
+                .client_to_upstream => conn.stream.upstream_socket.?,
                 .upstream_to_client => conn.client_socket,
             };
         }
@@ -715,11 +715,10 @@ const Harness = struct {
             // the layer a transform sits above rather than inside.
             null,
             .connecting,
-            0,
             .l4,
             bed.server.io.peerAddress(bed.proxy_client_socket),
         );
-        conn.upstream_socket = bed.proxy_upstream_socket;
+        conn.stream.upstream_socket = bed.proxy_upstream_socket;
         conn.state = .relaying;
         bed.conn = conn;
         bed.server.storeDeadline(conn, 5_000);

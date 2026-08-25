@@ -58,7 +58,7 @@ pub fn Relay(comptime IoType: type) type {
             return struct {
                 fn targetSocket(conn: *const ConnType) IoType.Socket {
                     return switch (direction) {
-                        .client_to_upstream => conn.upstream_socket.?,
+                        .client_to_upstream => conn.stream.upstream_socket.?,
                         .upstream_to_client => conn.client_socket,
                     };
                 }
@@ -348,7 +348,7 @@ pub fn Relay(comptime IoType: type) type {
 
         pub fn start(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .relaying);
-            assert(conn.upstream_socket != null);
+            assert(conn.stream.upstream_socket != null);
             const client_to_upstream =
                 &conn.stream.directions[@intFromEnum(Direction.client_to_upstream)];
             if (client_to_upstream.owed() >= 1) {

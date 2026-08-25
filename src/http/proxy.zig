@@ -148,7 +148,7 @@ pub fn Proxy(comptime IoType: type) type {
     const ConnType = conn_module.Conn(IoType);
     const StreamType = ConnType.StreamType;
     const UpstreamType = @import("../net/upstream.zig").UpstreamPool(IoType).Upstream;
-    const Framing = ConnType.Framing;
+    const Framing = StreamType.Framing;
 
     return struct {
         /// Entry from admission: the slot is prepared in `.l7_reading_head`
@@ -226,8 +226,8 @@ pub fn Proxy(comptime IoType: type) type {
             // left HTTPS slowlorises the whole idle window; answering in
             // one arm and resetting in the other would be that defect
             // again, wearing the fix's clothes.
-            if (conn.l7.pending_verdict != .none) {
-                assert(conn.l7.pending_verdict == .request_timeout);
+            if (conn.stream.l7.pending_verdict != .none) {
+                assert(conn.stream.l7.pending_verdict == .request_timeout);
                 settlePendingVerdict(server, conn);
                 return;
             }
@@ -554,8 +554,8 @@ pub fn Proxy(comptime IoType: type) type {
             // error handling below so a forced EOF never reaches the
             // kernel-pressure witness, the same order `settlePendingVerdict`
             // relies on for the upstream verdicts.
-            if (conn.l7.pending_verdict != .none) {
-                assert(conn.l7.pending_verdict == .request_timeout);
+            if (conn.stream.l7.pending_verdict != .none) {
+                assert(conn.stream.l7.pending_verdict == .request_timeout);
                 settlePendingVerdict(server, conn);
                 return;
             }
@@ -647,8 +647,8 @@ pub fn Proxy(comptime IoType: type) type {
         /// bias exists for.
         fn installHeadBudget(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
-            if (conn.l7.head_budget_installed) return;
-            conn.l7.head_budget_installed = true;
+            if (conn.stream.l7.head_budget_installed) return;
+            conn.stream.l7.head_budget_installed = true;
             const budget_ms = @min(server.config.head_timeout_ms, server.idleTimeoutMs());
             assert(budget_ms >= 1);
             server.narrowDeadline(conn, budget_ms);
@@ -874,11 +874,11 @@ pub fn Proxy(comptime IoType: type) type {
             // Once per request: `resetForNextRequest` and
             // `resumeAfterStaticResponse` both clear `l7` on the turnaround,
             // so a second recording would mean a head was routed twice.
-            assert(conn.l7.request_head_len == 0);
-            conn.l7.request_method = request.method;
-            conn.l7.request_framing = framingFromParsed(request.framing);
-            conn.l7.request_head_len = request.head_len;
-            conn.l7.client_keep_alive = request.keep_alive;
+            assert(conn.stream.l7.request_head_len == 0);
+            conn.stream.l7.request_method = request.method;
+            conn.stream.l7.request_framing = framingFromParsed(request.framing);
+            conn.stream.l7.request_head_len = request.head_len;
+            conn.stream.l7.client_keep_alive = request.keep_alive;
             // Copied out now because the head buffer is not the log's to
             // read later: the response head renders over it (§7 buffer
             // rotation), and by the exchange's settle these bytes are gone.
@@ -899,12 +899,12 @@ pub fn Proxy(comptime IoType: type) type {
         /// exchange clamps under a timer already due on time.
         fn armRequestDeadline(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
-            assert(conn.l7.request_deadline_ns == 0);
+            assert(conn.stream.l7.request_deadline_ns == 0);
             if (server.config.request_timeout_ms == 0) return;
             const now_ns = server.io.nowNs();
-            conn.l7.request_deadline_ns = now_ns +
+            conn.stream.l7.request_deadline_ns = now_ns +
                 @as(u64, server.config.request_timeout_ms) * std.time.ns_per_ms;
-            assert(conn.l7.request_deadline_ns > now_ns);
+            assert(conn.stream.l7.request_deadline_ns > now_ns);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.rebaseDeadline(conn);
         }
@@ -1039,7 +1039,7 @@ pub fn Proxy(comptime IoType: type) type {
                     .respond => |page| return respondWithPage(server, conn, page),
                 }
             }
-            conn.cluster_index = router.route(conn.routes, keys.host, keys.views.match) orelse {
+            conn.stream.cluster_index = router.route(conn.routes, keys.host, keys.views.match) orelse {
                 return respond(server, conn, 404, "l7_no_route");
             };
 
@@ -1060,9 +1060,9 @@ pub fn Proxy(comptime IoType: type) type {
             conn: *const ConnType,
             request: *const parser.RequestHead,
         ) Balancer.RequestKey {
-            assert(conn.cluster_index < server.config.clusters.len);
+            assert(conn.stream.cluster_index < server.config.clusters.len);
             assert(request.head_len >= 1);
-            const cluster = &server.config.clusters[conn.cluster_index];
+            const cluster = &server.config.clusters[conn.stream.cluster_index];
             if (cluster.pick != .hash) {
                 return .none;
             }
@@ -1093,7 +1093,7 @@ pub fn Proxy(comptime IoType: type) type {
         fn streamOverLimit(conn: *const ConnType) bool {
             assert(conn.state == .l7_exchanging);
             if (conn.max_body_bytes == 0) return false; // Opted out.
-            return switch (conn.l7.request_framing) {
+            return switch (conn.stream.l7.request_framing) {
                 .chunked => |scanner| scanner.body_bytes > conn.max_body_bytes,
                 .none, .content_length, .until_close => false,
             };
@@ -1134,7 +1134,7 @@ pub fn Proxy(comptime IoType: type) type {
         fn admitUpgrade(server: *ServerType, conn: *ConnType, token: []const u8) bool {
             assert(conn.state == .l7_reading_head);
             assert(conn.tunnel_buffer == null);
-            assert(!conn.l7.upgrade_requested);
+            assert(!conn.stream.l7.upgrade_requested);
             if (!conn.upgrades.websocket or !std.ascii.eqlIgnoreCase(token, "websocket")) {
                 respond(server, conn, 501, "l7_not_implemented");
                 return false;
@@ -1152,7 +1152,7 @@ pub fn Proxy(comptime IoType: type) type {
                 respond(server, conn, 503, "l7_shed_tunnels");
                 return false;
             };
-            conn.l7.upgrade_requested = true;
+            conn.stream.l7.upgrade_requested = true;
             return true;
         }
 
@@ -1172,12 +1172,12 @@ pub fn Proxy(comptime IoType: type) type {
             request_key: Balancer.RequestKey,
         ) ?Balancer.Pick {
             const outcome = server.balancer.pick(
-                conn.cluster_index,
+                conn.stream.cluster_index,
                 &server.endpointLoad(),
                 server.health.healthy,
                 &conn.client_address,
                 request_key,
-                conn.l7.tried[0..conn.l7.tried_count],
+                conn.stream.l7.tried[0..conn.stream.l7.tried_count],
             );
             switch (outcome) {
                 .dial => |chosen| return chosen,
@@ -1188,7 +1188,7 @@ pub fn Proxy(comptime IoType: type) type {
                     // "they are full", and the shed rungs must not absorb
                     // it. A first try cannot land here — the routable set
                     // is non-empty until something has been tried.
-                    assert(conn.l7.tried_count >= 1);
+                    assert(conn.stream.l7.tried_count >= 1);
                     server.counters.increment("upstream_retries_exhausted");
                     respond(server, conn, 502, "l7_bad_gateway");
                     return null;
@@ -1198,7 +1198,7 @@ pub fn Proxy(comptime IoType: type) type {
                     // this fires precisely because no endpoint could be
                     // picked — all of them were full, so an endpoint
                     // label would be an invention.
-                    server.labeled.incrementCluster(.l7_shed_inflight, conn.cluster_index);
+                    server.labeled.incrementCluster(.l7_shed_inflight, conn.stream.cluster_index);
                     respond(server, conn, 503, "l7_shed_endpoint_inflight");
                     return null;
                 },
@@ -1236,20 +1236,20 @@ pub fn Proxy(comptime IoType: type) type {
             // The head bytes are gone by the response render (§7 buffer
             // rotation), so the render's half of #178 — "did the request
             // already name the endpoint it got?" — is recorded now.
-            conn.l7.sticky_cookie = switch (request_key) {
+            conn.stream.l7.sticky_cookie = switch (request_key) {
                 .endpoint => |identity| identity,
                 else => null,
             };
             const pick = pickEndpointOrShed(server, conn, request_key) orelse return;
-            if (server.upstreams.checkout(conn.cluster_index, pick.endpoint_index)) |parked| {
+            if (server.upstreams.checkout(conn.stream.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
                 // pick: a request shed for want of a slot contacted no
                 // origin, and a line claiming one would send an operator
                 // looking at a backend that never saw the request (§8).
                 conn.log.endpoint_index = pick.endpoint_index;
-                conn.upstream = parked;
-                conn.upstream_socket = parked.socket;
+                conn.stream.upstream = parked;
+                conn.stream.upstream_socket = parked.socket;
                 parked.head_len = 0;
                 // A parked slot released its head buffer before parking;
                 // the exchange re-acquires here, still in
@@ -1257,7 +1257,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // socket is closed with the slot — the shed costs a
                 // parked origin connection, not a client one).
                 if (!acquireUpstreamHeadOrShed(server, conn)) return;
-                conn.l7.upstream_was_reused = true;
+                conn.stream.l7.upstream_was_reused = true;
                 conn.state = .l7_dialing;
                 // No await happened: this runs in the same callback as the
                 // parse whose result is still live, so the reuse path —
@@ -1281,7 +1281,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// `respond` has already released the slot the caller just
         /// obtained, so the caller only returns.
         fn acquireUpstreamHeadOrShed(server: *ServerType, conn: *ConnType) bool {
-            const upstream = conn.upstream.?;
+            const upstream = conn.stream.upstream.?;
             assert(upstream.head_buffer == null);
             upstream.head_buffer = server.acquireUpstreamHeadBuffer() orelse {
                 respond(server, conn, 503, "l7_shed_upstream_head_buffers");
@@ -1321,9 +1321,9 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_reading_head or conn.state == .l7_dialing or
                 conn.state == .l7_exchanging);
             if (conn.state == .l7_dialing) assert(budget == .carried);
-            assert(conn.upstream == null);
-            assert(conn.upstream_socket == null);
-            conn.upstream = server.acquireUpstream(conn.cluster_index, pick.endpoint_index) orelse {
+            assert(conn.stream.upstream == null);
+            assert(conn.stream.upstream_socket == null);
+            conn.stream.upstream = server.acquireUpstream(conn.stream.cluster_index, pick.endpoint_index) orelse {
                 return respond(server, conn, 503, "l7_shed_upstream_slots");
             };
             if (!acquireUpstreamHeadOrShed(server, conn)) return;
@@ -1392,24 +1392,24 @@ pub fn Proxy(comptime IoType: type) type {
                 // The teardown raced the dial (§5): a socket that arrived
                 // anyway must still be shut down and closed.
                 if (result) |socket| {
-                    conn.upstream_socket = socket;
+                    conn.stream.upstream_socket = socket;
                     server.io.shutdown(socket, .both);
                 } else |_| {}
                 server.continueTeardown(conn);
                 return;
             }
             assert(conn.state == .l7_dialing);
-            if (conn.l7.pending_verdict != .none) {
+            if (conn.stream.l7.pending_verdict != .none) {
                 // The §8 dial-timeout verdict: the deadline canceled this
                 // connect. Whatever the result — the expected Canceled, a
                 // genuine failure, or a success that raced the cancel —
                 // the dial is condemned; a socket that arrived anyway is
                 // attached so respond's upstream disposal closes it.
-                assert(conn.l7.pending_verdict == .gateway_timeout);
-                conn.l7.pending_verdict = .none;
+                assert(conn.stream.l7.pending_verdict == .gateway_timeout);
+                conn.stream.l7.pending_verdict = .none;
                 if (result) |socket| {
-                    conn.upstream.?.socket = socket;
-                    conn.upstream_socket = socket;
+                    conn.stream.upstream.?.socket = socket;
+                    conn.stream.upstream_socket = socket;
                 } else |_| {}
                 witnessNoResponse(server, conn);
                 respond(server, conn, 504, "l7_gateway_timeout");
@@ -1421,10 +1421,10 @@ pub fn Proxy(comptime IoType: type) type {
                 // await, but the leased slot did — it still names the
                 // endpoint this dial was for, and `respond`'s disposal
                 // releases it only after this line.
-                assert(conn.upstream != null);
+                assert(conn.stream.upstream != null);
                 server.labeled.incrementEndpoint(.connect_failed, server.upstreams.keys.key(
-                    conn.upstream.?.cluster_index,
-                    conn.upstream.?.endpoint_index,
+                    conn.stream.upstream.?.cluster_index,
+                    conn.stream.upstream.?.endpoint_index,
                 ));
                 // Same split as the L4 dial: the origin's verdict arrives
                 // typed, our own resource exhaustion does not (§8).
@@ -1437,8 +1437,8 @@ pub fn Proxy(comptime IoType: type) type {
                 // outage.
                 if (err != error.Unexpected) {
                     server.health.witnessPassiveFailure(
-                        conn.upstream.?.cluster_index,
-                        conn.upstream.?.endpoint_index,
+                        conn.stream.upstream.?.cluster_index,
+                        conn.stream.upstream.?.endpoint_index,
                     );
                 }
                 if (retryEligible(server, conn, err)) {
@@ -1448,8 +1448,8 @@ pub fn Proxy(comptime IoType: type) type {
                 respond(server, conn, 502, "l7_bad_gateway");
                 return;
             };
-            conn.upstream.?.socket = socket;
-            conn.upstream_socket = socket;
+            conn.stream.upstream.?.socket = socket;
+            conn.stream.upstream_socket = socket;
             server.io.setNodelay(socket) catch |err| {
                 server.witnessKernelPressure(.set_option, err);
             };
@@ -1478,7 +1478,7 @@ pub fn Proxy(comptime IoType: type) type {
             err: Io.ConnectError,
         ) bool {
             assert(conn.state == .l7_dialing);
-            assert(conn.upstream != null);
+            assert(conn.stream.upstream != null);
             // Exhaustive rather than an `else`, so a fifth connect error
             // is a compile error here — a decision to make once, not a
             // default to inherit silently.
@@ -1486,10 +1486,10 @@ pub fn Proxy(comptime IoType: type) type {
                 error.Refused, error.Unreachable => {},
                 error.Canceled, error.Unexpected => return false,
             }
-            const budget = server.config.clusters[conn.cluster_index].retries;
+            const budget = server.config.clusters[conn.stream.cluster_index].retries;
             assert(budget <= constants.cluster_retries_max);
-            assert(conn.l7.retries_used <= budget);
-            return conn.l7.retries_used < budget;
+            assert(conn.stream.l7.retries_used <= budget);
+            return conn.stream.l7.retries_used < budget;
         }
 
         /// Spend one retry: record the endpoint that refused, give its
@@ -1504,13 +1504,13 @@ pub fn Proxy(comptime IoType: type) type {
         /// reason: only the bytes survive an await, and they are unchanged.
         fn beginRetry(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_dialing);
-            assert(conn.upstream_socket == null); // A failed dial produced none.
+            assert(conn.stream.upstream_socket == null); // A failed dial produced none.
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
-            const failed = conn.upstream.?;
-            assert(conn.l7.tried_count < conn.l7.tried.len);
-            conn.l7.tried[conn.l7.tried_count] = failed.endpoint_index;
-            conn.l7.tried_count += 1;
+            const failed = conn.stream.upstream.?;
+            assert(conn.stream.l7.tried_count < conn.stream.l7.tried.len);
+            conn.stream.l7.tried[conn.stream.l7.tried_count] = failed.endpoint_index;
+            conn.stream.l7.tried_count += 1;
             // Released before the re-pick, not after: the endpoint's
             // in-flight total is what `p2c` and the §8 cap read, and
             // leaving a dead dial counted there would make the retry
@@ -1518,7 +1518,7 @@ pub fn Proxy(comptime IoType: type) type {
             // doing. The slot is re-acquired in the same callback, so the
             // pool cannot have been emptied in between.
             server.releaseUpstream(failed);
-            conn.upstream = null;
+            conn.stream.upstream = null;
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
             const request = parser.parseRequestHead(
@@ -1534,8 +1534,8 @@ pub fn Proxy(comptime IoType: type) type {
             // and that has not changed.
             const request_key = requestKeyFor(server, conn, &request);
             const pick = pickEndpointOrShed(server, conn, request_key) orelse return;
-            assert(pick.endpoint_index != conn.l7.tried[conn.l7.tried_count - 1]);
-            conn.l7.retries_used += 1;
+            assert(pick.endpoint_index != conn.stream.l7.tried[conn.stream.l7.tried_count - 1]);
+            conn.stream.l7.retries_used += 1;
             server.counters.increment("upstream_retried");
             dialUpstream(server, conn, pick, .carried);
         }
@@ -1557,7 +1557,7 @@ pub fn Proxy(comptime IoType: type) type {
                 storage,
                 null,
             ) catch unreachable;
-            assert(request.head_len == conn.l7.request_head_len);
+            assert(request.head_len == conn.stream.l7.request_head_len);
             // Only this path pays for canonicalization twice, and it has
             // to: routeRequest's use of the shared scratch ended with its
             // frame at the dial — which is also why reusing the same
@@ -1593,10 +1593,10 @@ pub fn Proxy(comptime IoType: type) type {
             scratch: *RenderScratch,
         ) void {
             assert(conn.state == .l7_dialing);
-            assert(request.head_len == conn.l7.request_head_len);
+            assert(request.head_len == conn.stream.l7.request_head_len);
             assert(views.forward.path.len >= 1);
             assert(views.match.len >= 1);
-            const upstream = conn.upstream.?;
+            const upstream = conn.stream.upstream.?;
             // Acquired back when the slot was obtained (`acquireUpstreamHeadOrShed`),
             // while the state still allowed a kept shed; by render time it
             // is a held invariant, not a question.
@@ -1635,7 +1635,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // The participating `Upgrade` travels only when this
                 // listener agreed to carry it (#180); the gate already
                 // refused every other spelling.
-                conn.l7.upgrade_requested,
+                conn.stream.l7.upgrade_requested,
                 &scratch.head,
                 upstreamHeadBytes(upstream),
             ) catch {
@@ -1644,10 +1644,10 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, conn, 431, "l7_headers_too_large");
             };
             assert(rendered.len >= 1);
-            conn.l7.rendered_request_len = @intCast(rendered.len);
-            conn.l7.request_head_sent = 0;
+            conn.stream.l7.rendered_request_len = @intCast(rendered.len);
+            conn.stream.l7.request_head_sent = 0;
             conn.state = .l7_exchanging;
-            conn.l7.request_leg = .sending_head;
+            conn.stream.l7.request_leg = .sending_head;
             server.storeDeadline(conn, server.idleTimeoutMs());
             armRequestHeadSend(server, conn);
         }
@@ -1735,14 +1735,14 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn armRequestHeadSend(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .sending_head);
-            const l7 = &conn.l7;
+            assert(conn.stream.l7.request_leg == .sending_head);
+            const l7 = &conn.stream.l7;
             assert(l7.request_head_sent < l7.rendered_request_len);
             l7.request_op_on_client = false; // A send on the upstream socket.
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
-                conn.upstream_socket.?,
-                upstreamHeadBytes(conn.upstream.?)[l7.request_head_sent..l7.rendered_request_len],
+                conn.stream.upstream_socket.?,
+                upstreamHeadBytes(conn.stream.upstream.?)[l7.request_head_sent..l7.rendered_request_len],
                 &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -1758,8 +1758,8 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .sending_head);
-            if (conn.l7.pending_verdict != .none) {
+            assert(conn.stream.l7.request_leg == .sending_head);
+            if (conn.stream.l7.pending_verdict != .none) {
                 settlePendingVerdict(server, conn);
                 return;
             }
@@ -1769,9 +1769,9 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(sent >= 1);
-            conn.l7.request_head_sent += sent;
-            assert(conn.l7.request_head_sent <= conn.l7.rendered_request_len);
-            if (conn.l7.request_head_sent < conn.l7.rendered_request_len) {
+            conn.stream.l7.request_head_sent += sent;
+            assert(conn.stream.l7.request_head_sent <= conn.stream.l7.rendered_request_len);
+            if (conn.stream.l7.request_head_sent < conn.stream.l7.rendered_request_len) {
                 armRequestHeadSend(server, conn);
                 return;
             }
@@ -1782,8 +1782,8 @@ pub fn Proxy(comptime IoType: type) type {
             // (§7). Once the response recv is armed that op is gone, and an
             // op is never canceled (§5) — so a malformed body found later
             // can only tear down. Checking here keeps the 400 reachable.
-            const excess = headBytes(server, conn)[conn.l7.request_head_len..conn.stream.head_len];
-            const feed = feedFraming(&conn.l7.request_framing, excess);
+            const excess = headBytes(server, conn)[conn.stream.l7.request_head_len..conn.stream.head_len];
+            const feed = feedFraming(&conn.stream.l7.request_framing, excess);
             if (feed.malformed) {
                 respond(server, conn, 400, "l7_bad_request");
                 return;
@@ -1813,15 +1813,15 @@ pub fn Proxy(comptime IoType: type) type {
         /// framing was already advanced and validated by the caller.
         fn forwardRequestExcess(server: *ServerType, conn: *ConnType, feed: FeedResult) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .sending_head);
+            assert(conn.stream.l7.request_leg == .sending_head);
             assert(!feed.malformed);
-            const excess = headBytes(server, conn)[conn.l7.request_head_len..conn.stream.head_len];
+            const excess = headBytes(server, conn)[conn.stream.l7.request_head_len..conn.stream.head_len];
             if (feed.consumed < excess.len) {
-                conn.l7.client_pipelined = true;
+                conn.stream.l7.client_pipelined = true;
             }
             const direction = &conn.stream.directions[0];
             direction.owe(feed.consumed);
-            conn.l7.request_leg = .sending_body_excess;
+            conn.stream.l7.request_leg = .sending_body_excess;
             if (direction.owed() >= 1) {
                 armRequestExcessSend(server, conn);
             } else {
@@ -1831,13 +1831,13 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn armRequestExcessSend(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .sending_body_excess);
+            assert(conn.stream.l7.request_leg == .sending_body_excess);
             const direction = &conn.stream.directions[0];
-            const base = conn.l7.request_head_len;
-            conn.l7.request_op_on_client = false; // A send on the upstream socket.
+            const base = conn.stream.l7.request_head_len;
+            conn.stream.l7.request_op_on_client = false; // A send on the upstream socket.
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
-                conn.upstream_socket.?,
+                conn.stream.upstream_socket.?,
                 direction.pending(headBytes(server, conn)[base..]),
                 &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
@@ -1854,8 +1854,8 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .sending_body_excess);
-            if (conn.l7.pending_verdict != .none) {
+            assert(conn.stream.l7.request_leg == .sending_body_excess);
+            if (conn.stream.l7.pending_verdict != .none) {
                 settlePendingVerdict(server, conn);
                 return;
             }
@@ -1880,10 +1880,10 @@ pub fn Proxy(comptime IoType: type) type {
         /// carried the whole body).
         fn requestHeadVacated(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.request_leg == .sending_body_excess);
-            conn.l7.request_head_vacated = true;
-            if (conn.l7.response_render_pending) {
-                conn.l7.response_render_pending = false;
+            assert(conn.stream.l7.request_leg == .sending_body_excess);
+            conn.stream.l7.request_head_vacated = true;
+            if (conn.stream.l7.response_render_pending) {
+                conn.stream.l7.response_render_pending = false;
                 beginResponseForward(server, conn);
                 // A deferred render that fails (oversize/malformed origin
                 // head) answers 502 (.l7_responding) or tears down — either
@@ -1891,13 +1891,13 @@ pub fn Proxy(comptime IoType: type) type {
                 // keep pumping into a connection that is already closing (§7).
                 if (conn.state != .l7_exchanging) return;
             }
-            if (framingDoneOf(&conn.l7.request_framing)) {
-                conn.l7.request_leg = .done;
+            if (framingDoneOf(&conn.stream.l7.request_framing)) {
+                conn.stream.l7.request_leg = .done;
             } else {
-                conn.l7.request_leg = .pumping_body;
+                conn.stream.l7.request_leg = .pumping_body;
                 // Relay chunks will flow and be overwritten: from here the
                 // try is no longer reconstructible — no replay (§7).
-                conn.l7.request_body_pumped = true;
+                conn.stream.l7.request_body_pumped = true;
                 armRequestBodyRecv(server, conn);
             }
         }
@@ -1957,18 +1957,18 @@ pub fn Proxy(comptime IoType: type) type {
 
             pub fn beforeRecv(conn: *ConnType) void {
                 assert(conn.state == .l7_exchanging);
-                assert(conn.l7.request_leg == .pumping_body);
+                assert(conn.stream.l7.request_leg == .pumping_body);
                 // A client-side recv is never armed under a pending verdict:
                 // expiry is unanswerable then, and a verdict arms nothing.
-                assert(conn.l7.pending_verdict == .none);
+                assert(conn.stream.l7.pending_verdict == .none);
                 // A recv on the CLIENT socket: an expiry cannot force it, so
                 // the deadline verdict is unanswerable while this op is armed.
-                conn.l7.request_op_on_client = true;
+                conn.stream.l7.request_op_on_client = true;
             }
 
             pub fn beforeSend(conn: *ConnType) void {
                 assert(conn.state == .l7_exchanging);
-                conn.l7.request_op_on_client = false; // A send on the upstream socket.
+                conn.stream.l7.request_op_on_client = false; // A send on the upstream socket.
             }
 
             /// Completion-time re-checks (post-await): a client-side body
@@ -1976,12 +1976,12 @@ pub fn Proxy(comptime IoType: type) type {
             /// unanswerable then — so none can have arrived during the await.
             pub fn onRecvEntry(conn: *ConnType) void {
                 assert(conn.state == .l7_exchanging);
-                assert(conn.l7.request_leg == .pumping_body);
-                assert(conn.l7.pending_verdict == .none);
+                assert(conn.stream.l7.request_leg == .pumping_body);
+                assert(conn.stream.l7.pending_verdict == .none);
             }
 
             pub fn feed(conn: *ConnType, chunk: []const u8) pump.FeedResult {
-                const fr = feedFraming(&conn.l7.request_framing, chunk);
+                const fr = feedFraming(&conn.stream.l7.request_framing, chunk);
                 if (fr.malformed) return fr;
                 // A chunked body announces no size, so the cap can only be
                 // read off what has actually arrived (#236). Checked after
@@ -2007,12 +2007,12 @@ pub fn Proxy(comptime IoType: type) type {
                 if (fr.consumed < received) {
                     // Bytes past the body are a pipelined next request; the
                     // connection will close after this exchange (§7 note).
-                    conn.l7.client_pipelined = true;
+                    conn.stream.l7.client_pipelined = true;
                 }
             }
 
             pub fn framingDone(conn: *ConnType) bool {
-                return framingDoneOf(&conn.l7.request_framing);
+                return framingDoneOf(&conn.stream.l7.request_framing);
             }
 
             pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
@@ -2029,21 +2029,21 @@ pub fn Proxy(comptime IoType: type) type {
 
             pub fn onDrained(server: *ServerType, conn: *ConnType) void {
                 _ = server;
-                conn.l7.request_leg = .done;
+                conn.stream.l7.request_leg = .done;
                 // The delivered recv was the flag's referent; keep the
                 // flag self-descriptive now that no request op is armed.
-                conn.l7.request_op_on_client = false;
+                conn.stream.l7.request_op_on_client = false;
             }
 
             pub fn onComplete(server: *ServerType, conn: *ConnType) void {
                 _ = server;
-                conn.l7.request_leg = .done;
+                conn.stream.l7.request_leg = .done;
             }
 
             pub fn onSendEntry(server: *ServerType, conn: *ConnType) bool {
                 assert(conn.state == .l7_exchanging);
-                assert(conn.l7.request_leg == .pumping_body);
-                if (conn.l7.pending_verdict != .none) {
+                assert(conn.stream.l7.request_leg == .pumping_body);
+                if (conn.stream.l7.pending_verdict != .none) {
                     settlePendingVerdict(server, conn);
                     return true;
                 }
@@ -2084,20 +2084,20 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn startResponseLeg(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .idle);
-            assert(conn.upstream.?.head_len == 0);
-            conn.l7.response_leg = .awaiting_head;
+            assert(conn.stream.l7.response_leg == .idle);
+            assert(conn.stream.upstream.?.head_len == 0);
+            conn.stream.l7.response_leg = .awaiting_head;
             armResponseHeadRecv(server, conn);
         }
 
         fn armResponseHeadRecv(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .awaiting_head);
-            const upstream = conn.upstream.?;
+            assert(conn.stream.l7.response_leg == .awaiting_head);
+            const upstream = conn.stream.upstream.?;
             assert(upstream.head_len < upstreamHeadBytes(upstream).len);
             conn.stream.arm(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.recv(
-                conn.upstream_socket.?,
+                conn.stream.upstream_socket.?,
                 upstreamHeadBytes(upstream)[upstream.head_len..],
                 &conn.stream.op_data_upstream_to_client.completion,
                 ConnType,
@@ -2114,8 +2114,8 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .awaiting_head);
-            if (conn.l7.pending_verdict != .none) {
+            assert(conn.stream.l7.response_leg == .awaiting_head);
+            if (conn.stream.l7.pending_verdict != .none) {
                 settlePendingVerdict(server, conn);
                 return;
             }
@@ -2125,7 +2125,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(received >= 1);
-            const upstream = conn.upstream.?;
+            const upstream = conn.stream.upstream.?;
             upstream.head_len += received;
             assert(upstream.head_len <= upstreamHeadBytes(upstream).len);
             parseResponseAndDispatch(server, conn);
@@ -2137,7 +2137,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// framing strictness applies to it all the same).
         fn parseResponseAndDispatch(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            const upstream = conn.upstream.?;
+            const upstream = conn.stream.upstream.?;
             const head = upstreamHeadBytes(upstream)[0..upstream.head_len];
             const head_is_full = upstream.head_len == upstreamHeadBytes(upstream).len;
 
@@ -2147,7 +2147,7 @@ pub fn Proxy(comptime IoType: type) type {
                 head,
                 head_is_full,
                 storage,
-                conn.l7.request_method,
+                conn.stream.l7.request_method,
             ) catch |err| switch (err) {
                 error.Incomplete => {
                     assert(!head_is_full);
@@ -2162,15 +2162,15 @@ pub fn Proxy(comptime IoType: type) type {
             // The render reuses conn.head, so it must wait until the
             // request head has vacated that buffer (§7 buffer rotation);
             // record the head boundary so the deferred render agrees.
-            conn.l7.response_head_len_marker = response.head_len;
-            if (conn.l7.request_head_vacated) {
+            conn.stream.l7.response_head_len_marker = response.head_len;
+            if (conn.stream.l7.request_head_vacated) {
                 // conn.head is already free, so render straight from the
                 // parse we just did — no second parse of the same bytes.
                 // This is the common path: the request head vacates long
                 // before the origin answers.
                 renderResponse(server, conn, &response);
             } else {
-                conn.l7.response_render_pending = true;
+                conn.stream.l7.response_render_pending = true;
             }
         }
 
@@ -2181,18 +2181,18 @@ pub fn Proxy(comptime IoType: type) type {
         /// from the first parse via `renderResponse` and never gets here.
         fn beginResponseForward(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .awaiting_head);
-            assert(conn.l7.request_head_vacated);
-            const upstream = conn.upstream.?;
+            assert(conn.stream.l7.response_leg == .awaiting_head);
+            assert(conn.stream.l7.request_head_vacated);
+            const upstream = conn.stream.upstream.?;
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
             const response = parser.parseResponseHead(
                 upstreamHeadBytes(upstream)[0..upstream.head_len],
                 false,
                 storage,
-                conn.l7.request_method,
+                conn.stream.l7.request_method,
             ) catch unreachable;
-            assert(response.head_len == conn.l7.response_head_len_marker);
+            assert(response.head_len == conn.stream.l7.response_head_len_marker);
             renderResponse(server, conn, &response);
         }
 
@@ -2280,7 +2280,7 @@ pub fn Proxy(comptime IoType: type) type {
         ) StaticPersistence {
             const would_keep = may_keep and
                 staticResponseResyncable(conn) and
-                conn.l7.client_keep_alive and
+                conn.stream.l7.client_keep_alive and
                 !server.draining and
                 !server.keepAliveSuppressed();
             if (!would_keep) return .{ .keep = false, .capped = false };
@@ -2329,9 +2329,9 @@ pub fn Proxy(comptime IoType: type) type {
             response: *const parser.ResponseHead,
         ) bool {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .awaiting_head);
-            return conn.l7.client_keep_alive and
-                !conn.l7.client_pipelined and !server.draining and
+            assert(conn.stream.l7.response_leg == .awaiting_head);
+            return conn.stream.l7.client_keep_alive and
+                !conn.stream.l7.client_pipelined and !server.draining and
                 !server.keepAliveSuppressed() and response.framing != .until_close;
         }
 
@@ -2366,8 +2366,8 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn stickyVerdict(server: *const ServerType, conn: *const ConnType) StickyVerdict {
             assert(conn.state == .l7_exchanging);
-            assert(conn.cluster_index < server.config.clusters.len);
-            const cluster = &server.config.clusters[conn.cluster_index];
+            assert(conn.stream.cluster_index < server.config.clusters.len);
+            const cluster = &server.config.clusters[conn.stream.cluster_index];
             switch (cluster.hash_key) {
                 .source_ip, .header => return .none,
                 .cookie => {},
@@ -2376,10 +2376,10 @@ pub fn Proxy(comptime IoType: type) type {
             // endpoint was recorded when its slot was (§8).
             assert(conn.log.endpoint_index != conn_module.LogState.endpoint_none);
             const served = server.balancer.endpointIdentity(
-                conn.cluster_index,
+                conn.stream.cluster_index,
                 conn.log.endpoint_index,
             );
-            const carried = conn.l7.sticky_cookie orelse return .assigned;
+            const carried = conn.stream.l7.sticky_cookie orelse return .assigned;
             if (carried == served) {
                 return .followed;
             }
@@ -2427,7 +2427,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .none, .followed => return edits,
                 .assigned, .repicked => {},
             }
-            const name = switch (server.config.clusters[conn.cluster_index].hash_key) {
+            const name = switch (server.config.clusters[conn.stream.cluster_index].hash_key) {
                 .cookie => |name| name,
                 // The verdict said cookie cluster; the config cannot
                 // have changed under it (§5 parse-once).
@@ -2444,7 +2444,7 @@ pub fn Proxy(comptime IoType: type) type {
             // stamp announces is byte-identical to the tag the next
             // request's parse will match.
             Balancer.formatEndpointTag(
-                server.balancer.endpointIdentity(conn.cluster_index, conn.log.endpoint_index),
+                server.balancer.endpointIdentity(conn.stream.cluster_index, conn.log.endpoint_index),
                 scratch[len..][0..Balancer.endpoint_tag_len],
             );
             len += Balancer.endpoint_tag_len;
@@ -2505,10 +2505,10 @@ pub fn Proxy(comptime IoType: type) type {
             response: *const parser.ResponseHead,
         ) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.upgrade_requested);
+            assert(conn.stream.l7.upgrade_requested);
             assert(response.status == 101);
             assert(conn.tunnel_buffer != null);
-            const upstream = conn.upstream.?;
+            const upstream = conn.stream.upstream.?;
             // No edits and no sticky stamp: #175 and #178 both describe a
             // response an origin *served*, and this one only announces
             // that serving has stopped being HTTP. A `Set-Cookie` naming
@@ -2535,8 +2535,8 @@ pub fn Proxy(comptime IoType: type) type {
             }
             @memcpy(headBytes(server, conn)[rendered.len..][0..trailing.len], trailing);
             const head_write_len: u32 = @intCast(rendered.len + trailing.len);
-            conn.l7.response_leg = .sending_head;
-            conn.l7.response_started = true;
+            conn.stream.l7.response_leg = .sending_head;
+            conn.stream.l7.response_started = true;
             // The status is recorded at `beginTunnel`, not here: a `101`
             // in the log means a tunnel the client actually got, so a
             // handshake whose write never landed reports the teardown it
@@ -2566,12 +2566,12 @@ pub fn Proxy(comptime IoType: type) type {
         /// something this proxy dropped.
         fn beginTunnel(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.upgrade_requested);
-            assert(conn.upstream_socket != null);
+            assert(conn.stream.l7.upgrade_requested);
+            assert(conn.stream.upstream_socket != null);
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
-            assert(conn.l7.request_head_len <= conn.stream.head_len);
-            const pipelined = conn.stream.head_len - conn.l7.request_head_len;
+            assert(conn.stream.l7.request_head_len <= conn.stream.head_len);
+            const pipelined = conn.stream.head_len - conn.stream.l7.request_head_len;
             // `tunnel_buffer` stays set: it is what marks which pool this
             // buffer belongs to. `relay_buffer` only *aliases* it, so the
             // relay reads one field like every other connection while the
@@ -2585,14 +2585,14 @@ pub fn Proxy(comptime IoType: type) type {
                 assert(pipelined <= buffer.client_to_upstream.len);
                 @memcpy(
                     buffer.client_to_upstream[0..pipelined],
-                    headBytes(server, conn)[conn.l7.request_head_len..conn.stream.head_len],
+                    headBytes(server, conn)[conn.stream.l7.request_head_len..conn.stream.head_len],
                 );
             }
-            const leased = conn.upstream.?;
+            const leased = conn.stream.upstream.?;
             const cluster_index = leased.cluster_index;
             const endpoint_index = leased.endpoint_index;
             server.releaseUpstream(leased);
-            conn.upstream = null;
+            conn.stream.upstream = null;
             // Both held for certain here, unlike at the static-response
             // rungs where either may never have been acquired: this runs
             // only after a rendered head went out, which needed the head
@@ -2666,11 +2666,11 @@ pub fn Proxy(comptime IoType: type) type {
             response: *const parser.ResponseHead,
         ) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .awaiting_head);
+            assert(conn.stream.l7.response_leg == .awaiting_head);
             assert(response.status >= 100);
             assert(response.status < 200);
             assert(response.status != 101); // The caller diverts both 101 cases.
-            if (conn.l7.interims_seen >= constants.interim_responses_max) {
+            if (conn.stream.l7.interims_seen >= constants.interim_responses_max) {
                 // An origin that keeps promising and never answers is an
                 // unbounded loop on the one thread (§3), which no legal
                 // response justifies. Counted apart from a malformed head
@@ -2680,8 +2680,8 @@ pub fn Proxy(comptime IoType: type) type {
                 upstreamFailed(server, conn);
                 return;
             }
-            conn.l7.interims_seen += 1;
-            const upstream = conn.upstream.?;
+            conn.stream.l7.interims_seen += 1;
+            const upstream = conn.stream.upstream.?;
             const scratch = server.borrowRenderScratch();
             defer server.returnRenderScratch();
             const rendered = render.renderResponseHead(
@@ -2711,7 +2711,7 @@ pub fn Proxy(comptime IoType: type) type {
                 );
             }
             upstream.head_len = rest;
-            conn.l7.response_head_len_marker = 0;
+            conn.stream.l7.response_head_len_marker = 0;
             server.counters.increment("l7_interim_forwarded");
             armClientWrite(server, conn, headBytes(server, conn)[0..rendered.len], .interim_sent);
         }
@@ -2721,10 +2721,10 @@ pub fn Proxy(comptime IoType: type) type {
         /// sent `100` and its `200` in one write — or the socket owes it.
         fn resumeAfterInterim(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .awaiting_head);
-            assert(!conn.l7.response_started);
-            assert(conn.l7.interims_seen >= 1);
-            const upstream = conn.upstream.?;
+            assert(conn.stream.l7.response_leg == .awaiting_head);
+            assert(!conn.stream.l7.response_started);
+            assert(conn.stream.l7.interims_seen >= 1);
+            const upstream = conn.stream.upstream.?;
             if (upstream.head_len >= 1) {
                 parseResponseAndDispatch(server, conn);
                 return;
@@ -2752,7 +2752,7 @@ pub fn Proxy(comptime IoType: type) type {
         ) bool {
             assert(conn.state == .l7_exchanging);
             assert(response.status >= 100);
-            if (conn.l7.upgrade_requested and response.status == 101) {
+            if (conn.stream.l7.upgrade_requested and response.status == 101) {
                 renderUpgradeAccepted(server, conn, response);
                 return false;
             }
@@ -2760,8 +2760,8 @@ pub fn Proxy(comptime IoType: type) type {
                 // The origin declined an upgrade it was offered, which is
                 // legal and ordinary — hand the claim back before the
                 // exchange carries on as any other (#180).
-                if (conn.l7.upgrade_requested) {
-                    conn.l7.upgrade_requested = false;
+                if (conn.stream.l7.upgrade_requested) {
+                    conn.stream.l7.upgrade_requested = false;
                     releaseTunnelClaim(server, conn);
                 }
                 return true;
@@ -2792,11 +2792,11 @@ pub fn Proxy(comptime IoType: type) type {
             const head = headBytes(server, conn);
             assert(rendered_len <= head.len);
             if (rendered_len + excess.len > head.len) {
-                conn.l7.response_excess_len = @intCast(excess.len);
+                conn.stream.l7.response_excess_len = @intCast(excess.len);
                 return rendered_len;
             }
             @memcpy(head[rendered_len..][0..excess.len], excess);
-            conn.l7.response_excess_len = 0; // It rides the head write.
+            conn.stream.l7.response_excess_len = 0; // It rides the head write.
             return rendered_len + @as(u32, @intCast(excess.len));
         }
 
@@ -2806,9 +2806,9 @@ pub fn Proxy(comptime IoType: type) type {
             response: *const parser.ResponseHead,
         ) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_leg == .awaiting_head);
-            assert(conn.l7.request_head_vacated);
-            const upstream = conn.upstream.?;
+            assert(conn.stream.l7.response_leg == .awaiting_head);
+            assert(conn.stream.l7.request_head_vacated);
+            const upstream = conn.stream.upstream.?;
             // Not every status reaching here is *the* response: a tunnel,
             // an interim and an uninvited switch all divert first.
             if (!dispatchByStatus(server, conn, response)) return;
@@ -2823,8 +2823,8 @@ pub fn Proxy(comptime IoType: type) type {
                 conn,
                 downstreamKeepAlive(server, conn, response),
             );
-            conn.l7.downstream_close_announced = !keep_downstream;
-            conn.l7.upstream_reusable = response.keep_alive;
+            conn.stream.l7.downstream_close_announced = !keep_downstream;
+            conn.stream.l7.upstream_reusable = response.keep_alive;
             const verdict = stickyVerdict(server, conn);
             const scratch = server.borrowRenderScratch();
             defer server.returnRenderScratch();
@@ -2851,12 +2851,12 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             };
             assert(rendered.len >= 1);
-            conn.l7.response_framing = framingFromParsed(response.framing);
+            conn.stream.l7.response_framing = framingFromParsed(response.framing);
 
             // Feed the framing tracker over the body excess that arrived
             // coalesced with the head.
             const excess = upstreamHeadBytes(upstream)[response.head_len..upstream.head_len];
-            const feed = feedFraming(&conn.l7.response_framing, excess);
+            const feed = feedFraming(&conn.stream.l7.response_framing, excess);
             if (feed.malformed) {
                 upstreamFailed(server, conn);
                 return;
@@ -2894,10 +2894,10 @@ pub fn Proxy(comptime IoType: type) type {
             head_write_len: u32,
         ) void {
             assert(conn.state == .l7_exchanging);
-            assert(!conn.l7.response_started);
+            assert(!conn.stream.l7.response_started);
             assert(head_write_len >= 1);
-            conn.l7.response_leg = .sending_head;
-            conn.l7.response_started = true;
+            conn.stream.l7.response_leg = .sending_head;
+            conn.stream.l7.response_started = true;
             creditSticky(server, verdict);
             conn.log.status = response.status;
             server.captureResponseLogHeaders(conn, response.headers);
@@ -2963,17 +2963,17 @@ pub fn Proxy(comptime IoType: type) type {
                 // as the response, and no verdict can be pending (#232).
                 .interim_sent => {
                     assert(conn.state == .l7_exchanging);
-                    assert(conn.l7.pending_verdict == .none);
-                    assert(!conn.l7.response_started);
-                    assert(conn.l7.response_leg == .awaiting_head);
+                    assert(conn.stream.l7.pending_verdict == .none);
+                    assert(!conn.stream.l7.response_started);
+                    assert(conn.stream.l7.response_leg == .awaiting_head);
                 },
                 // The handshake is out and nothing has been relayed yet:
                 // still the exchange, still no verdict, and the tunnel
                 // buffer claimed at the gate is still in hand (#180).
                 .tunnel_start => {
                     assert(conn.state == .l7_exchanging);
-                    assert(conn.l7.pending_verdict == .none);
-                    assert(conn.l7.upgrade_requested);
+                    assert(conn.stream.l7.pending_verdict == .none);
+                    assert(conn.stream.l7.upgrade_requested);
                     assert(conn.tunnel_buffer != null);
                 },
                 .response_excess, .response_body => {
@@ -2981,7 +2981,7 @@ pub fn Proxy(comptime IoType: type) type {
                     // pending once response bytes are flowing (negative
                     // space).
                     assert(conn.state == .l7_exchanging);
-                    assert(conn.l7.pending_verdict == .none);
+                    assert(conn.stream.l7.pending_verdict == .none);
                 },
                 // The two static-response endings share one state:
                 // `respond` is the only writer of either, and always sets
@@ -3101,7 +3101,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .interim_sent => resumeAfterInterim(server, conn),
                 .response_excess => sendResponseExcess(server, conn),
                 .response_body => {
-                    assert(conn.l7.response_leg == .sending_body_excess);
+                    assert(conn.stream.l7.response_leg == .sending_body_excess);
                     afterResponseExcess(server, conn);
                 },
                 // A static answer is fully delivered. Log it here rather
@@ -3138,23 +3138,23 @@ pub fn Proxy(comptime IoType: type) type {
         /// coalesced with it but did not fit beside it follows straight from
         /// `upstream.head`; otherwise the body pump takes over.
         fn sendResponseExcess(server: *ServerType, conn: *ConnType) void {
-            assert(conn.l7.response_leg == .sending_head);
-            const excess_len = conn.l7.response_excess_len;
+            assert(conn.stream.l7.response_leg == .sending_head);
+            const excess_len = conn.stream.l7.response_excess_len;
             if (excess_len == 0) {
                 afterResponseExcess(server, conn);
                 return;
             }
-            conn.l7.response_leg = .sending_body_excess;
+            conn.stream.l7.response_leg = .sending_body_excess;
             server.counters.increment("l7_response_excess_sent");
-            const base = conn.l7.response_head_len_marker;
+            const base = conn.stream.l7.response_head_len_marker;
             // These are bytes the origin actually delivered past its head —
             // the bound `DirectionState.pending` used to check for this write
             // before the channel owned the cursor.
-            assert(base + excess_len <= conn.upstream.?.head_len);
+            assert(base + excess_len <= conn.stream.upstream.?.head_len);
             armClientWrite(
                 server,
                 conn,
-                upstreamHeadBytes(conn.upstream.?)[base..][0..excess_len],
+                upstreamHeadBytes(conn.stream.upstream.?)[base..][0..excess_len],
                 .response_body,
             );
         }
@@ -3163,8 +3163,8 @@ pub fn Proxy(comptime IoType: type) type {
         /// body ended there, else pump the remaining body from the origin.
         fn afterResponseExcess(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            conn.l7.response_leg = .pumping_body;
-            if (framingDoneOf(&conn.l7.response_framing)) {
+            conn.stream.l7.response_leg = .pumping_body;
+            if (framingDoneOf(&conn.stream.l7.response_framing)) {
                 finishExchange(server, conn);
             } else {
                 armResponseBodyRecv(server, conn);
@@ -3231,8 +3231,8 @@ pub fn Proxy(comptime IoType: type) type {
 
             pub fn beforeRecv(conn: *ConnType) void {
                 assert(conn.state == .l7_exchanging);
-                assert(conn.l7.response_leg == .pumping_body);
-                assert(conn.l7.pending_verdict == .none); // response_started.
+                assert(conn.stream.l7.response_leg == .pumping_body);
+                assert(conn.stream.l7.pending_verdict == .none); // response_started.
             }
 
             /// Completion-time re-checks (post-await): once a response byte
@@ -3240,12 +3240,12 @@ pub fn Proxy(comptime IoType: type) type {
             /// invariant must still hold after the await.
             pub fn onRecvEntry(conn: *ConnType) void {
                 assert(conn.state == .l7_exchanging);
-                assert(conn.l7.response_leg == .pumping_body);
-                assert(conn.l7.pending_verdict == .none); // response_started.
+                assert(conn.stream.l7.response_leg == .pumping_body);
+                assert(conn.stream.l7.pending_verdict == .none); // response_started.
             }
 
             pub fn feed(conn: *ConnType, chunk: []const u8) pump.FeedResult {
-                return feedFraming(&conn.l7.response_framing, chunk);
+                return feedFraming(&conn.stream.l7.response_framing, chunk);
             }
 
             /// Response body bytes that reached the client. The head and
@@ -3257,12 +3257,12 @@ pub fn Proxy(comptime IoType: type) type {
             }
 
             pub fn framingDone(conn: *ConnType) bool {
-                return framingDoneOf(&conn.l7.response_framing);
+                return framingDoneOf(&conn.stream.l7.response_framing);
             }
 
             pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
                 if (err == error.EndOfStream) {
-                    if (conn.l7.response_framing == .until_close) {
+                    if (conn.stream.l7.response_framing == .until_close) {
                         // The origin's EOF is this framing's terminator.
                         finishExchange(server, conn);
                         return;
@@ -3290,8 +3290,8 @@ pub fn Proxy(comptime IoType: type) type {
             pub fn onSendEntry(server: *ServerType, conn: *ConnType) bool {
                 _ = server;
                 assert(conn.state == .l7_exchanging);
-                assert(conn.l7.response_leg == .pumping_body);
-                assert(conn.l7.pending_verdict == .none); // response_started.
+                assert(conn.stream.l7.response_leg == .pumping_body);
+                assert(conn.stream.l7.pending_verdict == .none); // response_started.
                 return false;
             }
         };
@@ -3307,24 +3307,24 @@ pub fn Proxy(comptime IoType: type) type {
         /// two byte streams are no longer alignable.
         fn finishExchange(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.response_started);
-            conn.l7.response_leg = .done;
+            assert(conn.stream.l7.response_started);
+            conn.stream.l7.response_leg = .done;
             server.counters.increment("l7_responses");
             // The labeled twin (#179): the slot is still attached here —
             // park and detach run below — and it names the endpoint that
             // actually served, which is what "requests per backend" means.
-            assert(conn.upstream != null);
+            assert(conn.stream.upstream != null);
             server.labeled.incrementEndpoint(.responses, server.upstreams.keys.key(
-                conn.upstream.?.cluster_index,
-                conn.upstream.?.endpoint_index,
+                conn.stream.upstream.?.cluster_index,
+                conn.stream.upstream.?.endpoint_index,
             ));
             // #230: a served response ends whatever passive streak was
             // building. Any response — the status is deliberately not
             // read, because an origin answering 500 is a software bug
             // and this counts endpoints, not deployments.
             server.health.witnessPassiveSuccess(
-                conn.upstream.?.cluster_index,
-                conn.upstream.?.endpoint_index,
+                conn.stream.upstream.?.cluster_index,
+                conn.stream.upstream.?.endpoint_index,
             );
             // The whole response reached the client: the line goes out
             // now, before the turnaround below clears what it reports.
@@ -3335,11 +3335,11 @@ pub fn Proxy(comptime IoType: type) type {
             conn.log.outcome = .ok;
             server.logExchange(conn);
 
-            const request_complete = conn.l7.request_leg == .done;
-            if (conn.l7.upstream_reusable and request_complete and !server.draining) {
+            const request_complete = conn.stream.l7.request_leg == .done;
+            if (conn.stream.l7.upstream_reusable and request_complete and !server.draining) {
                 parkUpstream(server, conn);
             }
-            const keep_downstream = !conn.l7.downstream_close_announced and
+            const keep_downstream = !conn.stream.l7.downstream_close_announced and
                 request_complete and !server.draining;
             if (keep_downstream) {
                 detachUpstream(server, conn);
@@ -3358,7 +3358,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// so idle parked sockets free their slots before the 503 wall.
         fn parkUpstream(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            const upstream = conn.upstream.?;
+            const upstream = conn.stream.upstream.?;
             assert(!upstream.parked);
             // The exchange's head bytes go back before the slot parks
             // (§5): the response leg is settled, so the client-write
@@ -3370,8 +3370,8 @@ pub fn Proxy(comptime IoType: type) type {
             upstream.deadline_ns = server.io.nowNs() +
                 @as(u64, server.parkedTimeoutMs()) * std.time.ns_per_ms;
             server.ensureUpstreamSweep();
-            conn.upstream = null;
-            conn.upstream_socket = null;
+            conn.stream.upstream = null;
+            conn.stream.upstream_socket = null;
         }
 
         /// Close and release an upstream that did not park while the conn
@@ -3381,13 +3381,13 @@ pub fn Proxy(comptime IoType: type) type {
         fn detachUpstream(server: *ServerType, conn: *ConnType) void {
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
-            if (conn.upstream) |leased| {
-                server.io.closeNow(conn.upstream_socket.?);
+            if (conn.stream.upstream) |leased| {
+                server.io.closeNow(conn.stream.upstream_socket.?);
                 server.releaseUpstream(leased);
-                conn.upstream = null;
-                conn.upstream_socket = null;
+                conn.stream.upstream = null;
+                conn.stream.upstream_socket = null;
             }
-            assert(conn.upstream_socket == null);
+            assert(conn.stream.upstream_socket == null);
         }
 
         /// Keep-alive turnaround (§5): the relay buffer goes back to its
@@ -3396,7 +3396,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// a fresh idle deadline.
         fn resetForNextRequest(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.upstream == null);
+            assert(conn.stream.upstream == null);
             // The exchange is fully settled: no data or dial ops in flight.
             // The lazy deadline timer stays armed across the turnaround (§4),
             // and a dial rebase (§8) cancel may still be draining if the
@@ -3427,7 +3427,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// can state why they hold.
         fn beginNextRequest(server: *ServerType, conn: *ConnType) void {
             assert(conn.stream.relay_buffer == null);
-            assert(conn.upstream == null);
+            assert(conn.stream.upstream == null);
             assert(conn.stream.client_write.pending.len == 0);
             // The exchange that just ended has spoken for itself, so its
             // accounting resets with the rest of the per-request state
@@ -3444,7 +3444,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             conn.stream.head_len = 0;
             conn.stream.head_cursor.reset();
-            conn.l7 = .{};
+            conn.stream.l7 = .{};
             conn.log.reset();
             // The #140 captures live in the server's side table, not on
             // `log`, so they need clearing beside it — or the next
@@ -3475,10 +3475,10 @@ pub fn Proxy(comptime IoType: type) type {
         /// it belonged to could not complete regardless.
         pub fn expiryAnswerable(conn: *const ConnType) bool {
             assert(conn.state == .l7_exchanging);
-            if (conn.l7.response_started) {
+            if (conn.stream.l7.response_started) {
                 return false;
             }
-            if (conn.stream.armed.data_client_to_upstream and conn.l7.request_op_on_client) {
+            if (conn.stream.armed.data_client_to_upstream and conn.stream.l7.request_op_on_client) {
                 return false;
             }
             return true;
@@ -3493,18 +3493,18 @@ pub fn Proxy(comptime IoType: type) type {
         /// known: a deadline can only be answered against a try, and a
         /// try is a pick.
         fn witnessNoResponse(server: *ServerType, conn: *const ConnType) void {
-            assert(conn.upstream != null);
+            assert(conn.stream.upstream != null);
             server.labeled.incrementEndpoint(.no_response, server.upstreams.keys.key(
-                conn.upstream.?.cluster_index,
-                conn.upstream.?.endpoint_index,
+                conn.stream.upstream.?.cluster_index,
+                conn.stream.upstream.?.endpoint_index,
             ));
             // #230's second signal. This is the wedged-application case a
             // `tcp` probe is blind to — the kernel completed a handshake
             // the application never got to — so it is the one passive
             // ejection exists for more than any other.
             server.health.witnessPassiveFailure(
-                conn.upstream.?.cluster_index,
-                conn.upstream.?.endpoint_index,
+                conn.stream.upstream.?.cluster_index,
+                conn.stream.upstream.?.endpoint_index,
             );
         }
 
@@ -3527,8 +3527,8 @@ pub fn Proxy(comptime IoType: type) type {
             // set only inside `.l7_exchanging` and cleared on every entry
             // to this state, so a conditional here would read as live and
             // never be.
-            assert(!conn.l7.response_started);
-            if (!conn.l7.head_budget_installed) return false;
+            assert(!conn.stream.l7.response_started);
+            if (!conn.stream.l7.head_budget_installed) return false;
             return conn.stream.armed.data_client_to_upstream;
         }
 
@@ -3548,9 +3548,9 @@ pub fn Proxy(comptime IoType: type) type {
         /// cannot carry another request, so the `408` announces close.
         pub fn beginHeadExpiry(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
-            assert(conn.l7.pending_verdict == .none);
+            assert(conn.stream.l7.pending_verdict == .none);
             assert(headExpiryAnswerable(conn));
-            conn.l7.pending_verdict = .request_timeout;
+            conn.stream.l7.pending_verdict = .request_timeout;
             server.io.shutdown(conn.client_socket, .read);
         }
 
@@ -3563,12 +3563,12 @@ pub fn Proxy(comptime IoType: type) type {
         /// never inline here.
         pub fn beginExpiry(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.pending_verdict == .none);
+            assert(conn.stream.l7.pending_verdict == .none);
             assert(expiryAnswerable(conn));
             assert(conn.stream.armed.data_client_to_upstream or
                 conn.stream.armed.data_upstream_to_client);
-            conn.l7.pending_verdict = .gateway_timeout;
-            server.io.shutdown(conn.upstream_socket.?, .both);
+            conn.stream.l7.pending_verdict = .gateway_timeout;
+            server.io.shutdown(conn.stream.upstream_socket.?, .both);
         }
 
         /// A completion landed with a verdict pending: once the last data
@@ -3585,15 +3585,15 @@ pub fn Proxy(comptime IoType: type) type {
             // would be two copies of that rule to keep in step.
             assert(conn.state == .l7_exchanging or
                 (conn.state == .l7_reading_head and
-                    conn.l7.pending_verdict == .request_timeout));
-            assert(conn.l7.pending_verdict != .none);
+                    conn.stream.l7.pending_verdict == .request_timeout));
+            assert(conn.stream.l7.pending_verdict != .none);
             if (conn.stream.armed.data_client_to_upstream or
                 conn.stream.armed.data_upstream_to_client)
             {
                 return; // The sibling's forced completion re-enters here.
             }
-            const verdict = conn.l7.pending_verdict;
-            conn.l7.pending_verdict = .none;
+            const verdict = conn.stream.l7.pending_verdict;
+            conn.stream.l7.pending_verdict = .none;
             switch (verdict) {
                 .none => unreachable,
                 .gateway_timeout => {
@@ -3620,16 +3620,16 @@ pub fn Proxy(comptime IoType: type) type {
         /// the request leg already done.
         fn replayEligible(conn: *const ConnType) bool {
             assert(conn.state == .l7_exchanging);
-            if (!conn.l7.upstream_was_reused) {
+            if (!conn.stream.l7.upstream_was_reused) {
                 return false;
             }
-            if (conn.l7.replay_used) {
+            if (conn.stream.l7.replay_used) {
                 return false;
             }
-            if (conn.l7.response_started) {
+            if (conn.stream.l7.response_started) {
                 return false;
             }
-            if (conn.upstream.?.head_len != 0) {
+            if (conn.stream.upstream.?.head_len != 0) {
                 return false; // A response byte arrived: the origin spoke.
             }
             // And an interim means it spoke *and the client heard it*
@@ -3641,14 +3641,14 @@ pub fn Proxy(comptime IoType: type) type {
             // settles "may have begun processing" against — to a second
             // origin, after this proxy has already told the client to go
             // ahead.
-            if (conn.l7.interims_seen != 0) {
+            if (conn.stream.l7.interims_seen != 0) {
                 return false;
             }
-            if (conn.l7.request_body_pumped) {
+            if (conn.stream.l7.request_body_pumped) {
                 return false; // Relay chunks flowed; not reconstructible.
             }
-            assert(conn.l7.request_leg != .idle);
-            assert(conn.l7.request_leg != .pumping_body); // Implied by the flag.
+            assert(conn.stream.l7.request_leg != .idle);
+            assert(conn.stream.l7.request_leg != .pumping_body); // Implied by the flag.
             return true;
         }
 
@@ -3657,29 +3657,29 @@ pub fn Proxy(comptime IoType: type) type {
         /// already cleared; the caller (settle) proved both data ops free.
         fn beginReplay(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.pending_verdict == .none);
-            assert(conn.l7.replay_used); // Spent before the try began.
+            assert(conn.stream.l7.pending_verdict == .none);
+            assert(conn.stream.l7.replay_used); // Spent before the try began.
             // A replay always precedes any #181 retry, never follows one:
             // it needs a *reused* checkout, and a retry only ever dials
             // fresh. So the rebuild below defaulting the tried set to
             // empty is the truth, not a reset.
-            assert(conn.l7.tried_count == 0);
+            assert(conn.stream.l7.tried_count == 0);
             // No interim was relayed, so the rebuild below defaulting
             // `interims_seen` to zero is the truth rather than a reset —
             // `replayEligible` refuses a replay once one has gone out
             // (#232), and this is what would trip if that ever stopped
             // being true.
-            assert(conn.l7.interims_seen == 0);
+            assert(conn.stream.l7.interims_seen == 0);
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
-            assert(!conn.l7.response_started);
+            assert(!conn.stream.l7.response_started);
             assert(conn.stream.relay_buffer != null); // Retained across the replay.
-            const stale = conn.upstream.?;
+            const stale = conn.stream.upstream.?;
             assert(stale.head_len == 0);
-            server.io.closeNow(conn.upstream_socket.?);
+            server.io.closeNow(conn.stream.upstream_socket.?);
             server.releaseUpstream(stale);
-            conn.upstream = null;
-            conn.upstream_socket = null;
+            conn.stream.upstream = null;
+            conn.stream.upstream_socket = null;
             server.counters.increment("upstream_replayed");
             // Rebuild the per-try state from the §7 source of truth — the
             // client's bytes, intact in conn.head (the eligible legs sent
@@ -3695,19 +3695,19 @@ pub fn Proxy(comptime IoType: type) type {
                 storage,
                 null,
             ) catch unreachable;
-            assert(request.head_len == conn.l7.request_head_len);
-            conn.l7 = .{
-                .request_method = conn.l7.request_method,
+            assert(request.head_len == conn.stream.l7.request_head_len);
+            conn.stream.l7 = .{
+                .request_method = conn.stream.l7.request_method,
                 .request_framing = framingFromParsed(request.framing),
-                .request_head_len = conn.l7.request_head_len,
-                .client_keep_alive = conn.l7.client_keep_alive,
+                .request_head_len = conn.stream.l7.request_head_len,
+                .client_keep_alive = conn.stream.l7.client_keep_alive,
                 .replay_used = true,
                 // The §8 cap rides across too: a replay is the *same*
                 // client-visible request taking its one free retry, not a
                 // new exchange, so it must not win itself a fresh budget.
                 // Dropping it here would silently uncap the rest of the
                 // exchange, since `storeDeadline` stops clamping at zero.
-                .request_deadline_ns = conn.l7.request_deadline_ns,
+                .request_deadline_ns = conn.stream.l7.request_deadline_ns,
                 // The #180 claim rides across, and must: the tunnel
                 // buffer is held on the connection, so a rebuild that
                 // dropped this flag would re-render the head *without*
@@ -3716,7 +3716,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // never asked for, and the claim would sit unspent until
                 // the connection closed. Found by the simulator, on a
                 // seed where a stale checkout replayed a handshake.
-                .upgrade_requested = conn.l7.upgrade_requested,
+                .upgrade_requested = conn.stream.l7.upgrade_requested,
                 // upstream_was_reused stays default-false: the replay try
                 // is a fresh dial, and a second early failure answers 502.
             };
@@ -3730,7 +3730,7 @@ pub fn Proxy(comptime IoType: type) type {
             // the same request key (#178), re-derived from the re-parse
             // exactly like the framing: same bytes, same key.
             const request_key = requestKeyFor(server, conn, &request);
-            conn.l7.sticky_cookie = switch (request_key) {
+            conn.stream.l7.sticky_cookie = switch (request_key) {
                 .endpoint => |identity| identity,
                 else => null,
             };
@@ -3747,18 +3747,18 @@ pub fn Proxy(comptime IoType: type) type {
         /// completion the answer would need.
         fn upstreamFailed(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_exchanging);
-            assert(conn.l7.pending_verdict == .none); // Handlers divert first.
+            assert(conn.stream.l7.pending_verdict == .none); // Handlers divert first.
             if (replayEligible(conn)) {
-                conn.l7.pending_verdict = .replay;
-                conn.l7.replay_used = true; // Spent now: a loop is impossible.
+                conn.stream.l7.pending_verdict = .replay;
+                conn.stream.l7.replay_used = true; // Spent now: a loop is impossible.
                 // Force the sibling op, if armed (the response recv during
                 // an excess send); settle acts immediately when both are
                 // already free (the head-send failure case).
-                server.io.shutdown(conn.upstream_socket.?, .both);
+                server.io.shutdown(conn.stream.upstream_socket.?, .both);
                 settlePendingVerdict(server, conn);
                 return;
             }
-            if (conn.l7.response_started or conn.stream.armed.data_client_to_upstream or
+            if (conn.stream.l7.response_started or conn.stream.armed.data_client_to_upstream or
                 conn.stream.armed.data_upstream_to_client)
             {
                 server.beginTeardown(conn);
@@ -3771,11 +3771,11 @@ pub fn Proxy(comptime IoType: type) type {
             // conclusion by deadline where this one reaches it by
             // transport error, and an endpoint is no healthier for
             // failing fast.
-            assert(!conn.l7.response_started);
-            assert(conn.upstream != null);
+            assert(!conn.stream.l7.response_started);
+            assert(conn.stream.upstream != null);
             server.health.witnessPassiveFailure(
-                conn.upstream.?.cluster_index,
-                conn.upstream.?.endpoint_index,
+                conn.stream.upstream.?.cluster_index,
+                conn.stream.upstream.?.endpoint_index,
             );
             respond(server, conn, 502, "l7_bad_gateway");
         }
@@ -3817,9 +3817,9 @@ pub fn Proxy(comptime IoType: type) type {
             // this state follows a fill, so an unparsed head cannot tie
             // with `request_head_len`'s zero.
             assert(conn.stream.head_len >= 1);
-            assert(conn.l7.request_head_len <= conn.stream.head_len);
-            if (!framingDoneOf(&conn.l7.request_framing)) return false;
-            return conn.stream.head_len == conn.l7.request_head_len;
+            assert(conn.stream.l7.request_head_len <= conn.stream.head_len);
+            if (!framingDoneOf(&conn.stream.l7.request_framing)) return false;
+            return conn.stream.head_len == conn.stream.l7.request_head_len;
         }
 
         /// Everything a static response no longer needs, returned before
@@ -3857,24 +3857,24 @@ pub fn Proxy(comptime IoType: type) type {
             // response — so this is always an unspent claim.
             assert(conn.state != .relaying);
             releaseTunnelClaim(server, conn);
-            if (conn.upstream) |leased| {
-                if (conn.upstream_socket) |socket| {
+            if (conn.stream.upstream) |leased| {
+                if (conn.stream.upstream_socket) |socket| {
                     server.io.closeNow(socket);
                 }
                 server.releaseUpstream(leased);
-                conn.upstream = null;
-                conn.upstream_socket = null;
+                conn.stream.upstream = null;
+                conn.stream.upstream_socket = null;
             }
             assert(conn.stream.relay_buffer == null);
-            assert(conn.upstream == null);
-            assert(conn.upstream_socket == null);
+            assert(conn.stream.upstream == null);
+            assert(conn.stream.upstream_socket == null);
         }
 
         /// Undo an unspent tunnel claim (#180): the gate takes a buffer
         /// before the handshake is forwarded, and every ending other than
         /// the origin's `101` has to give it back.
         ///
-        /// One chokepoint because the claim outlives `conn.l7`. The
+        /// One chokepoint because the claim outlives `conn.stream.l7`. The
         /// per-exchange state resets at every keep-alive turnaround, but
         /// this lives on the connection, so a path that forgot would pin a
         /// pool slot no session is using for as long as the client stays —
@@ -3903,7 +3903,7 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.state == .l7_exchanging);
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
-            assert(!conn.l7.response_started);
+            assert(!conn.stream.l7.response_started);
             // The head-shed rung can never keep, structurally: nothing was
             // read (the ring was empty, so no buffer was ever bound), the
             // request's bytes wait unread in the socket, and a kept
@@ -3936,7 +3936,7 @@ pub fn Proxy(comptime IoType: type) type {
             comptime counter: []const u8,
             may_keep: bool,
         ) bool {
-            assert(!conn.l7.response_started);
+            assert(!conn.stream.l7.response_started);
             releaseForStaticResponse(server, conn);
             // Retiring the *cap* is only half of it — `conn.deadline_ns`
             // is still standing wherever the cap clamped it, and the
@@ -3980,7 +3980,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
             assert(conn.stream.relay_buffer == null);
-            assert(conn.upstream == null);
+            assert(conn.stream.upstream == null);
             const keep = commitStaticVerdict(server, conn, 200, "l7_max_forwards_exhausted", true);
             const persistence: shed.Persistence = if (keep) .keep else .close;
             const answer = server.static_responses.getOptions(persistence);
@@ -3990,7 +3990,7 @@ pub fn Proxy(comptime IoType: type) type {
             // The answer is bodiless, so a HEAD would take the same bytes
             // — and a HEAD never reaches here anyway: this is the OPTIONS
             // path alone.
-            assert(conn.l7.request_method == .options);
+            assert(conn.stream.l7.request_method == .options);
             const then: stream_module.ClientWrite.Then =
                 if (keep) .next_request else .lingering_close;
             armClientWrite(server, conn, answer.bytes, then);
@@ -4025,11 +4025,11 @@ pub fn Proxy(comptime IoType: type) type {
             keep: bool,
         ) void {
             assert(conn.state == .l7_responding);
-            assert(!conn.l7.response_started);
+            assert(!conn.stream.l7.response_started);
             // Keeping implies the head parsed (§7 resync), which is what
             // makes the HEAD decision below sound wherever it matters.
             if (keep) {
-                assert(conn.l7.request_head_len >= 1);
+                assert(conn.stream.l7.request_head_len >= 1);
             }
             if (configuredPage(server, status)) |page| {
                 return armPageWrite(server, conn, page, keep);
@@ -4063,7 +4063,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_responding);
             assert(page.keep_head_len <= page.keep.len);
             assert(page.close_head_len <= page.close.len);
-            const head_only = conn.l7.request_method == .head;
+            const head_only = conn.stream.l7.request_method == .head;
             const bytes = if (keep)
                 (if (head_only) page.keep[0..page.keep_head_len] else page.keep)
             else
@@ -4094,12 +4094,12 @@ pub fn Proxy(comptime IoType: type) type {
             // and any lingering drain have their completions.
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
-            assert(!conn.l7.response_started);
+            assert(!conn.stream.l7.response_started);
             // A terminal verdict runs before routing acquires anything,
             // which is what keeps it clear of every rung past the head
             // ring (the redirect's precondition, same phase).
             assert(conn.stream.relay_buffer == null);
-            assert(conn.upstream == null);
+            assert(conn.stream.upstream == null);
             // The page is immutable arena memory, never the connection's
             // head buffer — so this answer releases before the send like
             // every other static one, rather than holding through it the
@@ -4204,12 +4204,12 @@ pub fn Proxy(comptime IoType: type) type {
             // the send and any lingering drain have their completions.
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
-            assert(!conn.l7.response_started);
+            assert(!conn.stream.l7.response_started);
             // Routing has acquired nothing yet: a redirect never touches
             // the relay or upstream pools, which is what keeps it out of
             // every shed rung past the head ring.
             assert(conn.stream.relay_buffer == null);
-            assert(conn.upstream == null);
+            assert(conn.stream.upstream == null);
             const location = composeLocation(server, redirect, request_host, forward) catch |err|
                 switch (err) {
                     // The request's own target made the Location too long
@@ -4337,8 +4337,8 @@ pub fn Proxy(comptime IoType: type) type {
             // connection carries nothing into its next request (§5).
             assert(conn.stream.head_buffer_id == StreamType.head_buffer_none);
             assert(conn.stream.relay_buffer == null);
-            assert(conn.upstream == null);
-            assert(conn.upstream_socket == null);
+            assert(conn.stream.upstream == null);
+            assert(conn.stream.upstream_socket == null);
             assert(!conn.stream.armed.data_client_to_upstream);
             assert(!conn.stream.armed.data_upstream_to_client);
             // The same OR `resetForNextRequest` needs, for the same reason,
