@@ -52,7 +52,14 @@ and the **proxy-specific deltas**. When in doubt, read the original.
   errors — OSDI'14.)
 - **Explicitly-sized integers** (`u32`, `u63`, …). Avoid `usize` except for real
   machine-word/index quantities.
-- **Functions ≤ 70 lines.** Hard limit.
+- **Functions ≤ 70 lines of code.** Hard limit, lint-enforced
+  (`scripts/lint.zig`). Comment and blank lines do not count: this codebase
+  buys its correctness partly with dense explanation, and a limit measured
+  in physical lines taxes exactly that — it would flag `dialUpstream` for
+  the 35-line comment justifying one assertion (#253), and reward deleting
+  it. Measured across the tree, 70 *physical* lines flagged 16 functions of
+  which 13 were more than a third comment; 70 *code* lines flags the three
+  that were genuinely long.
 - **4-space indentation.** `zig fmt` clean; trailing comma on wrapped signatures.
 - **Braces on every `if`** unless it fits on one line (defense against
   `goto fail;`-class bugs).

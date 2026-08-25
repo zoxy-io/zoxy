@@ -163,7 +163,8 @@ fn lintFile(
         }
     }
     assert(line_number >= 1);
-    return violation_count + lintUnboundedLoops(contents, path);
+    return violation_count + lintUnboundedLoops(contents, path) +
+        lintFunctionLengths(contents, path);
 }
 
 /// Flag every `while (true)` whose bound is neither asserted nor
@@ -541,4 +542,261 @@ test "pathIsUnder: exact files, directory prefixes, and near misses" {
     try std.testing.expect(!pathIsUnder("io", "io/"));
     // An empty spec confines a needle to nowhere.
     try std.testing.expect(!pathIsUnder("anything.zig", ""));
+}
+
+/// TIGER_STYLE's function-length limit, made mechanical — and measured in
+/// *code* lines, which is the whole point of having it here rather than
+/// leaving it to review.
+///
+/// A physical-line limit taxes the practice this codebase is most
+/// distinctive for. Measured over the tree the day this rule landed, 70
+/// physical lines flagged 16 functions, 13 of them more than a third
+/// comment: `dialUpstream` at 75 physical was 32 lines of code and a
+/// 35-line comment justifying one assertion (#253), a comment a
+/// million-seed soak paid for. A rule that says "shorten this" about that
+/// function is a rule that rewards deleting the explanation. Counting
+/// code alone flagged the three that were genuinely long.
+const function_code_lines_max: u32 = 70;
+
+/// How far a wrapped signature may run before its `{`. Generous: the
+/// widest in the tree is nine lines, and over-running merely means this
+/// pass cannot tell a type constructor from an ordinary function.
+const signature_lines_max: u32 = 16;
+
+fn lintFunctionLengths(contents: []const u8, path: []const u8) u32 {
+    assert(path.len > 0);
+    var violation_count: u32 = 0;
+    var scan: FunctionScan = .{ .contents = contents };
+    // Bounded by the line count: `next` advances past the header it
+    // returned, and a file is already held under `file_bytes_max`.
+    while (scan.next()) |found| {
+        if (found.code_lines <= function_code_lines_max) continue;
+        std.debug.print("{s}:{d}: function is {d} lines of code, limit is {d} " ++
+            "(TIGER_STYLE; comments and blanks do not count)\n", .{
+            path,
+            found.line_number,
+            found.code_lines,
+            function_code_lines_max,
+        });
+        violation_count += 1;
+    }
+    return violation_count;
+}
+
+/// The count without the report — what the tests below assert on, the
+/// same split `nextUnboundedLoop` has.
+fn countOverlongFunctions(contents: []const u8) u32 {
+    return countOverlongFunctionsAt(contents, function_code_lines_max);
+}
+
+/// The same count against an arbitrary limit. The threshold is a
+/// parameter so the tests can state a fixture in five readable lines
+/// instead of seventy: what they are checking is where the boundary
+/// falls and what counts toward it, neither of which is a property of
+/// the number 70.
+fn countOverlongFunctionsAt(contents: []const u8, limit: u32) u32 {
+    var count: u32 = 0;
+    var scan: FunctionScan = .{ .contents = contents };
+    // Bounded by the file's function count: `next` advances past each
+    // header it returns.
+    while (scan.next()) |found| {
+        if (found.code_lines > limit) count += 1;
+    }
+    return count;
+}
+
+/// Walks the function bodies in one file, skipping the comptime type
+/// constructors (`fn Name(...) type`) that are containers rather than
+/// functions — the 70-line rule is about a body a reader must hold in
+/// their head, and `fn Server(comptime IoType: type) type` is a module.
+const FunctionScan = struct {
+    contents: []const u8,
+    line_index: u32 = 0,
+
+    const Found = struct {
+        line_number: u32,
+        code_lines: u32,
+    };
+
+    fn next(scan: *FunctionScan) ?Found {
+        // Bounded: every iteration advances `line_index` by at least one,
+        // and the file has finitely many lines.
+        while (scan.lineAt(scan.line_index)) |line| {
+            const start = scan.line_index;
+            scan.line_index += 1;
+            const indent = headerIndent(line) orelse continue;
+            if (scan.isTypeConstructor(start)) continue;
+            const code_lines = scan.countBody(start, indent) orelse continue;
+            return .{ .line_number = start + 1, .code_lines = code_lines };
+        }
+        return null;
+    }
+
+    /// The zero-based `index`th line, or null past the end.
+    fn lineAt(scan: *const FunctionScan, index: u32) ?[]const u8 {
+        var seen: u32 = 0;
+        var offset: usize = 0;
+        // Bounded by the file length: each step moves past one newline.
+        while (offset <= scan.contents.len) {
+            const end = std.mem.indexOfScalarPos(u8, scan.contents, offset, '\n') orelse
+                scan.contents.len;
+            if (seen == index) return scan.contents[offset..end];
+            if (end == scan.contents.len) return null;
+            seen += 1;
+            offset = end + 1;
+        }
+        return null;
+    }
+
+    /// True when the signature starting at `start` returns `type`.
+    fn isTypeConstructor(scan: *const FunctionScan, start: u32) bool {
+        var offset: u32 = 0;
+        while (offset < signature_lines_max) : (offset += 1) {
+            const line = scan.lineAt(start + offset) orelse return false;
+            const trimmed = std.mem.trimEnd(u8, line, " \t\r");
+            if (!std.mem.endsWith(u8, trimmed, "{")) continue;
+            return std.mem.indexOf(u8, trimmed, ") type {") != null;
+        }
+        return false;
+    }
+
+    /// Lines of code from the header through the closing brace at the
+    /// same indent, or null when no such brace is found — a signature
+    /// this pass could not follow, which it declines to judge rather than
+    /// guessing.
+    fn countBody(scan: *const FunctionScan, start: u32, indent: usize) ?u32 {
+        var code_lines: u32 = 0;
+        var offset: u32 = 0;
+        // Bounded by the file's line count, which `file_bytes_max`
+        // bounds in turn.
+        while (scan.lineAt(start + offset)) |line| : (offset += 1) {
+            if (!isBlankOrComment(line)) code_lines += 1;
+            if (offset >= 1 and isCloseAt(line, indent)) return code_lines;
+        }
+        return null;
+    }
+};
+
+/// The indent of a function header line, or null when the line is not
+/// one. `fn` must open the statement: a `fn` inside a type expression or
+/// a string is not a declaration this rule is about.
+fn headerIndent(line: []const u8) ?usize {
+    const indent = line.len - std.mem.trimStart(u8, line, " ").len;
+    const rest = line[indent..];
+    const body = if (std.mem.startsWith(u8, rest, "pub ")) rest["pub ".len..] else rest;
+    if (!std.mem.startsWith(u8, body, "fn ")) return null;
+    // A name and an open paren, so `fn` in prose cannot match.
+    if (std.mem.indexOfScalar(u8, body, '(') == null) return null;
+    return indent;
+}
+
+/// True for the `}` that closes a declaration opened at `indent`.
+fn isCloseAt(line: []const u8, indent: usize) bool {
+    if (line.len != indent + 1) return false;
+    if (line[indent] != '}') return false;
+    for (line[0..indent]) |byte| {
+        if (byte != ' ') return false;
+    }
+    return true;
+}
+
+fn isBlankOrComment(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return true;
+    return std.mem.startsWith(u8, trimmed, "//");
+}
+
+test "countOverlongFunctions: the boundary is exact" {
+    // Three code lines: the header, one statement, the brace.
+    const at_limit =
+        \\fn f() void {
+        \\    step();
+        \\}
+        \\
+    ;
+    const over =
+        \\fn f() void {
+        \\    step();
+        \\    step();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countOverlongFunctionsAt(at_limit, 3));
+    try std.testing.expectEqual(@as(u32, 1), countOverlongFunctionsAt(over, 3));
+}
+
+test "countOverlongFunctions: comments and blanks do not count" {
+    // The rule's whole point: explanation is not length. A physical-line
+    // limit would flag this body and reward deleting the reason it works.
+    const padded =
+        \\fn f() void {
+        \\    // Why this is correct, at length.
+        \\    //
+        \\    // Still explaining.
+        \\
+        \\    step();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countOverlongFunctionsAt(padded, 3));
+}
+
+test "countOverlongFunctions: a comptime type constructor is not a function" {
+    // `fn Server(comptime IoType: type) type` is a module, and the limit
+    // is about a body a reader holds in their head.
+    const constructor =
+        \\fn Server(comptime IoType: type) type {
+        \\    step();
+        \\    step();
+        \\    step();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countOverlongFunctionsAt(constructor, 3));
+}
+
+test "countOverlongFunctions: a wrapped signature is still recognized" {
+    // The `) type {` this pass looks for may be several lines below the
+    // `fn`, which is how every generic in the tree is written.
+    const wrapped =
+        \\fn Pool(
+        \\    comptime T: type,
+        \\) type {
+        \\    step();
+        \\    step();
+        \\    step();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countOverlongFunctionsAt(wrapped, 3));
+}
+
+test "countOverlongFunctions: a nested declaration is measured at its own indent" {
+    const nested =
+        \\    fn inner() void {
+        \\        step();
+        \\        step();
+        \\    }
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countOverlongFunctionsAt(nested, 3));
+    try std.testing.expectEqual(@as(u32, 0), countOverlongFunctionsAt(nested, 4));
+}
+
+test "countOverlongFunctions: each overlong function in a file is counted" {
+    const source =
+        \\fn a() void {
+        \\    step();
+        \\    step();
+        \\}
+        \\fn b() void {
+        \\    step();
+        \\}
+        \\fn c() void {
+        \\    step();
+        \\    step();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 2), countOverlongFunctionsAt(source, 3));
 }
