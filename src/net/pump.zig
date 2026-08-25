@@ -204,13 +204,13 @@ pub fn Pump(
         fn source(conn: *const ConnType) IoType.Socket {
             return switch (direction) {
                 .client_to_upstream => conn.client_socket,
-                .upstream_to_client => conn.upstream_socket.?,
+                .upstream_to_client => conn.stream.upstream_socket.?,
             };
         }
 
         fn target(conn: *const ConnType) IoType.Socket {
             return switch (direction) {
-                .client_to_upstream => conn.upstream_socket.?,
+                .client_to_upstream => conn.stream.upstream_socket.?,
                 .upstream_to_client => conn.client_socket,
             };
         }
