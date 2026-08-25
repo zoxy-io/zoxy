@@ -38,6 +38,7 @@ const std = @import("std");
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const conn_module = @import("Conn.zig");
+const stream_module = @import("Stream.zig");
 const pump = @import("pump.zig");
 const router = @import("../http/router.zig");
 const server_module = @import("../Server.zig");
@@ -48,7 +49,7 @@ const assert = std.debug.assert;
 
 const ServerSim = server_module.Server(SimIo);
 const ConnSim = conn_module.Conn(SimIo);
-const Direction = ConnSim.Direction;
+const Direction = ConnSim.StreamType.Direction;
 
 /// `[u16 big-endian length][payload]` — the smallest framing with a real
 /// header, so every frame puts two bytes on the wire that framing never
@@ -118,8 +119,8 @@ const Scratch = struct {
 /// dead code — the transform seam is this file's only job.
 fn Base(comptime direction: Direction) type {
     return struct {
-        fn state(conn: *ConnSim) *conn_module.DirectionState {
-            return &conn.directions[@intFromEnum(direction)];
+        fn state(conn: *ConnSim) *stream_module.DirectionState {
+            return &conn.stream.directions[@intFromEnum(direction)];
         }
 
         fn targetSocket(conn: *const ConnSim) SimIo.Socket {
@@ -170,8 +171,8 @@ fn Base(comptime direction: Direction) type {
             assert(state(conn).phase != .finished);
             state(conn).phase = .finished;
             server.io.shutdown(targetSocket(conn), .write);
-            if (conn.directions[0].phase == .finished and
-                conn.directions[1].phase == .finished)
+            if (conn.stream.directions[0].phase == .finished and
+                conn.stream.directions[1].phase == .finished)
             {
                 server.beginTeardown(conn);
             }
@@ -267,7 +268,7 @@ const ToUpstreamPolicy = struct {
         assert(chunk.len >= 1);
         scratch.inbound_len += @intCast(chunk.len);
         assert(scratch.inbound_len <= scratch.inbound.len);
-        const out = conn.relay_buffer.?.client_to_upstream;
+        const out = conn.stream.relay_buffer.?.client_to_upstream;
         var out_len: u32 = 0;
         // Bounded by the scratch: each turn either consumes a whole frame or
         // breaks out.
@@ -332,7 +333,7 @@ const ToClientPolicy = struct {
         // runs exactly once per framed chunk.
         assert(scratch.outbound_len == scratch.outbound_sent);
         if (consumed > payload_max) return false;
-        const body = conn.relay_buffer.?.upstream_to_client[0..consumed];
+        const body = conn.stream.relay_buffer.?.upstream_to_client[0..consumed];
         std.mem.writeInt(u16, scratch.outbound[0..2], @intCast(consumed), .big);
         @memcpy(scratch.outbound[header_bytes..][0..consumed], body);
         scratch.outbound_len = header_bytes + consumed;
@@ -358,7 +359,7 @@ const ToClientPolicy = struct {
         scratch.outbound_sent += sent;
         assert(scratch.outbound_sent <= scratch.outbound_len);
         if (scratch.outbound_sent < scratch.outbound_len) return;
-        const direction_state = &conn.directions[@intFromEnum(Direction.upstream_to_client)];
+        const direction_state = &conn.stream.directions[@intFromEnum(Direction.upstream_to_client)];
         direction_state.credit(direction_state.owed());
     }
 };
@@ -698,7 +699,9 @@ const Harness = struct {
         // release rule this harness asserts at teardown does.
         const stream = bed.server.streams.acquire().?;
         stream.prepare(conn);
+        conn.stream = stream;
         const buffer = bed.server.relay_buffers.acquire().?;
+        stream.relay_buffer = buffer;
         // The accept gate and the admission tail are not exercised here, so
         // their counters are set by hand: `reconcile` (§9) checks
         // completed <= admitted <= accepted, and this connection did pass
@@ -707,9 +710,7 @@ const Harness = struct {
         bed.server.counters.increment("admitted");
         conn.prepare(
             &bed.server,
-            stream,
             bed.proxy_client_socket,
-            buffer,
             // Plaintext: this bed drives the pump seam directly, which is
             // the layer a transform sits above rather than inside.
             null,
