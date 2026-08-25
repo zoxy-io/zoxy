@@ -129,7 +129,7 @@ pub fn Budget(comptime IoType: type) type {
                 .upstream_slots = limits.upstream_slots,
                 .upstream_bytes = @sizeOf(UpstreamType),
                 .access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes),
-                .log_header_bytes = ServerType.logHeaderBytes(config, limits.conn_slots),
+                .log_header_bytes = ServerType.logHeaderBytes(config, constants.streamSlotsFor(limits.conn_slots)),
                 .endpoint_table_bytes = ServerType.endpointTableBytes(config),
                 .metrics_bytes = ServerType.metricsBytes(config),
                 .head_buffers = limits.head_buffers,

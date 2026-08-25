@@ -19,6 +19,7 @@ const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const counters_module = @import("counters.zig");
 const conn_module = @import("net/Conn.zig");
+const stream_module = @import("net/Stream.zig");
 const health_module = @import("net/health.zig");
 const Io = @import("io/io.zig");
 const Pool = @import("mem/Pool.zig").Pool;
@@ -762,8 +763,9 @@ pub fn Server(comptime IoType: type) type {
         }
 
         /// The #140 capture table, sized by the config's named headers
-        /// times the connection slots that can each hold one request's
-        /// worth. Both allocations are empty when no header is named,
+        /// times the stream slots that can each hold one request's
+        /// worth (#274: the captures share `LogState`'s unit, and that
+        /// is the slot it lives on). Both allocations are empty when no header is named,
         /// which is what makes the feature free to a deployment that
         /// does not use it.
         fn initLogHeaders(
@@ -773,7 +775,12 @@ pub fn Server(comptime IoType: type) type {
         ) error{OutOfMemory}!void {
             const per_conn = logHeadersPerConn(server.config);
             server.log_headers_per_conn = per_conn;
-            const slots: usize = @as(usize, options.conn_slots) * per_conn;
+            // One slice per *stream* slot (#274): the captures share
+            // `LogState`'s unit, and that is the slot the line lives on.
+            // Pinned 1:1 to the conn count, so the reservation is the
+            // number the §5 banner has always printed.
+            const stream_slots = constants.streamSlotsFor(options.conn_slots);
+            const slots: usize = @as(usize, stream_slots) * per_conn;
             server.log_header_values = try arena.alloc(
                 u8,
                 slots * constants.access_log_header_bytes_max,
@@ -781,7 +788,7 @@ pub fn Server(comptime IoType: type) type {
             server.log_header_lens = try arena.alloc(u16, slots);
             @memset(server.log_header_lens, 0);
             assert(server.log_header_values.len ==
-                logHeaderBytes(server.config, options.conn_slots) -
+                logHeaderBytes(server.config, stream_slots) -
                     server.log_header_lens.len * @sizeOf(u16));
         }
 
@@ -1827,39 +1834,19 @@ pub fn Server(comptime IoType: type) type {
             shed.closeQuietly(IoType, server.io, client_socket);
         }
 
-        /// The shared admission tail (§8 single choke point): counting, slot
-        /// prepare, socket options, the routing tables, and the one deadline
-        /// timer this connection ever arms are identical across protocols —
-        /// the protocol only chooses which values go in, through
-        /// `entryState` and `entryTimeoutMs`.
-        fn finishAdmission(
+        /// What the listener decided, written onto the two slots it was
+        /// decided for (§5, §7). Split from `finishAdmission` for the
+        /// length limit, and the seam is the one the split of #274 made
+        /// natural: the caller owns the connection's *lifecycle* — the
+        /// count, the reset, the socket options, the one deadline it
+        /// arms — while this owns the values a listener contributes to
+        /// the connection and to the exchange starting on it.
+        fn installListenerState(
             server: *Self,
             conn: *ConnType,
-            client_socket: IoType.Socket,
             buffer: ?*relay.RelayBuffer,
-            engine: ?*TlsEngine,
             listener: *const ListenerState,
         ) void {
-            assert(!server.draining);
-            // Whatever a listener terminates, it terminates for every
-            // connection: an engine without a credentialed listener would
-            // be one this slot leaks, and a credentialed listener without
-            // one would serve ciphertext as if it were a request.
-            assert((engine != null) == (listener.credentials != null));
-            server.counters.increment("admitted");
-            conn.prepare(
-                server,
-                client_socket,
-                engine,
-                entryState(listener.protocol),
-                listener.protocol,
-                // Asked once, here, and kept: at log time the socket may
-                // already be closed (§8).
-                server.io.peerAddress(client_socket),
-            );
-            server.io.setNodelay(client_socket) catch |err| {
-                server.witnessKernelPressure(.set_option, err);
-            };
             // The L7 path routes and filters once the head parses (§7);
             // every connection gets its listener's tables and the protocol
             // decides whether it reads them — an l4 listener resolves to
@@ -1895,7 +1882,55 @@ pub fn Server(comptime IoType: type) type {
             // capture at all, and its line would otherwise report
             // whatever the slot's *previous* occupant sent.
             server.resetLogHeaders(conn);
+            // An L4 connection is its own log unit and starts its line
+            // here — the first point at which a listener has said it is
+            // one. An L7 exchange starts only when its first head byte
+            // lands, so an idle keep-alive connection reaped without ever
+            // being asked anything owes no line. Both are gated on the log
+            // being on, so a deployment without one reads no clock here.
+            if (listener.protocol == .l4 and server.access_log.sink != null) {
+                conn.stream.log.started_wall_ns = server.io.nowWallNs();
+            }
             assert(conn.routes.len >= 1);
+            assert(conn.stream.conn == conn);
+        }
+
+        /// The shared admission tail (§8 single choke point): counting,
+        /// slot prepare, socket options and the one deadline timer this
+        /// connection ever arms are identical across protocols — the
+        /// protocol only chooses which values go in, through `entryState`
+        /// and `entryTimeoutMs`. What a *listener* contributes to the two
+        /// slots is `installListenerState`'s, split out for the length
+        /// limit.
+        fn finishAdmission(
+            server: *Self,
+            conn: *ConnType,
+            client_socket: IoType.Socket,
+            buffer: ?*relay.RelayBuffer,
+            engine: ?*TlsEngine,
+            listener: *const ListenerState,
+        ) void {
+            assert(!server.draining);
+            // Whatever a listener terminates, it terminates for every
+            // connection: an engine without a credentialed listener would
+            // be one this slot leaks, and a credentialed listener without
+            // one would serve ciphertext as if it were a request.
+            assert((engine != null) == (listener.credentials != null));
+            server.counters.increment("admitted");
+            conn.prepare(
+                server,
+                client_socket,
+                engine,
+                entryState(listener.protocol),
+                listener.protocol,
+                // Asked once, here, and kept: at log time the socket may
+                // already be closed (§8).
+                server.io.peerAddress(client_socket),
+            );
+            server.io.setNodelay(client_socket) catch |err| {
+                server.witnessKernelPressure(.set_option, err);
+            };
+            server.installListenerState(conn, buffer, listener);
             server.storeDeadline(conn, server.entryTimeoutMs(listener.protocol));
             server.armDeadline(conn);
             assert(conn.deadline_ns > 0);
@@ -2080,20 +2115,28 @@ pub fn Server(comptime IoType: type) type {
         /// The #140 capture table's closed form — values plus their
         /// lengths — for the banner and for `initLogHeaders` to assert
         /// against. Zero for a config that names no headers.
-        pub fn logHeaderBytes(config: *const config_module.Config, conn_slots: u32) u64 {
-            const slots: u64 = @as(u64, conn_slots) * logHeadersPerConn(config);
+        pub fn logHeaderBytes(config: *const config_module.Config, stream_slots: u32) u64 {
+            const slots: u64 = @as(u64, stream_slots) * logHeadersPerConn(config);
             return slots * constants.access_log_header_bytes_max + slots * @sizeOf(u16);
         }
 
-        /// One connection's slice of the capture table: `per_conn` value
-        /// slots, addressed by the pool index — stable across reuse, and
-        /// the same index for the whole life of the connection holding
-        /// it. Split from the capture and the read so both speak one
-        /// piece of arithmetic.
+        /// One exchange's slice of the capture table: `per_conn` value
+        /// slots, addressed by the *stream* pool index — stable across
+        /// reuse, and the same index for the whole life of the slot
+        /// holding it. Split from the capture and the read so both speak
+        /// one piece of arithmetic.
+        ///
+        /// Keyed by the stream since #274, because these are the fields
+        /// `LogState` could not hold inline and they share its unit
+        /// exactly: one request on the L7 path, cleared at every
+        /// turnaround. Addressing them by the conn slot while the line
+        /// they belong to lives on the stream would be two units for one
+        /// log entry. The count is unchanged — the pools are pinned 1:1
+        /// (#274) — so the §5 budget term does not move.
         fn logHeaderSlot(server: *Self, conn: *const ConnType, index: u32) []u8 {
             assert(index < server.log_headers_per_conn);
-            const conn_index = server.conns.indexOf(conn);
-            const slot = conn_index * server.log_headers_per_conn + index;
+            const stream_index = server.streams.indexOf(conn.stream);
+            const slot = stream_index * server.log_headers_per_conn + index;
             assert(slot < server.log_header_lens.len);
             const bytes = constants.access_log_header_bytes_max;
             return server.log_header_values[slot * bytes ..][0..bytes];
@@ -2101,8 +2144,8 @@ pub fn Server(comptime IoType: type) type {
 
         fn logHeaderLen(server: *Self, conn: *const ConnType, index: u32) *u16 {
             assert(index < server.log_headers_per_conn);
-            const conn_index = server.conns.indexOf(conn);
-            const slot = conn_index * server.log_headers_per_conn + index;
+            const stream_index = server.streams.indexOf(conn.stream);
+            const slot = stream_index * server.log_headers_per_conn + index;
             assert(slot < server.log_header_lens.len);
             return &server.log_header_lens[slot];
         }
@@ -2230,13 +2273,13 @@ pub fn Server(comptime IoType: type) type {
             };
         }
 
-        /// Forget this connection's captured values, so a kept-alive
+        /// Forget this exchange's captured values, so a kept-alive
         /// turnaround cannot report the previous request's headers on
         /// the next one's line — `LogState.reset`'s rule for the fields
-        /// that live in the side table instead of on the conn.
+        /// that live in the side table instead of on the slot.
         pub fn resetLogHeaders(server: *Self, conn: *const ConnType) void {
             assert(server.log_header_lens.len ==
-                @as(usize, server.conns.capacity()) * server.log_headers_per_conn);
+                @as(usize, server.streams.capacity()) * server.log_headers_per_conn);
             var index: u32 = 0;
             while (index < server.log_headers_per_conn) : (index += 1) {
                 server.logHeaderLen(conn, index).* = 0;
@@ -2415,7 +2458,7 @@ pub fn Server(comptime IoType: type) type {
                 // access log's `bytes_in` unit (§8) — which the relay's
                 // own counting will never see; the header is metadata the
                 // origin never receives, so it stays uncounted.
-                conn.log.bytes_in += leftover_len;
+                conn.stream.log.bytes_in += leftover_len;
                 const direction = &conn.stream.directions[
                     @intFromEnum(StreamType.Direction.client_to_upstream)
                 ];
@@ -2744,7 +2787,7 @@ pub fn Server(comptime IoType: type) type {
                     bytes,
                 );
                 conn.tls_pending_len += @intCast(bytes.len);
-                conn.log.bytes_in += bytes.len;
+                conn.stream.log.bytes_in += bytes.len;
             }
 
             fn closed(ctx: *anyopaque) void {
@@ -2852,7 +2895,7 @@ pub fn Server(comptime IoType: type) type {
             // An L4 dial holds no slot to record the endpoint on, so the
             // access log takes it here — the only place that knows which
             // origin this connection is being relayed to (§8).
-            conn.log.endpoint_index = dial.endpoint_index;
+            conn.stream.log.endpoint_index = dial.endpoint_index;
             server.chargeEndpoint(conn, cluster_index, dial.endpoint_index);
             if (server.config.clusters[cluster_index].proxy_protocol_send) |version| {
                 server.stageProxySendHeader(conn, version);
@@ -2886,7 +2929,7 @@ pub fn Server(comptime IoType: type) type {
                 // await, but the charge did — `chargeEndpoint` recorded the
                 // endpoint this dial was for, and the charge is released
                 // only at teardown, after this line.
-                assert(conn.charged_endpoint != conn_module.LogState.endpoint_none);
+                assert(conn.charged_endpoint != stream_module.LogState.endpoint_none);
                 server.labeled.incrementEndpoint(
                     .connect_failed,
                     server.upstreams.keys.key(conn.charged_cluster, conn.charged_endpoint),
@@ -3023,7 +3066,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.stream.relay_buffer == null);
             assert(conn.tunnel_buffer == null);
             assert(conn.stream.upstream == null);
-            assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
+            assert(conn.charged_endpoint == stream_module.LogState.endpoint_none);
         }
 
         /// Public for the relay: a completion delivered during teardown
@@ -3079,14 +3122,14 @@ pub fn Server(comptime IoType: type) type {
         /// the whole time it spent dribbling.
         pub fn beginLogRequest(server: *Self, conn: *ConnType) void {
             if (server.access_log.sink == null) return;
-            if (conn.log.started_wall_ns != 0) return;
-            conn.log.started_wall_ns = server.io.nowWallNs();
-            assert(conn.log.started_wall_ns != 0);
+            if (conn.stream.log.started_wall_ns != 0) return;
+            conn.stream.log.started_wall_ns = server.io.nowWallNs();
+            assert(conn.stream.log.started_wall_ns != 0);
         }
 
         /// Write the access-log line this connection owes, if any (§8).
         ///
-        /// The caller sets `conn.log.status` and `conn.log.outcome` when it
+        /// The caller sets `conn.stream.log.status` and `conn.stream.log.outcome` when it
         /// knows them; the defaults — status 0, outcome `aborted` — are
         /// deliberately the answer for the caller that does not, which is
         /// teardown. That is what lets one function serve both the path
@@ -3095,11 +3138,11 @@ pub fn Server(comptime IoType: type) type {
         /// took both.
         pub fn logExchange(server: *Self, conn: *ConnType) void {
             if (server.access_log.sink == null) return;
-            if (conn.log.emitted) return;
+            if (conn.stream.log.emitted) return;
             // Nothing was asked of this connection: an L7 slot that idled
             // out between requests, or one reaped before its first byte.
-            if (conn.log.started_wall_ns == 0) return;
-            conn.log.emitted = true;
+            if (conn.stream.log.started_wall_ns == 0) return;
+            conn.stream.log.emitted = true;
             const now_wall_ns = server.io.nowWallNs();
             // Both indices are pool/config positions this connection has
             // carried since routing; a stale one would name another
@@ -3107,8 +3150,8 @@ pub fn Server(comptime IoType: type) type {
             // rather than left to Zig's bounds check to turn into a panic.
             assert(conn.stream.cluster_index < server.config.clusters.len);
             const cluster = server.config.clusters[conn.stream.cluster_index];
-            if (conn.log.endpoint_index != conn_module.LogState.endpoint_none) {
-                assert(conn.log.endpoint_index < cluster.endpoints.len);
+            if (conn.stream.log.endpoint_index != stream_module.LogState.endpoint_none) {
+                assert(conn.stream.log.endpoint_index < cluster.endpoints.len);
             }
             var values: LoggedHeaderValues = undefined;
             const logged = server.loggedHeaderPair(conn, &values);
@@ -3117,24 +3160,24 @@ pub fn Server(comptime IoType: type) type {
                     .l4 => .l4,
                     .http => .http,
                 },
-                .outcome = conn.log.outcome,
-                .started_wall_ns = conn.log.started_wall_ns,
+                .outcome = conn.stream.log.outcome,
+                .started_wall_ns = conn.stream.log.started_wall_ns,
                 // Saturating: the wall clock can step backwards under NTP,
                 // and a duration that wrapped to eighteen quintillion
                 // microseconds would be read as a stall that never happened.
-                .duration_ns = now_wall_ns -| conn.log.started_wall_ns,
+                .duration_ns = now_wall_ns -| conn.stream.log.started_wall_ns,
                 .client = conn.client_address,
-                .upstream = if (conn.log.endpoint_index == conn_module.LogState.endpoint_none)
+                .upstream = if (conn.stream.log.endpoint_index == stream_module.LogState.endpoint_none)
                     null
                 else
-                    cluster.endpoints[conn.log.endpoint_index],
+                    cluster.endpoints[conn.stream.log.endpoint_index],
                 .cluster = cluster.name,
-                .bytes_in = conn.log.bytes_in,
-                .bytes_out = conn.log.bytes_out,
-                .method = conn.log.methodSlice(),
-                .host = conn.log.hostSlice(),
-                .path = conn.log.pathSlice(),
-                .status = conn.log.status,
+                .bytes_in = conn.stream.log.bytes_in,
+                .bytes_out = conn.stream.log.bytes_out,
+                .method = conn.stream.log.methodSlice(),
+                .host = conn.stream.log.hostSlice(),
+                .path = conn.stream.log.pathSlice(),
+                .status = conn.stream.log.status,
                 .upstream_reused = conn.stream.l7.upstream_was_reused,
                 .upstream_replayed = conn.stream.l7.replay_used,
                 .request_headers = logged.request,
@@ -3369,7 +3412,7 @@ pub fn Server(comptime IoType: type) type {
         /// counted for its whole life without pinning a shared slot.
         pub fn chargeEndpoint(server: *Self, conn: *ConnType, cluster_index: u16, endpoint_index: u16) void {
             assert(conn.protocol == .l4 or conn.state == .l7_exchanging);
-            assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
+            assert(conn.charged_endpoint == stream_module.LogState.endpoint_none);
             const key = server.upstreams.keys.key(cluster_index, endpoint_index);
             server.l4_inflight[key] += 1;
             // Every charge is held by a live conn slot, so one endpoint's
@@ -3386,11 +3429,11 @@ pub fn Server(comptime IoType: type) type {
         /// through. Idempotent by the sentinel: a connection shed before
         /// its dial, or torn down twice, has nothing charged.
         fn releaseL4(server: *Self, conn: *ConnType) void {
-            if (conn.charged_endpoint == conn_module.LogState.endpoint_none) return;
+            if (conn.charged_endpoint == stream_module.LogState.endpoint_none) return;
             const key = server.upstreams.keys.key(conn.charged_cluster, conn.charged_endpoint);
             assert(server.l4_inflight[key] >= 1);
             server.l4_inflight[key] -= 1;
-            conn.charged_endpoint = conn_module.LogState.endpoint_none;
+            conn.charged_endpoint = stream_module.LogState.endpoint_none;
         }
 
         pub fn releaseUpstream(

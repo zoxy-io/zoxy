@@ -123,13 +123,13 @@ pub fn Relay(comptime IoType: type) type {
                 pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
                     _ = received;
                     if (direction == .client_to_upstream) {
-                        conn.log.bytes_in += fr.consumed;
+                        conn.stream.log.bytes_in += fr.consumed;
                     }
                 }
 
                 pub fn afterSend(conn: *ConnType, sent: u32) void {
                     if (direction == .upstream_to_client) {
-                        conn.log.bytes_out += sent;
+                        conn.stream.log.bytes_out += sent;
                     }
                 }
 
@@ -379,7 +379,7 @@ pub fn Relay(comptime IoType: type) type {
                     // — a reset, a deadline, a drain straggler — leaves the
                     // access log's default `aborted` in place (§8), so the
                     // line distinguishes a completed relay from a cut one.
-                    conn.log.outcome = .closed;
+                    conn.stream.log.outcome = .closed;
                     server.beginTeardown(conn);
                 }
             }
