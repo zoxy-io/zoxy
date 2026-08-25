@@ -505,6 +505,31 @@ pub const ring_entries: u16 = 4096;
 /// that reach exactly four (§8, §9).
 pub const conn_ops_max: u32 = 4;
 
+/// Stream slots (`Pool(Stream)`) for a given conn-slot count (#274).
+///
+/// One stream per connection, which is what an HTTP/1.1 exchange model
+/// *is*: a connection carries one request at a time, so a second stream
+/// could never be acquired. Derived here rather than configured because
+/// there is no question for an operator in it yet — the same argument
+/// `health_probe_concurrency` settled (#132) — and because a limit of
+/// its own could drift from `conn_slots` in a hand-written bridge, where
+/// this cannot.
+///
+/// A stream carries no ring ops yet, so `inFlightOps` below is unchanged
+/// and charges nothing per stream slot. The pin is what will hold that
+/// budget still once they move (#274 slice 2): the per-connection charge
+/// splits into a conn share and a stream share, and while the two counts
+/// are equal their sum is the one divisor per admitted connection the CQ
+/// ceiling has always been derived from. #173 is what unpins the counts —
+/// a shared pool sized for concurrent *streams* rather than for
+/// connections — at which point this becomes a limit and the divisor is
+/// re-derived against it.
+pub fn streamSlotsFor(conn_slots: u32) u32 {
+    assert(conn_slots >= 1);
+    assert(conn_slots <= conn_slots_max);
+    return conn_slots;
+}
+
 /// Completions drained per loop tick before control returns to the kernel;
 /// bounds both callback batches and `Io.now_ns` staleness (§4).
 pub const loop_completions_per_tick_max: u32 = 256;
@@ -1488,6 +1513,17 @@ comptime {
 pub const PoolSizes = struct {
     conn_slots: u32,
     conn_bytes: u64,
+    /// The §5 stream pool (#274): one exchange per slot, one slot per
+    /// connection for now, so the count is `streamSlotsFor(conn_slots)`
+    /// and the unit is `@sizeOf` the pool element — the intrusive
+    /// free-list header rides along like every other pool's.
+    ///
+    /// Its own banner term rather than folded into `conn_bytes`, even
+    /// while the two counts are pinned together, because the split is
+    /// exactly what a reader of the banner should be able to see: what
+    /// the connection costs, and what one exchange on it costs.
+    stream_slots: u32,
+    stream_bytes: u64,
     relay_buffers: u32,
     relay_buffer_pair_bytes: u64,
     upstream_slots: u32,
@@ -1603,6 +1639,11 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
     assert(sizes.upstream_slots >= 1);
     assert(sizes.upstream_slots <= upstream_slots_max);
     assert(sizes.conn_bytes > 0);
+    // Pinned to the conn count while an exchange is a connection (#274);
+    // the assert is what will fail loudly the day #173 sizes the pool
+    // for concurrent streams instead and this form needs re-deriving.
+    assert(sizes.stream_slots == streamSlotsFor(sizes.conn_slots));
+    assert(sizes.stream_bytes > 0);
     assert(sizes.relay_buffer_pair_bytes >= 2 * @as(u64, relay_buffer_bytes_min));
     // Once 8 KiB of head, now scalars: the slot's head moved to the §5
     // upstream head pool, whose own bound is asserted below.
@@ -1654,6 +1695,7 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         assert(sizes.libcrypto_heap_bytes == libcrypto_heap_bytes);
     }
     const total = @as(u64, sizes.conn_slots) * sizes.conn_bytes +
+        @as(u64, sizes.stream_slots) * sizes.stream_bytes +
         @as(u64, sizes.relay_buffers) * sizes.relay_buffer_pair_bytes +
         @as(u64, sizes.upstream_slots) * sizes.upstream_bytes +
         sizes.access_log_bytes + sizes.log_header_bytes +
@@ -1693,6 +1735,9 @@ test "pressure: relay watermarks have a hysteresis gap at every capacity" {
 
 test "budgets: memory total matches the closed form" {
     const conn_bytes: u64 = 10240;
+    // The stream pool's unit (#274). A stand-in like `conn_bytes` above:
+    // this test pins the *sum*, and `@sizeOf` owns the real figure.
+    const stream_bytes: u64 = 16;
     const pair_bytes: u64 = 2 * @as(u64, relay_buffer_bytes_default);
     // Scalars only since the head moved to its own pool (§5).
     const upstream_bytes: u64 = 64;
@@ -1723,6 +1768,7 @@ test "budgets: memory total matches the closed form" {
     // (`Server.metricsBytes` owns that).
     const metrics: u64 = 4096;
     const expected_max = @as(u64, conn_slots_max) * conn_bytes +
+        @as(u64, streamSlotsFor(conn_slots_max)) * stream_bytes +
         @as(u64, relay_buffers_max) * pair_bytes +
         @as(u64, upstream_slots_max) * upstream_bytes +
         accessLogBytes(access_log_buffer_bytes_default) + endpoint_tables +
@@ -1733,6 +1779,8 @@ test "budgets: memory total matches the closed form" {
     try std.testing.expectEqual(expected_max, memoryBytesTotal(&.{
         .conn_slots = conn_slots_max,
         .conn_bytes = conn_bytes,
+        .stream_slots = streamSlotsFor(conn_slots_max),
+        .stream_bytes = stream_bytes,
         .relay_buffers = relay_buffers_max,
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = upstream_slots_max,
@@ -1748,11 +1796,14 @@ test "budgets: memory total matches the closed form" {
     }));
     // The L4-only shape still carries the prober's one response buffer —
     // and the labeled metrics, which exist for every config (§8).
-    const expected_small = 64 * conn_bytes + 8 * pair_bytes + 8 * upstream_bytes +
+    const expected_small = 64 * conn_bytes + streamSlotsFor(64) * stream_bytes +
+        8 * pair_bytes + 8 * upstream_bytes +
         metrics + head_buffer_bytes_default;
     try std.testing.expectEqual(expected_small, memoryBytesTotal(&.{
         .conn_slots = 64,
         .conn_bytes = conn_bytes,
+        .stream_slots = streamSlotsFor(64),
+        .stream_bytes = stream_bytes,
         .relay_buffers = 8,
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = 8,
@@ -1779,6 +1830,8 @@ test "budgets: memory total matches the closed form" {
     try std.testing.expectEqual(expected_tunnels, memoryBytesTotal(&.{
         .conn_slots = 64,
         .conn_bytes = conn_bytes,
+        .stream_slots = streamSlotsFor(64),
+        .stream_bytes = stream_bytes,
         .relay_buffers = 8,
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = 8,
@@ -1815,6 +1868,8 @@ test "budgets: memory total matches the closed form" {
     try std.testing.expectEqual(expected_tls, memoryBytesTotal(&.{
         .conn_slots = 64,
         .conn_bytes = conn_bytes,
+        .stream_slots = streamSlotsFor(64),
+        .stream_bytes = stream_bytes,
         .relay_buffers = 8,
         .relay_buffer_pair_bytes = pair_bytes,
         .upstream_slots = 8,

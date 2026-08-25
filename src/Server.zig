@@ -43,6 +43,19 @@ pub fn Server(comptime IoType: type) type {
         io: *IoType,
         config: *const config_module.Config,
         conns: Pool(ConnType),
+        /// The §5 stream pool (#274): one exchange per slot, and for now
+        /// exactly one slot per admitted connection.
+        ///
+        /// Sized to `conn_slots` rather than given a limit of its own,
+        /// which is the whole shape of this slice: at one stream per
+        /// connection the pool cannot be exhausted independently, so it
+        /// adds no shed rung and no counter, and the ring budget it
+        /// re-derives comes out where it was. #173 is what makes the two
+        /// counts diverge — a shared pool sized for concurrent *streams*,
+        /// with `SETTINGS_MAX_CONCURRENT_STREAMS` an advertisement over
+        /// it and `REFUSED_STREAM` the rung when it runs dry — and that
+        /// is when it earns an operator-facing limit.
+        streams: Pool(StreamType),
         relay_buffers: Pool(relay.RelayBuffer),
         /// The §5 tunnel pool (#180): relay buffers for upgraded
         /// connections, deliberately *not* the pool above.
@@ -319,6 +332,7 @@ pub fn Server(comptime IoType: type) type {
         const Self = @This();
 
         pub const ConnType = conn_module.Conn(IoType);
+        pub const StreamType = ConnType.StreamType;
         pub const AccessLogType = access_log_module.AccessLog(IoType);
         const Proxy = proxy.Proxy(IoType);
 
@@ -501,6 +515,11 @@ pub fn Server(comptime IoType: type) type {
             server.static_sends_inflight = 0;
             server.initDateSlots();
             try server.conns.init(arena, options.conn_slots);
+            // One stream per connection (#274). Derived rather than
+            // configured, so the pair cannot drift apart in a
+            // hand-written bridge the way two limits could.
+            try server.streams.init(arena, constants.streamSlotsFor(options.conn_slots));
+            assert(server.streams.capacity() == server.conns.capacity());
             try server.relay_buffers.init(arena, options.relay_buffers);
             try wireRelayHalves(arena, server.relay_buffers.slots, options.relay_buffer_bytes);
             try server.initTunnelBuffers(arena, &options);
@@ -1377,6 +1396,12 @@ pub fn Server(comptime IoType: type) type {
             if (!server.access_log.isQuiescent()) return;
             // Same rule for the prober's armed ops (§8).
             if (!server.health.isQuiescent()) return;
+            // Every stream released ahead of the conn that owned it
+            // (#274, `continueTeardown`), and the check above says every
+            // conn is gone — so an outstanding stream here is the split's
+            // own leak, one layer below the one this enumeration was
+            // written for.
+            assert(server.streams.isFullyReleased());
             assert(server.relay_buffers.isFullyReleased());
             // Trivially true until a tunnel can exist, and stated now for
             // exactly that reason: the §9 leak invariant is cheapest to
@@ -1474,6 +1499,10 @@ pub fn Server(comptime IoType: type) type {
             }
             return server.l4Released() and
                 server.conns.isFullyReleased() and
+                // Both pools drain to zero, which is the #274 half of
+                // this invariant: a stream leaked without its connection
+                // is exactly the bug the split makes possible.
+                server.streams.isFullyReleased() and
                 server.relay_buffers.isFullyReleased() and
                 server.tunnel_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
@@ -1798,6 +1827,7 @@ pub fn Server(comptime IoType: type) type {
             server.counters.increment("admitted");
             conn.prepare(
                 server,
+                server.admitStream(conn),
                 client_socket,
                 buffer,
                 engine,
@@ -2175,6 +2205,37 @@ pub fn Server(comptime IoType: type) type {
             while (index < server.log_headers_per_conn) : (index += 1) {
                 server.logHeaderLen(conn, index).* = 0;
             }
+        }
+
+        /// The stream slot for a connection just admitted (#274).
+        ///
+        /// Not a shed rung, and the `orelse unreachable` is the argument
+        /// rather than an omission: the pool is sized to `conn_slots`,
+        /// every stream is acquired strictly after a conn slot and
+        /// released strictly before one, so occupancy is equal at every
+        /// point and a conn slot in hand *is* a stream slot in hand. The
+        /// assert below states that equality where it is relied on, so
+        /// the day #173 unpins the two counts this reads as a wall that
+        /// moved rather than as a silent overdraw.
+        fn admitStream(server: *Self, conn: *ConnType) *StreamType {
+            assert(!server.draining);
+            assert(server.streams.acquired_count < server.streams.capacity());
+            const stream = server.streams.acquire() orelse unreachable;
+            stream.prepare(conn);
+            assert(stream.conn == conn);
+            return stream;
+        }
+
+        /// The release half, called from `continueTeardown` ahead of the
+        /// conn slot's own: §5's rule gains a level here — a conn slot
+        /// releases when its armed set is empty *and* every stream it
+        /// owns has released — and at one stream per connection that
+        /// ordering is the whole of it.
+        fn releaseStream(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tearing_down);
+            assert(conn.armedCount() == 0);
+            assert(conn.stream.conn == conn);
+            server.streams.release(conn.stream);
         }
 
         /// The same pair for conn slots, with `admitConn` as its acquire
@@ -2931,7 +2992,12 @@ pub fn Server(comptime IoType: type) type {
             // truncated body, a drain straggler — and every L4 connection,
             // whose whole life is the unit being logged.
             server.logExchange(conn);
+            // Before the conn slot, never after: the stream is the
+            // connection's, and a pool that outlived its owner is how a
+            // release order becomes a leak (§5).
+            server.releaseStream(conn);
             server.releaseConn(conn);
+            assert(server.streams.acquired_count == server.conns.acquired_count);
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
         }

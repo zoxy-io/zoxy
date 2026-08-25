@@ -15,6 +15,7 @@ const parser = @import("../http/parser.zig");
 const router = @import("../http/router.zig");
 const filter = @import("../http/filter.zig");
 const relay = @import("relay.zig");
+const stream_module = @import("Stream.zig");
 const TlsEngine = @import("../tls/Engine.zig");
 const upstream_module = @import("upstream.zig");
 
@@ -274,6 +275,16 @@ pub fn Conn(comptime IoType: type) type {
         pool_next: u32,
         generation: u32,
         server: *ServerType,
+        /// The §5 stream slot carrying this connection's exchange
+        /// (#274). Exactly one for now, held for the connection's life,
+        /// which is what keeps the ring budget where it was; #173 turns
+        /// this into the set a multiplexed connection owns.
+        ///
+        /// Not optional: a connection without a stream could not run an
+        /// exchange at all, and the 1:1 cap means the acquire past the
+        /// conn slot's own rung can never fail — `admitStream` states
+        /// that argument where it is made.
+        stream: *StreamType,
         state: State,
         client_socket: IoType.Socket,
         /// Null until the upstream dial completes; making the socket and
@@ -452,6 +463,12 @@ pub fn Conn(comptime IoType: type) type {
         op_deadline_cancel: Op,
 
         const Self = @This();
+
+        /// This connection's stream slot type (#274). Declared here
+        /// rather than beside `ServerType` above because `Stream` is
+        /// parameterized by the connection it points back at — see its
+        /// own docstring for why that is a parameter and not an import.
+        pub const StreamType = stream_module.Stream(Self);
 
         /// "This connection holds no head-ring buffer." Out of range by
         /// construction: a group never publishes more than
@@ -750,6 +767,12 @@ pub fn Conn(comptime IoType: type) type {
         pub fn prepare(
             conn: *Self,
             server: *ServerType,
+            /// This connection's stream slot (#274), acquired by the
+            /// caller. A parameter for the same reason `engine` is one:
+            /// a slot is recycled, and a caller that acquired a stream
+            /// and then let this reset the field would leak one per
+            /// connection.
+            stream: *StreamType,
             client_socket: IoType.Socket,
             buffer: ?*relay.RelayBuffer,
             engine: ?*TlsEngine,
@@ -760,6 +783,7 @@ pub fn Conn(comptime IoType: type) type {
         ) void {
             assert(state == .connecting or state == .l7_reading_head);
             conn.server = server;
+            conn.stream = stream;
             conn.state = state;
             conn.client_socket = client_socket;
             conn.upstream_socket = null;
@@ -820,6 +844,11 @@ pub fn Conn(comptime IoType: type) type {
             conn.op_deadline = .{};
             conn.op_deadline_cancel = .{};
             assert(conn.state == state);
+            // The pairing this slice rests on, stated where it is made:
+            // the stream the caller acquired is the one that points back
+            // here, so the two slots are each other's and neither can be
+            // read through the wrong partner (§5).
+            assert(conn.stream.conn == conn);
             assert(conn.armedCount() == 0);
             assert(conn.head_len == 0);
             assert(conn.client_write.pending.len == 0);

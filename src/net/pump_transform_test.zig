@@ -693,6 +693,11 @@ const Harness = struct {
         assert(bed.conn == null);
         assert(scratch.isClean());
         const conn = bed.server.conns.acquire().?;
+        // One stream per connection (#274), like the admission tail this
+        // bed stands in for: the pump seam does not read it yet, but the
+        // release rule this harness asserts at teardown does.
+        const stream = bed.server.streams.acquire().?;
+        stream.prepare(conn);
         const buffer = bed.server.relay_buffers.acquire().?;
         // The accept gate and the admission tail are not exercised here, so
         // their counters are set by hand: `reconcile` (§9) checks
@@ -702,6 +707,7 @@ const Harness = struct {
         bed.server.counters.increment("admitted");
         conn.prepare(
             &bed.server,
+            stream,
             bed.proxy_client_socket,
             buffer,
             // Plaintext: this bed drives the pump seam directly, which is
@@ -720,10 +726,15 @@ const Harness = struct {
         PumpToClient.armRecv(&bed.server, conn);
     }
 
-    /// Every scenario ends the same way: the connection is gone, both pools
-    /// are back, and the books balance.
+    /// Every scenario ends the same way: the connection is gone, every
+    /// pool it drew from is back, and the books balance.
     fn expectSettled(bed: *Harness) !void {
         try std.testing.expect(bed.server.conns.isFullyReleased());
+        // Checked beside its siblings rather than left to the hard assert
+        // in `continueTeardown` (#274): this bed acquires the stream by
+        // hand, so it is exactly the caller that could get the pairing
+        // wrong and never reach that teardown at all.
+        try std.testing.expect(bed.server.streams.isFullyReleased());
         try std.testing.expect(bed.server.relay_buffers.isFullyReleased());
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
         try std.testing.expect(bed.server.reconcile());
