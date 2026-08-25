@@ -258,7 +258,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // nobody made, which teardown then writes out as an
                 // aborted exchange with no method and no bytes.
                 server.beginLogRequest(conn);
-                conn.log.bytes_in += head.appended;
+                conn.stream.log.bytes_in += head.appended;
             }
             if (conn.tls.?.peerClosed()) {
                 // An in-band EOF mid-head: the client said it will send no
@@ -534,7 +534,7 @@ pub fn Proxy(comptime IoType: type) type {
             // the parse: a slowloris that dribbles for the whole head-read
             // deadline must report the time it spent doing it (§8).
             server.beginLogRequest(conn);
-            conn.log.bytes_in += bound.len;
+            conn.stream.log.bytes_in += bound.len;
             fillHead(conn, bound.len, headBytes(server, conn).len);
             parseAndDispatch(server, conn);
         }
@@ -575,7 +575,7 @@ pub fn Proxy(comptime IoType: type) type {
             // the buffer; this is more of the same head.
             assert(conn.stream.head_buffer_id != StreamType.head_buffer_none);
             assert(conn.stream.head_len >= 1);
-            conn.log.bytes_in += received;
+            conn.stream.log.bytes_in += received;
             fillHead(conn, received, headBytes(server, conn).len);
             parseAndDispatch(server, conn);
         }
@@ -882,7 +882,7 @@ pub fn Proxy(comptime IoType: type) type {
             // Copied out now because the head buffer is not the log's to
             // read later: the response head renders over it (§7 buffer
             // rotation), and by the exchange's settle these bytes are gone.
-            conn.log.captureMethod(request.method_token);
+            conn.stream.log.captureMethod(request.method_token);
             // The #140 named headers, on the same terms and for the same
             // reason — and here rather than deeper, so every line that
             // reports a parsed request carries them, rejects included.
@@ -922,10 +922,10 @@ pub fn Proxy(comptime IoType: type) type {
         fn captureTarget(conn: *ConnType, host: ?[]const u8, path: []const u8) void {
             assert(conn.state == .l7_reading_head);
             assert(path.len >= 1);
-            conn.log.capturePath(path);
+            conn.stream.log.capturePath(path);
             if (host) |canonical| {
                 assert(canonical.len >= 1);
-                conn.log.captureHost(canonical);
+                conn.stream.log.captureHost(canonical);
             }
         }
 
@@ -1247,7 +1247,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // pick: a request shed for want of a slot contacted no
                 // origin, and a line claiming one would send an operator
                 // looking at a backend that never saw the request (§8).
-                conn.log.endpoint_index = pick.endpoint_index;
+                conn.stream.log.endpoint_index = pick.endpoint_index;
                 conn.stream.upstream = parked;
                 conn.stream.upstream_socket = parked.socket;
                 parked.head_len = 0;
@@ -1330,7 +1330,7 @@ pub fn Proxy(comptime IoType: type) type {
             // The slot is held, so this try really is going to this
             // endpoint — whether or not the dial ends up succeeding. A
             // replay overwrites it, naming the endpoint that served (§7).
-            conn.log.endpoint_index = pick.endpoint_index;
+            conn.stream.log.endpoint_index = pick.endpoint_index;
             conn.state = .l7_dialing;
             // The head-read/idle timer is already armed; re-base it to the
             // tighter per-try connect budget so a hung origin fires the §8
@@ -2003,7 +2003,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // Body bytes this request owns, counted where framing said
                 // which they were: a pipelined tail belongs to the *next*
                 // request, so it must not land on this one's line (§8).
-                conn.log.bytes_in += fr.consumed;
+                conn.stream.log.bytes_in += fr.consumed;
                 if (fr.consumed < received) {
                     // Bytes past the body are a pipelined next request; the
                     // connection will close after this exchange (§7 note).
@@ -2374,10 +2374,10 @@ pub fn Proxy(comptime IoType: type) type {
             }
             // An exchange rendering a response holds an upstream, so the
             // endpoint was recorded when its slot was (§8).
-            assert(conn.log.endpoint_index != conn_module.LogState.endpoint_none);
+            assert(conn.stream.log.endpoint_index != stream_module.LogState.endpoint_none);
             const served = server.balancer.endpointIdentity(
                 conn.stream.cluster_index,
-                conn.log.endpoint_index,
+                conn.stream.log.endpoint_index,
             );
             const carried = conn.stream.l7.sticky_cookie orelse return .assigned;
             if (carried == served) {
@@ -2444,7 +2444,7 @@ pub fn Proxy(comptime IoType: type) type {
             // stamp announces is byte-identical to the tag the next
             // request's parse will match.
             Balancer.formatEndpointTag(
-                server.balancer.endpointIdentity(conn.stream.cluster_index, conn.log.endpoint_index),
+                server.balancer.endpointIdentity(conn.stream.cluster_index, conn.stream.log.endpoint_index),
                 scratch[len..][0..Balancer.endpoint_tag_len],
             );
             len += Balancer.endpoint_tag_len;
@@ -2620,7 +2620,7 @@ pub fn Proxy(comptime IoType: type) type {
             // Recorded here, where the client provably has the handshake
             // (§8): the one line this connection writes at close is the
             // tunnel's, and `101` is what identifies it as one.
-            conn.log.status = 101;
+            conn.stream.log.status = 101;
             // The tunnel's own clock replaces the three that would each
             // cut a healthy session (§8). Stored, not re-based: a rebase
             // exists to pull a deadline *earlier* than the armed timer,
@@ -2899,7 +2899,7 @@ pub fn Proxy(comptime IoType: type) type {
             conn.stream.l7.response_leg = .sending_head;
             conn.stream.l7.response_started = true;
             creditSticky(server, verdict);
-            conn.log.status = response.status;
+            conn.stream.log.status = response.status;
             server.captureResponseLogHeaders(conn, response.headers);
             armClientWrite(server, conn, headBytes(server, conn)[0..head_write_len], .response_excess);
         }
@@ -3019,13 +3019,13 @@ pub fn Proxy(comptime IoType: type) type {
                 if (engine.outbound().len >= 1) return true; // Short send.
                 assert(write.staged >= 1);
                 assert(write.staged <= write.pending.len);
-                conn.log.bytes_out += write.staged;
+                conn.stream.log.bytes_out += write.staged;
                 write.pending = write.pending[write.staged..];
                 write.staged = 0;
                 return write.pending.len > 0;
             }
             assert(sent <= write.pending.len);
-            conn.log.bytes_out += sent;
+            conn.stream.log.bytes_out += sent;
             write.pending = write.pending[sent..];
             return write.pending.len > 0;
         }
@@ -3253,7 +3253,7 @@ pub fn Proxy(comptime IoType: type) type {
             /// channel; between them every byte this proxy sends the
             /// client is counted exactly once (§8).
             pub fn afterSend(conn: *ConnType, sent: u32) void {
-                conn.log.bytes_out += sent;
+                conn.stream.log.bytes_out += sent;
             }
 
             pub fn framingDone(conn: *ConnType) bool {
@@ -3331,8 +3331,8 @@ pub fn Proxy(comptime IoType: type) type {
             // This is also the only place `ok` is earned — nothing between
             // the response head being queued and this point may claim it,
             // which is what keeps one `ok` line per `l7_responses`.
-            assert(conn.log.outcome == .aborted);
-            conn.log.outcome = .ok;
+            assert(conn.stream.log.outcome == .aborted);
+            conn.stream.log.outcome = .ok;
             server.logExchange(conn);
 
             const request_complete = conn.stream.l7.request_leg == .done;
@@ -3433,7 +3433,7 @@ pub fn Proxy(comptime IoType: type) type {
             // accounting resets with the rest of the per-request state
             // (§8). The captures are left in place: their lengths are what
             // gate every read, and this zeroes those.
-            assert(conn.log.emitted or conn.log.started_wall_ns == 0);
+            assert(conn.stream.log.emitted or conn.stream.log.started_wall_ns == 0);
             // The request's head buffer goes back to the ring before the
             // idle wait begins — an idle connection holds no head bytes
             // (§5). Conditional because the static-response path already
@@ -3445,7 +3445,7 @@ pub fn Proxy(comptime IoType: type) type {
             conn.stream.head_len = 0;
             conn.stream.head_cursor.reset();
             conn.stream.l7 = .{};
-            conn.log.reset();
+            conn.stream.log.reset();
             // The #140 captures live in the server's side table, not on
             // `log`, so they need clearing beside it — or the next
             // request's line would report this one's headers.
@@ -3951,8 +3951,8 @@ pub fn Proxy(comptime IoType: type) type {
             // What the line will say, recorded here where the verdict is
             // made; it is written once the response is on the wire, so
             // the byte count includes the answer itself (§8).
-            conn.log.status = status;
-            conn.log.outcome = comptime outcomeOfCounter(counter);
+            conn.stream.log.status = status;
+            conn.stream.log.outcome = comptime outcomeOfCounter(counter);
             // §8's "then keep or close per pressure". Closing is not free:
             // it costs the client a fresh handshake and this proxy a fresh
             // accept, conn slot and admission — which is how a shed storm
@@ -4110,8 +4110,8 @@ pub fn Proxy(comptime IoType: type) type {
             ServerType.clearRequestDeadline(conn);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment("l7_responded");
-            conn.log.status = page.status;
-            conn.log.outcome = .responded;
+            conn.stream.log.status = page.status;
+            conn.stream.log.outcome = .responded;
             // The same four brakes every static answer honors (§7, §8):
             // the client's own ask, the drain, relay pressure and the
             // #237 cap.
@@ -4253,8 +4253,8 @@ pub fn Proxy(comptime IoType: type) type {
             ServerType.clearRequestDeadline(conn);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment("l7_redirected");
-            conn.log.status = redirect.status;
-            conn.log.outcome = .redirected;
+            conn.stream.log.status = redirect.status;
+            conn.stream.log.outcome = .redirected;
             conn.state = .l7_responding;
             if (keep) {
                 armClientWrite(server, conn, rendered, .redirect_next_request);

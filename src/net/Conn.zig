@@ -8,10 +8,8 @@
 
 const std = @import("std");
 
-const access_log = @import("../access_log.zig");
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
-const parser = @import("../http/parser.zig");
 const router = @import("../http/router.zig");
 const filter = @import("../http/filter.zig");
 const relay = @import("relay.zig");
@@ -19,108 +17,6 @@ const stream_module = @import("Stream.zig");
 const TlsEngine = @import("../tls/Engine.zig");
 
 const assert = std.debug.assert;
-
-/// What an access-log line needs that is not still on the connection when
-/// the line is written (DESIGN.md §8). The head buffer is the reason this
-/// exists: it holds the request head only until the response head renders
-/// over it (§7 buffer rotation), so a line emitted at settle time would
-/// find the method, host and path it is supposed to report already gone.
-/// Each is therefore copied out — bounded, truncation marked — while it is
-/// still there.
-///
-/// One instance per connection, covering one *request* on the L7 path
-/// (`reset` runs at every keep-alive turnaround) and the whole connection
-/// on the L4 path, which has no smaller unit. The arrays are deliberately
-/// not cleared by `reset`: the lengths beside them gate every read, so
-/// clearing 500-odd bytes per request would be work for an invariant that
-/// already holds — the same argument `Conn.head` makes.
-pub const LogState = struct {
-    /// Wall-clock nanoseconds at which this request — or, on L4, this
-    /// connection — began. Zero means nothing is in flight, which is what
-    /// keeps an idle keep-alive connection reaped by its deadline from
-    /// emitting a line about a request nobody made; it is also why nothing
-    /// sets it while the log is off, so a disabled log reads no clock.
-    ///
-    /// Wall-clock rather than the monotonic deadline clock because a line
-    /// needs both a date and a duration, and one precise read at each end
-    /// answers both — where `Io.now_ns` is coarse and cached per tick (§4),
-    /// which would report 0 µs for every request served inside one batch.
-    started_wall_ns: u64 = 0,
-    /// Bytes read from the client and written to it, for this request.
-    bytes_in: u64 = 0,
-    bytes_out: u64 = 0,
-    /// The endpoint the balancer picked (§7), or `endpoint_none` before
-    /// one was — every reject that fires ahead of routing.
-    endpoint_index: u16 = endpoint_none,
-    /// The status this request was answered with; 0 until one is decided.
-    status: u16 = 0,
-    outcome: access_log.Outcome = .aborted,
-    /// Set once this request's line has been written, so the teardown
-    /// fallback cannot emit a second one for an exchange that already
-    /// reported its own outcome.
-    emitted: bool = false,
-    method_len: u8 = 0,
-    host_len: u16 = 0,
-    path_len: u16 = 0,
-    method: [constants.access_log_method_bytes_max]u8 = undefined,
-    host: [constants.host_bytes_max]u8 = undefined,
-    path: [constants.access_log_path_bytes_max]u8 = undefined,
-
-    /// No endpoint has been picked. `maxInt` rather than a separate flag:
-    /// the loader rejects a cluster declaring more than `maxInt(u16)`
-    /// endpoints (`EndpointsOverLimit`), so a real index stops at
-    /// `maxInt(u16) - 1` and the sentinel can never collide with one.
-    /// That bound used to be `endpoints_per_cluster_max`; with the policy
-    /// ceiling gone, the index type is what is left holding it up.
-    pub const endpoint_none: u16 = std.math.maxInt(u16);
-
-    comptime {
-        // A relationship, not a restatement: the loader bounds real
-        // indices by `endpoint_index_max`, and this is what makes that
-        // bound the right one. Widening either past the other is a
-        // compile error rather than a sentinel that means two things.
-        assert(constants.endpoint_index_max < endpoint_none);
-    }
-
-    /// Start a fresh request's accounting. Only the scalars: the three
-    /// captures are read through their lengths, which this zeroes.
-    pub fn reset(state: *LogState) void {
-        state.started_wall_ns = 0;
-        state.bytes_in = 0;
-        state.bytes_out = 0;
-        state.endpoint_index = endpoint_none;
-        state.status = 0;
-        state.outcome = .aborted;
-        state.emitted = false;
-        state.method_len = 0;
-        state.host_len = 0;
-        state.path_len = 0;
-    }
-
-    pub fn methodSlice(state: *const LogState) []const u8 {
-        return state.method[0..state.method_len];
-    }
-
-    pub fn hostSlice(state: *const LogState) []const u8 {
-        return state.host[0..state.host_len];
-    }
-
-    pub fn pathSlice(state: *const LogState) []const u8 {
-        return state.path[0..state.path_len];
-    }
-
-    pub fn captureMethod(state: *LogState, token: []const u8) void {
-        state.method_len = @intCast(access_log.captureTruncated(&state.method, token).len);
-    }
-
-    pub fn captureHost(state: *LogState, host: []const u8) void {
-        state.host_len = @intCast(access_log.captureTruncated(&state.host, host).len);
-    }
-
-    pub fn capturePath(state: *LogState, path: []const u8) void {
-        state.path_len = @intCast(access_log.captureTruncated(&state.path, path).len);
-    }
-};
 
 pub fn Conn(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
@@ -224,9 +120,9 @@ pub fn Conn(comptime IoType: type) type {
         /// The endpoint this L4 connection is charged against in the
         /// server's per-endpoint in-flight table (§7), or `endpoint_none`
         /// when it is charged against none — every L7 connection, and
-        /// every L4 one shed before it dialed. Separate from
-        /// `log.endpoint_index`, which the access log still needs after
-        /// the charge is released; this one is the release's own
+        /// every L4 one shed before it dialed. Separate from the
+        /// exchange's `stream.log.endpoint_index`, which the access log
+        /// still needs after the charge is released; this one is the release's own
         /// bookkeeping, and clearing it is what makes the release
         /// exactly-once.
         charged_endpoint: u16,
@@ -248,9 +144,6 @@ pub fn Conn(comptime IoType: type) type {
         /// already be closed, and `getpeername` on a closed fd names
         /// whoever inherited the number.
         client_address: std.Io.net.IpAddress,
-        /// Access-log capture (§8); per request on the L7 path, per
-        /// connection on the L4 one.
-        log: LogState,
 
         op_deadline: Op,
         op_deadline_cancel: Op,
@@ -389,22 +282,10 @@ pub fn Conn(comptime IoType: type) type {
             conn.max_body_bytes = 0;
             conn.requests_served = 0;
             conn.forwarded = null;
-            conn.charged_endpoint = LogState.endpoint_none;
+            conn.charged_endpoint = stream_module.LogState.endpoint_none;
             conn.charged_cluster = 0;
             conn.protocol = protocol;
             conn.client_address = client_address;
-            // The field defaults are `reset`'s values; a recycled slot
-            // needs both the scalars and the (unread) capture arrays, and
-            // this sets them in one write.
-            conn.log = .{};
-            // An L4 connection is its own log unit and starts here; an L7
-            // one starts a request only when its first head byte lands, so
-            // an idle keep-alive connection that is reaped without ever
-            // being asked anything owes no line. Both are gated on the log
-            // being on, so a deployment without one reads no clock here.
-            if (protocol == .l4 and server.access_log.sink != null) {
-                conn.log.started_wall_ns = server.io.nowWallNs();
-            }
             conn.op_deadline = .{};
             conn.op_deadline_cancel = .{};
             assert(conn.state == state);
@@ -415,8 +296,6 @@ pub fn Conn(comptime IoType: type) type {
             assert(conn.stream.conn == conn);
             assert(conn.armedCount() == 0);
             assert(conn.stream.armedCount() == 0);
-            assert(!conn.log.emitted);
-            assert(conn.log.bytes_in == 0);
         }
 
         /// Records the arm in the op and the armed set; call immediately

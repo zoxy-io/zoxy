@@ -21,6 +21,7 @@
 
 const std = @import("std");
 
+const access_log = @import("../access_log.zig");
 const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const relay = @import("relay.zig");
@@ -172,6 +173,108 @@ pub const ClientWrite = struct {
     };
 };
 
+/// What an access-log line needs that is not still on the connection when
+/// the line is written (DESIGN.md §8). The head buffer is the reason this
+/// exists: it holds the request head only until the response head renders
+/// over it (§7 buffer rotation), so a line emitted at settle time would
+/// find the method, host and path it is supposed to report already gone.
+/// Each is therefore copied out — bounded, truncation marked — while it is
+/// still there.
+///
+/// One instance per connection, covering one *request* on the L7 path
+/// (`reset` runs at every keep-alive turnaround) and the whole connection
+/// on the L4 path, which has no smaller unit. The arrays are deliberately
+/// not cleared by `reset`: the lengths beside them gate every read, so
+/// clearing 500-odd bytes per request would be work for an invariant that
+/// already holds — the same argument `Conn.head` makes.
+pub const LogState = struct {
+    /// Wall-clock nanoseconds at which this request — or, on L4, this
+    /// connection — began. Zero means nothing is in flight, which is what
+    /// keeps an idle keep-alive connection reaped by its deadline from
+    /// emitting a line about a request nobody made; it is also why nothing
+    /// sets it while the log is off, so a disabled log reads no clock.
+    ///
+    /// Wall-clock rather than the monotonic deadline clock because a line
+    /// needs both a date and a duration, and one precise read at each end
+    /// answers both — where `Io.now_ns` is coarse and cached per tick (§4),
+    /// which would report 0 µs for every request served inside one batch.
+    started_wall_ns: u64 = 0,
+    /// Bytes read from the client and written to it, for this request.
+    bytes_in: u64 = 0,
+    bytes_out: u64 = 0,
+    /// The endpoint the balancer picked (§7), or `endpoint_none` before
+    /// one was — every reject that fires ahead of routing.
+    endpoint_index: u16 = endpoint_none,
+    /// The status this request was answered with; 0 until one is decided.
+    status: u16 = 0,
+    outcome: access_log.Outcome = .aborted,
+    /// Set once this request's line has been written, so the teardown
+    /// fallback cannot emit a second one for an exchange that already
+    /// reported its own outcome.
+    emitted: bool = false,
+    method_len: u8 = 0,
+    host_len: u16 = 0,
+    path_len: u16 = 0,
+    method: [constants.access_log_method_bytes_max]u8 = undefined,
+    host: [constants.host_bytes_max]u8 = undefined,
+    path: [constants.access_log_path_bytes_max]u8 = undefined,
+
+    /// No endpoint has been picked. `maxInt` rather than a separate flag:
+    /// the loader rejects a cluster declaring more than `maxInt(u16)`
+    /// endpoints (`EndpointsOverLimit`), so a real index stops at
+    /// `maxInt(u16) - 1` and the sentinel can never collide with one.
+    /// That bound used to be `endpoints_per_cluster_max`; with the policy
+    /// ceiling gone, the index type is what is left holding it up.
+    pub const endpoint_none: u16 = std.math.maxInt(u16);
+
+    comptime {
+        // A relationship, not a restatement: the loader bounds real
+        // indices by `endpoint_index_max`, and this is what makes that
+        // bound the right one. Widening either past the other is a
+        // compile error rather than a sentinel that means two things.
+        assert(constants.endpoint_index_max < endpoint_none);
+    }
+
+    /// Start a fresh request's accounting. Only the scalars: the three
+    /// captures are read through their lengths, which this zeroes.
+    pub fn reset(state: *LogState) void {
+        state.started_wall_ns = 0;
+        state.bytes_in = 0;
+        state.bytes_out = 0;
+        state.endpoint_index = endpoint_none;
+        state.status = 0;
+        state.outcome = .aborted;
+        state.emitted = false;
+        state.method_len = 0;
+        state.host_len = 0;
+        state.path_len = 0;
+    }
+
+    pub fn methodSlice(state: *const LogState) []const u8 {
+        return state.method[0..state.method_len];
+    }
+
+    pub fn hostSlice(state: *const LogState) []const u8 {
+        return state.host[0..state.host_len];
+    }
+
+    pub fn pathSlice(state: *const LogState) []const u8 {
+        return state.path[0..state.path_len];
+    }
+
+    pub fn captureMethod(state: *LogState, token: []const u8) void {
+        state.method_len = @intCast(access_log.captureTruncated(&state.method, token).len);
+    }
+
+    pub fn captureHost(state: *LogState, host: []const u8) void {
+        state.host_len = @intCast(access_log.captureTruncated(&state.host, host).len);
+    }
+
+    pub fn capturePath(state: *LogState, path: []const u8) void {
+        state.path_len = @intCast(access_log.captureTruncated(&state.path, path).len);
+    }
+};
+
 /// `ConnType` is a parameter rather than an import, and that is load
 /// bearing: `Conn` names this type for its own field, so importing back
 /// would make the two generics mutually re-entrant — Zig memoizes an
@@ -272,6 +375,19 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         upstream: ?*UpstreamType,
         /// L7 exchange bookkeeping (§7); reset per exchange.
         l7: L7State,
+
+        /// Access-log capture (§8) — and the seam #274 exists to draw.
+        ///
+        /// One line covers one *request* on the L7 path and one whole
+        /// *connection* on the L4 path, which has no smaller unit. That
+        /// was already true when this lived on the conn slot, but it was
+        /// true by convention: `reset` was called at each keep-alive
+        /// turnaround, and a path that forgot would report the previous
+        /// request's method on the next request's line (#129). Here the
+        /// unit is structural — a line belongs to the exchange that owns
+        /// this slot — and on the L4 path the exchange simply lasts as
+        /// long as the connection does.
+        log: LogState,
 
         const Self = @This();
 
@@ -543,12 +659,22 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // resolves one (`finishAdmission`); on the L7 path `routeRequest`
             // overwrites it per request anyway (§7).
             stream.cluster_index = 0;
+            // The field defaults are `reset`'s values; a recycled slot
+            // needs both the scalars and the (unread) capture arrays, and
+            // this sets them in one write. The clock stays at zero: an L4
+            // exchange starts its line in the admission tail, once a
+            // listener says it is one, and an L7 exchange only when its
+            // first head byte lands.
+            stream.log = .{};
             assert(stream.armedCount() == 0);
             assert(stream.relay_buffer == null);
             assert(stream.head_len == 0);
             assert(stream.client_write.pending.len == 0);
             assert(stream.upstream == null);
             assert(stream.l7.request_leg == .idle);
+            assert(!stream.log.emitted);
+            assert(stream.log.bytes_in == 0);
+            assert(stream.log.started_wall_ns == 0);
         }
 
         /// Records the arm in the op and the armed set; call immediately
