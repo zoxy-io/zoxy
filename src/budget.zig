@@ -115,6 +115,11 @@ pub fn Budget(comptime IoType: type) type {
             return .{
                 .conn_slots = limits.conn_slots,
                 .conn_bytes = @sizeOf(ServerType.ConnType),
+                // One stream per connection (#274), derived from the
+                // same limit `Server.init` sizes the pool from, so the
+                // printed number and the reserved one cannot disagree.
+                .stream_slots = constants.streamSlotsFor(limits.conn_slots),
+                .stream_bytes = @sizeOf(ServerType.StreamType),
                 .relay_buffers = limits.relay_buffers,
                 // The pool element (free-list header and the two slab
                 // slices) plus both halves it points at, the same shape
@@ -325,7 +330,8 @@ pub fn Budget(comptime IoType: type) type {
             std.debug.print(
                 \\zoxy {s}{s}
                 \\budgets (DESIGN.md §5/§8; closed-form except where marked):
-                \\  memory  total {d} KiB = conn slots {d} x {d} B + relay buffers {d} x {d} B
+                \\  memory  total {d} KiB = conn slots {d} x {d} B + stream slots {d} x {d} B
+                \\          + relay buffers {d} x {d} B
                 \\          + upstream slots {d} x {d} B + head buffers {d} x {d} B (+ ring {d} B)
                 \\          + upstream head buffers {d} x {d} B + head scratch {d} B
                 \\          + access log {d} KiB (+ logged headers {d} B)
@@ -341,6 +347,8 @@ pub fn Budget(comptime IoType: type) type {
                 memory_total / 1024,
                 limits.conn_slots,
                 sizes.conn_bytes,
+                sizes.stream_slots,
+                sizes.stream_bytes,
                 limits.relay_buffers,
                 sizes.relay_buffer_pair_bytes,
                 limits.upstream_slots,
