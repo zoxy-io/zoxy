@@ -1018,8 +1018,8 @@ pub fn Server(comptime IoType: type) type {
         pub fn claimStaticSend(server: *Self, conn: *ConnType) void {
             // One write at a time per connection (`armClientWrite`), so a
             // conn already holding one would mean two are in flight.
-            assert(!conn.static_send);
-            conn.static_send = true;
+            assert(!conn.stream.static_send);
+            conn.stream.static_send = true;
             server.static_sends_inflight += 1;
             assert(server.static_sends_inflight <= server.conns.capacity());
         }
@@ -1029,10 +1029,10 @@ pub fn Server(comptime IoType: type) type {
         /// what they were writing — and so the connection's own release
         /// can be the backstop for the ones that end it abruptly.
         pub fn releaseStaticSend(server: *Self, conn: *ConnType) void {
-            if (!conn.static_send) {
+            if (!conn.stream.static_send) {
                 return;
             }
-            conn.static_send = false;
+            conn.stream.static_send = false;
             assert(server.static_sends_inflight >= 1);
             server.static_sends_inflight -= 1;
         }
@@ -1754,12 +1754,12 @@ pub fn Server(comptime IoType: type) type {
             switch (protocol) {
                 .l4 => {
                     // A recv must always have a buffer posted (§6).
-                    assert(conn.relay_buffer != null);
+                    assert(conn.stream.relay_buffer != null);
                     server.armConnect(conn, conn.cluster_index);
                 },
                 .http => {
                     // An idle L7 connection holds no relay buffer (§5).
-                    assert(conn.relay_buffer == null);
+                    assert(conn.stream.relay_buffer == null);
                     Proxy.start(server, conn);
                 },
             }
@@ -1774,6 +1774,15 @@ pub fn Server(comptime IoType: type) type {
                 shed.closeWithRst(IoType, server.io, client_socket);
                 return null;
             };
+            // The pair is taken together, not at the admission tail, and
+            // that is what makes the 1:1 claim structural rather than a
+            // property of one code path: every route that gives a conn
+            // slot back gives its stream back with it, including the §8
+            // rungs that abort before `finishAdmission` ever runs. Taken
+            // apart, those rungs would release a slot whose stream
+            // pointer was never set — and `releaseConn`'s own #234
+            // backstop reads through it.
+            conn.stream = server.admitStream(conn);
             server.updateConnPressure();
             return conn;
         }
@@ -1840,9 +1849,7 @@ pub fn Server(comptime IoType: type) type {
             server.counters.increment("admitted");
             conn.prepare(
                 server,
-                server.admitStream(conn),
                 client_socket,
-                buffer,
                 engine,
                 entryState(listener.protocol),
                 listener.cluster_index,
@@ -1865,6 +1872,19 @@ pub fn Server(comptime IoType: type) type {
             conn.upgrades = listener.upgrades;
             conn.max_body_bytes = listener.max_body_bytes;
             conn.forwarded = listener.forwarded;
+            // The L4 relay buffer is claimed after the conn slot, so it
+            // arrives after the stream that will carry it — installed
+            // here rather than threaded through `Stream.prepare`, which
+            // ran at acquisition, before this buffer existed.
+            //
+            // Deliberately *unlike* `engine`, which is a `Conn.prepare`
+            // parameter precisely so a reset cannot orphan it. The
+            // asymmetry is safe because the two are claimed on opposite
+            // sides of that reset: an engine is in hand before `prepare`
+            // runs and would be overwritten by it, where this arrives
+            // after and has nothing left to overwrite it. Null on the L7
+            // path, which acquires one only when a body relay starts (§5).
+            conn.stream.relay_buffer = buffer;
             // The #140 captures live in a side table addressed by pool
             // slot, so a slot's bytes outlive the connection that wrote
             // them. Clearing on acquire is what keeps them from being
@@ -2011,13 +2031,13 @@ pub fn Server(comptime IoType: type) type {
             // returns a buffer on the L7 path reaches here, so the fork
             // lives once rather than at each of them.
             if (conn.tls != null) {
-                assert(conn.head_buffer_id == ConnType.head_buffer_none);
+                assert(conn.stream.head_buffer_id == StreamType.head_buffer_none);
                 return;
             }
-            assert(conn.head_buffer_id != ConnType.head_buffer_none);
+            assert(conn.stream.head_buffer_id != StreamType.head_buffer_none);
             assert(server.head_buffers_in_use >= 1);
-            server.io.bufferGroupReturn(conn.head_buffer_id);
-            conn.head_buffer_id = ConnType.head_buffer_none;
+            server.io.bufferGroupReturn(conn.stream.head_buffer_id);
+            conn.stream.head_buffer_id = StreamType.head_buffer_none;
             server.head_buffers_in_use -= 1;
             server.updateHeadPressure();
         }
@@ -2236,20 +2256,8 @@ pub fn Server(comptime IoType: type) type {
             const stream = server.streams.acquire() orelse unreachable;
             stream.prepare(conn);
             assert(stream.conn == conn);
+            assert(stream.relay_buffer == null);
             return stream;
-        }
-
-        /// The release half, called from `continueTeardown` ahead of the
-        /// conn slot's own: §5's rule gains a level here — a conn slot
-        /// releases when its armed set is empty *and* every stream it
-        /// owns has released — and at one stream per connection that
-        /// ordering is the whole of it.
-        fn releaseStream(server: *Self, conn: *ConnType) void {
-            assert(conn.state == .tearing_down);
-            assert(conn.armedCount() == 0);
-            assert(conn.stream.armedCount() == 0);
-            assert(conn.stream.conn == conn);
-            server.streams.release(conn.stream);
         }
 
         /// The same pair for conn slots, with `admitConn` as its acquire
@@ -2262,7 +2270,26 @@ pub fn Server(comptime IoType: type) type {
             // outlived its connection would freeze the `Date` for the
             // life of the process.
             server.releaseStaticSend(conn);
+            // §5's release rule, one level deeper (#274): the stream goes
+            // back before the connection that owns it, never after — a
+            // pool that outlived its owner is how a release order becomes
+            // a leak.
+            //
+            // The stream's own set is asserted; the connection's is not,
+            // and the asymmetry is real rather than an omission. An §8
+            // admission rung returns the slot before `Conn.prepare` has
+            // run, so `conn.armed` here may still hold the *previous*
+            // occupant's bits — which is why this release site has never
+            // asserted anything about the conn slot's contents.
+            // `continueTeardown` is where a prepared slot is checked, and
+            // it asserts both sets before it closes a single fd. The
+            // stream is safe to read on either path because it is
+            // prepared at acquisition, one line after the slot itself.
+            assert(conn.stream.armedCount() == 0);
+            assert(conn.stream.conn == conn);
+            server.streams.release(conn.stream);
             server.conns.release(conn);
+            assert(server.streams.acquired_count == server.conns.acquired_count);
             server.updateConnPressure();
         }
 
@@ -2278,9 +2305,9 @@ pub fn Server(comptime IoType: type) type {
         fn startProxyHeaderPhase(server: *Self, conn: *ConnType) void {
             assert(!conn.isTearingDown());
             assert(conn.state == .connecting);
-            assert(conn.relay_buffer != null);
+            assert(conn.stream.relay_buffer != null);
             assert(conn.armed.deadline);
-            assert(conn.head_len == 0);
+            assert(conn.stream.head_len == 0);
             conn.state = .l4_reading_proxy_header;
             server.armProxyHeaderRecv(conn);
         }
@@ -2291,14 +2318,14 @@ pub fn Server(comptime IoType: type) type {
         /// outreading the staging the §5 budget assigned this phase.
         fn armProxyHeaderRecv(server: *Self, conn: *ConnType) void {
             assert(conn.state == .l4_reading_proxy_header);
-            assert(conn.relay_buffer != null);
-            assert(conn.head_len < constants.proxy_header_bytes_max);
-            const staging = conn.relay_buffer.?
+            assert(conn.stream.relay_buffer != null);
+            assert(conn.stream.head_len < constants.proxy_header_bytes_max);
+            const staging = conn.stream.relay_buffer.?
                 .client_to_upstream[0..constants.proxy_header_bytes_max];
             conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
-                staging[conn.head_len..],
+                staging[conn.stream.head_len..],
                 &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
@@ -2329,9 +2356,9 @@ pub fn Server(comptime IoType: type) type {
                 return;
             };
             assert(received >= 1);
-            conn.head_len += received;
-            assert(conn.head_len <= constants.proxy_header_bytes_max);
-            const staged = conn.relay_buffer.?.client_to_upstream[0..conn.head_len];
+            conn.stream.head_len += received;
+            assert(conn.stream.head_len <= constants.proxy_header_bytes_max);
+            const staged = conn.stream.relay_buffer.?.client_to_upstream[0..conn.stream.head_len];
             const parsed = proxy_protocol.parse(staged);
             switch (parsed) {
                 .need_more => server.armProxyHeaderRecv(conn),
@@ -2353,16 +2380,16 @@ pub fn Server(comptime IoType: type) type {
         ) void {
             assert(conn.state == .l4_reading_proxy_header);
             assert(header.bytes_len >= 1);
-            assert(header.bytes_len <= conn.head_len);
+            assert(header.bytes_len <= conn.stream.head_len);
             server.counters.increment("l4_proxy_header_accepted");
             // Null keeps the observed peer (LOCAL/UNKNOWN, §6): the
             // fronting proxy's own health checks arrive that way.
             if (header.client) |client| {
                 conn.client_address = client;
             }
-            const leftover_len = conn.head_len - header.bytes_len;
-            const staging = conn.relay_buffer.?.client_to_upstream;
-            const leftover = staging[header.bytes_len..conn.head_len];
+            const leftover_len = conn.stream.head_len - header.bytes_len;
+            const staging = conn.stream.relay_buffer.?.client_to_upstream;
+            const leftover = staging[header.bytes_len..conn.stream.head_len];
             if (conn.tls) |engine| {
                 // On a terminating listener those leftover bytes are the
                 // client's first handshake record, not payload: the PROXY
@@ -2370,8 +2397,8 @@ pub fn Server(comptime IoType: type) type {
                 // everything past it already belongs to TLS. Framing them
                 // as relay debt would send a ClientHello to the origin.
                 assert(leftover_len <= engine.plaintext.len);
-                conn.head_len = 0;
-                conn.head_cursor.reset();
+                conn.stream.head_len = 0;
+                conn.stream.head_cursor.reset();
                 server.startTlsPhaseWith(conn, leftover);
                 return;
             }
@@ -2386,15 +2413,15 @@ pub fn Server(comptime IoType: type) type {
                 // own counting will never see; the header is metadata the
                 // origin never receives, so it stays uncounted.
                 conn.log.bytes_in += leftover_len;
-                const direction = &conn.directions[
-                    @intFromEnum(ConnType.Direction.client_to_upstream)
+                const direction = &conn.stream.directions[
+                    @intFromEnum(StreamType.Direction.client_to_upstream)
                 ];
                 assert(direction.phase == .idle);
                 direction.phase = .receiving;
                 direction.owe(leftover_len);
             }
-            conn.head_len = 0;
-            conn.head_cursor.reset();
+            conn.stream.head_len = 0;
+            conn.stream.head_cursor.reset();
             server.startProtocol(conn, .l4);
         }
 
@@ -2650,7 +2677,7 @@ pub fn Server(comptime IoType: type) type {
             // buffer before the dial (§6); an L7 one takes its per-leg.
             // Admission already settled that, so nothing is acquired here.
             if (conn.protocol == .l4) {
-                assert(conn.relay_buffer != null);
+                assert(conn.stream.relay_buffer != null);
                 server.stageTlsPending(conn);
             }
             server.startProtocol(conn, conn.protocol);
@@ -2676,8 +2703,8 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls_pending_len <= engine.plaintext.len);
             // At the buffer's front, which is where `sendSlice` reads a
             // TLS direction's pending window from.
-            const direction = &conn.directions[
-                @intFromEnum(ConnType.Direction.client_to_upstream)
+            const direction = &conn.stream.directions[
+                @intFromEnum(StreamType.Direction.client_to_upstream)
             ];
             assert(direction.phase == .idle);
             direction.phase = .receiving;
@@ -2740,17 +2767,17 @@ pub fn Server(comptime IoType: type) type {
             version: config_module.Config.Cluster.ProxyProtocolSend,
         ) void {
             assert(conn.state == .connecting);
-            assert(conn.relay_buffer != null);
+            assert(conn.stream.relay_buffer != null);
             var header_buffer: [proxy_protocol.send_bytes_max]u8 = undefined;
             const local_address = server.io.localAddress(conn.client_socket);
             const header = switch (version) {
                 .v1 => proxy_protocol.writeV1(&header_buffer, &conn.client_address, &local_address),
                 .v2 => proxy_protocol.writeV2(&header_buffer, &conn.client_address, &local_address),
             };
-            const direction = &conn.directions[
-                @intFromEnum(ConnType.Direction.client_to_upstream)
+            const direction = &conn.stream.directions[
+                @intFromEnum(StreamType.Direction.client_to_upstream)
             ];
-            const staging = conn.relay_buffer.?.client_to_upstream;
+            const staging = conn.stream.relay_buffer.?.client_to_upstream;
             const framed = direction.framed_len;
             // Comptime-guaranteed in proxy_protocol: header + the largest
             // receive leftover fit the buffer half together.
@@ -2952,21 +2979,21 @@ pub fn Server(comptime IoType: type) type {
                 // so clearing the second on the strength of the first
                 // would drop a live pool slot without releasing it. The
                 // pointer compare says exactly which case this is.
-                if (conn.relay_buffer == buffer) {
-                    conn.relay_buffer = null;
+                if (conn.stream.relay_buffer == buffer) {
+                    conn.stream.relay_buffer = null;
                 }
                 server.releaseTunnelBuffer(buffer);
                 conn.tunnel_buffer = null;
             }
             // An idle L7 connection holds no relay buffer (§5); only
             // release one that was actually acquired.
-            if (conn.relay_buffer) |buffer| {
+            if (conn.stream.relay_buffer) |buffer| {
                 server.releaseRelayBuffer(buffer);
-                conn.relay_buffer = null;
+                conn.stream.relay_buffer = null;
             }
             // Same rule for the ring buffer: nothing armed references it
             // (asserted above), so the return cannot race a landing recv.
-            if (conn.head_buffer_id != ConnType.head_buffer_none) {
+            if (conn.stream.head_buffer_id != StreamType.head_buffer_none) {
                 server.returnHeadBuffer(conn);
             }
             // The leased upstream slot rides the same release rule: its
@@ -2990,7 +3017,7 @@ pub fn Server(comptime IoType: type) type {
                 conn.tls_pending_len = 0;
             }
             assert(conn.tls == null);
-            assert(conn.relay_buffer == null);
+            assert(conn.stream.relay_buffer == null);
             assert(conn.tunnel_buffer == null);
             assert(conn.upstream == null);
             assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
@@ -3036,12 +3063,8 @@ pub fn Server(comptime IoType: type) type {
             // truncated body, a drain straggler — and every L4 connection,
             // whose whole life is the unit being logged.
             server.logExchange(conn);
-            // Before the conn slot, never after: the stream is the
-            // connection's, and a pool that outlived its owner is how a
-            // release order becomes a leak (§5).
-            server.releaseStream(conn);
+            // Which returns the stream with it (§5).
             server.releaseConn(conn);
-            assert(server.streams.acquired_count == server.conns.acquired_count);
             server.counters.increment("completed");
             server.maybeStopAfterDrain();
         }

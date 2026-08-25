@@ -91,6 +91,7 @@
 const std = @import("std");
 
 const conn_module = @import("Conn.zig");
+const stream_module = @import("Stream.zig");
 const Io = @import("../io/io.zig");
 
 const assert = std.debug.assert;
@@ -115,7 +116,7 @@ pub const FeedResult = struct {
 
 pub fn Pump(
     comptime IoType: type,
-    comptime direction: conn_module.Conn(IoType).Direction,
+    comptime direction: conn_module.Conn(IoType).StreamType.Direction,
     comptime Policy: type,
 ) type {
     const ConnType = conn_module.Conn(IoType);
@@ -132,12 +133,12 @@ pub fn Pump(
             return &@field(conn.stream, "op_data_" ++ direction_tag);
         }
 
-        fn directionState(conn: *ConnType) *conn_module.DirectionState {
-            return &conn.directions[@intFromEnum(direction)];
+        fn directionState(conn: *ConnType) *stream_module.DirectionState {
+            return &conn.stream.directions[@intFromEnum(direction)];
         }
 
         fn buffer(conn: *ConnType) []u8 {
-            return @field(conn.relay_buffer.?, direction_tag);
+            return @field(conn.stream.relay_buffer.?, direction_tag);
         }
 
         // -- the transform seam (§4, §6; see the module header) --
@@ -218,7 +219,7 @@ pub fn Pump(
             // A direction-agnostic precondition the pump enforces itself, so
             // the shared mechanism never relies solely on the optional
             // `beforeRecv` hook: every pump reads and writes the relay buffer.
-            assert(conn.relay_buffer != null);
+            assert(conn.stream.relay_buffer != null);
             if (@hasDecl(Policy, "beforeRecv")) Policy.beforeRecv(conn);
             conn.stream.arm(op(conn), bit);
             server.io.recv(
@@ -296,7 +297,7 @@ pub fn Pump(
         }
 
         pub fn armSend(server: *ServerType, conn: *ConnType) void {
-            assert(conn.relay_buffer != null);
+            assert(conn.stream.relay_buffer != null);
             if (@hasDecl(Policy, "beforeSend")) Policy.beforeSend(conn);
             const wire = sendSlice(conn);
             // Nothing arms an empty send: the seam's contract is

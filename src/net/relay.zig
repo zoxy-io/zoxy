@@ -15,6 +15,7 @@ const std = @import("std");
 
 const constants = @import("../constants.zig");
 const conn_module = @import("Conn.zig");
+const stream_module = @import("Stream.zig");
 const pump = @import("pump.zig");
 const TlsEngine = @import("../tls/Engine.zig");
 const Io = @import("../io/io.zig");
@@ -45,7 +46,8 @@ pub const RelayBuffer = struct {
 pub fn Relay(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const ConnType = conn_module.Conn(IoType);
-    const Direction = ConnType.Direction;
+    const StreamType = ConnType.StreamType;
+    const Direction = StreamType.Direction;
 
     return struct {
         /// The L4 relay policy for one direction: no framing, EOF is a
@@ -61,8 +63,8 @@ pub fn Relay(comptime IoType: type) type {
                     };
                 }
 
-                fn state(conn: *ConnType) *conn_module.DirectionState {
-                    return &conn.directions[@intFromEnum(direction)];
+                fn state(conn: *ConnType) *stream_module.DirectionState {
+                    return &conn.stream.directions[@intFromEnum(direction)];
                 }
 
                 pub fn beforeRecv(conn: *ConnType) void {
@@ -203,7 +205,7 @@ pub fn Relay(comptime IoType: type) type {
                     if (direction == .client_to_upstream) {
                         if (conn.tls) |engine| return engine.recvBuffer();
                     }
-                    return @field(conn.relay_buffer.?, @tagName(direction));
+                    return @field(conn.stream.relay_buffer.?, @tagName(direction));
                 }
 
                 /// Decrypt, so framing sees plaintext and never learns a
@@ -245,7 +247,7 @@ pub fn Relay(comptime IoType: type) type {
                     const engine = conn.tls orelse return true;
                     if (!hasOutboundRoom(conn.server, conn)) return false;
                     engine.sendApp(
-                        conn.relay_buffer.?.upstream_to_client[0..consumed],
+                        conn.stream.relay_buffer.?.upstream_to_client[0..consumed],
                     ) catch {
                         conn.server.counters.increment("tls_relay_failed");
                         return false;
@@ -264,7 +266,7 @@ pub fn Relay(comptime IoType: type) type {
                         return direction_state.pending(engine.plaintext);
                     }
                     if (direction_state.owed() == 0) return &.{};
-                    return direction_state.pending(@field(conn.relay_buffer.?, @tagName(direction)));
+                    return direction_state.pending(@field(conn.stream.relay_buffer.?, @tagName(direction)));
                 }
 
                 /// Credit whichever cursor tracks the wire. Only the
@@ -348,7 +350,7 @@ pub fn Relay(comptime IoType: type) type {
             assert(conn.state == .relaying);
             assert(conn.upstream_socket != null);
             const client_to_upstream =
-                &conn.directions[@intFromEnum(Direction.client_to_upstream)];
+                &conn.stream.directions[@intFromEnum(Direction.client_to_upstream)];
             if (client_to_upstream.owed() >= 1) {
                 // Payload that arrived coalesced behind a PROXY header
                 // (#142): the receive phase staged it at the buffer's
@@ -363,15 +365,15 @@ pub fn Relay(comptime IoType: type) type {
                 assert(client_to_upstream.phase == .idle);
                 PumpClientToUpstream.armRecv(server, conn);
             }
-            assert(conn.directions[1].phase == .idle);
+            assert(conn.stream.directions[1].phase == .idle);
             PumpUpstreamToClient.armRecv(server, conn);
         }
 
         /// Both directions drained: the orderly end of an L4 connection.
         fn maybeFinish(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .relaying);
-            if (conn.directions[0].phase == .finished) {
-                if (conn.directions[1].phase == .finished) {
+            if (conn.stream.directions[0].phase == .finished) {
+                if (conn.stream.directions[1].phase == .finished) {
                     // The one L4 ending that is not a failure: both peers
                     // said goodbye. Every other way this connection can end
                     // — a reset, a deadline, a drain straggler — leaves the
