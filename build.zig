@@ -556,7 +556,7 @@ pub fn build(b: *std.Build) void {
 
     const lint_run = b.addRunArtifact(lint_exe);
     lint_run.addDirectoryArg(b.path("src"));
-    const lint_step = b.step("lint", "fd-boundary lint: raw syscalls only under src/io/");
+    const lint_step = b.step("lint", "Mechanical TIGER_STYLE rules over src/: import boundaries, loop bounds, function length");
     lint_step.dependOn(&lint_run.step);
 
     // The per-change gates. The Tier-1 `bench` step is deliberately
