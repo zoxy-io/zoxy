@@ -125,8 +125,11 @@ pub fn Pump(
     return struct {
         const bit = "data_" ++ direction_tag;
 
-        fn op(conn: *ConnType) *ConnType.Op {
-            return &@field(conn, "op_data_" ++ direction_tag);
+        /// The exchange's op, on the stream slot since #274 — the pump
+        /// itself is unchanged by that move, because it reached the op
+        /// through this one accessor and nothing else.
+        fn op(conn: *ConnType) *ConnType.StreamType.Op {
+            return &@field(conn.stream, "op_data_" ++ direction_tag);
         }
 
         fn directionState(conn: *ConnType) *conn_module.DirectionState {
@@ -217,7 +220,7 @@ pub fn Pump(
             // `beforeRecv` hook: every pump reads and writes the relay buffer.
             assert(conn.relay_buffer != null);
             if (@hasDecl(Policy, "beforeRecv")) Policy.beforeRecv(conn);
-            conn.arm(op(conn), bit);
+            conn.stream.arm(op(conn), bit);
             server.io.recv(
                 source(conn),
                 recvBuffer(conn),
@@ -230,7 +233,7 @@ pub fn Pump(
 
         fn onRecv(conn: *ConnType, result: Io.RecvError!u32) void {
             const server = conn.server;
-            conn.delivered(op(conn), bit);
+            conn.stream.delivered(op(conn), bit);
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -300,7 +303,7 @@ pub fn Pump(
             // `bytes.len >= 1` (§4), and an empty slice here would mean a
             // caller asked to write with nothing staged.
             assert(wire.len >= 1);
-            conn.arm(op(conn), bit);
+            conn.stream.arm(op(conn), bit);
             server.io.send(
                 target(conn),
                 wire,
@@ -313,7 +316,7 @@ pub fn Pump(
 
         fn onSend(conn: *ConnType, result: Io.SendError!u32) void {
             const server = conn.server;
-            conn.delivered(op(conn), bit);
+            conn.stream.delivered(op(conn), bit);
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;

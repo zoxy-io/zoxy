@@ -490,20 +490,51 @@ pub const accept_retry_delay_ms: u32 = 10;
 /// fixes the completion queue at twice this (§4).
 pub const ring_entries: u16 = 4096;
 
-/// Worst-case simultaneously armed ring ops for one connection: four.
-/// Two peaks tie: a teardown racing its own upstream dial holds
-/// {connect, deadline, connect_cancel, deadline_cancel}, and a relay
-/// teardown holds {both data ops, deadline, deadline_cancel}. Closes
-/// never join either set — they are not ring ops at all:
+/// Worst-case simultaneously armed ring ops for one *connection slot*:
+/// two. The deadline and its cancel are all that is left here since #274
+/// moved the exchange onto its own slot — a deadline is the connection's
+/// clock and outlives any one exchange, where the dial and the data legs
+/// do not.
+///
+/// The per-connection worst case is unchanged at four, and that is the
+/// equality the split is checked against rather than a coincidence:
+/// `conn_ops_max + stream_ops_max` is four while a connection owns one
+/// stream, which is what keeps the CQ divisor and every ceiling derived
+/// from it exactly where they were. Both peaks below split the same way,
+/// two and two — a teardown racing its own upstream dial holds
+/// {deadline, deadline_cancel} here and {connect, connect_cancel} there,
+/// and a relay teardown holds {deadline, deadline_cancel} against {both
+/// data ops}.
+///
+/// Closes never join either set — they are not ring ops at all:
 /// `continueTeardown` closes synchronously once every armed op has
 /// drained, nothing referencing the fds by then. Serializing them
 /// behind the drain is what cut this budget from five (a dial
 /// completing against its own cancel used to co-arm the closes with
 /// the deadline and both cancels); making them synchronous then
-/// removed their two completions outright. `Conn.arm` asserts the
-/// budget on every arm, and the drain-vs-dial sim test pins seeds
-/// that reach exactly four (§8, §9).
-pub const conn_ops_max: u32 = 4;
+/// removed their two completions outright. `Conn.arm` asserts this half
+/// on every arm and `Stream.arm` the other, and the drain-vs-dial sim
+/// test pins seeds that reach exactly four combined (§8, §9).
+pub const conn_ops_max: u32 = 2;
+
+/// Worst-case simultaneously armed ring ops for one *stream slot*: two.
+///
+/// The exchange's four completions, of which at most two can be
+/// outstanding at once — the disjointness `Stream.Armed` states: a dial
+/// and its cancel belong to the dialing states, the two data legs to the
+/// relaying and exchanging ones, and nothing arms one kind while the
+/// other is in flight. That claim is what makes the sum above four rather
+/// than six, so it is asserted at the arm site rather than argued here:
+/// a path that ever co-armed three would fail the first seed that reached
+/// it, and the divisor below would need re-deriving.
+pub const stream_ops_max: u32 = 2;
+
+comptime {
+    // The equality #274 rests on, and the reason none of the ceilings
+    // derived from the divisor moved: an admitted connection is charged
+    // exactly what it was charged when all six ops sat on one slot.
+    assert(conn_ops_max + stream_ops_max == 4);
+}
 
 /// Stream slots (`Pool(Stream)`) for a given conn-slot count (#274).
 ///
@@ -1057,7 +1088,13 @@ pub fn inFlightOps(
     assert(listeners <= std.math.maxInt(u16));
     assert(health_probes >= 1);
     assert(health_probes <= health_probe_concurrency_max);
-    return conn_slots * conn_ops_max + upstream_slots +
+    // The stream term is derived rather than passed: the two counts are
+    // pinned while an exchange is a connection (#274), and a parameter
+    // that must always equal `streamSlotsFor(conn_slots)` is a parameter
+    // a caller can pass wrong. `conn_ops_max + stream_ops_max` is the
+    // one divisor per admitted connection this has always charged.
+    return conn_slots * conn_ops_max +
+        streamSlotsFor(conn_slots) * stream_ops_max + upstream_slots +
         2 * (listeners + admin_listeners) +
         admin_conns * admin_conn_ops_max + access_log_ops_max +
         health_probes * health_probe_ops_max + 1 + 1;
@@ -1370,15 +1407,16 @@ comptime {
     // and the admin listener plus its one client op — are carved out (§8).
     // The pair is pinned (`upstream_slots_max = conn_slots_max`), so the
     // shared CQ line has one divisor — an admitted connection costs
-    // `conn_ops_max` conn ops plus the one op of the upstream slot it may
-    // need — rather than one ceiling subtracting from the other.
+    // `conn_ops_max` conn ops plus `stream_ops_max` for the one stream it
+    // owns (#274) plus the one op of the upstream slot it may need —
+    // rather than one ceiling subtracting from the other.
     assert(upstream_slots_max == conn_slots_max);
     assert(conn_slots_max == @divFloor(
         @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
             2 * admin_listeners -
             admin_conns * admin_conn_ops_max - access_log_ops_max -
             health_probe_concurrency_max * health_probe_ops_max - 1 - 1,
-        conn_ops_max + 1,
+        conn_ops_max + stream_ops_max + 1,
     ));
     assert(admin_listeners >= 1);
     assert(admin_conns >= 1);
@@ -1945,7 +1983,13 @@ test "budgets: conn slots sit at the completion-queue ceiling" {
     // that still satisfies it after the parked-upstream reservation, so
     // one more slot would break the budget.
     try std.testing.expect(inFlightOps(conn_slots_max, upstream_slots_max, 0, health_probe_concurrency_max) <= @divExact(completion_queue_entries, 8) * cq_fill_eighths_default);
-    const one_more = (conn_slots_max + 1) * conn_ops_max + upstream_slots_max +
+    // One more connection costs both shares, because the counts are
+    // pinned (#274): a conn slot the pool cannot pair a stream with could
+    // never run an exchange. Spelled as the sum rather than through
+    // `streamSlotsFor`, whose own assert bounds its argument by the very
+    // ceiling this line is trying to step past.
+    const one_more = (conn_slots_max + 1) * (conn_ops_max + stream_ops_max) +
+        upstream_slots_max +
         2 * admin_listeners +
         admin_conns * admin_conn_ops_max + access_log_ops_max +
         health_probe_concurrency_max * health_probe_ops_max + 1 + 1;

@@ -289,14 +289,26 @@ pub fn Server(comptime IoType: type) type {
         /// zero when it named none. Stored because every index into the
         /// tables above is a multiple of it.
         log_headers_per_conn: u32,
-        /// Highest armed-op count any one connection has reached (§8):
-        /// `Conn.arm` asserts the `conn_ops_max` budget on every arm and,
-        /// under runtime safety only (Debug and ReleaseSafe — the shipped
-        /// build is ReleaseSafe, see docs/IMPLEMENTATION_NOTES.md
-        /// "Shipping ReleaseSafe"), records the peak here, so a test can
-        /// claim a race co-armed exactly the budgeted worst case, not
-        /// merely stayed under it.
+        /// Highest armed-op count any one connection has reached (§8),
+        /// counting both of its slots since #274: `Conn.arm` asserts the
+        /// `conn_ops_max` budget and `Stream.arm` the `stream_ops_max`
+        /// one, and both record this *combined* peak — which is the
+        /// number the CQ is charged per admitted connection, and so the
+        /// one that must not move when ops change slots. Under runtime
+        /// safety only (Debug and ReleaseSafe — the shipped build is
+        /// ReleaseSafe, see docs/IMPLEMENTATION_NOTES.md "Shipping
+        /// ReleaseSafe"), so a test can claim a race co-armed exactly the
+        /// budgeted worst case, not merely stayed under it.
         armed_ops_peak: u8,
+        /// The stream half of that peak (#274), tracked beside it because
+        /// the combined number cannot distinguish the two shapes the
+        /// budget rests on: `stream_ops_max` is two only because a dial
+        /// and the data legs are disjoint, and a seed that ever co-armed
+        /// three stream ops would be a divisor that has to move. The
+        /// assert in `Stream.arm` is what fails first; this is what a
+        /// test reads to claim the peak was *reached*, not merely
+        /// respected.
+        stream_armed_ops_peak: u8,
         /// The raw errno of the most recent kernel-pressure failure, or 0
         /// (§8). Reported as a gauge rather than a counter because it is a
         /// level — "what is failing now" — and because an errno space is
@@ -816,6 +828,7 @@ pub fn Server(comptime IoType: type) type {
             server.render_scratch = undefined;
             server.render_scratch_lent = false;
             server.armed_ops_peak = 0;
+            server.stream_armed_ops_peak = 0;
             server.last_pressure_errno = 0;
             server.drain_deadline_completion = .{};
             server.drain_stuck_completion = .{};
@@ -1332,11 +1345,11 @@ pub fn Server(comptime IoType: type) type {
                     .{
                         index,
                         conn.state,
-                        conn.armedCount(),
-                        conn.armed.data_client_to_upstream,
-                        conn.armed.data_upstream_to_client,
-                        conn.armed.connect,
-                        conn.armed.connect_cancel,
+                        conn.armedCount() + conn.stream.armedCount(),
+                        conn.stream.armed.data_client_to_upstream,
+                        conn.stream.armed.data_upstream_to_client,
+                        conn.stream.armed.connect,
+                        conn.stream.armed.connect_cancel,
                         conn.armed.deadline,
                         conn.armed.deadline_cancel,
                         conn.tls != null,
@@ -2234,6 +2247,7 @@ pub fn Server(comptime IoType: type) type {
         fn releaseStream(server: *Self, conn: *ConnType) void {
             assert(conn.state == .tearing_down);
             assert(conn.armedCount() == 0);
+            assert(conn.stream.armedCount() == 0);
             assert(conn.stream.conn == conn);
             server.streams.release(conn.stream);
         }
@@ -2281,11 +2295,11 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.head_len < constants.proxy_header_bytes_max);
             const staging = conn.relay_buffer.?
                 .client_to_upstream[0..constants.proxy_header_bytes_max];
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
                 staging[conn.head_len..],
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onProxyHeaderRecv,
@@ -2297,7 +2311,7 @@ pub fn Server(comptime IoType: type) type {
         /// header reads `need_more` until its last byte lands.
         fn onProxyHeaderRecv(conn: *ConnType, result: Io.RecvError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -2433,11 +2447,11 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls != null);
             const destination = conn.tls.?.recvBuffer();
             assert(destination.len >= 1);
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
                 destination,
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onTlsRecv,
@@ -2446,7 +2460,7 @@ pub fn Server(comptime IoType: type) type {
 
         fn onTlsRecv(conn: *ConnType, result: Io.RecvError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -2528,11 +2542,11 @@ pub fn Server(comptime IoType: type) type {
             }
             const staged = engine.outbound();
             if (staged.len >= 1) {
-                conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+                conn.stream.arm(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
                 server.io.send(
                     conn.client_socket,
                     staged,
-                    &conn.op_data_upstream_to_client.completion,
+                    &conn.stream.op_data_upstream_to_client.completion,
                     ConnType,
                     conn,
                     onTlsSent,
@@ -2595,7 +2609,7 @@ pub fn Server(comptime IoType: type) type {
 
         fn onTlsSent(conn: *ConnType, result: Io.SendError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            conn.stream.delivered(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -2799,12 +2813,12 @@ pub fn Server(comptime IoType: type) type {
                     // Nothing was armed for this dial yet — the arm below
                     // is the first — so teardown here cancels only the
                     // deadline admission left running (§5).
-                    assert(!conn.armed.connect);
+                    assert(!conn.stream.armed.connect);
                     server.beginTeardown(conn);
                     return;
                 },
             };
-            conn.arm(&conn.op_connect, "connect");
+            conn.stream.arm(&conn.stream.op_connect, "connect");
             // An L4 dial holds no slot to record the endpoint on, so the
             // access log takes it here — the only place that knows which
             // origin this connection is being relayed to (§8).
@@ -2815,7 +2829,7 @@ pub fn Server(comptime IoType: type) type {
             }
             server.io.connect(
                 dial.address,
-                &conn.op_connect.completion,
+                &conn.stream.op_connect.completion,
                 ConnType,
                 conn,
                 onConnect,
@@ -2824,7 +2838,7 @@ pub fn Server(comptime IoType: type) type {
 
         fn onConnect(conn: *ConnType, result: Io.ConnectError!IoType.Socket) void {
             const server = conn.server;
-            conn.delivered(&conn.op_connect, "connect");
+            conn.stream.delivered(&conn.stream.op_connect, "connect");
             if (conn.isTearingDown()) {
                 // The teardown raced the dial. A socket that arrived
                 // anyway must still be shut down and closed.
@@ -2890,7 +2904,7 @@ pub fn Server(comptime IoType: type) type {
             }
             // A dial-timeout verdict (§8) may already have a cancel in
             // flight; submitting a second would double-arm the op.
-            if (conn.armed.connect and !conn.armed.connect_cancel) {
+            if (conn.stream.armed.connect and !conn.stream.armed.connect_cancel) {
                 server.armConnectCancel(conn);
             }
             // A dial rebase (§8) may already have this timer's cancel in
@@ -2910,26 +2924,20 @@ pub fn Server(comptime IoType: type) type {
             server.continueTeardown(conn);
         }
 
-        /// Public for the relay: a completion delivered during teardown
-        /// re-enters here (§5). The delivery that empties the armed set
-        /// finishes the whole teardown synchronously: nothing references
-        /// either fd any more, so the closes are plain syscalls — the
-        /// same close-after-full-drain discipline `detachUpstream` and
-        /// the parked reap already use — and the slot releases in the
-        /// same call instead of waiting out two close completions. A
-        /// dial completing against its own teardown still peaks at four
-        /// armed ops: the `conn_ops_max` budget the CQ is sized by (§8).
-        pub fn continueTeardown(server: *Self, conn: *ConnType) void {
+        /// Every pool slot this connection drew from, returned in the one
+        /// order that is safe (§5). Split out of `continueTeardown` for
+        /// the length limit, and it is the right seam: the caller owns
+        /// *when* a release may happen — the armed-set check and the fd
+        /// closes that check licenses — while this owns *what* is
+        /// released and in what order. Its precondition is the caller's
+        /// postcondition, restated rather than assumed.
+        fn releasePooledResources(server: *Self, conn: *ConnType) void {
             assert(conn.state == .tearing_down);
-            if (conn.armedCount() != 0) return;
-            // Nothing armed: no op references either fd, which is what
-            // makes the synchronous closes and the release safe.
             assert(conn.armedCount() == 0);
-            server.io.closeNow(conn.client_socket);
-            if (conn.upstream_socket) |socket| {
-                server.io.closeNow(socket);
-                conn.upstream_socket = null;
-            }
+            assert(conn.stream.armedCount() == 0);
+            // Both fds are shut: nothing here may reference a socket, and
+            // the upstream one is the field the caller cleared.
+            assert(conn.upstream_socket == null);
             // The §5 tunnel buffer first, and the order matters: a live
             // tunnel's `relay_buffer` *aliases* its `tunnel_buffer`
             // (#180), so releasing the shared way would hand one pool's
@@ -2962,15 +2970,15 @@ pub fn Server(comptime IoType: type) type {
                 server.returnHeadBuffer(conn);
             }
             // The leased upstream slot rides the same release rule: its
-            // socket (if any) was closed just above, so the slot is
+            // socket (if any) was closed by the caller, so the slot is
             // inert (§5). Parking replaces this with reuse later.
             if (conn.upstream) |leased| {
                 server.releaseUpstream(leased);
                 conn.upstream = null;
             }
             // The L4 endpoint charge rides the same rule: the socket that
-            // made this connection work against an origin is closed just
-            // above, so the origin is no longer carrying it (§7).
+            // made this connection work against an origin is closed, so
+            // the origin is no longer carrying it (§7).
             server.releaseL4(conn);
             // The TLS engine, last of the per-connection resources and the
             // only one held for the whole life of the connection rather
@@ -2983,8 +2991,44 @@ pub fn Server(comptime IoType: type) type {
             }
             assert(conn.tls == null);
             assert(conn.relay_buffer == null);
+            assert(conn.tunnel_buffer == null);
             assert(conn.upstream == null);
             assert(conn.charged_endpoint == conn_module.LogState.endpoint_none);
+        }
+
+        /// Public for the relay: a completion delivered during teardown
+        /// re-enters here (§5). The delivery that empties *both* armed
+        /// sets finishes the whole teardown synchronously: nothing
+        /// references either fd any more, so the closes are plain
+        /// syscalls — the same close-after-full-drain discipline
+        /// `detachUpstream` and the parked reap already use — and the two
+        /// slots release in the same call instead of waiting out two
+        /// close completions. A dial completing against its own teardown
+        /// still peaks at four armed ops, split two and two across the
+        /// slots since #274: the `conn_ops_max + stream_ops_max` budget
+        /// the CQ is sized by (§8).
+        pub fn continueTeardown(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .tearing_down);
+            // §5's release rule, one level deeper since #274: the conn
+            // slot goes back when *its* armed set is empty **and** every
+            // stream it owns has emptied its own. The exchange's four
+            // completions live on the stream now, so a check that read
+            // only this set would close both fds out from under an armed
+            // recv — which is the shape of bug the rule exists to make
+            // impossible, and which the sim finds on the first idle
+            // timeout when it is got wrong.
+            if (conn.armedCount() != 0 or conn.stream.armedCount() != 0) return;
+            // Nothing armed on either slot: no op references either fd,
+            // which is what makes the synchronous closes and the two
+            // releases safe.
+            assert(conn.armedCount() == 0);
+            assert(conn.stream.armedCount() == 0);
+            server.io.closeNow(conn.client_socket);
+            if (conn.upstream_socket) |socket| {
+                server.io.closeNow(socket);
+                conn.upstream_socket = null;
+            }
+            server.releasePooledResources(conn);
             // The last chance to say anything about this connection (§8).
             // An exchange that reached a verdict already spoke and is
             // skipped by `emitted`; what is left here is everything that
@@ -3630,8 +3674,8 @@ pub fn Server(comptime IoType: type) type {
             if (conn.state == .l7_dialing and conn.l7.pending_verdict == .none) {
                 // At loop-rest a dialing L7 connection always has its
                 // connect in flight, no data ops, and no response byte.
-                assert(conn.armed.connect);
-                assert(!conn.armed.connect_cancel);
+                assert(conn.stream.armed.connect);
+                assert(!conn.stream.armed.connect_cancel);
                 assert(!conn.l7.response_started);
                 conn.l7.pending_verdict = .gateway_timeout;
                 // Same fixed grace as the exchange verdict above.
@@ -3681,12 +3725,12 @@ pub fn Server(comptime IoType: type) type {
         /// the double-arm themselves: a verdict cancel may already be in
         /// flight when teardown starts.
         fn armConnectCancel(server: *Self, conn: *ConnType) void {
-            assert(conn.armed.connect);
-            assert(!conn.armed.connect_cancel);
-            conn.arm(&conn.op_connect_cancel, "connect_cancel");
+            assert(conn.stream.armed.connect);
+            assert(!conn.stream.armed.connect_cancel);
+            conn.stream.arm(&conn.stream.op_connect_cancel, "connect_cancel");
             server.io.connectCancel(
-                &conn.op_connect.completion,
-                &conn.op_connect_cancel.completion,
+                &conn.stream.op_connect.completion,
+                &conn.stream.op_connect_cancel.completion,
                 ConnType,
                 conn,
                 onConnectCancel,
@@ -3694,7 +3738,7 @@ pub fn Server(comptime IoType: type) type {
         }
 
         fn onConnectCancel(conn: *ConnType) void {
-            conn.delivered(&conn.op_connect_cancel, "connect_cancel");
+            conn.stream.delivered(&conn.stream.op_connect_cancel, "connect_cancel");
             if (conn.isTearingDown()) {
                 conn.server.continueTeardown(conn);
                 return;

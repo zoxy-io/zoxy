@@ -1055,6 +1055,12 @@ test "teardown: a drain racing its own upstream dial peaks at four armed ops" {
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("drained_at_deadline"));
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
         try std.testing.expectEqual(@as(u8, 4), bed.server.armed_ops_peak);
+        // And the #274 split of that same four: {connect, connect_cancel}
+        // on the stream, {deadline, deadline_cancel} on the conn. The
+        // combined figure above is what the CQ is charged and is what
+        // must not move; this one is why `stream_ops_max` is two rather
+        // than four, pinned by the seeds that actually reach the race.
+        try std.testing.expectEqual(@as(u8, 2), bed.server.stream_armed_ops_peak);
         try bed.expectDrained();
     }
 }
