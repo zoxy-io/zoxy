@@ -198,11 +198,11 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.tls != null);
             const destination = conn.tls.?.recvBuffer();
             assert(destination.len >= 1);
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
                 destination,
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onTlsHeadRecv,
@@ -211,7 +211,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onTlsHeadRecv(conn: *ConnType, result: Io.RecvError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -451,10 +451,10 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_reading_head);
             assert(conn.head_buffer_id == ConnType.head_buffer_none);
             assert(conn.head_len == 0);
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recvGroup(
                 conn.client_socket,
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onHeadGroupRecv,
@@ -468,11 +468,11 @@ pub fn Proxy(comptime IoType: type) type {
             // Resolved before the arm, so the source's own bound is checked
             // before any state changes.
             const into = headRecvBuffer(server, conn);
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
                 into,
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onHeadRecv,
@@ -481,7 +481,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onHeadGroupRecv(conn: *ConnType, result: Io.RecvGroupError!Io.GroupRecv) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 // The teardown raced the client's first byte (§5): the
                 // kernel may already have bound a ring buffer for the
@@ -539,7 +539,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onHeadRecv(conn: *ConnType, result: Io.RecvError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -1373,10 +1373,10 @@ pub fn Proxy(comptime IoType: type) type {
                 // §8 504.
                 assert(conn.armed.deadline or conn.armed.deadline_cancel);
             }
-            conn.arm(&conn.op_connect, "connect");
+            conn.stream.arm(&conn.stream.op_connect, "connect");
             server.io.connect(
                 pick.address,
-                &conn.op_connect.completion,
+                &conn.stream.op_connect.completion,
                 ConnType,
                 conn,
                 onUpstreamConnect,
@@ -1385,7 +1385,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onUpstreamConnect(conn: *ConnType, result: Io.ConnectError!IoType.Socket) void {
             const server = conn.server;
-            conn.delivered(&conn.op_connect, "connect");
+            conn.stream.delivered(&conn.stream.op_connect, "connect");
             if (conn.isTearingDown()) {
                 // The teardown raced the dial (§5): a socket that arrived
                 // anyway must still be shut down and closed.
@@ -1503,8 +1503,8 @@ pub fn Proxy(comptime IoType: type) type {
         fn beginRetry(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_dialing);
             assert(conn.upstream_socket == null); // A failed dial produced none.
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             const failed = conn.upstream.?;
             assert(conn.l7.tried_count < conn.l7.tried.len);
             conn.l7.tried[conn.l7.tried_count] = failed.endpoint_index;
@@ -1737,11 +1737,11 @@ pub fn Proxy(comptime IoType: type) type {
             const l7 = &conn.l7;
             assert(l7.request_head_sent < l7.rendered_request_len);
             l7.request_op_on_client = false; // A send on the upstream socket.
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
                 upstreamHeadBytes(conn.upstream.?)[l7.request_head_sent..l7.rendered_request_len],
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onRequestHeadSent,
@@ -1750,7 +1750,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onRequestHeadSent(conn: *ConnType, result: Io.SendError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -1833,11 +1833,11 @@ pub fn Proxy(comptime IoType: type) type {
             const direction = &conn.directions[0];
             const base = conn.l7.request_head_len;
             conn.l7.request_op_on_client = false; // A send on the upstream socket.
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.send(
                 conn.upstream_socket.?,
                 direction.pending(headBytes(server, conn)[base..]),
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onRequestExcessSent,
@@ -1846,7 +1846,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onRequestExcessSent(conn: *ConnType, result: Io.SendError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -2093,11 +2093,11 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.l7.response_leg == .awaiting_head);
             const upstream = conn.upstream.?;
             assert(upstream.head_len < upstreamHeadBytes(upstream).len);
-            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            conn.stream.arm(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.recv(
                 conn.upstream_socket.?,
                 upstreamHeadBytes(upstream)[upstream.head_len..],
-                &conn.op_data_upstream_to_client.completion,
+                &conn.stream.op_data_upstream_to_client.completion,
                 ConnType,
                 conn,
                 onResponseHeadRecv,
@@ -2106,7 +2106,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onResponseHeadRecv(conn: *ConnType, result: Io.RecvError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            conn.stream.delivered(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -2566,8 +2566,8 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.upgrade_requested);
             assert(conn.upstream_socket != null);
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             assert(conn.l7.request_head_len <= conn.head_len);
             const pipelined = conn.head_len - conn.l7.request_head_len;
             // `tunnel_buffer` stays set: it is what marks which pool this
@@ -2935,11 +2935,11 @@ pub fn Proxy(comptime IoType: type) type {
             else
                 conn.client_write.pending;
             assert(bytes.len >= 1);
-            conn.arm(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            conn.stream.arm(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.send(
                 conn.client_socket,
                 bytes,
-                &conn.op_data_upstream_to_client.completion,
+                &conn.stream.op_data_upstream_to_client.completion,
                 ConnType,
                 conn,
                 onClientWritten,
@@ -3066,7 +3066,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onClientWritten(conn: *ConnType, result: Io.SendError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_upstream_to_client, "data_upstream_to_client");
+            conn.stream.delivered(&conn.stream.op_data_upstream_to_client, "data_upstream_to_client");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
@@ -3377,8 +3377,8 @@ pub fn Proxy(comptime IoType: type) type {
         /// data ops settled with the exchange), so the close is
         /// synchronous, like the parked-reap path.
         fn detachUpstream(server: *ServerType, conn: *ConnType) void {
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             if (conn.upstream) |leased| {
                 server.io.closeNow(conn.upstream_socket.?);
                 server.releaseUpstream(leased);
@@ -3399,10 +3399,10 @@ pub fn Proxy(comptime IoType: type) type {
             // The lazy deadline timer stays armed across the turnaround (§4),
             // and a dial rebase (§8) cancel may still be draining if the
             // exchange outran it — both re-establish the next idle deadline.
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
-            assert(!conn.armed.connect);
-            assert(!conn.armed.connect_cancel);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.connect);
+            assert(!conn.stream.armed.connect_cancel);
             assert(conn.armed.deadline or conn.armed.deadline_cancel);
             // The channel's cursor lives on the conn, not in `l7`, so the
             // reset below does not wipe it: assert it drained instead of
@@ -3476,7 +3476,7 @@ pub fn Proxy(comptime IoType: type) type {
             if (conn.l7.response_started) {
                 return false;
             }
-            if (conn.armed.data_client_to_upstream and conn.l7.request_op_on_client) {
+            if (conn.stream.armed.data_client_to_upstream and conn.l7.request_op_on_client) {
                 return false;
             }
             return true;
@@ -3527,7 +3527,7 @@ pub fn Proxy(comptime IoType: type) type {
             // never be.
             assert(!conn.l7.response_started);
             if (!conn.l7.head_budget_installed) return false;
-            return conn.armed.data_client_to_upstream;
+            return conn.stream.armed.data_client_to_upstream;
         }
 
         /// Begin the #247 head-read verdict: force the armed head recv and
@@ -3563,8 +3563,8 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_exchanging);
             assert(conn.l7.pending_verdict == .none);
             assert(expiryAnswerable(conn));
-            assert(conn.armed.data_client_to_upstream or
-                conn.armed.data_upstream_to_client);
+            assert(conn.stream.armed.data_client_to_upstream or
+                conn.stream.armed.data_upstream_to_client);
             conn.l7.pending_verdict = .gateway_timeout;
             server.io.shutdown(conn.upstream_socket.?, .both);
         }
@@ -3585,8 +3585,8 @@ pub fn Proxy(comptime IoType: type) type {
                 (conn.state == .l7_reading_head and
                     conn.l7.pending_verdict == .request_timeout));
             assert(conn.l7.pending_verdict != .none);
-            if (conn.armed.data_client_to_upstream or
-                conn.armed.data_upstream_to_client)
+            if (conn.stream.armed.data_client_to_upstream or
+                conn.stream.armed.data_upstream_to_client)
             {
                 return; // The sibling's forced completion re-enters here.
             }
@@ -3668,8 +3668,8 @@ pub fn Proxy(comptime IoType: type) type {
             // (#232), and this is what would trip if that ever stopped
             // being true.
             assert(conn.l7.interims_seen == 0);
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
             assert(conn.relay_buffer != null); // Retained across the replay.
             const stale = conn.upstream.?;
@@ -3756,8 +3756,8 @@ pub fn Proxy(comptime IoType: type) type {
                 settlePendingVerdict(server, conn);
                 return;
             }
-            if (conn.l7.response_started or conn.armed.data_client_to_upstream or
-                conn.armed.data_upstream_to_client)
+            if (conn.l7.response_started or conn.stream.armed.data_client_to_upstream or
+                conn.stream.armed.data_upstream_to_client)
             {
                 server.beginTeardown(conn);
                 return;
@@ -3832,8 +3832,8 @@ pub fn Proxy(comptime IoType: type) type {
         /// data ops are free at every caller, so nothing is armed on the
         /// upstream socket and the close is synchronous, like `detach`.
         fn releaseForStaticResponse(server: *ServerType, conn: *ConnType) void {
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             // The head buffer too: the answer is static memory and the
             // lingering drain discards into the shared sink, so nothing
             // past this point reads or writes head bytes — and a reject
@@ -3899,8 +3899,8 @@ pub fn Proxy(comptime IoType: type) type {
         ) void {
             assert(conn.state == .l7_reading_head or conn.state == .l7_dialing or
                 conn.state == .l7_exchanging);
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
             // The head-shed rung can never keep, structurally: nothing was
             // read (the ring was empty, so no buffer was ever bound), the
@@ -3975,8 +3975,8 @@ pub fn Proxy(comptime IoType: type) type {
         /// the whole meaning of a budget that ran out here.
         fn respondMaxForwardsExhausted(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .l7_reading_head);
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             assert(conn.relay_buffer == null);
             assert(conn.upstream == null);
             const keep = commitStaticVerdict(server, conn, 200, "l7_max_forwards_exhausted", true);
@@ -4090,8 +4090,8 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_reading_head);
             // `respond`'s own contract: both data ops free, so the send
             // and any lingering drain have their completions.
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
             // A terminal verdict runs before routing acquires anything,
             // which is what keeps it clear of every rung past the head
@@ -4200,8 +4200,8 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state == .l7_reading_head);
             // The same contract `respond` states: both data ops free, so
             // the send and any lingering drain have their completions.
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             assert(!conn.l7.response_started);
             // Routing has acquired nothing yet: a redirect never touches
             // the relay or upstream pools, which is what keeps it out of
@@ -4337,8 +4337,8 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.relay_buffer == null);
             assert(conn.upstream == null);
             assert(conn.upstream_socket == null);
-            assert(!conn.armed.data_client_to_upstream);
-            assert(!conn.armed.data_upstream_to_client);
+            assert(!conn.stream.armed.data_client_to_upstream);
+            assert(!conn.stream.armed.data_upstream_to_client);
             // The same OR `resetForNextRequest` needs, for the same reason,
             // and it is not this request's doing: a *previous* request on
             // this connection may have dialed, re-based its deadline (§8),
@@ -4375,11 +4375,11 @@ pub fn Proxy(comptime IoType: type) type {
             // nobody reads may alias, and a reject storm drains through
             // 4 KiB total instead of 8 KiB per draining connection (§5).
             assert(conn.head_buffer_id == ConnType.head_buffer_none);
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
                 server.drainSink(),
-                &conn.op_data_client_to_upstream.completion,
+                &conn.stream.op_data_client_to_upstream.completion,
                 ConnType,
                 conn,
                 onDrainRecv,
@@ -4388,7 +4388,7 @@ pub fn Proxy(comptime IoType: type) type {
 
         fn onDrainRecv(conn: *ConnType, result: Io.RecvError!u32) void {
             const server = conn.server;
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;

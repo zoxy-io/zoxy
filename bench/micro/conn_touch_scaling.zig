@@ -2,13 +2,20 @@
 //! live connection count grows — the memory-hierarchy half of the c10k
 //! question, isolated from the network.
 //!
-//! `Conn.arm`/`Conn.delivered` are three instructions in ReleaseFast (the
-//! assertions compile out), so their cost is not the work — it is reaching
-//! `conn.armed` at all. One conn slot is ~9.5 KiB, so N live connections
-//! spread that byte over N distinct pages, and the completion order across
-//! them is effectively random. At 500 connections the touched set is a few
-//! MiB and lives in L3; at 10k it is over 100 MiB and every touch is a DRAM
-//! access plus a page walk.
+//! `Stream.arm`/`Stream.delivered` are three instructions in ReleaseFast
+//! (the assertions compile out), so their cost is not the work — it is
+//! reaching `stream.armed` at all. A conn slot is ~2 KiB and the stream
+//! slot beside it is small, but they are allocated in separate pools, so N
+//! live connections spread the pair over 2N distinct locations and the
+//! completion order across them is effectively random. At 500 connections
+//! the touched set lives in L3; at 10k every touch is a DRAM access plus a
+//! page walk.
+//!
+//! Since #274 a data completion arms on the *stream* — that is the object
+//! the ops moved to — and the peak accounting reaches its connection, so
+//! both are on the measured path. Comparing bands across that change is
+//! the point: the split traded one large object per completion for two
+//! smaller ones, and only a measurement says which way that goes.
 //!
 //! The permutation is the point: a sequential walk measures the prefetcher,
 //! not the proxy. A real loop services whichever connection the ring hands
@@ -28,7 +35,9 @@ const zoxy = @import("zoxy");
 
 const assert = std.debug.assert;
 
-const ConnType = zoxy.Server(zoxy.Io.XevIo).ConnType;
+const ServerType = zoxy.Server(zoxy.Io.XevIo);
+const ConnType = ServerType.ConnType;
+const StreamType = ServerType.StreamType;
 
 /// `std.time` carries only constants in 0.16 — `Instant`/`Timer` moved out —
 /// and this bench has no `Io` runtime to borrow a clock from, so it reads
@@ -106,10 +115,29 @@ const Measurement = struct {
 fn measure(arena: std.mem.Allocator, count: u32) !Measurement {
     assert(count >= 1);
     const conns = try arena.alloc(ConnType, count);
-    for (conns, 0..) |*conn, index| {
+    // One stream per connection, as the server pairs them (#274): a data
+    // completion's bookkeeping now lands on the stream slot, and the peak
+    // tracking inside `arm` reaches back through it to the conn. Both
+    // objects are therefore on the path this bench measures, which is the
+    // layout change worth watching — the arrays are allocated apart, so a
+    // touched pair is two distinct pages exactly as it is in the server.
+    const streams = try arena.alloc(StreamType, count);
+    // The peak counters `arm` writes under runtime safety (this binary is
+    // ReleaseSafe) are the only fields either type reads off the server,
+    // and they must be real storage: reaching them through an undefined
+    // pointer is what this loop used to do, quietly.
+    const server = try arena.create(ServerType);
+    server.armed_ops_peak = 0;
+    server.stream_armed_ops_peak = 0;
+    for (conns, streams, 0..) |*conn, *stream, index| {
         conn.generation = @intCast(index);
         conn.armed = .{};
-        conn.op_data_client_to_upstream = .{};
+        conn.server = server;
+        conn.stream = stream;
+        stream.generation = @intCast(index);
+        stream.conn = conn;
+        stream.armed = .{};
+        stream.op_data_client_to_upstream = .{};
     }
 
     // A random permutation, walked repeatedly: the completion order a ring
@@ -125,10 +153,10 @@ fn measure(arena: std.mem.Allocator, count: u32) !Measurement {
     var done: u64 = 0;
     while (done < ops_per_point) {
         for (order) |index| {
-            const conn = &conns[index];
-            conn.arm(&conn.op_data_client_to_upstream, "data_client_to_upstream");
-            conn.delivered(&conn.op_data_client_to_upstream, "data_client_to_upstream");
-            checksum +%= conn.generation;
+            const stream = &streams[index];
+            stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
+            stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
+            checksum +%= stream.conn.generation;
         }
         done += count;
     }

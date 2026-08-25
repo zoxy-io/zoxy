@@ -455,10 +455,6 @@ pub fn Conn(comptime IoType: type) type {
         /// connection on the L4 one.
         log: LogState,
 
-        op_data_client_to_upstream: Op,
-        op_data_upstream_to_client: Op,
-        op_connect: Op,
-        op_connect_cancel: Op,
         op_deadline: Op,
         op_deadline_cancel: Op,
 
@@ -468,7 +464,7 @@ pub fn Conn(comptime IoType: type) type {
         /// rather than beside `ServerType` above because `Stream` is
         /// parameterized by the connection it points back at — see its
         /// own docstring for why that is a parameter and not an import.
-        pub const StreamType = stream_module.Stream(Self);
+        pub const StreamType = stream_module.Stream(IoType, Self);
 
         /// "This connection holds no head-ring buffer." Out of range by
         /// construction: a group never publishes more than
@@ -742,14 +738,17 @@ pub fn Conn(comptime IoType: type) type {
             upstream_to_client,
         };
 
-        /// One bit per embedded op; release requires all clear (§5).
-        /// Closes carry no bit: they are synchronous syscalls once this
-        /// set is empty, never ring ops (`Server.continueTeardown`).
-        pub const Armed = packed struct(u6) {
-            data_client_to_upstream: bool = false,
-            data_upstream_to_client: bool = false,
-            connect: bool = false,
-            connect_cancel: bool = false,
+        /// One bit per embedded op; release requires all clear (§5) —
+        /// and, since #274, requires the same of every stream this
+        /// connection owns. Closes carry no bit: they are synchronous
+        /// syscalls once both sets are empty, never ring ops
+        /// (`Server.continueTeardown`).
+        ///
+        /// What is left here is the connection's own clock. The dial and
+        /// the two data legs are the *exchange's* and live on `Stream`;
+        /// a deadline outlives any one exchange on the connection, which
+        /// is exactly the line the split draws.
+        pub const Armed = packed struct(u2) {
             deadline: bool = false,
             deadline_cancel: bool = false,
         };
@@ -837,10 +836,6 @@ pub fn Conn(comptime IoType: type) type {
             if (protocol == .l4 and server.access_log.sink != null) {
                 conn.log.started_wall_ns = server.io.nowWallNs();
             }
-            conn.op_data_client_to_upstream = .{};
-            conn.op_data_upstream_to_client = .{};
-            conn.op_connect = .{};
-            conn.op_connect_cancel = .{};
             conn.op_deadline = .{};
             conn.op_deadline_cancel = .{};
             assert(conn.state == state);
@@ -850,6 +845,7 @@ pub fn Conn(comptime IoType: type) type {
             // read through the wrong partner (§5).
             assert(conn.stream.conn == conn);
             assert(conn.armedCount() == 0);
+            assert(conn.stream.armedCount() == 0);
             assert(conn.head_len == 0);
             assert(conn.client_write.pending.len == 0);
             assert(conn.upstream == null);
@@ -873,9 +869,16 @@ pub fn Conn(comptime IoType: type) type {
             // shipped build is ReleaseSafe, so this compare-and-max runs
             // in production now, same cost class as the assert next to
             // it; only the counter's only reader is a test.
+            //
+            // The *combined* count since #274, and that is the point: the
+            // CQ is charged per admitted connection, so what this peaks at
+            // must be what it peaked at before the ops moved. `Stream.arm`
+            // samples the same sum from its own side.
             if (std.debug.runtime_safety) {
-                conn.server.armed_ops_peak =
-                    @max(conn.server.armed_ops_peak, conn.armedCount());
+                conn.server.armed_ops_peak = @max(
+                    conn.server.armed_ops_peak,
+                    conn.armedCount() + conn.stream.armedCount(),
+                );
             }
         }
 
@@ -889,7 +892,7 @@ pub fn Conn(comptime IoType: type) type {
         }
 
         pub fn armedCount(conn: *const Self) u8 {
-            return @popCount(@as(u6, @bitCast(conn.armed)));
+            return @popCount(@as(u2, @bitCast(conn.armed)));
         }
     };
 }
