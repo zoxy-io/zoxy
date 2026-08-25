@@ -351,6 +351,32 @@ pub const TestBed = struct {
         }
     }
 
+    /// The bed's TLS credentials, loaded apart from `setUp` for the
+    /// length limit — and it is the half worth naming, since the
+    /// deterministic-nonce option below is a §9 property (a seeded run
+    /// replays a byte-exact handshake) and never a production setting.
+    fn loadCredentials(
+        bed: *TestBed,
+        arena: std.mem.Allocator,
+        options: SetUpOptions,
+        server_options: ServerSim.InitOptions,
+    ) !void {
+        bed.tls_credentials = .{null};
+        if (options.tls) {
+            assert(server_options.tls_engines >= 1);
+            bed.tls_credentials[0] = try Credentials.load(
+                arena,
+                fixture_cert_pem,
+                fixture_key_pem,
+                // Deterministic signatures, so a seeded run replays a
+                // byte-exact handshake — the §9 property the whole
+                // simulation rests on. Never set in production.
+                .{ .deterministic_nonce = true },
+            );
+            bed.server.setTlsCredentials(&bed.tls_credentials);
+        }
+    }
+
     pub fn setUp(bed: *TestBed, gpa: std.mem.Allocator, options: SetUpOptions) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer bed.arena_state.deinit();
@@ -410,20 +436,7 @@ pub const TestBed = struct {
         else
             0;
         try bed.server.init(arena, &bed.sim_io, &bed.config, server_options);
-        bed.tls_credentials = .{null};
-        if (options.tls) {
-            assert(server_options.tls_engines >= 1);
-            bed.tls_credentials[0] = try Credentials.load(
-                arena,
-                fixture_cert_pem,
-                fixture_key_pem,
-                // Deterministic signatures, so a seeded run replays a
-                // byte-exact handshake — the §9 property the whole
-                // simulation rests on. Never set in production.
-                .{ .deterministic_nonce = true },
-            );
-            bed.server.setTlsCredentials(&bed.tls_credentials);
-        }
+        try bed.loadCredentials(arena, options, server_options);
         try bed.server.start();
 
         bed.scenario = .{

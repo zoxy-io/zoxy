@@ -1310,6 +1310,56 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
 /// resolvers have each enforced their own half, because a pool past this
 /// is not merely wasteful — the fd and ring budgets are derived from
 /// `conn_slots` on the strength of it (`fdsRequired`, `inFlightOps`), so
+/// The two pools a *feature* switches on: TLS engines, reserved exactly
+/// when some listener terminates, and #180's tunnels, reserved exactly
+/// when some listener allows an upgrade. Their own group because both are
+/// zero for a deployment that asked for neither — which is what makes
+/// each feature free — and both are bounded by the conn slots above.
+fn resolveFeaturePools(
+    limits_json: *const LimitsJson,
+    conn_slots: u32,
+    tls_listeners_count: u32,
+    upgrade_listeners_count: u32,
+) ValidationError!struct { tls_engines: u32, tunnels: u32 } {
+    const tls_engines = try resolveTlsEngines(
+        limits_json.tls_engines,
+        conn_slots,
+        tls_listeners_count,
+    );
+    const tunnels = try resolveTunnels(
+        limits_json.tunnels,
+        conn_slots,
+        upgrade_listeners_count,
+    );
+    return .{ .tls_engines = tls_engines, .tunnels = tunnels };
+}
+
+/// The two head pools (§5), which exist only for an HTTP listener: the
+/// downstream ring and the upstream pool. Their own group because both
+/// are gated on the same `http_listeners_count` and each is bounded by a
+/// different slot count above.
+fn resolveHeadPools(
+    limits_json: *const LimitsJson,
+    conn_slots: u32,
+    upstream_slots: u32,
+    http_listeners_count: u32,
+) ValidationError!struct { head_buffers: u32, upstream_head_buffers: u32 } {
+    const head_buffers = try resolveHeadBuffers(
+        limits_json.head_buffers,
+        conn_slots,
+        http_listeners_count,
+    );
+    const upstream_head_buffers = try resolveUpstreamHeadBuffers(
+        limits_json.upstream_head_buffers,
+        upstream_slots,
+        http_listeners_count,
+    );
+    return .{
+        .head_buffers = head_buffers,
+        .upstream_head_buffers = upstream_head_buffers,
+    };
+}
+
 /// a breach here is an under-provisioned ring rather than spare memory.
 fn assertPoolsFitConnSlots(
     conn_slots: u32,
@@ -1344,26 +1394,18 @@ fn resolveLimits(
     const conn_slots = slots.conn_slots;
     const relay_buffers = slots.relay_buffers;
     const upstream_slots = slots.upstream_slots;
-    const head_buffers = try resolveHeadBuffers(
-        limits_json.head_buffers,
+    const head_pools = try resolveHeadPools(
+        limits_json,
         conn_slots,
-        http_listeners_count,
-    );
-    const upstream_head_buffers = try resolveUpstreamHeadBuffers(
-        limits_json.upstream_head_buffers,
         upstream_slots,
         http_listeners_count,
     );
     const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
     const relay_buffer_bytes = try resolveRelayBufferBytes(limits_json.relay_buffer_bytes);
-    const tls_engines = try resolveTlsEngines(
-        limits_json.tls_engines,
+    const feature_pools = try resolveFeaturePools(
+        limits_json,
         conn_slots,
         tls_listeners_count,
-    );
-    const tunnels = try resolveTunnels(
-        limits_json.tunnels,
-        conn_slots,
         upgrade_listeners_count,
     );
     const cq_fill_eighths = try resolveCqFill(
@@ -1383,17 +1425,23 @@ fn resolveLimits(
         access_log_on,
         log_header_count,
     );
-    assertPoolsFitConnSlots(conn_slots, relay_buffers, head_buffers, tls_engines, tunnels);
+    assertPoolsFitConnSlots(
+        conn_slots,
+        relay_buffers,
+        head_pools.head_buffers,
+        feature_pools.tls_engines,
+        feature_pools.tunnels,
+    );
     return .{
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
         .upstream_slots = upstream_slots,
-        .head_buffers = head_buffers,
-        .upstream_head_buffers = upstream_head_buffers,
+        .head_buffers = head_pools.head_buffers,
+        .upstream_head_buffers = head_pools.upstream_head_buffers,
         .head_buffer_bytes = head_buffer_bytes,
         .relay_buffer_bytes = relay_buffer_bytes,
-        .tls_engines = tls_engines,
-        .tunnels = tunnels,
+        .tls_engines = feature_pools.tls_engines,
+        .tunnels = feature_pools.tunnels,
         .keepalive_requests = limits_json.keepalive_requests orelse
             constants.keepalive_requests_default,
         .cq_fill_eighths = cq_fill_eighths,

@@ -431,6 +431,19 @@ pub fn Client(comptime IoType: type) type {
             /// plus Connection tokens, as the parser computed them.
             keep_alives: [responses_max]bool,
             violation: ?ClientError,
+
+            /// A walk that has read nothing yet. A decl on the type
+            /// rather than a literal at the one call site: the zero value
+            /// of a `Walk` is a property of the type, and stating it here
+            /// keeps the walk itself about walking.
+            pub const empty: Walk = .{
+                .complete_count = 0,
+                .interim_count = 0,
+                .offset = 0,
+                .statuses = @splat(0),
+                .keep_alives = @splat(false),
+                .violation = null,
+            };
         };
 
         /// Walk the received bytes as a sequence of responses, validating
@@ -439,15 +452,55 @@ pub fn Client(comptime IoType: type) type {
         /// a legal prefix (the adversary cuts mid-anything); bytes that
         /// can never extend to a legal transcript — or one complete
         /// response more than the transcript contains — are a violation.
+        /// The per-status header oracles (#176, #240, #180): the three
+        /// statuses whose *content* is the claim under test, where a
+        /// status check alone would pass a render that dropped or
+        /// corrupted the header carrying it. Null when the head is
+        /// consistent with what its status promises.
+        ///
+        /// Split from `walkResponses` for the length limit, and the seam
+        /// is what each half is: this one judges one head, the caller
+        /// walks a byte stream of them.
+        fn checkStatusHeaders(response: parser.ResponseHead, entry: Spec) ?ClientError {
+            // The #176 oracle: `filter_redirect` is the only script
+            // that earns a 301, its rule composes from the request's
+            // own host and canonical path, and both are fixed — so
+            // every 301 must carry exactly the canonical Location.
+            if (response.status == 301) {
+                if (!headerEquals(response.headers, "Location", canon.redirect_location)) {
+                    return ClientError.RedirectLocationWrong;
+                }
+            }
+            // The #240 oracle: a final-recipient answer's whole
+            // content is what it says about this hop, so a `200` that
+            // reached the client without an exact `Allow` answered
+            // the question with nothing.
+            if (response.status == 200 and entry.answered_here) {
+                if (!headerEquals(response.headers, "Allow", parser.allow_value)) {
+                    return ClientError.AllowMissing;
+                }
+            }
+            // The #180 oracle, and the mirror of the redirect check
+            // above: §7 lets the participating `Upgrade` survive
+            // hop-by-hop stripping precisely so the client is told
+            // *what* it was upgraded to, and the proxy writes its own
+            // `Connection: upgrade` rather than echoing whatever
+            // arrived. A status check alone cannot see either — a
+            // render that dropped or corrupted the pair would still
+            // produce a `101` and pass — so the headers are demanded
+            // by name, byte for byte.
+            if (response.status == 101) {
+                if (!headerEquals(response.headers, "upgrade", "websocket") or
+                    !headerEquals(response.headers, "connection", "upgrade"))
+                {
+                    return ClientError.UpgradePairMissing;
+                }
+            }
+            return null;
+        }
+
         pub fn walkResponses(bytes: []const u8, entry: Spec, connection: Connection) Walk {
-            var walk = Walk{
-                .complete_count = 0,
-                .interim_count = 0,
-                .offset = 0,
-                .statuses = @splat(0),
-                .keep_alives = @splat(false),
-                .violation = null,
-            };
+            var walk: Walk = .empty;
             while (walk.complete_count < responses_max) {
                 assert(walk.offset <= bytes.len);
                 if (walk.offset == bytes.len) return walk;
@@ -501,42 +554,9 @@ pub fn Client(comptime IoType: type) type {
                     walk.violation = violation;
                     return walk;
                 }
-                // The #176 oracle: `filter_redirect` is the only script
-                // that earns a 301, its rule composes from the request's
-                // own host and canonical path, and both are fixed — so
-                // every 301 must carry exactly the canonical Location.
-                if (response.status == 301) {
-                    if (!headerEquals(response.headers, "Location", canon.redirect_location)) {
-                        walk.violation = ClientError.RedirectLocationWrong;
-                        return walk;
-                    }
-                }
-                // The #240 oracle: a final-recipient answer's whole
-                // content is what it says about this hop, so a `200` that
-                // reached the client without an exact `Allow` answered
-                // the question with nothing.
-                if (response.status == 200 and entry.answered_here) {
-                    if (!headerEquals(response.headers, "Allow", parser.allow_value)) {
-                        walk.violation = ClientError.AllowMissing;
-                        return walk;
-                    }
-                }
-                // The #180 oracle, and the mirror of the redirect check
-                // above: §7 lets the participating `Upgrade` survive
-                // hop-by-hop stripping precisely so the client is told
-                // *what* it was upgraded to, and the proxy writes its own
-                // `Connection: upgrade` rather than echoing whatever
-                // arrived. A status check alone cannot see either — a
-                // render that dropped or corrupted the pair would still
-                // produce a `101` and pass — so the headers are demanded
-                // by name, byte for byte.
-                if (response.status == 101) {
-                    if (!headerEquals(response.headers, "upgrade", "websocket") or
-                        !headerEquals(response.headers, "connection", "upgrade"))
-                    {
-                        walk.violation = ClientError.UpgradePairMissing;
-                        return walk;
-                    }
+                if (checkStatusHeaders(response, entry)) |violation| {
+                    walk.violation = violation;
+                    return walk;
                 }
                 const body = bytes[walk.offset + response.head_len ..];
                 const verdict = walkBody(response, body, entry) orelse return walk;

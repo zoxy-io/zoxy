@@ -687,6 +687,37 @@ const Http1Bed = struct {
         health_interval_ms: u32 = 40,
     };
 
+    /// The bed's `Config`, assembled apart from the rest of `setUp` for
+    /// the length limit. It is the natural half: everything here is what
+    /// the *loader* would have produced, where the caller's remaining
+    /// half is what the runtime does with it.
+    fn buildConfig(bed: *Http1Bed, options: Options) void {
+        bed.config = .{
+            .listeners = &bed.listeners,
+            .clusters = &bed.clusters,
+            // The #237 cap is read off the *config*, which is where the
+            // loader puts it; `InitOptions` sizes the pools. The bed keeps
+            // the rest of `limits` at its struct defaults, which is what
+            // every test before this one was measuring against.
+            .limits = .{ .keepalive_requests = options.keepalive_requests },
+            .connect_timeout_ms = connect_timeout_ms,
+            .idle_timeout_ms = idle_timeout_ms,
+            // Mirrors the idle window unless a test is about the split
+            // (#235): the bed's timeouts are milliseconds, so a flat
+            // default would sit far above the window it must tighten.
+            .head_timeout_ms = options.head_timeout_ms orelse idle_timeout_ms,
+            .drain_deadline_ms = options.drain_deadline_ms,
+            .max_lifetime_ms = options.max_lifetime_ms,
+            .request_timeout_ms = options.request_timeout_ms,
+            .tunnel_timeout_ms = constants.tunnel_ms_default,
+            .access_log_sink = if (options.access_log) .stdout else null,
+            .health_interval_ms = options.health_interval_ms,
+            .error_pages = options.error_pages,
+            .access_log_request_headers = options.access_log_request_headers,
+            .access_log_response_headers = options.access_log_response_headers,
+        };
+    }
+
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer bed.arena_state.deinit();
@@ -729,30 +760,7 @@ const Http1Bed = struct {
             else
                 null,
         }};
-        bed.config = .{
-            .listeners = &bed.listeners,
-            .clusters = &bed.clusters,
-            // The #237 cap is read off the *config*, which is where the
-            // loader puts it; `InitOptions` sizes the pools. The bed keeps
-            // the rest of `limits` at its struct defaults, which is what
-            // every test before this one was measuring against.
-            .limits = .{ .keepalive_requests = options.keepalive_requests },
-            .connect_timeout_ms = connect_timeout_ms,
-            .idle_timeout_ms = idle_timeout_ms,
-            // Mirrors the idle window unless a test is about the split
-            // (#235): the bed's timeouts are milliseconds, so a flat
-            // default would sit far above the window it must tighten.
-            .head_timeout_ms = options.head_timeout_ms orelse idle_timeout_ms,
-            .drain_deadline_ms = options.drain_deadline_ms,
-            .max_lifetime_ms = options.max_lifetime_ms,
-            .request_timeout_ms = options.request_timeout_ms,
-            .tunnel_timeout_ms = constants.tunnel_ms_default,
-            .access_log_sink = if (options.access_log) .stdout else null,
-            .health_interval_ms = options.health_interval_ms,
-            .error_pages = options.error_pages,
-            .access_log_request_headers = options.access_log_request_headers,
-            .access_log_response_headers = options.access_log_response_headers,
-        };
+        bed.buildConfig(options);
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
             .relay_buffers = options.relay_buffers,

@@ -934,9 +934,22 @@ pub fn Proxy(comptime IoType: type) type {
         /// selects a cluster (400 if it will not canonicalize, 404 if no
         /// route matches, §7/§8); a routable request then claims its
         /// relay buffer and upstream slot (§8 rungs, 503) and dials.
-        fn routeRequest(server: *ServerType, conn: *ConnType, request: *const parser.RequestHead) void {
+        /// §7's `admit` phase: everything answerable about the request
+        /// itself, before a single resource is acquired. True when the
+        /// request survives to be routed; false when it has already been
+        /// answered — the same convention `admitUpgrade` below uses, and
+        /// the reason every rejection here is a tail call.
+        ///
+        /// Split from `routeRequest` on the seam §7's own phase model
+        /// draws: this half needs nothing but the parsed head, where the
+        /// half below borrows scratch, takes a relay buffer and picks an
+        /// endpoint.
+        fn admitRequest(
+            server: *ServerType,
+            conn: *ConnType,
+            request: *const parser.RequestHead,
+        ) bool {
             assert(conn.state == .l7_reading_head);
-            assert(request.head_len <= conn.stream.head_len);
             recordRequestFacts(server, conn, request);
             // Counted where a request becomes real (#237): a head that
             // parsed and will be answered. A malformed one never reaches
@@ -964,7 +977,8 @@ pub fn Proxy(comptime IoType: type) type {
             // this proxy the final recipient of every TRACE chain
             // unconditionally, which is half of RFC 9110 §7.6.2.
             if (request.method == .connect or request.method == .trace) {
-                return respond(server, conn, 501, "l7_not_implemented");
+                respond(server, conn, 501, "l7_not_implemented");
+                return false;
             }
             // RFC 9110 §7.6.2's hop budget, checked before anything is
             // acquired because a budget that ran out means no origin is
@@ -980,16 +994,20 @@ pub fn Proxy(comptime IoType: type) type {
                     // about either; this proxy answers the way it answers
                     // every other field it reads and cannot parse, rather
                     // than guessing which budget was meant.
-                    .malformed => return respond(server, conn, 400, "l7_bad_request"),
+                    .malformed => {
+                        respond(server, conn, 400, "l7_bad_request");
+                        return false;
+                    },
                     .hops => |hops| {
                         if (hops == 0) {
-                            return respondMaxForwardsExhausted(server, conn);
+                            respondMaxForwardsExhausted(server, conn);
+                            return false;
                         }
                     },
                 }
             }
             if (parser.headerValue(request.headers, "upgrade")) |token| {
-                if (!admitUpgrade(server, conn, token)) return;
+                if (!admitUpgrade(server, conn, token)) return false;
             }
             // A declared body over the listener's cap is knowable now, so
             // it is refused now (#236) — the §8 tunnel rung's own
@@ -999,9 +1017,18 @@ pub fn Proxy(comptime IoType: type) type {
             // still unread in the socket and draining it only to reject it
             // is the wrong trade at the size this triggers on.
             if (bodyOverLimit(conn, request)) {
-                return respond(server, conn, 413, "l7_body_over_limit");
+                respond(server, conn, 413, "l7_body_over_limit");
+                return false;
             }
+            return true;
+        }
 
+        /// §7's `route` phase: canonicalize once, filter, route, then take
+        /// the first resource this request has needed.
+        fn routeRequest(server: *ServerType, conn: *ConnType, request: *const parser.RequestHead) void {
+            assert(conn.state == .l7_reading_head);
+            assert(request.head_len <= conn.stream.head_len);
+            if (!admitRequest(server, conn, request)) return;
             // §7: canonicalize the host and path once, then apply filters
             // and routing to that one view before acquiring any resource,
             // so a bad path, a policy reject, or an unrouted host/path is

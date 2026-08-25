@@ -1024,6 +1024,68 @@ const HeaderAnalysis = struct {
 /// than a slice: both spans are fields of the one aggregate now, and
 /// handing this a slice of `raw` while it writes `headers` would state an
 /// aliasing relation the caller cannot check.
+/// Fold one header into the running analysis (§7). Split from
+/// `analyzeHeaders` for the length limit, and it is the shape
+/// TIGER_STYLE asks for: the caller's loop is straight-line, and the
+/// branching lives in a leaf that sees one header and nothing else.
+///
+/// `Malformed` here is always the same class of finding — a duplicate or
+/// empty field whose two readings would disagree, which is the
+/// request-smuggling shape §7's strictness exists to refuse.
+fn foldHeader(
+    analysis: *HeaderAnalysis,
+    header: Header,
+    value: []const u8,
+) error{Malformed}!void {
+    switch (header.tag) {
+        .host => {
+            // A second Host changes routing depending on who reads which —
+            // a smuggling shape, like an empty one (RFC 9112 §3.2).
+            if (analysis.host != null) {
+                return error.Malformed;
+            }
+            if (value.len == 0) {
+                return error.Malformed;
+            }
+            analysis.host = value;
+        },
+        .content_length => {
+            // Duplicate Content-Length is rejected outright, identical
+            // values included (§7 "duplicate/garbage Content-Length").
+            if (analysis.content_length != null) {
+                return error.Malformed;
+            }
+            analysis.content_length = try parseDecimal(value);
+        },
+        .transfer_encoding => {
+            // A second Transfer-Encoding header is the list form in
+            // disguise; only the single exact "chunked" is ever legal
+            // here, so any repeat is malformed.
+            if (analysis.te_chunked or analysis.te_other) {
+                return error.Malformed;
+            }
+            if (std.ascii.eqlIgnoreCase(value, "chunked")) {
+                analysis.te_chunked = true;
+            } else {
+                analysis.te_other = true;
+            }
+        },
+        .connection => {
+            // Multiple Connection headers combine as one list (RFC 9110).
+            scanConnectionTokens(value, analysis);
+        },
+        // `x_forwarded_for` and `max_forwards` join the no-analysis
+        // set: their tags exist so the *render* can find them cheaply
+        // (§7), and nothing about framing, routing or persistence
+        // reads either here. `Max-Forwards` in particular is read
+        // only for the two methods RFC 9110 §7.6.2 names, by
+        // `maxForwards` below — parsing it for every request would
+        // let a garbage value on a POST reject a request the spec
+        // says may ignore the field entirely (#240).
+        .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => {},
+    }
+}
+
 fn analyzeHeaders(
     header_count: usize,
     headers_storage: *HeaderStorage,
@@ -1044,53 +1106,7 @@ fn analyzeHeaders(
         // decision, here and in the render walk, tests the tag instead.
         const header: Header = .init(raw_header.key, raw_header.value);
         headers_storage.headers[index] = header;
-        switch (header.tag) {
-            .host => {
-                // A second Host changes routing depending on who reads which —
-                // a smuggling shape, like an empty one (RFC 9112 §3.2).
-                if (analysis.host != null) {
-                    return error.Malformed;
-                }
-                if (raw_header.value.len == 0) {
-                    return error.Malformed;
-                }
-                analysis.host = raw_header.value;
-            },
-            .content_length => {
-                // Duplicate Content-Length is rejected outright, identical
-                // values included (§7 "duplicate/garbage Content-Length").
-                if (analysis.content_length != null) {
-                    return error.Malformed;
-                }
-                analysis.content_length = try parseDecimal(raw_header.value);
-            },
-            .transfer_encoding => {
-                // A second Transfer-Encoding header is the list form in
-                // disguise; only the single exact "chunked" is ever legal
-                // here, so any repeat is malformed.
-                if (analysis.te_chunked or analysis.te_other) {
-                    return error.Malformed;
-                }
-                if (std.ascii.eqlIgnoreCase(raw_header.value, "chunked")) {
-                    analysis.te_chunked = true;
-                } else {
-                    analysis.te_other = true;
-                }
-            },
-            .connection => {
-                // Multiple Connection headers combine as one list (RFC 9110).
-                scanConnectionTokens(raw_header.value, &analysis);
-            },
-            // `x_forwarded_for` and `max_forwards` join the no-analysis
-            // set: their tags exist so the *render* can find them cheaply
-            // (§7), and nothing about framing, routing or persistence
-            // reads either here. `Max-Forwards` in particular is read
-            // only for the two methods RFC 9110 §7.6.2 names, by
-            // `maxForwards` below — parsing it for every request would
-            // let a garbage value on a POST reject a request the spec
-            // says may ignore the field entirely (#240).
-            .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => {},
-        }
+        try foldHeader(&analysis, header, raw_header.value);
     }
     assert(!(analysis.te_chunked and analysis.te_other));
     if (analysis.host) |host| {
