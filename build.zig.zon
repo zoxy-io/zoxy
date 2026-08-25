@@ -140,6 +140,62 @@
         // moves only after re-audit, and the paragraphs below are that
         // record.
         //
+        // Re-audit for 2dcaf45, six commits on and performance only. Two of
+        // them never reach this build — 2f2c6cd re-measures the README, 0db3856
+        // rebuilds the benchmark harness — and the other four are the whole
+        // src/ delta. No table changed: checked by filtering the diff for map,
+        // table and hex-byte lines, which is the standing check this pin's
+        // history says to run, and the only arithmetic line it turns up keeps
+        // its constants. So no verdict moves, and zoxy parses exactly the bytes
+        // it parsed before. What moves is scan speed.
+        //
+        // The one rewrite that could have changed a verdict is
+        // `matchHeaderValue`'s mask, restated as its De Morgan negation so both
+        // scans hand `firstRejected` the same reject convention: the old
+        // `~((chunk > 31 | chunk == TAB) & ~(chunk == DEL))` is the new
+        // `~(chunk > 31 | chunk == TAB) | (chunk == DEL)`, which is exact.
+        // Both still describe `value_map` — TAB, 0x20-0x7e, 0x80-0xff — and
+        // that table is byte-identical.
+        //
+        // dee665b is the shape change. Both vector loops used to advance by
+        // `@ctz(mask)` every iteration, so the next load's address waited on the
+        // whole classify/mask/count chain even on a clean chunk, where the
+        // answer is always `vec_size`. They now `@reduce(.Or, bad)` first and
+        // advance by a literal, asking for a position only on the chunk that
+        // stops the scan. Same bytes consumed, off the loop-carried dependency.
+        //
+        // 416ca0a is the one that matters most HERE, because it is aarch64-only
+        // and release.yml ships aarch64-linux and aarch64-macos. x86 keeps the
+        // bit-per-lane `pmovmskb` form byte-for-byte, so the tier this dev box
+        // and the x86 artifacts run is unchanged; aarch64 gets a `shrn` nibble
+        // mask instead of the `and`/`ext`/`zip1`/`addv`/`fmov` reduction LLVM
+        // was emitting inside the dependency chain. Verified the packing by
+        // hand rather than trusting the measurement: narrowing each u16 lane
+        // right by four leaves the even byte's high nibble in the low half and
+        // the odd byte's low nibble in the high half, so a rejected lane sets
+        // its nibble to 0xf and `@ctz >> 2` is the lane index. That reading is
+        // little-endian-only, and `is_aarch64` excludes `.aarch64_be`
+        // deliberately, leaving a big-endian build on the path it already took.
+        //
+        // 2dcaf45 adds `scalar_prefix = 2`: `matchHeaderValue` classifies two
+        // bytes scalar before entering the vector loop. The gate there is
+        // `hasLength(vec_size)`, which asks how much BUFFER remains and not how
+        // long the VALUE is, so a one-byte value mid-head paid a full chunk to
+        // find a CR one byte away. The prefix uses `isValidValueChar`, the same
+        // classifier as the tail, and returns on the first invalid byte, so it
+        // cannot admit or consume anything the vector tier would not have. Its
+        // worst case is 3% (`chrome`, a 2013 capture with no short values);
+        // `many-tiny` is 2.12x. `matchPath` pointedly does NOT get one, and the
+        // fork measured why — 12% worse on a long target, since a target is
+        // only ever one or two bytes for `GET /`.
+        //
+        // d2e0cc3 drops two unused imports and is inert.
+        //
+        // The asserts the new `firstRejected` carries are Debug and ReleaseSafe
+        // only, which is the build release.yml ships (#283) — so the claim that
+        // the reduction and the mask agree about the same chunk is checked in
+        // the artifact, not just in the fork's tests.
+        //
         // Re-audit for 11e4735, one commit on and performance only. The
         // entire code delta is two deletions: `matchHeaderValue`'s middle
         // SWAR tier, and `broadcast()`, which had no callers left after it.
@@ -265,8 +321,8 @@
         // terminator and one-shot parses a head already known to be
         // complete, and the comment there says why.
         .hparse = .{
-            .url = "git+https://github.com/zoxy-io/hparse#11e47352cb402f48ac625276745bc254cb994a9b",
-            .hash = "hparse-0.2.0-IukW0qbOAwD-EYdn93kCU42Z2gfwufpKl7yTf5yk6vRF",
+            .url = "git+https://github.com/zoxy-io/hparse#2dcaf4599dcd22628fcc6b7c5ea7a666d2ac8cc1",
+            .hash = "hparse-0.2.0-IukW0vD7AwCZKtRWydtUnnrsIsiHHYvVNPRsyty5M7GX",
         },
         // libcrypto, built by Zig rather than found on the system.
         //
