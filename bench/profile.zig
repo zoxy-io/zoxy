@@ -324,8 +324,8 @@ fn spawnZoxy(
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
         \\    "listeners": [
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
-        \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "http" }}
+        \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
+        \\        {{ "bind": "127.0.0.1:{d}", "http": {{ "cluster": "origin" }} }}
         \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
         \\    "timeouts": {{ "connect_ms": 5000, "idle_ms": 60000, "drain_deadline_ms": 5000,

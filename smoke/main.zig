@@ -1716,7 +1716,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
 const config_template =
     \\{{
     \\    "listeners": [
-    \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
+    \\        {{ "bind": "127.0.0.1:{d}", "http": {{
     \\          "routes": [
     \\              {{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }},
     \\              {{ "host": "127.0.0.1", "prefix": "/sticky", "cluster": "sticky" }}
@@ -1727,10 +1727,10 @@ const config_template =
     \\          ],
     \\          "response_filters": [
     \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
-    \\          ] }},
-    \\        {{ "bind": "127.0.0.1:{d}", "cluster": "origin", "protocol": "l4" }},
-    \\        {{ "bind": "127.0.0.1:{d}", "protocol": "http",
-    \\          "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}],
+    \\          ] }} }},
+    \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
+    \\        {{ "bind": "127.0.0.1:{d}",
+    \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}] }},
     \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
     \\    ],
     \\    "clusters": {{

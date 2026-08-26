@@ -30,7 +30,6 @@ const assert = std.debug.assert;
 
 const Writer = std.Io.Writer;
 const Stringify = std.json.Stringify;
-const Protocol = config.Config.Listener.Protocol;
 const Pick = config.Config.Cluster.Pick;
 
 /// Emit the whole schema document, pretty-printed (it is a shipped,
@@ -39,8 +38,9 @@ const Pick = config.Config.Cluster.Pick;
 /// walks fields/enums in declaration order.
 pub fn writeSchema(w: *Writer) Writer.Error!void {
     // The generated vocabularies are closed and non-empty; an empty enum
-    // could never be satisfied, so guard the shapes at comptime.
-    comptime assert(@typeInfo(Protocol).@"enum".fields.len >= 1);
+    // could never be satisfied, so guard the shapes at comptime. The
+    // protocol vocabulary is no longer among them: it is the listener's
+    // body key now, not a string field with an enum (#305).
     comptime assert(@typeInfo(Pick).@"enum".fields.len >= 1);
     comptime assert(filter.reject_statuses.len >= 1);
 
@@ -616,6 +616,7 @@ test "config_schema: response filter status bounds and class vocabulary" {
     const listener = parsed.value.object.get("properties").?.object
         .get("listeners").?.object.get("items").?.object;
     const response_filters = listener.get("properties").?.object
+        .get("http").?.object.get("properties").?.object
         .get("response_filters").?.object;
     const match = response_filters.get("items").?.object.get("properties").?.object
         .get("match").?.object;
@@ -644,7 +645,9 @@ test "config_schema: every exactly-one-of fork is emitted, and names real proper
         .get("listeners").?.object.get("items").?.object;
     try expectOneOf(&listener, config.ListenerJson.schema_one_of.len);
 
-    const filter_item = listener.get("properties").?.object
+    const http = listener.get("properties").?.object.get("http").?.object;
+    try expectOneOf(&http, config.HttpListenerJson.schema_one_of.len);
+    const filter_item = http.get("properties").?.object
         .get("request_filters").?.object.get("items").?.object;
     const action = filter_item.get("properties").?.object
         .get("actions").?.object.get("items").?.object;

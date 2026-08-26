@@ -403,9 +403,13 @@ pub const Config = struct {
         };
 
         /// What the listener speaks (§6, §7): `l4` relays bytes blindly,
-        /// `http` runs the HTTP/1.1 reverse-proxy state machine. The
-        /// JSON field is optional and defaults to `l4`, so pre-L7
-        /// configs stay valid.
+        /// `http` runs the HTTP/1.1 reverse-proxy state machine.
+        ///
+        /// Named in the config by the key the listener's settings live
+        /// under, and required (#305). It was once an optional string
+        /// defaulting to `l4` — a pre-L7 compatibility default that the
+        /// freeze was the last chance to remove, and whose absence a
+        /// reverse proxy would have kept reading as "relay blindly".
         pub const Protocol = enum(u1) {
             l4,
             http,
@@ -649,7 +653,7 @@ pub const ValidationError = error{
     ListenersOverLimit,
     ListenerBindInvalid,
     ListenerBindDuplicate,
-    ListenerProtocolUnknown,
+    ListenerHttpOrL4,
     ClusterUnknown,
     ClustersEmpty,
     ClustersOverLimit,
@@ -700,21 +704,14 @@ pub const ValidationError = error{
     ErrorPageStatusUnknown,
     ErrorPageDuplicate,
     ListenerClusterOrRoutes,
-    ListenerL4Routes,
     RoutesEmpty,
     RoutePrefixNotCanonical,
     RouteHostNotCanonical,
     RouteDuplicate,
-    ListenerL4RequestFilters,
-    ListenerL4ResponseFilters,
-    ListenerL4Forwarded,
-    ListenerL4Upgrades,
-    ListenerL4MaxBodyBytes,
     ListenerMaxBodyBytesOutOfRange,
     ListenerUpgradesEmpty,
     ListenerUpgradeTokenUnknown,
     ListenerForwardedModeUnknown,
-    ListenerHttpProxyProtocol,
     ListenerProxyProtocolModeUnknown,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
@@ -848,9 +845,10 @@ pub fn parseWithFiles(
     // forever at runtime. The reorder moves precedences, pinned by
     // tests: emptiness still outranks everything after the clusters
     // (the limits resolver asserts a non-empty set, so the gate fires
-    // first here); a bad protocol string surfaces from the count below —
-    // before any bind or sink is looked at; and a bad bind, resolved
-    // last, now reports after a bad access-log sink.
+    // first here); a listener naming neither protocol body, or both,
+    // surfaces from the count below — before any bind or sink is looked
+    // at; and a bad bind, resolved last, now reports after a bad
+    // access-log sink.
     if (parsed.listeners.len == 0) {
         return error.ListenersEmpty;
     }
@@ -858,7 +856,10 @@ pub fn parseWithFiles(
     var tls_listeners_count: u32 = 0;
     var upgrade_listeners_count: u32 = 0;
     for (parsed.listeners) |listener_json| {
-        if (try protocolOf(listener_json.protocol) == .http) http_listeners_count += 1;
+        // The tag decides the count, so a listener that names neither
+        // body or both is refused here rather than sizing a pool from a
+        // protocol nobody stated (#305).
+        if (try protocolOf(&listener_json) == .http) http_listeners_count += 1;
         // Presence only: whether the block is *usable* is `resolveTls`'s
         // to say, later and per listener. Counting it here would mean
         // deciding the engine pool's size against blocks that might yet
@@ -870,7 +871,9 @@ pub fn parseWithFiles(
         // and sizing the tunnel pool against a list that might yet be
         // refused would report a limits error for a config whose real
         // fault is a token nobody recognises.
-        if (listener_json.upgrades != null) upgrade_listeners_count += 1;
+        if (listener_json.http) |http_json| {
+            if (http_json.upgrades != null) upgrade_listeners_count += 1;
+        }
     }
     const access_log_sink = try resolveAccessLogSink(parsed.access_log);
     // Before the limits, because the named headers widen the line the
@@ -1947,85 +1950,128 @@ pub const LimitsJson = struct {
     };
 };
 
+/// One accepting socket, as a tagged shape: what is true of every
+/// listener sits at this level, and what only one protocol can mean sits
+/// inside the body that names it (#305).
+///
+/// This used to be eleven flat fields of which seven were conditionally
+/// valid on a `protocol` string — a discriminated union modeled as a
+/// struct, with the discrimination left to seven loader errors that no
+/// emitted schema could carry. The tag is now the body's own key, so
+/// `{"l4": {"max_body_bytes": 500}}` is refused by the schema's shape
+/// rather than by a rule written twice in prose, and the seven errors are
+/// gone rather than reworded.
+///
+/// `bind` and `tls` stay out here because they are genuinely shared: an
+/// address is an address, and `resolveTls` says of the other why it is
+/// not a body field — "both speak over a terminated session (§4, §7)".
 pub const ListenerJson = struct {
     bind: []const u8,
-    /// Exactly one of `cluster` (sugar for a single catch-all route) or
-    /// `routes` (an explicit §7 path table) must be present.
-    cluster: ?[]const u8 = null,
-    routes: ?[]const RouteJson = null,
-    /// Optional §7 request filter rules; absent means none. HTTP-only.
-    request_filters: ?[]const FilterJson = null,
-    /// Optional #175 response filter rules; absent means none. HTTP-only,
-    /// like everything with a head to match on.
-    response_filters: ?[]const ResponseFilterJson = null,
-    /// Optional: absent means `l4`, keeping pre-L7 configs valid.
-    protocol: []const u8 = "l4",
-    /// Optional §7 client-address forwarding; absent leaves the header
-    /// untouched. HTTP-only — an l4 relay has no header to carry it.
-    forwarded: ?ForwardedJson = null,
-    /// Optional PROXY protocol expectation (#142); absent treats first
-    /// bytes as payload. L4-only until the L7 receive phase exists.
-    proxy_protocol: ?ProxyProtocolJson = null,
     /// Optional TLS termination (#125); absent is a plaintext socket.
+    /// Shared, unlike everything in the bodies below.
     tls: ?TlsJson = null,
-    /// Optional #180 upgrade allowlist; absent allows none, so an
-    /// `Upgrade` stays the 501 it has always been. HTTP-only — an l4
-    /// relay parses no handshake to recognise.
-    upgrades: ?[]const []const u8 = null,
-    /// Optional #236 request-body cap; absent means one MiB, `0` means
-    /// no cap. HTTP-only — an l4 relay has no request to measure.
-    max_body_bytes: ?u64 = null,
+    /// Exactly one of these names what the listener speaks and carries
+    /// that protocol's own fields.
+    http: ?HttpListenerJson = null,
+    l4: ?L4ListenerJson = null,
 
     pub const schema_doc =
-        "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
-        "the upstream.";
-    pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
+        "One accepting socket. Exactly one of `http` or `l4` names what it " ++
+        "speaks and carries that protocol's settings; `bind` and `tls` are " ++
+        "shared by both.";
+    pub const schema_one_of = [_][]const u8{ "http", "l4" };
     pub const schema_fields = .{
         .bind = .{ .desc = "IP:port literal to bind (hostnames are rejected — DNS is a non-goal)." },
-        .cluster = .{ .desc = "Sugar for a single catch-all route to this cluster; mutually exclusive with routes." },
-        .routes = .{
-            .desc = "Explicit longest-prefix route table (http listeners only).",
-            .min_items = 1,
-        },
-        .request_filters = .{
-            .desc = "Request filter rules, evaluated top-down (http listeners only).",
-        },
-        .response_filters = .{
-            .desc = "Response filter rules — header edits on the origin's response, " ++
-                "evaluated top-down (http listeners only).",
-        },
-        .protocol = .{
-            .desc = "What the listener speaks: l4 relays bytes blindly, http runs the reverse-proxy state machine.",
-            .enum_type = Config.Listener.Protocol,
-        },
-        .forwarded = .{
-            .desc = "Tell the origin the client's address via X-Forwarded-For " ++
-                "(http listeners only); absent leaves the header untouched.",
-        },
-        .proxy_protocol = .{
-            .desc = "Expect a PROXY protocol header (v1 or v2) ahead of every " ++
-                "connection's payload (l4 listeners only); absent treats first " ++
-                "bytes as payload.",
-        },
         .tls = .{
             .desc = "Terminate TLS on this listener with the given certificate " ++
                 "and key; absent is a plaintext socket. Inbound only — the " ++
                 "upstream leg stays plaintext.",
         },
+        .http = .{
+            .desc = "Speak HTTP/1.1: run the reverse-proxy state machine, with " ++
+                "routing, filters and body limits.",
+        },
+        .l4 = .{
+            .desc = "Speak L4: relay bytes to one cluster without inspecting them.",
+        },
+    };
+};
+
+/// What an `http` listener carries, and nothing an `l4` one could.
+pub const HttpListenerJson = struct {
+    /// Exactly one of `cluster` (sugar for a single catch-all route) or
+    /// `routes` (an explicit §7 path table) must be present.
+    cluster: ?[]const u8 = null,
+    routes: ?[]const RouteJson = null,
+    /// Optional §7 request filter rules; absent means none.
+    request_filters: ?[]const FilterJson = null,
+    /// Optional #175 response filter rules; absent means none.
+    response_filters: ?[]const ResponseFilterJson = null,
+    /// Optional §7 client-address forwarding; absent leaves the header
+    /// untouched.
+    forwarded: ?ForwardedJson = null,
+    /// Optional #180 upgrade allowlist; absent allows none, so an
+    /// `Upgrade` stays the 501 it has always been.
+    upgrades: ?[]const []const u8 = null,
+    /// Optional #236 request-body cap; absent means one MiB, `0` means
+    /// no cap.
+    max_body_bytes: ?u64 = null,
+
+    pub const schema_doc =
+        "An HTTP/1.1 listener's settings. Exactly one of `cluster` or " ++
+        "`routes` selects the upstream.";
+    pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
+    pub const schema_fields = .{
+        .cluster = .{ .desc = "Sugar for a single catch-all route to this cluster; mutually exclusive with routes." },
+        .routes = .{
+            .desc = "Explicit longest-prefix route table.",
+            .min_items = 1,
+        },
+        .request_filters = .{
+            .desc = "Request filter rules, evaluated top-down.",
+        },
+        .response_filters = .{
+            .desc = "Response filter rules — header edits on the origin's response, " ++
+                "evaluated top-down.",
+        },
+        .forwarded = .{
+            .desc = "Tell the origin the client's address via X-Forwarded-For; " ++
+                "absent leaves the header untouched.",
+        },
         .max_body_bytes = .{
-            .desc = "Cap on one request body in bytes (http listeners only); " ++
-                "absent means 1 MiB, 0 accepts any size. A body over the cap is " ++
-                "refused 413 before the origin is dialed where its length was " ++
-                "declared, and the connection closes.",
+            .desc = "Cap on one request body in bytes; absent means 1 MiB, 0 " ++
+                "accepts any size. A body over the cap is refused 413 before the " ++
+                "origin is dialed where its length was declared, and the " ++
+                "connection closes.",
             .minimum = 0,
             .maximum = constants.request_body_bytes_max,
         },
         .upgrades = .{
-            .desc = "Protocol upgrades this listener will carry as tunnels (http " ++
-                "listeners only); absent allows none and an Upgrade stays 501. " ++
-                "Requires limits.tunnels.",
+            .desc = "Protocol upgrades this listener will carry as tunnels; absent " ++
+                "allows none and an Upgrade stays 501. Requires limits.tunnels.",
             .min_items = 1,
             .items = SchemaItems.upgrade_token,
+        },
+    };
+};
+
+/// What an `l4` listener carries. `cluster` is required rather than
+/// forked against `routes`: an L4 relay has no path to match, so there is
+/// exactly one destination and no table to express it in.
+pub const L4ListenerJson = struct {
+    cluster: []const u8,
+    /// Optional PROXY protocol expectation (#142); absent treats first
+    /// bytes as payload.
+    proxy_protocol: ?ProxyProtocolJson = null,
+
+    pub const schema_doc =
+        "An L4 listener's settings: the one cluster it relays to, and what " ++
+        "it expects ahead of the payload.";
+    pub const schema_fields = .{
+        .cluster = .{ .desc = "The cluster every connection on this listener is relayed to." },
+        .proxy_protocol = .{
+            .desc = "Expect a PROXY protocol header (v1 or v2) ahead of every " ++
+                "connection's payload; absent treats first bytes as payload.",
         },
     };
 };
@@ -3054,7 +3100,7 @@ pub const dto_types = .{
     AdminJson,          AccessLogJson,       CheckJson,                PickJson,
     ForwardedJson,      ProxyProtocolJson,   ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
-    TlsJson,            PassiveEjectionJson,
+    TlsJson,            PassiveEjectionJson, HttpListenerJson,         L4ListenerJson,
 };
 
 comptime {
@@ -3296,32 +3342,98 @@ fn resolveListener(
     const bind_address = std.Io.net.IpAddress.parseLiteral(listener_json.bind) catch {
         return error.ListenerBindInvalid;
     };
-    const protocol = try protocolOf(listener_json.protocol);
-    const listener: Config.Listener = .{
-        .bind_address = bind_address,
-        .routes = try resolveRoutes(arena, listener_json, clusters, protocol, head_buffer_bytes),
-        .request_filters = try resolveRequestFilters(
+    const tls = try resolveTls(listener_json.tls);
+    // The tag dispatches, and every field it does not carry is one this
+    // arm cannot be handed (#305): the seven "this key is meaningless on
+    // that protocol" errors this replaced were the loader restating a
+    // shape it now simply has.
+    const listener: Config.Listener = switch (try protocolOf(listener_json)) {
+        .http => try resolveHttpListener(
             arena,
-            listener_json,
-            protocol,
+            bind_address,
+            tls,
+            &listener_json.http.?,
+            clusters,
             head_buffer_bytes,
             bodies,
         ),
-        .response_filters = try resolveResponseFilters(arena, listener_json, protocol),
-        .protocol = protocol,
-        .forwarded = try resolveForwarded(listener_json.forwarded, protocol),
-        .proxy_protocol = try resolveProxyProtocol(listener_json.proxy_protocol, protocol),
-        .tls = try resolveTls(listener_json.tls, protocol),
-        .upgrades = try resolveUpgrades(listener_json.upgrades, protocol),
-        .max_body_bytes = try resolveMaxBodyBytes(listener_json.max_body_bytes, protocol),
+        .l4 => try resolveL4Listener(arena, bind_address, tls, &listener_json.l4.?, clusters),
     };
-    if (protocol == .http) {
+    if (listener.protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
     }
     if (listener.tls != null) {
         try rejectTlsClusterSend(listener.routes, clusters);
     }
     assert(listener.routes.len >= 1);
+    return listener;
+}
+
+/// An `http` listener: the routing table, both filter tables, and the
+/// three §7 policies only a parsed request can mean anything to.
+fn resolveHttpListener(
+    arena: std.mem.Allocator,
+    bind_address: std.Io.net.IpAddress,
+    tls: ?Config.Listener.Tls,
+    http_json: *const HttpListenerJson,
+    clusters: []const Config.Cluster,
+    head_buffer_bytes: u32,
+    bodies: []ResolvedBody,
+) ParseError!Config.Listener {
+    assert(clusters.len >= 1);
+    assert(head_buffer_bytes >= 1);
+    return .{
+        .bind_address = bind_address,
+        .routes = try resolveRoutes(arena, http_json, clusters, head_buffer_bytes),
+        .request_filters = try resolveRequestFilters(arena, http_json, head_buffer_bytes, bodies),
+        .response_filters = try resolveResponseFilters(arena, http_json),
+        .protocol = .http,
+        .forwarded = try resolveForwarded(http_json.forwarded),
+        .proxy_protocol = null,
+        .tls = tls,
+        .upgrades = try resolveUpgrades(http_json.upgrades),
+        .max_body_bytes = try resolveMaxBodyBytes(http_json.max_body_bytes),
+    };
+}
+
+/// An `l4` listener: one cluster, reached as the single catch-all route
+/// every L4 listener has always had, and what it expects ahead of the
+/// payload. Nothing here allocates a table — the one route is built by
+/// `resolveL4Route` from the one cluster name.
+fn resolveL4Listener(
+    arena: std.mem.Allocator,
+    bind_address: std.Io.net.IpAddress,
+    tls: ?Config.Listener.Tls,
+    l4_json: *const L4ListenerJson,
+    clusters: []const Config.Cluster,
+) ParseError!Config.Listener {
+    assert(clusters.len >= 1);
+    const routes = try resolveL4Route(arena, l4_json.cluster, clusters);
+    assert(routes.len == 1);
+    const listener: Config.Listener = .{
+        .bind_address = bind_address,
+        .routes = routes,
+        .protocol = .l4,
+        .proxy_protocol = try resolveProxyProtocol(l4_json.proxy_protocol),
+        .tls = tls,
+        // Stated rather than defaulted: an l4 relay never measures a
+        // request, so its cap is the absence of one — and the field's
+        // own default is the http default, which would read here as a
+        // policy this listener does not have.
+        .max_body_bytes = 0,
+    };
+    // The four fields this initializer does not name inherit
+    // `Config.Listener`'s defaults, and those defaults happen to be the
+    // l4 answer too — an l4 listener has always had no filters, no
+    // forwarding and no upgrades, because asking for any of them used to
+    // be a rejected config and is now an unwritable one. "Happen to be"
+    // is the problem: nothing else pins that coincidence, so a default
+    // changed with only the http case in mind would move l4's behaviour
+    // silently. These four asserts are where it would stop.
+    assert(listener.request_filters.len == 0);
+    assert(listener.response_filters.len == 0);
+    assert(listener.forwarded == null);
+    assert(!listener.upgrades.any());
     return listener;
 }
 
@@ -3338,25 +3450,45 @@ fn bindOrder(address: std.Io.net.IpAddress) u160 {
     };
 }
 
+/// An `l4` listener's one route: the whole table, because there is no
+/// path to match on and therefore nothing to choose between.
+///
+/// The hash-key check lives here rather than beside the other cluster
+/// validations because it is a property of *this pairing*, not of the
+/// cluster: a request-derived hash key reads the parsed head (#178) and
+/// an l4 listener never parses one. Reachability rather than
+/// exclusivity, like an http route to a PROXY-sending cluster — the same
+/// cluster stays valid beside any http listener.
+fn resolveL4Route(
+    arena: std.mem.Allocator,
+    cluster_name: []const u8,
+    clusters: []const Config.Cluster,
+) ParseError![]const router.Route {
+    assert(clusters.len >= 1);
+    const cluster_index = try clusterIndexOf(clusters, cluster_name);
+    assert(cluster_index < clusters.len);
+    switch (clusters[cluster_index].hash_key) {
+        .source_ip => {},
+        .header, .cookie => return error.ListenerL4RequestKeyedHash,
+    }
+    const routes = try arena.alloc(router.Route, 1);
+    routes[0] = .{ .prefix = "/", .cluster_index = cluster_index };
+    return routes;
+}
+
 /// Compile a listener's §7 filter rules into immutable arena tables.
-/// HTTP-only (an l4 listener has no head to match); absent = none. Match
-/// keys are validated canonical so a filter and the router agree
+/// Reachable only from an `http` body, so there is no protocol to check:
+/// an l4 listener has no field to put these in (#305). Absent = none.
+/// Match keys are validated canonical so a filter and the router agree
 /// byte-for-byte, and each action is validated at load, so the request-
 /// time interpreter is bounded loops over trusted data.
 fn resolveRequestFilters(
     arena: std.mem.Allocator,
-    listener_json: *const ListenerJson,
-    protocol: Config.Listener.Protocol,
+    http_json: *const HttpListenerJson,
     head_buffer_bytes: u32,
     bodies: []ResolvedBody,
 ) ParseError![]const filter.Rule {
-    const filters_json = listener_json.request_filters orelse return &.{};
-    // Any `request_filters` key on an l4 listener is a mistake — l4 relays bytes,
-    // there is no head to match on — so reject it whether the array is
-    // populated or (vacuously) empty, before the empty-array shortcut.
-    if (protocol == .l4) {
-        return error.ListenerL4RequestFilters;
-    }
+    const filters_json = http_json.request_filters orelse return &.{};
     if (filters_json.len == 0) {
         return &.{};
     }
@@ -3409,16 +3541,9 @@ fn countHeaderEdits(actions: []const filter.Action) u32 {
 /// every matched rule's edits from a single fixed buffer.
 fn resolveResponseFilters(
     arena: std.mem.Allocator,
-    listener_json: *const ListenerJson,
-    protocol: Config.Listener.Protocol,
+    http_json: *const HttpListenerJson,
 ) ParseError![]const filter.ResponseRule {
-    const rules_json = listener_json.response_filters orelse return &.{};
-    // The same rejection as `request_filters`: an l4 relay has no
-    // response head to edit, so the key — populated or vacuously empty —
-    // describes a proxy that is not running.
-    if (protocol == .l4) {
-        return error.ListenerL4ResponseFilters;
-    }
+    const rules_json = http_json.response_filters orelse return &.{};
     if (rules_json.len == 0) {
         return &.{};
     }
@@ -3917,41 +4042,25 @@ const isTokenByte = parser.isTokenByte;
 /// `l4` listeners have no path, so they take only the `cluster` form.
 fn resolveRoutes(
     arena: std.mem.Allocator,
-    listener_json: *const ListenerJson,
+    http_json: *const HttpListenerJson,
     clusters: []const Config.Cluster,
-    protocol: Config.Listener.Protocol,
     head_buffer_bytes: u32,
 ) ParseError![]const router.Route {
-    const has_cluster = listener_json.cluster != null;
-    const has_routes = listener_json.routes != null;
+    const has_cluster = http_json.cluster != null;
+    const has_routes = http_json.routes != null;
     if (has_cluster == has_routes) {
         return error.ListenerClusterOrRoutes; // Neither, or both.
     }
     if (has_cluster) {
-        const cluster_index = try clusterIndexOf(clusters, listener_json.cluster.?);
-        // A request-derived hash key reads the parsed head (#178), and
-        // an l4 listener never parses one: rejected as a pair, like an
-        // http route to a PROXY-sending cluster — reachability, not
-        // exclusivity, so the same cluster stays valid beside any http
-        // listener.
-        if (protocol == .l4) {
-            switch (clusters[cluster_index].hash_key) {
-                .source_ip => {},
-                .header, .cookie => return error.ListenerL4RequestKeyedHash,
-            }
-        }
         const routes = try arena.alloc(router.Route, 1);
         routes[0] = .{
             .prefix = "/",
-            .cluster_index = cluster_index,
+            .cluster_index = try clusterIndexOf(clusters, http_json.cluster.?),
         };
         assert(routes.len == 1); // The sugar is always one catch-all route.
         return routes;
     }
-    if (protocol == .l4) {
-        return error.ListenerL4Routes; // L4 relays bytes; there is no path.
-    }
-    const routes_json = listener_json.routes.?;
+    const routes_json = http_json.routes.?;
     if (routes_json.len == 0) {
         return error.RoutesEmpty;
     }
@@ -4183,18 +4292,8 @@ fn resolveRetries(retries: u16) ParseError!u16 {
 /// ignored: a byte relay parses no request to measure, so a cap there
 /// describes a proxy that is not running — the same refusal `forwarded`
 /// and `upgrades` get, for the same reason.
-fn resolveMaxBodyBytes(
-    max_body_bytes: ?u64,
-    protocol: Config.Listener.Protocol,
-) ValidationError!u64 {
-    const cap = max_body_bytes orelse {
-        // An l4 listener never reads the field, so absence is not a
-        // statement about it — only an explicit one is.
-        return if (protocol == .l4) 0 else constants.request_body_bytes_default;
-    };
-    if (protocol == .l4) {
-        return error.ListenerL4MaxBodyBytes;
-    }
+fn resolveMaxBodyBytes(max_body_bytes: ?u64) ValidationError!u64 {
+    const cap = max_body_bytes orelse return constants.request_body_bytes_default;
     if (cap > constants.request_body_bytes_max) {
         return error.ListenerMaxBodyBytesOutOfRange;
     }
@@ -4218,15 +4317,8 @@ fn resolveMaxBodyBytes(
 /// one.
 fn resolveUpgrades(
     upgrades_json: ?[]const []const u8,
-    protocol: Config.Listener.Protocol,
 ) ValidationError!Config.Listener.Upgrades {
     const tokens = upgrades_json orelse return .{};
-    if (protocol == .l4) {
-        // A byte relay parses no handshake to recognise, so there is
-        // nothing here for it to allow — the same refusal `forwarded`
-        // and `routes` get on an l4 listener, for the same reason.
-        return error.ListenerL4Upgrades;
-    }
     if (tokens.len == 0) {
         return error.ListenerUpgradesEmpty;
     }
@@ -4255,29 +4347,21 @@ fn resolveUpgrades(
 /// `request_filters` and `routes` on the same listener.
 fn resolveForwarded(
     forwarded_json: ?ForwardedJson,
-    protocol: Config.Listener.Protocol,
 ) ValidationError!?Config.Listener.Forwarded {
     const forwarded = forwarded_json orelse return null;
-    if (protocol == .l4) {
-        return error.ListenerL4Forwarded;
-    }
     return std.meta.stringToEnum(Config.Listener.Forwarded, forwarded.mode) orelse
         error.ListenerForwardedModeUnknown;
 }
 
 /// Resolve a listener's PROXY protocol expectation (#142): absent is
-/// off, and a block on an `http` listener is rejected rather than
-/// ignored — the L7 path has no receive phase yet, so accepting the
-/// config would state a trust boundary nothing enforces, the exact
-/// silent hole the option exists to close.
+/// off. Reachable only from an `l4` body — the L7 path has no receive
+/// phase yet, so an http listener has nowhere to state a trust boundary
+/// nothing enforces, which is the silent hole the option exists to close
+/// and is now closed by the shape rather than by a rejection (#305).
 fn resolveProxyProtocol(
     proxy_protocol_json: ?ProxyProtocolJson,
-    protocol: Config.Listener.Protocol,
 ) ValidationError!?Config.Listener.ProxyProtocol {
     const proxy_protocol = proxy_protocol_json orelse return null;
-    if (protocol == .http) {
-        return error.ListenerHttpProxyProtocol;
-    }
     return std.meta.stringToEnum(Config.Listener.ProxyProtocol, proxy_protocol.mode) orelse
         error.ListenerProxyProtocolModeUnknown;
 }
@@ -4288,11 +4372,9 @@ fn resolveProxyProtocol(
 /// can name the path. What is checkable here is that a path was given at
 /// all: an empty string would otherwise reach `openat` as a request to
 /// open the current directory, which fails somewhere far less obvious.
-fn resolveTls(
-    tls_json: ?TlsJson,
-    protocol: Config.Listener.Protocol,
-) ValidationError!?Config.Listener.Tls {
-    _ = protocol; // Both speak over a terminated session (§4, §7).
+/// Shared by both protocols rather than living in either body: both
+/// speak over a terminated session (§4, §7).
+fn resolveTls(tls_json: ?TlsJson) ValidationError!?Config.Listener.Tls {
     const tls = tls_json orelse return null;
     if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
     if (tls.key.len == 0) return error.ListenerTlsKeyPathEmpty;
@@ -4420,16 +4502,19 @@ fn resolveClusterProxyProtocol(
     ) orelse error.ClusterProxyProtocolSendUnknown;
 }
 
-/// The closed protocol vocabulary; anything else is its own error so a
-/// typo ("htpp") fails loudly instead of silently relaying as L4.
-fn protocolOf(literal: []const u8) error{ListenerProtocolUnknown}!Config.Listener.Protocol {
-    if (std.mem.eql(u8, literal, "l4")) {
-        return .l4;
+/// Which protocol a listener's tag names (#305). The vocabulary used to
+/// be a string this compared against, where a typo ("htpp") had to be
+/// caught by hand and turned into an error; it is now the body's own key,
+/// so an unknown one is an unknown field the strict parser already
+/// refuses and the only fault left to name here is a listener that
+/// declares neither body or both.
+fn protocolOf(listener_json: *const ListenerJson) error{ListenerHttpOrL4}!Config.Listener.Protocol {
+    if (listener_json.http != null and listener_json.l4 != null) {
+        return error.ListenerHttpOrL4;
     }
-    if (std.mem.eql(u8, literal, "http")) {
-        return .http;
-    }
-    return error.ListenerProtocolUnknown;
+    if (listener_json.http != null) return .http;
+    if (listener_json.l4 != null) return .l4;
+    return error.ListenerHttpOrL4;
 }
 
 fn clusterIndexOf(
@@ -4670,7 +4755,7 @@ test "config: max_lifetime_ms is optional and defaults to disabled" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -4682,7 +4767,7 @@ test "config: max_lifetime_ms is optional and defaults to disabled" {
 
 test "config: request_ms is optional, defaults off, and shares the timeout ceiling" {
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
     ;
     // Absent: pre-existing configs stay valid and the §8 request deadline
@@ -4735,7 +4820,7 @@ test "config: the whole timeouts block is optional, and every default is usable"
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}}}
     );
     try std.testing.expectEqual(constants.connect_ms_default, parsed.connect_timeout_ms);
@@ -4757,22 +4842,22 @@ test "config: a zero drain deadline is no cap, but a zero connect or idle is sti
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"drain_deadline_ms":0}}
         );
         try std.testing.expectEqual(@as(u32, 0), parsed.drain_deadline_ms);
     }
     const rejected = [_][]const u8{
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":0}}
         ,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"idle_ms":0}}
         ,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"health_interval_ms":0}}
         ,
@@ -4790,11 +4875,11 @@ test "config: the dial budget must sit below the idle one" {
     // shortening. Equal is rejected too: it is the boundary where the
     // handoff already changes nothing.
     const rejected = [_][]const u8{
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":90000,"idle_ms":60000}}
         ,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":5000,"idle_ms":5000}}
         ,
@@ -4802,11 +4887,11 @@ test "config: the dial budget must sit below the idle one" {
         // the *defaulted* idle one is the shape an operator reaches for
         // first, and it reads as tuning one number rather than as ordering
         // two.
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":90000}}
         ,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"idle_ms":1000}}
         ,
@@ -4819,7 +4904,7 @@ test "config: the dial budget must sit below the idle one" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":5000,"idle_ms":5001}}
     );
@@ -4835,7 +4920,7 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":0}}
         );
@@ -4845,7 +4930,7 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":1800000}}
         );
@@ -4853,13 +4938,16 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
     }
 }
 
-test "config: listener protocol defaults to l4 and accepts http" {
-    // Absent field: pre-L7 configs stay valid.
+test "config: a listener's body key is what names its protocol" {
+    // Each tag resolves to its `Protocol`, and that is now the whole job
+    // of this test: there is no defaulted spelling left to disagree with
+    // an explicit one (#305), and a listener naming neither body or both
+    // is `ListenerHttpOrL4`, covered where the fork itself is tested.
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
@@ -4869,7 +4957,7 @@ test "config: listener protocol defaults to l4 and accepts http" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
@@ -4881,10 +4969,10 @@ test "config: explicit routes resolve, sorted longest-prefix-first" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","routes":[
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"routes":[
         \\   {"prefix":"/","cluster":"root"},
         \\   {"prefix":"/api/v2","cluster":"v2"},
-        \\   {"prefix":"/api","cluster":"api"}]}],
+        \\   {"prefix":"/api","cluster":"api"}]}}],
         \\ "clusters":{"root":{"endpoints":["127.0.0.1:2"]},
         \\   "api":{"endpoints":["127.0.0.1:3"]},
         \\   "v2":{"endpoints":["127.0.0.1:4"]}},
@@ -4913,45 +5001,51 @@ test "config: routing schema rejects malformed tables" {
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
     // Neither cluster nor routes.
-    try expectParseError(error.ListenerClusterOrRoutes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"}]," ++ base_clusters);
+    try expectParseError(error.ListenerClusterOrRoutes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{}}]," ++ base_clusters);
     // Both cluster and routes.
-    try expectParseError(error.ListenerClusterOrRoutes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"," ++
-        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
-    // Routes on an l4 listener: there is no path to match.
-    try expectParseError(error.ListenerL4Routes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\"," ++
-        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    try expectParseError(error.ListenerClusterOrRoutes, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
+    // Routes on an l4 listener: there is no path to match, and now no
+    // field to ask for one in — the shape refuses what a rule used to
+    // (#305), so the verdict is the strict parser's.
+    try expectParseError(error.UnknownField, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{" ++
+        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
+    // And a listener that names no protocol body at all.
+    try expectParseError(error.ListenerHttpOrL4, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"}]," ++ base_clusters);
+    try expectParseError(error.ListenerHttpOrL4, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"," ++
+        "\"http\":{\"cluster\":\"a\"},\"l4\":{\"cluster\":\"a\"}}]," ++ base_clusters);
     // Empty routes table.
-    try expectParseError(error.RoutesEmpty, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"routes\":[]}]," ++ base_clusters);
+    try expectParseError(error.RoutesEmpty, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[]}}]," ++ base_clusters);
     // A non-canonical prefix (dot-segment) — would mismatch at request time.
-    try expectParseError(error.RoutePrefixNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"routes\":[{\"prefix\":\"/a/../b\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    try expectParseError(error.RoutePrefixNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[{\"prefix\":\"/a/../b\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
     // A prefix without a leading slash.
-    try expectParseError(error.RoutePrefixNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"routes\":[{\"prefix\":\"api\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    try expectParseError(error.RoutePrefixNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[{\"prefix\":\"api\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
     // Duplicate (host, prefix) — same any-host prefix twice.
-    try expectParseError(error.RouteDuplicate, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
+    try expectParseError(error.RouteDuplicate, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
         "\"routes\":[{\"prefix\":\"/x\",\"cluster\":\"a\"}," ++
-        "{\"prefix\":\"/x\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+        "{\"prefix\":\"/x\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
     // A non-canonical host (uppercase) — would mismatch at request time.
-    try expectParseError(error.RouteHostNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"routes\":[{\"host\":\"API.Example.com\",\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    try expectParseError(error.RouteHostNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[{\"host\":\"API.Example.com\",\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
     // A host carrying a port — the port is not part of the routing name.
-    try expectParseError(error.RouteHostNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"routes\":[{\"host\":\"api.example.com:8080\",\"prefix\":\"/\",\"cluster\":\"a\"}]}]," ++ base_clusters);
+    try expectParseError(error.RouteHostNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[{\"host\":\"api.example.com:8080\",\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
     // An unknown cluster named by a route.
-    try expectParseError(error.ClusterUnknown, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"ghost\"}]}]," ++ base_clusters);
+    try expectParseError(error.ClusterUnknown, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"ghost\"}]}}]," ++ base_clusters);
 }
 
 test "config: host routes resolve, host-specific sorted before any-host" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","routes":[
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"routes":[
         \\   {"prefix":"/","cluster":"root"},
         \\   {"host":"api.example.com","prefix":"/","cluster":"api"},
-        \\   {"host":"api.example.com","prefix":"/v2","cluster":"v2"}]}],
+        \\   {"host":"api.example.com","prefix":"/v2","cluster":"v2"}]}}],
         \\ "clusters":{"root":{"endpoints":["127.0.0.1:2"]},
         \\   "api":{"endpoints":["127.0.0.1:3"]},
         \\   "v2":{"endpoints":["127.0.0.1:4"]}},
@@ -4980,13 +5074,13 @@ test "config: filters compile into rules with matches and actions" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","request_filters":[
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a","request_filters":[
         \\   {"match":{"method":["GET","POST"],"path_prefix":"/admin",
         \\             "headers":[{"name":"X-Env","equals":"prod"}]},
         \\    "actions":[{"reject":403}]},
         \\   {"match":{"host":"api.example"},
         \\    "actions":[{"header_set":{"name":"X-Via","value":"zoxy"}},
-        \\               {"rewrite_prefix":{"from":"/old","to":"/new"}}]}]}],
+        \\               {"rewrite_prefix":{"from":"/old","to":"/new"}}]}]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5019,50 +5113,50 @@ test "config: filter schema rejects malformed rules" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
-    // L4 listener may not carry filters.
-    try expectParseError(error.ListenerL4RequestFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
-        "\"request_filters\":[{\"actions\":[{\"reject\":403}]}]}]," ++ tail);
-    // Even a vacuously empty filters array on l4 is a mistake — the key is
-    // meaningless there, and an empty array must not slip past the guard.
-    try expectParseError(error.ListenerL4RequestFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
-        "\"request_filters\":[]}]," ++ tail);
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"request_filters\":[";
+    // An l4 listener has no field to carry filters, populated or
+    // vacuously empty: the key it would need is not in the `l4` body, so
+    // the strict parser refuses it before any rule could (#305).
+    try expectParseError(error.UnknownField, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+        "\"request_filters\":[{\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.UnknownField, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+        "\"request_filters\":[]}}]," ++ tail);
     // A rule with no actions.
-    try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}]," ++ tail);
+    try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}}]," ++ tail);
     // An action object with no kind set.
-    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{}]}]}]," ++ tail);
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{}]}]}}]," ++ tail);
     // An action object with two kinds set.
-    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}]," ++ tail);
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}}]," ++ tail);
     // A reject status outside the policy set.
-    try expectParseError(error.FilterRejectStatus, head ++ "{\"actions\":[{\"reject\":503}]}]}]," ++ tail);
+    try expectParseError(error.FilterRejectStatus, head ++ "{\"actions\":[{\"reject\":503}]}]}}]," ++ tail);
     // An unknown / lowercase method token.
-    try expectParseError(error.FilterMethodUnknown, head ++ "{\"match\":{\"method\":[\"get\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterMethodUnknown, head ++ "{\"match\":{\"method\":[\"get\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // A header match with no predicate kind.
-    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\"}]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // A `contains` predicate with an empty needle: it would match every
     // present header (a degenerate `present`), so it is rejected.
-    try expectParseError(error.FilterHeaderContainsEmpty, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\",\"contains\":\"\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderContainsEmpty, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\",\"contains\":\"\"}]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // A non-canonical match path prefix.
-    try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"match\":{\"path_prefix\":\"/a/../b\"},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"match\":{\"path_prefix\":\"/a/../b\"},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // A header edit with an invalid header name.
-    try expectParseError(error.FilterHeaderNameInvalid, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Bad Name\",\"value\":\"v\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameInvalid, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Bad Name\",\"value\":\"v\"}}]}]}}]," ++ tail);
     // A header value carrying CRLF — a smuggling vector when rendered.
-    try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"X\",\"value\":\"a\\r\\nInjected: 1\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"X\",\"value\":\"a\\r\\nInjected: 1\"}}]}]}}]," ++ tail);
     // "present: false" is not a predicate.
-    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\",\"present\":false}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"X\",\"present\":false}]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // A rewrite whose target is not canonical.
-    try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b/../c\"}}]}]}]," ++ tail);
+    try expectParseError(error.RoutePrefixNotCanonical, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b/../c\"}}]}]}}]," ++ tail);
     // A header edit may not name a proxy-managed header — case-insensitively.
-    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Host\",\"value\":\"evil\"}}]}]}]," ++ tail);
-    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_remove\":\"content-length\"}]}]}]," ++ tail);
-    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_add\":{\"name\":\"Connection\",\"value\":\"close\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Host\",\"value\":\"evil\"}}]}]}}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_remove\":\"content-length\"}]}]}}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_add\":{\"name\":\"Connection\",\"value\":\"close\"}}]}]}}]," ++ tail);
     // The two headers this proxy writes on the client's behalf: a
     // constant here would restate a value it computes per request (§7,
     // #240).
-    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-For\",\"value\":\"1.2.3.4\"}}]}]}]," ++ tail);
-    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"max-forwards\",\"value\":\"9\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"X-Forwarded-For\",\"value\":\"1.2.3.4\"}}]}]}}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"max-forwards\",\"value\":\"9\"}}]}]}}]," ++ tail);
     // A matched header predicate may still name a managed header (read-only).
-    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"Host\"}]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderMatchKind, head ++ "{\"match\":{\"headers\":[{\"name\":\"Host\"}]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
 }
 
 test "config: a filter set over the header-edit budget is rejected" {
@@ -5083,8 +5177,8 @@ test "config: a filter set over the header-edit budget is rejected" {
         }
         break :blk s;
     };
-    const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"cluster\":\"a\",\"request_filters\":[" ++ rules ++ "]}]," ++ tail;
+    const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"cluster\":\"a\",\"request_filters\":[" ++ rules ++ "]}}]," ++ tail;
     try expectParseError(error.FilterHeaderEditsOverLimit, json);
 }
 
@@ -5092,13 +5186,13 @@ test "config: redirect actions compile in both target forms" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","request_filters":[
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a","request_filters":[
         \\   {"match":{"host":"www.example.com"},
         \\    "actions":[{"redirect":{"status":308,"scheme":"https","host":"example.com"}}]},
         \\   {"actions":[{"redirect":{"scheme":"https"}}]},
         \\   {"match":{"path_prefix":"/gone"},
         \\    "actions":[{"redirect":{"status":302,"location":"https://status.example.com/"}}]}
-        \\ ]}],
+        \\ ]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5121,39 +5215,39 @@ test "config: redirect validation has its own errors" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"request_filters\":[";
     // Outside the closed set — 303 changes the method's meaning and has
     // no proxy semantics here.
-    try expectParseError(error.FilterRedirectStatus, head ++ "{\"actions\":[{\"redirect\":{\"status\":303,\"scheme\":\"https\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterRedirectStatus, head ++ "{\"actions\":[{\"redirect\":{\"status\":303,\"scheme\":\"https\"}}]}]}}]," ++ tail);
     // Neither target form, both at once, half a composed one, and an
     // empty literal: each is FilterRedirectTarget.
-    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"status\":301}}]}]}]," ++ tail);
-    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\",\"scheme\":\"https\"}}]}]}]," ++ tail);
-    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"host\":\"example.com\"}}]}]}]," ++ tail);
-    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"\"}}]}]}]," ++ tail);
-    try expectParseError(error.FilterRedirectSchemeUnknown, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"ftp\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"status\":301}}]}]}}]," ++ tail);
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\",\"scheme\":\"https\"}}]}]}}]," ++ tail);
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"host\":\"example.com\"}}]}]}}]," ++ tail);
+    try expectParseError(error.FilterRedirectTarget, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"\"}}]}]}}]," ++ tail);
+    try expectParseError(error.FilterRedirectSchemeUnknown, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"ftp\"}}]}]}}]," ++ tail);
     // The composed host is a route host: canonical or refused.
-    try expectParseError(error.RouteHostNotCanonical, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\",\"host\":\"WWW.Example.com\"}}]}]}]," ++ tail);
+    try expectParseError(error.RouteHostNotCanonical, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\",\"host\":\"WWW.Example.com\"}}]}]}}]," ++ tail);
     // A literal Location is a header value the render emits verbatim:
     // injection-safety is proven at load.
-    try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\\r\\nSet-Cookie: a\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\\r\\nSet-Cookie: a\"}}]}]}}]," ++ tail);
     // Two kinds is still a kind error; a redirect on the way out is
     // refused by name.
-    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\"},\"reject\":403}]}]}]," ++ tail);
-    try expectParseError(error.ResponseFilterRedirect, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\"," ++
-        "\"response_filters\":[{\"actions\":[{\"redirect\":{\"scheme\":\"https\"}}]}]}]," ++ tail);
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\"},\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.ResponseFilterRedirect, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+        "\"response_filters\":[{\"actions\":[{\"redirect\":{\"scheme\":\"https\"}}]}]}}]," ++ tail);
 }
 
 test "config: client CIDR predicates compile with their prefixes" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","request_filters":[
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a","request_filters":[
         \\   {"match":{"path_prefix":"/admin","client":["10.0.0.0/8","192.168.1.0/24","2001:db8::/32"]},
         \\    "actions":[{"reject":403}]},
         \\   {"match":{"client":["0.0.0.0/0","::/0"]},
         \\    "actions":[{"header_set":{"name":"X-Any","value":"1"}}]}
-        \\ ]}],
+        \\ ]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5180,38 +5274,38 @@ test "config: client CIDR validation has its own errors" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"request_filters\":[";
     // An explicitly empty list: absence already says "any client".
-    try expectParseError(error.FilterClientEmpty, head ++ "{\"match\":{\"client\":[]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientEmpty, head ++ "{\"match\":{\"client\":[]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // A bare address has no single meaning across families (an exact
     // IPv4 host is /32, an exact IPv6 client is its /64): the prefix is
     // mandatory.
-    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.1\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
-    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"office/8\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
-    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
-    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/eight\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.1\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.FilterClientCidrInvalid, head ++ "{\"match\":{\"client\":[\"office/8\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixInvalid, head ++ "{\"match\":{\"client\":[\"10.0.0.0/eight\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // Past the family's bound: /32 for v4; /64 for v6, where the low
     // half is interface identity that rotates (RFC 8981).
-    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"10.0.0.0/33\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
-    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"2001:db8::/65\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"10.0.0.0/33\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.FilterClientPrefixTooNarrow, head ++ "{\"match\":{\"client\":[\"2001:db8::/65\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // Host bits set past the prefix: a typo for one of two different
     // ranges, and the loader cannot know which.
-    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"10.0.0.1/8\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
-    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"2001:db8::1/48\"]},\"actions\":[{\"reject\":403}]}]}]," ++ tail);
+    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"10.0.0.1/8\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.FilterClientCidrHostBits, head ++ "{\"match\":{\"client\":[\"2001:db8::1/48\"]},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
 }
 
 test "config: response filters compile into rules with matches and edits" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","cluster":"a","response_filters":[
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a","response_filters":[
         \\   {"actions":[{"header_remove":"Server"},
         \\               {"header_set":{"name":"Strict-Transport-Security","value":"max-age=63072000"}}]},
         \\   {"match":{"status_class":"5xx"},
         \\    "actions":[{"header_set":{"name":"Retry-After","value":"1"}}]},
         \\   {"match":{"status":[301,302],"headers":[{"name":"Location","contains":"http:"}]},
         \\    "actions":[{"header_add":{"name":"X-Insecure-Redirect","value":"1"}}]}
-        \\ ]}],
+        \\ ]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5242,31 +5336,32 @@ test "config: response filter schema rejects what has no meaning on the way out"
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"response_filters\":[";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"response_filters\":[";
     // The two request-side arms are rejected by their own names, so an
     // operator is told which idea does not transfer.
-    try expectParseError(error.ResponseFilterReject, head ++ "{\"actions\":[{\"reject\":403}]}]}]," ++ tail);
-    try expectParseError(error.ResponseFilterRewrite, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b\"}}]}]}]," ++ tail);
+    try expectParseError(error.ResponseFilterReject, head ++ "{\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
+    try expectParseError(error.ResponseFilterRewrite, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b\"}}]}]}}]," ++ tail);
     // A two-kind action is still a kind error, never a misleading arm one.
-    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}]," ++ tail);
-    try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}]," ++ tail);
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}}]," ++ tail);
+    try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}}]," ++ tail);
     // A status the parser can never produce is a rule that can never
     // fire — a typo, told at load.
-    try expectParseError(error.ResponseFilterStatusInvalid, head ++ "{\"match\":{\"status\":[99]},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
-    try expectParseError(error.ResponseFilterStatusInvalid, head ++ "{\"match\":{\"status\":[600]},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
+    try expectParseError(error.ResponseFilterStatusInvalid, head ++ "{\"match\":{\"status\":[99]},\"actions\":[{\"header_remove\":\"X\"}]}]}}]," ++ tail);
+    try expectParseError(error.ResponseFilterStatusInvalid, head ++ "{\"match\":{\"status\":[600]},\"actions\":[{\"header_remove\":\"X\"}]}]}}]," ++ tail);
     // An explicitly empty status list is a mistake — absence already
     // says "any", unambiguously.
-    try expectParseError(error.ResponseFilterStatusEmpty, head ++ "{\"match\":{\"status\":[]},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
-    try expectParseError(error.ResponseFilterStatusClassUnknown, head ++ "{\"match\":{\"status_class\":\"6xx\"},\"actions\":[{\"header_remove\":\"X\"}]}]}]," ++ tail);
+    try expectParseError(error.ResponseFilterStatusEmpty, head ++ "{\"match\":{\"status\":[]},\"actions\":[{\"header_remove\":\"X\"}]}]}}]," ++ tail);
+    try expectParseError(error.ResponseFilterStatusClassUnknown, head ++ "{\"match\":{\"status_class\":\"6xx\"},\"actions\":[{\"header_remove\":\"X\"}]}]}}]," ++ tail);
     // The proxy-managed names hold on the way out too: hand-written
     // framing would desynchronise the relay.
-    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Content-Length\",\"value\":\"0\"}}]}]}]," ++ tail);
-    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_remove\":\"connection\"}]}]}]," ++ tail);
-    // L4 listeners may not carry the key, populated or vacuously empty.
-    try expectParseError(error.ListenerL4ResponseFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
-        "\"response_filters\":[{\"actions\":[{\"header_remove\":\"Server\"}]}]}]," ++ tail);
-    try expectParseError(error.ListenerL4ResponseFilters, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"l4\",\"cluster\":\"a\"," ++
-        "\"response_filters\":[]}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"Content-Length\",\"value\":\"0\"}}]}]}}]," ++ tail);
+    try expectParseError(error.FilterHeaderNameReserved, head ++ "{\"actions\":[{\"header_remove\":\"connection\"}]}]}}]," ++ tail);
+    // The same on the way out, and by the same mechanism (#305): the
+    // `l4` body has no such key, populated or vacuously empty.
+    try expectParseError(error.UnknownField, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+        "\"response_filters\":[{\"actions\":[{\"header_remove\":\"Server\"}]}]}}]," ++ tail);
+    try expectParseError(error.UnknownField, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+        "\"response_filters\":[]}}]," ++ tail);
 }
 
 test "config: a response filter set over the header-edit budget is rejected" {
@@ -5286,8 +5381,8 @@ test "config: a response filter set over the header-edit budget is rejected" {
         }
         break :blk s;
     };
-    const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-        "\"cluster\":\"a\",\"response_filters\":[" ++ rules ++ "]}]," ++ tail;
+    const json = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"cluster\":\"a\",\"response_filters\":[" ++ rules ++ "]}}]," ++ tail;
     try expectParseError(error.ResponseFilterHeaderEditsOverLimit, json);
 }
 
@@ -5297,7 +5392,7 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"rr"},
             \\   "b":{"endpoints":["127.0.0.1:3"],"pick":"p2c"},
             \\   "c":{"endpoints":["127.0.0.1:4"]}},
@@ -5309,7 +5404,7 @@ test "config: cluster pick policy parses, defaults to p2c, rejects typos" {
     }
     // A typo must not silently balance as the default.
     try expectParseError(error.ClusterPickUnknown,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"pick":"pc2"}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5319,7 +5414,7 @@ test "config: a check block resolves its kind, thresholds and budget" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
         \\     "check":{"type":"tcp","fall":5,"rise":1,"timeout_ms":250}},
         \\   "b":{"endpoints":["127.0.0.1:3"],"check":{"type":"tcp"}},
@@ -5345,7 +5440,7 @@ test "config: an http check resolves its request and expected status" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
             \\     "check":{"type":"http","path":"/healthz","host":"api.example",
             \\       "expect_status":204}}},
@@ -5363,7 +5458,7 @@ test "config: an http check resolves its request and expected status" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],
             \\     "check":{"type":"http","path":"/health"}}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -5382,7 +5477,7 @@ test "config: the failure-detection fact counts only clusters it can be true of"
     // fail-open makes the ejection a no-op, so counting it would put
     // noise on exactly the configs the number has nothing to say about.
     const json =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"bare"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"bare"}}],
         \\ "clusters":{
         \\  "bare":{"endpoints":["127.0.0.1:2","127.0.0.1:3"]},
         \\  "alone":{"endpoints":["127.0.0.1:4"]},
@@ -5407,7 +5502,7 @@ test "config: the failure-detection fact counts only clusters it can be true of"
 
 test "config: a passive_ejection block rejects the thresholds it cannot act on" {
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"passive_ejection":
     ;
     const tail =
@@ -5435,7 +5530,7 @@ test "config: a passive_ejection block rejects the thresholds it cannot act on" 
     // Absent is off, and off is not "defaults" — an unconfigured cluster
     // must be distinguishable from one that opted in and took them.
     const bare =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
@@ -5447,7 +5542,7 @@ test "config: a passive_ejection block rejects the thresholds it cannot act on" 
 
 test "config: a check block rejects every shape it cannot run" {
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"check":
     ;
     const tail =
@@ -5508,7 +5603,7 @@ test "config: health interval parses, defaults to inter, rejects zero" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,
             \\   "health_interval_ms":250}}
@@ -5519,7 +5614,7 @@ test "config: health interval parses, defaults to inter, rejects zero" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
@@ -5527,13 +5622,13 @@ test "config: health interval parses, defaults to inter, rejects zero" {
     }
     // Zero would probe in a tight loop; the cluster flag is the switch.
     try expectParseError(error.TimeoutZero,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,
         \\   "health_interval_ms":0}}
     );
     try expectParseError(error.TimeoutOverLimit,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,
         \\   "health_interval_ms":3600001}}
@@ -5546,7 +5641,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
             \\ "limits":{"conn_slots":64}}
@@ -5566,7 +5661,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
             \\ "limits":{"conn_slots":64,"relay_buffers":8,"upstream_slots":8,"cq_fill_eighths":4}}
@@ -5583,7 +5678,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
             \\ "limits":{"conn_slots":64,"head_buffers":16}}
@@ -5599,7 +5694,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
             \\ "limits":{"conn_slots":64}}
@@ -5610,7 +5705,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
@@ -5626,7 +5721,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
     ;
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}],";
     // Zero and over-ceiling both fail loudly, each with its own error.
     try expectParseError(error.LimitConnSlotsOutOfRange, head ++ tail ++ "\"limits\":{\"conn_slots\":0}}");
     try expectParseError(error.LimitConnSlotsOutOfRange, head ++ tail ++ "\"limits\":{\"conn_slots\":99999}}");
@@ -5644,7 +5739,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
     // connections is waste stated as intent; any buffers without an http
     // listener can never bind; an http listener with none would shed
     // every request it is configured to serve.
-    const http_head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}],";
+    const http_head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}],";
     try expectParseError(error.LimitHeadBuffersOverConnSlots, http_head ++ tail ++
         "\"limits\":{\"conn_slots\":4,\"head_buffers\":8}}");
     try expectParseError(error.LimitHeadBuffersWithoutHttpListener, head ++ tail ++
@@ -5685,9 +5780,9 @@ test "config: limits shrink pools below the ceilings, never past them" {
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1},
         \\ "access_log":{"sink":"nonsense"}}
     );
-    try expectParseError(error.ListenerProtocolUnknown,
-        \\{"listeners":[{"bind":"not-an-address","cluster":"a"},
-        \\               {"bind":"127.0.0.1:1","cluster":"a","protocol":"gopher"}],
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"not-an-address","l4":{"cluster":"a"}},
+        \\               {"bind":"127.0.0.1:1","gopher":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5719,7 +5814,7 @@ test "config: limits shrink pools below the ceilings, never past them" {
 }
 
 test "config: admin block resolves a bind literal, absent leaves it off" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}],";
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}
@@ -5751,9 +5846,19 @@ test "config: admin block resolves a bind literal, absent leaves it off" {
 }
 
 test "config: unknown listener protocol fails loudly" {
-    // A typo must not silently relay as L4.
-    try expectParseError(error.ListenerProtocolUnknown,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"htpp"}],
+    // A typo must not silently relay as L4. The protocol is the body's
+    // own key now (#305), so a misspelled one is an unknown *field*
+    // rather than an unknown token — the same loudness, one vocabulary
+    // fewer to keep in step with the enum.
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","htpp":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // And the key that used to name it is gone: a config still spelling
+    // `protocol` is refused rather than quietly ignored.
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","protocol":"http","http":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5761,7 +5866,7 @@ test "config: unknown listener protocol fails loudly" {
 
 test "config: max_lifetime_ms still obeys the shared ceiling" {
     try expectParseError(error.TimeoutOverLimit,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1,"max_lifetime_ms":3600001}}
     );
@@ -5814,8 +5919,8 @@ test "config: a table far past the old caps parses, and is bounded only by itsel
                 "{\"match\":{\"headers\":[{\"name\":\"X-K" ++ n ++ "\",\"present\":true}]}," ++
                 "\"actions\":[{\"reject\":404}]}";
         }
-        break :blk "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\"," ++
-            "\"routes\":[" ++ routes ++ "],\"request_filters\":[" ++ filters ++ "]}]," ++
+        break :blk "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+            "\"routes\":[" ++ routes ++ "],\"request_filters\":[" ++ filters ++ "]}}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
     };
@@ -5828,7 +5933,7 @@ test "config: a table far past the old caps parses, and is bounded only by itsel
 
 test "config: strictness rejects unknown and duplicate fields" {
     try expectParseError(error.UnknownField,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","nope":1}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a","nope":1}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5838,7 +5943,7 @@ test "config: strictness rejects unknown and duplicate fields" {
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ClusterNameDuplicate,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]},"a":{"endpoints":["127.0.0.1:3"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5857,7 +5962,7 @@ test "config: a `$schema` editor hint loads and is ignored" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
             \\{"$schema":"https://zoxy.io/schema/config.schema.json",
-            \\ "listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\ "listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
@@ -5869,12 +5974,12 @@ test "config: a `$schema` editor hint loads and is ignored" {
     // is only a root key — nested objects reject it like any other extra.
     try expectParseError(error.UnknownField,
         \\{"$schemas":"x",
-        \\ "listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\ "listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.UnknownField,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","$schema":"x"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a","$schema":"x"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5882,29 +5987,29 @@ test "config: a `$schema` editor hint loads and is ignored" {
 
 test "config: references and addresses are validated" {
     try expectParseError(error.ClusterUnknown,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"missing"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"missing"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     // Hostnames are structurally unresolvable: static addresses only (§1).
     try expectParseError(error.EndpointInvalid,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["origin.internal:80"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.EndpointPortZero,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:0"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ListenerBindInvalid,
-        \\{"listeners":[{"bind":"not-an-address","cluster":"a"}],
+        \\{"listeners":[{"bind":"not-an-address","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ListenerBindDuplicate,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"},
-        \\               {"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}},
+        \\               {"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5914,7 +6019,7 @@ test "config: endpoint weights parse in both spellings" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["10.0.0.1:8080",
         \\   {"address":"10.0.0.2:8080","weight":3},
         \\   {"address":"10.0.0.3:8080"},
@@ -5938,7 +6043,7 @@ test "config: unweighted endpoints leave the weights table null" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2",
         \\   {"address":"127.0.0.1:3","weight":1}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -5953,7 +6058,7 @@ test "config: the weight ceiling itself is a legal share" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
     const parsed = try expectParseOk(&arena_state,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weight":256}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -5962,40 +6067,40 @@ test "config: the weight ceiling itself is a legal share" {
 
 test "config: endpoint weight validation has its own errors" {
     try expectParseError(error.EndpointWeightOverLimit,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weight":257}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     // Every weight zero is a cluster drained to nowhere — rejected like
     // an empty endpoint list, not accepted as one that can never answer.
     try expectParseError(error.EndpointWeightsAllZero,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weight":0},
         \\   {"address":"127.0.0.1:3","weight":0}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     // The object form validates its address exactly like the bare one.
     try expectParseError(error.EndpointInvalid,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[{"address":"origin.internal:80","weight":2}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.EndpointPortZero,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:0","weight":2}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     // Strictness reaches inside the object form: a typo'd key is an
     // unknown field, not a silently-dropped weight.
     try expectParseError(error.UnknownField,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[{"address":"127.0.0.1:2","weigth":2}]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     // An endpoint is a string or an object; any other token is refused
     // rather than coerced.
     try expectParseError(error.UnexpectedToken,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[42]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
@@ -6008,22 +6113,22 @@ test "config: every emptiness and limit has its own error" {
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.ClustersEmpty,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.EndpointsEmpty,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":[]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     );
     try expectParseError(error.TimeoutZero,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":0,"idle_ms":1,"drain_deadline_ms":1}}
     );
     try expectParseError(error.TimeoutOverLimit,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":3600001,"idle_ms":1,"drain_deadline_ms":1}}
     );
@@ -6036,7 +6141,7 @@ fn listenersJson(comptime count: u32, comptime limits: []const u8) []const u8 {
     while (index < count) : (index += 1) {
         if (index > 0) json = json ++ ",";
         json = json ++ std.fmt.comptimePrint(
-            \\{{"bind":"127.0.0.1:{d}","cluster":"a"}}
+            \\{{"bind":"127.0.0.1:{d}","l4":{{"cluster":"a"}}}}
         , .{1000 + index});
     }
     return json ++ "]," ++ limits ++
@@ -6098,12 +6203,11 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 /// vocabulary it hands the mutator, and one that never spells
 /// `drain_deadline_ms` gives it no path to that branch of the parser.
 const fuzz_seed_json =
-    \\{"listeners":[{"bind":"127.0.0.1:8080","routes":[{"prefix":"/","cluster":"o"}],
+    \\{"listeners":[{"bind":"127.0.0.1:8080","http":{"routes":[{"prefix":"/","cluster":"o"}],
     \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]},
     \\ {"match":{"path_prefix":"/old"},"actions":[{"redirect":{"status":301,"scheme":"https"}}]},
-    \\ {"match":{"path_prefix":"/robots.txt"},"actions":[{"respond":{"status":200,"body":"oops"}}]}],
-    \\ "protocol":"http"},
-    \\ {"bind":"127.0.0.1:8443","cluster":"t","tls":{"cert":"/c.pem","key":"/k.pem"}}],
+    \\ {"match":{"path_prefix":"/robots.txt"},"actions":[{"respond":{"status":200,"body":"oops"}}]}]}},
+    \\ {"bind":"127.0.0.1:8443","tls":{"cert":"/c.pem","key":"/k.pem"},"l4":{"cluster":"t"}}],
     \\ "clusters":{"o":{"endpoints":["127.0.0.1:9000",
     \\ {"address":"127.0.0.1:9001","weight":3}],
     \\ "pick":{"policy":"hash","key":"cookie","name":"zoxy-srv"},"max_inflight":8,
@@ -6207,7 +6311,7 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}
     ;
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}],";
 
     // Absent: the log stays off and reserves nothing. The buffer size is
     // zero exactly then, which is how `accessLogBytes` reads "off" off one
@@ -6309,7 +6413,7 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
 }
 
 test "config: a cluster name is bounded, because the access log echoes it" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"";
     const long_name = "n" ** (constants.cluster_name_bytes_max + 1);
     const at_limit = "n" ** constants.cluster_name_bytes_max;
 
@@ -6321,7 +6425,7 @@ test "config: a cluster name is bounded, because the access log echoes it" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ at_limit ++ "\"}],\"clusters\":{\"" ++ at_limit ++
+            head ++ at_limit ++ "\"}}],\"clusters\":{\"" ++ at_limit ++
                 "\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
                 "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
         );
@@ -6329,21 +6433,21 @@ test "config: a cluster name is bounded, because the access log echoes it" {
     }
     try expectParseError(
         error.ClusterNameTooLong,
-        head ++ long_name ++ "\"}],\"clusters\":{\"" ++ long_name ++
+        head ++ long_name ++ "\"}}],\"clusters\":{\"" ++ long_name ++
             "\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
     // An empty name names nothing and would render as `"cluster":""`.
     try expectParseError(
         error.ClusterNameEmpty,
-        head ++ "\"}],\"clusters\":{\"\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        head ++ "\"}}],\"clusters\":{\"\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
 }
 
 test "config: pick resolves both spellings, and hash names its key" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}],\"clusters\":{\"a\":{";
-    const head_http = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}],\"clusters\":{\"a\":{";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}],\"clusters\":{\"a\":{";
+    const head_http = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}],\"clusters\":{\"a\":{";
     const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
     const endpoints = "\"endpoints\":[\"127.0.0.1:2\"]";
 
@@ -6452,7 +6556,7 @@ test "config: pick resolves both spellings, and hash names its key" {
 }
 
 test "config: a request-derived pick name is required, bounded, and a token" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}],\"clusters\":{\"a\":{";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}],\"clusters\":{\"a\":{";
     const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
     const endpoints = "\"endpoints\":[\"127.0.0.1:2\"]";
 
@@ -6524,7 +6628,7 @@ test "config: a request-keyed hash cluster is unreachable from l4" {
     // rule in the other direction.
     try expectParseError(
         error.ListenerL4RequestKeyedHash,
-        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}]," ++ cookie_cluster ++ tail,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}]," ++ cookie_cluster ++ tail,
     );
     // The same cluster behind an http listener is exactly what #178 asks
     // for.
@@ -6533,7 +6637,7 @@ test "config: a request-keyed hash cluster is unreachable from l4" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}]," ++
+            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}]," ++
                 cookie_cluster ++ tail,
         );
         try std.testing.expectEqualStrings("zoxy-srv", parsed.clusters[0].hash_key.cookie);
@@ -6558,7 +6662,7 @@ fn testReadBodyFile(
     return arena.dupe(u8, test_file_body);
 }
 
-const bodies_head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}]," ++
+const bodies_head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}]," ++
     "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}},";
 const bodies_tail = "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
@@ -6718,7 +6822,7 @@ test "config: error pages take only known statuses naming known bodies" {
 }
 
 test "config: logged header names are lowercased, deduped and bounded (#140)" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}]," ++
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}]," ++
         "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}},\"access_log\":{\"sink\":\"stdout\"";
     const tail = "},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
@@ -6781,7 +6885,7 @@ test "config: logged header names are lowercased, deduped and bounded (#140)" {
 }
 
 test "config: the two header lists share one cap, and widen the line (#140)" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"}]," ++
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}]," ++
         "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}},\"access_log\":{\"sink\":\"stdout\"";
     const tail = "},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
@@ -6836,14 +6940,14 @@ test "config: a respond action compiles to a page, sharing one buffer (#159)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const parsed = try parse(arena_state.allocator(),
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
         \\ "request_filters":[
         \\   {"match":{"path_prefix":"/robots.txt"},
         \\    "actions":[{"respond":{"status":200,"body":"robots"}}]},
         \\   {"match":{"path_prefix":"/down"},
         \\    "actions":[{"respond":{"status":503,"body":"maint"}}]},
         \\   {"match":{"path_prefix":"/also-down"},
-        \\    "actions":[{"respond":{"status":503,"body":"maint"}}]}]}],
+        \\    "actions":[{"respond":{"status":503,"body":"maint"}}]}]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
         \\ "bodies":{"robots":{"inline":"User-agent: *\n","content_type":"text/plain"},
         \\   "maint":{"inline":"back soon","content_type":"text/plain"}},
@@ -6876,9 +6980,9 @@ test "config: a respond action compiles to a page, sharing one buffer (#159)" {
 }
 
 test "config: the respond action's vocabulary is closed, and request-side only" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"," ++
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
         "\"request_filters\":[{\"match\":{},\"actions\":[";
-    const mid = "]}]}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+    const mid = "]}]}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"bodies\":{\"x\":{\"inline\":\"a\",\"content_type\":\"t/p\"}},";
     const tail = "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
@@ -6915,8 +7019,8 @@ test "config: the respond action's vocabulary is closed, and request-side only" 
     // edit this table has.
     try expectParseError(
         error.ResponseFilterRespond,
-        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\",\"protocol\":\"http\"," ++
-            "\"response_filters\":[{\"actions\":[{\"respond\":{\"body\":\"x\"}}]}]}]," ++
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+            "\"response_filters\":[{\"actions\":[{\"respond\":{\"body\":\"x\"}}]}]}}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"bodies\":{\"x\":{\"inline\":\"a\",\"content_type\":\"t/p\"}}," ++ tail,
     );
@@ -6966,7 +7070,7 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"max_inflight":64},
             \\   "b":{"endpoints":["127.0.0.1:3"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -6979,7 +7083,7 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
     // past the largest representable load could never refuse one —
     // both are typos rather than intents (§8).
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"max_inflight":
     ;
     const tail =
@@ -7009,8 +7113,11 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
 }
 
 test "config: the forwarded block resolves a mode, and is http-only" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
-    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+    // The head opens the `http` body, so the fields each case appends
+    // land inside it — which is the whole shape (#305): `forwarded` is
+    // reachable from here and from nowhere else.
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
     // Absent: the header is untouched, which is what every config that
@@ -7018,7 +7125,7 @@ test "config: the forwarded block resolves a mode, and is http-only" {
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try expectParseOk(&arena_state, head ++ ",\"protocol\":\"http\"" ++ tail);
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
         try std.testing.expect(parsed.listeners[0].forwarded == null);
     }
     // Both modes resolve; neither is a default.
@@ -7027,7 +7134,7 @@ test "config: the forwarded block resolves a mode, and is http-only" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ ",\"protocol\":\"http\",\"forwarded\":{\"mode\":\"" ++ mode ++ "\"}" ++ tail,
+            head ++ ",\"forwarded\":{\"mode\":\"" ++ mode ++ "\"}" ++ tail,
         );
         try std.testing.expectEqual(
             std.meta.stringToEnum(Config.Listener.Forwarded, mode).?,
@@ -7036,30 +7143,31 @@ test "config: the forwarded block resolves a mode, and is http-only" {
     }
 
     // An l4 listener has no header to carry an address, so asking for one
-    // describes a proxy that is not running — rejected, like `request_filters`.
+    // describes a proxy that is not running. There is no longer a rule
+    // saying so — the `l4` body has no such key, so the strict parser
+    // refuses it (#305), which is the same verdict one mechanism earlier.
     try expectParseError(
-        error.ListenerL4Forwarded,
-        head ++ ",\"forwarded\":{\"mode\":\"replace\"}" ++ tail,
-    );
-    try expectParseError(
-        error.ListenerL4Forwarded,
-        head ++ ",\"protocol\":\"l4\",\"forwarded\":{\"mode\":\"replace\"}" ++ tail,
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"forwarded\":{\"mode\":\"replace\"}}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
     // The mode vocabulary is closed and `mode` is required: there is no
     // safe default to fall back to, which is the whole point.
     try expectParseError(
         error.ListenerForwardedModeUnknown,
-        head ++ ",\"protocol\":\"http\",\"forwarded\":{\"mode\":\"trust\"}" ++ tail,
+        head ++ ",\"forwarded\":{\"mode\":\"trust\"}" ++ tail,
     );
     try expectParseError(
         error.MissingField,
-        head ++ ",\"protocol\":\"http\",\"forwarded\":{}" ++ tail,
+        head ++ ",\"forwarded\":{}" ++ tail,
     );
 }
 
 test "config: the proxy_protocol block resolves a mode, and is l4-only" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
-    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"";
+    const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
     // Absent: first bytes are payload — every config predating this.
@@ -7069,13 +7177,16 @@ test "config: the proxy_protocol block resolves a mode, and is l4-only" {
         const parsed = try expectParseOk(&arena_state, head ++ tail);
         try std.testing.expect(parsed.listeners[0].proxy_protocol == null);
     }
-    // The one mode resolves, on the defaulted protocol and stated l4 alike.
-    inline for (.{ "", ",\"protocol\":\"l4\"" }) |protocol_field| {
+    // The one mode resolves. This used to run twice — once on the
+    // defaulted protocol and once on a stated `l4` — and there is no
+    // longer a difference to cover: the body's key *is* the statement,
+    // so there is no defaulted spelling for it to disagree with (#305).
+    {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ protocol_field ++ ",\"proxy_protocol\":{\"mode\":\"require\"}" ++ tail,
+            head ++ ",\"proxy_protocol\":{\"mode\":\"require\"}" ++ tail,
         );
         try std.testing.expectEqual(
             Config.Listener.ProxyProtocol.require,
@@ -7083,10 +7194,15 @@ test "config: the proxy_protocol block resolves a mode, and is l4-only" {
         );
     }
     // The L7 path has no receive phase yet, so a block there would state
-    // a trust boundary nothing enforces — rejected, not ignored.
+    // a trust boundary nothing enforces. The `http` body has no such key
+    // (#305), so it is refused rather than ignored — the same verdict the
+    // rule used to give, one mechanism earlier.
     try expectParseError(
-        error.ListenerHttpProxyProtocol,
-        head ++ ",\"protocol\":\"http\",\"proxy_protocol\":{\"mode\":\"require\"}" ++ tail,
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+            "\"proxy_protocol\":{\"mode\":\"require\"}}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
     // The mode vocabulary is closed and `mode` is required; sniffing
     // ("optional") is deliberately not in it — a listener that accepts
@@ -7102,7 +7218,10 @@ test "config: the proxy_protocol block resolves a mode, and is l4-only" {
 }
 
 test "config: the tls block resolves paths, and only shape-checks them" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    // The head closes the protocol body, because `tls` is the listener's
+    // and not either body's (#305) — so every case below appends at the
+    // level the key actually lives on.
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}";
     const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
@@ -7116,12 +7235,15 @@ test "config: the tls block resolves paths, and only shape-checks them" {
     // Present on either protocol: termination is orthogonal to what the
     // terminated stream then speaks, which is why the handshake is a
     // phase ahead of the protocol rather than part of one.
-    inline for (.{ "", ",\"protocol\":\"l4\"", ",\"protocol\":\"http\"" }) |protocol_field| {
+    inline for (.{
+        "\"l4\":{\"cluster\":\"a\"}",
+        "\"http\":{\"cluster\":\"a\"}",
+    }) |body| {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            head ++ protocol_field ++
+            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"," ++ body ++
                 ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail,
         );
         const tls = parsed.listeners[0].tls.?;
@@ -7174,7 +7296,7 @@ test "config: a terminating listener cannot reach a PROXY-sending cluster" {
 
     try expectParseError(
         error.ClusterProxyProtocolOnTlsListener,
-        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"," ++
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}," ++
             "\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}}]," ++ tail,
     );
     // Without the tls block the same cluster is fine.
@@ -7183,14 +7305,14 @@ test "config: a terminating listener cannot reach a PROXY-sending cluster" {
         defer arena_state.deinit();
         const parsed = try expectParseOk(
             &arena_state,
-            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}]," ++ tail,
+            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}]," ++ tail,
         );
         try std.testing.expect(parsed.clusters[0].proxy_protocol_send != null);
     }
 }
 
 test "config: tls_engines follows the tls listeners, and refuses a mismatch" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}";
     const tls_block = ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}";
     const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}";
@@ -7265,7 +7387,7 @@ test "config: tls_engines follows the tls listeners, and refuses a mismatch" {
 }
 
 test "config: the cluster proxy_protocol block resolves a version, l4-reachable only" {
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}";
     const middle = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]";
     const tail = "}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
@@ -7294,15 +7416,15 @@ test "config: the cluster proxy_protocol block resolves a version, l4-reachable 
     // would name one client and serve many.
     try expectParseError(
         error.ClusterProxyProtocolOnHttpListener,
-        head ++ ",\"protocol\":\"http\"" ++ middle ++
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}" ++ middle ++
             ",\"proxy_protocol\":{\"send\":\"v2\"}" ++ tail,
     );
     // The same cluster reached by an http listener *beside* the l4 one is
     // just as rejected — reachability poisons, not exclusivity.
     try expectParseError(
         error.ClusterProxyProtocolOnHttpListener,
-        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"cluster\":\"a\"}," ++
-            "{\"bind\":\"127.0.0.1:3\",\"protocol\":\"http\",\"cluster\":\"a\"" ++ middle ++
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}," ++
+            "{\"bind\":\"127.0.0.1:3\",\"http\":{\"cluster\":\"a\"}" ++ middle ++
             ",\"proxy_protocol\":{\"send\":\"v2\"}" ++ tail,
     );
     // The version vocabulary is closed and `send` is required.
@@ -7321,8 +7443,8 @@ test "config: a filter may not name the header zoxy manages" {
     // encodes one fixed address for every client — it looks like client
     // forwarding and is the opposite of it. Reserved unconditionally, not
     // only on listeners that set it, so one mechanism owns the header.
-    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"protocol\":\"http\",\"cluster\":\"a\",\"request_filters\":[";
-    const tail = "]}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"request_filters\":[";
+    const tail = "]}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
 
     inline for (.{ "header_set", "header_add" }) |action| {
@@ -7349,7 +7471,7 @@ test "config: retries resolves, defaults to none, rejects past the ceiling" {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:2","127.0.0.1:3"],"retries":2},
             \\   "b":{"endpoints":["127.0.0.1:4"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -7360,7 +7482,7 @@ test "config: retries resolves, defaults to none, rejects past the ceiling" {
         try std.testing.expectEqual(@as(u16, 0), parsed.clusters[1].retries);
     }
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"retries":
     ;
     const tail =
@@ -7401,11 +7523,11 @@ test "config: retries resolves, defaults to none, rejects past the ceiling" {
 
 test "config: the upgrade allowlist is closed, http-only, and never empty" {
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
         \\ "upgrades":
     ;
     const tail =
-        \\},{"bind":"127.0.0.1:2","cluster":"a"}],
+        \\}},{"bind":"127.0.0.1:2","l4":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "limits":{"tunnels":16},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -7434,11 +7556,11 @@ test "config: the upgrade allowlist is closed, http-only, and never empty" {
 
 test "config: upgrades are refused on an l4 listener" {
     // A byte relay parses no handshake to recognise, so there is nothing
-    // here for it to allow — the same refusal `forwarded` and `routes`
-    // get on an l4 listener, rather than a block that quietly does
-    // nothing.
-    try expectParseError(error.ListenerL4Upgrades,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","upgrades":["websocket"]}],
+    // here for it to allow. The `l4` body has no such key (#305), so the
+    // refusal is the strict parser's rather than a rule's — a block that
+    // quietly did nothing was never the alternative.
+    try expectParseError(error.UnknownField,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a","upgrades":["websocket"]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "limits":{"tunnels":4},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -7447,8 +7569,8 @@ test "config: upgrades are refused on an l4 listener" {
 
 test "config: the tunnel pool has no derived default, and binds to the allowlist" {
     const with_upgrades =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
-        \\ "upgrades":["websocket"]}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+        \\ "upgrades":["websocket"]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}
     ;
@@ -7467,7 +7589,7 @@ test "config: the tunnel pool has no derived default, and binds to the allowlist
     // And a pool nothing can draw on is the mirror image: asked for, and
     // unusable.
     try expectParseError(error.LimitTunnelsWithoutUpgrades,
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "limits":{"tunnels":8},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -7478,7 +7600,7 @@ test "config: the tunnel pool has no derived default, and binds to the allowlist
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
         const parsed = try expectParseOk(&arena_state,
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a"}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
             \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
         );
@@ -7497,8 +7619,8 @@ test "config: the tunnel pool may not exceed the connections that hold one" {
         &buffer,
         "{s}{d}{s}",
         .{
-            \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
-            \\ "upgrades":["websocket"]}],
+            \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+            \\ "upgrades":["websocket"]}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
             \\ "limits":{"conn_slots":8,"tunnels":
             ,
@@ -7513,8 +7635,8 @@ test "config: the tunnel pool may not exceed the connections that hold one" {
 
 test "config: tunnel_ms defaults to an hour and has no off switch" {
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http",
-        \\ "upgrades":["websocket"]}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
+        \\ "upgrades":["websocket"]}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "limits":{"tunnels":4},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1
@@ -7546,7 +7668,7 @@ test "config: tunnel_ms defaults to an hour and has no off switch" {
 
 test "config: the head budget is derived from its neighbours, never fixed" {
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "timeouts":{"drain_deadline_ms":1,
     ;
@@ -7592,7 +7714,7 @@ test "config: the head budget is derived from its neighbours, never fixed" {
 
 test "config: head_ms must sit strictly above the dial and at or below the idle" {
     const head =
-        \\{"listeners":[{"bind":"127.0.0.1:1","cluster":"a","protocol":"http"}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "timeouts":{"drain_deadline_ms":1,"connect_ms":5000,"idle_ms":60000,"head_ms":
     ;

@@ -756,6 +756,21 @@ Rules:
   shrink a pool; a fill whose ring would exceed the compiled one
   (`cqFillFits` false for the chosen conn/upstream slots and listeners) is
   rejected at load, not clamped (§4/§8).
+- **A listener is a tagged shape, not a flat struct** (#305). `protocol`
+  used to be a string beside eleven fields, seven of which were valid only
+  on one of its two values — a discriminated union modeled as a struct,
+  with the discrimination left to seven loader errors no emitted schema
+  could carry. The tag is the body's own key now: `bind` and `tls` are
+  shared (an address is an address, and termination is a phase ahead of
+  what the terminated stream speaks, so `resolveTls` never asked which
+  protocol it was), and everything else lives inside the `http` or `l4`
+  body that gives it meaning. `{"l4": {"max_body_bytes": 500}}` is
+  refused by the shape rather than by a rule written twice, the seven
+  errors are gone rather than reworded, and `protocol`'s pre-L7 default
+  of `"l4"` went with them — a listener states what it speaks. This is
+  also what unblocks L4 SNI routing (#298): an `l4` route table and an
+  `http` one are different types in different bodies, so `Route.prefix`
+  stays non-optional.
 - **The config arena is the only allocating region** — parse-once,
   immutable, shared read-only. (Carried verbatim; it worked.)
 - **The config surface has a generated JSON Schema.** `zig build schema`
