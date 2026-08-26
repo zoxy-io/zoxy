@@ -203,14 +203,45 @@ pub fn Budget(comptime IoType: type) type {
             return total;
         }
 
-        /// The §5 banner, to **stderr**: the banner is diagnostics, and
-        /// stdout belongs to the data an operator may point there — the
-        /// access log's `stdout` sink must stay one uncontaminated JSON
-        /// line per event. Stderr is where the counter dump already
-        /// goes, and via the same `std.debug.print` plain-write path, so
-        /// the two interleave whole-lines even when both land in one
-        /// redirected file (a positional writer here would be silently
-        /// overwritten by the dump's shared-offset writes).
+        /// Where a banner goes.
+        ///
+        /// Two sinks rather than two renderings: `--check` (#301) prints
+        /// the same budget to stdout, and a second copy of these format
+        /// strings would be a second thing to keep in step with the
+        /// closed form. The union is what lets one body serve both.
+        pub const Sink = union(enum) {
+            /// **stderr**, through `std.debug.print`: the banner is
+            /// diagnostics, and stdout belongs to the data an operator
+            /// may point there — the access log's `stdout` sink must
+            /// stay one uncontaminated JSON line per event. Stderr is
+            /// where the counter dump already goes, and via the same
+            /// plain-write path, so the two interleave whole-lines even
+            /// when both land in one redirected file (a positional
+            /// writer here would be silently overwritten by the dump's
+            /// shared-offset writes).
+            diagnostics,
+            /// A writer the caller owns and flushes. This is the arm a
+            /// check run takes, where the banner is not diagnostics
+            /// printed beside a result — it *is* the result.
+            writer: *std.Io.Writer,
+        };
+
+        /// One chunk of banner to whichever sink. The `.diagnostics` arm
+        /// cannot fail (`std.debug.print` ignores its own write errors),
+        /// so every error this returns belongs to the caller's writer.
+        fn emit(
+            sink: Sink,
+            comptime format: []const u8,
+            args: anytype,
+        ) std.Io.Writer.Error!void {
+            switch (sink) {
+                .diagnostics => std.debug.print(format, args),
+                .writer => |writer| try writer.print(format, args),
+            }
+        }
+
+        /// The §5 banner, to stderr — `Sink.diagnostics` carries why
+        /// that and not stdout.
         pub fn print(
             config: *const config_module.Config,
             demands: Demands,
@@ -219,6 +250,39 @@ pub fn Budget(comptime IoType: type) type {
             config_arena_bytes: u64,
             build: Build,
         ) void {
+            // `unreachable` rather than `catch {}`: `emit`'s
+            // `.diagnostics` arm never calls `try`, so this error does
+            // not exist — and stating that is what makes a future
+            // fallible diagnostics path fail loudly instead of writing
+            // half a banner and saying nothing.
+            emitBanner(.diagnostics, config, demands, config_arena_bytes, build) catch unreachable;
+        }
+
+        /// The same banner to a writer the caller owns and flushes —
+        /// `--check`'s stdout (#301). One body, so a check run and the
+        /// start it predicts can never price one config two ways.
+        pub fn printTo(
+            writer: *std.Io.Writer,
+            config: *const config_module.Config,
+            demands: Demands,
+            config_arena_bytes: u64,
+            build: Build,
+        ) std.Io.Writer.Error!void {
+            return emitBanner(.{ .writer = writer }, config, demands, config_arena_bytes, build);
+        }
+
+        /// The banner itself, once, for whichever sink asked. Both
+        /// public entry points land here, which is the property that
+        /// matters: the startup banner and the `--check` report are the
+        /// same closed form evaluated once, not two renderings that
+        /// happen to agree today.
+        fn emitBanner(
+            sink: Sink,
+            config: *const config_module.Config,
+            demands: Demands,
+            config_arena_bytes: u64,
+            build: Build,
+        ) std.Io.Writer.Error!void {
             assert(config.listeners.len >= 1);
             assert(demands.fds > 0);
             // Every budget reflects the *effective* config (§5, §8): the
@@ -235,11 +299,11 @@ pub fn Budget(comptime IoType: type) type {
             const access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes);
             const sizes = poolSizesFor(config);
             const memory_total = totalBytesFor(&sizes, config_arena_bytes);
-            printMemoryBanner(config, &sizes, memory_total, access_log_bytes, config_arena_bytes, build);
+            try emitMemoryBanner(sink, config, &sizes, memory_total, access_log_bytes, config_arena_bytes, build);
             // A stack temporary in a function that runs once at startup,
             // not a reservation (§5).
             var fact_buffer: [failure_detection_fact_bytes]u8 = undefined;
-            std.debug.print(
+            try emit(sink,
                 \\  fds     {d} required (asserted against RLIMIT_NOFILE)
                 \\  ring    {d} entries, completion queue {d}, in-flight ops <= {d}
                 \\  config  {d} listener(s), {d} cluster(s), {d} error page(s), access log {s}{s}
@@ -256,7 +320,7 @@ pub fn Budget(comptime IoType: type) type {
                 // measured number already covers them; this count is
                 // what says why it grew.
                 config.error_pages.len,
-                if (config.access_log_sink) |sink| @tagName(sink) else "off",
+                if (config.access_log_sink) |log_sink| @tagName(log_sink) else "off",
                 failureDetectionFact(config, &fact_buffer),
             });
         }
@@ -310,24 +374,25 @@ pub fn Budget(comptime IoType: type) type {
         }
 
         /// The banner's version and memory lines — the §5 closed form
-        /// itemized. Split from `print` for the length limit; the two
-        /// prints are sequential same-thread writes to stderr, so
-        /// nothing interleaves.
-        fn printMemoryBanner(
+        /// itemized. Split from `emitBanner` for the length limit; the
+        /// two emissions are sequential same-thread writes to one sink,
+        /// so nothing interleaves.
+        fn emitMemoryBanner(
+            sink: Sink,
             config: *const config_module.Config,
             sizes: *const constants.PoolSizes,
             memory_total: u64,
             access_log_bytes: u64,
             config_arena_bytes: u64,
             build: Build,
-        ) void {
+        ) std.Io.Writer.Error!void {
             assert(memory_total > 0);
             assert(config.listeners.len >= 1);
             const limits = config.limits;
             // The version leads, because this banner is what a bug
             // report pastes and `--version` is what it does not think to
             // run.
-            std.debug.print(
+            try emit(sink,
                 \\zoxy {s}{s}
                 \\budgets (DESIGN.md §5/§8; closed-form except where marked):
                 \\  memory  total {d} KiB = conn slots {d} x {d} B + stream slots {d} x {d} B

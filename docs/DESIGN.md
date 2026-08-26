@@ -733,6 +733,20 @@ Rules:
   `conn_slots_max`/`upstream_slots_max` are therefore stated at *zero*
   configured listeners, and each listener a config declares spends from
   the same budget.
+- **`--check` runs that gauntlet without taking a port** (#301). Refusing
+  at startup rather than warning is the right trade, and it is also what
+  makes the pre-flight worth having: a config can be valid JSON, valid
+  semantically, and still not start *on this box* — and config is
+  parse-once immutable (§1), so the blast radius of finding that out the
+  hard way is an outage rather than a failed reload. `--check` loads the
+  config, opens every file it names, prices the pools and measures the fd
+  demand against the observed `RLIMIT_NOFILE`, prints the banner to
+  stdout and exits: `0` if it would start here, `1` if the config is
+  wrong, `2` if the config is right and this machine cannot fit it. It is
+  the same code path and not a second validator — a pre-flight that
+  agreed with the binary only by construction would be worse than none —
+  and the live gate (§9) runs it over the config it then serves, which is
+  the only place that agreement can be observed.
 - **The CQ fill is a headroom knob, not a pool shrink.**
   `limits.cq_fill_eighths` sets how many eighths of the completion queue
   the worst-case in-flight ops may fill: ⅞ (the default, the fill the c10k

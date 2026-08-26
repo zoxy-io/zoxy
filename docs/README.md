@@ -18,9 +18,10 @@ in [DESIGN.md](DESIGN.md), which the bare `§` references point at.
 The binary takes exactly one argument, the path to a JSON config:
 
 ```sh
-zoxy config.json     # start the proxy
-zoxy --help          # usage summary (-h)
-zoxy --version       # print the version (-V)
+zoxy config.json           # start the proxy
+zoxy --check config.json   # validate and price it, bind nothing (-c)
+zoxy --help                # usage summary (-h)
+zoxy --version             # print the version (-V)
 ```
 
 A release prints its bare version, `zoxy 0.0.9`. A build made from source
@@ -36,11 +37,66 @@ process prints `zoxy: invalid config '<path>': <reason>` and exits `1`. That
 is what makes the replacement procedure below safe to run against a live
 port.
 
+A config that is *valid* and still will not start here — its fd budget is
+above this machine's `RLIMIT_NOFILE` hard limit — is refused the same way,
+after the startup banner, so the numbers that refused it are on the screen
+with the reason.
+
+### Checking a config without running it
+
+`--check` is that same refusal, asked for on purpose. It loads the config,
+opens every file the config names, prices the pools and measures the fd
+demand against this machine's `RLIMIT_NOFILE` — everything a start does up
+to the banner — and then exits without binding a port:
+
+```console
+$ zoxy --check config.json
+zoxy 0.0.9
+budgets (DESIGN.md §5/§8; closed-form except where marked):
+  memory  total 47127 KiB = conn slots 1386 x 440 B + stream slots 1386 x 1448 B
+          …
+  fds     4094 required (asserted against RLIMIT_NOFILE)
+  ring    4096 entries, completion queue 8192, in-flight ops <= 6871
+  config  1 listener(s), 1 cluster(s), 0 error page(s), access log stdout
+  rlimit  RLIMIT_NOFILE 524288 soft, 524288 hard (a start raises the soft limit to the fd budget)
+  check   config.json: valid, and this box can start it
+```
+
+The output is not a bare `OK` because the interesting question is usually
+not whether the config parses. Config shape is yours to size, and a shape
+that does not fit is *refused* rather than warned about — so `--check`
+answers "will this start" and "what will it cost" with one command, and a
+CI job, a config-management dry run and a pre-deploy hook can all run it.
+
+The whole report goes to **stdout**, unlike the startup banner: a check
+run's output is its result rather than diagnostics printed beside a
+process that carries on serving. Reasons for a refusal still go to stderr,
+where every other startup refusal already writes them.
+
+| exit | meaning |
+|---|---|
+| `0` | the config loads and this machine can start it |
+| `1` | the config is wrong — unreadable, unparseable, semantically refused, or naming a file that will not load |
+| `2` | the config is right and *this machine* cannot fit it: the fd budget is above the `RLIMIT_NOFILE` hard limit |
+
+The split between `1` and `2` is what a CI job branches on. A build agent
+with a stock `RLIMIT_NOFILE` may legitimately accept `2` on a config sized
+for production; it must never accept `1`.
+
+Two things to know before wiring it into a pipeline. It does the **full**
+load, so every body, error page and certificate the config names is opened
+— which means it needs the same file permissions the proxy would, and a
+config naming production certificates cannot be checked on an agent that
+does not hold them. And an `access_log` `file` sink is created if it is
+absent, exactly as a start creates it; the alternative would be a check
+that passes on a log directory the start then cannot write.
+
 ### Signals
 
-The banner goes to stderr, and so does the `SIGUSR1` counter dump: stdout
-belongs to the access log, whose `stdout` sink must stay one uncontaminated
-JSON line per event.
+The *startup* banner goes to stderr, and so does the `SIGUSR1` counter
+dump: stdout belongs to the access log, whose `stdout` sink must stay one
+uncontaminated JSON line per event. `--check` is the exception and not a
+contradiction — it never serves, so nothing is writing that access log.
 
 | signal | effect |
 |---|---|
@@ -87,9 +143,14 @@ order:
 <!-- figure: reuseport-handoff -->
 
 ```sh
+zoxy --check new-config.json || exit 1   # refuse to proceed on a bad config
 zoxy new-config.json &   # the replacement binds the same port and starts serving
 kill -TERM "$old_pid"    # the old process drains its work, then exits 0
 ```
+
+The first line is optional and worth having: starting the replacement is
+already safe, but a `--check` that fails costs nothing and keeps a
+half-written config from ever reaching a `&`.
 
 Starting the replacement *first* is what makes this safe: a config zoxy
 refuses never reaches a listener, so the new process exits `1` with its

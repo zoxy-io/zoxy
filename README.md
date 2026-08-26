@@ -29,7 +29,8 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
 The binary takes exactly one argument, the path to a JSON config:
 
 ```sh
-zoxy config.json
+zoxy config.json           # start the proxy
+zoxy --check config.json   # validate and price it, without binding a port
 ```
 
 A minimal config — one L4 listener forwarding to one origin:
