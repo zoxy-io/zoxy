@@ -1592,7 +1592,7 @@ pub const PoolSizes = struct {
     endpoint_table_bytes: u64,
     /// The #179 labeled metrics (§8): the per-endpoint/per-cluster
     /// counter tables and their prebuilt label strings, plus the two
-    /// render staging buffers — the admin response and the SIGUSR1 dump
+    /// render staging buffers — the admin response and the exit tally
     /// — whose length became the config's when the exposition gained
     /// labels. Its own term on the issue's own argument: the cost of
     /// labelling your metrics should be visible next to everything else

@@ -668,7 +668,7 @@ are still there.
 The labeled metrics (§8, #179) add one more reservation on the same
 promise: the per-endpoint counter tables with their prebuilt label
 strings, and the two render staging buffers — the admin scrape response
-and the SIGUSR1 dump. The buffers stopped being comptime constants when
+and the exit tally. The buffers stopped being comptime constants when
 the exposition gained labels: the rendered text's length depends on
 endpoint count, cluster-name length and address literals, none known
 before config load. The term stays closed-form — `Server.metricsBytes`
@@ -1969,8 +1969,14 @@ origin, not one this proxy can pick for them.
   asserts counters reconcile (admitted = completed + shed + in-flight)
   under every seed. Counters live in `counters.zig` (§10); exposure is
   the admin/metrics listener's Prometheus rendering (`admin.zig`, one
-  reserved scrape slot off the shared pools) plus a SIGUSR1 dump through
-  the seam's `signal` primitive (§4).
+  reserved scrape slot off the shared pools), and nothing else while the
+  process serves. A SIGUSR1 dump to stderr was the second reader until
+  #310 removed it, for two reasons worth keeping written down: the
+  exposition is a *snapshot*, so a second dump on one stream repeats
+  every series and leaves a file no scraper can ingest — and it grew with
+  clusters x endpoints (#179), reaching 1.6 MB, which a blocking write on
+  a slow stderr pipe turned into a parked loop. The drain's exit tally
+  survives both objections: once per process, after `run` has returned.
 - **The exposition says which backend, not only how many** (#179,
   settled 2026-08-02). Beside the process totals, labeled families:
   per-endpoint counters for dial failures, responses served and health

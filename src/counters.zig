@@ -680,7 +680,7 @@ pub const Counters = struct {
 
     /// Render every counter and gauge as Prometheus exposition text into a
     /// caller-owned buffer (zero-alloc, §5) — the single renderer shared by
-    /// the SIGUSR1 `dump` and the admin endpoint. The buffer must be
+    /// the exit tally and the admin endpoint. The buffer must be
     /// at least `render_bytes_max`; that bound is exact, so a correctly
     /// sized caller can never truncate. Returns the filled prefix.
     ///

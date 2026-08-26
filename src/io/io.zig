@@ -73,7 +73,6 @@ pub const XevIo = @import("XevIo.zig");
 /// simulator can inject drain as just another scheduled event (§4).
 pub const Signal = enum(u8) {
     terminate,
-    dump_counters,
     /// SIGHUP: reopen the access log's file sink (§8 rotation). This is
     /// the *only* meaning SIGHUP carries — zoxy does not reload config
     /// (§1 non-goal: the §5 pools are startup-fixed, so a config change

@@ -1555,9 +1555,6 @@ fn onNotifierWake(
     if (mask & signalBit(.terminate) != 0) {
         callback(io.signal_userdata, .terminate);
     }
-    if (mask & signalBit(.dump_counters) != 0) {
-        callback(io.signal_userdata, .dump_counters);
-    }
     if (mask & signalBit(.reopen_log) != 0) {
         callback(io.signal_userdata, .reopen_log);
     }

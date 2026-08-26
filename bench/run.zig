@@ -317,7 +317,7 @@ fn forwardStderr(io: Io, child: *const std.process.Child) void {
 /// all excess shed with a correct status (5xx and accept-RSTs — the
 /// latter are the conn-slot wall, so zrk's connect errors are exempt
 /// from the health gate), bounded latency for what was admitted, and a
-/// clean drain. SIGUSR1 lands the counter dump in the run log first.
+/// clean drain. The drain's exit tally lands the counters in the run log.
 fn runOverload(
     arena: std.mem.Allocator,
     io: Io,
@@ -352,9 +352,11 @@ fn runOverload(
     printReport("zoxy overload", &report, .keep_alive);
     std.debug.print("zoxy overload RSS: {d} KiB -> {d} KiB\n", .{ rss_before_kb, rss_after_kb });
 
-    // The counter dump (sheds, pressure engagements) lands in the run
-    // log for the human band review before the drain.
-    try std.posix.kill(child.id.?, .USR1);
+    // The counters this row is read against — sheds and pressure
+    // engagements — are cumulative, so the drain's own exit tally carries
+    // them (`drainChild` forwards it to the run log). This used to send
+    // SIGUSR1 first to get them *before* the drain; that signal stopped
+    // printing anything in #310, and nothing was lost with it.
     const drained_cleanly = try drainChild(io, &child, &running, "zoxy overload");
     return overloadPassed(rss_before_kb, rss_after_kb, &report, drained_cleanly);
 }
