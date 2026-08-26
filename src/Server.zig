@@ -133,7 +133,7 @@ pub fn Server(comptime IoType: type) type {
         /// also moves the matching bare counter, and `reconcile` holds
         /// the partitions equal.
         labeled: counters_module.Labeled,
-        /// Staging for the SIGUSR1/post-drain metrics dump (§8): the
+        /// Staging for the §8 exit tally: the
         /// full exposition — counters then labeled — no longer fits a
         /// fixed stack buffer once its length is the config's, so it is
         /// arena memory priced in the banner (`metricsBytes`).
@@ -1369,17 +1369,43 @@ pub fn Server(comptime IoType: type) type {
         fn onSignal(server: *Self, signal: Io.Signal) void {
             switch (signal) {
                 .terminate => server.beginDrain(),
-                .dump_counters => server.dumpMetrics(),
                 .reopen_log => server.access_log.requestReopen(),
             }
         }
 
-        /// The SIGUSR1 / post-drain §8 dump: the exact exposition the
-        /// scrape serves — counters then the labeled breakdown — through
-        /// the same two renderers, so the dump and the endpoint can never
-        /// disagree on the wire format. Staged in the arena buffer sized
-        /// for both at init; one print, so the two halves cannot
-        /// interleave with other stderr writers.
+        /// The §8 exit tally: the exact exposition the scrape serves —
+        /// counters then the labeled breakdown — through the same two
+        /// renderers, so the dump and the endpoint can never disagree on
+        /// the wire format. Staged in the arena buffer sized for both at
+        /// init; one print, so the two halves cannot interleave with
+        /// other stderr writers.
+        ///
+        /// Blocking, and that is now a property of *where it runs* rather
+        /// than a hazard (#310). SIGUSR1 used to call it from a live loop,
+        /// which is what #310 was — a dump that reached 1.6 MB on a stderr
+        /// pipe parked the whole proxy in one `writev`. The signal no
+        /// longer carries this; `/metrics` does, framed as a response and
+        /// non-blocking.
+        ///
+        /// The two callers left are both past the point a stall can cost
+        /// anything, for two *different* reasons:
+        ///
+        ///   - `main` prints the final tally after `run` has returned, so
+        ///     there is no loop to park and no op that could complete.
+        ///   - `reportStuckDrain` runs immediately before an unconditional
+        ///     `abort`: the process is already committed to a hard exit,
+        ///     so there is no serving left to delay. And a stall there is
+        ///     bounded rather than open-ended — the alarm watchdog
+        ///     (`armDrainWatchdog`) is not an op the loop delivers, so it
+        ///     fires through a blocked `writev` and ends the process.
+        ///     Deliberately *not* the argument that the loop has stopped
+        ///     delivering: `onDrainStuck` is itself a timer completion the
+        ///     loop delivered, which is the whole reason the alarm exists
+        ///     beside it (#226).
+        ///
+        /// Called *once* per process either way, which is what keeps the
+        /// output honest: Prometheus exposition is a snapshot, so two of
+        /// them concatenated repeat every series and parse as neither.
         pub fn dumpMetrics(server: *const Self) void {
             assert(server.dump_buffer.len >= counters_module.Counters.render_bytes_max);
             const snapshot = server.gauges();
@@ -3336,7 +3362,7 @@ pub fn Server(comptime IoType: type) type {
         }
 
         /// The live occupancy of all three pools, read straight off them
-        /// for a scrape or a SIGUSR1 dump (§8). The only producer of
+        /// for a scrape or the exit tally (§8). The only producer of
         /// `Counters.Gauges` — nothing mirrors these levels, so nothing
         /// can disagree with the pool it reports.
         ///

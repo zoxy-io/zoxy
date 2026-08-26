@@ -651,10 +651,13 @@ const help_text =
     \\above the RLIMIT_NOFILE hard limit).
     \\
     \\Signals:
-    \\  SIGTERM, SIGINT   Drain in-flight connections, then exit 0.
-    \\  SIGUSR1           Dump counters to stderr.
+    \\  SIGTERM, SIGINT   Drain in-flight connections, then exit 0. The
+    \\                    counters are printed once on the way out.
     \\  SIGHUP            Reopen the access log's file sink (rotation).
     \\                    No other meaning: config changes are a restart.
+    \\  SIGUSR1           Ignored. It printed the counters until they moved
+    \\                    to the admin listener's /metrics, which frames each
+    \\                    rendering as its own response.
     \\
 ;
 
@@ -737,9 +740,8 @@ fn installSignalHandlers() void {
     };
     std.posix.sigaction(.TERM, &action, null);
     std.posix.sigaction(.INT, &action, null);
-    std.posix.sigaction(.USR1, &action, null);
     std.posix.sigaction(.HUP, &action, null);
-    // §8's drain watchdog (#226). Unlike the four above, this one never
+    // §8's drain watchdog (#226). Unlike the three above, this one never
     // reaches the loop: every other bound in the proxy is an op the loop
     // delivers, which makes them all blind to a backend that has stopped
     // delivering — including `onDrainStuck`, the backstop for exactly
@@ -769,6 +771,14 @@ fn installSignalHandlers() void {
         .flags = 0,
     };
     std.posix.sigaction(.PIPE, &ignore, null);
+    // SIGUSR1 carried the counter dump until #310 removed it, and its
+    // default disposition is *terminate*. Dropping the handler without
+    // this line would turn an operator's muscle memory — the signal that
+    // used to print counters — into an outage. Ignored rather than
+    // handled, because there is nothing left for it to mean: the
+    // exposition it used to write is what `/metrics` serves, framed and
+    // scrapeable, and the drain still prints the final tally.
+    std.posix.sigaction(.USR1, &ignore, null);
 }
 
 /// Async-signal-safe by delegation: the seam's handler is one `write` and
@@ -788,7 +798,6 @@ fn onAlarm(signal_number: std.posix.SIG) callconv(.c) void {
 fn onRawSignal(signal_number: std.posix.SIG) callconv(.c) void {
     const signal: zoxy.Io.Signal = switch (signal_number) {
         .TERM, .INT => .terminate,
-        .USR1 => .dump_counters,
         .HUP => .reopen_log,
         else => return,
     };

@@ -139,7 +139,7 @@ pub const Config = struct {
     /// and that is the point — a multi-endpoint cluster with no failure
     /// detection is legitimate behind a mesh, or when the endpoints are
     /// themselves VIPs, so warning every startup would teach operators
-    /// to ignore the stream the banner and the `SIGUSR1` dump share.
+    /// to ignore the stream the banner and the exit tally share.
     ///
     /// Clusters with fewer than two endpoints a request could actually
     /// be sent to are excluded deliberately: there is nowhere to eject

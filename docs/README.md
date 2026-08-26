@@ -93,20 +93,32 @@ that passes on a log directory the start then cannot write.
 
 ### Signals
 
-The *startup* banner goes to stderr, and so does the `SIGUSR1` counter
-dump: stdout belongs to the access log, whose `stdout` sink must stay one
-uncontaminated JSON line per event. `--check` is the exception and not a
-contradiction — it never serves, so nothing is writing that access log.
+The startup banner goes to stderr, and so does the exit tally: stdout
+belongs to the access log, whose `stdout` sink must stay one uncontaminated
+JSON line per event. `--check` is the exception and not a contradiction —
+it never serves, so nothing is writing that access log.
 
 | signal | effect |
 |---|---|
 | `SIGTERM`, `SIGINT` | drain in-flight connections, then exit 0 |
-| `SIGUSR1` | dump counters to stderr |
 | `SIGHUP` | reopen the access log's `file` sink — rotation, and nothing else |
+| `SIGUSR1` | ignored |
 
 A completed drain prints the counters one last time on its way out, so a
 process that exited cleanly leaves its final tally behind without anyone
-having to have scraped it.
+having to have scraped it. A drain that gets *stuck* prints them too,
+beside the diagnostic naming which plane never finished — those two are
+the only paths that put counters on stderr, and both run once, at the end
+of a process. The reason it is not more than that is the format:
+Prometheus exposition is a snapshot, so two of them written to one stream
+repeat every series and parse as neither. Live counters come from
+[`/metrics`](#metrics), which frames each rendering as its own response.
+
+> [!NOTE]
+> `SIGUSR1` used to dump counters here and no longer does. It is
+> explicitly *ignored* rather than left unhandled, because its default
+> disposition is to terminate — an operator's muscle memory must not
+> become an outage.
 
 ### A minimal config
 
@@ -1134,8 +1146,9 @@ every lifecycle counter, and live pool-occupancy gauges:
 ```
 
 One scrape is served at a time from a slot reserved outside the data-path
-pools, so a scrape and a request can never shed one another. `SIGUSR1` dumps
-the same rendering to stderr, which needs no listener at all.
+pools, so a scrape and a request can never shed one another. This listener
+is how live counters are read: there is no signal that prints them, because
+a second snapshot on one stream invalidates the first.
 
 The gauges matter as much as the counters: a `shed_*` counter only moves once
 a wall is *hit*, while `zoxy_conn_slots_in_use` against
