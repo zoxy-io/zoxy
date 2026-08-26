@@ -771,6 +771,27 @@ Rules:
   also what unblocks L4 SNI routing (#298): an `l4` route table and an
   `http` one are different types in different bodies, so `Route.prefix`
   stays non-optional.
+- **`tls` means terminate on a listener and originate on a cluster**
+  (#305). One key at both levels with disjoint field sets, the side read
+  from position — which is the `proxy_protocol` precedent already in the
+  tree, where `{mode}` on a listener receives and `{send}` on a cluster
+  sends. Inside the listener's block, #297's certificate set is a
+  `certificates` list and #304's `client_ca` is that list's sibling
+  rather than a certificate's, because verifying a peer is per-listener
+  and not per-credential; writing #304 against today's one-pair shape
+  would mean relocating a field it had just added. The cluster's block
+  carries the server name to verify and send as SNI, which §7's endpoints
+  cannot supply — they are resolved addresses, and an address is not an
+  identity. Decided here, implemented with the features that need it: a
+  key with no feature behind it is not a freeze, it is a promise.
+- **An address is a string, and `unix:` extends its grammar** (#303,
+  #305). `bind` and `endpoints` stay single scalars rather than becoming
+  tagged objects or gaining a second key — they are the two most-written
+  fields in any config, nginx and HAProxy already spell a socket path
+  this way, and a `unix:` prefix cannot collide with an IP literal. The
+  endpoint object form that carries a #174 weight is unaffected, so the
+  grammar grows at one parse site and nothing that parses today changes
+  shape.
 - **The config arena is the only allocating region** — parse-once,
   immutable, shared read-only. (Carried verbatim; it worked.)
 - **The config surface has a generated JSON Schema.** `zig build schema`
