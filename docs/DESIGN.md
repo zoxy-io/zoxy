@@ -766,10 +766,16 @@ Rules:
   release-only asset, never committed (so it cannot drift); the emitter's
   tests run under `zig build ci`, and `assert_meta_matches` fails the build
   if a field lacks schema metadata. It intentionally stops at what JSON
-  Schema can express: the loader's semantic checks (canonical
-  prefixes/hosts, address literals, reserved header names, port ≠ 0) and
-  the "exactly one of" forks stay the loader's job, so passing the schema
-  means well-shaped, not accepted. The one concession strictness makes to
+  Schema can express — but where that line sits is a decision, not a
+  property of JSON Schema, and it has moved once. The three "exactly one
+  of" forks (a listener's `cluster`/`routes`, a header predicate's kind, a
+  filter action's kind) were conceded in prose for as long as nothing
+  emitted `oneOf`; they are emitted now (#305), and the emitter's tests
+  hold the remaining concessions at a counted number, so a new one has
+  to be deliberate rather than quiet. What stays the loader's is what is
+  genuinely semantic: canonical prefixes and hosts, address literals,
+  reserved header names, port ≠ 0. Passing the schema still means
+  well-shaped, not accepted. The one concession strictness makes to
   the schema is a root `$schema` key: it is a declared, optional field that
   the loader parses and ignores, so an editor can point a config at the
   document without the proxy refusing to start over the pointer. It buys no

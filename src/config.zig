@@ -1978,7 +1978,8 @@ pub const ListenerJson = struct {
 
     pub const schema_doc =
         "One accepting socket. Exactly one of `cluster` or `routes` selects " ++
-        "the upstream — that fork is enforced by the loader, not this schema.";
+        "the upstream.";
+    pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
     pub const schema_fields = .{
         .bind = .{ .desc = "IP:port literal to bind (hostnames are rejected — DNS is a non-goal)." },
         .cluster = .{ .desc = "Sugar for a single catch-all route to this cluster; mutually exclusive with routes." },
@@ -2146,7 +2147,8 @@ pub const HeaderMatchJson = struct {
 
     pub const schema_doc =
         "One header predicate. Exactly one of `present`/`equals`/`contains` " ++
-        "selects the kind — that fork is enforced by the loader.";
+        "selects the kind.";
+    pub const schema_one_of = [_][]const u8{ "present", "equals", "contains" };
     pub const schema_fields = .{
         .name = .{ .desc = "Header field name (matched case-insensitively)." },
         .present = .{
@@ -2174,8 +2176,16 @@ pub const ActionJson = struct {
     rewrite_prefix: ?RewriteJson = null,
 
     pub const schema_doc =
-        "One filter action. Exactly one field is set — the action's kind — " ++
-        "and that fork is enforced by the loader.";
+        "One filter action. Exactly one field is set — the action's kind.";
+    pub const schema_one_of = [_][]const u8{
+        "reject",
+        "redirect",
+        "respond",
+        "header_set",
+        "header_add",
+        "header_remove",
+        "rewrite_prefix",
+    };
     pub const schema_fields = .{
         .reject = .{
             .desc = "Reject the request with this status code.",
@@ -2984,6 +2994,50 @@ pub fn assert_meta_matches(comptime T: type) void {
             }
             if (!known) {
                 @compileError(@typeName(T) ++ "." ++ entry_field.name ++ " has unknown schema attribute '" ++ attr.name ++ "'");
+            }
+        }
+    }
+    assertOneOfMatches(T);
+}
+
+/// A DTO's optional `schema_one_of` — the fields of which exactly one may
+/// be present — held to the shape the emitter turns into JSON Schema's
+/// `oneOf`.
+///
+/// The checks are what make the emitted fork *true* rather than merely
+/// present. A name that is not a field would emit a branch nothing can
+/// satisfy; a name that is a *required* field (no Zig default) is already
+/// in `required`, so every branch would match at once and `oneOf` — which
+/// means exactly one — would reject every config. Both are silent in JSON
+/// Schema and loud here.
+fn assertOneOfMatches(comptime T: type) void {
+    if (!@hasDecl(T, "schema_one_of")) return;
+    const names = T.schema_one_of;
+    // A fork needs two arms. One would be a plain `required` entry, which
+    // the emitter already derives, and zero is not a fork at all.
+    if (names.len < 2) {
+        @compileError(@typeName(T) ++ " schema_one_of needs at least two fields");
+    }
+    inline for (names, 0..) |name, index| {
+        if (!@hasField(T, name)) {
+            @compileError(@typeName(T) ++ " schema_one_of names '" ++ name ++ "', which is not a field");
+        }
+        // A name listed twice emits two identical branches, and a config
+        // setting that one field then satisfies *both* — so "exactly one"
+        // would reject every valid config for this DTO. Compiles cleanly
+        // and is invisible in the schema, which is the whole reason this
+        // function exists.
+        inline for (names[0..index]) |earlier| {
+            if (comptime std.mem.eql(u8, earlier, name)) {
+                @compileError(@typeName(T) ++ " schema_one_of names '" ++ name ++ "' twice");
+            }
+        }
+        inline for (@typeInfo(T).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, name)) {
+                if (comptime field.defaultValue() == null) {
+                    @compileError(@typeName(T) ++ ".schema_one_of names '" ++ name ++
+                        "', which is required — every arm would match and the fork would reject everything");
+                }
             }
         }
     }

@@ -11,11 +11,13 @@
 //!
 //! What JSON Schema *can* express is emitted: structure, `required`,
 //! `additionalProperties: false` (the parser rejects unknown fields), enums,
-//! and numeric ranges. What it *cannot* — the loader's semantic validations
-//! (canonical route prefixes/hosts, IP:port literal parsing, reserved header
-//! names, endpoint port != 0) and the "exactly one of" forks (listener
-//! cluster/routes, header-match kind, action kind) — stays the loader's job.
-//! A config that passes this schema is well-shaped, not necessarily accepted.
+//! numeric ranges, and the "exactly one of" forks — listener
+//! `cluster`/`routes`, header-match kind, action kind — as `oneOf`
+//! (`writeOneOf`, #305). What it *cannot* is the loader's semantic
+//! validation: canonical route prefixes and hosts, IP:port literal parsing,
+//! reserved header names, endpoint port != 0. Those stay the loader's job,
+//! so a config that passes this schema is well-shaped, not necessarily
+//! accepted — but the gap is now only what is genuinely semantic.
 
 const std = @import("std");
 
@@ -92,6 +94,42 @@ fn writeObjectBody(out: *Stringify, comptime T: type, comptime with_doc: bool) W
 
     try out.objectField("additionalProperties");
     try out.write(false);
+
+    try writeOneOf(out, T);
+}
+
+/// Emit a DTO's "exactly one of these fields" fork as `oneOf`, one
+/// `required` branch per name.
+///
+/// `oneOf` means *exactly* one branch matches, which is the rule itself:
+/// a config naming two of the fields satisfies two branches and a config
+/// naming none satisfies none, so both are rejected without the schema
+/// having to describe why. Three DTOs share this shape — the listener's
+/// `cluster`/`routes`, a header predicate's kind, a filter action's kind
+/// — and each used to concede the rule in prose ("enforced by the
+/// loader, not this schema"). They are the cheap third of #305's eight
+/// admissions: expressible all along, just never expressed.
+///
+/// The branches carry no `properties` of their own, so the enclosing
+/// `additionalProperties: false` is unaffected — in draft 2020-12 that
+/// keyword only considers `properties` declared in the same schema
+/// object, never a sibling subschema's.
+fn writeOneOf(out: *Stringify, comptime T: type) Writer.Error!void {
+    if (!@hasDecl(T, "schema_one_of")) return;
+    // `assertOneOfMatches` proved this at comptime; restated where the
+    // loop below depends on it.
+    comptime assert(T.schema_one_of.len >= 2);
+    try out.objectField("oneOf");
+    try out.beginArray();
+    inline for (T.schema_one_of) |name| {
+        try out.beginObject();
+        try out.objectField("required");
+        try out.beginArray();
+        try out.write(name);
+        try out.endArray();
+        try out.endObject();
+    }
+    try out.endArray();
 }
 
 /// Emit one field's schema object: its `description` (from metadata),
@@ -594,6 +632,83 @@ test "config_schema: response filter status bounds and class vocabulary" {
     try std.testing.expectEqual(@as(usize, 5), class_values.items.len);
     try std.testing.expectEqualStrings("1xx", class_values.items[0].string);
     try std.testing.expectEqualStrings("5xx", class_values.items[4].string);
+}
+
+test "config_schema: every exactly-one-of fork is emitted, and names real properties" {
+    var buffer: [64 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+
+    const listener = parsed.value.object.get("properties").?.object
+        .get("listeners").?.object.get("items").?.object;
+    try expectOneOf(&listener, config.ListenerJson.schema_one_of.len);
+
+    const filter_item = listener.get("properties").?.object
+        .get("request_filters").?.object.get("items").?.object;
+    const action = filter_item.get("properties").?.object
+        .get("actions").?.object.get("items").?.object;
+    try expectOneOf(&action, config.ActionJson.schema_one_of.len);
+    const header_match = filter_item.get("properties").?.object
+        .get("match").?.object.get("properties").?.object
+        .get("headers").?.object.get("items").?.object;
+    try expectOneOf(&header_match, config.HeaderMatchJson.schema_one_of.len);
+}
+
+/// One fork, checked the way a validator would read it: an arm per
+/// declared name, each arm requiring exactly that one field, and every
+/// named field actually declared as a property of the same object.
+///
+/// The last part is the one worth the code. A `oneOf` naming a field the
+/// object does not declare is not an error in JSON Schema — combined
+/// with `additionalProperties: false` it is a branch nothing can ever
+/// satisfy, so the fork would silently reject every config instead of
+/// forking them.
+fn expectOneOf(object: *const std.json.ObjectMap, arms_expected: usize) !void {
+    const arms = object.get("oneOf").?.array;
+    try std.testing.expectEqual(arms_expected, arms.items.len);
+    const properties = object.get("properties").?.object;
+    for (arms.items) |arm| {
+        const required = arm.object.get("required").?.array;
+        try std.testing.expectEqual(@as(usize, 1), required.items.len);
+        const name = required.items[0].string;
+        try std.testing.expect(properties.contains(name));
+        // And it must not *also* be in the object's own `required`: a
+        // field required outright is set in every config, so every arm
+        // would match at once and "exactly one" would reject them all.
+        for (object.get("required").?.array.items) |already| {
+            try std.testing.expect(!std.mem.eql(u8, already.string, name));
+        }
+    }
+}
+
+test "config_schema: no DTO concedes a rule the schema now expresses" {
+    // #305's measurable definition of done, held at the count it is
+    // actually at. Every "enforced by the loader" sentence in the emitted
+    // document is a cross-field rule a shape could have carried instead —
+    // the forks were the expressible third and are gone, so what is left
+    // must be genuinely semantic. A new concession has to move this
+    // number deliberately rather than accumulate quietly.
+    var buffer: [64 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(text, "enforced by the loader, not this schema"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences(text, "that fork is enforced by the loader"));
+    // The one remaining, and it is the honest one: the root's note that
+    // canonical prefixes, address literals and reserved header names are
+    // semantic checks no JSON Schema can carry.
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(text, "enforced by the loader"));
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    assert(needle.len >= 1);
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, offset, needle)) |at| {
+        assert(at >= offset);
+        count += 1;
+        offset = at + needle.len;
+    }
+    return count;
 }
 
 test "config_schema: the method enum matches what the parser accepts" {
