@@ -99,6 +99,11 @@ const loop_bound_lookahead_lines: u32 = 6;
 const main_allowed_members = [_][]const u8{
     "getrlimit",
     "setrlimit",
+    // The two types `getrlimit` answers in, so a reported limit can be
+    // held and rendered without the value leaving the allowlist.
+    "rlimit",
+    "rlim_t",
+    "RLIM",
     "sigaction",
     "Sigaction",
     "sigemptyset",

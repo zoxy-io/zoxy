@@ -6,6 +6,13 @@
 //! until a drain completes. `--help` and `--version` are answered before any
 //! of that and exit immediately.
 //!
+//! `--check` (#301) is that same sequence stopped one step short: it loads
+//! the config, opens every file the config names, prices the pools and
+//! measures the demand against this box's `RLIMIT_NOFILE` — then reports
+//! and exits without binding a port. Deliberately the same code and not a
+//! second validator: a pre-flight that agreed with the real binary only by
+//! construction would be worse than not having one.
+//!
 //! This file is the *application* — the CLI, the filesystem, and the two
 //! process-level syscalls. Everything an embedder would need identically
 //! is the library's (§13): the budget's closed form and banner live in
@@ -71,26 +78,39 @@ fn buildIdSuffix(comptime version: []const u8, comptime id: []const u8) []const 
 /// the loop lives for the whole process (§3).
 var global_io: XevIo = undefined;
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(arena);
-    const config_path = switch (classifyArgs(args)) {
-        .run => |path| path,
+    assert(args.len >= 1); // argv always carries the program name at [0].
+    switch (classifyArgs(args)) {
+        .run => |path| {
+            try serve(init, arena, path);
+            return 0;
+        },
+        // The one mode with more than one non-zero answer, so it returns
+        // its own code rather than an error (#301).
+        .check => |path| return checkConfig(init, arena, path),
         .help => {
             try printHelp(init.io);
-            return;
+            return 0;
         },
         .version => {
             try printVersion(init.io);
-            return;
+            return 0;
         },
         .usage => |reason| {
             printUsageError(reason);
             return error.InvalidArguments;
         },
-    };
+    }
+}
 
+/// Start the proxy and hand the process to the loop until a drain
+/// completes — the module doc's sequence, and the only mode that takes a
+/// port.
+fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const u8) !void {
+    assert(config_path.len >= 1);
     // Measured across the read, not assumed from the file size: the
     // parse allocates its own structures beside the text it parses, and
     // both live in the arena for the process's life (§5).
@@ -98,23 +118,30 @@ pub fn main(init: std.process.Init) !void {
     const config = try readConfig(init.io, arena, config_path);
     const config_arena_bytes = init.arena.queryCapacity() - arena_before;
 
-    const cq_entries = try resolveBudgets(&config, config_arena_bytes);
-    const log_sink_fd = try openLogSinkFd(&config);
-    // Certificates before the loop, on `openLogSinkFd`'s reasoning: the
-    // config named a file, so open it while a failure can still name it
-    // and stop the process, rather than surfacing as a broken connection
-    // under traffic (§4).
-    const tls_credentials = try loadTlsCredentials(init.io, arena, &config);
+    const demands = BudgetXev.demandsFor(&config);
+    // The closed form and the banner are the library's (`budget.zig`,
+    // §13): they have to price exactly what `Server.init` reserves, and
+    // a second derivation here would be a copy that could drift.
+    //
+    // Printed *before* the box is asked for anything, so a start the fd
+    // budget refuses still leaves behind the numbers that refused it —
+    // `--check` prints whatever its verdict for the same reason (#301),
+    // and the two modes agreeing on that is the point.
+    BudgetXev.print(&config, demands, config_arena_bytes, .{
+        .version = build_options.version,
+        .id_suffix = build_id_suffix,
+    });
+    const resources = try openStartupResources(init.io, arena, &config, demands);
 
     // The ring is the config's to size (§5), count and unit both;
     // Server.init asserts its own accounting against the same numbers.
     try global_io.init(
         arena,
-        cq_entries,
+        demands.cq_entries,
         @intCast(config.listeners.len),
         config.limits.head_buffers,
         config.limits.head_buffer_bytes,
-        log_sink_fd,
+        resources.log_sink_fd,
         // The path rides beside its fd so SIGHUP can reopen it (§8).
         if (config.access_log_sink) |sink| switch (sink) {
             .stdout => null,
@@ -123,8 +150,8 @@ pub fn main(init: std.process.Init) !void {
     );
     var server: ServerXev = undefined;
     try server.init(arena, &global_io, &config, config.limits);
-    if (tls_credentials.len > 0) {
-        server.setTlsCredentials(tls_credentials);
+    if (resources.tls_credentials.len > 0) {
+        server.setTlsCredentials(resources.tls_credentials);
     }
     try server.start();
     installSignalHandlers();
@@ -136,27 +163,226 @@ pub fn main(init: std.process.Init) !void {
     server.dumpMetrics();
 }
 
-/// The §5/§8 startup budget gauntlet. The closed form and the banner are
-/// the library's (`budget.zig`, §13) — they have to price exactly what
-/// `Server.init` reserves, and a second derivation here would be a copy
-/// that could drift. What stays is what only an application may do: raise
-/// `RLIMIT_NOFILE` to the demand. Returns the CQ depth the ring must be
-/// created with.
-fn resolveBudgets(
+/// Everything a start takes from the box before the loop exists.
+const StartupResources = struct {
+    /// The fd `XevIo` writes access-log bytes to (§8).
+    log_sink_fd: @TypeOf(XevIo.log_sink_stdout),
+    /// One slot per listener, null where the listener is plaintext —
+    /// empty when nothing terminates TLS.
+    tls_credentials: []const ?zoxy.tls.Credentials,
+};
+
+/// The §5/§8 startup gauntlet: raise `RLIMIT_NOFILE` to the demand, open
+/// the access log's sink, load every listener's certificate. What only an
+/// application may do, in the order it must do it.
+///
+/// One function rather than two hand-synced sequences, because the order
+/// is itself a *verdict*: a config that fails two of these earns the
+/// answer of whichever a start reaches first, and `--check` (#301)
+/// reports that answer as an exit code an operator branches on — `1` says
+/// change the file, `2` says run it elsewhere. `serve` and
+/// `checkStartFits` both call this, so the two cannot drift and no
+/// comment has to guard that they don't.
+fn openStartupResources(
+    io: std.Io,
+    arena: std.mem.Allocator,
     config: *const zoxy.config.Config,
-    config_arena_bytes: u64,
-) !u32 {
+    demands: BudgetXev.Demands,
+) !StartupResources {
     assert(config.listeners.len >= 1);
-    const demands = BudgetXev.demandsFor(config);
+    assert(demands.fds > 0);
+    // `demandsFor` bounds this from above but never from below, and a
+    // zero is a closed form that broke upstream: `serve` creates the
+    // ring at this depth, and a ring that deep completes nothing.
+    assert(demands.cq_entries > 0);
+    // fds are pre-budgeted rather than shed (§8), so this is both the
+    // first thing the box can refuse and the first thing asked of it.
     try ensureFdBudget(demands.fds);
-    BudgetXev.print(config, demands, config_arena_bytes, .{
+    const log_sink_fd = try openLogSinkFd(config);
+    // Certificates before the loop, on `openLogSinkFd`'s reasoning: the
+    // config named a file, so open it while a failure can still name it
+    // and stop the process, rather than surfacing as a broken connection
+    // under traffic (§4).
+    const tls_credentials = try loadTlsCredentials(io, arena, config);
+    assert(tls_credentials.len == 0 or tls_credentials.len == config.listeners.len);
+    return .{ .log_sink_fd = log_sink_fd, .tls_credentials = tls_credentials };
+}
+
+/// What `--check` exits with (#301). Three answers rather than two,
+/// because the difference is what a CI job acts on: a build agent with a
+/// small `RLIMIT_NOFILE` may legitimately accept `does_not_fit` on a
+/// config sized for production, and must never accept `invalid_config`.
+const CheckExit = enum(u8) {
+    /// The config loads and this box can start it.
+    ok = 0,
+    /// The config is wrong: unreadable, unparseable, semantically
+    /// refused, or naming a file that will not load. A path the process
+    /// cannot open counts as the config's own, deliberately — the
+    /// operator has to change something either way, and a CI job that
+    /// does not hold the deployment's certificates should check a config
+    /// that does not name them rather than learn to ignore a code that
+    /// also covers a real mistake.
+    invalid_config = 1,
+    /// The config is right and this machine is what refused it: the fd
+    /// budget is above `RLIMIT_NOFILE`'s hard limit, the startup arena
+    /// could not be had, or libcrypto would not take the fixed heap
+    /// (§5). The same file would start elsewhere.
+    does_not_fit = 2,
+};
+
+/// Which of the two failing verdicts a load error is. The question this
+/// answers is not whose fault the failure is but what the operator does
+/// next: change the config, or run it somewhere else.
+fn checkExitFor(err: anyerror) CheckExit {
+    return switch (err) {
+        error.OutOfMemory,
+        error.FdBudgetUnsatisfiable,
+        error.LibcryptoHeapUnavailable,
+        => .does_not_fit,
+        else => .invalid_config,
+    };
+}
+
+/// `--check` (#301): everything `serve` does up to the banner, and
+/// nothing that takes a port.
+///
+/// zoxy needs this more than its peers do, because two of its virtues
+/// make a bad config expensive. Config shape is the operator's to size
+/// (§5) and a shape that does not fit is *refused*, not warned about; and
+/// config is parse-once immutable (§1), so the blast radius of a bad one
+/// is not a failed reload but an outage. This is the pre-flight that pays
+/// for both, and the reason it is a mode rather than a tool is that a
+/// second validator could disagree with the binary.
+fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []const u8) !u8 {
+    assert(config_path.len >= 1);
+    const arena_before = init.arena.queryCapacity();
+    // The one failure with no budget to report: nothing was loaded, so
+    // there is no config to price and this arm answers without a banner.
+    const config = readConfig(init.io, arena, config_path) catch |err|
+        return @intFromEnum(checkExitFor(err));
+    const config_arena_bytes = init.arena.queryCapacity() - arena_before;
+    const demands = BudgetXev.demandsFor(&config);
+    assert(demands.fds > 0);
+
+    // Read before the gauntlet below: `ensureFdBudget` raises the soft
+    // limit toward the demand, so asking afterwards would report what
+    // this check just did rather than what it found.
+    const nofile = try std.posix.getrlimit(.NOFILE);
+    const verdict = checkStartFits(init.io, arena, &config, demands);
+    try writeCheckReport(init.io, &.{
+        .config = &config,
+        .demands = demands,
+        .config_arena_bytes = config_arena_bytes,
+        .config_path = config_path,
+        .nofile = nofile,
+        .verdict = verdict,
+    });
+    return @intFromEnum(verdict);
+}
+
+/// Ask the box for exactly what a start asks it for, and give it back.
+///
+/// The gauntlet is `openStartupResources`, unchanged and unbranched — a
+/// check that ran its own sequence could reach a different verdict than
+/// the start it predicts, which is the way #301 warns a pre-flight can be
+/// worse than none. Every arm names its own reason on stderr on the way
+/// out (§5's rule that a path which cannot open stops the process), so
+/// what comes back here is only the verdict.
+fn checkStartFits(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    config: *const zoxy.config.Config,
+    demands: BudgetXev.Demands,
+) CheckExit {
+    assert(config.listeners.len >= 1);
+    assert(demands.fds > 0);
+    const resources = openStartupResources(io, arena, config, demands) catch |err|
+        return checkExitFor(err);
+    // Given straight back, because a check holds nothing. The `file`
+    // sink was still *created* if it was absent, exactly as a start
+    // creates it: the alternative is a check that passes on a log
+    // directory the start then cannot write.
+    if (resources.log_sink_fd != XevIo.log_sink_stdout) {
+        XevIo.closeLogSink(resources.log_sink_fd);
+    }
+    return .ok;
+}
+
+/// What a check run prints: the priced config, the verdict it earned, and
+/// the two facts only a check has — the file it was asked about, and the
+/// `RLIMIT_NOFILE` it found on the way in.
+const CheckReport = struct {
+    config: *const zoxy.config.Config,
+    demands: BudgetXev.Demands,
+    config_arena_bytes: u64,
+    config_path: []const u8,
+    nofile: std.posix.rlimit,
+    verdict: CheckExit,
+};
+
+/// A check run's whole output, to **stdout** — unlike the startup banner,
+/// which is diagnostics printed beside a process that then goes on to
+/// serve. Here there is nothing beside: the budget *is* the result, so an
+/// operator redirecting it into a file or a CI artifact must get it
+/// rather than an empty one. The reasons for a failure still go to
+/// stderr, where every other startup refusal already writes them.
+///
+/// Printed whatever the verdict, and that is the point of #301: a budget
+/// that does not fit is exactly the one whose numbers an operator needs
+/// in front of them.
+fn writeCheckReport(io: std.Io, report: *const CheckReport) !void {
+    assert(report.config_path.len >= 1);
+    assert(report.nofile.max >= report.nofile.cur);
+    // The writer drains to stdout whenever this staging buffer fills, so
+    // its size is a batching choice, not a cap on the banner's length.
+    var buffer: [1024]u8 = undefined;
+    var file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
+    const writer = &file_writer.interface;
+    try BudgetXev.printTo(writer, report.config, report.demands, report.config_arena_bytes, .{
         .version = build_options.version,
         .id_suffix = build_id_suffix,
     });
-    // What the ring is created with, so a zero would be a loop that can
-    // complete nothing — the closed form broke upstream of here.
-    assert(demands.cq_entries > 0);
-    return demands.cq_entries;
+    var soft_buffer: [rlimit_text_bytes]u8 = undefined;
+    var hard_buffer: [rlimit_text_bytes]u8 = undefined;
+    try writer.print(
+        \\  rlimit  RLIMIT_NOFILE {s} soft, {s} hard (a start raises the soft limit to the fd budget)
+        \\  check   {s}: {s}
+        \\
+    , .{
+        rlimitText(report.nofile.cur, &soft_buffer),
+        rlimitText(report.nofile.max, &hard_buffer),
+        report.config_path,
+        checkVerdictText(report.verdict),
+    });
+    try writer.flush();
+}
+
+/// The verdict as the line an operator reads. The switch is exhaustive
+/// over `CheckExit`, so a fourth verdict is a compile error rather than a
+/// check that reports nothing — no runtime guard adds anything.
+fn checkVerdictText(verdict: CheckExit) []const u8 {
+    return switch (verdict) {
+        .ok => "valid, and this box can start it",
+        .invalid_config => "refused; the reason is on stderr",
+        .does_not_fit => "valid, but this box cannot start it; the reason is on stderr",
+    };
+}
+
+/// The widest a limit renders: `RLIM_INFINITY` is the largest `rlim_t`,
+/// and every other value is shorter.
+const rlimit_text_bytes = std.fmt.count("{d}", .{std.math.maxInt(std.posix.rlim_t)});
+
+/// One `RLIMIT_NOFILE` bound as an operator reads it. `RLIM_INFINITY`
+/// renders as 18446744073709551615, which reads as a bug rather than as
+/// "no limit", so it gets the word instead.
+fn rlimitText(value: std.posix.rlim_t, buffer: []u8) []const u8 {
+    assert(buffer.len == rlimit_text_bytes);
+    if (value == std.posix.RLIM.INFINITY) return "unlimited";
+    // The assert above covers every `rlim_t`, which is what makes the
+    // buffer wide enough for whatever this value is.
+    const rendered = std.fmt.bufPrint(buffer, "{d}", .{value}) catch unreachable;
+    assert(rendered.len <= rlimit_text_bytes);
+    return rendered;
 }
 
 /// The §8 access-log sink as the fd `XevIo` will write: the inherited
@@ -349,11 +575,12 @@ fn readBodyFile(
     };
 }
 
-/// What the command line asked for: run against a config, or one of the
-/// two informational modes, or a usage mistake (with the reason so the
-/// message can be specific).
+/// What the command line asked for: run against a config, check one
+/// without running it (#301), or one of the two informational modes, or a
+/// usage mistake (with the reason so the message can be specific).
 const Cli = union(enum) {
     run: []const u8,
+    check: []const u8,
     help,
     version,
     usage: UsageError,
@@ -362,9 +589,11 @@ const Cli = union(enum) {
 const UsageError = enum { missing_config, extra_arguments, unknown_option };
 
 /// Classify argv without touching the world, so it is unit-testable. zoxy
-/// takes exactly one positional argument — the config path; a `--help` or
-/// `--version` anywhere on the line wins so it still works appended to a
-/// half-typed command.
+/// takes exactly one positional argument — the config path — and every
+/// flag it has is a *mode* rather than an option carrying a value, so any
+/// of them may appear anywhere on the line. `--help` and `--version` win
+/// over `--check` for the reason they win over a config path: they still
+/// work appended to a half-typed command.
 fn classifyArgs(args: []const []const u8) Cli {
     assert(args.len >= 1); // argv always carries the program name at [0].
     for (args[1..]) |arg| {
@@ -373,13 +602,24 @@ fn classifyArgs(args: []const []const u8) Cli {
     for (args[1..]) |arg| {
         if (flagMatches(arg, "-V", "--version")) return .version;
     }
-    if (args.len < 2) return .{ .usage = .missing_config };
-    if (args.len > 2) return .{ .usage = .extra_arguments };
-    const only = args[1];
-    // A lone unrecognized -flag is a typo, not a file named "-x".
-    if (only.len > 0 and only[0] == '-') return .{ .usage = .unknown_option };
-    assert(only.len == 0 or only[0] != '-');
-    return .{ .run = only };
+    var check = false;
+    var config_path: []const u8 = "";
+    var positionals: u32 = 0;
+    for (args[1..]) |arg| {
+        if (flagMatches(arg, "-c", "--check")) {
+            check = true;
+            continue;
+        }
+        // A lone unrecognized -flag is a typo, not a file named "-x".
+        if (arg.len > 0 and arg[0] == '-') return .{ .usage = .unknown_option };
+        positionals += 1;
+        assert(positionals < args.len);
+        if (positionals == 1) config_path = arg;
+    }
+    if (positionals == 0) return .{ .usage = .missing_config };
+    if (positionals > 1) return .{ .usage = .extra_arguments };
+    assert(config_path.len == 0 or config_path[0] != '-');
+    return if (check) .{ .check = config_path } else .{ .run = config_path };
 }
 
 fn flagMatches(arg: []const u8, short: []const u8, long: []const u8) bool {
@@ -392,14 +632,23 @@ const help_text =
     \\zoxy {s} — a zero-allocation L4/L7 edge proxy.
     \\
     \\Usage:
-    \\  zoxy <config.json>   Start the proxy with the given JSON config.
-    \\  zoxy --help, -h      Show this message and exit.
-    \\  zoxy --version, -V   Print the version and exit.
+    \\  zoxy <config.json>          Start the proxy with the given JSON config.
+    \\  zoxy --check <config.json>  Validate and price the config, then exit
+    \\                              without binding anything (-c).
+    \\  zoxy --help, -h             Show this message and exit.
+    \\  zoxy --version, -V          Print the version and exit.
     \\
     \\zoxy reads the whole config once at startup, sizes every pool and the
     \\io_uring ring from it, then serves without allocating again. The config
     \\format is documented by the JSON Schema shipped with each release and by
     \\docs/DESIGN.md.
+    \\
+    \\--check runs that whole load — every body, error page and certificate
+    \\the config names is opened, so it needs the same file permissions the
+    \\proxy would — and prints the budget banner to stdout. It exits 0 when
+    \\the config would start on this machine, 1 when the config is wrong, and
+    \\2 when the config is right and this machine cannot fit it (an fd budget
+    \\above the RLIMIT_NOFILE hard limit).
     \\
     \\Signals:
     \\  SIGTERM, SIGINT   Drain in-flight connections, then exit 0.
@@ -439,16 +688,29 @@ fn printUsageError(reason: UsageError) void {
         .unknown_option => "unknown option; run `zoxy --help` for usage",
     };
     std.debug.print(
-        "zoxy: {s}\nusage: zoxy <config.json>  (or --help, --version)\n",
+        "zoxy: {s}\nusage: zoxy <config.json>  (or --check, --help, --version)\n",
         .{detail},
     );
 }
 
 /// fds are pre-budgeted, not shed (§8): raise the soft limit up to the
 /// hard limit, and refuse to start if even that cannot cover the budget.
-fn ensureFdBudget(fds_required: u32) !void {
+///
+/// One error for every way this can fail, the kernel's included, because
+/// they all mean the same thing to whoever reads it — this box will not
+/// give this config the descriptors it needs — and because `--check`
+/// classifies on the error (#301): a distinct value here is what keeps
+/// "run it elsewhere" from ever being reported as "change the file". The
+/// specific reason is printed instead of returned, here where the numbers
+/// that produced it are still in hand.
+fn ensureFdBudget(fds_required: u32) error{FdBudgetUnsatisfiable}!void {
+    assert(fds_required > 0);
     const required: u64 = fds_required;
-    var limits = try std.posix.getrlimit(.NOFILE);
+    var limits = std.posix.getrlimit(.NOFILE) catch |err| {
+        std.debug.print("zoxy: cannot read RLIMIT_NOFILE: {t}\n", .{err});
+        return error.FdBudgetUnsatisfiable;
+    };
+    assert(limits.max >= limits.cur);
     if (limits.cur >= required) return;
     if (limits.max < required) {
         std.debug.print(
@@ -458,7 +720,13 @@ fn ensureFdBudget(fds_required: u32) !void {
         return error.FdBudgetUnsatisfiable;
     }
     limits.cur = required;
-    try std.posix.setrlimit(.NOFILE, limits);
+    std.posix.setrlimit(.NOFILE, limits) catch |err| {
+        std.debug.print(
+            "zoxy: cannot raise RLIMIT_NOFILE to the fd budget {d}: {t}\n",
+            .{ required, err },
+        );
+        return error.FdBudgetUnsatisfiable;
+    };
 }
 
 fn installSignalHandlers() void {
@@ -579,6 +847,74 @@ test "classifyArgs: help wins over version, and both win appended to a config" {
     try testing.expect(classifyArgs(&.{ "zoxy", "--version", "--help" }) == .help);
     try testing.expect(classifyArgs(&.{ "zoxy", "config.json", "--help" }) == .help);
     try testing.expect(classifyArgs(&.{ "zoxy", "config.json", "--version" }) == .version);
+}
+
+test "classifyArgs: --check names the config it must not run" {
+    // Either side of the path: `--check` carries no value of its own, so
+    // its position on the line is not information.
+    const leading = classifyArgs(&.{ "zoxy", "--check", "config.json" });
+    try testing.expect(leading == .check);
+    try testing.expectEqualStrings("config.json", leading.check);
+    const trailing = classifyArgs(&.{ "zoxy", "config.json", "-c" });
+    try testing.expect(trailing == .check);
+    try testing.expectEqualStrings("config.json", trailing.check);
+    // Still exactly one positional, and still the informational modes
+    // first — a `--check` with nothing to check is the same mistake a
+    // bare `zoxy` is.
+    try testing.expectEqual(
+        Cli{ .usage = .missing_config },
+        classifyArgs(&.{ "zoxy", "--check" }),
+    );
+    try testing.expectEqual(
+        Cli{ .usage = .extra_arguments },
+        classifyArgs(&.{ "zoxy", "--check", "a.json", "b.json" }),
+    );
+    try testing.expect(classifyArgs(&.{ "zoxy", "--check", "a.json", "--help" }) == .help);
+    // And a config path is still a config path when nobody asked to
+    // check it.
+    try testing.expect(classifyArgs(&.{ "zoxy", "config.json" }) == .run);
+}
+
+test "checkExitFor: the box's refusals are told from the config's" {
+    // What the operator does next is the whole distinction (#301): these
+    // three say "run it elsewhere"…
+    try testing.expectEqual(CheckExit.does_not_fit, checkExitFor(error.OutOfMemory));
+    try testing.expectEqual(
+        CheckExit.does_not_fit,
+        checkExitFor(error.LibcryptoHeapUnavailable),
+    );
+    // The one value `ensureFdBudget` collapses every kernel answer into,
+    // and the reason it has a distinct value at all.
+    try testing.expectEqual(
+        CheckExit.does_not_fit,
+        checkExitFor(error.FdBudgetUnsatisfiable),
+    );
+    // …and everything else says "change the file", including a path in
+    // it that would not open, which is the arm most worth pinning: a CI
+    // job must not learn to ignore the code a real mistake also earns.
+    try testing.expectEqual(CheckExit.invalid_config, checkExitFor(error.FileNotFound));
+    try testing.expectEqual(CheckExit.invalid_config, checkExitFor(error.AccessDenied));
+    try testing.expectEqual(CheckExit.invalid_config, checkExitFor(error.MissingField));
+    // The codes themselves are the CI contract, so they are asserted
+    // rather than left to the declaration order.
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(CheckExit.ok));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(CheckExit.invalid_config));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(CheckExit.does_not_fit));
+}
+
+test "rlimitText: an infinite limit reads as one" {
+    var buffer: [rlimit_text_bytes]u8 = undefined;
+    try testing.expectEqualStrings("1024", rlimitText(1024, &buffer));
+    try testing.expectEqualStrings("0", rlimitText(0, &buffer));
+    // The case the helper exists for: 2^64-1 in a banner reads as a bug.
+    try testing.expectEqualStrings(
+        "unlimited",
+        rlimitText(std.posix.RLIM.INFINITY, &buffer),
+    );
+    // The buffer is wide enough for the widest value that is not
+    // INFINITY, which is what the `catch unreachable` inside rests on.
+    const widest = std.math.maxInt(std.posix.rlim_t) - 1;
+    try testing.expectEqual(rlimit_text_bytes, rlimitText(widest, &buffer).len);
 }
 
 test "classifyArgs: usage mistakes carry their reason" {

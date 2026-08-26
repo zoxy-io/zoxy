@@ -53,6 +53,41 @@ const zoxy_log_path = work_directory ++ "/zoxy.log";
 const robots_path = work_directory ++ "/robots.txt";
 const robots_body = "User-agent: *\nDisallow: /private\n";
 
+/// The #301 pre-flight's own files. `--check` writes its whole result to
+/// stdout, so the gate captures stdout and stderr apart: the split is the
+/// decision that issue made, and a gate that merged the two streams could
+/// not see it.
+const check_stdout_path = work_directory ++ "/check.out";
+const check_log_path = work_directory ++ "/check.log";
+const invalid_config_path = work_directory ++ "/invalid.json";
+
+/// A config the *loader* refuses rather than the schema — a bind that is
+/// well-shaped JSON and not an address (`ListenerBindInvalid`). Chosen
+/// deliberately: the semantic checks are the ones only the real loader
+/// makes, so refusing this is what says `--check` runs the loader instead
+/// of a second, agreeable validator.
+const invalid_config_text =
+    \\{"listeners":[{"bind":"not-an-address","cluster":"a"}],
+    \\"clusters":{"a":{"endpoints":["127.0.0.1:1"]}}}
+;
+
+/// What `--check` must exit with. Spelled here rather than imported from
+/// `main.zig`'s `CheckExit`, on the rule the rest of this file follows:
+/// the gate reads what the binary *did*, so a drift has to fail loudly
+/// rather than agree with itself.
+const check_exit_ok: u8 = 0;
+const check_exit_invalid_config: u8 = 1;
+
+/// The two lines that must reach stdout for the budget to have been
+/// reported at all — the banner's own header, and the verdict line only a
+/// check run writes.
+const check_banner_needle = "budgets (DESIGN.md";
+const check_verdict_needle = "  check   ";
+
+/// The most of a check run's stdout the gate will read. A banner is about
+/// 1 KiB; anything near this cap is itself the finding.
+const check_output_bytes_max: usize = 16 * 1024;
+
 /// The §4 fixture the terminating listener serves. Handed in by the build
 /// rather than embedded here (`@embedFile` cannot escape a module root),
 /// and written to the work directory so the proxy reads it off disk the
@@ -333,6 +368,7 @@ var watchdog_child_pid = std.atomic.Value(i32).init(0);
 /// statement about everything before it having finished.
 const Stage = enum {
     starting,
+    pre_flight,
     awaiting_listener,
     load,
     counter_scrape,
@@ -348,6 +384,7 @@ const Stage = enum {
     fn label(stage: Stage) []const u8 {
         return switch (stage) {
             .starting => "starting the proxy",
+            .pre_flight => "the --check pre-flight (#301)",
             .awaiting_listener => "waiting for the listener",
             .load => "the http and l4 load",
             .counter_scrape => "the counter scrapes",
@@ -428,6 +465,10 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
 
     const ports = try reservePorts(io);
     try writeConfig(arena, io, &ports, origin.port);
+    // Before the spawn, because that ordering is the claim: the config
+    // `--check` just passed is the one this run then serves.
+    enterStage(.pre_flight);
+    const check_ok = try checkPassed(arena, io, flags.zoxy_path);
     var child = try spawnZoxy(io, flags.zoxy_path);
     var running = true;
     defer if (running) child.kill(io);
@@ -461,7 +502,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        tls_ok and memory_ok and drain_ok;
+        tls_ok and memory_ok and drain_ok and check_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -484,7 +525,7 @@ fn report(
     var memory_buffer: [64]u8 = undefined;
     std.debug.print(
         "smoke: {d} http + {d} l4 exchanges, {d} access-log lines, counters reconcile, " ++
-            "{d} probes in {d}ms, {s}, clean drain\n",
+            "{d} probes in {d}ms, {s}, --check agrees, clean drain\n",
         .{
             lines.http,
             lines.l4,
@@ -1746,6 +1787,99 @@ fn prepareWorkDirectory(io: Io) !void {
     // decision.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_cert_path, .data = tls_cert_pem });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_key_path, .data = tls_key_pem });
+    // The #301 pre-flight's negative case, written beside the real one so
+    // both reach the same binary through the same argument.
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = invalid_config_path,
+        .data = invalid_config_text,
+    });
+}
+
+/// One `--check` run's verdict: the code it exited with, and whether the
+/// budget reached **stdout**. The placement is the decision #301 made —
+/// a check run's whole output is its result, unlike the startup banner,
+/// which is diagnostics beside a process that goes on to serve — so the
+/// gate pins it rather than trusting it.
+const CheckRun = struct {
+    exit_code: u8,
+    budget_on_stdout: bool,
+};
+
+/// The #301 pre-flight, over the very config this run is about to serve
+/// and over one no loader will take.
+///
+/// That first pairing is the whole claim `--check` makes: it says a
+/// config would start here, and the only place that can be *checked* is
+/// where the real binary then starts on the same file. The second pins
+/// the other half — that the mode refuses what the loader refuses, with
+/// the exit code a CI job branches on rather than a bare non-zero.
+fn checkPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
+    assert(zoxy_path.len >= 1);
+    const accepted = try runZoxyCheck(arena, io, zoxy_path, config_path);
+    const refused = try runZoxyCheck(arena, io, zoxy_path, invalid_config_path);
+    var passed = true;
+    if (accepted.exit_code != check_exit_ok) {
+        std.debug.print(
+            "FAIL: --check refused the config this run then served (exit {d})\n",
+            .{accepted.exit_code},
+        );
+        passed = false;
+    }
+    if (!accepted.budget_on_stdout) {
+        std.debug.print("FAIL: --check wrote no budget to stdout\n", .{});
+        passed = false;
+    }
+    if (refused.exit_code != check_exit_invalid_config) {
+        std.debug.print(
+            "FAIL: --check did not refuse a config the loader refuses (exit {d})\n",
+            .{refused.exit_code},
+        );
+        passed = false;
+    }
+    // Nothing was loaded, so there is nothing to price: a budget printed
+    // beside a refusal would be a number for a config that does not
+    // exist.
+    if (refused.budget_on_stdout) {
+        std.debug.print("FAIL: --check priced a config it refused\n", .{});
+        passed = false;
+    }
+    return passed;
+}
+
+/// One `zoxy --check <config>`, with the two streams captured apart.
+fn runZoxyCheck(
+    arena: std.mem.Allocator,
+    io: Io,
+    zoxy_path: []const u8,
+    config: []const u8,
+) !CheckRun {
+    assert(zoxy_path.len >= 1);
+    assert(config.len >= 1);
+    const out_file = try Io.Dir.cwd().createFile(io, check_stdout_path, .{});
+    defer out_file.close(io);
+    const log_file = try Io.Dir.cwd().createFile(io, check_log_path, .{});
+    defer log_file.close(io);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ zoxy_path, "--check", config },
+        .stdout = .{ .file = out_file },
+        .stderr = .{ .file = log_file },
+    });
+    const term = try child.wait(io);
+    const text = try Io.Dir.cwd().readFileAlloc(
+        io,
+        check_stdout_path,
+        arena,
+        .limited(check_output_bytes_max),
+    );
+    assert(text.len <= check_output_bytes_max);
+    return .{
+        // A check that died of a signal has no code to report, and the
+        // sentinel is outside every code `CheckExit` defines, so it can
+        // only ever read as a failure.
+        .exit_code = if (term == .exited) term.exited else 255,
+        .budget_on_stdout = std.mem.indexOf(u8, text, check_banner_needle) != null and
+            std.mem.indexOf(u8, text, check_verdict_needle) != null,
+    };
 }
 
 /// zoxy's own output goes to a file rather than this process's stderr:

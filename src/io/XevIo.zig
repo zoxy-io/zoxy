@@ -988,6 +988,19 @@ pub fn openLogSink(path: []const u8) !posix.fd_t {
     }, 0o644);
 }
 
+/// Give back an `openLogSink` fd the caller will not write through.
+///
+/// A serving process never does — it holds its sink for the process's
+/// life — so this exists for `--check` (#301), the one mode that opens
+/// the sink solely to learn whether it opens. Asking it about the
+/// inherited stdout is asserted misuse: that fd was not this seam's to
+/// hand out and is not its to close.
+pub fn closeLogSink(fd: posix.fd_t) void {
+    assert(fd != log_sink_stdout);
+    assert(fd >= 0);
+    closeFd(fd);
+}
+
 /// Reopen the `file` sink at its configured path (§8 rotation): open the
 /// new fd *first* — on failure the old one stays and the caller keeps
 /// writing where lines were already landing — then close the old and
