@@ -115,7 +115,7 @@ One L4 listener forwarding to one origin:
 ```json title="config.json"
 {
     "listeners": [
-        { "bind": "127.0.0.1:8080", "cluster": "origin", "protocol": "l4" }
+        { "bind": "127.0.0.1:8080", "l4": { "cluster": "origin" } }
     ],
     "clusters": {
         "origin": { "endpoints": ["127.0.0.1:9000"] }
@@ -212,13 +212,23 @@ process-wide blocks, `admin` and `access_log`, are documented under
 
 ### Listeners
 
-A listener binds an address and speaks one protocol. `l4` relays bytes
-without inspecting them; `http` runs the HTTP/1.1 reverse proxy.
+A listener binds an address and speaks one protocol, named by the key its
+settings live under: `l4` relays bytes without inspecting them, `http` runs
+the HTTP/1.1 reverse proxy. Exactly one of the two is required — there is no
+default, because a reverse proxy that guesses which one you meant guesses
+wrong in the direction that quietly stops inspecting traffic.
+
+`bind` and `tls` sit outside the body because they are true of both: an
+address is an address, and TLS termination is a phase ahead of whatever the
+terminated stream then speaks. Everything else lives inside the body that
+gives it meaning, so a setting that only makes sense for one protocol has
+nowhere to be written for the other — `max_body_bytes` on an `l4` listener
+is a rejected config rather than a key that silently does nothing.
 
 ```json
 "listeners": [
-    { "bind": "0.0.0.0:80",   "protocol": "http", "cluster": "web" },
-    { "bind": "0.0.0.0:5432", "protocol": "l4",   "cluster": "postgres" }
+    { "bind": "0.0.0.0:80",   "http": { "cluster": "web" } },
+    { "bind": "0.0.0.0:5432", "l4":   { "cluster": "postgres" } }
 ]
 ```
 
@@ -241,7 +251,7 @@ the same filters.
 
 ```json
 "listeners": [
-    { "bind": "0.0.0.0:443", "protocol": "http", "cluster": "web",
+    { "bind": "0.0.0.0:443", "http": { "cluster": "web" },
       "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key" } }
 ]
 ```
@@ -312,8 +322,8 @@ getting. An `http` listener opts in by naming the tokens it will carry:
 
 ```json
 "listeners": [
-    { "bind": "0.0.0.0:80", "protocol": "http", "cluster": "web",
-      "upgrades": ["websocket"] }
+    { "bind": "0.0.0.0:80", "http": { "cluster": "web",
+      "upgrades": ["websocket"] } }
 ],
 "limits": { "tunnels": 512 }
 ```
@@ -377,8 +387,8 @@ by default** — nginx's `client_max_body_size`, which also ships on — and
 `0` accepts any size:
 
 ```json
-{ "bind": "0.0.0.0:80", "protocol": "http", "cluster": "api",
-  "max_body_bytes": 5242880 }
+{ "bind": "0.0.0.0:80", "http": { "cluster": "api",
+  "max_body_bytes": 5242880 } }
 ```
 
 zoxy itself is unharmed by a large upload: the strict recv → send → recv
@@ -418,13 +428,14 @@ host** — of any length your config cares to write:
 ```json
 {
     "bind": "0.0.0.0:80",
-    "protocol": "http",
-    "routes": [
-        { "host": "api.example.com", "prefix": "/v2", "cluster": "api-v2" },
-        { "host": "api.example.com", "prefix": "/",   "cluster": "api" },
-        { "prefix": "/static",                        "cluster": "cdn" },
-        { "prefix": "/",                              "cluster": "web" }
-    ]
+    "http": {
+        "routes": [
+            { "host": "api.example.com", "prefix": "/v2", "cluster": "api-v2" },
+            { "host": "api.example.com", "prefix": "/",   "cluster": "api" },
+            { "prefix": "/static",                        "cluster": "cdn" },
+            { "prefix": "/",                              "cluster": "web" }
+        ]
+    }
 }
 ```
 
@@ -698,9 +709,10 @@ AWS NLB, GCP and HAProxy emit) announcing the real client:
 ```json
 {
     "bind": "0.0.0.0:5432",
-    "protocol": "l4",
-    "cluster": "postgres",
-    "proxy_protocol": { "mode": "require" }
+    "l4": {
+        "cluster": "postgres",
+        "proxy_protocol": { "mode": "require" }
+    }
 }
 ```
 
@@ -741,9 +753,10 @@ add `X-Forwarded-For`:
 ```json
 {
     "bind": "0.0.0.0:80",
-    "protocol": "http",
-    "cluster": "web",
-    "forwarded": { "mode": "replace" }
+    "http": {
+        "cluster": "web",
+        "forwarded": { "mode": "replace" }
+    }
 }
 ```
 

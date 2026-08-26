@@ -756,6 +756,42 @@ Rules:
   shrink a pool; a fill whose ring would exceed the compiled one
   (`cqFillFits` false for the chosen conn/upstream slots and listeners) is
   rejected at load, not clamped (§4/§8).
+- **A listener is a tagged shape, not a flat struct** (#305). `protocol`
+  used to be a string beside eleven fields, seven of which were valid only
+  on one of its two values — a discriminated union modeled as a struct,
+  with the discrimination left to seven loader errors no emitted schema
+  could carry. The tag is the body's own key now: `bind` and `tls` are
+  shared (an address is an address, and termination is a phase ahead of
+  what the terminated stream speaks, so `resolveTls` never asked which
+  protocol it was), and everything else lives inside the `http` or `l4`
+  body that gives it meaning. `{"l4": {"max_body_bytes": 500}}` is
+  refused by the shape rather than by a rule written twice, the seven
+  errors are gone rather than reworded, and `protocol`'s pre-L7 default
+  of `"l4"` went with them — a listener states what it speaks. This is
+  also what unblocks L4 SNI routing (#298): an `l4` route table and an
+  `http` one are different types in different bodies, so `Route.prefix`
+  stays non-optional.
+- **`tls` means terminate on a listener and originate on a cluster**
+  (#305). One key at both levels with disjoint field sets, the side read
+  from position — which is the `proxy_protocol` precedent already in the
+  tree, where `{mode}` on a listener receives and `{send}` on a cluster
+  sends. Inside the listener's block, #297's certificate set is a
+  `certificates` list and #304's `client_ca` is that list's sibling
+  rather than a certificate's, because verifying a peer is per-listener
+  and not per-credential; writing #304 against today's one-pair shape
+  would mean relocating a field it had just added. The cluster's block
+  carries the server name to verify and send as SNI, which §7's endpoints
+  cannot supply — they are resolved addresses, and an address is not an
+  identity. Decided here, implemented with the features that need it: a
+  key with no feature behind it is not a freeze, it is a promise.
+- **An address is a string, and `unix:` extends its grammar** (#303,
+  #305). `bind` and `endpoints` stay single scalars rather than becoming
+  tagged objects or gaining a second key — they are the two most-written
+  fields in any config, nginx and HAProxy already spell a socket path
+  this way, and a `unix:` prefix cannot collide with an IP literal. The
+  endpoint object form that carries a #174 weight is unaffected, so the
+  grammar grows at one parse site and nothing that parses today changes
+  shape.
 - **The config arena is the only allocating region** — parse-once,
   immutable, shared read-only. (Carried verbatim; it worked.)
 - **The config surface has a generated JSON Schema.** `zig build schema`
@@ -766,10 +802,16 @@ Rules:
   release-only asset, never committed (so it cannot drift); the emitter's
   tests run under `zig build ci`, and `assert_meta_matches` fails the build
   if a field lacks schema metadata. It intentionally stops at what JSON
-  Schema can express: the loader's semantic checks (canonical
-  prefixes/hosts, address literals, reserved header names, port ≠ 0) and
-  the "exactly one of" forks stay the loader's job, so passing the schema
-  means well-shaped, not accepted. The one concession strictness makes to
+  Schema can express — but where that line sits is a decision, not a
+  property of JSON Schema, and it has moved once. The three "exactly one
+  of" forks (a listener's `cluster`/`routes`, a header predicate's kind, a
+  filter action's kind) were conceded in prose for as long as nothing
+  emitted `oneOf`; they are emitted now (#305), and the emitter's tests
+  hold the remaining concessions at a counted number, so a new one has
+  to be deliberate rather than quiet. What stays the loader's is what is
+  genuinely semantic: canonical prefixes and hosts, address literals,
+  reserved header names, port ≠ 0. Passing the schema still means
+  well-shaped, not accepted. The one concession strictness makes to
   the schema is a root `$schema` key: it is a declared, optional field that
   the loader parses and ignores, so an editor can point a config at the
   document without the proxy refusing to start over the pointer. It buys no

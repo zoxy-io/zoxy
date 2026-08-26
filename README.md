@@ -38,7 +38,7 @@ A minimal config — one L4 listener forwarding to one origin:
 ```json
 {
     "listeners": [
-        { "bind": "127.0.0.1:8080", "cluster": "origin", "protocol": "l4" }
+        { "bind": "127.0.0.1:8080", "l4": { "cluster": "origin" } }
     ],
     "clusters": {
         "origin": { "endpoints": ["127.0.0.1:9000"] }

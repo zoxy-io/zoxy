@@ -56,8 +56,8 @@ trap cleanup EXIT
 cat > "$work/zoxy.json" <<JSON
 {
   "listeners": [
-    { "bind": "127.0.0.1:$port_http", "cluster": "origin", "protocol": "http" },
-    { "bind": "127.0.0.1:$port_tls", "cluster": "origin", "protocol": "http",
+    { "bind": "127.0.0.1:$port_http", "http": { "cluster": "origin" } },
+    { "bind": "127.0.0.1:$port_tls", "http": { "cluster": "origin" },
       "tls": { "cert": "$cert", "key": "$key" } }
   ],
   "clusters": { "origin": { "endpoints": ["127.0.0.1:1"], "pick": "rr" } },
