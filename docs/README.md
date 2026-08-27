@@ -1288,6 +1288,48 @@ re-derives from a live scrape. Label cardinality is bounded by your
 config — endpoints and cluster names, never request data — and the
 startup banner prices what the labels and their render buffers cost.
 
+#### Rate, Errors, Duration
+
+Two families answer the halves of the RED triad a scrape could not:
+
+```text
+zoxy_cluster_responses{cluster="api",class="2xx"} 4182
+zoxy_cluster_responses{cluster="api",class="5xx"} 17
+zoxy_cluster_duration_seconds_bucket{cluster="api",le="0.005000000"} 3910
+zoxy_cluster_duration_seconds_bucket{cluster="api",le="+Inf"} 4199
+zoxy_cluster_duration_seconds_sum{cluster="api"} 12.884901888
+zoxy_cluster_duration_seconds_count{cluster="api"} 4199
+```
+
+**Errors** used to mean zoxy's own. Every status the proxy *generates* had
+a counter — the whole `shed_` ladder, `l7_bad_gateway`, `l7_gateway_timeout`
+— while an origin returning `500` to every request was invisible to a
+scrape and showed up only in the access log. `cluster_responses` closes
+that: it is the status the client actually received, classed.
+
+**Duration** had no answer at all — no p50, no p99, nothing to alert on.
+`cluster_duration_seconds` is a standard Prometheus histogram, so
+`histogram_quantile` works on it directly.
+
+Both are labelled by **cluster**, not endpoint, and that is a deliberate
+trade: the per-endpoint families are what make a large deployment's
+exposition large, and per-endpoint `5xx` is already watched — [passive
+ejection](#detecting-a-dead-backend-from-real-traffic) acts on it and
+counts what it ejected. Cluster is the granularity that answers "which
+backend got slow" without multiplying the axis that already dominates.
+
+The bucket ladder is compiled in — eighteen boundaries, a steady 2.5×
+apart from 25 µs to 10 s — so every zoxy's histogram is directly
+comparable to every other's, and `_sum`/`_count` give an exact mean
+whatever the buckets do.
+
+Only **completed** exchanges are observed: an exchange the client cut off
+mid-response is not in the histogram, so p99 measures how long serving
+takes rather than how long clients wait before giving up. Those are still
+visible — as `outcome: aborted` in the access log. `_count` therefore
+equals `zoxy_l7_responses` exactly, an identity the simulator asserts on
+every seed.
+
 ### Access log
 
 One JSON object per line — one per HTTP exchange (rejects, `503` sheds and
