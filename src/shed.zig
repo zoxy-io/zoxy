@@ -64,14 +64,28 @@ const Template = struct {
 /// copies it into writable memory at startup, and the arming path stamps
 /// the slot. The status set is closed in `reasonPhrase`: an unlisted
 /// status is a compile error.
-fn staticTemplate(comptime status: u16, comptime persistence: Persistence) Template {
+fn staticTemplate(
+    comptime status: u16,
+    comptime persistence: Persistence,
+    comptime cause: ProxyStatusCause,
+) Template {
     comptime assert(status >= 400);
     comptime assert(status <= 599);
     const prefix = comptime std.fmt.comptimePrint(
         "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nDate: ",
         .{ status, reasonPhrase(status) },
     );
-    const suffix = "\r\n" ++ server_line ++ switch (persistence) {
+    // RFC 9209's answer to the thing §8 documents having: an origin's own
+    // `503` and this proxy's shed `503` are the same three digits and
+    // opposite events, and until now only the access log could tell them
+    // apart. Written only here, on a page this proxy renders itself — a
+    // relayed response keeps whatever the hop before it wrote (§7), so
+    // the List reads back as a chain rather than being overwritten.
+    const status_line = if (comptime causeToken(cause)) |token|
+        "Proxy-Status: " ++ proxy_status_identity ++ "; error=" ++ token ++ "\r\n"
+    else
+        "";
+    const suffix = "\r\n" ++ server_line ++ status_line ++ switch (persistence) {
         .keep => "",
         .close => "Connection: close\r\n",
     } ++ "\r\n";
@@ -79,6 +93,150 @@ fn staticTemplate(comptime status: u16, comptime persistence: Persistence) Templ
         .bytes = prefix ++ date_placeholder ++ suffix,
         .date_offset = prefix.len,
     };
+}
+
+/// What this proxy calls itself in a `Proxy-Status` field (#300). A
+/// bare token rather than a hostname: 9209 permits either, and a
+/// hostname would put deployment topology on the wire for every client
+/// — which is the same reason `next-hop` is deliberately not emitted.
+pub const proxy_status_identity = "zoxy";
+
+/// What a refusal is *about*, in the terms RFC 9209 registered (#300).
+///
+/// Keyed on the rung rather than on the status, because the two are
+/// different questions: a filter's `404` and an empty routing table's
+/// `404` are the same three digits and opposite causes, and a table
+/// indexed by status alone would have to answer one of them wrongly.
+/// The rung is comptime at every `respond` call site, so this costs a
+/// template rather than a branch.
+pub const ProxyStatusCause = enum {
+    /// Nothing 9209 says that the status line does not. Not an absence
+    /// of information — a decision, argued at `causeToken`.
+    none,
+    /// No route matched: this gateway does not serve what was named, and
+    /// the origin was never asked.
+    no_route,
+    /// A §7 filter refused on policy — this proxy's rule, not the
+    /// origin's answer.
+    denied,
+    /// Any rung of the §8 ladder: a limit of *this process* was reached.
+    limit,
+    /// The backend was dialed and did not answer inside the deadline.
+    timeout,
+};
+
+/// The registered token each cause is named by, or null where the
+/// registry has nothing to add.
+///
+/// The silences are the design. 9209's registry is written for what goes
+/// wrong *upstream*, and several of this proxy's rungs are request-side
+/// refusals: a `400`, `413`, `414` or `431` has no token but
+/// `http_request_error`, which says only "something about the request" —
+/// restating the status line in a field nobody can act on. A `502` is
+/// left out for the opposite reason: `l7_bad_gateway` answers a refused
+/// dial, a reset mid-leg and a malformed origin head at one call site,
+/// and 9209 has a distinct token for each, so any single one would be
+/// right by accident. So a `Proxy-Status` from zoxy always carries
+/// something the status line did not.
+fn causeToken(comptime cause: ProxyStatusCause) ?[]const u8 {
+    return switch (cause) {
+        .none => null,
+        // 9209 recommends `500` for this one and this proxy answers
+        // `404` — a deliberate deviation recorded in §12: the request
+        // named a resource this gateway does not serve, which is the
+        // client's answer rather than an internal error.
+        .no_route => "destination_not_found",
+        .denied => "http_request_denied",
+        // Every 503 rung is one fact to a client: zoxy is full, and the
+        // origin was never asked. Which pool ran out is the operator's
+        // question, and the access log and the counters answer it.
+        .limit => "connection_limit_reached",
+        .timeout => "http_response_timeout",
+    };
+}
+
+/// The cause a §8 rung refuses for, named by the rung's own counter —
+/// the identity `respond` already carries, so a call site cannot state a
+/// cause that disagrees with what it counted.
+///
+/// The shed ladder matches by prefix on purpose: every rung under it is
+/// a limit of this process by construction, so a rung added later is
+/// covered the day it is named rather than the day someone remembers
+/// this table.
+pub fn proxyStatusCauseFor(comptime rung: []const u8) ProxyStatusCause {
+    if (std.mem.startsWith(u8, rung, "l7_shed_")) return .limit;
+    if (std.mem.eql(u8, rung, "l7_no_route")) return .no_route;
+    if (std.mem.eql(u8, rung, "l7_filtered")) return .denied;
+    if (std.mem.eql(u8, rung, "l7_gateway_timeout")) return .timeout;
+    return .none;
+}
+
+/// One `Proxy-Status`-bearing page: a status and the cause it was
+/// refused for. A list of the pairs that actually occur rather than a
+/// second dimension on the table below — of twelve statuses and four
+/// causes, seven pairs are reachable, and the other forty-one would be
+/// slots nothing could ever select.
+const Variant = struct { status: u16, cause: ProxyStatusCause };
+
+const proxy_status_variants = [_]Variant{
+    .{ .status = 404, .cause = .no_route },
+    // The §7 filter reject vocabulary (`filter.reject_statuses`), each
+    // status carrying the same cause because the rung is the same one.
+    .{ .status = 400, .cause = .denied },
+    .{ .status = 403, .cause = .denied },
+    .{ .status = 404, .cause = .denied },
+    .{ .status = 429, .cause = .denied },
+    .{ .status = 503, .cause = .limit },
+    .{ .status = 504, .cause = .timeout },
+};
+
+comptime {
+    // Every variant must be a page this table can actually serve, and
+    // every one must say something: a variant for `.none` would be a
+    // byte-identical copy of the plain page, and a variant for a status
+    // outside the static set would be memory nothing selects.
+    for (proxy_status_variants) |variant| {
+        assert(causeToken(variant.cause) != null);
+        assert(staticStatusIndex(variant.status) != null);
+    }
+    // And the list must be a set: two rows for one pair would render the
+    // same page twice and leave `variantIndex` picking arbitrarily.
+    for (proxy_status_variants, 0..) |variant, index| {
+        for (proxy_status_variants[index + 1 ..]) |other| {
+            assert(variant.status != other.status or variant.cause != other.cause);
+        }
+    }
+}
+
+const proxy_status_templates: [proxy_status_variants.len][2]Template = blk: {
+    var table: [proxy_status_variants.len][2]Template = undefined;
+    for (proxy_status_variants, 0..) |variant, index| {
+        table[index] = .{
+            staticTemplate(variant.status, .keep, variant.cause),
+            staticTemplate(variant.status, .close, variant.cause),
+        };
+    }
+    const frozen = table;
+    break :blk frozen;
+};
+
+/// Whether a (status, cause) pair has a page to render — the check a
+/// caller makes at comptime so that naming a cause the table cannot
+/// serve is a compile error rather than a silent fall-back to the plain
+/// page, which would look exactly like the opt-in being off.
+pub fn hasVariant(comptime status: u16, comptime cause: ProxyStatusCause) bool {
+    return variantIndex(status, cause) != null;
+}
+
+/// Where one (status, cause) pair sits in the variant table, or null
+/// when the pair carries no field. Comptime-only: every caller knows
+/// both halves at the `respond` that raised them, so selecting a page
+/// costs nothing at runtime.
+fn variantIndex(comptime status: u16, comptime cause: ProxyStatusCause) ?usize {
+    for (proxy_status_variants, 0..) |variant, index| {
+        if (variant.status == status and variant.cause == cause) return index;
+    }
+    return null;
 }
 
 /// The `200` this proxy answers an `OPTIONS` with when it becomes the
@@ -117,7 +275,18 @@ pub const static_response_bytes_max: u32 = blk: {
     var widest: u32 = 0;
     for (static_statuses) |status| {
         for ([_]Persistence{ .keep, .close }) |persistence| {
-            const template = staticTemplate(status, persistence);
+            const template = staticTemplate(status, persistence, .none);
+            if (template.bytes.len > widest) {
+                widest = @intCast(template.bytes.len);
+            }
+        }
+    }
+    // The #300 variants share the slot width: a listener's flag chooses
+    // between two pages of the same status, so the slot must hold the
+    // wider one.
+    for (proxy_status_variants) |variant| {
+        for ([_]Persistence{ .keep, .close }) |persistence| {
+            const template = staticTemplate(variant.status, persistence, variant.cause);
             if (template.bytes.len > widest) {
                 widest = @intCast(template.bytes.len);
             }
@@ -146,21 +315,32 @@ comptime {
     // anything near it means a status grew a body it should not have.
     for (static_statuses) |status| {
         for ([_]Persistence{ .keep, .close }) |persistence| {
-            const template = staticTemplate(status, persistence);
+            const template = staticTemplate(status, persistence, .none);
+            assert(template.date_offset + date_bytes <= template.bytes.len);
+            assert(template.bytes.len <= static_response_bytes_max);
+        }
+    }
+    for (proxy_status_variants) |variant| {
+        for ([_]Persistence{ .keep, .close }) |persistence| {
+            const template = staticTemplate(variant.status, persistence, variant.cause);
             assert(template.date_offset + date_bytes <= template.bytes.len);
             assert(template.bytes.len <= static_response_bytes_max);
         }
     }
     assert(static_response_bytes_max > date_bytes);
-    assert(static_statuses.len * 2 * static_response_bytes_max <= 8 * 1024);
+    // The bound holds the shape it always did, widened by the rows #300
+    // adds — seven of the forty-eight (status, cause) pairs are
+    // reachable, which is why this is a `+` and not a multiplication.
+    assert((static_statuses.len + proxy_status_variants.len) * 2 *
+        static_response_bytes_max <= 12 * 1024);
 }
 
 const templates: [static_statuses.len][2]Template = blk: {
     var table: [static_statuses.len][2]Template = undefined;
     for (static_statuses, 0..) |status, index| {
         table[index] = .{
-            staticTemplate(status, .keep),
-            staticTemplate(status, .close),
+            staticTemplate(status, .keep, .none),
+            staticTemplate(status, .close, .none),
         };
     }
     const frozen = table;
@@ -192,11 +372,23 @@ pub const StaticTable = struct {
     /// it is the one static this proxy sends that is not a refusal, so it
     /// has no place in a table keyed by `static_statuses`.
     options: [2][static_response_bytes_max]u8,
+    /// The #300 variants: the same pages carrying an RFC 9209 error
+    /// token, for the three statuses that have one. Separate storage
+    /// rather than a dimension on `storage`, because nine of twelve
+    /// statuses would carry a slot nothing could ever select.
+    proxy_status_storage: [proxy_status_variants.len][2][static_response_bytes_max]u8,
 
     pub fn init(table: *StaticTable) void {
         for (&table.storage, 0..) |*variants, index| {
             for (variants, 0..) |*slot, persistence| {
                 const template = templates[index][persistence];
+                assert(template.bytes.len <= slot.len);
+                @memcpy(slot[0..template.bytes.len], template.bytes);
+            }
+        }
+        for (&table.proxy_status_storage, 0..) |*variants, index| {
+            for (variants, 0..) |*slot, persistence| {
+                const template = proxy_status_templates[index][persistence];
                 assert(template.bytes.len <= slot.len);
                 @memcpy(slot[0..template.bytes.len], template.bytes);
             }
@@ -222,9 +414,21 @@ pub const StaticTable = struct {
     /// Write `date` into every slot at once — what startup does, so no
     /// response can be the first user of an un-stamped one (#234).
     pub fn stampAll(table: *StaticTable, date: *const [date_bytes]u8) void {
-        for (static_statuses) |status| {
+        inline for (static_statuses) |status| {
             for ([_]Persistence{ .keep, .close }) |persistence| {
-                @memcpy(table.get(status, persistence).date, date);
+                @memcpy(table.get(status, .none, persistence, false).date, date);
+            }
+        }
+        // The #300 variants are separate storage, so "every slot" has to
+        // name them: a listener that opted in must not send the template
+        // date the first time it sheds. Walked through the storage rather
+        // than through `get`, because the pairs are the table's own shape
+        // and re-deriving them here is a second place to get it wrong.
+        for (&table.proxy_status_storage, 0..) |*variants, index| {
+            for (variants, 0..) |*slot, persistence| {
+                const template = proxy_status_templates[index][persistence];
+                assert(template.date_offset + date_bytes <= template.bytes.len);
+                @memcpy(slot[template.date_offset..][0..date_bytes], date);
             }
         }
         for ([_]Persistence{ .keep, .close }) |persistence| {
@@ -232,16 +436,38 @@ pub const StaticTable = struct {
         }
     }
 
-    /// The response for one verdict. `status` is a runtime value on the
-    /// filter-reject path, so membership is a lookup rather than a
-    /// comptime switch — but it is still the closed set, and a status
-    /// outside it is a caller that never consulted `isStaticStatus`.
+    /// The response for one verdict. `status` and `cause` are both
+    /// comptime, which the whole path can afford: every caller arrives
+    /// through `respond`, whose status and counter are comptime already,
+    /// so both lookups fold away and a status outside the closed set is
+    /// a compile error rather than a `null` unwrapped at runtime.
+    ///
+    /// `cause` is the rung that raised it (#300) and `proxy_status` the
+    /// listener's opt-in; both are needed, and only their conjunction
+    /// selects a variant — a listener that did not ask gets the plain
+    /// page, and so does a rung 9209 has no token for. That fall-back
+    /// is checkable rather than trusted: `hasVariant` lets the caller
+    /// assert at comptime that a named cause has a page, so a rung
+    /// cannot lose its token silently.
     pub fn get(
         table: *StaticTable,
-        status: u16,
+        comptime status: u16,
+        comptime cause: ProxyStatusCause,
         persistence: Persistence,
+        proxy_status: bool,
     ) StaticResponse {
-        const index = staticStatusIndex(status).?;
+        if (proxy_status) {
+            if (comptime variantIndex(status, cause)) |index| {
+                const template = proxy_status_templates[index][@intFromEnum(persistence)];
+                const slot = &table.proxy_status_storage[index][@intFromEnum(persistence)];
+                assert(template.date_offset + date_bytes <= template.bytes.len);
+                return .{
+                    .bytes = slot[0..template.bytes.len],
+                    .date = slot[template.date_offset..][0..date_bytes],
+                };
+            }
+        }
+        const index = comptime staticStatusIndex(status).?;
         const template = templates[index][@intFromEnum(persistence)];
         const slot = &table.storage[index][@intFromEnum(persistence)];
         assert(template.date_offset + date_bytes <= template.bytes.len);
@@ -422,6 +648,92 @@ pub fn closeQuietly(comptime IoType: type, io: *IoType, socket: IoType.Socket) v
     io.closeNow(socket);
 }
 
+test "shed: an opted-in listener names the cause it refused for" {
+    var table: StaticTable = undefined;
+    table.init();
+    // The variant is the same page with one field added, in the position
+    // 9209 asks for: after `Server`, before the terminator.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
+            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
+            "Proxy-Status: zoxy; error=connection_limit_reached\r\n" ++
+            "Connection: close\r\n\r\n",
+        table.get(503, .limit, .close, true).bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n" ++
+            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
+            "Proxy-Status: zoxy; error=http_response_timeout\r\n\r\n",
+        table.get(504, .timeout, .keep, true).bytes,
+    );
+    // The whole reason the table is keyed on the rung: one status, two
+    // causes, two different pages. A `404` from an empty routing table
+    // and a `404` a filter chose are indistinguishable by status.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++
+            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
+            "Proxy-Status: zoxy; error=destination_not_found\r\n\r\n",
+        table.get(404, .no_route, .keep, true).bytes,
+    );
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++
+            "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n" ++
+            "Proxy-Status: zoxy; error=http_request_denied\r\n\r\n",
+        table.get(404, .denied, .keep, true).bytes,
+    );
+    // A rung with no token ignores the opt-in rather than emitting an
+    // empty or a redundant field: a malformed head is the request's own
+    // fault and 9209 has nothing to add to the status line.
+    try std.testing.expectEqualStrings(
+        table.get(413, .none, .close, false).bytes,
+        table.get(413, .none, .close, true).bytes,
+    );
+    // The variants are separate storage, so the stamp has to reach them
+    // — a listener that opted in must not send the placeholder date.
+    table.stampAll("Sun, 06 Nov 1994 08:49:37 GMT");
+    try std.testing.expectEqualStrings(
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        table.get(404, .no_route, .keep, true).date,
+    );
+    // And that storage is its own: stamping the variant leaves the plain
+    // page alone, which is what says one listener cannot patch another's.
+    formatHttpDate(0, table.get(404, .no_route, .keep, true).date);
+    try std.testing.expectEqualStrings(
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        table.get(404, .none, .keep, false).date,
+    );
+}
+
+test "shed: every token this proxy emits is one the registry defines" {
+    // The set is closed and small, so it is checkable rather than
+    // asserted: a token invented here would be a field a client cannot
+    // interpret, which is worse than the header being absent.
+    const registry = [_][]const u8{
+        "destination_not_found",
+        "http_request_denied",
+        "connection_limit_reached",
+        "http_response_timeout",
+    };
+    var seen: usize = 0;
+    inline for (@typeInfo(ProxyStatusCause).@"enum".fields) |field| {
+        const cause: ProxyStatusCause = @enumFromInt(field.value);
+        const token = comptime causeToken(cause) orelse continue;
+        seen += 1;
+        var found = false;
+        for (registry) |entry| {
+            if (std.mem.eql(u8, entry, token)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(registry.len, seen);
+    // And every cause a rung can name has a variant to render it, or the
+    // opt-in would silently fall back to the plain page on that rung.
+    try std.testing.expectEqual(ProxyStatusCause.limit, proxyStatusCauseFor("l7_shed_tunnels"));
+    try std.testing.expectEqual(ProxyStatusCause.no_route, proxyStatusCauseFor("l7_no_route"));
+    try std.testing.expectEqual(ProxyStatusCause.denied, proxyStatusCauseFor("l7_filtered"));
+    try std.testing.expectEqual(ProxyStatusCause.none, proxyStatusCauseFor("l7_bad_gateway"));
+}
+
 test "shed: static responses are exact bytes with close announced" {
     var table: StaticTable = undefined;
     table.init();
@@ -430,25 +742,25 @@ test "shed: static responses are exact bytes with close announced" {
     try std.testing.expectEqualStrings(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
             "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\nConnection: close\r\n\r\n",
-        table.get(503, .close).bytes,
+        table.get(503, .none, .close, false).bytes,
     );
     try std.testing.expectEqualStrings(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
             "Date: " ++ date_placeholder ++ "\r\nServer: zoxy\r\n\r\n",
-        table.get(503, .keep).bytes,
+        table.get(503, .none, .keep, false).bytes,
     );
     // And a stamp lands in the response, not beside it: the slice the
     // send is handed changes under exactly those 29 bytes.
-    formatHttpDate(784_111_777, table.get(503, .keep).date);
+    formatHttpDate(784_111_777, table.get(503, .none, .keep, false).date);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n" ++
             "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\nServer: zoxy\r\n\r\n",
-        table.get(503, .keep).bytes,
+        table.get(503, .none, .keep, false).bytes,
     );
     // Each entry owns its own slot: stamping one leaves the rest alone.
     try std.testing.expectEqualStrings(
         date_placeholder,
-        table.get(503, .close).date,
+        table.get(503, .none, .close, false).date,
     );
 }
 
@@ -538,8 +850,8 @@ test "shed: every static response parses as a valid bodiless head" {
     // than the placeholder's shape.
     inline for (static_statuses) |status| {
         inline for ([_]Persistence{ .keep, .close }) |persistence| {
-            formatHttpDate(1_577_836_800, table.get(status, persistence).date);
-            const bytes = table.get(status, persistence).bytes;
+            formatHttpDate(1_577_836_800, table.get(status, .none, persistence, false).date);
+            const bytes = table.get(status, .none, persistence, false).bytes;
             var storage: parser.HeaderStorage = undefined;
             const head = try parser.parseResponseHead(bytes, false, &storage, .get);
             try std.testing.expectEqual(status, head.status);

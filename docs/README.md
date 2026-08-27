@@ -1416,6 +1416,82 @@ reopen also heals a sink that had broken: what broke was the fd the rotation
 just replaced. On a `stdout` sink, or with no log configured at all, `SIGHUP`
 is a no-op.
 
+### Telling a client zoxy refused (Proxy-Status)
+
+The access log answers *you*. This answers the client, and it exists
+because a proxy's refusal and an origin's are the same three digits: a
+`503` from an overloaded zoxy and a `503` from a healthy zoxy relaying an
+overloaded backend are indistinguishable on the wire, and only one of
+them is your problem. Setting `proxy_status` on an `http` listener makes
+the pages zoxy renders *itself* say so, in an RFC 9209 `Proxy-Status`
+field:
+
+```json
+{
+    "bind": "0.0.0.0:80",
+    "http": {
+        "cluster": "web",
+        "proxy_status": true
+    }
+}
+```
+
+```
+HTTP/1.1 503 Service Unavailable
+Content-Length: 0
+Date: Wed, 01 Jan 2020 00:00:00 GMT
+Server: zoxy
+Proxy-Status: zoxy; error=connection_limit_reached
+```
+
+Four causes carry a token, and only those four:
+
+| cause | status | `error=` |
+|---|---|---|
+| no route matched — zoxy never dialed a backend, so the origin was not asked about this path | `404` | `destination_not_found` |
+| a [filter](#filters) refused on policy — zoxy's rule, not the origin's answer | the status the rule names (`400`/`403`/`404`/`429`) | `http_request_denied` |
+| a zoxy limit, any rung of the shed ladder — slots, buffers, tunnels, per-endpoint in-flight | `503` | `connection_limit_reached` |
+| the backend was dialed and did not answer in time | `504` | `http_response_timeout` |
+
+The token names the **cause, not the status**, and the first two rows are
+why: a filter rejecting with `404` and an empty routing table answering
+`404` are the same three digits and different advice — one means "ask
+someone else", the other means "you were refused". A client reading only
+the status line cannot tell them apart, and that is the gap the field
+closes.
+
+Everything else is deliberately silent. A `400`, `413`, `414` or `431`
+that is the *request's* own fault gets nothing: 9209's only fitting token
+(`http_request_error`) restates the status line, and a field a client
+cannot act on is worse than no field. A `502` is skipped for the opposite
+reason — a refused dial, a reset mid-response and a malformed origin head
+are three different 9209 causes that zoxy answers at one place, so any
+single token would be right by accident. So a `Proxy-Status` from zoxy
+always carries something the status line didn't.
+
+Notes on what it does *not* do:
+
+- **No `next-hop`.** 9209 allows naming the backend; that publishes your
+  topology to every client that can provoke an error. The endpoint is in
+  the access log, where it belongs.
+- **An upstream proxy's field survives.** `Proxy-Status` is a List, and
+  zoxy sets it only on pages it renders itself — a relayed response
+  carries whatever the hop before it wrote, unedited, so a chain reads
+  back in order.
+- **Configured error pages win.** A status you gave a body for in
+  `error_pages` is sent exactly as you wrote it, header included or not
+  — your bytes are not edited.
+- **Forwarded responses are untouched.** Only pages zoxy renders itself
+  carry the field; an origin's own `503` is relayed as the origin wrote
+  it, which is precisely the distinction being drawn.
+
+> [!IMPORTANT]
+> Off by default, and per listener, on the same reasoning as
+> [`forwarded`](#telling-an-http-origin-x-forwarded-for): the field states
+> which of *this proxy's* limits a caller hit. Inside a mesh that is a
+> diagnostic; at an untrusted edge it is a capacity disclosure, and zoxy
+> cannot tell from the inside which side of that line a listener is on.
+
 ## Under load
 
 The defining behavior: **when a resource is exhausted, zoxy degrades the

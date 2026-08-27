@@ -385,6 +385,13 @@ pub const Config = struct {
         /// listener applies to another byte of it, so which sockets may
         /// hand out that exemption is a property of the socket.
         upgrades: Upgrades = .{},
+        /// Whether refusals name their RFC 9209 cause on the wire
+        /// (#300). Per listener and off by default, on `forwarded`'s
+        /// reasoning: the header states which of *this proxy's* limits a
+        /// client hit, which is a diagnostic inside a mesh and a
+        /// disclosure at an edge — and a proxy cannot tell from the
+        /// inside which side of that line it is on.
+        proxy_status: bool = false,
         /// Cap on one request's body (#236), or `0` to accept any size.
         ///
         /// Per listener rather than in `limits`, and the distinction is
@@ -2018,6 +2025,9 @@ pub const HttpListenerJson = struct {
     /// Optional #236 request-body cap; absent means one MiB, `0` means
     /// no cap.
     max_body_bytes: ?u64 = null,
+    /// Whether this listener names *why* it refused, in an RFC 9209
+    /// `Proxy-Status` field (#300). Absent is off.
+    proxy_status: bool = false,
 
     pub const schema_doc =
         "An HTTP/1.1 listener's settings. Exactly one of `cluster` or " ++
@@ -2047,6 +2057,13 @@ pub const HttpListenerJson = struct {
                 "connection closes.",
             .minimum = 0,
             .maximum = constants.request_body_bytes_max,
+        },
+        .proxy_status = .{
+            .desc = "Name why this proxy refused a request, in an RFC 9209 " ++
+                "Proxy-Status field, so a client can tell a shed 503 from the " ++
+                "origin's own. Off by default: it states internal limits on " ++
+                "the wire, which an internal listener may want and an edge " ++
+                "one may not.",
         },
         .upgrades = .{
             .desc = "Protocol upgrades this listener will carry as tunnels; absent " ++
@@ -3479,6 +3496,7 @@ fn resolveHttpListener(
         .tls = tls,
         .upgrades = try resolveUpgrades(http_json.upgrades),
         .max_body_bytes = try resolveMaxBodyBytes(http_json.max_body_bytes),
+        .proxy_status = http_json.proxy_status,
     };
 }
 
@@ -7830,6 +7848,36 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
             parsed.clusters[0].max_inflight,
         );
     }
+}
+
+test "config: proxy_status is off unless asked for, and is http-only" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // Absent means silent (#300): a config written before the feature
+    // must not start naming this proxy's limits on the wire.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
+        try std.testing.expect(!parsed.listeners[0].proxy_status);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ ",\"proxy_status\":true" ++ tail);
+        try std.testing.expect(parsed.listeners[0].proxy_status);
+    }
+    // An l4 relay renders no HTTP response to put the field in, so the
+    // key does not exist there — the strict parser is the rule (#305).
+    try expectParseError(
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"proxy_status\":true}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
 }
 
 test "config: the forwarded block resolves a mode, and is http-only" {
