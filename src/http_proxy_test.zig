@@ -654,6 +654,9 @@ const Http1Bed = struct {
         /// leaves `X-Forwarded-For` untouched, as every pre-existing
         /// scenario expects.
         forwarded: ?config_module.Config.Listener.Forwarded = null,
+        /// The #300 opt-in; off by default, so every pre-existing
+        /// scenario still asserts on pages with no `Proxy-Status`.
+        proxy_status: bool = false,
         /// Turn the §8 access log on. Off by default so every existing
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
@@ -753,6 +756,7 @@ const Http1Bed = struct {
             .upgrades = options.upgrades,
             .max_body_bytes = options.max_body_bytes,
             .forwarded = options.forwarded,
+            .proxy_status = options.proxy_status,
             // Paths nothing reads: the bed embeds the PEMs, so what this
             // states is only that the listener terminates.
             .tls = if (options.tls)
@@ -1386,6 +1390,82 @@ test "l7: the origin sees the canonical path, query verbatim (§7)" {
     // Router and origin agree on the same canonical resource: /a/.. pops
     // to /, then /b/./c collapses to /b/c; the query rides along untouched.
     try std.testing.expectEqualStrings("/b/c?x=1%2F2", forwarded.target);
+    try bed.expectDrained();
+}
+
+test "l7: an opted-in listener names why it refused (#300)" {
+    // RFC 9209 exists for exactly the ambiguity §8 documents: this 404 is
+    // *this proxy* having no route, not the origin having no resource,
+    // and until the header the two were the same three digits. The origin
+    // is never dialed here, which is the fact the field states.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 13,
+        .route_prefix = "/api",
+        .proxy_status = true,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /elsewhere HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Proxy-Status: zoxy; error=destination_not_found\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 0), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: two 404s, two causes — the field says which (#300)" {
+    // The reason the token is keyed on the rung and not the status: a
+    // filter answering `404` and an empty routing table answering `404`
+    // are the same three digits, and a client acting on them differs —
+    // one is "ask someone else", the other is "you were refused".
+    const rules = [_]filter.Rule{.{
+        .match = .{ .path_prefix = "/api/private" },
+        .actions = &.{.{ .reject = 404 }},
+    }};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 15,
+        .route_prefix = "/api",
+        .request_filters = &rules,
+        .proxy_status = true,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /api/private/x HTTP/1.1\r\nHost: o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Proxy-Status: zoxy; error=http_request_denied\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try std.testing.expectEqual(@as(u64, 0), bed.origin.requests_served);
+    try bed.expectDrained();
+}
+
+test "l7: the opt-in is silent where the registry has nothing to add" {
+    // A `400` is the request's own fault and 9209's only fitting token
+    // restates the status line. Emitting it would train a client to read
+    // a field that never distinguishes anything; this pins the silence,
+    // so a later "complete the table" cannot quietly undo the decision.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 14,
+        .proxy_status = true,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /one HTTP/1.1\r\nHost o\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Connection: close\r\n\r\n",
+        bed.client.response(),
+    );
     try bed.expectDrained();
 }
 

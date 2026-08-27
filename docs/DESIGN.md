@@ -1948,6 +1948,49 @@ origin, not one this proxy can pick for them.
   storm the date goes stale, never malformed. Every slot is stamped once
   at startup, where nothing is in flight by construction, so no response
   is ever the first user of an un-stamped one.
+- **A listener may make those responses name their cause** (#300, RFC
+  9209). The ambiguity the point above settles with `Server` is only
+  half-settled by it: `Server: zoxy` says *who* answered, not *why*, and
+  an operator reading a `503` still cannot tell the shed ladder from a
+  relayed origin failure without the access log. A `proxy_status`
+  listener adds a `Proxy-Status` field naming the cause from 9209's
+  registry, on the four rungs where the registry says something the
+  status line does not: no route matched → `destination_not_found` (the
+  origin was never asked), a §7 filter reject → `http_request_denied`
+  (this proxy's policy, not the origin's answer), any rung of the ladder
+  above → `connection_limit_reached` (they are one fact to a client:
+  zoxy is full), the request deadline → `http_response_timeout`.
+  The token is a function of the **rung, not the status**, and that is
+  the load-bearing choice: `filter.reject_statuses` includes `404`, so a
+  table indexed by status alone would have to answer a filter reject and
+  an empty routing table identically — the same three digits, opposite
+  causes, and the whole point of the field is telling them apart. The
+  rung is comptime at every `respond` call site (its counter name *is*
+  the identity, §9), so keying on it costs a template rather than a
+  branch, and a shed rung added later inherits its token from the
+  ladder's naming rule rather than from a table someone must remember.
+  The **silences are the design**. A `400`, `413`, `414` or `431` that is
+  the *request's own* fault gets no field: 9209's registry is written for
+  what goes wrong *upstream*, so its only fitting token restates the
+  status line, and a field that never distinguishes anything is worse
+  than an absent one. (A `400` a filter *chose* is a different rung and
+  does carry `http_request_denied` — which is the keying argument above,
+  seen from the other side.) `502` is skipped
+  for the opposite reason — a refused dial, a reset mid-response and a
+  malformed origin head are three distinct 9209 causes answered at one
+  call site, so any single token would be right by accident. `next-hop`
+  is never sent: it would publish backend topology to every client that
+  can provoke an error, and the endpoint is already in the access log.
+  Structurally this is a **second rendering of the same table**, not a
+  render path: the reachable (status, cause) pairs — seven of the
+  forty-eight the two vocabularies could form — × two persistences of
+  additional comptime templates and their stamped storage, selected at
+  the same lookup by the listener's flag and the call site's cause. Shedding still costs one send from server memory,
+  and §5's closed form grows by a bound the same comptime assert covers.
+  Off by default and per listener, on `forwarded`'s reasoning: the field
+  states which of *this proxy's* limits a caller hit, which is a
+  diagnostic inside a mesh and a capacity disclosure at an edge, and a
+  proxy cannot tell from the inside which it is behind.
 - **Those responses can carry a body, and bodies are a named table**
   (#159, settled 2026-08-03). `bodies` maps a name to bytes — a `file`
   read once at startup or an `inline` string, exactly one, plus the
@@ -2662,6 +2705,7 @@ is a trap rather than a synonym.
 | **9112** HTTP/1.1 | §3.2 target forms; §6.3 body length; §7 transfer codings and §7.1.2's trailer section; §9 connection management | §7 framing, §8 close announcement |
 | **6585** additional statuses | defines `429` and `431` — **9110 did not absorb these**, the registry still points here | §8's static set |
 | **8297** early hints | defines `103` | §7's interim relay (#232) |
+| **9209** `Proxy-Status` | defines the field and the error-token registry a proxy may name a cause from | §8's opt-in, with one deviation below |
 | **3986** URI syntax | §2.3 unreserved, §5.2.4 dot-segments | §7 canonical path |
 
 RFC 9111 (caching) binds only an implementation that caches, which §1
@@ -2700,6 +2744,16 @@ states what their authority does to the `Host` beside them — the missing
 one costs a response that used to be immutable, and `Max-Forwards`
 (§7.6.2) with #240, which §7 states beside the `TRACE` refusal that
 closed the other half of it.
+
+- **`destination_not_found` is sent with `404`, not the `500` RFC 9209
+  recommends** (§8, #300). The registry pairs that token with a
+  recommended status, and this proxy answers a different one on purpose:
+  "no route matched" means the request named something this gateway does
+  not serve, which is the client's answer and not an internal failure —
+  answering `500` would put a healthy proxy's routing table in every
+  origin-error dashboard downstream. The recommendation is advisory in
+  9209's own words; the token, which is the part a client parses, is
+  used exactly as registered.
 
 - **`Via` is not sent** (9110 §7.6.3, a MUST for intermediaries). The
   cost is real and worth naming: a request that loops through this proxy

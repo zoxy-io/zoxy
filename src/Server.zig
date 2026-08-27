@@ -388,6 +388,11 @@ pub fn Server(comptime IoType: type) type {
             /// handed over the same way: trust depends on what is in front
             /// of this socket, so it cannot live on the cluster.
             forwarded: ?config_module.Config.Listener.Forwarded,
+            /// The listener's #300 opt-in: whether the pages this proxy
+            /// renders itself name why they refused. Per listener for the
+            /// same reason as `forwarded` — what may be said on the wire
+            /// depends on who is in front of this socket.
+            proxy_status: bool,
             /// The listener's PROXY protocol expectation (#142, null =
             /// first bytes are payload). Read at admission only — the
             /// receive phase is entered before the connection has any
@@ -1071,6 +1076,7 @@ pub fn Server(comptime IoType: type) type {
                     .request_filters = listener_config.request_filters,
                     .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
+                    .proxy_status = listener_config.proxy_status,
                     .proxy_protocol = listener_config.proxy_protocol,
                     .protocol = listener_config.protocol,
                     .credentials = server.credentialsFor(index),
@@ -1898,6 +1904,7 @@ pub fn Server(comptime IoType: type) type {
             conn.upgrades = listener.upgrades;
             conn.max_body_bytes = listener.max_body_bytes;
             conn.forwarded = listener.forwarded;
+            conn.proxy_status = listener.proxy_status;
             // The exchange's starting cluster, from the same listener and
             // for the same reason as the tables above — the L7 path
             // overwrites it at routing once the head parses (§7).

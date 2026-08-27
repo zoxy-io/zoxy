@@ -122,6 +122,10 @@ pub fn Conn(comptime IoType: type) type {
         /// The listener's §7 client-address forwarding mode, same lifetime
         /// as `routes`; null leaves `X-Forwarded-For` untouched.
         forwarded: ?config_module.Config.Listener.Forwarded,
+        /// Whether this listener names an RFC 9209 cause on the refusals
+        /// it renders itself (#300), carried like the modes above so a
+        /// shed asks its own socket rather than the listener index.
+        proxy_status: bool,
         /// The endpoint this L4 connection is charged against in the
         /// server's per-endpoint in-flight table (§7), or `endpoint_none`
         /// when it is charged against none — every L7 connection, and
@@ -305,6 +309,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.max_body_bytes = 0;
             conn.requests_served = 0;
             conn.forwarded = null;
+            conn.proxy_status = false;
             conn.charged_endpoint = stream_module.LogState.endpoint_none;
             conn.charged_cluster = 0;
             conn.protocol = protocol;

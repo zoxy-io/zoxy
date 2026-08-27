@@ -3978,7 +3978,7 @@ pub fn Proxy(comptime IoType: type) type {
             const may_keep = comptime !std.mem.eql(u8, counter, "l7_shed_head_buffers");
             const keep = commitStaticVerdict(server, conn, status, counter, may_keep);
             conn.state = .l7_responding;
-            armStaticAnswer(server, conn, status, keep);
+            armStaticAnswer(server, conn, status, comptime shed.proxyStatusCauseFor(counter), keep);
         }
 
         /// Everything a static verdict does before its bytes are chosen:
@@ -4087,10 +4087,16 @@ pub fn Proxy(comptime IoType: type) type {
             server: *ServerType,
             conn: *ConnType,
             comptime status: u16,
+            comptime cause: shed.ProxyStatusCause,
             keep: bool,
         ) void {
             assert(conn.state == .l7_responding);
             assert(!conn.stream.l7.response_started);
+            // A rung that names a cause must have a page for it (#300).
+            // The failure this forbids is silent: a missing variant looks
+            // exactly like the listener never opting in, so the wrong
+            // half of the pair would be found by nobody.
+            comptime assert(cause == .none or shed.hasVariant(status, cause));
             // Keeping implies the head parsed (§7 resync), which is what
             // makes the HEAD decision below sound wherever it matters.
             if (keep) {
@@ -4100,7 +4106,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return armPageWrite(server, conn, page, keep);
             }
             const persistence: shed.Persistence = if (keep) .keep else .close;
-            const answer = server.static_responses.get(status, persistence);
+            const answer = server.static_responses.get(status, cause, persistence, conn.proxy_status);
             // The `Date` this answer will carry (#234), written now
             // because now is when the server can still prove nothing is
             // reading these bytes — the claim taken below is what makes
