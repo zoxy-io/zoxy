@@ -2026,7 +2026,7 @@ test "tls: an operator's head size widens the plaintext buffer, and is priced" {
 }
 
 test "tls: an L4 listener terminates, and relays the plaintext both ways" {
-    // The whole promise in one scenario: a real ztls client handshakes
+    // The whole promise in one scenario: a real zssl client handshakes
     // against the proxy, sends application data, and the origin — which
     // knows nothing about TLS — echoes plaintext that comes back
     // encrypted. Every byte crosses the transform twice.

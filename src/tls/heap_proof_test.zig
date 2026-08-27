@@ -13,12 +13,12 @@ const std = @import("std");
 
 const Credentials = @import("Credentials.zig");
 const heap_mod = @import("libcrypto_heap.zig");
-const ztls = @import("ztls");
+const zssl = @import("zssl");
 
 const assert = std.debug.assert;
 
 // The heap's own unit tests ride this step too: the file links libcrypto
-// through its ztls import, so it cannot join the CI test binary without
+// through its zssl import, so it cannot join the CI test binary without
 // dragging libcrypto's initialization in ahead of the install above.
 comptime {
     _ = heap_mod;
@@ -71,48 +71,44 @@ test "a handshake runs entirely on the fixed libcrypto heap" {
     try std.testing.expectEqual(after_first, heap_mod.usedPeak());
 }
 
-/// One full in-memory handshake, raw ztls both sides. Its own function so
+/// One full in-memory handshake, raw zssl both sides. Its own function so
 /// the plateau check above can run it repeatedly — every buffer here is a
 /// local, so a handshake's whole libcrypto footprint is freed on return.
 fn handshake(credentials: *const Credentials) !void {
-    const server_keypair = try ztls.x25519.KeyPair.generateDeterministic(.init(@splat(0x42)));
-    var server: ztls.ServerHandshake = .init(.{
-        .keypairs = try .init(server_keypair),
-        .random = .init(@splat(0x43)),
+    var server_reassembly: [16 * 1024]u8 = undefined;
+    var server_flight: [zssl.Credentials.chain_bytes_max + 1024]u8 = undefined;
+    var server: zssl.ServerHandshake = .init(&.{
+        .credentials = &credentials.inner,
+        .server_random = @splat(0x43),
+        .x25519_private = @splat(0x42),
+        .reassembly = &server_reassembly,
+        .flight = &server_flight,
     });
     defer server.deinit();
-    server.setCredentials(credentials.chain, credentials.signer());
 
-    const client_x25519 = try ztls.x25519.KeyPair.generateDeterministic(.init(@splat(0x51)));
-    const client_p256 = try ztls.p256.KeyPair.generateDeterministic(.init(@splat(0x53)));
-    var client: ztls.ClientHandshake = .init(.{
-        .keypairs = .initWithP256(client_x25519, client_p256),
-        .host_name = "spike.zoxy.test",
-        .now_sec = 0,
-        .random = .init(@splat(0x52)),
-        .insecure_no_chain_anchor = true,
+    var client_reassembly: [16 * 1024]u8 = undefined;
+    var client: zssl.ClientHandshake = .init(&.{
+        .client_random = @splat(0x52),
+        .x25519_private = @splat(0x51),
+        .server_name = "spike.zoxy.test",
+        .certificate_policy = .insecure_no_verification,
+        .reassembly = &client_reassembly,
     });
     defer client.deinit();
 
-    var client_out: ztls.ClientHandshake.OutBuffer = .empty;
-    var server_out: ztls.ServerHandshake.OutBuffer = .empty;
-    var flight: ztls.ServerHandshake.FlightBuffer = .empty;
+    var client_out: [zssl.ClientHandshake.out_bytes_min]u8 = undefined;
+    var server_out: [zssl.ServerHandshake.out_bytes_min]u8 = undefined;
 
     var to_server: Wire = .{};
     var to_client: Wire = .{};
-    to_server.write(try client.start(&client_out.buffer));
-    client.completeWrite();
+    to_server.write(client.start(&client_out));
 
-    to_client.write(try server.acceptClientHello(to_server.take(), &server_out.buffer));
-    server.completeWrite();
-    to_client.write((try server.sendServerFlightBuffered(&flight)).?);
-    server.completeWrite();
-
+    try feedServer(&server, &server_out, to_server.take(), &to_client);
     try feedClient(&client, &client_out, to_client.take(), &to_server);
-    try server.processClientFinished(to_server.take());
+    try feedServer(&server, &server_out, to_server.take(), &to_client);
 
-    assert(client.isConnected());
-    assert(server.isConnected());
+    assert(client.state == .connected);
+    assert(server.state == .connected);
 }
 
 const Wire = struct {
@@ -125,7 +121,7 @@ const Wire = struct {
         wire.len += @intCast(chunk.len);
     }
 
-    /// Mutable: ztls decrypts records in place.
+    /// Mutable: records are decrypted in place.
     fn take(wire: *Wire) []u8 {
         const bytes = wire.bytes[0..wire.len];
         wire.len = 0;
@@ -133,15 +129,13 @@ const Wire = struct {
     }
 };
 
-fn feedClient(
-    client: *ztls.ClientHandshake,
-    out: *ztls.ClientHandshake.OutBuffer,
-    server_wire: []u8,
-    to_server: *Wire,
-) !void {
-    var storage: ztls.RecordBuffer.Storage = .empty;
-    var records: ztls.RecordBuffer = .init(&storage.buffer);
-    var remaining = server_wire;
+/// Both directions are the same loop over a different machine, so it is
+/// written once and instantiated twice: the two event unions differ only
+/// in arms this proof ignores.
+fn feed(machine: anytype, out: []u8, peer_wire: []u8, to_peer: *Wire) !void {
+    var storage: [zssl.record.wire_record_bytes_max]u8 = undefined;
+    var records = zssl.record_buffer.RecordBuffer.init(&storage);
+    var remaining = peer_wire;
     // Bounded: every iteration moves at least one byte out of `remaining`,
     // and a drained record buffer always has room for one.
     while (remaining.len > 0) {
@@ -151,14 +145,37 @@ fn feedClient(
         @memcpy(writable[0..taken], remaining[0..taken]);
         records.advance(taken);
         remaining = remaining[taken..];
-        while (try records.next()) |record| {
-            switch (try client.handleRecord(record, &out.buffer)) {
-                .write => |bytes| {
-                    to_server.write(bytes);
-                    client.completeWrite();
+        while (try records.next()) |wire_record| {
+            switch (try machine.handleRecord(wire_record, out)) {
+                .send => |bytes| to_peer.write(bytes),
+                // The client's `.connected` carries its flight; the
+                // server's carries nothing, which is why this is matched
+                // by shape rather than by name. Sound because Zig prunes
+                // the untaken comptime branch per instantiation, so the
+                // void-payload side never type-checks the slice arm.
+                .connected => |payload| {
+                    if (@TypeOf(payload) == []const u8) to_peer.write(payload);
                 },
-                .application_data, .closed, .key_update, .new_session_ticket, .none => {},
+                else => {},
             }
         }
     }
+}
+
+fn feedClient(
+    client: *zssl.ClientHandshake,
+    out: []u8,
+    server_wire: []u8,
+    to_server: *Wire,
+) !void {
+    return feed(client, out, server_wire, to_server);
+}
+
+fn feedServer(
+    server: *zssl.ServerHandshake,
+    out: []u8,
+    client_wire: []u8,
+    to_client: *Wire,
+) !void {
+    return feed(server, out, client_wire, to_client);
 }

@@ -444,8 +444,8 @@
         // names the adversarial gate still missing. Read that before
         // trusting this pin further than the fork it replaced.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#8cd7da8504bef87c3f904eae4f1115682b5e2fbb",
-            .hash = "zssl-0.0.1-5ocyiFUtBgBYqYQZjIwnHxqYbInXPM9M2Lwc8PQ866NT",
+            .url = "git+https://github.com/zoxy-io/zssl#4ed35598e0d76c270112d97f98c4e40319c1e781",
+            .hash = "zssl-0.0.1-5ocyiFByBgACklfzAx0xOsJRaqCnJ6ExzYSvv5hyA6R9",
         },
     },
     .paths = .{

@@ -63,6 +63,12 @@ pub fn load(
     key_pem: []const u8,
     options: Options,
 ) LoadError!Credentials {
+    // An empty file is an operator mistake worth naming, and zssl
+    // asserts rather than returns on one — its contract is that the
+    // embedder validated its own config. This is where that validation
+    // lives.
+    if (cert_pem.len == 0) return error.NoCertificates;
+    if (key_pem.len == 0) return error.UnsupportedCertKey;
     const storage = try arena.alloc(u8, zssl.Credentials.chain_bytes_max);
     var inner = zssl.Credentials.load(cert_pem, key_pem, storage, options.deterministic_nonce) catch |err| switch (err) {
         // zssl reports "no usable chain" for both an empty PEM and one
@@ -145,6 +151,25 @@ test "credentials: a PEM with no certificate block is rejected" {
     try std.testing.expectError(
         error.NoCertificates,
         Credentials.load(arena_state.allocator(), "not a pem file", fixture_key_pem, .{}),
+    );
+}
+
+// Both guards exist because zssl *asserts* on empty input rather than
+// returning — its contract is that the embedder validated its own
+// config, and this is where that validation lives. A guard added to
+// close an assert-on-operator-input gap needs a gate of its own, or the
+// next refactor removes it as dead code.
+test "credentials: an empty certificate or key file is named, not asserted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(
+        error.NoCertificates,
+        Credentials.load(arena, "", fixture_key_pem, .{}),
+    );
+    try std.testing.expectError(
+        error.UnsupportedCertKey,
+        Credentials.load(arena, fixture_cert_pem, "", .{}),
     );
 }
 

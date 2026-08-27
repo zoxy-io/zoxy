@@ -505,24 +505,32 @@ pub fn build(b: *std.Build) void {
                 // startup) but a *raised* one silently — a profile aimed at
                 // the new maximum would cap below it and say nothing.
                 //
-                // `src/constants.zig` directly rather than the whole `zoxy`
-                // module, which imports zssl: this executable also imports
-                // zrk, which reaches ztls through ztls_std, and both reach
-                // one libcrypto — while the
-                // two instantiations differ in optimize mode — ReleaseSafe
-                // for the zoxy under test, ReleaseFast for the load
-                // generator. Zig treats those as two modules rooted at one
-                // file and refuses to compile:
+                // `src/constants.zig` directly rather than the whole
+                // `zoxy` module, which imports zssl. Two reasons, and the
+                // second is newer than the first.
+                //
+                // One: this executable also imports zrk, and the two
+                // instantiations differ in optimize mode — ReleaseSafe for
+                // the zoxy under test, ReleaseFast for the load generator.
+                // Where both sides reach one TLS package, Zig treats that
+                // as two modules rooted at one file and refuses to
+                // compile:
                 //
                 //     error: file exists in modules 'zssl' and 'zssl0'
                 //     note: files must belong to only one module
                 //
+                // Two: the pinned zrk (v2.1.0) still links ztls over the
+                // *pre-split* openssl, while zoxy links zssl over the
+                // crypto/ssl split — two different pins of the same C
+                // library, with different artifact names, in one binary.
                 // Importing a leaf that depends on nothing but `std` keeps
-                // both of those optimize choices, which are deliberate, and
-                // takes the shared C dependency out of the question. It only
-                // became possible to hit once libcrypto stopped being one
+                // both optimize choices, which are deliberate, and takes
+                // the whole question out of the link. It only became
+                // possible to hit once libcrypto stopped being one
                 // system-wide shared object and became a per-configuration
-                // artifact (#279).
+                // artifact (#279); bumping zrk onto zssl will make the
+                // first reason bite again, so this stays a leaf import
+                // either way.
                 .{ .name = "zoxy_constants", .module = b.createModule(.{
                     .root_source_file = b.path("src/constants.zig"),
                     .target = target,

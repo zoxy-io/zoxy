@@ -1,7 +1,7 @@
 //! A scripted TLS *client* for the gates (§9): connects over an `Io`
-//! backend, drives a real ztls handshake against zoxy's server engine,
+//! backend, drives a real zssl client handshake against zoxy's server engine,
 //! and records how the session ended. It lives under `src/tls/` because
-//! that is the only place ztls may be named (§4) — which also makes it
+//! that is the only place zssl may be named (§4) — which also makes it
 //! the one TLS peer the server tests and the simulator share.
 //!
 //! Every input is seeded, never drawn from entropy: both keyshares and
@@ -13,24 +13,66 @@ const std = @import("std");
 
 const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
-const ztls = @import("ztls");
+const zssl = @import("zssl");
 
 const assert = std.debug.assert;
 
 /// What a client captures from one session and offers on the next.
-/// Re-exported because ztls may not be named outside `src/tls/` (§4), and
+/// Owned rather than re-exported: zssl hands a ticket out as views into
+/// the handshake's reassembly buffer, valid only until the next record,
+/// and a resuming client offers one back a whole session later. So the
+/// bytes are copied here, along with the PSK derived while the session
+/// that issued it was still alive.
+///
+/// Lives here because zssl may not be named outside `src/tls/` (§4), and
 /// a gate driving a resumption needs to hold one between two clients.
-pub const SessionTicket = ztls.ClientHandshake.SessionTicket;
+pub const SessionTicket = struct {
+    identity: [ticket_identity_bytes_max]u8,
+    identity_bytes: u16,
+    psk: [zssl.cipher_suite.hash_bytes_max]u8,
+    psk_bytes: u8,
+    obfuscated_age: u32,
+
+    /// Nothing captured yet. `identity_bytes == 0` is what
+    /// `ticket_captured` guards, so the storage need not be meaningful.
+    pub const empty: SessionTicket = .{
+        .identity = @splat(0),
+        .identity_bytes = 0,
+        .psk = @splat(0),
+        .psk_bytes = 0,
+        .obfuscated_age = 0,
+    };
+
+    /// What `Config.resume_session` wants, borrowing from this value —
+    /// which must outlive the handshake that offers it.
+    fn resumption(ticket: *const SessionTicket) zssl.ClientHandshake.Resumption {
+        assert(ticket.identity_bytes >= 1);
+        assert(ticket.psk_bytes == 32 or ticket.psk_bytes == 48);
+        return .{
+            .identity = ticket.identity[0..ticket.identity_bytes],
+            .obfuscated_age = ticket.obfuscated_age,
+            .psk = ticket.psk,
+            .psk_bytes = ticket.psk_bytes,
+        };
+    }
+};
+
+/// zoxy seals its own tickets at `Tickets.ticket_bytes`, comfortably
+/// inside this; the cap exists so the client stays fixed-size.
+const ticket_identity_bytes_max: usize = 512;
 
 /// Generic over the Io backend so the simulator and any socket-backed
 /// test drive the same client.
 pub fn TestClient(comptime IoType: type) type {
     return struct {
         io: *IoType,
-        hs: ztls.ClientHandshake,
-        storage: ztls.RecordBuffer.Storage,
-        records: ztls.RecordBuffer,
-        out: ztls.ClientHandshake.OutBuffer,
+        hs: zssl.ClientHandshake,
+        storage: [zssl.record.wire_record_bytes_max]u8,
+        records: zssl.record_buffer.RecordBuffer,
+        out: [zssl.ClientHandshake.out_bytes_min]u8,
+        /// Caller-owned reassembly for the server's flight — the
+        /// certificate chain is the big part.
+        reassembly: [16 * 1024]u8,
         socket: IoType.Socket,
         connect_completion: IoType.Completion,
         cancel_completion: IoType.Completion,
@@ -66,7 +108,7 @@ pub fn TestClient(comptime IoType: type) type {
         close_sent: bool,
         /// Whether the close rides the data write (`close_with_data`), and
         /// the scratch that makes that one write: `hs` renders each record
-        /// into the shared out buffer and `completeWrite` invalidates the
+        /// into the shared out buffer and the next render overwrites the
         /// previous one, so two records in one segment must be copied out
         /// as they are produced.
         close_with_data: bool,
@@ -91,12 +133,12 @@ pub fn TestClient(comptime IoType: type) type {
         /// test that the server's `psk_lookup` opens what it sealed.
         /// Meaningless until `ticket_captured`; a server that issues none
         /// leaves it so, and that is itself an assertable fact.
-        ticket: ztls.ClientHandshake.SessionTicket,
+        ticket: SessionTicket,
         ticket_captured: bool,
         /// A ticket to offer at the *next* handshake, from `Options`.
         /// Borrowed from whoever captured it — normally an earlier
         /// client whose storage outlives this one.
-        resume_with: ?*const ztls.ClientHandshake.SessionTicket,
+        resume_with: ?*const SessionTicket,
         /// Runs once the client is done — how a scenario learns to wind
         /// down (drain the server, stop the origin).
         on_end: ?*const fn (ctx: ?*anyopaque) void = null,
@@ -177,7 +219,7 @@ pub fn TestClient(comptime IoType: type) type {
             /// Offer this ticket in the ClientHello, resuming the session
             /// that issued it instead of running a full handshake. The
             /// storage is the caller's and must outlive the client.
-            resume_with: ?*const ztls.ClientHandshake.SessionTicket = null,
+            resume_with: ?*const SessionTicket = null,
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -193,25 +235,25 @@ pub fn TestClient(comptime IoType: type) type {
             options: Options,
         ) !void {
             checkOptions(&options);
-            const x25519 = try ztls.x25519.KeyPair.generateDeterministic(
-                .init(options.x25519_seed),
-            );
-            const p256 = try ztls.p256.KeyPair.generateDeterministic(
-                .init(options.p256_seed),
-            );
             client.io = io;
-            client.hs = .init(.{
-                .keypairs = .initWithP256(x25519, p256),
-                .host_name = options.host_name,
-                .now_sec = 0,
-                .random = .init(options.random),
-                // The test fixtures are self-signed; chain anchoring is
-                // not what these gates prove.
-                .insecure_no_chain_anchor = true,
+            // The seed *is* the x25519 scalar, and zssl offers that group
+            // alone — so there is no second keyshare to generate and no
+            // fallible keygen on this path.
+            client.hs = .init(&.{
+                .client_random = options.random,
+                .x25519_private = options.x25519_seed,
+                .server_name = options.host_name,
+                // The test fixtures are self-signed and these gates are
+                // about zoxy's record layer, not this client's trust
+                // decisions — the same call the smoke client makes.
+                .certificate_policy = .insecure_no_verification,
+                .resume_session = if (options.resume_with) |ticket|
+                    ticket.resumption()
+                else
+                    null,
+                .reassembly = &client.reassembly,
             });
-            client.storage = .empty;
-            client.records = .init(&client.storage.buffer);
-            client.out = .empty;
+            client.records = .init(&client.storage);
             client.connect_completion = .{};
             client.cancel_completion = .{};
             client.connected = false;
@@ -242,7 +284,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.payloads_sent = 0;
             client.coalesced_len = 0;
             client.app_received_len = 0;
-            client.ticket = .{};
+            client.ticket = .empty;
             client.ticket_captured = false;
             client.resume_with = options.resume_with;
             io.connect(&.{ .ip = address }, &client.connect_completion, Self, client, onConnect);
@@ -286,22 +328,13 @@ pub fn TestClient(comptime IoType: type) type {
                 return;
             };
             client.connected = true;
-            // A ticket in hand means offer it: the ClientHello carries a
+            // A ticket in hand means offer it — `Config.resume_session`
+            // was set at `start`, so the ClientHello carries a
             // pre_shared_key extension and the server either opens it
             // (resumed) or ignores it (full handshake). Both are legal
             // outcomes of the same call, which is why the test asserts on
             // the server's counters rather than on this succeeding.
-            client.pending_send = if (client.resume_with) |ticket|
-                client.hs.startWithPsk(ticket, &client.out.buffer, false) catch {
-                    client.finish();
-                    return;
-                }
-            else
-                client.hs.start(&client.out.buffer) catch {
-                    client.finish();
-                    return;
-                };
-            client.hs.completeWrite();
+            client.pending_send = client.hs.start(&client.out);
             client.armSend();
         }
 
@@ -460,21 +493,21 @@ pub fn TestClient(comptime IoType: type) type {
 
         /// Render one application payload and write it. The three "send
         /// the next thing" steps differ only in which bytes go, so the
-        /// render / `completeWrite` / arm sequence lives here once —
-        /// `completeWrite` invalidates the previous record, so getting
-        /// that order wrong overwrites bytes that have not left yet.
+        /// render-then-arm sequence lives here once — each render reuses
+        /// the shared out buffer, so starting the next before the last
+        /// has left would overwrite bytes still in flight. The
+        /// `pending_send.len == 0` assertion is what enforces that.
         fn sendPayload(client: *Self, bytes: []const u8) void {
             assert(bytes.len >= 1);
             assert(client.pending_send.len == 0);
             client.payloads_sent += 1;
             client.pending_send = client.hs.sendApplicationData(
                 bytes,
-                &client.out.buffer,
+                &client.out,
             ) catch {
                 client.finish();
                 return;
             };
-            client.hs.completeWrite();
             client.armSend();
         }
 
@@ -485,28 +518,20 @@ pub fn TestClient(comptime IoType: type) type {
         fn sendCloseNotify(client: *Self) void {
             assert(client.close_sent);
             assert(client.pending_send.len == 0);
-            client.pending_send = client.hs.sendAlert(
-                .close_notify,
-                &client.out.buffer,
-            ) catch {
+            client.pending_send = client.hs.sendClose(&client.out) catch {
                 client.finish();
                 return;
             };
-            client.hs.completeWrite();
             client.armSend();
         }
 
         fn sendKeyUpdate(client: *Self) void {
             assert(client.key_update_sent);
             assert(client.pending_send.len == 0);
-            client.pending_send = client.hs.sendKeyUpdate(
-                &client.out.buffer,
-                .update_requested,
-            ) catch {
+            client.pending_send = client.hs.sendKeyUpdate(true, &client.out) catch {
                 client.finish();
                 return;
             };
-            client.hs.completeWrite();
             client.armSend();
         }
 
@@ -541,20 +566,37 @@ pub fn TestClient(comptime IoType: type) type {
             client.payloads_sent += 1;
             const data = try client.hs.sendApplicationData(
                 client.app_to_send,
-                &client.out.buffer,
+                &client.out,
             );
             assert(data.len >= 1);
             assert(data.len <= client.coalesced.len);
             @memcpy(client.coalesced[0..data.len], data);
             client.coalesced_len = @intCast(data.len);
-            client.hs.completeWrite();
 
-            const alert = try client.hs.sendAlert(.close_notify, &client.out.buffer);
+            const alert = try client.hs.sendClose(&client.out);
             assert(alert.len >= 1);
             assert(client.coalesced_len + alert.len <= client.coalesced.len);
             @memcpy(client.coalesced[client.coalesced_len..][0..alert.len], alert);
             client.coalesced_len += @intCast(alert.len);
-            client.hs.completeWrite();
+        }
+
+        /// Copy an issued ticket out of zssl's borrowed views and derive
+        /// the PSK it stands for. Both halves must happen now: the views
+        /// die at the next record, and `resumptionPsk` needs the session
+        /// that issued the ticket to still be the live one.
+        fn captureTicket(client: *Self, issued: *const zssl.ClientHandshake.Ticket) void {
+            assert(!client.ticket_captured);
+            if (issued.ticket.len > ticket_identity_bytes_max) return;
+            var psk_buffer: [zssl.cipher_suite.hash_bytes_max]u8 = undefined;
+            const psk = client.hs.resumptionPsk(issued.nonce, &psk_buffer);
+            assert(psk.len == 32 or psk.len == 48);
+            @memcpy(client.ticket.identity[0..issued.ticket.len], issued.ticket);
+            client.ticket.identity_bytes = @intCast(issued.ticket.len);
+            @memset(&client.ticket.psk, 0);
+            @memcpy(client.ticket.psk[0..psk.len], psk);
+            client.ticket.psk_bytes = @intCast(psk.len);
+            client.ticket.obfuscated_age = issued.age_add;
+            client.ticket_captured = true;
         }
 
         fn feed(client: *Self, wire: []const u8) !void {
@@ -566,12 +608,12 @@ pub fn TestClient(comptime IoType: type) type {
                 @memcpy(writable[0..take], remaining[0..take]);
                 client.records.advance(take);
                 remaining = remaining[take..];
-                while (try client.records.next()) |record| {
-                    switch (try client.hs.handleRecord(record, &client.out.buffer)) {
-                        .write => |bytes| {
-                            client.pending_send = bytes;
-                            client.hs.completeWrite();
-                        },
+                while (try client.records.next()) |wire_record| {
+                    switch (try client.hs.handleRecord(wire_record, &client.out)) {
+                        // `.connected` carries the client flight, so both
+                        // arms are the same instruction: put it on the
+                        // wire.
+                        .send, .connected => |bytes| client.pending_send = bytes,
                         .closed => client.saw_close = true,
                         .application_data => |bytes| {
                             assert(client.app_received_len + bytes.len <=
@@ -582,22 +624,18 @@ pub fn TestClient(comptime IoType: type) type {
                             );
                             client.app_received_len += @intCast(bytes.len);
                         },
-                        .new_session_ticket => |nst| {
+                        .ticket => |issued| {
                             // Keep the *first* only. A server issues
                             // several and they are interchangeable, so
                             // storing one keeps this a fixed-size client
                             // and makes "the ticket" unambiguous in the
                             // test that offers it back.
-                            if (!client.ticket_captured) {
-                                client.ticket = client.hs.deriveSessionTicket(nst) catch
-                                    continue;
-                                client.ticket_captured = true;
-                            }
+                            if (!client.ticket_captured) client.captureTicket(&issued);
                         },
-                        .key_update, .none => {},
+                        .none => {},
                     }
                 }
-                if (client.hs.isConnected()) client.handshake_done = true;
+                if (client.hs.state == .connected) client.handshake_done = true;
             }
         }
 
@@ -612,7 +650,7 @@ pub fn TestClient(comptime IoType: type) type {
         fn finish(client: *Self) void {
             if (client.ended) return;
             client.ended = true;
-            if (client.hs.isConnected()) client.handshake_done = true;
+            if (client.hs.state == .connected) client.handshake_done = true;
             if (client.connected) client.io.closeNow(client.socket);
             if (client.on_end) |hook| hook(client.on_end_context);
         }
@@ -651,7 +689,7 @@ pub fn TestClient(comptime IoType: type) type {
         /// legal outcome and so a question rather than an assertion. The
         /// pointer is into this client's own storage, so whoever offers it
         /// must not outlive the one that captured it.
-        pub fn capturedTicket(client: *const Self) ?*const ztls.ClientHandshake.SessionTicket {
+        pub fn capturedTicket(client: *const Self) ?*const SessionTicket {
             if (!client.ticket_captured) return null;
             return &client.ticket;
         }

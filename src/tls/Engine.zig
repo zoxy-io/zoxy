@@ -4,8 +4,10 @@
 //! allocation in the wrapper — libcrypto's own allocations ride the fixed
 //! heap of `libcrypto_heap.zig`.
 //!
-//! An engine is ~132 KiB — mostly the record and reassembly buffers,
-//! each two max records wide — so the serving path holds these in a
+//! An engine is ~91 KiB — the outbox and flight scratch dominate, with
+//! one record buffer, one out buffer and a ClientHello-sized reassembly
+//! beside them (`constants.tls_engine_bytes_max` states the ceiling) —
+//! so the serving path holds these in a
 //! shared `Pool` rather than one per conn slot: a listener that
 //! terminates TLS pays for concurrent *handshaking and terminated*
 //! connections, not for every slot it could ever admit (§5).

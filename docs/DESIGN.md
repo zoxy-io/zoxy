@@ -213,8 +213,8 @@ iteration's hand-rolled TigerBeetle pattern, and the same shape as
 crypto primitives.** The TIGER_STYLE zero-dependency rule takes its
 recorded exceptions here, all vendored by content hash in `build.zig.zon`
 as zoxy-io forks: **libxev** (this section), **hparse** (the HTTP/1.1 head
-parser — as a hardened fork, §7), and **ztls** (the TLS 1.3 engine, below).
-libxev and hparse are pure Zig. ztls carries the codebase's one C surface,
+parser — as a hardened fork, §7), and **zssl** (the TLS 1.3 engine, below).
+libxev and hparse are pure Zig. zssl carries the codebase's one C surface,
 and takes the deliberate decision this section reserved: **battle-tested C
 crypto *primitive* libraries — the libcrypto family (OpenSSL / AWS-LC /
 BoringSSL) — are acceptable dependencies.** The trust split runs the right
@@ -241,7 +241,7 @@ does get is the audited Zig above it, the fixed heap beside it, and §9's
 And the pinned hash is an *audited commit*, never a branch tip — libxev's
 Zig 0.16 support is a self-described compatibility shim (PR #220) with
 real fixes still unmerged behind it — so a pin moves only after re-audit;
-for ztls that audit means the Zig protocol layer read line by line, the C
+for zssl that audit means the Zig protocol layer read line by line, the C
 primitives trusted institutionally.
 
 - **Caller-owned completions.** Every `xev.Completion` is embedded inline
@@ -524,7 +524,7 @@ a raised `RLIMIT_NOFILE`:
 | upstream slots | 1311 | 11457 | ~48 B state |
 | head buffers (ring) | = conn slots | 11457 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11457 | `head_buffer_bytes` + 24 B |
-| tls engines | 0, or min(conn slots, 1024) | 1024 | ~132 KiB + plaintext |
+| tls engines | 0, or min(conn slots, 1024) | 1024 | ~91 KiB + plaintext |
 | tunnels | 0 (off) | 11457 | 2 × `relay_buffer_bytes` |
 | **pool memory** | **~66 MiB** | **~653 MiB** | |
 
@@ -623,7 +623,7 @@ while `tunnels ≤ conn_slots` holds, which is why that is a rejection at
 load rather than advice.
 
 The **TLS engine pool** (§4) is the one whose default is not "one per
-connection", and the row above says so: an engine is ~132 KiB of ztls
+connection", and the row above says so: an engine is ~91 KiB of zssl
 record and reassembly buffers plus *two* plaintext destinations —
 `max(head_buffer_bytes, 32 KiB)` for the head, which the response head
 then renders back over, and a further 32 KiB for the request body, which
@@ -2694,7 +2694,7 @@ src/
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
   tls/
-    Engine.zig        // ztls wrapper: sans-I/O TLS 1.3 seam, pooled (§4, §5)
+    Engine.zig        // zssl wrapper: sans-I/O TLS 1.3 seam, pooled (§4, §5)
     Credentials.zig   // per-listener PEM chain + signing key, parsed once (§4)
     libcrypto_heap.zig // libcrypto's mallocs into one fixed startup buffer (§4, §5)
   balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)
