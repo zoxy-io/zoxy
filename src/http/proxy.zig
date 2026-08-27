@@ -1066,7 +1066,7 @@ pub fn Proxy(comptime IoType: type) type {
                     .respond => |page| return respondWithPage(server, conn, page),
                 }
             }
-            conn.stream.cluster_index = router.route(conn.routes, keys.host, keys.views.match) orelse {
+            conn.stream.cluster_index = router.route(conn.routes, keys.host, keys.views.match, request.headers) orelse {
                 return respond(server, conn, 404, "l7_no_route");
             };
 

@@ -514,6 +514,63 @@ origin receives, so the router and the backend cannot disagree about which
 resource was named. Structure-changing escapes (`%2F`, `%00`, truncated
 escapes) are rejected with `400`; no matching route is a `404`.
 
+#### Pinning a canary with a header
+
+Percentage canaries are [endpoint weights](#weights): put the new version's
+endpoints in the same cluster at low weight and every pick policy honours
+it. What weights cannot express is the **pinned** case — a specific client,
+a test account, an internal gateway's header — because it is not
+probabilistic. A route can match a header for exactly that:
+
+```json
+"routes": [
+    { "header": { "name": "X-Canary", "present": true },
+      "prefix": "/", "cluster": "next" },
+    { "prefix": "/", "cluster": "stable" }
+]
+```
+
+Either `{ "present": true }` for any value, or `{ "equals": "..." }` for
+one. Names match case-insensitively (RFC 9110); values do not. There is no
+substring or regex matching — a route's predicate is a bounded comparison,
+on a table every request walks.
+
+**Host, then header, then prefix.** Every key a route states must hold —
+the three are a conjunction, not a ranking — and where several routes
+match, the most specific wins in that order: a host-scoped route beats an
+any-host one, and within a host group a route naming a header beats one
+that does not.
+
+```json
+"routes": [
+    { "host": "api.example.com", "header": { "name": "X-Canary", "present": true },
+      "prefix": "/", "cluster": "api-canary" },
+    { "host": "api.example.com", "prefix": "/",  "cluster": "api" },
+    { "header": { "name": "X-Canary", "present": true },
+      "prefix": "/", "cluster": "canary" },
+    { "prefix": "/", "cluster": "web" }
+]
+```
+
+Those four can be written in any sequence and answer identically: the table
+is sorted once at startup, so config order cannot change which of two
+*differently* specific routes wins.
+
+Config order does decide one case, and it is the case the tiers cannot
+separate: two routes sharing a host and a prefix but naming **different**
+headers are distinct rules of equal specificity, and a request carrying
+both matches both. The one written first wins — the same thing every other
+proxy does for every route, here narrowed to the only place zoxy has left
+for it.
+
+> [!NOTE]
+> Two things worth knowing before you lean on this. A request that gains or
+> loses the header **moves to a different cluster**, so a `hash` pick still
+> holds within each cluster but not across the change — "sticky" and
+> "canary" together is exactly where that surprises people. And the header
+> is a routing key *and* is forwarded, so the origin sees it and can log
+> which side of the cut served the request.
+
 `CONNECT` and `TRACE` are answered `501` and never reach a backend.
 `CONNECT` asks the proxy to open an arbitrary destination, which is
 forward-proxy behaviour; `TRACE` echoes a request back, which is the
