@@ -34,15 +34,45 @@
     .dependencies = .{
         // Audited fork: zoxy-io/libxev branch zoxy-buffer-group = upstream
         // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
-        // plus five commits, each its own stacked PR:
+        // plus six commits, each its own stacked PR:
         //   c369817 expose io_uring setup flags through Options
         //   6bd950d expose the CQ depth (IORING_SETUP_CQSIZE) — the c10k
         //           lever
         //   b3d6b55 keep the raw errno on the Completion (zoxy-io/libxev#2)
         //   24da6d0 recv_group — provided-buffer receives (zoxy-io/libxev#3)
         //   fe5a07b leave readiness to the wait in submit (kqueue)
+        //   d3e0249 let connect address an AF_UNIX pathname socket (#303)
         // Diff against that upstream commit to audit; the pin moves only
         // after re-audit.
+        //
+        // Re-audit for d3e0249, signed off 2026-08-27. `Completion.connect`
+        // carries a `net.Address`, whose union members top out at 28 bytes;
+        // a `sockaddr_un` is 110, and `getOsSockLen`'s catch-all arm hands
+        // the kernel `@sizeOf(sockaddr)` — so an AF_UNIX destination was
+        // not merely unimplemented, it was inexpressible, and a path would
+        // have been truncated to thirteen characters. Both backends prep
+        // from `&v.addr.any` and that length, so the fix has to be in the
+        // union rather than at either call site.
+        //
+        // The diff is three things: a `un` member, an `initUnix` that
+        // rejects a path with no room for its terminator (and rejects the
+        // empty path, i.e. the abstract namespace, whose length is the
+        // caller's to state rather than the constructor's to derive), and
+        // an `AF.UNIX` arm deriving the length from that terminator as
+        // `unix(7)` documents. Nothing existing changes shape: the IP arms
+        // of `getOsSockLen`, `toIpAddress` and `fromIpAddress` are
+        // untouched, and no backend gained an op.
+        //
+        // What it costs, stated because §5 is closed-form: the kernel reads
+        // the address from one contiguous location that must outlive the
+        // submission, and the completion is the only storage the op has, so
+        // the path is inline and `Completion` grows 128 -> 152 bytes
+        // (io_uring) and 184 -> 208 (epoll). zoxy holds two per conn and
+        // four per stream, so the effective config's arena grows by
+        // 144 B x conn slots — 0.4% of the banner's total at the shipped
+        // shape, against relay buffers that dominate it. Upstream's two
+        // size-guard tests move with the number rather than being deleted;
+        // being told about exactly this is what they are for.
         //
         // Re-audit for fe5a07b, signed off 2026-08-27. **kqueue only**, and
         // the one commit in this stack that fixes upstream rather than
@@ -100,8 +130,8 @@
         // arms discard which errno failed, which is what left a c10k run
         // reporting 227,628 indistinguishable failures.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#fe5a07b4c2920e254e0c4504e5814999696b63b6",
-            .hash = "libxev-0.0.0-86vtc_ZhFAAfG-sAVZbbuZfYYc7wdbZbUsDli3Sn0Afw",
+            .url = "git+https://github.com/zoxy-io/libxev#d3e0249d528742598065923cbaa2cdc76a4a34b5",
+            .hash = "libxev-0.0.0-86vtcw5yFACICkLeGxnTeKcrj2Mb20q8-wkx_bk25-R9",
         },
         // Load generator, §9 Tier 0/1 only — never linked into the proxy
         // (no `src/` file imports it), so a bump moves what the benchmark
