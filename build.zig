@@ -519,18 +519,20 @@ pub fn build(b: *std.Build) void {
                 //     error: file exists in modules 'zssl' and 'zssl0'
                 //     note: files must belong to only one module
                 //
-                // Two: the pinned zrk (v2.1.0) still links ztls over the
-                // *pre-split* openssl, while zoxy links zssl over the
-                // crypto/ssl split — two different pins of the same C
-                // library, with different artifact names, in one binary.
+                // That reason is live again now that zrk pins the same
+                // zssl this file does: one TLS package reached from both
+                // sides at two optimize modes is exactly the collision
+                // above. It briefly had a second reason — while zrk still
+                // linked ztls over the pre-split openssl, the harness
+                // would have carried two pins of the same C library — and
+                // that is closed, but the first reason alone is enough.
+                //
                 // Importing a leaf that depends on nothing but `std` keeps
                 // both optimize choices, which are deliberate, and takes
                 // the whole question out of the link. It only became
                 // possible to hit once libcrypto stopped being one
                 // system-wide shared object and became a per-configuration
-                // artifact (#279); bumping zrk onto zssl will make the
-                // first reason bite again, so this stays a leaf import
-                // either way.
+                // artifact (#279).
                 .{ .name = "zoxy_constants", .module = b.createModule(.{
                     .root_source_file = b.path("src/constants.zig"),
                     .target = target,

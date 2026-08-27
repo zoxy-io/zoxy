@@ -149,34 +149,37 @@
         // come off the same generator; runs on mismatched versions are not
         // comparable, which is a trap this pin exists to close.
         //
-        // v2.1.0, matching zoxy-io/benchmark's `bench/build.zig.zon`
-        // verbatim — including the `?ref=` form, which the other pins here do
-        // not use: zrk is the one dependency whose *version* the comparability
-        // rule above is stated in, so the tag is carried in the URL where a
-        // reader sees it without resolving the sha.
+        // **A commit on `main` (2.3.0), not a tag, and that is a
+        // deliberate exception to the paragraph above.** The comparability
+        // rule wants this pin to match zoxy-io/benchmark's, and right now
+        // it does not: the benchmark repo still runs v2.1.0. So a local
+        // band measured today is **not comparable to a fleet number**
+        // until that repo moves. Read the nightly report, not a local
+        // figure, while this says so.
         //
-        // 2.x is major for reasons that do not reach this harness — dropped
-        // Windows targets, `--http2` — and one that does: zrk links C now,
-        // having swapped `std.crypto.tls` for ztls over a Zig-built libcrypto.
-        // The band is plaintext, so no measurement changes; what changes is
-        // that `zig build bench` builds libcrypto for zrk's ReleaseFast
-        // instantiation as well as zoxy's own.
+        // It moved anyway because the alternative was worse. zrk swapped
+        // ztls and its own `openssl` pin for zssl (zoxy-io/zrk 3183923),
+        // and pins the *same* zssl commit this file does. Held at v2.1.0
+        // instead, `zoxy-profile-harness` would link zrk's ztls over the
+        // pre-split openssl beside zoxy's zssl over the split one — two
+        // pins of the same C library, with different artifact names, in
+        // the one binary whose job is producing trustworthy measurements.
+        // That is the hazard v2.1.0 was itself chosen to close, in the
+        // BoringSSL form; this is the same trap wearing the next mask.
         //
-        // **2.1.0 and not 2.0.0**, and the difference is load-bearing. v2.0.0
-        // predates zoxy-io/zrk#53 and pins *BoringSSL*, while this file pins
-        // OpenSSL — and `zoxy-profile-harness` imports both the `zrk` and
-        // `zoxy` modules, so that tag would put two libcryptos with
-        // overlapping symbol sets into the one binary whose job is producing
-        // trustworthy measurements. 2.1.0 is the swap, so both sides resolve
-        // to the `openssl` pin below: one source, built per optimize mode.
+        // Now both sides resolve to one zssl and one libcrypto. The
+        // harness still imports `src/constants.zig` as a leaf rather than
+        // the `zoxy` module — see build.zig, where the reason is now
+        // squarely the optimize-mode module collision again, since the C
+        // dependency is no longer split between two pins.
         //
-        // The zio bump beside it is not optional. zrk 2.0.0 carries
-        // zio 0.17.0 at df666c2, and the rule below — that this file's zio must
-        // be *exactly* zrk's — is what keeps the harness and zrk's runner on
+        // The zio bump beside it is not optional. zrk carries zio 0.17.0 at
+        // 3820667, and the rule below — that this file's zio must be
+        // *exactly* zrk's — is what keeps the harness and zrk's runner on
         // one runtime.
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=v2.1.0#a47c02d628064dc1d6285fb5d42bdf90ce407b41",
-            .hash = "zrk-2.1.0-WqdFO1rQBQA9vPHaywTYs1dBhnCIP_h2Wn06dGSD3uxa",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=main#391145c959dcd87b6a625126f533fa5c385a83a1",
+            .hash = "zrk-2.3.0-WqdFO8ivBgAuhlauaaH-f0kFVtb7HN-Whto424YYd2AT",
         },
         // zrk embeds its load off a zio (io_uring) runtime, not the default
         // std.Io.Threaded backend — plain Threaded is missing pieces zrk
@@ -189,8 +192,10 @@
         // not patch is a second thing to keep in sync with zrk's pin, and
         // the only way it can differ from upstream is by being wrong.
         //
-        // df666c2 is v0.17.0 plus lalinsky/zio#699, and it is what zrk v2.0.0
-        // carries — which is the only reason this line has that value.
+        // 3820667 is what zrk 2.3.0 carries — which is the only reason
+        // this line has that value. It moved with the zrk bump above and
+        // for no other reason; the lockstep rule is the whole content of
+        // this pin.
         //
         // It is 121 commits ahead of the b822fda this used to pin, and zero
         // behind, so the fix that pin existed for is contained rather than
@@ -203,8 +208,8 @@
         // `compare/b822fda...df666c2` before moving, because "the fix is still
         // in there" is exactly the assumption a bump is where you lose.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=main#df666c286380bf513dfe843f65a8133207ad7373",
-            .hash = "zio-0.17.0-xHbVVJPWJwBY3c_AkOFjUCF_pTIMnMc7ia9ujTjAfsbk",
+            .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",
+            .hash = "zio-0.17.0-xHbVVK-DKABkbm_XZgK-21SgNvYr9U5zr1MgOw7Q6JtM",
         },
         // Audited fork: zoxy-io/hparse, pinned by content hash; the pin
         // moves only after re-audit, and the paragraphs below are that
