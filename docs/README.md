@@ -594,7 +594,8 @@ log records, and what the origin receives as the request's `Host`. Only
 
 ### Clusters and load balancing
 
-A cluster is a named set of endpoints — static `IP:port` literals, resolved
+A cluster is a named set of endpoints — static `IP:port` literals or
+[`unix:` socket paths](#reaching-a-local-app-over-a-unix-socket), resolved
 once at load, since dynamic DNS is deliberately out of scope — plus how one
 is chosen. Cluster and endpoint counts are bounded by your config, not
 by a compiled ceiling — the startup banner prints what the endpoint tables cost.
@@ -638,6 +639,72 @@ hosts. A weight of `0` **drains** the endpoint — still health-checked,
 never picked, not even when everything else is ejected — so taking a
 backend out of rotation no longer needs a restart. At least one endpoint
 must hold weight, or the config is rejected.
+
+#### Reaching a local app over a Unix socket
+
+When zoxy sits on the same host as the application it fronts, an endpoint
+can be a socket file instead of a loopback address:
+
+```json
+"clusters": {
+    "app": {
+        "endpoints": ["unix:/run/app.sock"]
+    }
+}
+```
+
+Three reasons, and the first is the one that usually forces the change:
+
+- **No ephemeral-port exhaustion.** A busy proxy in front of a local app
+  burns through the loopback's ephemeral range, and the failure arrives
+  suddenly — dials start failing while the backend is perfectly healthy.
+  A socket file has no port.
+- **Filesystem permissions as the ACL.** A socket in a directory the app
+  user owns is unreachable by anything else on the box, with no firewall
+  rule and nothing bound to an address something else could also reach.
+- **Less work per byte.** No checksum, no loopback routing, no TCP state
+  machine — on the leg that runs for every request.
+
+The `unix:` prefix is grammar, not part of the path: what reaches the
+kernel is the path you would `ls`. It must be **absolute** — a relative
+path resolves against a working directory you did not name and a service
+manager may change — and at most 103 bytes: a `sockaddr_un` carries 108
+on Linux and 104 on macOS, so 103 is the smaller of the two minus the
+terminator, and the same config file works on both. Neither is truncated
+at the dial; both are refused at load, because a shortened path names a
+*different* socket and nothing downstream could tell you so.
+
+The path must also be printable ASCII with no quote or backslash. POSIX
+permits stranger ones and nothing that runs a service creates them, and
+the reason to refuse is what an endpoint address is used *for*: it lands
+verbatim in every access-log line and every Prometheus label, where one
+control byte does not spoil a field — it invalidates the whole line and
+the whole scrape.
+
+Everything above the dial is unchanged. The two forms mix freely in one
+cluster, so a migration moves one endpoint at a time; weights, `pick`,
+health checks, retries and per-endpoint in-flight caps all work as they
+do on an IP endpoint; and `hash` stickiness keys on the path, so a client
+pinned to a socket stays pinned across restarts. The access log, the
+`endpoint` metrics label and the startup banner all print the endpoint
+exactly as you spelled it, `unix:` included:
+
+```json
+{"upstream":"unix:/run/app.sock", ...}
+```
+
+A [`proxy_protocol`](#telling-an-l4-origin-proxy-protocol) send block
+still works and still announces the *client's* addresses — the header
+describes the connection that arrived, not the leg it is written on.
+
+> [!NOTE]
+> Listeners are still IP-only: `bind` does not take a `unix:` path yet.
+> That half needs an answer for what a client address *is* when there is
+> none, which `hash: source_ip`, a filter's `match.client` and
+> `X-Forwarded-For` all ask, and shipping it half-answered would be
+> worse than not shipping it. The abstract namespace (a leading NUL) is
+> deliberately out of scope — it has no filesystem permissions, which is
+> most of the argument above.
 
 ### Sticky sessions
 

@@ -142,11 +142,11 @@ trace_hash: u64,
 /// concurrent, so it extends §8's closed-form op budgets from
 /// "worst-case in flight" to "total consumed".
 delivered: [std.enums.values(OpKind).len]u64,
-blackholed_addresses: [blackholed_addresses_max]std.Io.net.IpAddress,
+blackholed_addresses: [blackholed_addresses_max]Io.Address,
 blackholed_count: u8,
 /// One-shot dial faults by address (`injectConnectError`): the next
 /// connect to a matching address fails with `error.Unexpected`.
-connect_error_addresses: [connect_error_addresses_max]std.Io.net.IpAddress,
+connect_error_addresses: [connect_error_addresses_max]Io.Address,
 connect_error_count: u8,
 /// The virtual access-log sink (§8): what the server wrote, in order, for
 /// the §9 oracle to parse back. Arena-allocated at init like every other
@@ -299,7 +299,7 @@ pub const OpKind = enum(u8) {
 const Op = union(OpKind) {
     none,
     accept: struct { listener_index: u16 },
-    connect: struct { address: std.Io.net.IpAddress, fate: ConnectFate, canceled: bool },
+    connect: struct { address: Io.Address, fate: ConnectFate, canceled: bool },
     recv: struct { socket: Socket, buffer: []u8 },
     recv_group: struct { socket: Socket },
     send: struct { socket: Socket, bytes: []const u8 },
@@ -400,7 +400,7 @@ const SocketEntry = struct {
 };
 
 const ListenerEntry = struct {
-    address: std.Io.net.IpAddress,
+    address: Io.Address,
     active: bool,
     accept_queue: [accept_queue_max]Socket,
     accept_queue_len: u16,
@@ -542,22 +542,45 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
 /// use this to pin one dial while the adversary stays off the harness's
 /// own connects.
 pub fn blackholeAddress(io: *SimIo, address: std.Io.net.IpAddress) void {
+    io.blackholeDestination(&.{ .ip = address });
+}
+
+/// `blackholeAddress` for a destination in either family (#303) — the
+/// form a scenario dialing a socket path needs.
+pub fn blackholeDestination(io: *SimIo, address: *const Io.Address) void {
     assert(io.blackholed_count < blackholed_addresses_max);
-    io.blackholed_addresses[io.blackholed_count] = address;
+    io.blackholed_addresses[io.blackholed_count] = address.*;
     io.blackholed_count += 1;
 }
 
 pub fn listen(io: *SimIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
-    assert(io.listeners_count <= listeners_max);
-    if (io.listeners_count == listeners_max) {
-        return error.AddressUnavailable;
-    }
     var effective = address;
     if (effective.getPort() == 0) {
         effective.setPort(ephemeral_port_base + io.listeners_count);
     }
+    return io.listenAt(.{ .ip = effective });
+}
+
+/// Register a virtual origin on a socket path (#303).
+///
+/// A scenario-construction affordance rather than a seam op, beside
+/// `blackholeAddress` and `injectConnectError`: the proxy's own `bind`
+/// is still IP-only, and what a UDS *endpoint* needs from the simulator
+/// is something on the other end of the dial. There is no socket file
+/// here and nothing to unlink — a simulated Unix socket is a stream with
+/// a name, which is exactly the part of it §9 has to model.
+pub fn listenUnix(io: *SimIo, path: []const u8) Io.ListenError!Listener {
+    assert(path.len >= 1);
+    return io.listenAt(.{ .unix = path });
+}
+
+fn listenAt(io: *SimIo, effective: Io.Address) Io.ListenError!Listener {
+    assert(io.listeners_count <= listeners_max);
+    if (io.listeners_count == listeners_max) {
+        return error.AddressUnavailable;
+    }
     for (io.listeners[0..io.listeners_count]) |*existing| {
-        if (existing.active and std.meta.eql(existing.address, effective)) {
+        if (existing.active and existing.address.eql(&effective)) {
             return error.AddressInUse;
         }
     }
@@ -577,8 +600,12 @@ pub fn listen(io: *SimIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
 pub fn listenerAddress(io: *const SimIo, listener: Listener) std.Io.net.IpAddress {
     assert(listener.index < io.listeners_count);
     const entry = &io.listeners[listener.index];
-    assert(entry.address.getPort() != 0);
-    return entry.address;
+    // The seam's `listen` is IP-only, so its effective address is too.
+    // A `listenUnix` origin is a scenario's own construction and its
+    // caller already holds the path it asked for (#303).
+    assert(entry.address == .ip);
+    assert(entry.address.ip.getPort() != 0);
+    return entry.address.ip;
 }
 
 /// Sync close of a listener (drain, §8): the armed accept — if any —
@@ -635,7 +662,7 @@ pub fn accept(
 
 pub fn connect(
     io: *SimIo,
-    address: std.Io.net.IpAddress,
+    address: *const Io.Address,
     completion: *Completion,
     comptime Userdata: type,
     userdata: *Userdata,
@@ -663,7 +690,7 @@ pub fn connect(
     else
         random.uintAtMost(u64, io.adversary.connect_delay_ns_max);
     completion.* = .{
-        .op = .{ .connect = .{ .address = address, .fate = fate, .canceled = false } },
+        .op = .{ .connect = .{ .address = address.*, .fate = fate, .canceled = false } },
         .ready_at_ns = if (fate == .blackhole) never_ns else io.now_ns_value + delay_ns,
         .userdata = userdata,
         .callback = erasedResult(Userdata, .connect, callback),
@@ -1312,8 +1339,13 @@ pub fn injectAcceptError(io: *SimIo, listener: Listener) void {
 /// socket table never would (§9). One-shot, unlike `blackholeAddress`,
 /// so a scenario can fail one dial and let the retry through.
 pub fn injectConnectError(io: *SimIo, address: std.Io.net.IpAddress) void {
+    io.injectConnectErrorAt(&.{ .ip = address });
+}
+
+/// `injectConnectError` for a destination in either family (#303).
+pub fn injectConnectErrorAt(io: *SimIo, address: *const Io.Address) void {
     assert(io.connect_error_count < connect_error_addresses_max);
-    io.connect_error_addresses[io.connect_error_count] = address;
+    io.connect_error_addresses[io.connect_error_count] = address.*;
     io.connect_error_count += 1;
 }
 
@@ -1591,7 +1623,7 @@ fn deliverOne(io: *SimIo, completion: *Completion) void {
         .none => unreachable,
         .accept => |op| .{ .accept = io.finishAccept(op.listener_index) },
         .connect => |op| .{
-            .connect = if (op.canceled) error.Canceled else io.finishConnect(op.address, op.fate),
+            .connect = if (op.canceled) error.Canceled else io.finishConnect(&op.address, op.fate),
         },
         .recv => |op| .{ .recv = io.finishRecv(op.socket, op.buffer) },
         .recv_group => |op| .{ .recv_group = io.finishRecvGroup(op.socket) },
@@ -1649,7 +1681,7 @@ fn finishAccept(io: *SimIo, listener_index: u16) Io.AcceptError!Socket {
 
 fn finishConnect(
     io: *SimIo,
-    address: std.Io.net.IpAddress,
+    address: *const Io.Address,
     fate: ConnectFate,
 ) Io.ConnectError!Socket {
     assert(fate != .blackhole);
@@ -1677,7 +1709,14 @@ fn finishConnect(
     // client that reached it. Ports climb so every simulated client is
     // distinguishable in the access log; the wrap keeps that bounded
     // rather than overflowing on a long-lived fuzz run.
-    client_entry.peer_address = address;
+    // A dialed Unix socket has no peer address to name (#303); the
+    // loopback stand-in keeps every socket entry answerable, which is
+    // what `peerAddress` and `localAddress` need, and the listener half
+    // that would make it a real question is not this slice's.
+    client_entry.peer_address = switch (address.*) {
+        .ip => |ip| ip,
+        .unix => .{ .ip4 = .loopback(0) },
+    };
     server_entry.peer_address = .{ .ip4 = .{
         .bytes = client_ip_bytes,
         .port = io.next_client_port,
@@ -1685,7 +1724,7 @@ fn finishConnect(
     // Local addresses mirror the pair: each end's own address is what
     // the other end names it (§6 send's destination field).
     client_entry.local_address = server_entry.peer_address;
-    server_entry.local_address = address;
+    server_entry.local_address = client_entry.peer_address;
     io.next_client_port = if (io.next_client_port == std.math.maxInt(u16))
         client_port_base
     else
@@ -1946,10 +1985,10 @@ fn socketHandle(io: *SimIo, entry: *SocketEntry) Socket {
 }
 
 /// Consume a pending one-shot dial fault for this address, if any.
-fn takeConnectError(io: *SimIo, address: std.Io.net.IpAddress) bool {
+fn takeConnectError(io: *SimIo, address: *const Io.Address) bool {
     assert(io.connect_error_count <= connect_error_addresses_max);
     for (io.connect_error_addresses[0..io.connect_error_count], 0..) |pending, index| {
-        if (std.meta.eql(pending, address)) {
+        if (pending.eql(address)) {
             assert(io.connect_error_count >= 1);
             io.connect_error_addresses[index] =
                 io.connect_error_addresses[io.connect_error_count - 1];
@@ -1960,18 +1999,18 @@ fn takeConnectError(io: *SimIo, address: std.Io.net.IpAddress) bool {
     return false;
 }
 
-fn isBlackholed(io: *const SimIo, address: std.Io.net.IpAddress) bool {
+fn isBlackholed(io: *const SimIo, address: *const Io.Address) bool {
     for (io.blackholed_addresses[0..io.blackholed_count]) |blackholed| {
-        if (std.meta.eql(blackholed, address)) {
+        if (blackholed.eql(address)) {
             return true;
         }
     }
     return false;
 }
 
-fn findListener(io: *SimIo, address: std.Io.net.IpAddress) ?*ListenerEntry {
+fn findListener(io: *SimIo, address: *const Io.Address) ?*ListenerEntry {
     for (io.listeners[0..io.listeners_count]) |*entry| {
-        if (entry.active and std.meta.eql(entry.address, address)) {
+        if (entry.active and entry.address.eql(address)) {
             return entry;
         }
     }

@@ -126,6 +126,80 @@ test "tcp: loopback echo across the full watcher surface" {
     try std.testing.expectEqual(@as(u32, 3), echo.close_count);
 }
 
+test "unix: the same echo over a socket path (#303)" {
+    // The half the simulator cannot prove: an AF_UNIX dial is a real
+    // `sockaddr_un` reaching a real kernel, and the pinned libxev's
+    // `connect` op could not carry one until 010be2a. Reusing the TCP
+    // echo's context verbatim is the assertion worth making — above the
+    // connect, a Unix stream socket is indistinguishable from a TCP one.
+    var thread_pool = if (comptime xev.backend == .kqueue) xev.ThreadPool.init(.{}) else {};
+    defer if (comptime xev.backend == .kqueue) {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    };
+    var loop = try xev.Loop.init(.{
+        .entries = ring_entries,
+        .thread_pool = if (comptime xev.backend == .kqueue) &thread_pool else null,
+    });
+    defer loop.deinit();
+
+    // A short fixed path, because a `sockaddr_un` holds far less than a
+    // filesystem does and a temp directory's name would eat most of it.
+    // Removed before the bind rather than after: a bind onto an existing
+    // socket file is `EADDRINUSE`, which is the whole of the stale-file
+    // problem the listener half will have to answer, and a crashed
+    // previous run must not wedge every later one.
+    const path = "/tmp/zoxy-xev-unix-smoke.sock";
+    _ = std.posix.system.unlink(path);
+    defer _ = std.posix.system.unlink(path);
+
+    const address = try xev.net.Address.initUnix(path);
+    const listener = try xev.TCP.initAddress(address);
+    // Raw, because the stdlib's wrappers moved behind an `Io` in 0.16
+    // and this file is the one §4 lets name a syscall.
+    try std.testing.expect(
+        std.posix.system.bind(listener.fd, &address.any, address.getOsSockLen()) == 0,
+    );
+    try std.testing.expect(std.posix.system.listen(listener.fd, 1) == 0);
+
+    const client = try xev.TCP.initAddress(address);
+
+    var echo: EchoContext = .{ .listener = listener, .client = client };
+    listener.accept(&loop, &echo.completion_accept, EchoContext, &echo, EchoContext.onAccept);
+    client.connectAddress(
+        &loop,
+        &echo.completion_connect,
+        address,
+        EchoContext,
+        &echo,
+        EchoContext.onConnect,
+    );
+
+    try loop.run(.until_done);
+
+    try std.testing.expect(!echo.failed);
+    try std.testing.expect(echo.accept_ok);
+    try std.testing.expect(echo.connect_ok);
+    try std.testing.expectEqualStrings(echo_token, echo.server_buffer[0..echo.server_read_len]);
+    try std.testing.expectEqualStrings(echo_token, echo.client_buffer[0..echo.client_read_len]);
+    try std.testing.expectEqual(@as(u32, 3), echo.close_count);
+}
+
+test "unix: a path the length arithmetic gets wrong reaches the wrong socket" {
+    // The failure the `getOsSockLen` arm exists to prevent, pinned from
+    // the outside: the length a `sockaddr_un` is submitted with decides
+    // how much of the path the kernel reads, and the old catch-all arm
+    // (`@sizeOf(sockaddr)`, 16) would have cut every path to thirteen
+    // characters — so two different sockets would have been one.
+    const short = try xev.net.Address.initUnix("/run/aaaaaaaa");
+    const long = try xev.net.Address.initUnix("/run/aaaaaaaaXYZ");
+    try std.testing.expect(short.getOsSockLen() != long.getOsSockLen());
+    try std.testing.expectEqual(
+        @as(std.posix.socklen_t, @offsetOf(std.posix.sockaddr.un, "path") + 14),
+        short.getOsSockLen(),
+    );
+}
+
 const TimerContext = struct {
     fired_count: u32 = 0,
     canceled_count: u32 = 0,

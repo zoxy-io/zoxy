@@ -110,7 +110,7 @@ pub const Record = struct {
     client: std.Io.net.IpAddress,
     /// The endpoint this request or connection was served by, or null when
     /// none was ever picked — every reject that fires before routing.
-    upstream: ?std.Io.net.IpAddress,
+    upstream: ?Io.Address,
     /// The cluster's configured name, empty when routing never chose one.
     cluster: []const u8,
     /// Bytes received from the client, and bytes sent to it. Both are
@@ -223,6 +223,11 @@ fn renderInto(record: *const Record, writer: *std.Io.Writer) std.Io.Writer.Error
     try std.json.Stringify.encodeJsonString(record.cluster, .{}, writer);
     try writer.writeAll(",\"upstream\":");
     if (record.upstream) |address| {
+        // Unescaped, and the loader is what makes that safe: an IP
+        // literal has no escapable byte by construction and a socket
+        // path is held to `Address.pathIsRenderable` at load (§5). The
+        // stake is the line, not the field — this log's whole contract
+        // is one valid JSON object per event.
         try writer.print("\"{f}\"", .{address});
     } else {
         // Null rather than an empty string: "no endpoint was ever picked"
@@ -606,7 +611,7 @@ fn testRecord() Record {
         .started_wall_ns = 1_785_489_262 * std.time.ns_per_s + 481 * std.time.ns_per_ms,
         .duration_ns = 1_873_000,
         .client = std.Io.net.IpAddress.parseLiteral("10.1.2.3:52344") catch unreachable,
-        .upstream = std.Io.net.IpAddress.parseLiteral("10.0.0.7:8080") catch unreachable,
+        .upstream = .{ .ip = std.Io.net.IpAddress.parseLiteral("10.0.0.7:8080") catch unreachable },
         .cluster = "api",
         .bytes_in = 142,
         .bytes_out = 4096,
@@ -640,7 +645,7 @@ test "access log: an L4 line omits the request fields and names no status" {
     entry.kind = .l4;
     entry.outcome = .closed;
     entry.cluster = "tcp";
-    entry.upstream = try std.Io.net.IpAddress.parseLiteral("10.0.0.7:9000");
+    entry.upstream = .{ .ip = try std.Io.net.IpAddress.parseLiteral("10.0.0.7:9000") };
     const line = try renderLine(&entry, &buffer);
 
     try testing.expectEqualStrings(
@@ -757,7 +762,7 @@ test "access log: a line at every cap still fits the bound (#140)" {
     entry.method = "M" ** constants.access_log_method_bytes_max;
     entry.cluster = "c" ** constants.cluster_name_bytes_max;
     entry.client = try std.Io.net.IpAddress.parseLiteral("[2001:db8::1]:65535");
-    entry.upstream = try std.Io.net.IpAddress.parseLiteral("[2001:db8::2]:65535");
+    entry.upstream = .{ .ip = try std.Io.net.IpAddress.parseLiteral("[2001:db8::2]:65535") };
     entry.duration_ns = std.math.maxInt(u64);
     entry.bytes_in = std.math.maxInt(u64);
     entry.bytes_out = std.math.maxInt(u64);
@@ -809,8 +814,15 @@ test "access log: every line is valid JSON, including hostile paths" {
 test "access log: the line bound holds at every field's maximum" {
     // `access_log_line_bytes_max` is what lets `record` treat NoSpaceLeft
     // as backpressure rather than arithmetic (§8), so it must survive the
-    // widest line the caps allow: full-width IPv6 on both ends, a path and
-    // a host of nothing but 6-byte escapes, and every number saturated.
+    // widest line the caps allow: full-width IPv6 for the client, a path
+    // and a host of nothing but 6-byte escapes, and every number
+    // saturated. The upstream half takes a socket path at the loader's
+    // bound instead (#303) — that is the wider of the two forms, and
+    // pinning the narrower one would leave the bound untested where it
+    // actually binds.
+    var socket_path: [constants.unix_socket_path_bytes_max]u8 = undefined;
+    @memset(&socket_path, 'p');
+    socket_path[0] = '/';
     var path: [constants.access_log_path_bytes_max]u8 = undefined;
     @memset(&path, '\x01');
     var host: [constants.host_bytes_max]u8 = undefined;
@@ -826,7 +838,7 @@ test "access log: the line bound holds at every field's maximum" {
         .started_wall_ns = std.math.maxInt(u32) * std.time.ns_per_s,
         .duration_ns = std.math.maxInt(u64),
         .client = try .parseLiteral("[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"),
-        .upstream = try .parseLiteral("[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"),
+        .upstream = .{ .unix = &socket_path },
         .cluster = &cluster,
         .bytes_in = std.math.maxInt(u64),
         .bytes_out = std.math.maxInt(u64),

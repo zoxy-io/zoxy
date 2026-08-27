@@ -1404,7 +1404,7 @@ pub fn Proxy(comptime IoType: type) type {
             }
             conn.stream.arm(&conn.stream.op_connect, "connect");
             server.io.connect(
-                pick.address,
+                &pick.address,
                 &conn.stream.op_connect.completion,
                 ConnType,
                 conn,

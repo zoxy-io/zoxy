@@ -1189,11 +1189,19 @@ pub const Labeled = struct {
         });
     }
 
-    /// Widest rendered endpoint literal: a bracketed IPv6 address with
-    /// its port — 47 bytes, and truly the widest, since `parseLiteral`
-    /// cannot carry a scope id and the `{f}` render omits scopes anyway.
-    /// 64 is round headroom over that, not a scope allowance.
-    const endpoint_literal_bytes_max = 64;
+    /// Widest rendered endpoint literal. A bracketed IPv6 address with
+    /// its port is 47 bytes, and truly the widest of that family, since
+    /// `parseLiteral` cannot carry a scope id and the `{f}` render omits
+    /// scopes anyway. A socket path is longer (#303): the `unix:` prefix
+    /// plus what a `sockaddr_un` carries, which the loader enforces
+    /// rather than truncating. Escaping cannot widen either — the loader
+    /// admits nothing an escape would touch (`Address.pathIsRenderable`,
+    /// asserted at the renderer below) — so this is a bound and not an
+    /// estimate.
+    const endpoint_literal_bytes_max = @max(
+        64,
+        io_module.Address.unix_path_bytes_max + config_module.unix_address_prefix.len,
+    );
 
     /// Scratch wide enough for any label this config could produce: the
     /// grammar, a fully-escaped cluster name (every byte doubling), and
@@ -1210,7 +1218,7 @@ pub const Labeled = struct {
     fn endpointLabel(
         arena: std.mem.Allocator,
         name: []const u8,
-        address: *const std.Io.net.IpAddress,
+        address: *const io_module.Address,
     ) error{OutOfMemory}![]const u8 {
         var scratch: [label_scratch_bytes]u8 = undefined;
         return try arena.dupe(u8, renderEndpointLabel(&scratch, name, address));
@@ -1236,14 +1244,21 @@ pub const Labeled = struct {
     fn renderEndpointLabel(
         scratch: []u8,
         name: []const u8,
-        address: *const std.Io.net.IpAddress,
+        address: *const io_module.Address,
     ) []const u8 {
         assert(name.len >= 1);
         assert(name.len <= constants.cluster_name_bytes_max);
         assert(scratch.len >= label_scratch_bytes);
         var writer = std.Io.Writer.fixed(scratch);
         // Same cannot-fill argument as `renderClusterLabel`; the address
-        // half is bounded by the bracketed-IPv6 term of the scratch.
+        // half is bounded by the widest endpoint literal above. It is
+        // written unescaped, which the loader is what makes safe: an
+        // address carries nothing an escape would touch, and a label
+        // that did carry one would corrupt the whole exposition rather
+        // than one series.
+        if (address.* == .unix) {
+            assert(io_module.Address.pathIsRenderable(address.unix));
+        }
         writer.writeAll("{cluster=\"") catch unreachable;
         writeEscaped(&writer, name) catch unreachable;
         writer.print("\",endpoint=\"{f}\"}}", .{address.*}) catch unreachable;
@@ -1972,21 +1987,21 @@ fn labeledTestConfig(clusters: []const config_module.Config.Cluster) config_modu
     };
 }
 
-fn labeledTestAddress(comptime literal: []const u8) std.Io.net.IpAddress {
-    return std.Io.net.IpAddress.parseLiteral(literal) catch unreachable;
+fn labeledTestAddress(comptime literal: []const u8) io_module.Address {
+    return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch unreachable };
 }
 
 const labeled_test_keys: upstream_module.EndpointKeys = .init(2, 2);
 
 fn labeledTestClusters() [2]config_module.Config.Cluster {
     const api_endpoints = struct {
-        const list = [_]std.Io.net.IpAddress{
+        const list = [_]io_module.Address{
             labeledTestAddress("10.0.0.1:8080"),
             labeledTestAddress("10.0.0.2:8080"),
         };
     };
     const solo_endpoints = struct {
-        const list = [_]std.Io.net.IpAddress{
+        const list = [_]io_module.Address{
             labeledTestAddress("[2001:db8::1]:9000"),
         };
     };
@@ -2038,7 +2053,7 @@ test "counters: labeled labels escape what the exposition grammar reserves" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const endpoints = struct {
-        const list = [_]std.Io.net.IpAddress{labeledTestAddress("127.0.0.1:1")};
+        const list = [_]io_module.Address{labeledTestAddress("127.0.0.1:1")};
     };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "we\"ird\\name", .endpoints = &endpoints.list },
@@ -2181,7 +2196,7 @@ test "counters: labeled render drops the healthy family with nothing checked" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const endpoints = struct {
-        const list = [_]std.Io.net.IpAddress{labeledTestAddress("127.0.0.1:1")};
+        const list = [_]io_module.Address{labeledTestAddress("127.0.0.1:1")};
     };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "quiet", .endpoints = &endpoints.list },

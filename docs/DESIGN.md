@@ -294,6 +294,17 @@ primitives trusted institutionally.
   never `loop.stop()`, which does not wake a blocked loop from another
   thread (libxev #173). `SimIo` delivers drain as just another scheduled
   event.
+- **The data path never sees a `sockaddr` either.** `connect` takes an
+  `Io.Address` — an IP address or a Unix socket path (#303, §7) — and
+  each backend turns it into whatever the syscall wants. A union rather
+  than a `connectUnix` beside `connect`: every dial site stays one call,
+  and the family branch lives in the only file allowed to know what a
+  `sockaddr_un` is. The pinned libxev could not express the family at
+  all — its `connect` op carries an address union whose members top out
+  at 28 bytes against a `sockaddr_un`'s 110 — so this is where the fork
+  gained its sixth commit, priced in `build.zig.zon`'s audit note and in
+  the banner (§5): a completion grew 128 → 152 bytes, which is 144 B per
+  connection slot.
 - **The data path never sees a file descriptor.** The seam hands out an
   opaque `Io.Socket` handle; the fd itself never leaves `src/io/`, so a
   direct data syscall from the data path is unrepresentable. This
@@ -1568,7 +1579,44 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   Cluster endpoints are
   static socket addresses resolved once at config load, never on the
   loop (dynamic DNS is a non-goal, §1), each optionally weighted — two
-  bullets below.
+  bullets below — and in either family: an `IP:port` literal, or the
+  path of a Unix socket, the bullet after that.
+- **An endpoint may be a Unix socket** (#303, settled 2026-08-27).
+  `unix:/run/app.sock` beside `10.0.0.1:8080`, both spellings mixing
+  freely in one cluster. The prefix on the existing string is #305's
+  settled grammar: `endpoints` and `bind` are the two most-written
+  fields in any config and stay single scalars, nginx and HAProxy
+  already spell a socket path this way, and a prefix cannot collide with
+  an IP literal. What motivates it is not aesthetics — a proxy in front
+  of a local app exhausts the loopback's ephemeral range, suddenly and
+  while the backend is healthy, and a socket file has no port. The other
+  two reasons are filesystem permissions as the ACL, and no checksum or
+  TCP state machine on the leg that runs every request.
+  The seam takes an **address union** rather than a second entry point
+  (§4): one `connect` per dial site, with the branch pushed down to
+  where the syscall is, so `Server`, the L7 proxy and the health checker
+  are unchanged. Above the dial nothing knows: a Unix stream socket is a
+  stream socket, so framing, pooling, retries, health checks and
+  `max_inflight` all run as they were. `hash` stickiness keys on the
+  path, folded through the same finalizer the IP arms use, so a rolling
+  restart cannot re-shuffle which client lands on which socket.
+  The path is validated **at load, not repaired at the dial** (§5):
+  absolute, because a relative path resolves against a working directory
+  the operator did not name; within `unix_socket_path_bytes_max` (103 —
+  the smaller of Linux's 108 and macOS's 104, minus the terminator),
+  because the kernel would take a truncated path as a *different*
+  socket and could not say so; and free of interior NULs, which
+  truncate one layer down. The abstract namespace is out of scope: it
+  carries no filesystem permissions, which is most of the argument for
+  the feature.
+  **Listeners stay IP-only** for now. That half has to answer what a
+  client address *is* when there is none — a question `hash: source_ip`,
+  a filter's `match.client` (family-strict, #177), the access log and
+  `X-Forwarded-For` all ask at once — and `bind: "unix:…"` is refused at
+  load rather than half-accepted. A `proxy_protocol` send block is
+  unaffected in either direction: the header announces the *client's*
+  addresses, which is a fact about the connection that arrived and not
+  about the leg the header is written on.
 - **A pick chooses among the endpoints that are both healthy and under
   capacity**, in that order, and the two filters differ in what an empty
   result means. Health fails **open**: a cluster with every endpoint

@@ -98,7 +98,7 @@ pub fn Client(comptime IoType: type) type {
         pub fn begin(client: *Self) void {
             assert(client.token_len >= 1);
             client.io.connect(
-                client.address,
+                &.{ .ip = client.address },
                 &client.connect_completion,
                 Self,
                 client,

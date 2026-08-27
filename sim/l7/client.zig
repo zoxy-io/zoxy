@@ -195,7 +195,7 @@ pub fn Client(comptime IoType: type) type {
                 assert(scripts.spec(client.script).expected_responses == 0);
             }
             client.io.connect(
-                client.address,
+                &.{ .ip = client.address },
                 &client.connect_completion,
                 Self,
                 client,

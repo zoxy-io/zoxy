@@ -56,7 +56,7 @@ const PairScenario = struct {
     fn establish(pair: *PairScenario) !void {
         pair.listener = try pair.io.listen(testAddress());
         pair.io.accept(pair.listener, &pair.accept_completion, PairScenario, pair, onAccept);
-        pair.io.connect(testAddress(), &pair.connect_completion, PairScenario, pair, onConnect);
+        pair.io.connect(&.{ .ip = testAddress() }, &pair.connect_completion, PairScenario, pair, onConnect);
         try pair.io.run();
         assert(pair.ready_count == 2);
         pair.io.listenClose(pair.listener);
@@ -159,7 +159,7 @@ test "sim: connect to an unlistened address is refused" {
     try sim_io.init(arena_state.allocator(), .{ .seed = 3 });
 
     var probe: ConnectProbe = .{};
-    sim_io.connect(testAddress(), &probe.completion, ConnectProbe, &probe, ConnectProbe.onConnect);
+    sim_io.connect(&.{ .ip = testAddress() }, &probe.completion, ConnectProbe, &probe, ConnectProbe.onConnect);
     try sim_io.run();
     try std.testing.expectError(error.Refused, probe.result.?);
     try std.testing.expect(sim_io.sockets.isFullyReleased());
@@ -189,7 +189,7 @@ test "sim: an injected connect error fails one dial with Unexpected and records 
 
     var probe: ConnectPressureProbe = .{ .io = &sim_io };
     sim_io.connect(
-        testAddress(),
+        &.{ .ip = testAddress() },
         &probe.completion,
         ConnectPressureProbe,
         &probe,
@@ -200,7 +200,7 @@ test "sim: an injected connect error fails one dial with Unexpected and records 
     try std.testing.expectEqual(Io.Pressure.Cause.address_unavailable, probe.pressure.?.cause);
 
     var retry: ConnectProbe = .{};
-    sim_io.connect(testAddress(), &retry.completion, ConnectProbe, &retry, ConnectProbe.onConnect);
+    sim_io.connect(&.{ .ip = testAddress() }, &retry.completion, ConnectProbe, &retry, ConnectProbe.onConnect);
     try sim_io.run();
     const socket = try retry.result.?;
     sim_io.closeNow(socket);

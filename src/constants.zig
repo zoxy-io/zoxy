@@ -1079,6 +1079,17 @@ pub const access_log_headers_max: u8 = 8;
 /// Bounded because the key is config text that lands in every line.
 pub const access_log_header_name_bytes_max: u8 = 64;
 
+/// The longest path a filesystem `AF_UNIX` socket address can carry
+/// (#303): what `sockaddr_un` holds, minus the terminator the kernel
+/// expects on a pathname socket.
+///
+/// A loader bound rather than a truncation point, on §5's terms: a
+/// silently shortened path names a *different* socket, so a config past
+/// this is refused at load instead of repaired at runtime. 108 is Linux;
+/// macOS carries 104, and the smaller of the two is what a config has to
+/// fit for the same file to work on both.
+pub const unix_socket_path_bytes_max: u8 = 103;
+
 /// Upper bound on one rendered access-log line, including its newline
 /// (§5: the caller sizes a fixed buffer to it, so a line never has to be
 /// dropped for want of room in an *empty* buffer). Derived from the field
@@ -1101,10 +1112,15 @@ pub fn accessLogLineBytes(header_count: u32) u32 {
     const timestamp = 30; // "2026-07-31T09:14:22.481Z"
     // "[" + 39 bytes of IPv6 + "]:" + 5 port digits, quoted.
     const address = 48;
+    // The upstream half can also be a socket path (#303): the `unix:`
+    // prefix and the loader's own path bound, which is wider than any IP
+    // literal. The client half cannot — an `l4`/`http` listener still
+    // binds an IP, so a peer address is always one.
+    const upstream_address: u32 =
+        @max(address, "unix:".len + @as(u32, unix_socket_path_bytes_max) + 2);
     const number = 20; // a u64 at its widest
-    const addresses = 2; // client and upstream
     const numbers = 4; // duration, bytes in, bytes out, status
-    const fixed = scaffolding + timestamp + addresses * address + numbers * number +
+    const fixed = scaffolding + timestamp + address + upstream_address + numbers * number +
         @as(u32, access_log_method_bytes_max) + @as(u32, cluster_name_bytes_max) +
         6 * @as(u32, host_bytes_max) + 6 * @as(u32, access_log_path_bytes_max);
     // Per named header: the quoted key, the escaped value at JSON's

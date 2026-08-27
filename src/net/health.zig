@@ -305,7 +305,7 @@ pub fn Checker(comptime IoType: type) type {
                 );
                 probe.armed.connect = true;
                 server.io.connect(
-                    cluster.endpoints[endpoint_index],
+                    &cluster.endpoints[endpoint_index],
                     &probe.op_connect,
                     Probe,
                     probe,

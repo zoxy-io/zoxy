@@ -11,6 +11,7 @@ const std = @import("std");
 
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
+const io_module = @import("io/io.zig");
 const Credentials = @import("tls/Credentials.zig");
 const router = @import("http/router.zig");
 const sni_router = @import("net/sni_router.zig");
@@ -143,7 +144,7 @@ pub const Client = struct {
 
     fn start(client: *Client, scenario: *Scenario, address: std.Io.net.IpAddress) void {
         client.scenario = scenario;
-        scenario.io.connect(address, &client.connect_completion, Client, client, onConnect);
+        scenario.io.connect(&.{ .ip = address }, &client.connect_completion, Client, client, onConnect);
     }
 
     fn onConnect(client: *Client, result: Io.ConnectError!SimIo.Socket) void {
@@ -260,7 +261,7 @@ pub const TestBed = struct {
     /// scenarios need — enough endpoints that a serial sweep and a
     /// concurrent one finish at times a test can tell apart — and it
     /// fits `SimIo`'s own `blackholed_addresses_max`.
-    endpoints: [4]std.Io.net.IpAddress,
+    endpoints: [4]io_module.Address,
     endpoints_count: u16,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
@@ -343,7 +344,7 @@ pub const TestBed = struct {
         blackholed: u8,
     ) !void {
         assert(blackholed <= bed.endpoints.len - 1);
-        bed.endpoints = .{ originAddress(), undefined, undefined, undefined };
+        bed.endpoints = .{ .{ .ip = originAddress() }, undefined, undefined, undefined };
         bed.endpoints_count = 1 + blackholed;
         for (bed.endpoints[1..bed.endpoints_count], 0..) |*endpoint, index| {
             const literal = try std.fmt.allocPrintSentinel(
@@ -354,8 +355,8 @@ pub const TestBed = struct {
             );
             // The format is fixed and every port in range renders valid,
             // unlike the allocation above, which can genuinely fail.
-            endpoint.* = std.Io.net.IpAddress.parseLiteral(literal) catch unreachable;
-            bed.sim_io.blackholeAddress(endpoint.*);
+            endpoint.* = .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch unreachable };
+            bed.sim_io.blackholeDestination(endpoint);
         }
     }
 

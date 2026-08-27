@@ -28,6 +28,7 @@ const expected_date = "Date: Wed, 01 Jan 2020 00:00:00 GMT\r\nServer: zoxy\r\n";
 /// silently replaced.
 const origin_date = "Date: Tue, 31 Dec 2019 23:59:59 GMT\r\nServer: origin/1.0\r\n";
 const constants = @import("constants.zig");
+const io_module = @import("io/io.zig");
 const counters_module = @import("counters.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
@@ -97,7 +98,7 @@ const HttpClient = struct {
         client.io = io;
         client.server = server;
         client.address = address;
-        io.connect(address, &client.connect_completion, HttpClient, client, onConnect);
+        io.connect(&.{ .ip = address }, &client.connect_completion, HttpClient, client, onConnect);
     }
 
     fn onConnect(client: *HttpClient, result: Io.ConnectError!SimIo.Socket) void {
@@ -464,6 +465,17 @@ const HttpOrigin = struct {
         origin.armAccept();
     }
 
+    /// The same origin on a socket path (#303): everything past the
+    /// listen is identical, which is the fact the scenarios below rest
+    /// on — a UDS is a stream socket with a different name, so the L7
+    /// path above the dial cannot tell which it got.
+    fn startUnix(origin: *HttpOrigin, io: *SimIo, path: []const u8) !void {
+        origin.io = io;
+        origin.listener = try io.listenUnix(path);
+        origin.listening = true;
+        origin.armAccept();
+    }
+
     fn armAccept(origin: *HttpOrigin) void {
         origin.io.accept(origin.listener, &origin.accept_completion, HttpOrigin, origin, onAccept);
     }
@@ -530,7 +542,7 @@ fn endpointCounter(
 const Http1Bed = struct {
     arena_state: std.heap.ArenaAllocator,
     sim_io: SimIo,
-    endpoints: [2]std.Io.net.IpAddress,
+    endpoints: [2]io_module.Address,
     endpoints_count: u16,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
@@ -557,6 +569,10 @@ const Http1Bed = struct {
     fn originAddress() std.Io.net.IpAddress {
         return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") catch unreachable;
     }
+
+    /// The same origin reached over a socket path (#303) — the shape a
+    /// zoxy on the same host as its application actually deploys in.
+    const origin_socket_path = "/run/zoxy-test/origin.sock";
 
     /// An address no origin binds, so `SimIo` refuses every dial to it
     /// through its own listener lookup — the same answer a kernel gives
@@ -657,6 +673,10 @@ const Http1Bed = struct {
         /// The #300 opt-in; off by default, so every pre-existing
         /// scenario still asserts on pages with no `Proxy-Status`.
         proxy_status: bool = false,
+        /// Reach the origin over a Unix socket instead of loopback
+        /// (#303). Off by default: every pre-existing scenario is about
+        /// something other than which family the upstream leg speaks.
+        unix_origin: bool = false,
         /// Turn the §8 access log on. Off by default so every existing
         /// scenario keeps paying nothing for it; a test that turns it on
         /// reads the emitted lines straight out of SimIo's virtual sink.
@@ -721,6 +741,27 @@ const Http1Bed = struct {
         };
     }
 
+    /// The cluster's endpoint list for one scenario. Split from `setUp`
+    /// for the length limit, along the seam #303 made natural: which
+    /// family the upstream leg speaks is one decision, and every other
+    /// thing `setUp` wires is unaffected by it.
+    fn installEndpoints(bed: *Http1Bed, options: Options) void {
+        if (options.unix_origin) {
+            // The refusing endpoint is an IP literal nothing binds, and
+            // the two options answer the same question — a scenario that
+            // asked for both would be asking which family a refusal has.
+            assert(!options.refusing_endpoint_first);
+            bed.endpoints = .{ .{ .unix = origin_socket_path }, undefined };
+            bed.endpoints_count = 1;
+            return;
+        }
+        bed.endpoints = if (options.refusing_endpoint_first)
+            .{ .{ .ip = refusingEndpointAddress() }, .{ .ip = originAddress() } }
+        else
+            .{ .{ .ip = originAddress() }, .{ .ip = originAddress() } };
+        bed.endpoints_count = if (options.refusing_endpoint_first) 2 else 1;
+    }
+
     fn setUp(bed: *Http1Bed, gpa: std.mem.Allocator, options: Options) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer bed.arena_state.deinit();
@@ -740,11 +781,7 @@ const Http1Bed = struct {
             .buffer_group_count = head_buffers,
             .buffer_group_bytes = options.head_buffer_bytes,
         });
-        bed.endpoints = if (options.refusing_endpoint_first)
-            .{ refusingEndpointAddress(), originAddress() }
-        else
-            .{ originAddress(), originAddress() };
-        bed.endpoints_count = if (options.refusing_endpoint_first) 2 else 1;
+        bed.installEndpoints(options);
         bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
         bed.listeners = .{.{
@@ -790,7 +827,11 @@ const Http1Bed = struct {
             .close_second_at_accept = options.close_second_at_accept,
         };
         if (options.origin_listens) {
-            try bed.origin.start(&bed.sim_io, originAddress());
+            if (options.unix_origin) {
+                try bed.origin.startUnix(&bed.sim_io, origin_socket_path);
+            } else {
+                try bed.origin.start(&bed.sim_io, originAddress());
+            }
         }
         bed.client = .{ .send_delay_ms = options.send_delay_ms };
         bed.client2 = .{};
@@ -1337,6 +1378,86 @@ test "l7: OPTIONS asterisk-form is forwarded as \"*\", not as the \"/\" it match
     const forwarded = try forwardedRequest(&bed, &storage);
     try std.testing.expectEqual(parser.Method.options, forwarded.method);
     try std.testing.expectEqualStrings("*", forwarded.target);
+    try bed.expectDrained();
+}
+
+test "l7: a Unix-socket endpoint carries a request end to end (#303)" {
+    // The deployment this exists for: zoxy on the same host as its
+    // application, reaching it over a socket file rather than loopback —
+    // no ephemeral port per request, and filesystem permissions as the
+    // ACL. Above the dial nothing changes, which is the claim: a UDS is
+    // a stream socket with a different kind of name.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 90,
+        .unix_origin = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /path HTTP/1.1\r\nHost: origin.example\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        bed.client.response(),
+    );
+    try std.testing.expect(bed.origin.conns[0].request_complete);
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try forwardedRequest(&bed, &storage);
+    try std.testing.expectEqualStrings("/path", forwarded.target);
+    // The `Host` the origin sees is the client's, untouched: which
+    // family this leg speaks is not a routing fact (§7).
+    try std.testing.expectEqualStrings("origin.example", forwarded.host.?);
+    try bed.expectDrained();
+}
+
+test "l7: a Unix endpoint is named as the config spells it (#303)" {
+    // One renderer for the access log, the metrics label and the banner,
+    // so an operator greps the same string everywhere — and it is the
+    // string they wrote, prefix included, rather than a path stripped of
+    // what says it is a path.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 91,
+        .unix_origin = true,
+        .access_log = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const line = bed.sim_io.sinkBytes();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        line,
+        "\"upstream\":\"unix:" ++ Http1Bed.origin_socket_path ++ "\"",
+    ) != null);
+    try bed.expectDrained();
+}
+
+test "l7: a dial to a socket nothing binds is refused, not hung (#303)" {
+    // The failure an operator actually meets first — a typo in the path,
+    // or an application that has not started yet. A UDS connect to an
+    // unbound path returns immediately; what matters is that it reaches
+    // the same §8 verdict a refused TCP dial does rather than parking
+    // the exchange on the request deadline.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 92,
+        .unix_origin = true,
+        .origin_listens = false,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n" ++ expected_date ++
+            "Connection: close\r\n\r\n",
+        bed.client.response(),
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
     try bed.expectDrained();
 }
 
