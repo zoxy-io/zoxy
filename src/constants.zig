@@ -152,6 +152,24 @@ pub const relay_buffer_bytes_max: u32 = 16 * 1024;
 /// header and whatever payload arrived coalesced behind it.
 pub const proxy_header_bytes_max: u32 = 512;
 
+/// The most of a client's opening bytes an `l4` listener with SNI routes
+/// will stage to find a ClientHello (#298). The record layer's own
+/// ceiling rather than a number chosen against today's clients: a TLS
+/// record's fragment cannot exceed 16 KiB, so a hello that does not fit
+/// this could not have been one. Modern hellos run 2-3 KiB once
+/// post-quantum key shares are offered, well inside it.
+///
+/// Staged in the relay buffer's client->upstream half, which is why the
+/// loader will refuse SNI routes on a listener whose `relay_buffer_bytes`
+/// cannot hold one — §5's rule that a shape which cannot serve is a
+/// config error, not a runtime surprise. That check arrives with the
+/// config surface; today nothing reads SNI routes yet. That staging is also where the
+/// number comes from: the widest half a config can ask for. A maximal
+/// record is five bytes larger (the header sits outside the fragment
+/// length), which no ClientHello approaches and which a peer could only
+/// reach by padding one deliberately.
+pub const client_hello_bytes_max: u32 = relay_buffer_bytes_max;
+
 /// §8 "watermarks before walls": each pool flips a pressure flag before
 /// it hits the wall so the proxy sheds *idle* capacity before it must
 /// shed *work*: relay or conn pressure shortens idle timeouts, relay

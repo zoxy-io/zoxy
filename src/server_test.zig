@@ -13,6 +13,7 @@ const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const Credentials = @import("tls/Credentials.zig");
 const router = @import("http/router.zig");
+const sni_router = @import("net/sni_router.zig");
 const Io = @import("io/io.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
@@ -263,6 +264,9 @@ pub const TestBed = struct {
     endpoints_count: u16,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
+    /// The §6 SNI table (#298); empty unless a scenario asks for one, so
+    /// no pre-existing case pays for a peek phase it never wanted.
+    sni_routes: []const sni_router.Route,
     listeners: [1]config_module.Config.Listener,
     config: config_module.Config,
     server: ServerSim,
@@ -283,6 +287,10 @@ pub const TestBed = struct {
         /// Turn the §8 access log on. Off by default so every existing
         /// scenario keeps paying nothing for it.
         access_log: bool = false,
+        /// §6 SNI routes (#298). Empty by default: an l4 listener with
+        /// no table relays without reading a byte first, which is what
+        /// every scenario written before this expects.
+        sni_routes: []const sni_router.Route = &.{},
         /// §7 active health checks on the one cluster; null by default so
         /// existing scenarios see no probe traffic.
         check: ?config_module.Config.Cluster.Check = null,
@@ -402,9 +410,11 @@ pub const TestBed = struct {
             .proxy_protocol_send = options.proxy_protocol_send,
         }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
+        bed.sni_routes = options.sni_routes;
         bed.listeners = .{.{
             .bind_address = bindAddress(),
             .routes = &bed.routes,
+            .sni_routes = bed.sni_routes,
             .protocol = .l4,
             .proxy_protocol = options.proxy_protocol,
             // Paths nothing reads: the bed embeds the PEMs, so what this
@@ -1156,6 +1166,240 @@ test "relay: a connection reaped by the idle deadline is logged as aborted" {
 // (198.51.100.1:5xxxx) in *both* address and port, so the log oracle
 // below cannot pass by accident.
 const proxy_v1_line = "PROXY TCP4 203.0.113.7 10.0.0.1 4711 443\r\n";
+
+/// A minimal ClientHello naming `name`, built the way `client_hello.zig`
+/// builds its own fixtures — one record, empty vectors, one `server_name`
+/// extension. Small on purpose: what these scenarios exercise is the
+/// routing decision, and `client_hello.zig` already owns the parse.
+fn sniHello(out: []u8, name: ?[]const u8) []const u8 {
+    var at: usize = 0;
+    const put = struct {
+        fn byte(buffer: []u8, cursor: *usize, value: u8) void {
+            buffer[cursor.*] = value;
+            cursor.* += 1;
+        }
+        fn int16(buffer: []u8, cursor: *usize, value: u16) void {
+            std.mem.writeInt(u16, buffer[cursor.*..][0..2], value, .big);
+            cursor.* += 2;
+        }
+    };
+    put.byte(out, &at, 0x16); // handshake record
+    put.int16(out, &at, 0x0301);
+    const record_len_at = at;
+    put.int16(out, &at, 0);
+    const body_at = at;
+    put.byte(out, &at, 0x01); // client_hello
+    @memset(out[at..][0..3], 0);
+    at += 3;
+    put.int16(out, &at, 0x0303);
+    @memset(out[at..][0..32], 0); // random
+    at += 32;
+    put.byte(out, &at, 0); // legacy_session_id
+    put.int16(out, &at, 0); // cipher_suites
+    put.byte(out, &at, 0); // legacy_compression_methods
+    if (name) |server_name| {
+        put.int16(out, &at, @intCast(server_name.len + 9));
+        put.int16(out, &at, 0); // server_name extension
+        put.int16(out, &at, @intCast(server_name.len + 5));
+        put.int16(out, &at, @intCast(server_name.len + 3));
+        put.byte(out, &at, 0); // host_name
+        put.int16(out, &at, @intCast(server_name.len));
+        @memcpy(out[at..][0..server_name.len], server_name);
+        at += server_name.len;
+    }
+    const body_len = at - body_at;
+    std.mem.writeInt(u16, out[record_len_at..][0..2], @intCast(body_len), .big);
+    std.mem.writeInt(u24, out[body_at + 1 ..][0..3], @intCast(body_len - 4), .big);
+    return out[0..at];
+}
+
+/// The one named route these scenarios share, plus a catch-all where the
+/// case wants one. Both point at cluster 0 — the bed has one, and what is
+/// under test is which *verdict* the table reaches, not which backend.
+const sni_named_only = [_]sni_router.Route{
+    .{ .server_name = "api.example.com", .cluster_index = 0 },
+};
+const sni_with_catch_all = [_]sni_router.Route{
+    .{ .server_name = "api.example.com", .cluster_index = 0 },
+    .{ .cluster_index = 0 },
+};
+
+test "sni routing: a named hello routes, and the backend receives it unchanged" {
+    // #298's whole promise in one run: the proxy reads the name without
+    // terminating, picks the route, and the origin still gets a parseable
+    // hello asking for the same server. Partial-io seeds split the hello
+    // across deliveries, so the accumulate-and-retry loop is exercised
+    // rather than the one-recv happy path.
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = seed, .adversary = .{ .partial_io = true } },
+            .sni_routes = &sni_named_only,
+            .access_log = true,
+        });
+        defer bed.tearDown();
+        bed.scenario.origin.expect_client_hello = true;
+
+        var hello_buffer: [128]u8 = undefined;
+        const hello = sniHello(&hello_buffer, "api.example.com");
+        bed.scenario.clients_count = 1;
+        const client = &bed.scenario.clients[0];
+        client.exchange = true;
+        client.prefix = hello;
+        client.start(&bed.scenario, TestBed.bindAddress());
+        try bed.sim_io.run();
+        try bed.expectDrained();
+
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_routed"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_invalid"));
+        // The backend parsed a hello, and it named what the client asked
+        // for — which is the part termination would have destroyed.
+        try std.testing.expectEqual(@as(u32, 1), bed.scenario.origin.client_hello_conns);
+        try std.testing.expectEqualStrings(
+            "api.example.com",
+            bed.scenario.origin.client_hello_name[0..bed.scenario.origin.client_hello_name_len],
+        );
+        // And the token still round-trips behind it, byte-exact.
+        try std.testing.expectEqualStrings(
+            echo_token,
+            client.receive_buffer[0..client.received_len],
+        );
+    }
+}
+
+test "sni routing: the PROXY header is the envelope, the hello is what it wraps" {
+    // §6's stated composition, and the one shape where the two receive
+    // phases meet: the header is consumed, then the hello behind it is
+    // peeked and routed. Both arrive in the same segment on some seeds
+    // and split across deliveries on others, so this covers the
+    // hand-over that enters the peek already holding bytes as well as
+    // the one that enters it empty.
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        var bed: TestBed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .sim = .{ .seed = seed, .adversary = .{ .partial_io = true } },
+            .proxy_protocol = .require,
+            .sni_routes = &sni_named_only,
+            .access_log = true,
+        });
+        defer bed.tearDown();
+        bed.scenario.origin.expect_client_hello = true;
+
+        // The header, then the hello, then the token — one stream, three
+        // layers, each consumed by the phase that owns it.
+        var prefix_buffer: [256]u8 = undefined;
+        @memcpy(prefix_buffer[0..proxy_v1_line.len], proxy_v1_line);
+        var hello_buffer: [128]u8 = undefined;
+        const hello = sniHello(&hello_buffer, "api.example.com");
+        @memcpy(prefix_buffer[proxy_v1_line.len..][0..hello.len], hello);
+
+        bed.scenario.clients_count = 1;
+        const client = &bed.scenario.clients[0];
+        client.exchange = true;
+        client.prefix = prefix_buffer[0 .. proxy_v1_line.len + hello.len];
+        client.start(&bed.scenario, TestBed.bindAddress());
+        try bed.sim_io.run();
+        try bed.expectDrained();
+
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_proxy_header_accepted"));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_routed"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_invalid"));
+        // The hello reached the backend intact — the header did not.
+        try std.testing.expectEqual(@as(u32, 1), bed.scenario.origin.client_hello_conns);
+        try std.testing.expectEqualStrings(
+            "api.example.com",
+            bed.scenario.origin.client_hello_name[0..bed.scenario.origin.client_hello_name_len],
+        );
+        try std.testing.expectEqualStrings(
+            echo_token,
+            client.receive_buffer[0..client.received_len],
+        );
+        // And the announced client survived the second phase: a peek
+        // that rebuilt the connection's state would have lost it.
+        const line = std.mem.trimEnd(u8, bed.sim_io.sinkBytes(), "\n");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"client\":\"203.0.113.7:4711\"") != null);
+    }
+}
+
+test "sni routing: a hello naming nothing takes the any-name route" {
+    // A real and common shape (an IP-only client, an old stack), and a
+    // verdict rather than an error — counted apart from a named match
+    // because "nobody asked" and "asked for this" are different facts.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 3 },
+        .sni_routes = &sni_with_catch_all,
+    });
+    defer bed.tearDown();
+    bed.scenario.origin.expect_client_hello = true;
+
+    var hello_buffer: [128]u8 = undefined;
+    const hello = sniHello(&hello_buffer, null);
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = hello;
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_absent"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_routed"));
+    try std.testing.expectEqual(@as(u32, 1), bed.scenario.origin.client_hello_conns);
+}
+
+test "sni routing: a name no route claims is closed, not guessed" {
+    // The operator wrote no catch-all, which is them saying to close what
+    // their table does not cover rather than send it somewhere they never
+    // named (§6). Nothing reaches the origin.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 5 },
+        .sni_routes = &sni_named_only,
+    });
+    defer bed.tearDown();
+
+    var hello_buffer: [128]u8 = undefined;
+    const hello = sniHello(&hello_buffer, "other.example.com");
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = hello;
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_no_route"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_routed"));
+    try std.testing.expectEqual(@as(u32, 0), bed.scenario.origin.client_hello_conns);
+}
+
+test "sni routing: opening bytes that are not a hello are refused" {
+    // A plaintext client on a listener fronting TLS services. It named
+    // nothing this table could match and cannot be relayed blind, so it
+    // is closed — and counted where an operator can see the listener is
+    // receiving traffic it was not built for.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 7 },
+        .sni_routes = &sni_with_catch_all,
+    });
+    defer bed.tearDown();
+
+    bed.scenario.clients_count = 1;
+    const client = &bed.scenario.clients[0];
+    client.exchange = true;
+    client.prefix = "GET / HTTP/1.1\r\n\r\n";
+    client.start(&bed.scenario, TestBed.bindAddress());
+    try bed.sim_io.run();
+    try bed.expectDrained();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l4_sni_invalid"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_routed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l4_sni_absent"));
+}
 
 test "proxy protocol: the header is consumed, the payload relays, the client is believed" {
     // The slice-3 promise end to end: a require-listener consumes the
