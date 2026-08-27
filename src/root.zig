@@ -88,6 +88,7 @@ test {
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
     _ = @import("net/proxy_protocol.zig");
+    _ = @import("net/client_hello.zig");
     _ = @import("net/relay.zig");
     _ = @import("net/upstream.zig");
     _ = @import("testing/origin.zig");
