@@ -34,14 +34,45 @@
     .dependencies = .{
         // Audited fork: zoxy-io/libxev branch zoxy-buffer-group = upstream
         // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
-        // plus four commits, each its own stacked PR:
+        // plus five commits, each its own stacked PR:
         //   c369817 expose io_uring setup flags through Options
         //   6bd950d expose the CQ depth (IORING_SETUP_CQSIZE) — the c10k
         //           lever
         //   b3d6b55 keep the raw errno on the Completion (zoxy-io/libxev#2)
         //   24da6d0 recv_group — provided-buffer receives (zoxy-io/libxev#3)
+        //   fe5a07b leave readiness to the wait in submit (kqueue)
         // Diff against that upstream commit to audit; the pin moves only
         // after re-audit.
+        //
+        // Re-audit for fe5a07b, signed off 2026-08-27. **kqueue only**, and
+        // the one commit in this stack that fixes upstream rather than
+        // extending it: `Loop.submit` was completing readiness reported to
+        // its own kevent, whose eventlist aliases its changelist. Safe with
+        // one call, wrong with two — a submission queue longer than
+        // `events.len` is drained in batches, and a completion batch 1
+        // registered comes back ready in batch 2's reply, already performed
+        // and already linked into `completions`. The second push splices a
+        // linked node and the two intrusive lists cross; `queue.push`'s
+        // assert catches it in ReleaseSafe, and ReleaseFast spins on the
+        // cycle forever — a core pinned, both listeners dead, SIGTERM never
+        // delivered because the loop never returns to the kernel (#314).
+        //
+        // The diff is one `continue` and its reasoning: readiness belongs to
+        // the wait, which already owns it (the wait has always ignored
+        // EV_ERROR, the mirror of this split). Every filter here is
+        // level-triggered, so nothing is lost by leaving it — except
+        // EVFILT_MACHPORT, which arms with MACH_RCV_MSG and so *delivers* on
+        // report rather than signalling; that one is still consumed, and the
+        // draft that skipped it hung the async tests. No API, error set, or
+        // io_uring path is touched.
+        //
+        // Upstream has this as mitchellh/libxev#122 (2024) and #169 (2025),
+        // both open, both load-level repros with no mechanism named; #227 and
+        // #234 are the IOCP and epoll members of the family. mitchellh/libxev#224
+        // clears the same assert with `c.next = null` before the push, which
+        // truncates whichever list the node was linked in and silently orphans
+        // the rest — the reason this carries its own fix rather than that one.
+        // Send upstream; the pin moves only after re-audit either way.
         //
         // Re-audit for 24da6d0 (§4, §5's head-buffer ring), signed off
         // 2026-08-02 against zoxy-io/libxev#3 (standing open like the rest
@@ -69,8 +100,8 @@
         // arms discard which errno failed, which is what left a c10k run
         // reporting 227,628 indistinguishable failures.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#24da6d01bdc426cbbee045d7bfaf18843d0e6d2e",
-            .hash = "libxev-0.0.0-86vtczxOFAB_0IplaVvIkI3iUUo61wUtF10OMILaoVRG",
+            .url = "git+https://github.com/zoxy-io/libxev#fe5a07b4c2920e254e0c4504e5814999696b63b6",
+            .hash = "libxev-0.0.0-86vtc_ZhFAAfG-sAVZbbuZfYYc7wdbZbUsDli3Sn0Afw",
         },
         // Load generator, §9 Tier 0/1 only — never linked into the proxy
         // (no `src/` file imports it), so a bump moves what the benchmark
