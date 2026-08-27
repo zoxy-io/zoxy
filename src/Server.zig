@@ -3337,8 +3337,16 @@ pub fn Server(comptime IoType: type) type {
         /// first head byte lands — which is when the request begins, not
         /// when its head finishes parsing, so a slowloris's line reports
         /// the whole time it spent dribbling.
-        pub fn beginLogRequest(server: *Self, conn: *ConnType) void {
-            if (server.access_log.sink == null) return;
+        ///
+        /// Stamped whether or not an access log is configured, and that
+        /// is #299's doing: the §8 latency histogram measures the same
+        /// interval this starts, so gating the stamp on a sink would have
+        /// left every deployment without an access log — the default —
+        /// reporting no latency at all, or worse, a duration measured
+        /// from zero. The cost is one `CLOCK_REALTIME` read per request
+        /// where there was none: a vDSO call, against the ~25 us of loop
+        /// time a request already costs at the Tier-1 band.
+        pub fn beginRequest(server: *Self, conn: *ConnType) void {
             if (conn.stream.log.started_wall_ns != 0) return;
             conn.stream.log.started_wall_ns = server.io.nowWallNs();
             assert(conn.stream.log.started_wall_ns != 0);

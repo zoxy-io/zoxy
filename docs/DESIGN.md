@@ -2016,6 +2016,34 @@ origin, not one this proxy can pick for them.
   clusters x endpoints (#179), reaching 1.6 MB, which a blocking write on
   a slow stderr pipe turned into a parked loop. The drain's exit tally
   survives both objections: once per process, after `run` has returned.
+- **The exposition answers Rate, Errors and Duration** (#299). Of the RED
+  triad a scrape could answer Rate thoroughly and Errors only about
+  *zoxy* — every proxy-generated status had a counter and the origin's
+  own had none, so a backend returning `500` to every request was
+  invisible to metrics and visible only in the access log. Duration had
+  no answer at all. `cluster_responses{class}` and a
+  `cluster_duration_seconds` histogram close both.
+
+  Labelled by cluster rather than endpoint, which is a measured trade
+  rather than a taste: the per-endpoint families are the term that grows
+  (5 MB of exposition at 4096 endpoints, against ~22 KB for these two at
+  sixteen clusters), and per-endpoint `5xx` is already observed by
+  passive ejection (#230). Buckets are compiled in — eighteen boundaries
+  at a steady 2.5x from 25 us to 10 s — so every deployment's histogram
+  is comparable, the render bound stays a closed form of the cluster
+  count, and a ladder that suits one deployment badly still yields an
+  exact mean through `_sum`/`_count`.
+
+  Observed at `finishExchange` and nowhere else: that is where the
+  response has reached the client in full, where `l7_responses` is
+  incremented and where `ok` is earned, so `_count` equals the responses
+  it measures **by construction** — an identity `reconciles` asserts on
+  every seed rather than a convention. Only completed exchanges are
+  observed, so p99 measures service rather than teardown; an aborted one
+  is still witnessed by its outcome. The request's start is stamped
+  whether or not an access log is configured, which it previously was
+  not — a histogram that stopped when logging was off would have been
+  worse than none.
 - **The exposition says which backend, not only how many** (#179,
   settled 2026-08-02). Beside the process totals, labeled families:
   per-endpoint counters for dial failures, responses served and health

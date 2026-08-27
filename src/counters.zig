@@ -965,6 +965,30 @@ pub const Labeled = struct {
     /// *no* endpoint could be picked, so a per-endpoint label would be an
     /// invention — the cluster is everything the witness knows.
     l7_shed_inflight: []Value,
+    /// Responses by status class, per cluster (#299): `clusters x
+    /// StatusClass.count`, indexed `cluster * count + class`. The gap
+    /// this closes is that an origin returning 500 to every request was
+    /// invisible to a scrape — every proxy-generated status had a
+    /// counter, and the origin's own had none.
+    ///
+    /// Per cluster rather than per endpoint, and that is a measured
+    /// choice: the per-endpoint families are what make a large
+    /// deployment's exposition large (5 MB at 4096 endpoints), and
+    /// per-endpoint 5xx is already observed — passive ejection (#230)
+    /// ejects on it and counts what it ejected.
+    cluster_responses: []Value,
+    /// The §8 latency histogram, per cluster (#299): `clusters x
+    /// (buckets + 1)`, indexed `cluster * stride + bucket`, with the
+    /// final slot the `+Inf` overflow. Counts are per bucket, not
+    /// cumulative — the render accumulates, so an observation is one
+    /// atomic add rather than a walk.
+    cluster_duration_buckets: []Value,
+    /// Nanoseconds observed and observations made, per cluster: the
+    /// `_sum` and `_count` a Prometheus histogram owes. `_count` equals
+    /// this cluster's completed exchanges by construction — both are
+    /// written at `finishExchange` — which `reconciles` asserts.
+    cluster_duration_sum_ns: []Value,
+    cluster_duration_count: []Value,
     l4_shed_inflight: []Value,
     /// Exact byte bound on one `render` of this config — the runtime
     /// sibling of `Counters.render_bytes_max`, tight the same way, and
@@ -1011,6 +1035,51 @@ pub const Labeled = struct {
         }
     };
 
+    /// The status classes a response is bucketed into (#299). Closed and
+    /// small on purpose: `passive_ejection` already reasons in classes
+    /// (`status_class` in its config), so this is an observation zoxy
+    /// makes turned into one an operator can alert on, not a new
+    /// vocabulary. A status below 100 or above 599 cannot reach here —
+    /// the parser refuses it — so there is no "other" arm to render.
+    pub const StatusClass = enum(u8) {
+        informational,
+        success,
+        redirection,
+        client_error,
+        server_error,
+
+        pub const count = @typeInfo(StatusClass).@"enum".fields.len;
+
+        /// The `class` label's value, which is Prometheus convention and
+        /// the same spelling `passive_ejection`'s config accepts.
+        fn label(class: StatusClass) []const u8 {
+            return switch (class) {
+                .informational => "1xx",
+                .success => "2xx",
+                .redirection => "3xx",
+                .client_error => "4xx",
+                .server_error => "5xx",
+            };
+        }
+
+        pub fn of(status: u16) StatusClass {
+            assert(status >= 100);
+            assert(status <= 599);
+            return switch (status / 100) {
+                1 => .informational,
+                2 => .success,
+                3 => .redirection,
+                4 => .client_error,
+                5 => .server_error,
+                else => unreachable, // The asserts above bound the divide.
+            };
+        }
+    };
+
+    /// Buckets plus the `+Inf` overflow every Prometheus histogram ends
+    /// with — the stride of one cluster's row in `cluster_duration_buckets`.
+    pub const duration_bucket_count = constants.duration_buckets_ns.len + 1;
+
     pub const ClusterFamily = enum {
         l7_shed_inflight,
         l4_shed_inflight,
@@ -1052,6 +1121,12 @@ pub const Labeled = struct {
         labeled.health_down = try allocValues(arena, keys.count);
         labeled.health_up = try allocValues(arena, keys.count);
         labeled.l7_shed_inflight = try allocValues(arena, cluster_count);
+        labeled.cluster_responses =
+            try allocValues(arena, cluster_count * StatusClass.count);
+        labeled.cluster_duration_buckets =
+            try allocValues(arena, cluster_count * duration_bucket_count);
+        labeled.cluster_duration_sum_ns = try allocValues(arena, cluster_count);
+        labeled.cluster_duration_count = try allocValues(arena, cluster_count);
         labeled.l4_shed_inflight = try allocValues(arena, cluster_count);
         // Holes stay empty — the one answer to "what did init leave
         // here", and the tripwire `incrementEndpoint` asserts against.
@@ -1077,6 +1152,41 @@ pub const Labeled = struct {
         const values = try arena.alloc(Value, count);
         for (values) |*value| value.* = Value.init(0);
         return values;
+    }
+
+    /// What `,class="5xx"` adds to a cluster label, minus the `}` the
+    /// splice replaces. Every class token is three bytes, so this is
+    /// exact rather than a bound.
+    const class_suffix_bytes = ",class=\"5xx\"}".len - "}".len;
+
+    comptime {
+        // The constant above reads one class token's width off a literal,
+        // which is only sound while every token is that width. Tied to
+        // the labels themselves rather than left as a coincidence: a
+        // class spelled differently would otherwise shrink the render
+        // bound with nothing to say so.
+        for (std.enums.values(StatusClass)) |class| {
+            assert(class.label().len == "5xx".len);
+        }
+    }
+
+    /// The widest `_sum`: nanoseconds rendered as seconds, so the integer
+    /// part is bounded by `maxInt(u64) / 1e9` — eleven digits, not the
+    /// twenty a bare u64 would take — plus the point and nine fractional
+    /// digits.
+    const sum_digits_max = std.fmt.count("{d}.{d:0>9}", .{
+        std.math.maxInt(u64) / std.time.ns_per_s,
+        std.math.maxInt(u64) % std.time.ns_per_s,
+    });
+
+    /// What `,le="<bound>"` adds to a cluster label, for one bound. The
+    /// render writes seconds as `{d}.{d:0>9}` from the ladder's integer
+    /// nanoseconds, so this counts the same thing the same way.
+    fn leSuffixBytes(comptime bound: u64) usize {
+        return ",le=\"\"}".len - "}".len + std.fmt.count("{d}.{d:0>9}", .{
+            bound / std.time.ns_per_s,
+            bound % std.time.ns_per_s,
+        });
     }
 
     /// Widest rendered endpoint literal: a bracketed IPv6 address with
@@ -1160,6 +1270,13 @@ pub const Labeled = struct {
         total += cluster_count * @sizeOf(bool); // cluster_checked
         total += 4 * @as(u64, keys.count) * @sizeOf(Value); // endpoint families
         total += 2 * cluster_count * @sizeOf(Value); // cluster families
+        // #299's four tables, priced here because `init` allocates them:
+        // §5's promise is that the printed total covers everything this
+        // process holds, and a table the banner does not know about is
+        // the one way that stops being true.
+        total += cluster_count * StatusClass.count * @sizeOf(Value);
+        total += cluster_count * duration_bucket_count * @sizeOf(Value);
+        total += 2 * cluster_count * @sizeOf(Value); // duration sum + count
         var scratch: [label_scratch_bytes]u8 = undefined;
         for (config.clusters) |*cluster| {
             total += renderClusterLabel(&scratch, cluster.name).len;
@@ -1201,6 +1318,56 @@ pub const Labeled = struct {
         assert(previous < std.math.maxInt(u64));
     }
 
+    /// Record one completed exchange (#299): its status class and how
+    /// long it took, both against the cluster that served it.
+    ///
+    /// One call rather than two because they are one event — the site
+    /// that has a status has the duration, and splitting them invites a
+    /// caller that reports half of it. `_count` therefore equals the
+    /// cluster's completed exchanges by construction, which is the
+    /// identity `reconciles` asserts rather than hopes for.
+    pub fn observeExchange(
+        labeled: *Labeled,
+        cluster_index: u16,
+        status: u16,
+        duration_ns: u64,
+    ) void {
+        assert(cluster_index < labeled.cluster_labels.len);
+        assert(status >= 100);
+        assert(status <= 599);
+        const class = StatusClass.of(status);
+        const class_at = @as(usize, cluster_index) * StatusClass.count + @intFromEnum(class);
+        assert(class_at < labeled.cluster_responses.len);
+        const class_previous = labeled.cluster_responses[class_at].fetchAdd(1, .monotonic);
+        assert(class_previous < std.math.maxInt(u64));
+
+        // The first bound this duration does not exceed, or the `+Inf`
+        // slot past the ladder's end. A linear walk over the ladder's
+        // eighteen comptime-known bounds, on a path that runs once per
+        // exchange — a binary search over eighteen entries would trade a
+        // predictable scan for a branch pattern, on no measurement.
+        var bucket: usize = constants.duration_buckets_ns.len;
+        for (constants.duration_buckets_ns, 0..) |bound, index| {
+            if (duration_ns <= bound) {
+                bucket = index;
+                break;
+            }
+        }
+        assert(bucket < duration_bucket_count);
+        const bucket_at = @as(usize, cluster_index) * duration_bucket_count + bucket;
+        assert(bucket_at < labeled.cluster_duration_buckets.len);
+        const bucket_previous = labeled.cluster_duration_buckets[bucket_at].fetchAdd(1, .monotonic);
+        assert(bucket_previous < std.math.maxInt(u64));
+        // The one counter here that does not add one: it takes a whole
+        // duration, so it is the only place in this file where the
+        // guard is about the *addend* as much as the total.
+        const sum_previous =
+            labeled.cluster_duration_sum_ns[cluster_index].fetchAdd(duration_ns, .monotonic);
+        assert(sum_previous <= std.math.maxInt(u64) - duration_ns);
+        const count_previous = labeled.cluster_duration_count[cluster_index].fetchAdd(1, .monotonic);
+        assert(count_previous < std.math.maxInt(u64));
+    }
+
     pub fn incrementCluster(
         labeled: *Labeled,
         comptime family: ClusterFamily,
@@ -1230,6 +1397,8 @@ pub const Labeled = struct {
         inline for (comptime std.enums.values(ClusterFamily)) |family| {
             labeled.renderClusterFamily(&writer, family);
         }
+        labeled.renderStatusClasses(&writer);
+        labeled.renderDuration(&writer);
         labeled.renderInflight(&writer, views);
         labeled.renderHealthy(&writer, views);
         const text = writer.buffered();
@@ -1283,6 +1452,90 @@ pub const Labeled = struct {
                 label,
                 value.load(.monotonic),
             }) catch unreachable;
+        }
+    }
+
+    /// Responses by class, per cluster (#299) — the half of the RED triad
+    /// a scrape could not answer, because every status this proxy
+    /// *generates* had a counter and the origin's own had none.
+    fn renderStatusClasses(labeled: *const Labeled, writer: *std.Io.Writer) void {
+        assert(labeled.cluster_responses.len ==
+            labeled.cluster_labels.len * StatusClass.count);
+        writer.print(
+            "# TYPE {s}cluster_responses counter\n",
+            .{metric_prefix},
+        ) catch unreachable;
+        for (labeled.cluster_labels, 0..) |label, cluster_index| {
+            inline for (comptime std.enums.values(StatusClass)) |class| {
+                const at = cluster_index * StatusClass.count + @intFromEnum(class);
+                // The label is rendered `{cluster="x"}`, so the class
+                // joins it by replacing the closing brace — one splice
+                // rather than a second label table to keep in step.
+                assert(label.len >= 2);
+                assert(label[label.len - 1] == '}');
+                writer.print("{s}cluster_responses{s},class=\"{s}\"}} {d}\n", .{
+                    metric_prefix,
+                    label[0 .. label.len - 1],
+                    comptime class.label(),
+                    labeled.cluster_responses[at].load(.monotonic),
+                }) catch unreachable;
+            }
+        }
+    }
+
+    /// The §8 latency histogram, per cluster (#299): the Duration half of
+    /// the RED triad, which a scrape could not answer at all.
+    ///
+    /// Buckets are stored per-bucket and accumulated here, because
+    /// Prometheus wants cumulative `le` counts and an observation should
+    /// be one atomic add rather than a walk over the ladder.
+    fn renderDuration(labeled: *const Labeled, writer: *std.Io.Writer) void {
+        assert(labeled.cluster_duration_buckets.len ==
+            labeled.cluster_labels.len * duration_bucket_count);
+        writer.print(
+            "# TYPE {s}cluster_duration_seconds histogram\n",
+            .{metric_prefix},
+        ) catch unreachable;
+        for (labeled.cluster_labels, 0..) |label, cluster_index| {
+            assert(label.len >= 2);
+            assert(label[label.len - 1] == '}');
+            const inner = label[0 .. label.len - 1];
+            var cumulative: u64 = 0;
+            const base = cluster_index * duration_bucket_count;
+            inline for (constants.duration_buckets_ns, 0..) |bound, index| {
+                cumulative += labeled.cluster_duration_buckets[base + index].load(.monotonic);
+                // Seconds, as Prometheus base units require, rendered from
+                // the integer nanoseconds the ladder is written in so the
+                // boundary text cannot drift from the comparison.
+                writer.print("{s}cluster_duration_seconds_bucket{s},le=\"{d}.{d:0>9}\"}} {d}\n", .{
+                    metric_prefix,
+                    inner,
+                    bound / std.time.ns_per_s,
+                    bound % std.time.ns_per_s,
+                    cumulative,
+                }) catch unreachable;
+            }
+            cumulative += labeled.cluster_duration_buckets[base + constants.duration_buckets_ns.len]
+                .load(.monotonic);
+            writer.print("{s}cluster_duration_seconds_bucket{s},le=\"+Inf\"}} {d}\n", .{
+                metric_prefix, inner, cumulative,
+            }) catch unreachable;
+            const sum_ns = labeled.cluster_duration_sum_ns[cluster_index].load(.monotonic);
+            writer.print("{s}cluster_duration_seconds_sum{s} {d}.{d:0>9}\n", .{
+                metric_prefix,
+                label,
+                sum_ns / std.time.ns_per_s,
+                sum_ns % std.time.ns_per_s,
+            }) catch unreachable;
+            writer.print("{s}cluster_duration_seconds_count{s} {d}\n", .{
+                metric_prefix,
+                label,
+                labeled.cluster_duration_count[cluster_index].load(.monotonic),
+            }) catch unreachable;
+            // The `+Inf` bucket is every observation, which is what
+            // `_count` reports — a histogram whose two disagreed would be
+            // rejected by a scraper rather than merely wrong.
+            assert(cumulative == labeled.cluster_duration_count[cluster_index].load(.monotonic));
         }
     }
 
@@ -1369,6 +1622,8 @@ pub const Labeled = struct {
             total += typeLineLen(family.name(), "counter");
         }
         total += typeLineLen("endpoint_inflight", "gauge");
+        total += typeLineLen("cluster_responses", "counter");
+        total += typeLineLen("cluster_duration_seconds", "histogram");
         var checked_clusters: usize = 0;
         var scratch: [label_scratch_bytes]u8 = undefined;
         for (config.clusters) |*cluster| {
@@ -1377,6 +1632,33 @@ pub const Labeled = struct {
             inline for (comptime std.enums.values(ClusterFamily)) |family| {
                 total += rowLen(family.name(), cluster_label_len, u64_digits_max);
             }
+            // #299's two families, priced exactly like the rest. The
+            // label widens by `,class="5xx"` or `,le="..."`, so each row
+            // is the cluster label plus that suffix — the reason the
+            // cardinality decision was to keep both per *cluster*: this
+            // whole block is multiplied by clusters, where the endpoint
+            // block below is multiplied by endpoints.
+            total += StatusClass.count *
+                rowLen("cluster_responses", cluster_label_len + class_suffix_bytes, u64_digits_max);
+            // Summed per bound rather than the widest times the count:
+            // the bound this file promises is *exactly reachable*, and a
+            // ladder whose short `le` values were priced as the longest
+            // would make it merely sufficient.
+            inline for (constants.duration_buckets_ns) |bound| {
+                total += rowLen(
+                    "cluster_duration_seconds_bucket",
+                    cluster_label_len + comptime leSuffixBytes(bound),
+                    u64_digits_max,
+                );
+            }
+            total += rowLen(
+                "cluster_duration_seconds_bucket",
+                cluster_label_len + ",le=\"+Inf\"}".len - "}".len,
+                u64_digits_max,
+            );
+            // `_sum` renders seconds with nine fractional digits.
+            total += rowLen("cluster_duration_seconds_sum", cluster_label_len, sum_digits_max);
+            total += rowLen("cluster_duration_seconds_count", cluster_label_len, u64_digits_max);
             if (cluster_checked) checked_clusters += 1;
             for (cluster.endpoints) |*address| {
                 const label_len =
@@ -1438,6 +1720,16 @@ pub const Labeled = struct {
             counters.get("l7_shed_endpoint_inflight"));
         assert(tableTotal(labeled.l4_shed_inflight) ==
             counters.get("l4_shed_endpoint_inflight"));
+        // #299's two families partition the same total, because both are
+        // written at `finishExchange` beside the `l7_responses` it
+        // increments — one observation per completed exchange, and every
+        // completed exchange observed. A histogram whose `_count` drifted
+        // from the responses it claims to measure would be worse than
+        // absent: it would read as a latency distribution over some other
+        // population.
+        assert(tableTotal(labeled.cluster_responses) == counters.get("l7_responses"));
+        assert(tableTotal(labeled.cluster_duration_count) == counters.get("l7_responses"));
+        assert(tableTotal(labeled.cluster_duration_buckets) == counters.get("l7_responses"));
     }
 };
 
@@ -1805,15 +2097,37 @@ test "counters: labeled render speaks the exposition dialect" {
     try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"api\",endpoint=\"10.0.0.1:8080\"} 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "zoxy_endpoint_healthy{cluster=\"solo\"") == null);
 
+    // #299's two families. The class joins the cluster label rather than
+    // replacing it, and every class renders even at zero — a scrape that
+    // saw 5xx appear only once it was non-zero could not alert on the
+    // transition.
+    labeled.observeExchange(0, 503, 3_000_000);
+    labeled.observeExchange(0, 200, 30_000);
+    const with_observations = labeled.render(&views, buffer);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "# TYPE zoxy_cluster_responses counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"api\",class=\"5xx\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"api\",class=\"2xx\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"api\",class=\"4xx\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_responses{cluster=\"solo\",class=\"2xx\"} 0\n") != null);
+    // The histogram is cumulative: the 30us observation is inside every
+    // bound, the 3ms one only from 5ms up.
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "# TYPE zoxy_cluster_duration_seconds histogram\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_bucket{cluster=\"api\",le=\"0.000050000\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_bucket{cluster=\"api\",le=\"0.005000000\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_bucket{cluster=\"api\",le=\"+Inf\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_count{cluster=\"api\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_observations, "zoxy_cluster_duration_seconds_sum{cluster=\"api\"} 0.003030000\n") != null);
+
     // One TYPE line per family: four endpoint counters, two cluster
-    // counters, the inflight gauge, and healthy (a checked cluster exists).
+    // counters, #299's status classes and histogram, the inflight gauge,
+    // and healthy (a checked cluster exists).
     var type_lines: usize = 0;
     var search: usize = 0;
     while (std.mem.indexOfPos(u8, text, search, "# TYPE ")) |at| {
         type_lines += 1;
         search = at + "# TYPE ".len;
     }
-    try std.testing.expectEqual(@as(usize, 9), type_lines);
+    try std.testing.expectEqual(@as(usize, 11), type_lines);
 }
 
 test "counters: labeled render bound is exact at the maximum values" {
@@ -1825,12 +2139,22 @@ test "counters: labeled render bound is exact at the maximum values" {
     try labeled.init(arena_state.allocator(), &config, labeled_test_keys);
 
     for ([_][]Counters.Value{
-        labeled.connect_failed,   labeled.responses,
-        labeled.no_response,      labeled.health_down,
-        labeled.health_up,        labeled.l7_shed_inflight,
-        labeled.l4_shed_inflight,
+        labeled.connect_failed,          labeled.responses,
+        labeled.no_response,             labeled.health_down,
+        labeled.health_up,               labeled.l7_shed_inflight,
+        labeled.l4_shed_inflight,        labeled.cluster_responses,
+        labeled.cluster_duration_sum_ns, labeled.cluster_duration_count,
     }) |table| {
         for (table) |*value| value.store(std.math.maxInt(u64), .monotonic);
+    }
+    // The histogram is the one table that cannot be saturated slot by
+    // slot: its rows render *cumulatively*, so a maximal reading is the
+    // first bucket holding everything and the rest holding nothing —
+    // every `le` row then reports the same maximum, which is exactly
+    // what the bound prices and the only way it can be reached.
+    for (labeled.cluster_duration_buckets, 0..) |*value, index| {
+        const first = index % Labeled.duration_bucket_count == 0;
+        value.store(if (first) std.math.maxInt(u64) else 0, .monotonic);
     }
     // The widest live view either owner can produce: both u16 tables
     // saturated (the inflight bound is their sum, not a u32's), and a
@@ -1894,10 +2218,17 @@ test "counters: the labeled families partition their process totals" {
     // one labeled cell. The sums then agree, whatever the distribution.
     counters.increment("upstream_connect_failed");
     labeled.incrementEndpoint(.connect_failed, labeled_test_keys.key(0, 0));
+    // A completed exchange moves three labeled views, not one: the
+    // endpoint that served it, and #299's class and duration against the
+    // cluster. `observeExchange` writes the last two together for exactly
+    // this reason — a caller that reported half an exchange would break
+    // the partition here rather than at a scrape nobody was reading.
     counters.increment("l7_responses");
     counters.increment("l7_responses");
     labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
+    labeled.observeExchange(0, 200, 40_000);
     labeled.incrementEndpoint(.responses, labeled_test_keys.key(1, 0));
+    labeled.observeExchange(1, 503, 2_000_000_000);
     counters.increment("health_endpoint_down");
     labeled.incrementEndpoint(.health_down, labeled_test_keys.key(0, 0));
     counters.increment("l4_shed_endpoint_inflight");

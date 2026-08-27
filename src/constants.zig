@@ -150,6 +150,59 @@ pub const relay_buffer_bytes_max: u32 = 16 * 1024;
 /// the TLVs real senders append (AWS NLB's VPCE id); v1 bounds itself at
 /// 107. Must fit the relay buffer, where the receive phase stages the
 /// header and whatever payload arrived coalesced behind it.
+/// The §8 latency histogram's bucket ladder (#299), in nanoseconds, as
+/// `le` upper bounds. Compiled in rather than configured: every zoxy's
+/// p99 is then directly comparable to every other's, the exposition's
+/// closed form stays a function of the cluster count alone, and a ladder
+/// is not the kind of thing a deployment should have to get right before
+/// it can see its own latency.
+///
+/// Chosen against what this proxy actually measures rather than against a
+/// library default. The Tier-1 band settles at p50 ~43 us, so the ladder
+/// has to resolve tens of microseconds at the bottom or every request
+/// lands in one bucket; the top end reaches ten seconds because a request
+/// that slow is the one an operator is looking for. Eighteen boundaries,
+/// a steady 2.5x apart the whole way — the step stays constant to the top
+/// on purpose, because the decade between 100ms and 1s is exactly where
+/// "slow" lives and a ladder that coarsens there answers worst where it
+/// is asked most. Each boundary is one row per cluster, which is what
+/// keeps the density affordable.
+///
+/// A ladder that turns out wrong for a deployment costs a recompile, and
+/// the `_sum`/`_count` pair reports an exact mean whatever the buckets
+/// do — so this is the cheap thing to get approximately right, not the
+/// expensive thing to get exactly right.
+pub const duration_buckets_ns = [_]u64{
+    25_000, // 25us
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000, // 1ms
+    2_500_000,
+    5_000_000,
+    10_000_000,
+    25_000_000,
+    50_000_000,
+    100_000_000, // 100ms
+    250_000_000,
+    500_000_000,
+    1_000_000_000, // 1s
+    2_500_000_000,
+    5_000_000_000,
+    10_000_000_000, // 10s
+};
+
+comptime {
+    // Ascending and distinct: the render emits cumulative counts in this
+    // order, and a ladder out of order would publish a histogram whose
+    // buckets shrink as `le` grows.
+    for (duration_buckets_ns[1..], duration_buckets_ns[0 .. duration_buckets_ns.len - 1]) |next, previous| {
+        assert(next > previous);
+    }
+    assert(duration_buckets_ns.len >= 2);
+}
+
 pub const proxy_header_bytes_max: u32 = 512;
 
 /// The most of a client's opening bytes an `l4` listener with SNI routes

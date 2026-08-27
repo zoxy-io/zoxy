@@ -169,7 +169,7 @@ pub fn Proxy(comptime IoType: type) type {
                     const capacity = headBytes(server, conn).len;
                     const pending = conn.tls_pending_len;
                     conn.tls_pending_len = 0;
-                    server.beginLogRequest(conn);
+                    server.beginRequest(conn);
                     // The handshake phase collects whatever the last
                     // flight carried without knowing what the protocol
                     // will make of it, so it can hold more than an L7
@@ -257,7 +257,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // clock on the delivery opens a log entry for a request
                 // nobody made, which teardown then writes out as an
                 // aborted exchange with no method and no bytes.
-                server.beginLogRequest(conn);
+                server.beginRequest(conn);
                 conn.stream.log.bytes_in += head.appended;
             }
             if (conn.tls.?.peerClosed()) {
@@ -533,7 +533,7 @@ pub fn Proxy(comptime IoType: type) type {
             // would owe the log a line for a request nobody made. Nor at
             // the parse: a slowloris that dribbles for the whole head-read
             // deadline must report the time it spent doing it (§8).
-            server.beginLogRequest(conn);
+            server.beginRequest(conn);
             conn.stream.log.bytes_in += bound.len;
             fillHead(conn, bound.len, headBytes(server, conn).len);
             parseAndDispatch(server, conn);
@@ -3353,6 +3353,35 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.stream.upstream.?.cluster_index,
                 conn.stream.upstream.?.endpoint_index,
             );
+            // The §8 RED triad's other two answers (#299), taken here
+            // because this is where the exchange is *complete*: the
+            // status is known, the duration is final, and `l7_responses`
+            // is being incremented three lines up — so `_count` equals
+            // the responses it measures by construction rather than by
+            // agreement, which `reconciles` asserts.
+            //
+            // Deliberately not inside `logExchange`: that returns early
+            // when no access-log sink is configured, which is the
+            // default, and metrics that stopped when logging was off
+            // would be worse than metrics that were never added.
+            // Positively stated rather than guarded: `response_started`
+            // is asserted above, and the only site that sets it commits a
+            // status in the same breath — so a zero here is a regression
+            // upstream, and skipping the observation would hide it until
+            // `reconciles` noticed the histogram had drifted.
+            assert(conn.stream.log.status != 0);
+            {
+                server.labeled.observeExchange(
+                    conn.stream.upstream.?.cluster_index,
+                    conn.stream.log.status,
+                    // Saturating on `logExchange`'s reasoning: the wall
+                    // clock can step backwards under NTP, and a wrapped
+                    // duration would land every such exchange in the
+                    // `+Inf` bucket and add eighteen quintillion
+                    // nanoseconds to the sum.
+                    server.io.nowWallNs() -| conn.stream.log.started_wall_ns,
+                );
+            }
             // The whole response reached the client: the line goes out
             // now, before the turnaround below clears what it reports.
             // This is also the only place `ok` is earned — nothing between
@@ -3460,7 +3489,16 @@ pub fn Proxy(comptime IoType: type) type {
             // accounting resets with the rest of the per-request state
             // (§8). The captures are left in place: their lengths are what
             // gate every read, and this zeroes those.
-            assert(conn.stream.log.emitted or conn.stream.log.started_wall_ns == 0);
+            // Either the line went out, or there was no sink for it to go
+            // to, or nothing was asked of this connection. The middle arm
+            // is #299's: the request's start is stamped whether or not an
+            // access log is configured, because the §8 latency histogram
+            // measures that same interval — so "started" no longer
+            // implies "will be logged", and this assert used to read the
+            // two as one fact.
+            assert(conn.stream.log.emitted or
+                conn.server.access_log.sink == null or
+                conn.stream.log.started_wall_ns == 0);
             // The request's head buffer goes back to the ring before the
             // idle wait begins — an idle connection holds no head bytes
             // (§5). Conditional because the static-response path already
