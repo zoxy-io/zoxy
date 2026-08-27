@@ -3,9 +3,9 @@
 //! named only under `src/io/`, with an explicit allowlist for `main.zig`
 //! startup work (rlimits, sigaction). The `hparse` import is likewise
 //! confined to `src/http/parser.zig` — the wrapper that owns the trust
-//! boundary (§7) — and `ztls` to `src/tls/`, the wrapper that owns the
+//! boundary (§7) — and `zssl` to `src/tls/`, the wrapper that owns the
 //! crypto boundary (§4). `@cImport` is forbidden everywhere: the codebase's
-//! one C surface is inside ztls, behind its Zig protocol layer, and a
+//! one C surface is inside zssl, behind its Zig protocol layer, and a
 //! second one opened here would not be (§4). Runs as `zig build lint` with
 //! the source root as its single argument.
 
@@ -37,7 +37,7 @@ const boundaries = [_]Boundary{
     .{
         .needle = "@cImport",
         .confined_to = "",
-        .message = "@cImport is forbidden: the C bindings live inside ztls (DESIGN.md §4)",
+        .message = "@cImport is forbidden: the C bindings live inside zssl (DESIGN.md §4)",
     },
     .{
         .needle = "@import(\"hparse\")",
@@ -50,9 +50,9 @@ const boundaries = [_]Boundary{
         .message = "xev may only be imported under src/io/ (DESIGN.md §4)",
     },
     .{
-        .needle = "@import(\"ztls\")",
+        .needle = "@import(\"zssl\")",
         .confined_to = "tls/",
-        .message = "ztls may only be imported under src/tls/ — the crypto boundary (DESIGN.md §4)",
+        .message = "zssl may only be imported under src/tls/ — the crypto boundary (DESIGN.md §4)",
     },
 };
 
@@ -70,7 +70,7 @@ const boundaries = [_]Boundary{
 /// its own `}`, the three `config.zig` object loops — which says so at the
 /// site with the marker below and a reason.
 ///
-/// The rule exists because of zoxy-io/zoxy#222: ztls's `p256.KeyPair.
+/// The rule exists because of zoxy-io/zoxy#222: a `p256.KeyPair.
 /// generate` retried `while (true) ... catch continue` on the assumption
 /// that its error was a once-in-2^32 bad scalar. When the error became a
 /// persistent one instead (the fixed libcrypto heap full), the retry spun
@@ -422,13 +422,13 @@ test "lintLine: hparse import is confined to the http parser wrapper" {
     try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "io/XevIo.zig") != null);
 }
 
-test "lintLine: ztls import is confined to the TLS engine wrapper" {
-    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "tls/Engine.zig") == null);
-    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "Server.zig") != null);
+test "lintLine: zssl import is confined to the TLS engine wrapper" {
+    try std.testing.expect(lintLine("const zssl = @import(\"zssl\");", "tls/Engine.zig") == null);
+    try std.testing.expect(lintLine("const zssl = @import(\"zssl\");", "Server.zig") != null);
     // The data path talks to `src/tls/`, never to the crypto library —
     // not even the parts that are already past a trust boundary of their own.
-    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "http/parser.zig") != null);
-    try std.testing.expect(lintLine("const ztls = @import(\"ztls\");", "io/XevIo.zig") != null);
+    try std.testing.expect(lintLine("const zssl = @import(\"zssl\");", "http/parser.zig") != null);
+    try std.testing.expect(lintLine("const zssl = @import(\"zssl\");", "io/XevIo.zig") != null);
 }
 
 test "lintUnboundedLoops: a bare while (true) is a violation" {

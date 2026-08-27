@@ -1930,7 +1930,7 @@ test "tls: two engines from one seed produce one handshake, replayed" {
         // The ServerHello random is the engine's seeded input made
         // visible: it goes on the wire verbatim, so comparing it compares
         // what the peer would see.
-        captured.* = engine.hs.random.data;
+        captured.* = engine.hs.config.server_random;
         bed.server.releaseTlsEngine(engine);
     }
     try std.testing.expectEqualSlices(u8, &runs[0], &runs[1]);
