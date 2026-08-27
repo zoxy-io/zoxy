@@ -393,6 +393,11 @@ pub fn Server(comptime IoType: type) type {
             /// same reason as `forwarded` — what may be said on the wire
             /// depends on who is in front of this socket.
             proxy_status: bool,
+            /// Whether this listener binds a socket file (#303), so
+            /// admission knows there is no peer address to ask for.
+            /// Copied like everything else here rather than reached back
+            /// through the config, on `installListenerState`'s reasoning.
+            unix_bind: bool,
             /// The listener's PROXY protocol expectation (#142, null =
             /// first bytes are payload). Read at admission only — the
             /// receive phase is entered before the connection has any
@@ -1062,7 +1067,10 @@ pub fn Server(comptime IoType: type) type {
                 const state = &server.listeners[index];
                 state.* = .{
                     .server = server,
-                    .listener = try server.io.listen(listener_config.bind_address),
+                    .listener = try server.io.listen(
+                        &listener_config.bind_address,
+                        listener_config.bind_mode,
+                    ),
                     .accept_completion = .{},
                     .retry_completion = .{},
                     // L4 has one route (the whole listener → one cluster);
@@ -1078,6 +1086,7 @@ pub fn Server(comptime IoType: type) type {
                     .forwarded = listener_config.forwarded,
                     .proxy_status = listener_config.proxy_status,
                     .proxy_protocol = listener_config.proxy_protocol,
+                    .unix_bind = listener_config.bind_address == .unix,
                     .protocol = listener_config.protocol,
                     .credentials = server.credentialsFor(index),
                     .accepting = false,
@@ -1971,8 +1980,13 @@ pub fn Server(comptime IoType: type) type {
                 entryState(listener.protocol),
                 listener.protocol,
                 // Asked once, here, and kept: at log time the socket may
-                // already be closed (§8).
-                server.io.peerAddress(client_socket),
+                // already be closed (§8). A socket file has no peer to
+                // ask about (#303), and the seam says so rather than
+                // inventing one.
+                if (listener.unix_bind)
+                    null
+                else
+                    server.io.peerAddress(client_socket),
             );
             server.io.setNodelay(client_socket) catch |err| {
                 server.witnessKernelPressure(.set_option, err);
@@ -3039,10 +3053,15 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.state == .connecting);
             assert(conn.stream.relay_buffer != null);
             var header_buffer: [proxy_protocol.send_bytes_max]u8 = undefined;
+            // Both halves exist because the loader says so: a `unix:`
+            // listener has neither a peer address nor a local one, and
+            // routing one to a cluster that announces a header is
+            // refused as a pair (`ListenerUnixBindClusterSend`, #303).
+            const client_address = &conn.client_address.?;
             const local_address = server.io.localAddress(conn.client_socket);
             const header = switch (version) {
-                .v1 => proxy_protocol.writeV1(&header_buffer, &conn.client_address, &local_address),
-                .v2 => proxy_protocol.writeV2(&header_buffer, &conn.client_address, &local_address),
+                .v1 => proxy_protocol.writeV1(&header_buffer, client_address, &local_address),
+                .v2 => proxy_protocol.writeV2(&header_buffer, client_address, &local_address),
             };
             const direction = &conn.stream.directions[
                 @intFromEnum(StreamType.Direction.client_to_upstream)
@@ -3080,7 +3099,7 @@ pub fn Server(comptime IoType: type) type {
                 cluster_index,
                 &server.endpointLoad(),
                 server.health.healthy,
-                &conn.client_address,
+                if (conn.client_address) |*address| address else null,
                 // L4 parses no head, so there is nothing request-derived
                 // to key on — and the loader keeps request-keyed clusters
                 // off l4 listeners (#178), so `.none` is exact, not a

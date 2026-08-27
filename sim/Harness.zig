@@ -1388,13 +1388,15 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
     const terminates_http = harness.tls_protocol == .http;
     harness.listener_configs = .{
         .{
-            .bind_address = bindAddress(),
+            .bind_address = .{ .ip = bindAddress() },
+            .bind_mode = null,
             .routes = &harness.routes_l4,
             .protocol = .l4,
             .proxy_protocol = harness.proxy_protocol_l4,
         },
         .{
-            .bind_address = httpBindAddress(),
+            .bind_address = .{ .ip = httpBindAddress() },
+            .bind_mode = null,
             .routes = &harness.routes_http,
             .request_filters = &harness.request_filters_http,
             .response_filters = &harness.response_filters_http,
@@ -1404,7 +1406,8 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .max_body_bytes = harness.max_body_bytes,
         },
         .{
-            .bind_address = tlsBindAddress(),
+            .bind_address = .{ .ip = tlsBindAddress() },
+            .bind_mode = null,
             // No #236 body cap, stated rather than inherited. The draw is
             // a *plaintext-leg* one, and that is exactly what makes
             // `routed_canonical`'s per-leg argument in `scripts.zig`

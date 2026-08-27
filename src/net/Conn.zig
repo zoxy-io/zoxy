@@ -152,7 +152,16 @@ pub fn Conn(comptime IoType: type) type {
         /// Kept rather than asked for at log time: by then the socket may
         /// already be closed, and `getpeername` on a closed fd names
         /// whoever inherited the number.
-        client_address: std.Io.net.IpAddress,
+        ///
+        /// Null on a `unix:` listener (#303), where there is no such
+        /// thing — a local process connected through a file, and the
+        /// kernel has no address to name it by. Optional rather than a
+        /// sentinel because every consumer would have believed the
+        /// sentinel: the loader refuses the three features that would
+        /// have to (`forwarded`, a filter's client match, `hash` on the
+        /// source IP), and the access log states `null` rather than an
+        /// address nobody connected from.
+        client_address: ?std.Io.net.IpAddress,
 
         op_deadline: Op,
         op_deadline_cancel: Op,
@@ -278,7 +287,7 @@ pub fn Conn(comptime IoType: type) type {
             engine: ?*TlsEngine,
             state: State,
             protocol: config_module.Config.Listener.Protocol,
-            client_address: std.Io.net.IpAddress,
+            client_address: ?std.Io.net.IpAddress,
         ) void {
             assert(state == .connecting or state == .l7_reading_head);
             conn.server = server;

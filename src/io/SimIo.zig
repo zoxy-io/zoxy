@@ -553,25 +553,38 @@ pub fn blackholeDestination(io: *SimIo, address: *const Io.Address) void {
     io.blackholed_count += 1;
 }
 
-pub fn listen(io: *SimIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
-    var effective = address;
-    if (effective.getPort() == 0) {
-        effective.setPort(ephemeral_port_base + io.listeners_count);
+/// Bind a virtual listener. `mode` is accepted and ignored: a simulated
+/// socket has no file, so there is nothing to chmod — the permission
+/// story is a property of the real filesystem, which is why the §9 gate
+/// for it lives in the production backend's own tests (#303).
+pub fn listen(
+    io: *SimIo,
+    address: *const Io.Address,
+    mode: ?Io.FileMode,
+) Io.ListenError!Listener {
+    switch (address.*) {
+        .ip => |ip| {
+            assert(mode == null); // The loader rejects a mode on an IP bind.
+            var effective = ip;
+            if (effective.getPort() == 0) {
+                effective.setPort(ephemeral_port_base + io.listeners_count);
+            }
+            return io.listenAt(.{ .ip = effective });
+        },
+        .unix => |path| {
+            assert(path.len >= 1);
+            return io.listenAt(.{ .unix = path });
+        },
     }
-    return io.listenAt(.{ .ip = effective });
 }
 
-/// Register a virtual origin on a socket path (#303).
-///
-/// A scenario-construction affordance rather than a seam op, beside
-/// `blackholeAddress` and `injectConnectError`: the proxy's own `bind`
-/// is still IP-only, and what a UDS *endpoint* needs from the simulator
-/// is something on the other end of the dial. There is no socket file
-/// here and nothing to unlink — a simulated Unix socket is a stream with
-/// a name, which is exactly the part of it §9 has to model.
+/// Register a virtual origin on a socket path (#303) — the other end of
+/// a UDS *endpoint*'s dial. Sugar over `listen` rather than a second
+/// mechanism, kept because a scenario that wants an origin should not
+/// have to spell a mode it has no opinion about.
 pub fn listenUnix(io: *SimIo, path: []const u8) Io.ListenError!Listener {
     assert(path.len >= 1);
-    return io.listenAt(.{ .unix = path });
+    return io.listen(&.{ .unix = path }, null);
 }
 
 fn listenAt(io: *SimIo, effective: Io.Address) Io.ListenError!Listener {

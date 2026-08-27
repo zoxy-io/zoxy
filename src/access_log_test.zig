@@ -87,7 +87,8 @@ const Harness = struct {
         harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
         harness.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         harness.listeners = .{.{
-            .bind_address = bindAddress(),
+            .bind_address = .{ .ip = bindAddress() },
+            .bind_mode = null,
             .routes = &harness.routes,
             .protocol = .http,
         }};

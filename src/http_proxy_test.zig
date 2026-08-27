@@ -95,10 +95,21 @@ const HttpClient = struct {
     const Outcome = enum(u8) { pending, fin, reset };
 
     fn start(client: *HttpClient, io: *SimIo, server: *ServerSim, address: std.Io.net.IpAddress) void {
+        client.startAt(io, server, .{ .ip = address });
+    }
+
+    /// Dial the proxy at whichever family this scenario binds (#303).
+    /// `start` is the IP-only sugar over it, kept because every
+    /// pre-existing scenario says `bindAddress()` and means one thing.
+    fn startAt(client: *HttpClient, io: *SimIo, server: *ServerSim, address: io_module.Address) void {
         client.io = io;
         client.server = server;
-        client.address = address;
-        io.connect(&.{ .ip = address }, &client.connect_completion, HttpClient, client, onConnect);
+        // Only the IP arm has an address to remember; a socket-file
+        // scenario never reads this field back.
+        if (address == .ip) {
+            client.address = address.ip;
+        }
+        io.connect(&address, &client.connect_completion, HttpClient, client, onConnect);
     }
 
     fn onConnect(client: *HttpClient, result: Io.ConnectError!SimIo.Socket) void {
@@ -460,7 +471,7 @@ const HttpOrigin = struct {
 
     fn start(origin: *HttpOrigin, io: *SimIo, address: std.Io.net.IpAddress) !void {
         origin.io = io;
-        origin.listener = try io.listen(address);
+        origin.listener = try io.listen(&.{ .ip = address }, null);
         origin.listening = true;
         origin.armAccept();
     }
@@ -574,6 +585,11 @@ const Http1Bed = struct {
     /// zoxy on the same host as its application actually deploys in.
     const origin_socket_path = "/run/zoxy-test/origin.sock";
 
+    /// Where a `unix_listener` scenario accepts (#303) — the other half
+    /// of the same deployment, zoxy reached through a file by something
+    /// local rather than over a port.
+    const listener_socket_path = "/run/zoxy-test/zoxy.sock";
+
     /// An address no origin binds, so `SimIo` refuses every dial to it
     /// through its own listener lookup — the same answer a kernel gives
     /// for a port nothing is on, and the failure #181 exists to survive.
@@ -673,6 +689,10 @@ const Http1Bed = struct {
         /// The #300 opt-in; off by default, so every pre-existing
         /// scenario still asserts on pages with no `Proxy-Status`.
         proxy_status: bool = false,
+        /// Accept on a socket file instead of a TCP port (#303). Off by
+        /// default: every pre-existing scenario is about something other
+        /// than which family the *client* leg speaks.
+        unix_listener: bool = false,
         /// Reach the origin over a Unix socket instead of loopback
         /// (#303). Off by default: every pre-existing scenario is about
         /// something other than which family the upstream leg speaks.
@@ -741,6 +761,34 @@ const Http1Bed = struct {
         };
     }
 
+    /// The listener this scenario binds. Split from `setUp` for the
+    /// length limit, on the seam #303 made natural: what a listener
+    /// accepts on is one decision, and everything `setUp` does around it
+    /// is the same either way.
+    fn installListener(bed: *Http1Bed, options: Options) void {
+        bed.listeners = .{.{
+            .bind_address = if (options.unix_listener)
+                .{ .unix = listener_socket_path }
+            else
+                .{ .ip = bindAddress() },
+            .bind_mode = null,
+            .routes = &bed.routes,
+            .request_filters = options.request_filters,
+            .response_filters = options.response_filters,
+            .protocol = .http,
+            .upgrades = options.upgrades,
+            .max_body_bytes = options.max_body_bytes,
+            .forwarded = options.forwarded,
+            .proxy_status = options.proxy_status,
+            // Paths nothing reads: the bed embeds the PEMs, so what this
+            // states is only that the listener terminates.
+            .tls = if (options.tls)
+                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+            else
+                null,
+        }};
+    }
+
     /// The cluster's endpoint list for one scenario. Split from `setUp`
     /// for the length limit, along the seam #303 made natural: which
     /// family the upstream leg speaks is one decision, and every other
@@ -784,23 +832,7 @@ const Http1Bed = struct {
         bed.installEndpoints(options);
         bed.clusters = .{.{ .name = "origin", .endpoints = bed.endpoints[0..bed.endpoints_count], .check = options.check, .passive_ejection = options.passive_ejection, .max_inflight = options.max_inflight, .pick = options.pick, .hash_key = options.hash_key, .retries = options.retries }};
         bed.routes = .{.{ .host = options.route_host, .prefix = options.route_prefix, .cluster_index = 0 }};
-        bed.listeners = .{.{
-            .bind_address = bindAddress(),
-            .routes = &bed.routes,
-            .request_filters = options.request_filters,
-            .response_filters = options.response_filters,
-            .protocol = .http,
-            .upgrades = options.upgrades,
-            .max_body_bytes = options.max_body_bytes,
-            .forwarded = options.forwarded,
-            .proxy_status = options.proxy_status,
-            // Paths nothing reads: the bed embeds the PEMs, so what this
-            // states is only that the listener terminates.
-            .tls = if (options.tls)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
-            else
-                null,
-        }};
+        bed.installListener(options);
         bed.buildConfig(options);
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
@@ -905,7 +937,7 @@ const Http1Bed = struct {
     /// outcome and the pools have drained.
     fn exchange(bed: *Http1Bed, request: []const u8) !void {
         bed.client.request = request;
-        bed.client.start(&bed.sim_io, &bed.server, bindAddress());
+        bed.client.startAt(&bed.sim_io, &bed.server, bed.listeners[0].bind_address);
         try bed.sim_io.run();
         bed.origin.stopListening();
     }
@@ -1378,6 +1410,61 @@ test "l7: OPTIONS asterisk-form is forwarded as \"*\", not as the \"/\" it match
     const forwarded = try forwardedRequest(&bed, &storage);
     try std.testing.expectEqual(parser.Method.options, forwarded.method);
     try std.testing.expectEqualStrings("*", forwarded.target);
+    try bed.expectDrained();
+}
+
+test "l7: a listener on a socket file serves a request (#303)" {
+    // The other half of the local-origin shape: something on this host
+    // reaches zoxy through a file rather than a port. Above the accept
+    // nothing changes — routing, filters, framing and the upstream leg
+    // are all the same code answering the same way.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 93,
+        .unix_listener = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /path HTTP/1.1\r\nHost: origin.example\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        bed.client.response(),
+    );
+    var storage: parser.HeaderStorage = undefined;
+    const forwarded = try forwardedRequest(&bed, &storage);
+    try std.testing.expectEqualStrings("/path", forwarded.target);
+    try bed.expectDrained();
+}
+
+test "l7: a socket-file listener logs no client address (#303)" {
+    // There is none, and the line says so rather than inventing one.
+    // `null` is the same answer `upstream` gives when no endpoint was
+    // picked — a reader can tell "there is none" from "here is one"
+    // without knowing which listener served the request.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 94,
+        .unix_listener = true,
+        .access_log = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /a HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    const line = bed.sim_io.sinkBytes();
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"client\":null") != null);
+    // Still one valid JSON object, which is the whole contract the field
+    // had to stay inside.
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, line, "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("client").?);
+    try std.testing.expectEqualStrings(
+        "127.0.0.1:9000",
+        parsed.value.object.get("upstream").?.string,
+    );
     try bed.expectDrained();
 }
 

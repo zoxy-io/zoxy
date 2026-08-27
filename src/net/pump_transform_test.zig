@@ -621,7 +621,8 @@ const Harness = struct {
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         bed.listeners = .{.{
-            .bind_address = clientAddress(),
+            .bind_address = .{ .ip = clientAddress() },
+            .bind_mode = null,
             .routes = &bed.routes,
             .protocol = .l4,
         }};
@@ -647,8 +648,8 @@ const Harness = struct {
         bed.origin.harness = bed;
         bed.origin.canned = options.origin_canned;
 
-        bed.client_listener = try bed.io.listen(clientAddress());
-        bed.origin_listener = try bed.io.listen(originAddress());
+        bed.client_listener = try bed.io.listen(&.{ .ip = clientAddress() }, null);
+        bed.origin_listener = try bed.io.listen(&.{ .ip = originAddress() }, null);
         bed.io.accept(bed.client_listener, &bed.accept_completion, Harness, bed, onProxyAccepted);
         bed.io.accept(bed.origin_listener, &bed.origin.accept_completion, Origin, &bed.origin, onOriginAccepted);
         bed.io.connect(&.{ .ip = clientAddress() }, &bed.client.connect_completion, Client, &bed.client, onClientConnected);

@@ -107,7 +107,13 @@ pub const Record = struct {
     /// and `duration_us` already says where each one ended.
     started_wall_ns: u64,
     duration_ns: u64,
-    client: std.Io.net.IpAddress,
+    /// Who connected, or null on a `unix:` listener (#303) — a local
+    /// process reached this proxy through a file, and there is no
+    /// address to name it by. Null rather than a stand-in for the same
+    /// reason `upstream` is when none was picked: "there is none" and
+    /// "here is one" are different facts, and a reader should not have
+    /// to guess which an address is.
+    client: ?std.Io.net.IpAddress,
     /// The endpoint this request or connection was served by, or null when
     /// none was ever picked — every reject that fires before routing.
     upstream: ?Io.Address,
@@ -203,7 +209,15 @@ fn renderInto(record: *const Record, writer: *std.Io.Writer) std.Io.Writer.Error
         record.kind,
         record.outcome,
     });
-    try writer.print(",\"client\":\"{f}\"", .{record.client});
+    if (record.client) |address| {
+        try writer.print(",\"client\":\"{f}\"", .{address});
+    } else {
+        // A `unix:` listener has no client address (#303). Null rather
+        // than an empty string or a stand-in, on the same reasoning
+        // `upstream` uses: "there is none" and "here is one" are
+        // different facts, and a consumer must not have to guess.
+        try writer.writeAll(",\"client\":null");
+    }
     if (record.kind == .http) {
         try renderHttpFields(record, writer);
     }

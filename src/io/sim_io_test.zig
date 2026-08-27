@@ -54,7 +54,7 @@ const PairScenario = struct {
     ready_count: u8 = 0,
 
     fn establish(pair: *PairScenario) !void {
-        pair.listener = try pair.io.listen(testAddress());
+        pair.listener = try pair.io.listen(&.{ .ip = testAddress() }, null);
         pair.io.accept(pair.listener, &pair.accept_completion, PairScenario, pair, onAccept);
         pair.io.connect(&.{ .ip = testAddress() }, &pair.connect_completion, PairScenario, pair, onConnect);
         try pair.io.run();
@@ -183,7 +183,7 @@ test "sim: an injected connect error fails one dial with Unexpected and records 
 
     // A live listener proves the fault wins over an otherwise-successful
     // connect — and, below, that it is one-shot: the retry goes through.
-    const listener = try sim_io.listen(testAddress());
+    const listener = try sim_io.listen(&.{ .ip = testAddress() }, null);
     sim_io.setPressureCause(.address_unavailable);
     sim_io.injectConnectError(testAddress());
 
