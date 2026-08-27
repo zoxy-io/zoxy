@@ -12,6 +12,7 @@ const std = @import("std");
 
 const constants = @import("constants.zig");
 const router = @import("http/router.zig");
+const sni_router = @import("net/sni_router.zig");
 const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
 const render = @import("http/render.zig");
@@ -323,6 +324,20 @@ pub const Config = struct {
         /// listeners always have exactly that one route (no path to
         /// match). Matched by `http/router.zig`.
         routes: []const router.Route,
+        /// The §6 SNI table (#298), sorted named-first and never empty on
+        /// a listener that routes by name — empty on every other, which
+        /// is what says the peek phase does not run. Matched by
+        /// `net/sni_router.zig`.
+        ///
+        /// `routes` above still carries one entry for such a listener,
+        /// because admission needs *a* cluster before any byte is read
+        /// (`Server.listeners[i].cluster_index`). It is the any-name
+        /// route's cluster where the config declared one, and the first
+        /// route's otherwise; either way it is provisional, and the peek
+        /// replaces it before a dial can consume it — the same
+        /// admit-then-refine §7 already does when a request's path picks
+        /// a different route than the listener was admitted under.
+        sni_routes: []const sni_router.Route = &.{},
         /// The §7 request filter rules, in config order (evaluated top-down).
         /// Empty on the L4 path and whenever no `"request_filters"` were given.
         /// Compiled and interpreted by `http/filter.zig`.
@@ -713,6 +728,9 @@ pub const ValidationError = error{
     ListenerUpgradeTokenUnknown,
     ListenerForwardedModeUnknown,
     ListenerProxyProtocolModeUnknown,
+    ListenerTlsWithSniRoutes,
+    RouteSniIsAddress,
+    LimitRelayBufferUnderSniRouting,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
     ClusterProxyProtocolSendUnknown,
@@ -852,29 +870,7 @@ pub fn parseWithFiles(
     if (parsed.listeners.len == 0) {
         return error.ListenersEmpty;
     }
-    var http_listeners_count: u32 = 0;
-    var tls_listeners_count: u32 = 0;
-    var upgrade_listeners_count: u32 = 0;
-    for (parsed.listeners) |listener_json| {
-        // The tag decides the count, so a listener that names neither
-        // body or both is refused here rather than sizing a pool from a
-        // protocol nobody stated (#305).
-        if (try protocolOf(&listener_json) == .http) http_listeners_count += 1;
-        // Presence only: whether the block is *usable* is `resolveTls`'s
-        // to say, later and per listener. Counting it here would mean
-        // deciding the engine pool's size against blocks that might yet
-        // be refused, and reporting a limit error for a config whose real
-        // fault is a missing path.
-        if (listener_json.tls != null) tls_listeners_count += 1;
-        // Presence only, like `tls` above and for the same reason: what
-        // the tokens *say* is `resolveUpgrades`'s to judge per listener,
-        // and sizing the tunnel pool against a list that might yet be
-        // refused would report a limits error for a config whose real
-        // fault is a token nobody recognises.
-        if (listener_json.http) |http_json| {
-            if (http_json.upgrades != null) upgrade_listeners_count += 1;
-        }
-    }
+    const features = try countListenerFeatures(parsed.listeners);
     const access_log_sink = try resolveAccessLogSink(parsed.access_log);
     // Before the limits, because the named headers widen the line the
     // staging buffer has to be able to hold (#140).
@@ -882,9 +878,7 @@ pub fn parseWithFiles(
     const limits = try resolveLimits(
         &parsed.limits,
         @intCast(parsed.listeners.len),
-        http_listeners_count,
-        tls_listeners_count,
-        upgrade_listeners_count,
+        features,
         access_log_sink != null,
         log_headers.count(),
         // The prober's share of the ring, which `resolveCqFill` has to
@@ -1380,9 +1374,7 @@ fn assertPoolsFitConnSlots(
 fn resolveLimits(
     limits_json: *const LimitsJson,
     listeners_count: u32,
-    http_listeners_count: u32,
-    tls_listeners_count: u32,
-    upgrade_listeners_count: u32,
+    features: ListenerFeatures,
     access_log_on: bool,
     log_header_count: u32,
     health_probes: u32,
@@ -1390,9 +1382,8 @@ fn resolveLimits(
     assert(listeners_count >= 1);
     assert(health_probes >= 1);
     assert(health_probes <= constants.health_probe_concurrency_max);
-    assert(http_listeners_count <= listeners_count);
-    assert(tls_listeners_count <= listeners_count);
-    assert(upgrade_listeners_count <= listeners_count);
+    // Bounds are `countListenerFeatures`'s postcondition, not re-checked
+    // here — restating them would be two places to keep in step.
     const slots = try resolveSlotCounts(limits_json);
     const conn_slots = slots.conn_slots;
     const relay_buffers = slots.relay_buffers;
@@ -1401,15 +1392,25 @@ fn resolveLimits(
         limits_json,
         conn_slots,
         upstream_slots,
-        http_listeners_count,
+        features.http,
     );
     const head_buffer_bytes = try resolveHeadBufferBytes(limits_json.head_buffer_bytes);
     const relay_buffer_bytes = try resolveRelayBufferBytes(limits_json.relay_buffer_bytes);
+    // The §6 peek stages a whole ClientHello in the relay buffer's
+    // client->upstream half (#298), so a listener that routes by name
+    // needs a half wide enough to hold one. Refused at load, which is
+    // the operator's decision either way: a buffer too small would
+    // otherwise route the clients whose hellos happen to be short and
+    // drop the ones offering post-quantum key shares — one config, two
+    // outcomes, and nothing saying why.
+    if (features.sni >= 1 and relay_buffer_bytes < constants.client_hello_bytes_max) {
+        return error.LimitRelayBufferUnderSniRouting;
+    }
     const feature_pools = try resolveFeaturePools(
         limits_json,
         conn_slots,
-        tls_listeners_count,
-        upgrade_listeners_count,
+        features.tls,
+        features.upgrades,
     );
     const cq_fill_eighths = try resolveCqFill(
         limits_json.cq_fill_eighths,
@@ -2055,24 +2056,65 @@ pub const HttpListenerJson = struct {
     };
 };
 
-/// What an `l4` listener carries. `cluster` is required rather than
-/// forked against `routes`: an L4 relay has no path to match, so there is
-/// exactly one destination and no table to express it in.
+/// What an `l4` listener carries. It forks on the upstream the way an
+/// `http` listener does — sugar for one destination, or a table — but on
+/// the only dimension a byte relay has: there is no path to match, so the
+/// table is keyed by the TLS name the client asked for (#298).
 pub const L4ListenerJson = struct {
-    cluster: []const u8,
+    /// Exactly one of `cluster` (sugar for a single any-name route) or
+    /// `routes` (an explicit §6 SNI table, #298) selects the upstream —
+    /// the same fork `HttpListenerJson` has, for the same reason.
+    cluster: ?[]const u8 = null,
+    routes: ?[]const L4RouteJson = null,
     /// Optional PROXY protocol expectation (#142); absent treats first
     /// bytes as payload.
     proxy_protocol: ?ProxyProtocolJson = null,
 
     pub const schema_doc =
-        "An L4 listener's settings: the one cluster it relays to, and what " ++
-        "it expects ahead of the payload.";
+        "An L4 listener's settings: which cluster it relays to, and what it " ++
+        "expects ahead of the payload. Exactly one of `cluster` or `routes` " ++
+        "selects the upstream.";
+    pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
     pub const schema_fields = .{
-        .cluster = .{ .desc = "The cluster every connection on this listener is relayed to." },
+        .cluster = .{
+            .desc = "Sugar for a single any-name route to this cluster; " ++
+                "mutually exclusive with routes.",
+        },
+        .routes = .{
+            .desc = "Route by the TLS server name (SNI) the client asked for, " ++
+                "without terminating: the ClientHello is read and relayed " ++
+                "unchanged. Requires the full-size relay buffer, and cannot be " ++
+                "combined with this listener's own tls block.",
+            .min_items = 1,
+        },
         .proxy_protocol = .{
             .desc = "Expect a PROXY protocol header (v1 or v2) ahead of every " ++
                 "connection's payload; absent treats first bytes as payload.",
         },
+    };
+};
+
+/// One §6 SNI route (#298): the name a client must have asked for, and
+/// the cluster that answers it.
+pub const L4RouteJson = struct {
+    /// Absent is the any-name route — it answers every connection,
+    /// including one whose hello named nothing. §7's any-host route,
+    /// wearing the only dimension an L4 relay has.
+    sni: ?[]const u8 = null,
+    cluster: []const u8,
+
+    pub const schema_doc =
+        "One SNI route. `sni` absent is the catch-all: it answers any " ++
+        "connection, including one whose ClientHello carried no name. A " ++
+        "connection matching no route is closed.";
+    pub const schema_fields = .{
+        .sni = .{
+            .desc = "The TLS server name to match, exactly — the same rule " ++
+                "http routes match a host by, so the two cannot disagree " ++
+                "about what a name is. No wildcards.",
+            .min_length = 1,
+        },
+        .cluster = .{ .desc = "The cluster connections naming this server are relayed to." },
     };
 };
 
@@ -3101,6 +3143,7 @@ pub const dto_types = .{
     ForwardedJson,      ProxyProtocolJson,   ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
     TlsJson,            PassiveEjectionJson, HttpListenerJson,         L4ListenerJson,
+    L4RouteJson,
 };
 
 comptime {
@@ -3396,10 +3439,14 @@ fn resolveHttpListener(
     };
 }
 
-/// An `l4` listener: one cluster, reached as the single catch-all route
-/// every L4 listener has always had, and what it expects ahead of the
-/// payload. Nothing here allocates a table — the one route is built by
-/// `resolveL4Route` from the one cluster name.
+/// An `l4` listener: which cluster (or which table of them) it relays to,
+/// and what it expects ahead of the payload.
+///
+/// Two shapes, and the second is the one that allocates. A `cluster`
+/// resolves to the single any-path route every L4 listener has always
+/// had. A `routes` table resolves to an SNI table beside it (#298), and
+/// then `routes[0]` carries only the cluster admission needs before a
+/// byte has been read — see `admittedCluster`.
 fn resolveL4Listener(
     arena: std.mem.Allocator,
     bind_address: std.Io.net.IpAddress,
@@ -3408,11 +3455,28 @@ fn resolveL4Listener(
     clusters: []const Config.Cluster,
 ) ParseError!Config.Listener {
     assert(clusters.len >= 1);
-    const routes = try resolveL4Route(arena, l4_json.cluster, clusters);
+    const has_cluster = l4_json.cluster != null;
+    const has_routes = l4_json.routes != null;
+    if (has_cluster == has_routes) {
+        return error.ListenerClusterOrRoutes; // Neither, or both.
+    }
+    // Routing by name means reading the client's ClientHello and relaying
+    // it on. A listener that *terminates* consumed that hello during its
+    // own handshake, so there is nothing left for the peek to read —
+    // the two describe different proxies and the config states one (§6).
+    if (has_routes and tls != null) {
+        return error.ListenerTlsWithSniRoutes;
+    }
+    const sni_routes: []const sni_router.Route = if (has_routes)
+        try resolveSniRoutes(arena, l4_json.routes.?, clusters)
+    else
+        &.{};
+    const routes = try resolveL4Route(arena, admittedCluster(l4_json, sni_routes), clusters);
     assert(routes.len == 1);
     const listener: Config.Listener = .{
         .bind_address = bind_address,
         .routes = routes,
+        .sni_routes = sni_routes,
         .protocol = .l4,
         .proxy_protocol = try resolveProxyProtocol(l4_json.proxy_protocol),
         .tls = tls,
@@ -3422,6 +3486,7 @@ fn resolveL4Listener(
         // policy this listener does not have.
         .max_body_bytes = 0,
     };
+    assert((listener.sni_routes.len >= 1) == (l4_json.routes != null));
     // The four fields this initializer does not name inherit
     // `Config.Listener`'s defaults, and those defaults happen to be the
     // l4 answer too — an l4 listener has always had no filters, no
@@ -3450,6 +3515,136 @@ fn bindOrder(address: std.Io.net.IpAddress) u160 {
     };
 }
 
+/// Which cluster an `l4` listener admits connections under, before any
+/// byte has been read (#298).
+///
+/// With no SNI table that is simply the configured cluster. With one it
+/// is provisional and the peek replaces it: the any-name route's cluster
+/// where the operator declared one, and the first route's where they did
+/// not — a listener whose every route is named closes what it cannot
+/// place, so nothing is ever relayed to this choice.
+fn admittedCluster(
+    l4_json: *const L4ListenerJson,
+    sni_routes: []const sni_router.Route,
+) []const u8 {
+    if (l4_json.cluster) |name| {
+        assert(sni_routes.len == 0);
+        return name;
+    }
+    assert(sni_routes.len >= 1);
+    const routes_json = l4_json.routes.?;
+    assert(routes_json.len >= 1);
+    for (routes_json) |route_json| {
+        if (route_json.sni == null) return route_json.cluster;
+    }
+    return routes_json[0].cluster;
+}
+
+/// An `l4` listener's §6 SNI table (#298), resolved into the immutable
+/// arena and sorted named-first so a match is the most specific rule that
+/// fires — `router.zig`'s host dimension, one layer down.
+///
+/// Names are held to `validateRouteHost`, which is not a convenience: it
+/// is the *same* canonical form §7's `host` routes are held to, so a name
+/// written in both tables means one thing in both. Two rules for one idea
+/// is what #298 asked to avoid.
+fn resolveSniRoutes(
+    arena: std.mem.Allocator,
+    routes_json: []const L4RouteJson,
+    clusters: []const Config.Cluster,
+) ParseError![]const sni_router.Route {
+    assert(clusters.len >= 1);
+    if (routes_json.len == 0) {
+        return error.RoutesEmpty;
+    }
+    const routes = try arena.alloc(sni_router.Route, routes_json.len);
+    for (routes_json, 0..) |route_json, index| {
+        const name = if (route_json.sni) |raw| try validateSniName(raw) else null;
+        for (routes_json[0..index]) |previous| {
+            // Earlier names already passed `validateRouteHost`, so their
+            // raw form equals their canonical one and a byte compare is
+            // sound. Two rules for one name is an operator asking for two
+            // answers to one question, which the scan would settle by
+            // position rather than by intent.
+            if (optionalHostEql(previous.sni, name)) {
+                return error.RouteDuplicate;
+            }
+        }
+        routes[index] = .{
+            .server_name = name,
+            // `l4ClusterIndexOf`, not the bare lookup: every cluster this
+            // table can reach is reachable from an l4 listener, so every
+            // one of them is held to the rule the admitted cluster is.
+            .cluster_index = try l4ClusterIndexOf(clusters, route_json.cluster),
+        };
+    }
+    std.mem.sort(sni_router.Route, routes, {}, sniRouteMoreSpecific);
+    assert(routes.len == routes_json.len);
+    assert(routes.len >= 1);
+    return routes;
+}
+
+/// An SNI route's name: §7's canonical host form, minus what RFC 6066
+/// forbids.
+///
+/// The form check is `validateRouteHost`'s, shared deliberately — a name
+/// written in an `http` route table and in an SNI one has to mean the
+/// same thing, and two validators is how that stops being true.
+///
+/// What is *not* shared is the domain. A `Host` header may legitimately
+/// be an IP literal, so `canonicalHost` accepts `1.2.3.4` and `[::1]`;
+/// RFC 6066 §3 forbids a literal in `server_name` outright, so no
+/// compliant ClientHello can ever carry one. Accepting such a route would
+/// load a rule that is structurally dead — it could never match, and
+/// nothing at runtime would say why. Refused at load instead (§5).
+fn validateSniName(raw: []const u8) ParseError![]const u8 {
+    const name = try validateRouteHost(raw);
+    assert(name.len >= 1);
+    // A bracketed literal is the IPv6 form `canonicalHost` admits; the
+    // parser wants a port to answer, and the port is irrelevant here —
+    // what is being asked is only whether this text is an address.
+    if (name[0] == '[') return error.RouteSniIsAddress;
+    var buffer: [constants.host_bytes_max + 2]u8 = undefined;
+    const with_port = std.fmt.bufPrint(&buffer, "{s}:0", .{name}) catch {
+        // Too long to be an address at all, and `validateRouteHost`
+        // already bounded it as a name.
+        return name;
+    };
+    if (std.Io.net.IpAddress.parseLiteral(with_port)) |_| {
+        return error.RouteSniIsAddress;
+    } else |_| {}
+    return name;
+}
+
+/// Named before any-name, which is all the ordering this table needs:
+/// there is one dimension, so specificity is only "does it name a name".
+fn sniRouteMoreSpecific(_: void, left: sni_router.Route, right: sni_router.Route) bool {
+    return (left.server_name != null) and (right.server_name == null);
+}
+
+/// A cluster named by an `l4` listener, by any route it has.
+///
+/// The reachability rule `HashKey` states — "`header` and `cookie` read
+/// the parsed request, so clusters carrying them are unreachable from
+/// `l4` listeners" — has to hold for *every* cluster such a listener can
+/// reach, not just the one it admits under. An SNI table (#298) makes
+/// that a real distinction: a named route can reach a cluster the
+/// admitted route never names, and a request-keyed hash there would be a
+/// pick the relay has no parsed head to compute.
+fn l4ClusterIndexOf(
+    clusters: []const Config.Cluster,
+    cluster_name: []const u8,
+) ParseError!u16 {
+    assert(clusters.len >= 1);
+    const cluster_index = try clusterIndexOf(clusters, cluster_name);
+    assert(cluster_index < clusters.len);
+    switch (clusters[cluster_index].hash_key) {
+        .source_ip => {},
+        .header, .cookie => return error.ListenerL4RequestKeyedHash,
+    }
+    return cluster_index;
+}
+
 /// An `l4` listener's one route: the whole table, because there is no
 /// path to match on and therefore nothing to choose between.
 ///
@@ -3465,12 +3660,8 @@ fn resolveL4Route(
     clusters: []const Config.Cluster,
 ) ParseError![]const router.Route {
     assert(clusters.len >= 1);
-    const cluster_index = try clusterIndexOf(clusters, cluster_name);
+    const cluster_index = try l4ClusterIndexOf(clusters, cluster_name);
     assert(cluster_index < clusters.len);
-    switch (clusters[cluster_index].hash_key) {
-        .source_ip => {},
-        .header, .cookie => return error.ListenerL4RequestKeyedHash,
-    }
     const routes = try arena.alloc(router.Route, 1);
     routes[0] = .{ .prefix = "/", .cluster_index = cluster_index };
     return routes;
@@ -4502,6 +4693,54 @@ fn resolveClusterProxyProtocol(
     ) orelse error.ClusterProxyProtocolSendUnknown;
 }
 
+/// How many listeners ask for each of the four features whose pools and
+/// buffers are sized before any listener resolves. Split from
+/// `parseWithFiles` for the length limit, and it reads better whole: four
+/// counts taken on one rule.
+///
+/// `tls`, `upgrades` and `sni` are **presence only**: whether a block is
+/// *usable* is its own resolver's to say, later and per listener.
+/// Counting on usability here would size a pool against blocks that might
+/// yet be refused, and report a limits error for a config whose real
+/// fault is a missing path or a token nobody recognises. `http` is the
+/// exception and is validated, because the tag it reads is what says a
+/// listener declared a protocol at all (#305).
+const ListenerFeatures = struct {
+    http: u32 = 0,
+    tls: u32 = 0,
+    upgrades: u32 = 0,
+    /// Listeners routing by SNI (#298) — what decides whether the relay
+    /// buffer has to be wide enough to stage a ClientHello.
+    sni: u32 = 0,
+};
+
+fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFeatures {
+    assert(listeners.len >= 1);
+    var features: ListenerFeatures = .{};
+    for (listeners) |listener_json| {
+        // The tag decides the count, so a listener that names neither
+        // body or both is refused here rather than sizing a pool from a
+        // protocol nobody stated (#305).
+        if (try protocolOf(&listener_json) == .http) features.http += 1;
+        if (listener_json.tls != null) features.tls += 1;
+        if (listener_json.http) |http_json| {
+            if (http_json.upgrades != null) features.upgrades += 1;
+        }
+        if (listener_json.l4) |l4_json| {
+            if (l4_json.routes != null) features.sni += 1;
+        }
+    }
+    // Every count is bounded here, at the one place that can prove it by
+    // construction — one turn of the loop per listener, and no field
+    // increments twice. Consumers take the struct and inherit the bound
+    // rather than re-deriving it.
+    assert(features.http <= listeners.len);
+    assert(features.tls <= listeners.len);
+    assert(features.upgrades <= listeners.len);
+    assert(features.sni <= listeners.len);
+    return features;
+}
+
 /// Which protocol a listener's tag names (#305). The vocabulary used to
 /// be a string this compared against, where a typo ("htpp") had to be
 /// caught by hand and turned into an error; it is now the body's own key,
@@ -4963,6 +5202,173 @@ test "config: a listener's body key is what names its protocol" {
         );
         try std.testing.expectEqual(Config.Listener.Protocol.http, parsed.listeners[0].protocol);
     }
+}
+
+test "config: l4 sni routes resolve, named before any-name" {
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"routes":[
+        \\   {"cluster":"fallback"},
+        \\   {"sni":"api.example.com","cluster":"api"},
+        \\   {"sni":"db.example.com","cluster":"db"}]}}],
+        \\ "clusters":{"fallback":{"endpoints":["127.0.0.1:2"]},
+        \\   "api":{"endpoints":["127.0.0.1:3"]},
+        \\   "db":{"endpoints":["127.0.0.1:4"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const routes = parsed.listeners[0].sni_routes;
+    try std.testing.expectEqual(@as(usize, 3), routes.len);
+    // Named first whatever the config order, so the scan's first match is
+    // the most specific rule — the any-name route can only be reached by
+    // a name no rule claimed.
+    try std.testing.expect(routes[0].server_name != null);
+    try std.testing.expect(routes[1].server_name != null);
+    try std.testing.expect(routes[2].server_name == null);
+    // And the listener still admits under *a* cluster before any byte is
+    // read: the any-name route's, since this config declared one.
+    try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].routes.len);
+}
+
+test "config: an l4 listener without sni routes carries no table" {
+    // The absence is what says the peek phase does not run, so it is
+    // asserted rather than assumed: every config written before #298
+    // keeps relaying without reading a byte first.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try std.testing.expectEqual(@as(usize, 0), parsed.listeners[0].sni_routes.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.listeners[0].routes.len);
+}
+
+test "config: the l4 sni table is held to §7's own rules" {
+    const tail = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"routes\":[";
+
+    // Neither `cluster` nor `routes`, and both: the http body's fork,
+    // now the l4 body's too.
+    try expectParseError(
+        error.ListenerClusterOrRoutes,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{}}]," ++ tail,
+    );
+    try expectParseError(
+        error.ListenerClusterOrRoutes,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"routes\":[{\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    // A name is held to the canonical form §7's `host` routes use — the
+    // same rule, so one name means one thing in both tables.
+    try expectParseError(
+        error.RouteHostNotCanonical,
+        head ++ "{\"sni\":\"API.Example.com\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    try expectParseError(
+        error.RouteHostNotCanonical,
+        head ++ "{\"sni\":\"api.example.com:443\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    // Two rules for one name is two answers to one question.
+    try expectParseError(
+        error.RouteDuplicate,
+        head ++ "{\"sni\":\"a.example.com\",\"cluster\":\"a\"}," ++
+            "{\"sni\":\"a.example.com\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    // And two any-name routes are the same mistake spelled differently.
+    try expectParseError(
+        error.RouteDuplicate,
+        head ++ "{\"cluster\":\"a\"},{\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    try expectParseError(
+        error.ClusterUnknown,
+        head ++ "{\"sni\":\"a.example.com\",\"cluster\":\"ghost\"}]}}]," ++ tail,
+    );
+    // RFC 6066 §3 forbids an address in `server_name`, so a route naming
+    // one could never match anything — a dead rule, refused rather than
+    // loaded. A `Host` header may legitimately be a literal, which is why
+    // this is the one check the two tables do not share.
+    try expectParseError(
+        error.RouteSniIsAddress,
+        head ++ "{\"sni\":\"1.2.3.4\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    try expectParseError(
+        error.RouteSniIsAddress,
+        head ++ "{\"sni\":\"[::1]\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    // A name that merely *contains* digits is a name.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        _ = try expectParseOk(
+            &arena_state,
+            head ++ "{\"sni\":\"v2.example.com\",\"cluster\":\"a\"}]}}]," ++ tail,
+        );
+    }
+}
+
+test "config: an l4 route cannot reach a request-keyed hash cluster" {
+    // `HashKey`'s own rule: `header` and `cookie` read the parsed
+    // request, and an l4 relay parses none. The admitted cluster was
+    // always held to it; every cluster an SNI table can reach has to be
+    // too, or a named route would resolve to a pick the relay cannot
+    // compute (#298).
+    const tail = "\"clusters\":{\"plain\":{\"endpoints\":[\"127.0.0.1:2\"]}," ++
+        "\"keyed\":{\"endpoints\":[\"127.0.0.1:3\"]," ++
+        "\"pick\":{\"policy\":\"hash\",\"key\":\"cookie\",\"name\":\"s\"}}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    // The keyed cluster reached by a *named* route, with the any-name
+    // route pointing somewhere harmless — the shape that slipped past
+    // when only the admitted cluster was checked.
+    try expectParseError(
+        error.ListenerL4RequestKeyedHash,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"routes\":[" ++
+            "{\"sni\":\"a.example.com\",\"cluster\":\"keyed\"}," ++
+            "{\"cluster\":\"plain\"}]}}]," ++ tail,
+    );
+    // And still refused when it is the any-name route's own cluster.
+    try expectParseError(
+        error.ListenerL4RequestKeyedHash,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"routes\":[" ++
+            "{\"cluster\":\"keyed\"}]}}]," ++ tail,
+    );
+}
+
+test "config: sni routing and terminating this listener are different proxies" {
+    // Routing by name reads the client's hello and relays it on; a
+    // terminating listener consumed that hello during its own handshake,
+    // so there is nothing left to read. The config states one (§6).
+    try expectParseError(error.ListenerTlsWithSniRoutes,
+        \\{"listeners":[{"bind":"127.0.0.1:1",
+        \\   "tls":{"cert":"/c.pem","key":"/k.pem"},
+        \\   "l4":{"routes":[{"sni":"a.example.com","cluster":"a"}]}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+}
+
+test "config: sni routing needs a relay buffer that can stage a hello" {
+    // A half too narrow would route the clients whose hellos happen to be
+    // short and drop the ones offering post-quantum key shares — one
+    // config, two outcomes. Refused at load instead (§5).
+    try expectParseError(error.LimitRelayBufferUnderSniRouting,
+        \\{"listeners":[{"bind":"127.0.0.1:1",
+        \\   "l4":{"routes":[{"sni":"a.example.com","cluster":"a"}]}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "limits":{"relay_buffer_bytes":4096},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // The same narrow buffer is fine on a listener that does not peek.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    _ = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "limits":{"relay_buffer_bytes":4096},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
 }
 
 test "config: explicit routes resolve, sorted longest-prefix-first" {

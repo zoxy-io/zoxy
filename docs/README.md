@@ -244,6 +244,62 @@ is a rejected config rather than a key that silently does nothing.
 ]
 ```
 
+#### Routing an `l4` listener by TLS name (SNI)
+
+One `:443` can front several TLS services **without terminating any of
+them**. Give the `l4` body a route table keyed on the server name the
+client asks for, and zoxy reads that name out of the ClientHello and
+relays every byte of it onward, unchanged:
+
+```json
+{
+    "bind": "0.0.0.0:443",
+    "l4": {
+        "routes": [
+            { "sni": "api.example.com", "cluster": "api" },
+            { "sni": "grpc.example.com", "cluster": "grpc" },
+            { "cluster": "fallback" }
+        ]
+    }
+}
+```
+
+It holds no key material and runs no handshake: the backend completes the
+TLS session with the client exactly as it would without a proxy in the
+path, and zoxy never sees a plaintext byte. That is the point — it is how
+you front a service whose certificate this proxy must *not* be able to
+present.
+
+A route with no `sni` is the catch-all: it answers any connection,
+including one whose hello named nothing at all (an IP-only client, an
+older stack). **Write no catch-all and a name your table does not cover is
+closed** rather than sent somewhere you did not name.
+
+Matching is exact — `api.example.com` matches that name and not
+`x.api.example.com` — which is the same rule `http` routes match a `host`
+by, so a name means one thing in both tables. There are no wildcards in
+either.
+
+Two combinations are refused at load rather than at runtime:
+
+| config | why |
+|---|---|
+| `routes` beside this listener's own `tls` | terminating consumes the hello this reads; the two are different proxies |
+| `limits.relay_buffer_bytes` below 16 KiB | the hello is staged in the relay buffer, and a modern one with post-quantum key shares runs past 2 KiB — a narrow buffer would route short hellos and drop long ones from the same config |
+
+Four counters report what the table did: `zoxy_l4_sni_routed`,
+`zoxy_l4_sni_absent` (the client named nothing), `zoxy_l4_sni_no_route`
+(named something no route claims) and `zoxy_l4_sni_invalid` (the opening
+bytes were not a ClientHello — a plaintext client, or a handshake this
+proxy could not read).
+
+> [!NOTE]
+> The hello must arrive in one TLS record. Every client sends it that way;
+> a fragmented first flight is legal but does not occur in practice, and
+> reassembling one would mean buffering inside a parser that reads
+> attacker-controlled bytes on every connection. Such a connection counts
+> `zoxy_l4_sni_invalid` and is closed.
+
 Listener count is bounded by your config's own ring and fd budgets, checked
 at startup, not by a compiled ceiling. The banner prints both, and a config
 that does not fit is refused there rather than being a number to remember.

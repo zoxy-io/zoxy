@@ -852,9 +852,37 @@ accept → admit (slots? buffers?) → route by listener
 ```
 
 - A listener is bound to a cluster in config; no parsing, no inspection
-  *of the payload*. The one exception is opt-in and runs ahead of it: a
-  `proxy_protocol` listener consumes one bounded PROXY-protocol header
-  before the dial (below), and after that the relay is as blind as ever.
+  *of the payload*. Two exceptions, both opt-in, both ahead of the relay
+  rather than inside it, and after either the relay is as blind as ever:
+  a `proxy_protocol` listener consumes one bounded PROXY-protocol header
+  before the dial (below), and an `l4` listener with a route table peeks
+  the client's ClientHello for its `server_name` and picks the cluster
+  from it (#298). They compose in that order — the header is the outer
+  envelope, the hello the payload it wraps.
+
+  The peek is deliberately **not** termination, and the distinction is
+  the whole value: no key material, no `Engine`, no `limits.tls_engines`,
+  no libcrypto heap, no handshake CPU. The parser reads a prefix and the
+  relay forwards it *unchanged*, which is `pump.zig`'s existing
+  pre-owed-debt entry rather than a transform, so the backend completes
+  the session with the client exactly as it would with no proxy in the
+  path. It is how one `:443` fronts several TLS services without holding
+  any of their private keys — and the only way to front a backend whose
+  certificate this proxy must not be able to present. Terminating and
+  peeking on one listener is refused at load: a handshake consumes the
+  hello the peek exists to read.
+
+  Mechanically it costs what the header phase costs, for the same
+  reasons: it stages in the relay buffer's client→upstream half, runs
+  under the connect budget, re-parses from byte 0 per delivery against a
+  parser whose verdicts are monotonic, and enters the relay with the
+  staged bytes pre-owed as the first send. What differs is that nothing
+  is consumed — the header is stripped and uncounted because the origin
+  never receives it, where every byte of the hello reaches the backend
+  and so counts toward `bytes_in`. Bounded by
+  `client_hello_bytes_max`; a listener whose relay buffer cannot stage
+  one is refused at load rather than dropping the clients whose hellos
+  happen to be large.
 - Relay buffers (one per direction) are acquired at admission and held
   for the connection's life — a recv must always have a buffer posted —
   so `relay_buffers`, not connection slots, bounds concurrent L4

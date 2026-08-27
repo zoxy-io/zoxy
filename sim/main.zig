@@ -171,6 +171,46 @@ const Uncovered = struct {
 /// serves both kinds at once, and what stops the table rotting into stale
 /// excuses.
 const uncovered = [_]Uncovered{
+    // §6 SNI routing (#298). The sweep's l4 population opens with a
+    // scripted prefix its oracle asserts is *never* relayed — the shape
+    // a PROXY header has — and a ClientHello is the opposite: it is the
+    // client's payload and the backend must receive every byte. Teaching
+    // that client a second, relayed-prefix mode would fork the integrity
+    // oracle these scenarios exist for, which is a worse trade than
+    // covering four verdicts where the whole decision is already
+    // reachable in one place.
+    //
+    // `src/server_test.zig` covers all four against `SimIo` — the same
+    // virtual sockets, the same adversary, partial-io seeds included, so
+    // the accumulate-and-retry loop is exercised rather than the
+    // one-recv path — and its origin double parses the relayed hello to
+    // prove the backend still receives what the client sent.
+    .{
+        .name = "l4_sni_routed",
+        .why = .unreached,
+        .reason = "the sweep's l4 client scripts prefixes its oracle expects " ++
+            "to be stripped, and a ClientHello is relayed; " ++
+            "src/server_test.zig's four sni-routing scenarios cover the " ++
+            "verdicts against the same SimIo, under partial io",
+    },
+    .{
+        .name = "l4_sni_absent",
+        .why = .unreached,
+        .reason = "same as l4_sni_routed — covered by src/server_test.zig " ++
+            "\"a hello naming nothing takes the any-name route\"",
+    },
+    .{
+        .name = "l4_sni_no_route",
+        .why = .unreached,
+        .reason = "same as l4_sni_routed — covered by src/server_test.zig " ++
+            "\"a name no route claims is closed, not guessed\"",
+    },
+    .{
+        .name = "l4_sni_invalid",
+        .why = .unreached,
+        .reason = "same as l4_sni_routed — covered by src/server_test.zig " ++
+            "\"opening bytes that are not a hello are refused\"",
+    },
     .{
         .name = "health_probe_deadline_raced",
         .why = .must_stay_zero,

@@ -482,6 +482,37 @@ pub const Counters = struct {
     /// not — `LOCAL` and `UNKNOWN` keep the observed peer, and a
     /// fronting proxy's health checks arrive exactly that way (§6).
     l4_proxy_header_accepted: Value = Value.init(0),
+    /// §6 SNI routing (#298): connections routed by the name their
+    /// ClientHello asked for. Deliberately **not** `shed_`-prefixed, on
+    /// `l4_proxy_header_invalid`'s exact reasoning — the connection was
+    /// admitted before it could be judged, so all four of these count in
+    /// the flow identity as ordinary completions.
+    l4_sni_routed: Value = Value.init(0),
+    /// Connections whose hello carried no `server_name` and which the
+    /// listener's any-name route therefore answered. A real and common
+    /// case (an IP-only client, an old stack), not an error — and
+    /// counted apart from `l4_sni_routed` because "nobody asked" and
+    /// "asked for this" are different facts about a deployment.
+    ///
+    /// Also counted when there is no any-name route and the connection
+    /// was closed: what the operator wants to know is how many clients
+    /// named nothing, and that number does not depend on whether they
+    /// wrote a catch-all for them.
+    l4_sni_absent: Value = Value.init(0),
+    /// Connections that named a server no route claimed, closed because
+    /// the listener had no any-name route (§6). A rising count is a name
+    /// reaching this listener that its table does not cover — a
+    /// certificate rotated onto a new hostname, or a client pointed at
+    /// the wrong address.
+    l4_sni_no_route: Value = Value.init(0),
+    /// Connections closed because their opening bytes were not a
+    /// ClientHello — not TLS at all, malformed, over
+    /// `client_hello_bytes_max`, fragmented across records (which this
+    /// proxy does not reassemble, see `net/client_hello.zig`), or EOF
+    /// mid-hello. A rising count on a listener fronting real TLS
+    /// services is the signal that the fragmentation limit stopped being
+    /// theoretical.
+    l4_sni_invalid: Value = Value.init(0),
     /// Headers staged for a sending cluster's origin (#142 send), one
     /// per dialed L4 connection there. Counted at the stage, not the
     /// wire: a dial that fails tears the connection down whole, so the

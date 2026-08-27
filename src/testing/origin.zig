@@ -12,10 +12,19 @@ const std = @import("std");
 
 const Io = @import("../io/io.zig");
 const proxy_protocol = @import("../net/proxy_protocol.zig");
+const client_hello = @import("../net/client_hello.zig");
+const constants = @import("../constants.zig");
 
 const assert = std.debug.assert;
 
 /// Per-connection origin behavior.
+/// The widest opening `Conn.header_buffer` must stage. A #142 header
+/// tops out at `proxy_protocol.send_bytes_max`; a #298 ClientHello is
+/// larger, and the tests build a minimal one, so this is sized for the
+/// shapes the harness scripts rather than for the protocol's ceiling —
+/// a hello that did not fit is a violation this double reports.
+const origin_header_bytes_max: usize = 256;
+
 pub const Mode = enum(u8) {
     /// Echo every chunk back (strict recv → send → recv), close on FIN.
     echo,
@@ -45,13 +54,30 @@ pub fn Origin(comptime IoType: type) type {
         /// loudly — garbage where a header belongs is a violation the
         /// harness asserts on, never a tolerated shape.
         expect_proxy_header: bool = false,
+        /// #298's receiving end: expect every connection to open with a
+        /// ClientHello, consume it before echoing, and record the name it
+        /// asked for. The property under test is what SNI routing
+        /// promises the backend — that the hello reaches it *unchanged*,
+        /// because this proxy read it without terminating — so an origin
+        /// double that could not parse one must fail loudly.
+        expect_client_hello: bool = false,
+        /// Connections whose ClientHello parsed, and the name the last
+        /// one carried.
+        client_hello_conns: u32 = 0,
+        client_hello_name: [constants.host_bytes_max]u8 = undefined,
+        client_hello_name_len: u8 = 0,
         /// Connections whose header parsed. Echo-mode only: the
         /// misbehaving modes never parse — `reset_on_first_chunk` acts
         /// on the first delivery, `mute` reads without judging (its
         /// `header_len` never advances, so its recv window never
         /// shrinks), and `frozen` never reads.
         proxy_header_conns: u32 = 0,
-        /// Connections whose opening bytes were not a valid header.
+        /// Connections whose opening bytes were not the valid opening
+        /// this double was told to expect — a #142 header, or a #298
+        /// ClientHello. One counter for both because the meaning is one:
+        /// the harness scripted an opening and the bytes were not it,
+        /// which is a violation of the test's own premise rather than a
+        /// proxy behaviour under examination.
         proxy_header_violations: u32 = 0,
         /// Optional hook fired after each accept (the drain-race test
         /// starts a client from here).
@@ -79,7 +105,10 @@ pub fn Origin(comptime IoType: type) type {
             /// The #142 header accumulates here until it parses; any
             /// payload that rode the same delivery follows it and is
             /// moved to `buffer` for the echo.
-            header_buffer: [proxy_protocol.send_bytes_max]u8 = undefined,
+            /// Wide enough for either opening this double consumes: a
+            /// #142 header, or a #298 ClientHello (larger, and the one
+            /// that sets the size).
+            header_buffer: [origin_header_bytes_max]u8 = undefined,
             header_len: u32 = 0,
             header_done: bool = false,
             /// What the header announced (null: LOCAL/UNKNOWN), for the
@@ -90,7 +119,8 @@ pub fn Origin(comptime IoType: type) type {
                 // While a header is owed, bytes land in its accumulator —
                 // the payload behind it is extracted on completion.
                 const target: []u8 =
-                    if (conn.origin.expect_proxy_header and !conn.header_done)
+                    if ((conn.origin.expect_proxy_header or
+                        conn.origin.expect_client_hello) and !conn.header_done)
                         conn.header_buffer[conn.header_len..]
                     else
                         conn.buffer[0..];
@@ -118,6 +148,10 @@ pub fn Origin(comptime IoType: type) type {
                             conn.feedProxyHeader(received);
                             return;
                         }
+                        if (conn.origin.expect_client_hello and !conn.header_done) {
+                            conn.feedClientHello(received);
+                            return;
+                        }
                         conn.transfer_len = received;
                         conn.sent_len = 0;
                         conn.armSend();
@@ -135,6 +169,66 @@ pub fn Origin(comptime IoType: type) type {
                     },
                     .mute => conn.armRecv(),
                     .frozen => unreachable,
+                }
+            }
+
+            /// Accumulate and judge the #298 ClientHello, then echo what
+            /// rode behind it.
+            ///
+            /// The record's own length is re-derived here rather than
+            /// returned by the parser, and that is the parser being
+            /// right: nothing is consumed on the proxy's side, so `ok`
+            /// carries a name and no cursor. This origin *does* need to
+            /// know where the hello ended, because it is the backend and
+            /// the token starts after it — a length only a consumer
+            /// needs, computed by the one consumer there is.
+            fn feedClientHello(conn: *Conn, received: u32) void {
+                const origin = conn.origin;
+                assert(origin.expect_client_hello);
+                assert(!conn.header_done);
+                conn.header_len += received;
+                assert(conn.header_len <= conn.header_buffer.len);
+                const staged = conn.header_buffer[0..conn.header_len];
+                switch (client_hello.parse(staged)) {
+                    .need_more => {
+                        if (conn.header_len == conn.header_buffer.len) {
+                            conn.witnessHeaderViolation();
+                            return;
+                        }
+                        conn.armRecv();
+                    },
+                    .invalid => conn.witnessHeaderViolation(),
+                    .ok => |hello| {
+                        conn.header_done = true;
+                        origin.client_hello_conns += 1;
+                        origin.client_hello_name_len = 0;
+                        if (hello.server_name) |name| {
+                            assert(name.len <= origin.client_hello_name.len);
+                            @memcpy(origin.client_hello_name[0..name.len], name);
+                            origin.client_hello_name_len = @intCast(name.len);
+                        }
+                        // Record header plus the fragment it declared.
+                        const hello_len = 5 + @as(usize, std.mem.readInt(
+                            u16,
+                            staged[3..5],
+                            .big,
+                        ));
+                        assert(hello_len <= conn.header_len);
+                        const leftover_len = conn.header_len - hello_len;
+                        if (leftover_len >= 1) {
+                            assert(leftover_len <= buffer_bytes);
+                            std.mem.copyForwards(
+                                u8,
+                                conn.buffer[0..leftover_len],
+                                conn.header_buffer[hello_len..conn.header_len],
+                            );
+                            conn.transfer_len = @intCast(leftover_len);
+                            conn.sent_len = 0;
+                            conn.armSend();
+                            return;
+                        }
+                        conn.armRecv();
+                    },
                 }
             }
 

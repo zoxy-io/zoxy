@@ -11,6 +11,7 @@ const std = @import("std");
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
 const router = @import("../http/router.zig");
+const sni_router = @import("sni_router.zig");
 const filter = @import("../http/filter.zig");
 const relay = @import("relay.zig");
 const stream_module = @import("Stream.zig");
@@ -95,6 +96,10 @@ pub fn Conn(comptime IoType: type) type {
         /// it has no path to match. Set once at admission and constant for
         /// the connection's life, so it survives keep-alive turnarounds.
         routes: []const router.Route,
+        /// The listener's §6 SNI table (#298), borrowed like `routes` and
+        /// empty on every connection whose listener does not route by
+        /// name — which is what says the peek phase never runs.
+        sni_routes: []const sni_router.Route,
         /// The listener's §7 request filter rules, same lifetime as
         /// `routes` (empty on L4 and when no request filters are
         /// configured).
@@ -165,6 +170,22 @@ pub fn Conn(comptime IoType: type) type {
             /// consumes `client_address` (the hash pick, §7), and the
             /// header is what makes that address the real client's.
             l4_reading_proxy_header,
+            /// Reading the client's ClientHello to learn which backend it
+            /// asked for (§6, #298), staged in the relay buffer's
+            /// client→upstream half and accumulated in `head_len`.
+            ///
+            /// After the PROXY header, which is the outer envelope, and
+            /// before `.connecting`, necessarily: the dial needs the
+            /// cluster and the name is what picks it. Nothing is consumed
+            /// — unlike that header, these bytes are the client's first
+            /// payload and enter the relay as its opening debt, so the
+            /// backend receives the hello it would have received without
+            /// this proxy in the path.
+            ///
+            /// Never reached on a listener that terminates: the config
+            /// refuses that pairing, because a handshake consumes the
+            /// hello this phase exists to read.
+            l4_peeking_client_hello,
             /// Running the TLS handshake a terminating listener requires
             /// (§4, #125). Like the PROXY header phase it runs *before*
             /// the protocol rather than inside it — termination is
@@ -207,6 +228,7 @@ pub fn Conn(comptime IoType: type) type {
         pub fn isLive(conn: *const Self) bool {
             return switch (conn.state) {
                 .l4_reading_proxy_header,
+                .l4_peeking_client_hello,
                 .tls_handshaking,
                 .connecting,
                 .relaying,
@@ -276,6 +298,7 @@ pub fn Conn(comptime IoType: type) type {
             // Placeholders until the admission tail installs the
             // listener's real tables (§7); L4 never reads them.
             conn.routes = &.{};
+            conn.sni_routes = &.{};
             conn.request_filters = &.{};
             conn.response_filters = &.{};
             conn.upgrades = .{};

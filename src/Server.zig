@@ -28,6 +28,8 @@ const proxy = @import("http/proxy.zig");
 const router = @import("http/router.zig");
 const filter = @import("http/filter.zig");
 const proxy_protocol = @import("net/proxy_protocol.zig");
+const client_hello = @import("net/client_hello.zig");
+const sni_router = @import("net/sni_router.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 const Credentials = @import("tls/Credentials.zig");
@@ -367,6 +369,9 @@ pub fn Server(comptime IoType: type) type {
             /// The listener's §7 route table, handed to each admitted L7
             /// connection so `routeRequest` can pick a cluster by path.
             routes: []const router.Route,
+            /// The §6 SNI table (#298); empty on every listener that does
+            /// not route by name, which is what says the peek never runs.
+            sni_routes: []const sni_router.Route,
             /// The listener's §7 request filter rules, handed to each
             /// admitted L7 connection so `routeRequest` can evaluate
             /// policy.
@@ -1060,6 +1065,7 @@ pub fn Server(comptime IoType: type) type {
                     // path's route once the head parses (§7).
                     .cluster_index = listener_config.routes[0].cluster_index,
                     .routes = listener_config.routes,
+                    .sni_routes = listener_config.sni_routes,
                     .upgrades = listener_config.upgrades,
                     .max_body_bytes = listener_config.max_body_bytes,
                     .request_filters = listener_config.request_filters,
@@ -1708,6 +1714,11 @@ pub fn Server(comptime IoType: type) type {
                 server.startProxyHeaderPhase(conn);
             } else if (conn.tls != null) {
                 server.startTlsPhase(conn);
+            } else if (state.sni_routes.len >= 1) {
+                // The config refuses this beside `tls`, so reaching here
+                // means the hello is still in the client's hands (#298).
+                assert(state.protocol == .l4);
+                server.startSniPeekPhase(conn);
             } else {
                 server.startProtocol(conn, state.protocol);
             }
@@ -1756,9 +1767,11 @@ pub fn Server(comptime IoType: type) type {
         ///
         /// It takes the protocol as an argument rather than reading it off
         /// the slot deliberately: a field with one writer and one reader
-        /// would be state kept for the caller's convenience (§1), and both
-        /// callers — admission, and the PROXY-header phase's hand-over
-        /// (#142) — know the protocol without asking.
+        /// would be state kept for the caller's convenience (§1), and
+        /// every caller knows the protocol without asking: admission, and
+        /// the hand-over of each receive phase that can precede it — the
+        /// PROXY header (#142), the TLS handshake (#125) and the SNI peek
+        /// (#298).
         ///
         /// The state and deadline stores are idempotent at admission — the
         /// tail below set exactly these values from the same protocol, and
@@ -1766,7 +1779,7 @@ pub fn Server(comptime IoType: type) type {
         /// and the pressure flags `entryTimeoutMs` reads cannot have moved
         /// between the two writes — and they are load-bearing for a
         /// hand-over, which arrives in whatever state its phase ran in.
-        /// Keeping them here is what makes both callers a single call.
+        /// Keeping them here is what makes every caller a single call.
         ///
         /// No `!draining` assert, deliberately: admission's path asserts
         /// it at `admit`, but a hand-over may legally complete mid-drain —
@@ -1879,6 +1892,7 @@ pub fn Server(comptime IoType: type) type {
             // exactly one catch-all route and no filters, so this is one
             // rule rather than a third fork.
             conn.routes = listener.routes;
+            conn.sni_routes = listener.sni_routes;
             conn.request_filters = listener.request_filters;
             conn.response_filters = listener.response_filters;
             conn.upgrades = listener.upgrades;
@@ -2474,6 +2488,21 @@ pub fn Server(comptime IoType: type) type {
                 server.startTlsPhaseWith(conn, leftover);
                 return;
             }
+            if (conn.sni_routes.len >= 1) {
+                // The composition §6 states: the header is the outer
+                // envelope, and what rode behind it is the hello the peek
+                // exists to read (#298). Moved to the buffer's start so
+                // the peek accumulates from byte 0 like any other entry —
+                // and *not* framed as relay debt, because this connection
+                // has not chosen a backend yet.
+                if (leftover_len >= 1) {
+                    std.mem.copyForwards(u8, staging[0..leftover_len], leftover);
+                }
+                conn.stream.head_len = leftover_len;
+                conn.stream.head_cursor.reset();
+                server.startSniPeekPhase(conn);
+                return;
+            }
             if (leftover_len >= 1) {
                 // Payload the last recv delivered behind the header. Move
                 // it to the buffer's start and frame it as the client→
@@ -2492,6 +2521,168 @@ pub fn Server(comptime IoType: type) type {
                 direction.phase = .receiving;
                 direction.owe(leftover_len);
             }
+            conn.stream.head_len = 0;
+            conn.stream.head_cursor.reset();
+            server.startProtocol(conn, .l4);
+        }
+
+        /// Enter the §6 SNI peek phase (#298) on an admitted L4
+        /// connection whose listener routes by name: read the client's
+        /// ClientHello before the dial, because the dial consumes the
+        /// cluster and the name is what picks it.
+        ///
+        /// The PROXY-header phase's shape, under the same connect budget
+        /// and for the same reason — a client that connects to a TLS
+        /// service speaks immediately, so a silent one is reaped on a
+        /// dial-scale clock. Ordered after that phase where both are
+        /// configured: the header is the outer envelope, and the hello is
+        /// the payload it wraps.
+        fn startSniPeekPhase(server: *Self, conn: *ConnType) void {
+            assert(!conn.isTearingDown());
+            assert(conn.protocol == .l4);
+            assert(conn.tls == null);
+            assert(conn.sni_routes.len >= 1);
+            assert(conn.stream.relay_buffer != null);
+            assert(conn.armed.deadline);
+            assert(conn.stream.head_len < constants.client_hello_bytes_max);
+            conn.state = .l4_peeking_client_hello;
+            // Judged before any recv is armed, because this phase can be
+            // entered *holding* bytes: the PROXY-header phase reads past
+            // its own header routinely, and what it read past is the
+            // start of the hello. A client that sent both in one segment
+            // is waiting on the backend's ServerHello and will send
+            // nothing more, so arming a read first would stall it until
+            // the deadline reaped it.
+            server.judgeSniPeek(conn);
+        }
+
+        /// Parse whatever is staged and act on the verdict. The one place
+        /// the three outcomes are handled, so both entries into this
+        /// phase — a fresh admission and the header hand-over — and every
+        /// subsequent delivery reach them the same way.
+        fn judgeSniPeek(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .l4_peeking_client_hello);
+            assert(conn.stream.relay_buffer != null);
+            const staged = conn.stream.relay_buffer.?.client_to_upstream[0..conn.stream.head_len];
+            switch (client_hello.parse(staged)) {
+                .need_more => server.armSniPeekRecv(conn),
+                .invalid => {
+                    server.counters.increment("l4_sni_invalid");
+                    server.beginTeardown(conn);
+                },
+                .ok => |hello| server.finishSniPeek(conn, hello.server_name),
+            }
+        }
+
+        /// One recv into the staging window past what has accumulated.
+        /// The window ends at the cap, not the buffer, on
+        /// `armProxyHeaderRecv`'s rule — and the loader guarantees the
+        /// half is at least that wide (`LimitRelayBufferUnderSniRouting`),
+        /// so the cap is reachable rather than aspirational.
+        fn armSniPeekRecv(server: *Self, conn: *ConnType) void {
+            assert(conn.state == .l4_peeking_client_hello);
+            assert(conn.stream.relay_buffer != null);
+            assert(conn.stream.head_len < constants.client_hello_bytes_max);
+            const staging = conn.stream.relay_buffer.?
+                .client_to_upstream[0..constants.client_hello_bytes_max];
+            conn.stream.arm(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+            server.io.recv(
+                conn.client_socket,
+                staging[conn.stream.head_len..],
+                &conn.stream.op_data_client_to_upstream.completion,
+                ConnType,
+                conn,
+                onSniPeekRecv,
+            );
+        }
+
+        /// Accumulate and re-judge from byte 0, the same detect-and-retry
+        /// the PROXY header and the HTTP head both use: the parser's
+        /// verdicts are monotonic, so a partial hello reads `need_more`
+        /// until its last byte lands.
+        fn onSniPeekRecv(conn: *ConnType, result: Io.RecvError!u32) void {
+            const server = conn.server;
+            conn.stream.delivered(&conn.stream.op_data_client_to_upstream, "data_client_to_upstream");
+            if (conn.isTearingDown()) {
+                server.continueTeardown(conn);
+                return;
+            }
+            assert(conn.state == .l4_peeking_client_hello);
+            const received = result catch |err| {
+                if (err == error.EndOfStream) {
+                    // A peer that hangs up mid-hello never said what it
+                    // wanted; same verdict as bytes that were not one.
+                    server.counters.increment("l4_sni_invalid");
+                } else {
+                    server.witnessKernelPressure(.recv, err);
+                }
+                server.beginTeardown(conn);
+                return;
+            };
+            assert(received >= 1);
+            conn.stream.head_len += received;
+            assert(conn.stream.head_len <= constants.client_hello_bytes_max);
+            server.judgeSniPeek(conn);
+        }
+
+        /// The hand-over (#298): pick the cluster from the name, frame the
+        /// whole hello as the relay's opening debt, and dial.
+        ///
+        /// **Nothing is consumed.** The PROXY header is an envelope this
+        /// proxy strips, so `finishProxyHeader` forwards only what came
+        /// *after* it; a ClientHello is the client's first payload and the
+        /// backend must receive every byte of it, so the debt is the whole
+        /// staged run.
+        fn finishSniPeek(server: *Self, conn: *ConnType, server_name: ?[]const u8) void {
+            assert(conn.state == .l4_peeking_client_hello);
+            assert(conn.stream.head_len >= 1);
+            assert(conn.sni_routes.len >= 1);
+            // Canonicalized before the lookup, exactly as §7 canonicalizes
+            // a `Host` before consulting its own table: the config's names
+            // are stored canonical, and a hello naming `API.Example.com`
+            // asked for the same service as one naming `api.example.com`.
+            var host_scratch: [constants.host_bytes_max]u8 = undefined;
+            const canonical: ?[]const u8 = if (server_name) |raw|
+                parser.canonicalHost(raw, &host_scratch)
+            else
+                null;
+            const routed = sni_router.route(conn.sni_routes, canonical);
+            // `absent` is a fact about the client and is counted whatever
+            // the table did with it; the other two are facts about the
+            // table, so they are the ones the fork picks between.
+            if (server_name == null) {
+                server.counters.increment("l4_sni_absent");
+            } else if (routed != null) {
+                server.counters.increment("l4_sni_routed");
+            } else {
+                server.counters.increment("l4_sni_no_route");
+            }
+            const cluster_index = routed orelse {
+                // Nothing claimed this connection and the operator wrote
+                // no catch-all, which is them saying to close it rather
+                // than send it somewhere they did not name (§6).
+                server.beginTeardown(conn);
+                return;
+            };
+            // The provisional cluster admission stored is replaced here,
+            // before the dial can consume it — the whole reason
+            // `admittedCluster` is allowed to be provisional at all.
+            conn.stream.cluster_index = cluster_index;
+            // Every staged byte is payload the origin receives, so every
+            // one of them counts (§8). This is where the hello differs
+            // from the PROXY header rather than where it differs from the
+            // rule: that header is uncounted because it is *stripped*,
+            // and the rule both obey is that `bytes_in` is what crossed
+            // to the backend.
+            conn.stream.log.bytes_in += conn.stream.head_len;
+            const direction = &conn.stream.directions[
+                @intFromEnum(StreamType.Direction.client_to_upstream)
+            ];
+            assert(direction.phase == .idle);
+            direction.phase = .receiving;
+            direction.owe(conn.stream.head_len);
+            // Unlike `finishProxyHeader` the bytes stay where they are:
+            // nothing was stripped, so there is no prefix to move off.
             conn.stream.head_len = 0;
             conn.stream.head_cursor.reset();
             server.startProtocol(conn, .l4);
