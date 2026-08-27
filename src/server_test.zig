@@ -1931,7 +1931,7 @@ test "tls: two engines from one seed produce one handshake, replayed" {
         // The ServerHello random is the engine's seeded input made
         // visible: it goes on the wire verbatim, so comparing it compares
         // what the peer would see.
-        captured.* = engine.hs.random.data;
+        captured.* = engine.hs.config.server_random;
         bed.server.releaseTlsEngine(engine);
     }
     try std.testing.expectEqualSlices(u8, &runs[0], &runs[1]);
@@ -2027,7 +2027,7 @@ test "tls: an operator's head size widens the plaintext buffer, and is priced" {
 }
 
 test "tls: an L4 listener terminates, and relays the plaintext both ways" {
-    // The whole promise in one scenario: a real ztls client handshakes
+    // The whole promise in one scenario: a real zssl client handshakes
     // against the proxy, sends application data, and the origin — which
     // knows nothing about TLS — echoes plaintext that comes back
     // encrypted. Every byte crosses the transform twice.

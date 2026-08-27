@@ -32,7 +32,7 @@ pub const UpstreamHeadBuffer = @import("net/upstream.zig").HeadBuffer;
 pub const UpstreamPool = @import("net/upstream.zig").UpstreamPool;
 pub const Server = @import("Server.zig").Server;
 pub const shed = @import("shed.zig");
-/// TLS termination (§4). The only files that may name ztls, and so the
+/// TLS termination (§4). The only files that may name zssl, and so the
 /// only place libcrypto is reachable from — lint-enforced.
 pub const tls = struct {
     pub const Credentials = @import("tls/Credentials.zig");
@@ -41,7 +41,7 @@ pub const tls = struct {
     pub const Tickets = @import("tls/Tickets.zig");
     pub const TestClient = @import("tls/TestClient.zig").TestClient;
     /// What a client captures from one session to offer on the next. Named
-    /// here so a gate can hold one without naming ztls itself (§4).
+    /// here so a gate can hold one without naming zssl itself (§4).
     pub const SessionTicket = @import("tls/TestClient.zig").SessionTicket;
     /// The throwaway self-signed fixtures (`tls/testdata/README.md`),
     /// re-exported because `@embedFile` cannot escape its module root and
@@ -84,7 +84,6 @@ test {
     _ = tls.Tickets;
     _ = @import("tls/engine_test.zig");
     _ = tls.TestClient;
-    _ = @import("tls/spike_test.zig");
     _ = @import("mem/Pool.zig");
     _ = @import("net/Conn.zig");
     _ = @import("net/proxy_protocol.zig");

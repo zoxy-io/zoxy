@@ -5123,7 +5123,7 @@ test "l7: a client that sent no chain gets a line naming only itself" {
 }
 
 test "l7: a terminated listener proxies an HTTPS request end to end" {
-    // The whole L7-over-TLS promise: a real ztls client sends an HTTP
+    // The whole L7-over-TLS promise: a real zssl client sends an HTTP
     // request inside a TLS session, an origin that knows nothing about
     // TLS answers it, and the response comes back encrypted. The head is
     // parsed out of decrypted bytes and the response is encrypted on its
@@ -5265,7 +5265,7 @@ test "l7: a ticket issued by one session resumes the next" {
     // key that sealed it. Nothing short of two handshakes proves it —
     // the seal and open are unit-tested against each other, but only
     // this says the ticket survives the wire, the client's storage, and
-    // ztls's pre_shared_key extension in between.
+    // zssl's pre_shared_key extension in between.
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 54,

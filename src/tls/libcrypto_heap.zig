@@ -1,10 +1,10 @@
 //! The fixed libcrypto heap (DESIGN.md §4, §5).
 //!
-//! libcrypto (the ztls crypto backend) mallocs internally during a
+//! libcrypto (the zssl crypto backend) mallocs internally during a
 //! handshake; left on the libc heap those calls fault pages via
 //! mmap/brk, breaking the "zero allocating syscalls after init" promise
 //! (§5). This routes every libcrypto allocation into one fixed buffer
-//! reserved at startup, via `ztls.mem_hooks` — so after `install`,
+//! reserved at startup, via `zssl.mem_hooks` — so after `install`,
 //! libcrypto never calls libc malloc and issues no allocating syscall.
 //!
 //! Design: **segregated fits.** Requests round up to a power-of-two size
@@ -25,7 +25,7 @@
 
 const std = @import("std");
 
-const ztls = @import("ztls");
+const zssl = @import("zssl");
 
 const assert = std.debug.assert;
 
@@ -62,7 +62,7 @@ const Header = struct {
     class: u32,
     next_free: ?*Header,
 
-    const value: u32 = 0x7a_74_6c_73; // "ztls"
+    const value: u32 = 0x7a_73_73_6c; // "zssl"
 };
 
 comptime {
@@ -232,7 +232,7 @@ fn hookFree(addr: ?*anyopaque, file: ?[*:0]const u8, line: c_int) callconv(.c) v
 pub fn install(buffer: []align(alignment) u8) bool {
     assert(!installed); // Install exactly once.
     global_heap.init(buffer);
-    if (!ztls.mem_hooks.setMemFunctions(hookMalloc, hookRealloc, hookFree)) {
+    if (!zssl.mem_hooks.install(hookMalloc, hookRealloc, hookFree)) {
         return false;
     }
     installed = true;

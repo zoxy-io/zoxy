@@ -302,7 +302,7 @@ comptime {
 }
 
 /// The RFC 8446 §5.1 ceiling on one TLS record's plaintext: 2^14. Not a
-/// choice — it is what a conforming peer may send and what ztls will
+/// choice — it is what a conforming peer may send and what zssl will
 /// hand back from a single record, so every buffer the engine decrypts
 /// into is sized from it.
 pub const tls_record_plaintext_bytes_max: u32 = 16 * 1024;
@@ -337,14 +337,16 @@ comptime {
 /// The ceiling on one TLS engine's own footprint, asserted against
 /// `@sizeOf(Engine)` in `src/tls/Engine.zig` (§5: a budget is a stated
 /// number a thing must fit, not a number read back off whatever it grew
-/// to). Measured at 132 KiB — mostly ztls's record and reassembly
-/// buffers, each two max records wide — with the headroom here for a pin
-/// that adds a field. A bump past this is a deliberate re-costing of the
-/// engine pool, which is what tripping the assert makes it.
+/// to). Measured at 91 KiB — the record, out, flight and reassembly
+/// buffers plus the outbox — with the headroom here for a pin that adds
+/// a field. It was 132 KiB under ztls, whose per-handshake buffers were
+/// wider; the pool costs the same slots for less. A bump past this is a
+/// deliberate re-costing of the engine pool, which is what tripping the
+/// assert makes it.
 pub const tls_engine_bytes_max: u32 = 160 * 1024;
 
 /// The ceiling on `limits.tls_engines` — how many TLS sessions may be
-/// handshaking or terminated at once (§5). An engine is ~132 KiB plus its
+/// handshaking or terminated at once (§5). An engine is ~91 KiB plus its
 /// plaintext buffer, so this is the one pool whose count an operator
 /// notices in RSS: 1024 is ~170 MiB, and the ceiling exists so a typo in
 /// the config cannot ask for a gigabyte. Unlike the conn-slot ceiling it
@@ -449,7 +451,7 @@ pub const libcrypto_heap_base_bytes: u32 = 2 * 1024 * 1024;
 /// handshake at a time, each freeing before the next — which is true
 /// serially and false concurrently, and the gap was an outage rather than
 /// a rounding error: the heap ran out at ~675 concurrent sessions, and
-/// because ztls retried that allocation failure forever, the process
+/// because the engine retried that allocation failure forever, the process
 /// livelocked at 100% CPU with every listener dark (#222).
 pub fn libcryptoHeapBytes(tls_engines: u32) u32 {
     assert(tls_engines <= tls_engines_max);

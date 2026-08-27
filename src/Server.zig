@@ -110,7 +110,7 @@ pub fn Server(comptime IoType: type) type {
         /// nothing — when no listener does, which is the shape `Pool`'s
         /// zero-slot support exists for.
         ///
-        /// A pool rather than a `Conn` field because an engine is ~132 KiB
+        /// A pool rather than a `Conn` field because an engine is ~91 KiB
         /// against a conn slot's ~1.7: a deployment pays for the TLS it
         /// serves concurrently, not for every slot it could admit (§5).
         tls_engines: Pool(TlsEngine),
@@ -2876,7 +2876,7 @@ pub fn Server(comptime IoType: type) type {
         /// were staged.
         ///
         /// Best-effort on purpose: a deployment with no sealing key, or a
-        /// suite whose resumption secret ztls will not hand over, gets a
+        /// suite whose resumption secret zssl will not hand over, gets a
         /// working session without resumption rather than a failed
         /// handshake. Resumption is an optimisation, and a client that is
         /// offered no ticket simply does a full handshake next time.

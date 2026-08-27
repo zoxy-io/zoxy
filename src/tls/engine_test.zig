@@ -1,5 +1,5 @@
 //! The engine's contract with the data path (DESIGN.md §4), driven by a
-//! raw ztls client over an in-memory wire. What is pinned here is what
+//! raw zssl client over an in-memory wire. What is pinned here is what
 //! slices above this one will assume without re-checking: a handshake
 //! completes, a fragmented ClientHello does not fail it, the outbox
 //! survives the call that filled it and credits partial sends, and an
@@ -10,7 +10,7 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const Credentials = @import("Credentials.zig");
 const Engine = @import("Engine.zig");
-const ztls = @import("ztls");
+const zssl = @import("zssl");
 
 const assert = std.debug.assert;
 
@@ -44,7 +44,7 @@ const Peer = struct {
         peer.wire_len += @intCast(bytes.len);
     }
 
-    /// Mutable: ztls decrypts records in place.
+    /// Mutable: records are decrypted in place.
     fn take(peer: *Peer) []u8 {
         const bytes = peer.wire[0..peer.wire_len];
         peer.wire_len = 0;
@@ -69,37 +69,35 @@ const Peer = struct {
     }
 };
 
-/// The raw ztls client half, fully seeded so nothing it contributes to
+/// The raw zssl client half, fully seeded so nothing it contributes to
 /// the transcript varies between runs.
 const Client = struct {
-    hs: ztls.ClientHandshake,
-    out: ztls.ClientHandshake.OutBuffer,
-    storage: ztls.RecordBuffer.Storage,
-    records: ztls.RecordBuffer,
+    hs: zssl.ClientHandshake,
+    out: [zssl.ClientHandshake.out_bytes_min]u8,
+    storage: [zssl.record.wire_record_bytes_max]u8,
+    reassembly: [16 * 1024]u8,
+    records: zssl.record_buffer.RecordBuffer,
     app: [app_bytes_max]u8 = undefined,
     app_len: u32 = 0,
     saw_close: bool = false,
 
     fn init(client: *Client) !void {
-        const x25519 = try ztls.x25519.KeyPair.generateDeterministic(.init(@splat(0x51)));
-        const p256 = try ztls.p256.KeyPair.generateDeterministic(.init(@splat(0x53)));
-        client.hs = .init(.{
-            .keypairs = .initWithP256(x25519, p256),
-            .host_name = "spike.zoxy.test",
-            .now_sec = 0,
-            .random = .init(@splat(0x52)),
-            .insecure_no_chain_anchor = true,
+        client.hs = .init(&.{
+            .client_random = @splat(0x52),
+            .x25519_private = @splat(0x51),
+            .server_name = "spike.zoxy.test",
+            // The fixture is self-signed and what these tests exercise is
+            // zoxy's engine, not this client's trust decisions.
+            .certificate_policy = .insecure_no_verification,
+            .reassembly = &client.reassembly,
         });
-        client.out = .empty;
-        client.storage = .empty;
-        client.records = .init(&client.storage.buffer);
+        client.records = .init(&client.storage);
         client.app_len = 0;
         client.saw_close = false;
     }
 
     fn hello(client: *Client, to_server: *Peer) !void {
-        to_server.write(try client.hs.start(&client.out.buffer));
-        client.hs.completeWrite();
+        to_server.write(client.hs.start(&client.out));
     }
 
     fn feed(client: *Client, wire: []u8, to_server: *Peer) !void {
@@ -113,27 +111,25 @@ const Client = struct {
             @memcpy(writable[0..taken], remaining[0..taken]);
             client.records.advance(taken);
             remaining = remaining[taken..];
-            while (try client.records.next()) |record| {
-                switch (try client.hs.handleRecord(record, &client.out.buffer)) {
-                    .write => |bytes| {
-                        to_server.write(bytes);
-                        client.hs.completeWrite();
-                    },
+            while (try client.records.next()) |wire_record| {
+                switch (try client.hs.handleRecord(wire_record, &client.out)) {
+                    // `.connected` carries the client flight, so both
+                    // arms put bytes on the wire.
+                    .send, .connected => |bytes| to_server.write(bytes),
                     .application_data => |bytes| {
                         assert(client.app_len + bytes.len <= client.app.len);
                         @memcpy(client.app[client.app_len..][0..bytes.len], bytes);
                         client.app_len += @intCast(bytes.len);
                     },
                     .closed => client.saw_close = true,
-                    .key_update, .new_session_ticket, .none => {},
+                    .ticket, .none => {},
                 }
             }
         }
     }
 
     fn send(client: *Client, bytes: []const u8, to_server: *Peer) !void {
-        to_server.write(try client.hs.sendApplicationData(bytes, &client.out.buffer));
-        client.hs.completeWrite();
+        to_server.write(try client.hs.sendApplicationData(bytes, &client.out));
     }
 };
 
@@ -150,12 +146,18 @@ const Bed = struct {
     to_client: Peer,
 
     fn init(bed: *Bed) !void {
+        return bed.initWith(.{});
+    }
+
+    /// The deterministic-nonce tests below need the other setting, and
+    /// nothing else about the bed changes with it.
+    fn initWith(bed: *Bed, options: Credentials.Options) !void {
         bed.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         bed.credentials = try Credentials.load(
             bed.arena_state.allocator(),
             cert_pem,
             key_pem,
-            .{},
+            options,
         );
         bed.engine.bindPlaintext(
             &bed.plaintext,
@@ -202,7 +204,7 @@ const Bed = struct {
     fn handshake(bed: *Bed) !void {
         try bed.client.hello(&bed.to_server);
         var rounds: u8 = 0;
-        while (!(bed.engine.isConnected() and bed.client.hs.isConnected())) : (rounds += 1) {
+        while (!(bed.engine.isConnected() and bed.client.hs.state == .connected)) : (rounds += 1) {
             try std.testing.expect(rounds < rounds_max);
             try bed.driveServer();
             try bed.client.feed(bed.to_client.take(), &bed.to_server);
@@ -259,15 +261,14 @@ test "engine: the peer's close_notify outlives the step that saw it" {
     // A client close arrives as an in-band alert with no socket EOF behind
     // it. The sink reports it once; `peerClosed` is how a later read that
     // yielded nothing tells "fragment" from "stream over" (§6).
-    bed.to_server.write(try bed.client.hs.sendAlert(.close_notify, &bed.client.out.buffer));
-    bed.client.hs.completeWrite();
+    bed.to_server.write(try bed.client.hs.sendClose(&bed.client.out));
     try bed.driveServer();
 
     try std.testing.expect(bed.to_client.saw_close);
     try std.testing.expect(bed.engine.peerClosed());
 }
 
-// The reassembly buffer earns its field here: without it ztls answers a
+// The reassembly buffer earns its field here: without it a server answers a
 // split ClientHello with a decode_error alert. An ordinary client never
 // produces this; a hostile or MTU-shaped one can.
 test "engine: a ClientHello fragmented across records still handshakes" {
@@ -280,7 +281,7 @@ test "engine: a ClientHello fragmented across records still handshakes" {
     refragment(whole.take(), &bed.to_server);
 
     var rounds: u8 = 0;
-    while (!(bed.engine.isConnected() and bed.client.hs.isConnected())) : (rounds += 1) {
+    while (!(bed.engine.isConnected() and bed.client.hs.state == .connected)) : (rounds += 1) {
         try std.testing.expect(rounds < rounds_max);
         try bed.driveServer();
         try bed.client.feed(bed.to_client.take(), &bed.to_server);
@@ -291,7 +292,7 @@ test "engine: a ClientHello fragmented across records still handshakes" {
 
 // The outbox contract the data path depends on: ciphertext survives the
 // call that produced it, and a short write is credited partially. That is
-// what makes an async send safe against ztls's borrow-until-next-call
+// what makes an async send safe against zssl's borrow-until-next-call
 // buffers.
 test "engine: the outbox survives the drive step and credits partial sends" {
     var bed: Bed = undefined;
@@ -429,4 +430,61 @@ fn refragment(record: []const u8, out: *Peer) void {
     out.write(body[0..split]);
     out.write(&handshakeRecordHeader(@intCast(body.len - split)));
     out.write(body[split..]);
+}
+
+/// The server's first flight — ServerHello through Finished — as one
+/// seeded run produces it. Everything that feeds it is fixed: the
+/// engine's two seeds, the client's, and the credential.
+fn seededServerFlight(out: []u8, options: Credentials.Options) ![]const u8 {
+    var bed: Bed = undefined;
+    try bed.initWith(options);
+    defer bed.deinit();
+    try bed.client.hello(&bed.to_server);
+    try bed.driveServer();
+    const flight = bed.to_client.wire[0..bed.to_client.wire_len];
+    assert(flight.len >= 1);
+    assert(flight.len <= out.len);
+    @memcpy(out[0..flight.len], flight);
+    return out[0..flight.len];
+}
+
+// §9's oracle is "run one seed twice, hash every delivery, assert the
+// hashes match". A server whose CertificateVerify signature varies run
+// to run can never satisfy it, so TLS traffic would be the one thing the
+// simulator could carry but never assert on. This is that property,
+// taken through the Engine the simulator actually drives.
+test "engine: identical seeds yield a byte-exact server flight" {
+    var first_storage: [2 * Engine.emitted_record_bytes_max]u8 = undefined;
+    var second_storage: [2 * Engine.emitted_record_bytes_max]u8 = undefined;
+    const first = try seededServerFlight(&first_storage, .{ .deterministic_nonce = true });
+    const second = try seededServerFlight(&second_storage, .{ .deterministic_nonce = true });
+
+    try std.testing.expect(first.len > 0);
+    try std.testing.expectEqualSlices(u8, first, second);
+}
+
+// Negative space, and the reason the option exists at all: with
+// libcrypto's hedged random ECDSA nonce the CertificateVerify signature
+// differs every run, and DER integer trimming makes even the *length* of
+// the encrypted flight vary. Everything else is identical between the two
+// runs — same seeds, same credential, same code path — so a divergence
+// can only come from the nonce.
+test "engine: without the deterministic nonce the same flight diverges" {
+    var first_storage: [2 * Engine.emitted_record_bytes_max]u8 = undefined;
+    var second_storage: [2 * Engine.emitted_record_bytes_max]u8 = undefined;
+    const first = try seededServerFlight(&first_storage, .{ .deterministic_nonce = false });
+    const second = try seededServerFlight(&second_storage, .{ .deterministic_nonce = false });
+
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    // The divergence is confined to the encrypted flight: ServerHello
+    // carries only seeded material, so it must still match byte for byte.
+    // If this ever fails, something *other* than the signature is varying
+    // and the determinism claim above rests on the wrong evidence.
+    const server_hello_bytes = zssl.record.header_bytes +
+        std.mem.readInt(u16, first[3..5], .big);
+    try std.testing.expectEqualSlices(
+        u8,
+        first[0..server_hello_bytes],
+        second[0..server_hello_bytes],
+    );
 }

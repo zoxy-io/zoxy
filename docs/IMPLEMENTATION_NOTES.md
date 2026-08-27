@@ -17,7 +17,16 @@ Threads still being worked, carrying real tradeoffs rather than a simple
 feature request. Each stays here until resolved, or promoted to a
 GitHub issue once there's a concrete plan.
 
-### TLS termination — in progress on ztls (#125)
+### TLS termination — shipped, now on zssl (#125)
+
+> **Superseded, and kept for the record.** The engine below was ztls
+> through the audited `zoxy-io/ztls` fork; it is `zoxy-io/zssl` now, a
+> TLS 1.3 layer written for this proxy. Everything measured here still
+> holds — the no-worker-threads decision, the handshake CPU figures, the
+> delayed-ACK stall and its fix — because those are properties of the
+> design, not of which library implements it. What changed is who
+> maintains the protocol layer, and that the five fork commits below are
+> no longer patches carried against an upstream: they are the tree.
 
 The design settled on **no worker threads** for TLS handshakes (§3,
 DESIGN.md; measured below in "TLS handshake CPU" and "TLS on the
@@ -647,7 +656,14 @@ by the fork" below). Still queued, in rough value order:
    pending — see "The loop is not submission-bound" below; reopen only
    on a measured `cqes/wake` approaching 1.
 
-### ztls fork queue
+### ztls fork queue — closed
+
+> **Closed by the swap to zssl.** This queue existed to track fixes that
+> had to be carried against a pre-alpha upstream. There is no upstream
+> to carry them against any more; what was queued is either in zssl or
+> recorded in its docs/BOGO.md as outstanding work. Kept because the
+> reasoning about *why* each item was needed is what justified writing
+> zssl in the first place.
 
 Same pin policy, same batching. Landed in `zoxy-tls`: deterministic
 ECDSA nonces, `mem_hooks`, the bounded `fin_frag` wipe, NewSessionTicket
@@ -1461,10 +1477,26 @@ afterwards. That holds against the *unfixed* ztls, which is the point: the
 sizing removes the trigger, and the ztls fix makes the failure survivable
 if another deployment reaches it anyway.
 
-One thing this does **not** fix: once the heap has been exhausted even
-once, it never recovers, because ztls never drains OpenSSL's error queue
-and those entries allocate through the same hooks. Measured in the same
-issue; a restart is the only cure until that lands.
+One thing this did **not** fix, until it did: memory the error queue
+holds was never returned, because nothing drained it and its entries
+allocate through the same hooks.
+
+The bound is worth stating precisely, because "never recovers" — how
+this note read for a year — is worse than the mechanism was. OpenSSL's
+queue is a **ring of `ERR_NUM_ERRORS` = 16 slots per thread**
+(`include/openssl/err.h.in`), and `err_get_slot` advances `bottom`
+behind `top` on wrap, so an undrained queue plateaus at sixteen entries'
+worth of data rather than growing without limit. That is a fixed
+occupancy, not a leak, and it is why `tls-heap-proof`'s frontier
+plateaus at all. What was true is that those bytes were never given
+back, so a heap sized with no slack kept them for the life of the
+process.
+
+Fixed in zssl (`backend: drain libcrypto's error queue on failure`): an
+`errdefer` clearing the queue at each of the eight entry points that
+reach libcrypto, gated by a test that reads `ERR_peek_error` after three
+deliberately chatty failures and negative-controlled against a stubbed
+drain. zoxy inherits it at the pin.
 
 ### `shed_tls_crypto` has no gate, and why the obvious one does not work
 

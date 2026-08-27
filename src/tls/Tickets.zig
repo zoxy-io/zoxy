@@ -35,7 +35,7 @@
 
 const std = @import("std");
 
-const ztls = @import("ztls");
+const zssl = @import("zssl");
 
 const assert = std.debug.assert;
 
@@ -62,7 +62,7 @@ const payload_bytes = 1 + psk_bytes_max + 2 + 8;
 pub const ticket_bytes = 1 + nonce_bytes + payload_bytes + tag_bytes;
 
 comptime {
-    // The wire format caps an identity at 2^16-1, and ztls's client-side
+    // The wire format caps an identity at 2^16-1, and zssl's client-side
     // `SessionTicket.identity` at 256. Neither is close, but a future
     // payload change should fail here rather than at runtime.
     assert(ticket_bytes <= 256);
@@ -149,7 +149,7 @@ pub fn seal(
     tickets: *const Tickets,
     out: *[ticket_bytes]u8,
     psk: []const u8,
-    suite: ztls.CipherSuite,
+    suite: zssl.cipher_suite.CipherSuite,
     now_unix: u64,
     nonce: [nonce_bytes]u8,
 ) SealError![]const u8 {
@@ -185,7 +185,7 @@ pub fn seal(
 /// caller's storage) and the suite it belongs to.
 pub const Opened = struct {
     psk: []const u8,
-    suite: ztls.CipherSuite,
+    suite: zssl.cipher_suite.CipherSuite,
 };
 
 /// Recover a ticket's contents, or null if it is not ours, not intact,
@@ -221,7 +221,7 @@ pub fn open(
     const psk_len = payload[0];
     if (psk_len == 0 or psk_len > psk_bytes_max) return null;
     const suite_wire = std.mem.readInt(u16, payload[1 + psk_bytes_max ..][0..2], .big);
-    const suite = ztls.CipherSuite.fromWire(suite_wire) orelse return null;
+    const suite = zssl.cipher_suite.CipherSuite.fromWire(suite_wire) orelse return null;
     const issued = std.mem.readInt(u64, payload[1 + psk_bytes_max + 2 ..][0..8], .big);
 
     // Expired, or issued in the future — a clock that went backwards is
@@ -259,7 +259,7 @@ test "tickets: a sealed ticket opens to what went into it" {
     const opened = tickets.open(ticket, &psk_out, 1000, 3600) orelse
         return error.TestExpectedOpen;
     try testing.expectEqualSlices(u8, &psk, opened.psk);
-    try testing.expectEqual(ztls.CipherSuite.aes_128_gcm_sha256, opened.suite);
+    try testing.expectEqual(zssl.cipher_suite.CipherSuite.aes_128_gcm_sha256, opened.suite);
 }
 
 test "tickets: sealing needs a key" {
