@@ -784,6 +784,17 @@ Rules:
   cannot supply — they are resolved addresses, and an address is not an
   identity. Decided here, implemented with the features that need it: a
   key with no feature behind it is not a freeze, it is a promise.
+
+  All three of those features ship *after* 1.0.0, which turns this record
+  from a convenience into the contract they are held to. Two of them add
+  keys and are additive by nature. The certificate set is not: today's
+  `tls` is one `{cert, key}` pair, and a freeze means a config that was
+  valid at 1.0.0 stays valid. So `cert`/`key` survive as the one-pair
+  spelling of `certificates`, the way `endpoints` already accepts a bare
+  literal beside its object form and `pick` accepts a bare policy beside
+  its object — sugar for the common case, one general form underneath.
+  Breaking it instead would be the freeze meaning nothing the first time
+  it was tested.
 - **An address is a string, and `unix:` extends its grammar** (#303,
   #305). `bind` and `endpoints` stay single scalars rather than becoming
   tagged objects or gaining a second key — they are the two most-written
