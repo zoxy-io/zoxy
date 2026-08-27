@@ -1096,6 +1096,44 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   one matches only the any-host routes; config hosts must themselves be
   canonical (rejected at load otherwise), so a request host compares
   byte-for-byte against them.
+- **The header is the table's third dimension** (#302), between the two
+  above: **host, then header, then prefix**. A route gains an optional
+  `header` — `{ "name": "X-Canary", "present": true }` or an `equals` —
+  and the three keys are a **conjunction**: every one a route states must
+  hold. Cluster selection stays the route table's alone (a `cluster`
+  filter action would be the second engine §7 refuses), so a pinned
+  canary is a narrower *route* rather than a competing mechanism. What
+  weights (#174) already cover is the probabilistic case; this is the
+  pinned one, which is not probabilistic and cannot be expressed by a
+  share.
+
+  The ordering is a decision, and worth recording as one because **no
+  peer proxy makes it**. Envoy and HAProxy match routes in *config
+  order*, first match wins; Traefik sorts by rule length or an explicit
+  priority. Where a specificity ranking exists at all it is within one
+  dimension — Envoy's domain search order, nginx's `location`
+  precedence — never across two. This table faces the question only
+  because it sorts at load, which is what makes an answer independent of
+  the sequence an operator wrote the rules in — for every pair the tiers
+  can separate. Two routes sharing a host and a prefix while naming
+  different headers are distinct rules (not duplicates) of equal
+  specificity, and a request carrying both matches both; there the
+  earlier route wins, which is config order doing for one case what
+  every peer does for all of them. The comparator says so explicitly
+  rather than inheriting it from `std.mem.sort` being stable. Host outermost is Envoy's
+  own nesting, where a `virtual_host` is chosen by domain and header
+  matching happens on the routes inside it, and it reads right for the
+  case: a canary is a variant of a service, not a different service.
+
+  Two kinds of predicate, not the three `filters` carry: `equals` is one
+  `mem.eql` on a zero-copy head slice and `present` is one lookup, where
+  `contains` is a scan whose cost grows with what a client sent, on a
+  table every request walks. The predicate type and its evaluator live in
+  `router.zig` so the two matchers cannot disagree about whether a
+  request carries a header — the same argument that made `prefixMatches`
+  public for filters to share. A header is a routing key *and* is
+  forwarded: the origin sees it and can log which side of a cut served
+  the request, unlike the canonical `Host`, which is a key only.
 - **`TRACE` is refused, and `Max-Forwards` is spent** (#240). RFC 9110
   §7.6.2 is one of the few places the spec names intermediaries
   directly: a hop in an `OPTIONS` or `TRACE` chain MUST check the

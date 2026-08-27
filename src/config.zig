@@ -730,6 +730,7 @@ pub const ValidationError = error{
     ListenerProxyProtocolModeUnknown,
     ListenerTlsWithSniRoutes,
     RouteSniIsAddress,
+    RouteHeaderMatchKind,
     LimitRelayBufferUnderSniRouting,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
@@ -2427,13 +2428,55 @@ pub const RouteJson = struct {
     /// Optional §7 host scope; absent means the route matches any host.
     host: ?[]const u8 = null,
     prefix: []const u8,
+    /// Optional #302 header scope; absent means the route matches any
+    /// request. Conjoined with the other two, not ranked against them.
+    header: ?RouteHeaderJson = null,
     cluster: []const u8,
 
-    pub const schema_doc = "One longest-prefix route entry.";
+    pub const schema_doc =
+        "One route entry. Every key it states must hold — host, header and " ++
+        "prefix are a conjunction — and the table is matched most-specific " ++
+        "first: host, then header, then prefix.";
     pub const schema_fields = .{
         .host = .{ .desc = "Canonical host scope; absent matches any host." },
         .prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
+        .header = .{
+            .desc = "Header the request must carry for this route to match; " ++
+                "absent matches any request. A route naming one is the " ++
+                "narrower rule and is tried before the same route without.",
+        },
         .cluster = .{ .desc = "Name of the cluster matching requests route to." },
+    };
+};
+
+/// A route's header predicate (#302): a pinned canary is a specific
+/// client, a test account or an internal gateway's header, which endpoint
+/// weights cannot express because it is not probabilistic.
+///
+/// Two kinds, and deliberately not the three `filters` have. `equals` is
+/// one `mem.eql` on a zero-copy head slice and `present` is one lookup;
+/// `contains` is a scan whose cost grows with the header a client sent,
+/// on a table every request walks. §7 draws the line where a route
+/// dimension would become the second match engine it refuses, and a
+/// substring test is the near side of it.
+pub const RouteHeaderJson = struct {
+    name: []const u8,
+    /// Exactly one of these selects the predicate kind.
+    present: ?bool = null,
+    equals: ?[]const u8 = null,
+
+    pub const schema_doc =
+        "One header predicate on a route. Exactly one of `present`/`equals` " ++
+        "selects the kind. No substring or regex matching: a route's " ++
+        "predicate is a bounded comparison, on a table every request walks.";
+    pub const schema_one_of = [_][]const u8{ "present", "equals" };
+    pub const schema_fields = .{
+        .name = .{ .desc = "Header field name (matched case-insensitively)." },
+        .present = .{
+            .desc = "Matches when the header is present at all (present: false is rejected).",
+            .const_true = true,
+        },
+        .equals = .{ .desc = "Matches when the header's value equals this string exactly." },
     };
 };
 
@@ -3143,7 +3186,7 @@ pub const dto_types = .{
     ForwardedJson,      ProxyProtocolJson,   ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
     TlsJson,            PassiveEjectionJson, HttpListenerJson,         L4ListenerJson,
-    L4RouteJson,
+    L4RouteJson,        RouteHeaderJson,
 };
 
 comptime {
@@ -3976,6 +4019,41 @@ fn hostBitsSet(comptime T: type, bits: T, prefix_len: u8) bool {
     return (bits & host_mask) != 0;
 }
 
+/// A route's header predicate (#302), resolved into the same
+/// `HeaderMatch` the filter table uses — one type, one evaluator, so two
+/// matchers cannot disagree about whether a request carries a header.
+///
+/// Held to the same name and value rules as a filter's match, which
+/// includes what those rules deliberately do *not* reject: a
+/// proxy-managed name like `Content-Length` is matchable here as it is
+/// there. Only an *edit* target is reserved (§7), because rewriting one
+/// smuggles a framing change past the render — reading one to pick a
+/// backend changes nothing, and routing runs before any edit anyway.
+fn resolveRouteHeader(header_json: RouteHeaderJson) ParseError!router.HeaderMatch {
+    try validateHeaderName(header_json.name);
+    const set: u8 = @as(u8, @intFromBool(header_json.present != null)) +
+        @intFromBool(header_json.equals != null);
+    assert(set <= 2); // The route header has two kind fields.
+    if (set != 1) {
+        return error.RouteHeaderMatchKind;
+    }
+    if (header_json.present) |present| {
+        if (!present) {
+            return error.RouteHeaderMatchKind; // "present: false" is not a predicate.
+        }
+        return .{ .name = header_json.name, .kind = .present, .value = "" };
+    }
+    const value = header_json.equals.?;
+    // An `equals: ""` predicate is meaningful — a header present with an
+    // empty value — so the empty value is legal, as it is for a filter.
+    try validateHeaderValue(value);
+    // `headerMatches` asserts this of every predicate it is handed; the
+    // name came through `validateHeaderName`, so stating it here is what
+    // ties the producer to that precondition.
+    assert(header_json.name.len >= 1);
+    return .{ .name = header_json.name, .kind = .equals, .value = value };
+}
+
 fn resolveHeaderMatches(
     arena: std.mem.Allocator,
     headers_json: []const HeaderMatchJson,
@@ -4259,11 +4337,20 @@ fn resolveRoutes(
     for (routes_json, 0..) |route_json, index| {
         try validateRoutePrefix(route_json.prefix, head_buffer_bytes);
         const host = if (route_json.host) |raw| try validateRouteHost(raw) else null;
+        const header = if (route_json.header) |raw|
+            try resolveRouteHeader(raw)
+        else
+            null;
         for (routes_json[0..index]) |previous| {
             // Earlier routes already passed validateRouteHost, so their raw
             // host equals its canonical form — a byte compare is sound.
             if (optionalHostEql(previous.host, host) and
-                std.mem.eql(u8, previous.prefix, route_json.prefix))
+                std.mem.eql(u8, previous.prefix, route_json.prefix) and
+                // The header is part of what makes a route distinct
+                // (#302): two rules sharing a host and prefix but naming
+                // different headers are different rules, and only the
+                // pair that agrees on all three is the same rule twice.
+                routeHeaderEql(previous.header, route_json.header))
             {
                 return error.RouteDuplicate;
             }
@@ -4271,25 +4358,87 @@ fn resolveRoutes(
         routes[index] = .{
             .host = host,
             .prefix = route_json.prefix,
+            .header = header,
             .cluster_index = try clusterIndexOf(clusters, route_json.cluster),
         };
     }
-    // Host-specific first, then longest-prefix-first (§7): the router's
-    // linear scan then finds the most specific match first — any route
-    // scoped to the request's host before any any-host route, and within a
-    // group the longest prefix. Ties are rejected as duplicates above.
-    std.mem.sort(router.Route, routes, {}, routeMoreSpecific);
-    assert(routes.len >= 1);
-    return routes;
+    // Host, then header, then prefix (§7, #302): the router's linear scan
+    // then finds the most specific match first.
+    //
+    // Sorted through an index permutation rather than in place, so the
+    // comparator can fall back to config order *explicitly*. Since #302
+    // that fallback is reachable: two routes may share a host and a
+    // prefix and still be distinct rules, because they name different
+    // headers — legal, not duplicates, and equally specific by every
+    // tier this comparator has. Something must decide between them for a
+    // request that carries both, and config order is the only thing left
+    // that an operator can see and control. Leaning on `std.mem.sort`
+    // being stable would get the same answer today while making it a
+    // property of the standard library rather than of this table.
+    const order = try arena.alloc(u16, routes.len);
+    for (order, 0..) |*slot, index| slot.* = @intCast(index);
+    std.mem.sort(u16, order, routes, routeOrderMoreSpecific);
+    const sorted = try arena.alloc(router.Route, routes.len);
+    for (order, sorted) |from, *slot| {
+        assert(from < routes.len);
+        slot.* = routes[from];
+    }
+    assert(sorted.len >= 1);
+    return sorted;
 }
 
+/// The comparator over indices, so an exact tie can fall back to the
+/// order the operator wrote — see `resolveRoutes` for why that fallback
+/// is reachable and why it is not left to sort stability.
+fn routeOrderMoreSpecific(routes: []const router.Route, left: u16, right: u16) bool {
+    assert(left < routes.len);
+    assert(right < routes.len);
+    if (routeMoreSpecific({}, routes[left], routes[right])) return true;
+    if (routeMoreSpecific({}, routes[right], routes[left])) return false;
+    // Equally specific: earlier in the config wins, which is what every
+    // peer proxy does for *every* route and what this table now does for
+    // the one case its tiers cannot separate.
+    return left < right;
+}
+
+/// Host, then header, then prefix (#302) — the order `router.route`'s
+/// doc argues for, applied once here so a request-time match is a scan
+/// over an already-sorted table.
 fn routeMoreSpecific(_: void, left: router.Route, right: router.Route) bool {
     const left_scoped = left.host != null;
     const right_scoped = right.host != null;
     if (left_scoped != right_scoped) {
         return left_scoped; // A host-scoped route sorts before an any-host one.
     }
+    const left_keyed = left.header != null;
+    const right_keyed = right.header != null;
+    if (left_keyed != right_keyed) {
+        // Within one host group, a route naming a header is the narrower
+        // rule: it answers a subset of what the same route without one
+        // would. A canary pinned by header must therefore be reachable
+        // past the rule it is a variant of.
+        return left_keyed;
+    }
     return left.prefix.len > right.prefix.len;
+}
+
+/// Whether two route header predicates are the same rule. Compared on
+/// the raw DTOs rather than the resolved matches because this runs inside
+/// the resolve loop, before the later route has one — and the name
+/// compare is case-insensitive for the reason the matcher's is: RFC 9110
+/// says `X-Canary` and `x-canary` are one header.
+fn routeHeaderEql(left: ?RouteHeaderJson, right: ?RouteHeaderJson) bool {
+    const left_header = left orelse return right == null;
+    const right_header = right orelse return false;
+    if (!std.ascii.eqlIgnoreCase(left_header.name, right_header.name)) {
+        return false;
+    }
+    if ((left_header.present != null) != (right_header.present != null)) {
+        return false;
+    }
+    const left_equals = left_header.equals orelse return right_header.equals == null;
+    const right_equals = right_header.equals orelse return false;
+    return std.mem.eql(u8, left_equals, right_equals);
 }
 
 fn optionalHostEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -5204,6 +5353,171 @@ test "config: a listener's body key is what names its protocol" {
     }
 }
 
+test "config: a header route sorts between its host and its prefix" {
+    // #302's central question, answered: host, then header, then prefix.
+    // The table is written in the least helpful order on purpose — config
+    // order must not be able to change an answer.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"routes":[
+        \\   {"prefix":"/","cluster":"web"},
+        \\   {"header":{"name":"X-Canary","present":true},"prefix":"/","cluster":"canary"},
+        \\   {"host":"api.example.com","prefix":"/","cluster":"api"},
+        \\   {"host":"api.example.com","header":{"name":"X-Canary","present":true},
+        \\    "prefix":"/","cluster":"api-canary"}]}}],
+        \\ "clusters":{"web":{"endpoints":["127.0.0.1:2"]},
+        \\   "canary":{"endpoints":["127.0.0.1:3"]},
+        \\   "api":{"endpoints":["127.0.0.1:4"]},
+        \\   "api-canary":{"endpoints":["127.0.0.1:5"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const routes = parsed.listeners[0].routes;
+    try std.testing.expectEqual(@as(usize, 4), routes.len);
+    // Host group first, and within it the header rule ahead of the bare
+    // one; then the any-host group repeating the same shape.
+    try std.testing.expect(routes[0].host != null and routes[0].header != null);
+    try std.testing.expect(routes[1].host != null and routes[1].header == null);
+    try std.testing.expect(routes[2].host == null and routes[2].header != null);
+    try std.testing.expect(routes[3].host == null and routes[3].header == null);
+}
+
+test "config: two header rules of equal specificity keep config order" {
+    // The one tie #302 leaves. Same host, same prefix, different headers:
+    // distinct rules, equally specific by every tier, and a request
+    // carrying both matches both. The earlier one wins — stated here
+    // because it is a promise the docs make, and because relying on
+    // `std.mem.sort` being stable would make it std's promise instead.
+    const tail = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}," ++
+        "\"b\":{\"endpoints\":[\"127.0.0.1:3\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"routes\":[";
+    const canary = "{\"header\":{\"name\":\"X-Canary\",\"present\":true}," ++
+        "\"prefix\":\"/\",\"cluster\":\"a\"}";
+    const beta = "{\"header\":{\"name\":\"X-Beta\",\"present\":true}," ++
+        "\"prefix\":\"/\",\"cluster\":\"b\"}";
+    const catch_all = "{\"prefix\":\"/\",\"cluster\":\"a\"}";
+
+    // Written canary-first: the canary rule is tried first.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ canary ++ "," ++ beta ++ "," ++ catch_all ++ "]}}]," ++ tail,
+        );
+        const routes = parsed.listeners[0].routes;
+        try std.testing.expectEqualStrings("X-Canary", routes[0].header.?.name);
+        try std.testing.expectEqualStrings("X-Beta", routes[1].header.?.name);
+        try std.testing.expect(routes[2].header == null);
+    }
+    // Written beta-first: the other way round, and nothing else moves.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ beta ++ "," ++ canary ++ "," ++ catch_all ++ "]}}]," ++ tail,
+        );
+        const routes = parsed.listeners[0].routes;
+        try std.testing.expectEqualStrings("X-Beta", routes[0].header.?.name);
+        try std.testing.expectEqualStrings("X-Canary", routes[1].header.?.name);
+        try std.testing.expect(routes[2].header == null);
+    }
+    // And the catch-all sorts last from either spelling — the tiers still
+    // decide everything they can separate, whatever the order.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ catch_all ++ "," ++ beta ++ "," ++ canary ++ "]}}]," ++ tail,
+        );
+        const routes = parsed.listeners[0].routes;
+        try std.testing.expect(routes[0].header != null);
+        try std.testing.expect(routes[1].header != null);
+        try std.testing.expect(routes[2].header == null);
+    }
+}
+
+test "config: a route header is a bounded predicate, held to the filter's rules" {
+    const tail = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"routes\":[";
+
+    // Exactly one kind, and `present: false` is not a predicate.
+    try expectParseError(
+        error.RouteHeaderMatchKind,
+        head ++ "{\"header\":{\"name\":\"X-C\"},\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    try expectParseError(
+        error.RouteHeaderMatchKind,
+        head ++ "{\"header\":{\"name\":\"X-C\",\"present\":true,\"equals\":\"v\"}," ++
+            "\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    try expectParseError(
+        error.RouteHeaderMatchKind,
+        head ++ "{\"header\":{\"name\":\"X-C\",\"present\":false}," ++
+            "\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    // `contains` is not a route predicate at all — the DTO has no such
+    // field, so the strict parser refuses it rather than a rule doing so.
+    try expectParseError(
+        error.UnknownField,
+        head ++ "{\"header\":{\"name\":\"X-C\",\"contains\":\"v\"}," ++
+            "\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    // A name is a token, on the filter table's rule.
+    try expectParseError(
+        error.FilterHeaderNameInvalid,
+        head ++ "{\"header\":{\"name\":\"X Canary\",\"present\":true}," ++
+            "\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
+    // But a proxy-managed name is *matchable*, exactly as it is in a
+    // filter's match: only an edit target is reserved, because rewriting
+    // one smuggles a framing change past the render. Reading one to pick
+    // a backend changes nothing — pinned here so the two tables cannot
+    // drift on what a header name may be.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        _ = try expectParseOk(&arena_state, head ++
+            "{\"header\":{\"name\":\"Content-Length\",\"present\":true}," ++
+            "\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail);
+    }
+}
+
+test "config: the header is part of what makes a route distinct" {
+    const tail = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"routes\":[";
+
+    // Same host and prefix, different headers: two rules, not a duplicate
+    // — which is the whole point of the dimension.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++
+            "{\"header\":{\"name\":\"X-C\",\"equals\":\"v1\"},\"prefix\":\"/\",\"cluster\":\"a\"}," ++
+            "{\"header\":{\"name\":\"X-C\",\"equals\":\"v2\"},\"prefix\":\"/\",\"cluster\":\"a\"}," ++
+            "{\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail);
+        try std.testing.expectEqual(@as(usize, 3), parsed.listeners[0].routes.len);
+    }
+    // Agreeing on all three is the same rule written twice.
+    try expectParseError(error.RouteDuplicate, head ++
+        "{\"header\":{\"name\":\"X-C\",\"equals\":\"v1\"},\"prefix\":\"/\",\"cluster\":\"a\"}," ++
+        "{\"header\":{\"name\":\"x-c\",\"equals\":\"v1\"},\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail);
+    // And a header rule does not collide with the bare rule it varies.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++
+            "{\"header\":{\"name\":\"X-C\",\"present\":true},\"prefix\":\"/\",\"cluster\":\"a\"}," ++
+            "{\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ tail);
+        try std.testing.expectEqual(@as(usize, 2), parsed.listeners[0].routes.len);
+    }
+}
+
 test "config: l4 sni routes resolve, named before any-name" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
@@ -5393,11 +5707,11 @@ test "config: explicit routes resolve, sorted longest-prefix-first" {
     // The cluster the router will hand back for the longest match.
     try std.testing.expectEqual(
         @as(?u16, routes[0].cluster_index),
-        router.route(routes, null, "/api/v2/x"),
+        router.route(routes, null, "/api/v2/x", &.{}),
     );
     try std.testing.expectEqual(
         @as(?u16, routes[2].cluster_index),
-        router.route(routes, null, "/elsewhere"),
+        router.route(routes, null, "/elsewhere", &.{}),
     );
 }
 
@@ -5468,11 +5782,11 @@ test "config: host routes resolve, host-specific sorted before any-host" {
     // The router hands host-specificity precedence over prefix length.
     try std.testing.expectEqual(
         @as(?u16, routes[1].cluster_index),
-        router.route(routes, "api.example.com", "/other"),
+        router.route(routes, "api.example.com", "/other", &.{}),
     );
     try std.testing.expectEqual(
         @as(?u16, routes[2].cluster_index),
-        router.route(routes, "other.example.com", "/v2"),
+        router.route(routes, "other.example.com", "/v2", &.{}),
     );
 }
 

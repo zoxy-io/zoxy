@@ -18,16 +18,11 @@ const shed = @import("../shed.zig");
 
 const assert = std.debug.assert;
 
-/// A single header predicate: the named header must be present, or equal,
-/// or contain the given value (case-insensitive name, per RFC 9110).
-pub const HeaderMatch = struct {
-    name: []const u8,
-    kind: Kind,
-    /// Unused for `.present`; the compared value otherwise.
-    value: []const u8,
-
-    pub const Kind = enum(u8) { present, equals, contains };
-};
+/// One header predicate. Lives in `router.zig` since #302 gave the route
+/// table its own header dimension: two matchers judging one header have
+/// to judge it identically, so the predicate belongs in the module they
+/// both import — the same argument that put `prefixMatches` there.
+pub const HeaderMatch = router.HeaderMatch;
 
 /// One CIDR prefix a `client` predicate admits (#177). The address is
 /// canonical for its prefix — host bits are rejected at load — so
@@ -312,7 +307,7 @@ fn responseMatches(match: ResponseMatch, view: ResponseView) bool {
         }
     }
     for (match.headers) |header_match| {
-        if (!headerMatches(header_match, view.headers)) {
+        if (!router.headerMatches(header_match, view.headers)) {
             return false;
         }
     }
@@ -547,7 +542,7 @@ fn matches(match: Match, view: RequestView) bool {
         }
     }
     for (match.headers) |header_match| {
-        if (!headerMatches(header_match, view.headers)) {
+        if (!router.headerMatches(header_match, view.headers)) {
             return false;
         }
     }
@@ -568,31 +563,6 @@ fn clientMatches(cidrs: []const Cidr, client: *const std.Io.net.IpAddress) bool 
         assert(cidr.prefix_len <= 64);
         if (cidr.contains(client)) {
             return true;
-        }
-    }
-    return false;
-}
-
-/// Whether some header satisfies the predicate. Name comparison is
-/// case-insensitive (RFC 9110); `equals`/`contains` compare the value
-/// byte-exact / by substring. Multiple headers of the same name each get
-/// a chance — the predicate holds if any does.
-fn headerMatches(header_match: HeaderMatch, headers: []const parser.Header) bool {
-    assert(header_match.name.len >= 1); // A validated RFC 9110 token.
-    assert(headers.len <= constants.headers_max);
-    for (headers) |header| {
-        if (!std.ascii.eqlIgnoreCase(header.name, header_match.name)) {
-            continue;
-        }
-        switch (header_match.kind) {
-            .present => return true,
-            .equals => if (std.mem.eql(u8, header.value, header_match.value)) return true,
-            // Config rejects an empty `contains` needle, so this is a real
-            // substring test — never the always-true `indexOf(x, "")`.
-            .contains => {
-                assert(header_match.value.len >= 1);
-                if (std.mem.indexOf(u8, header.value, header_match.value) != null) return true;
-            },
         }
     }
     return false;
