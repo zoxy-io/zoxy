@@ -245,7 +245,7 @@ pub fn TestClient(comptime IoType: type) type {
             client.ticket = .{};
             client.ticket_captured = false;
             client.resume_with = options.resume_with;
-            io.connect(address, &client.connect_completion, Self, client, onConnect);
+            io.connect(&.{ .ip = address }, &client.connect_completion, Self, client, onConnect);
         }
 
         /// The `Options` combinations that are not merely unusual but

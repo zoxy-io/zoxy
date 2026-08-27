@@ -87,6 +87,7 @@ const std = @import("std");
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
 const upstream = @import("net/upstream.zig");
+const io_module = @import("io/io.zig");
 
 const assert = std.debug.assert;
 
@@ -155,18 +156,38 @@ fn bytesKeyOf(bytes: []const u8) u64 {
 /// An endpoint's stable identity for scoring: its address *and* port, so
 /// two endpoints sharing a host are distinct, and nothing positional, so
 /// the config list can grow or be reordered without remapping clients.
-fn endpointId(address: *const std.Io.net.IpAddress) u64 {
-    // The loader rejects a zero endpoint port (`EndpointPortZero`), and
-    // this folds the port into the identity — so a zero here would mean a
-    // caller reached past config validation, and two endpoints that
-    // differ only in a port nobody validated would be scored as one.
-    assert(address.getPort() != 0);
+fn endpointId(address: *const io_module.Address) u64 {
     return switch (address.*) {
-        .ip4 => |v4| mix64(
-            (@as(u64, std.mem.readInt(u32, &v4.bytes, .big)) << 16) | v4.port,
-        ),
-        .ip6 => |v6| mix64(mix64(std.mem.readInt(u64, v6.bytes[0..8], .big)) ^
-            mix64(std.mem.readInt(u64, v6.bytes[8..16], .big) ^ v6.port)),
+        // The loader rejects a zero endpoint port (`EndpointPortZero`),
+        // and this folds the port into the identity — so a zero here
+        // would mean a caller reached past config validation, and two
+        // endpoints that differ only in a port nobody validated would be
+        // scored as one.
+        .ip => |ip| switch (ip) {
+            .ip4 => |v4| id: {
+                assert(v4.port != 0);
+                break :id mix64(
+                    (@as(u64, std.mem.readInt(u32, &v4.bytes, .big)) << 16) | v4.port,
+                );
+            },
+            .ip6 => |v6| id: {
+                assert(v6.port != 0);
+                break :id mix64(mix64(std.mem.readInt(u64, v6.bytes[0..8], .big)) ^
+                    mix64(std.mem.readInt(u64, v6.bytes[8..16], .big) ^ v6.port));
+            },
+        },
+        // A socket path carries the whole identity — there is no port to
+        // fold in, and the path is what two spellings of one endpoint
+        // would have to share. Folded through the same `bytesKeyOf` the
+        // #178 header key uses, and through `mix64` like the IP arms, so
+        // every identity in this table comes out of one finalizer and a
+        // rendezvous score can compare them as whole words. Pinned for
+        // the reason `mix64` is: a rolling restart must not re-shuffle
+        // which client lands on which socket.
+        .unix => |path| id: {
+            assert(path.len >= 1); // The loader rejects an empty path.
+            break :id bytesKeyOf(path);
+        },
     };
 }
 
@@ -308,7 +329,7 @@ pub const Balancer = struct {
     /// gates use to compute the tag an endpoint *must* be spelled as,
     /// from nothing but its address, so an oracle can hold the running
     /// proxy to it from outside.
-    pub fn addressIdentity(address: *const std.Io.net.IpAddress) u64 {
+    pub fn addressIdentity(address: *const io_module.Address) u64 {
         return endpointId(address);
     }
 
@@ -389,7 +410,7 @@ pub const Balancer = struct {
     /// A pick names the endpoint both ways: the address to dial and the
     /// index the upstream pool keys its idle lists by (§5).
     pub const Pick = struct {
-        address: std.Io.net.IpAddress,
+        address: io_module.Address,
         endpoint_index: u16,
     };
 
@@ -925,8 +946,18 @@ const test_client = std.Io.net.IpAddress.parseLiteral("198.51.100.7:40000") catc
 /// has been dialed yet, so nothing is excluded.
 const test_untried: []const u16 = &.{};
 
+/// A *client* address for the fixtures below — the half that stays
+/// IP-only: a listener still binds an IP, so a peer address is always
+/// one. Endpoints use `ipEndpoint`.
 fn testAddress(comptime literal: []const u8) std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral(literal) catch unreachable;
+}
+
+/// One IP endpoint from its literal, for the fixtures below. `catch
+/// unreachable` is sound on a comptime literal this file wrote: an
+/// unparseable one is a compile-time-visible typo, not a runtime path.
+fn ipEndpoint(comptime literal: []const u8) io_module.Address {
+    return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch unreachable };
 }
 
 fn testConfig(clusters: []const config_module.Config.Cluster) config_module.Config {
@@ -944,10 +975,10 @@ fn testConfig(clusters: []const config_module.Config.Cluster) config_module.Conf
 }
 
 test "balancer: rr cycles endpoints and wraps per cluster" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .rr },
     };
@@ -970,8 +1001,8 @@ test "balancer: rr cycles endpoints and wraps per cluster" {
 }
 
 test "balancer: a single-endpoint cluster short-circuits without a draw" {
-    const solo = std.Io.net.IpAddress.parseLiteral("127.0.0.1:9") catch unreachable;
-    const one = [_]std.Io.net.IpAddress{solo};
+    const solo = ipEndpoint("127.0.0.1:9");
+    const one = [_]io_module.Address{solo};
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "one", .endpoints = &one },
     };
@@ -995,10 +1026,10 @@ test "balancer: a single-endpoint cluster short-circuits without a draw" {
 }
 
 test "balancer: p2c prefers the less-loaded of its two candidates" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .p2c },
     };
@@ -1022,10 +1053,10 @@ test "balancer: p2c prefers the less-loaded of its two candidates" {
 }
 
 test "balancer: p2c spreads across endpoints under equal load" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .p2c },
     };
@@ -1051,9 +1082,9 @@ test "balancer: p2c spreads across endpoints under equal load" {
 }
 
 test "balancer: same seed, same picks — the p2c draw is deterministic" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .p2c },
     };
@@ -1081,10 +1112,10 @@ test "balancer: same seed, same picks — the p2c draw is deterministic" {
 }
 
 test "balancer: rr rotates over the healthy endpoints only" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .rr },
     };
@@ -1108,9 +1139,9 @@ test "balancer: rr rotates over the healthy endpoints only" {
 }
 
 test "balancer: rr honors weights, and the schedule is smooth" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const weights = [_]u16{ 2, 1 };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "canary", .endpoints = &pair, .pick = .rr, .weights = &weights },
@@ -1135,10 +1166,10 @@ test "balancer: rr honors weights, and the schedule is smooth" {
 }
 
 test "balancer: rr weight zero drains an endpoint, past fail-open" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const weights = [_]u16{ 1, 0, 1 };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "draining", .endpoints = &trio, .pick = .rr, .weights = &weights },
@@ -1170,10 +1201,10 @@ test "balancer: rr weight zero drains an endpoint, past fail-open" {
 }
 
 test "balancer: p2c candidacy follows weight" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const weights = [_]u16{ 8, 1, 1 };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "weighted", .endpoints = &trio, .pick = .p2c, .weights = &weights },
@@ -1206,10 +1237,10 @@ test "balancer: p2c at unit weights draws exactly as the unweighted form" {
     // policy, draw for draw: the weighted path's unit case is the
     // uniform draw this grew from, which is what keeps unweighted §9
     // traces byte-stable across the change.
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const unit_weights = [_]u16{ 1, 1, 1 };
     const bare_clusters = [_]config_module.Config.Cluster{
         .{ .name = "bare", .endpoints = &trio, .pick = .p2c },
@@ -1241,10 +1272,10 @@ test "balancer: p2c at unit weights draws exactly as the unweighted form" {
 }
 
 test "balancer: p2c never picks an ejected endpoint" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .p2c },
     };
@@ -1270,9 +1301,9 @@ test "balancer: p2c never picks an ejected endpoint" {
 }
 
 test "balancer: p2c narrowed to one healthy endpoint spends no draw" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .p2c },
     };
@@ -1298,10 +1329,10 @@ test "balancer: p2c narrowed to one healthy endpoint spends no draw" {
 }
 
 test "balancer: a fully-ejected cluster fails open to every endpoint" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .rr },
     };
@@ -1327,9 +1358,9 @@ test "balancer: a fully-ejected cluster fails open to every endpoint" {
 }
 
 test "balancer: policies keep independent state across clusters" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "rotating", .endpoints = &pair, .pick = .rr },
         .{ .name = "drawing", .endpoints = &pair, .pick = .p2c },
@@ -1352,13 +1383,13 @@ test "balancer: policies keep independent state across clusters" {
 }
 
 /// A cluster of `count` endpoints at 10.0.0.1..N, for the §7 hash tests.
-fn testHashEndpoints(comptime count: u16) [count]std.Io.net.IpAddress {
-    var endpoints: [count]std.Io.net.IpAddress = undefined;
+fn testHashEndpoints(comptime count: u16) [count]io_module.Address {
+    var endpoints: [count]io_module.Address = undefined;
     for (&endpoints, 0..) |*endpoint, index| {
-        endpoint.* = .{ .ip4 = .{
+        endpoint.* = .{ .ip = .{ .ip4 = .{
             .bytes = .{ 10, 0, 0, @intCast(index + 1) },
             .port = 8080,
-        } };
+        } } };
     }
     return endpoints;
 }
@@ -1645,7 +1676,7 @@ test "balancer: two processes agree, and so do a config's reorderings" {
     // without re-homing every client — identity is the address, not the
     // index.
     const forward = testHashEndpoints(8);
-    var reversed: [8]std.Io.net.IpAddress = undefined;
+    var reversed: [8]io_module.Address = undefined;
     for (forward, 0..) |endpoint, index| {
         reversed[7 - index] = endpoint;
     }
@@ -1798,7 +1829,7 @@ fn sourceKeyOf(comptime literal: []const u8) u64 {
 }
 
 fn endpointIdOf(comptime literal: []const u8) u64 {
-    const address = testAddress(literal);
+    const address = ipEndpoint(literal);
     return endpointId(&address);
 }
 
@@ -2001,10 +2032,10 @@ test "balancer: the header key is pinned, like every mapping hash here" {
 }
 
 test "balancer: p2c weighs L4 connections, not only L7 leases" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .p2c },
     };
@@ -2031,9 +2062,9 @@ test "balancer: p2c weighs L4 connections, not only L7 leases" {
 }
 
 test "balancer: p2c compares the sum of both protocols" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .p2c },
     };
@@ -2066,9 +2097,9 @@ test "balancer: p2c compares the sum of both protocols" {
 }
 
 test "balancer: a capped endpoint is skipped while another has room" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .rr, .max_inflight = 2 },
     };
@@ -2095,9 +2126,9 @@ test "balancer: a capped endpoint is skipped while another has room" {
 }
 
 test "balancer: a fully capped cluster refuses rather than failing open" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .p2c, .max_inflight = 3 },
     };
@@ -2128,8 +2159,8 @@ test "balancer: a fully capped cluster refuses rather than failing open" {
 }
 
 test "balancer: the cap counts both protocols, and covers one endpoint" {
-    const solo = std.Io.net.IpAddress.parseLiteral("127.0.0.1:9") catch unreachable;
-    const one = [_]std.Io.net.IpAddress{solo};
+    const solo = ipEndpoint("127.0.0.1:9");
+    const one = [_]io_module.Address{solo};
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "one", .endpoints = &one, .max_inflight = 4 },
     };
@@ -2158,9 +2189,9 @@ test "balancer: the cap counts both protocols, and covers one endpoint" {
 }
 
 test "balancer: capacity is judged over the endpoints health left" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .rr, .max_inflight = 1 },
     };
@@ -2193,10 +2224,10 @@ test "balancer: capacity is judged over the endpoints health left" {
 }
 
 test "balancer: a tried endpoint is excluded from the retry" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "trio", .endpoints = &trio, .pick = .rr },
     };
@@ -2225,9 +2256,9 @@ test "balancer: a tried endpoint is excluded from the retry" {
 }
 
 test "balancer: fail-open cannot resurrect the endpoint that just failed" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .rr },
     };
@@ -2254,10 +2285,10 @@ test "balancer: fail-open cannot resurrect the endpoint that just failed" {
 }
 
 test "balancer: every routable endpoint tried is exhausted, never capped" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const c = std.Io.net.IpAddress.parseLiteral("127.0.0.1:3") catch unreachable;
-    const trio = [_]std.Io.net.IpAddress{ a, b, c };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const c = ipEndpoint("127.0.0.1:3");
+    const trio = [_]io_module.Address{ a, b, c };
     // Endpoint 2 is drained (#174), so the routable set is {0, 1} and
     // trying both exhausts the cluster even though an endpoint remains.
     const weights = [_]u16{ 1, 1, 0 };
@@ -2287,8 +2318,8 @@ test "balancer: every routable endpoint tried is exhausted, never capped" {
 }
 
 test "balancer: a single-endpoint cluster cannot retry" {
-    const solo = std.Io.net.IpAddress.parseLiteral("127.0.0.1:9") catch unreachable;
-    const one = [_]std.Io.net.IpAddress{solo};
+    const solo = ipEndpoint("127.0.0.1:9");
+    const one = [_]io_module.Address{solo};
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "one", .endpoints = &one },
     };
@@ -2311,9 +2342,9 @@ test "balancer: a single-endpoint cluster cannot retry" {
 }
 
 test "balancer: a retry whose survivors are all full is capped, not exhausted" {
-    const a = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    const b = std.Io.net.IpAddress.parseLiteral("127.0.0.1:2") catch unreachable;
-    const pair = [_]std.Io.net.IpAddress{ a, b };
+    const a = ipEndpoint("127.0.0.1:1");
+    const b = ipEndpoint("127.0.0.1:2");
+    const pair = [_]io_module.Address{ a, b };
     const clusters = [_]config_module.Config.Cluster{
         .{ .name = "pair", .endpoints = &pair, .pick = .rr, .max_inflight = 2 },
     };

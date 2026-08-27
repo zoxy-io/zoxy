@@ -17,6 +17,7 @@ const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
 const render = @import("http/render.zig");
 const shed = @import("shed.zig");
+const io_module = @import("io/io.zig");
 
 const assert = std.debug.assert;
 
@@ -486,7 +487,7 @@ pub const Config = struct {
 
     pub const Cluster = struct {
         name: []const u8,
-        endpoints: []const std.Io.net.IpAddress,
+        endpoints: []const io_module.Address,
         /// Per-endpoint §7 pick weights, parallel to `endpoints` — or
         /// null when every endpoint carries the default weight of 1,
         /// which is what the bare-string config form says and what most
@@ -774,6 +775,13 @@ pub const ValidationError = error{
     EndpointsOverLimit,
     EndpointInvalid,
     EndpointPortZero,
+    /// A `unix:` endpoint whose path is empty, past what a `sockaddr_un`
+    /// carries, or carries a byte an address may not — a control byte, a
+    /// quote or a backslash, each of which would corrupt the access log
+    /// and the metrics exposition rather than one field of them (#303).
+    EndpointUnixPathInvalid,
+    /// A `unix:` endpoint path that is not absolute (#303).
+    EndpointUnixPathRelative,
     EndpointWeightOverLimit,
     EndpointWeightsAllZero,
     TimeoutZero,
@@ -2569,11 +2577,13 @@ pub const EndpointJson = struct {
     weight: u32 = 1,
 
     pub const schema_doc =
-        "One endpoint: an IP:port literal, or an object carrying the " ++
-        "literal and a relative pick weight.";
+        "One endpoint: an IP:port literal, a `unix:` socket path, or an " ++
+        "object carrying either and a relative pick weight.";
     pub const schema_fields = .{
         .address = .{
-            .desc = "IP:port endpoint literal (port must be non-zero).",
+            .desc = "Endpoint literal: `IP:port` (port must be non-zero), or " ++
+                "`unix:` followed by the absolute path of a stream socket " ++
+                "(printable ASCII, no quote or backslash).",
             .min_length = 1,
         },
         .weight = .{
@@ -3311,9 +3321,59 @@ fn rejectDuplicateClusterNames(
 /// every endpoint carries weight 1, so the unweighted common case
 /// allocates nothing beyond the addresses it always did.
 const ResolvedEndpoints = struct {
-    addresses: []const std.Io.net.IpAddress,
+    addresses: []const io_module.Address,
     weights: ?[]const u16,
 };
+
+/// The `unix:` prefix the #305 grammar settled on, for both `bind` and
+/// `endpoints`. A prefix on the existing string rather than a tagged
+/// object or a second key: the two most-written fields in any config
+/// stay single scalars, nginx and HAProxy already spell a socket path
+/// this way, and the prefix cannot collide with an IP literal.
+pub const unix_address_prefix = "unix:";
+
+/// One endpoint address: an IP literal, or a `unix:` path (#303).
+///
+/// The path is validated here and nowhere else, on §5's terms — refuse
+/// at load rather than repair at runtime. Absolute, because a relative
+/// path resolves against a working directory the operator did not name
+/// and a service manager may change; within the `sockaddr_un` bound,
+/// because the kernel would otherwise take a truncated path as a
+/// *different* socket; and printable ASCII without a quote or a
+/// backslash.
+///
+/// That last rule is the one worth arguing. An endpoint address is not
+/// free-form text: it lands verbatim in every access-log line and in
+/// every Prometheus label, and a quote or a control byte there does not
+/// spoil one field — it invalidates the whole line and the whole scrape
+/// (§8's "one uncontaminated JSON line per event"). The alternatives
+/// are escaping at both renderers, which multiplies the §5 render bound
+/// by six for bytes no operator will ever write, or accepting a config
+/// that silently corrupts observability. POSIX permits such a path;
+/// nothing that runs a service ever creates one.
+fn resolveEndpointAddress(
+    arena: std.mem.Allocator,
+    literal: []const u8,
+) ParseError!io_module.Address {
+    if (std.mem.startsWith(u8, literal, unix_address_prefix)) {
+        const path = literal[unix_address_prefix.len..];
+        if (path.len == 0 or path.len > io_module.Address.unix_path_bytes_max) {
+            return error.EndpointUnixPathInvalid;
+        }
+        if (path[0] != '/') {
+            return error.EndpointUnixPathRelative;
+        }
+        if (!io_module.Address.pathIsRenderable(path)) {
+            return error.EndpointUnixPathInvalid;
+        }
+        // Duped so the address outlives the parsed JSON document, the
+        // same lifetime every other resolved string here takes.
+        return .{ .unix = try arena.dupe(u8, path) };
+    }
+    return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch {
+        return error.EndpointInvalid;
+    } };
+}
 
 fn resolveEndpoints(
     arena: std.mem.Allocator,
@@ -3332,14 +3392,12 @@ fn resolveEndpoints(
         return error.EndpointsOverLimit;
     }
 
-    const addresses = try arena.alloc(std.Io.net.IpAddress, endpoints_json.len);
+    const addresses = try arena.alloc(io_module.Address, endpoints_json.len);
     var weighted = false;
     var weight_sum: u64 = 0;
     for (endpoints_json, addresses) |entry, *address| {
-        address.* = std.Io.net.IpAddress.parseLiteral(entry.address) catch {
-            return error.EndpointInvalid;
-        };
-        if (address.getPort() == 0) {
+        address.* = try resolveEndpointAddress(arena, entry.address);
+        if (address.* == .ip and address.ip.getPort() == 0) {
             return error.EndpointPortZero;
         }
         if (entry.weight > constants.endpoint_weight_max) {
@@ -5129,10 +5187,10 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqual(Config.Listener.Protocol.l4, parsed.listeners[0].protocol);
     try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
-    try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].getPort());
+    try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].ip.getPort());
     // The example carries both endpoint spellings (#174): a bare literal
     // at weight 1 beside a weighted object.
-    try std.testing.expectEqual(@as(u16, 9001), parsed.clusters[0].endpoints[1].getPort());
+    try std.testing.expectEqual(@as(u16, 9001), parsed.clusters[0].endpoints[1].ip.getPort());
     try std.testing.expectEqualSlices(u16, &.{ 1, 3 }, parsed.clusters[0].weights.?);
     // The example's tcp check resolves with its thresholds, and its
     // omitted budget inherits the connect timeout.
@@ -6770,7 +6828,7 @@ test "config: endpoint weights parse in both spellings" {
     // spelling — is carried, not rejected, while a sibling holds weight.
     try std.testing.expectEqual(@as(usize, 4), cluster.endpoints.len);
     try std.testing.expectEqualSlices(u16, &.{ 1, 3, 1, 0 }, cluster.weights.?);
-    try std.testing.expectEqual(@as(u16, 8080), cluster.endpoints[1].getPort());
+    try std.testing.expectEqual(@as(u16, 8080), cluster.endpoints[1].ip.getPort());
 }
 
 test "config: unweighted endpoints leave the weights table null" {
@@ -7848,6 +7906,103 @@ test "config: max_inflight resolves, defaults to uncapped, rejects the useless" 
             parsed.clusters[0].max_inflight,
         );
     }
+}
+
+test "config: an endpoint may be a Unix socket path (#303)" {
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}]," ++
+        "\"clusters\":{\"a\":{\"endpoints\":[";
+    const tail = "]}},\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // Both spellings in one cluster, which is the point of a prefix on
+    // the existing string rather than a second key (#305): a migration
+    // moves one endpoint at a time.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"127.0.0.1:9000\",\"unix:/run/app.sock\"," ++
+                "{\"address\":\"unix:/run/app2.sock\",\"weight\":3}" ++ tail,
+        );
+        const endpoints = parsed.clusters[0].endpoints;
+        try std.testing.expectEqual(@as(usize, 3), endpoints.len);
+        try std.testing.expectEqual(@as(u16, 9000), endpoints[0].ip.getPort());
+        try std.testing.expectEqualStrings("/run/app.sock", endpoints[1].unix);
+        // The `unix:` prefix is grammar, not part of the path: what
+        // reaches the kernel is what the operator would `ls`.
+        try std.testing.expectEqualStrings("/run/app2.sock", endpoints[2].unix);
+        // The #174 object form is unaffected — the grammar grew at one
+        // parse site and nothing that parsed before changed shape.
+        try std.testing.expectEqualSlices(u16, &.{ 1, 1, 3 }, parsed.clusters[0].weights.?);
+        // And the rendered spelling round-trips to what was written,
+        // which is what the access log and the metrics label print.
+        var scratch: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&scratch);
+        try writer.print("{f}", .{endpoints[1]});
+        try std.testing.expectEqualStrings("unix:/run/app.sock", writer.buffered());
+    }
+
+    // A relative path resolves against a working directory the operator
+    // did not name and a service manager may change — so it names a
+    // socket nobody can point at. Refused at load (§5), not at the dial.
+    try expectParseError(
+        error.EndpointUnixPathRelative,
+        head ++ "\"unix:run/app.sock\"" ++ tail,
+    );
+    // The empty path is the abstract namespace, which is out of scope
+    // (#303) and would otherwise be a silent second meaning for `unix:`.
+    try expectParseError(error.EndpointUnixPathInvalid, head ++ "\"unix:\"" ++ tail);
+    // Past what a `sockaddr_un` carries. Refused rather than truncated:
+    // a shortened path names a *different* socket, and the kernel would
+    // have no way to say so.
+    {
+        const too_long = "/" ++ ("p" ** constants.unix_socket_path_bytes_max);
+        try expectParseError(
+            error.EndpointUnixPathInvalid,
+            head ++ "\"unix:" ++ too_long ++ "\"" ++ tail,
+        );
+        // One byte shorter is the longest path that fits, and it parses
+        // — the bound is a real edge, not a round number near one.
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"unix:" ++ too_long[0 .. too_long.len - 1] ++ "\"" ++ tail,
+        );
+        try std.testing.expectEqual(
+            @as(usize, constants.unix_socket_path_bytes_max),
+            parsed.clusters[0].endpoints[0].unix.len,
+        );
+    }
+    // A zero-port rule cannot apply to a socket path, and must not be
+    // reached through one: the check is on the `ip` arm only.
+    try expectParseError(error.EndpointPortZero, head ++ "\"127.0.0.1:0\"" ++ tail);
+
+    // The bytes an address may not carry. POSIX permits them in a path;
+    // the access log and the metrics exposition do not — one of these
+    // reaching a renderer invalidates the whole line and the whole
+    // scrape, not one field, so they are refused where every other
+    // §5 bound is.
+    inline for (.{ "\\\"", "\\\\", "\\u0001", "\\u007f", " " }) |hostile| {
+        try expectParseError(
+            error.EndpointUnixPathInvalid,
+            head ++ "\"unix:/run/a" ++ hostile ++ "b.sock\"" ++ tail,
+        );
+    }
+}
+
+test "config: a listener still binds an IP, not a socket path (#303)" {
+    // The listener half of #303 is a later slice: it needs answers for
+    // what a peer address is when there is none, which `hash: source_ip`,
+    // `match.client` and `X-Forwarded-For` all ask. Until then the
+    // grammar is refused here rather than half-accepted, so a config
+    // that looks like it works cannot be one that does not.
+    try expectParseError(
+        error.ListenerBindInvalid,
+        "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
 }
 
 test "config: proxy_status is off unless asked for, and is http-only" {

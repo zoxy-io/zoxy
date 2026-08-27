@@ -66,6 +66,8 @@
 
 const std = @import("std");
 
+const constants = @import("../constants.zig");
+
 pub const SimIo = @import("SimIo.zig");
 pub const XevIo = @import("XevIo.zig");
 
@@ -78,6 +80,78 @@ pub const Signal = enum(u8) {
     /// (§1 non-goal: the §5 pools are startup-fixed, so a config change
     /// is a restart), and claiming the signal for the log says so.
     reopen_log,
+};
+
+/// A dial destination (#303): an IP address, or the path of a
+/// filesystem `AF_UNIX` socket.
+///
+/// One union rather than a second `connectUnix` entry point, so the seam
+/// keeps one call site per operation and every dial site — `Server`, the
+/// L7 proxy, the health checker — stays a single call. The branch lives
+/// where the syscall does, which is the only place §4 lets it.
+///
+/// The path is borrowed, not owned: it points into the config arena,
+/// which outlives every dial by construction (§1, parse-once). Nothing
+/// here allocates and nothing copies the bytes until a backend builds
+/// the `sockaddr_un` a submission needs.
+pub const Address = union(enum) {
+    ip: std.Io.net.IpAddress,
+    unix: []const u8,
+
+    /// The loader's own bound on a socket path, which lives in
+    /// `constants.zig` beside every other §5 term rather than here: the
+    /// access log's line bound is a function of it too, and one number
+    /// with two homes is the one that goes stale.
+    pub const unix_path_bytes_max = constants.unix_socket_path_bytes_max;
+
+    /// Whether a socket path is safe to render verbatim: printable
+    /// ASCII with no quote and no backslash.
+    ///
+    /// The loader is the only caller that *decides* with this — an
+    /// address that fails it is refused at load (§5) — and the renderers
+    /// assert on it, because an endpoint literal goes into a JSON log
+    /// line and a Prometheus label unescaped, where one bad byte spoils
+    /// the whole line and the whole scrape rather than one field. One
+    /// definition, so the rule and the bound that rests on it cannot
+    /// drift apart.
+    pub fn pathIsRenderable(path: []const u8) bool {
+        for (path) |byte| {
+            if (byte <= 0x20 or byte >= 0x7f or byte == '"' or byte == '\\') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The two forms compare by value, which stickiness and the endpoint
+    /// tables both need: a `hash` cluster's identity is derived from the
+    /// address, so two spellings of one endpoint must be one endpoint.
+    pub fn eql(a: *const Address, b: *const Address) bool {
+        return switch (a.*) {
+            .ip => |lhs| switch (b.*) {
+                .ip => |rhs| lhs.eql(&rhs),
+                .unix => false,
+            },
+            .unix => |lhs| switch (b.*) {
+                .ip => false,
+                .unix => |rhs| std.mem.eql(u8, lhs, rhs),
+            },
+        };
+    }
+
+    /// Render as the config spells it — an IP literal, or the `unix:`
+    /// prefix the #305 grammar settled on. One renderer, so the access
+    /// log, the metrics label and the startup banner cannot disagree
+    /// about what an endpoint is called.
+    pub fn format(address: Address, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (address) {
+            .ip => |ip| try writer.print("{f}", .{ip}),
+            .unix => |path| {
+                try writer.writeAll("unix:");
+                try writer.writeAll(path);
+            },
+        }
+    }
 };
 
 pub const ShutdownHow = enum(u8) {

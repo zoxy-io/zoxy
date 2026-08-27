@@ -3125,7 +3125,7 @@ pub fn Server(comptime IoType: type) type {
                 server.stageProxySendHeader(conn, version);
             }
             server.io.connect(
-                dial.address,
+                &dial.address,
                 &conn.stream.op_connect.completion,
                 ConnType,
                 conn,

@@ -14,6 +14,7 @@ const std = @import("std");
 const admin = @import("admin.zig");
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
+const io_module = @import("io/io.zig");
 const counters_module = @import("counters.zig");
 const router = @import("http/router.zig");
 const Io = @import("io/io.zig");
@@ -37,10 +38,17 @@ fn originAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") catch unreachable;
 }
 
+/// The same origin as an endpoint (#303): every cluster's endpoint list
+/// is an address union now, and the harness dials and listens on the
+/// IP arm of it.
+fn originEndpoint() io_module.Address {
+    return .{ .ip = originAddress() };
+}
+
 const Harness = struct {
     arena_state: std.heap.ArenaAllocator,
     sim_io: SimIo,
-    endpoints: [1]std.Io.net.IpAddress,
+    endpoints: [1]io_module.Address,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
     listeners: [1]config_module.Config.Listener,
@@ -59,7 +67,7 @@ const Harness = struct {
         var sim_options = sim;
         sim_options.buffer_group_count = 0;
         try harness.sim_io.init(arena, sim_options);
-        harness.endpoints = .{originAddress()};
+        harness.endpoints = .{originEndpoint()};
         harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
         harness.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         harness.listeners = .{.{
@@ -163,7 +171,7 @@ const Scrape = struct {
     const Outcome = enum { pending, refused, eof, reset };
 
     fn start(scrape: *Scrape) void {
-        scrape.io.connect(adminAddress(), &scrape.connect_completion, Scrape, scrape, onConnect);
+        scrape.io.connect(&.{ .ip = adminAddress() }, &scrape.connect_completion, Scrape, scrape, onConnect);
     }
 
     fn onConnect(scrape: *Scrape, result: Io.ConnectError!SimIo.Socket) void {
@@ -295,7 +303,7 @@ const Holder = struct {
 
     fn start(holder: *Holder, io: *SimIo) void {
         holder.io = io;
-        io.connect(bindAddress(), &holder.connect_completion, Holder, holder, onConnect);
+        io.connect(&.{ .ip = bindAddress() }, &holder.connect_completion, Holder, holder, onConnect);
     }
 
     fn onConnect(holder: *Holder, result: Io.ConnectError!SimIo.Socket) void {

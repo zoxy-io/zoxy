@@ -34,6 +34,7 @@
 //! for a test, and issue #75 already measured the cost of the one it has.
 
 const std = @import("std");
+const io_module = @import("../io/io.zig");
 
 const config_module = @import("../config.zig");
 const constants = @import("../constants.zig");
@@ -573,7 +574,7 @@ const Harness = struct {
     routes: [1]router.Route = undefined,
     listeners: [1]config_module.Config.Listener = undefined,
     clusters: [1]config_module.Config.Cluster = undefined,
-    endpoints: [1]std.Io.net.IpAddress = undefined,
+    endpoints: [1]io_module.Address = undefined,
     config: config_module.Config = undefined,
 
     client_listener: SimIo.Listener = undefined,
@@ -616,7 +617,7 @@ const Harness = struct {
         var sim_options = options.sim;
         sim_options.buffer_group_count = 0;
         try bed.io.init(arena, sim_options);
-        bed.endpoints = .{originAddress()};
+        bed.endpoints = .{.{ .ip = originAddress() }};
         bed.clusters = .{.{ .name = "origin", .endpoints = &bed.endpoints }};
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         bed.listeners = .{.{
@@ -650,7 +651,7 @@ const Harness = struct {
         bed.origin_listener = try bed.io.listen(originAddress());
         bed.io.accept(bed.client_listener, &bed.accept_completion, Harness, bed, onProxyAccepted);
         bed.io.accept(bed.origin_listener, &bed.origin.accept_completion, Origin, &bed.origin, onOriginAccepted);
-        bed.io.connect(clientAddress(), &bed.client.connect_completion, Client, &bed.client, onClientConnected);
+        bed.io.connect(&.{ .ip = clientAddress() }, &bed.client.connect_completion, Client, &bed.client, onClientConnected);
     }
 
     fn tearDown(bed: *Harness) void {
@@ -661,7 +662,7 @@ const Harness = struct {
 
     fn onProxyAccepted(bed: *Harness, result: Io.AcceptError!SimIo.Socket) void {
         bed.proxy_client_socket = result catch unreachable;
-        bed.io.connect(originAddress(), &bed.connect_completion, Harness, bed, onProxyDialed);
+        bed.io.connect(&.{ .ip = originAddress() }, &bed.connect_completion, Harness, bed, onProxyDialed);
     }
 
     fn onProxyDialed(bed: *Harness, result: Io.ConnectError!SimIo.Socket) void {

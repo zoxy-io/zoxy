@@ -317,6 +317,17 @@ pub fn Origin(comptime IoType: type) type {
             origin.armAccept();
         }
 
+        /// Start on a socket path instead (#303). A simulator affordance
+        /// — `SimIo.listenUnix` — because what a UDS *endpoint* needs
+        /// from §9 is something on the other end of the dial, and the
+        /// proxy's own `bind` is still IP-only.
+        pub fn startUnix(origin: *Self, io: *IoType, path: []const u8) !void {
+            origin.io = io;
+            origin.listener = try io.listenUnix(path);
+            origin.listening = true;
+            origin.armAccept();
+        }
+
         fn armAccept(origin: *Self) void {
             origin.io.accept(origin.listener, &origin.accept_completion, Self, origin, onAccept);
         }

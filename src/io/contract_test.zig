@@ -146,7 +146,7 @@ pub fn EchoScenario(comptime IoType: type) type {
                 onAccept,
             );
             scenario.io.connect(
-                scenario.io.listenerAddress(scenario.listener),
+                &.{ .ip = scenario.io.listenerAddress(scenario.listener) },
                 &scenario.connect_completion,
                 Scenario,
                 scenario,
@@ -357,7 +357,7 @@ fn GroupContract(comptime IoType: type) type {
             c.connect_completion = .{};
             c.io.accept(listener, &c.accept_completion, Contract, c, onAccept);
             c.io.connect(
-                c.io.listenerAddress(listener),
+                &.{ .ip = c.io.listenerAddress(listener) },
                 &c.connect_completion,
                 Contract,
                 c,
@@ -964,7 +964,7 @@ fn connectPair(xev_io: *XevIo) !ConnectedPair {
     );
     xev_io.accept(listener, &pair.accept_completion, Pair, &pair, Pair.onAccept);
     xev_io.connect(
-        xev_io.listenerAddress(listener),
+        &.{ .ip = xev_io.listenerAddress(listener) },
         &pair.connect_completion,
         Pair,
         &pair,
@@ -1014,7 +1014,7 @@ test "xevio: a send after our own write shutdown is Reset, not kernel pressure" 
     const listener = try xev_io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
     xev_io.accept(listener, &pair.accept_completion, Pair, &pair, Pair.onAccept);
     xev_io.connect(
-        xev_io.listenerAddress(listener),
+        &.{ .ip = xev_io.listenerAddress(listener) },
         &pair.connect_completion,
         Pair,
         &pair,
@@ -1184,7 +1184,7 @@ test "xevio: a dial to a closed loopback port is Refused" {
 
     var outcome: ?(Io.ConnectError!XevIo.Socket) = null;
     var completion: XevIo.Completion = .{};
-    xev_io.connect(address, &completion, @TypeOf(outcome), &outcome, (struct {
+    xev_io.connect(&.{ .ip = address }, &completion, @TypeOf(outcome), &outcome, (struct {
         fn onConnect(
             state: *?(Io.ConnectError!XevIo.Socket),
             result: Io.ConnectError!XevIo.Socket,
@@ -1409,7 +1409,7 @@ test "xevio: canceling a stuck dial delivers Canceled and releases the op" {
     address.setPort(port);
     var outcome: ?(Io.ConnectError!XevIo.Socket) = null;
     var connect_completion: XevIo.Completion = .{};
-    xev_io.connect(address, &connect_completion, @TypeOf(outcome), &outcome, (struct {
+    xev_io.connect(&.{ .ip = address }, &connect_completion, @TypeOf(outcome), &outcome, (struct {
         fn onConnect(
             state: *?(Io.ConnectError!XevIo.Socket),
             result: Io.ConnectError!XevIo.Socket,

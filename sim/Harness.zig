@@ -106,11 +106,11 @@ comptime {
 
 io: SimIo,
 server: ServerSim,
-endpoints_l4: [1]std.Io.net.IpAddress,
+endpoints_l4: [1]zoxy.Io.Address,
 /// The http cluster's endpoints: the origin at index 0 always, and on a
 /// #181 retry seed a second one nothing is listening on (`deriveRetries`).
 /// How many are configured is `endpoints_http_count`.
-endpoints_http: [2]std.Io.net.IpAddress,
+endpoints_http: [2]zoxy.Io.Address,
 endpoints_http_count: u16,
 /// The #174 weight tables the clusters may reference, each as long as
 /// the endpoint list it parallels.
@@ -612,7 +612,7 @@ fn deriveRetries(harness: *Harness, random: std.Random) void {
     }
     harness.retries_http = budget;
     harness.endpoints_http_count = 2;
-    harness.endpoints_http[1] = refusingEndpointAddress();
+    harness.endpoints_http[1] = .{ .ip = refusingEndpointAddress() };
     assert(harness.retries_http >= 1);
     assert(harness.retries_http <= zoxy.constants.cluster_retries_max);
 }
@@ -645,8 +645,11 @@ fn deriveUpgrades(harness: *Harness, random: std.Random) void {
 }
 
 fn deriveTopology(harness: *Harness, random: std.Random) void {
-    harness.endpoints_l4 = .{originAddress()};
-    harness.endpoints_http = .{ httpOriginAddress(), httpOriginAddress() };
+    harness.endpoints_l4 = .{.{ .ip = originAddress() }};
+    harness.endpoints_http = .{
+        .{ .ip = httpOriginAddress() },
+        .{ .ip = httpOriginAddress() },
+    };
     deriveRetries(harness, random);
     deriveUpgrades(harness, random);
     harness.max_body_bytes = deriveMaxBodyBytes(harness.clean, random);

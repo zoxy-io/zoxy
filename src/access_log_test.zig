@@ -16,6 +16,7 @@ const std = @import("std");
 const access_log = @import("access_log.zig");
 const config_module = @import("config.zig");
 const constants = @import("constants.zig");
+const io_module = @import("io/io.zig");
 const router = @import("http/router.zig");
 const Server = @import("Server.zig").Server;
 const SimIo = @import("io/SimIo.zig");
@@ -32,10 +33,17 @@ fn originAddress() std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parseLiteral("127.0.0.1:9000") catch unreachable;
 }
 
+/// The same origin as an endpoint (#303): every cluster's endpoint list
+/// is an address union now, and the harness dials and listens on the
+/// IP arm of it.
+fn originEndpoint() io_module.Address {
+    return .{ .ip = originAddress() };
+}
+
 const Harness = struct {
     arena_state: std.heap.ArenaAllocator,
     sim_io: SimIo,
-    endpoints: [1]std.Io.net.IpAddress,
+    endpoints: [1]io_module.Address,
     clusters: [1]config_module.Config.Cluster,
     routes: [1]router.Route,
     listeners: [1]config_module.Config.Listener,
@@ -75,7 +83,7 @@ const Harness = struct {
             .adversary = .{ .partial_io = false, .log_write_stall_ns = stall_ns },
             .buffer_group_count = 4,
         });
-        harness.endpoints = .{originAddress()};
+        harness.endpoints = .{originEndpoint()};
         harness.clusters = .{.{ .name = "origin", .endpoints = &harness.endpoints }};
         harness.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         harness.listeners = .{.{
@@ -132,7 +140,7 @@ fn sampleRecord() access_log.Record {
         .started_wall_ns = 1_785_489_262 * std.time.ns_per_s,
         .duration_ns = 1000,
         .client = std.Io.net.IpAddress.parseLiteral("10.1.2.3:52344") catch unreachable,
-        .upstream = std.Io.net.IpAddress.parseLiteral("10.0.0.7:8080") catch unreachable,
+        .upstream = .{ .ip = std.Io.net.IpAddress.parseLiteral("10.0.0.7:8080") catch unreachable },
         .cluster = "origin",
         .bytes_in = 0,
         .bytes_out = 7,

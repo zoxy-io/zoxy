@@ -619,35 +619,31 @@ pub fn accept(
     }).adapter);
 }
 
+/// Dial one endpoint (§4). The address union's branch lives here, which
+/// is the point of taking a union at the seam: `AF_UNIX` needs a
+/// different socket family and a different `sockaddr`, and both are
+/// syscall-shaped facts that §4 confines to this file.
 pub fn connect(
     io: *XevIo,
-    address: std.Io.net.IpAddress,
+    address: *const Io.Address,
     completion: *Completion,
     comptime Userdata: type,
     userdata: *Userdata,
     comptime callback: fn (*Userdata, Io.ConnectError!Socket) void,
 ) void {
-    const tcp = xev.TCP.init(address) catch {
-        // Kernel pressure (§8): report as this op's failure, delivered
-        // asynchronously via a zero-delay timer so callbacks never run
-        // inline with submission.
-        io.timer.run(&io.loop, completion, 0, Userdata, userdata, (struct {
-            fn adapter(
-                context: ?*Userdata,
-                loop: *xev.Loop,
-                timer_completion: *xev.Completion,
-                result: xev.Timer.RunError!void,
-            ) xev.CallbackAction {
-                _ = loop;
-                _ = timer_completion;
-                result catch {};
-                callback(context.?, error.Unexpected);
-                return .disarm;
-            }
-        }).adapter);
-        return;
+    const posix_address = posixAddressOf(address) catch {
+        // A path the loader accepted cannot overflow a `sockaddr_un`, so
+        // this arm is a caller that reached past config validation —
+        // reported as this op's failure rather than asserted, because
+        // the seam's contract is that every dial reaches a completion.
+        return failConnect(io, completion, Userdata, userdata, callback);
     };
-    tcp.connect(&io.loop, completion, address, Userdata, userdata, (struct {
+    const tcp = xev.TCP.initAddress(posix_address) catch {
+        // Kernel pressure (§8): report as this op's failure, through
+        // the same deferred path the address arm above takes.
+        return failConnect(io, completion, Userdata, userdata, callback);
+    };
+    tcp.connectAddress(&io.loop, completion, posix_address, Userdata, userdata, (struct {
         fn adapter(
             context: ?*Userdata,
             loop: *xev.Loop,
@@ -676,6 +672,43 @@ pub fn connect(
                     else => error.Unexpected,
                 });
             }
+            return .disarm;
+        }
+    }).adapter);
+}
+
+/// The posix form of a seam address, built here because a `sockaddr` is
+/// a syscall's shape and §4 keeps those in this file.
+fn posixAddressOf(address: *const Io.Address) error{NameTooLong}!xev.net.Address {
+    return switch (address.*) {
+        .ip => |ip| xev.net.Address.fromIpAddress(ip),
+        .unix => |path| try xev.net.Address.initUnix(path),
+    };
+}
+
+/// Deliver a connect failure the caller can still act on: asynchronously,
+/// via a zero-delay timer, so a callback never runs inline with the
+/// submission that asked for it — the invariant every other op here
+/// holds, and the reason a failed dial still reaches a terminal
+/// completion and releases its slot (§5).
+fn failConnect(
+    io: *XevIo,
+    completion: *Completion,
+    comptime Userdata: type,
+    userdata: *Userdata,
+    comptime callback: fn (*Userdata, Io.ConnectError!Socket) void,
+) void {
+    io.timer.run(&io.loop, completion, 0, Userdata, userdata, (struct {
+        fn adapter(
+            context: ?*Userdata,
+            loop: *xev.Loop,
+            timer_completion: *xev.Completion,
+            result: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            _ = loop;
+            _ = timer_completion;
+            result catch {};
+            callback(context.?, error.Unexpected);
             return .disarm;
         }
     }).adapter);
