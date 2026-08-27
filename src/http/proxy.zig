@@ -839,7 +839,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .host = host,
                 .path = views.match,
                 .headers = request.headers,
-                .client = &conn.client_address,
+                .client = clientAddressOf(conn),
             };
             // One scan yields both the rewrite and the header edits (§7).
             const forward = filter.collectForward(conn.request_filters, view, edit_buffer);
@@ -1056,7 +1056,7 @@ pub fn Proxy(comptime IoType: type) type {
                 .host = keys.host,
                 .path = keys.views.match,
                 .headers = request.headers,
-                .client = &conn.client_address,
+                .client = clientAddressOf(conn),
             })) |verdict| {
                 switch (verdict) {
                     .reject => |status| return respondFilter(server, conn, status),
@@ -1202,7 +1202,7 @@ pub fn Proxy(comptime IoType: type) type {
                 conn.stream.cluster_index,
                 &server.endpointLoad(),
                 server.health.healthy,
-                &conn.client_address,
+                clientAddressOf(conn),
                 request_key,
                 conn.stream.l7.tried[0..conn.stream.l7.tried_count],
             );
@@ -1711,7 +1711,11 @@ pub fn Proxy(comptime IoType: type) type {
                 len += 2;
             }
             var client_scratch: [constants.forwarded_client_bytes_max]u8 = undefined;
-            const client = bareAddress(&conn.client_address, &client_scratch);
+            // The loader refuses a `forwarded` block on a listener with
+            // no client address (`ListenerUnixBindForwarded`, #303), so
+            // this path is unreachable without one — and a fabricated
+            // address is exactly what `X-Forwarded-For` must never carry.
+            const client = bareAddress(&conn.client_address.?, &client_scratch);
             assert(client.len >= 1);
             // The scratch is the chain bound plus a separator plus the
             // widest address, so a chain that fit leaves room for these.
@@ -4202,6 +4206,17 @@ pub fn Proxy(comptime IoType: type) type {
                 if (page.status == status) {
                     return page;
                 }
+            }
+            return null;
+        }
+
+        /// The connection's client address as a borrowed pointer, or
+        /// null on a `unix:` listener (#303). One helper, so the three
+        /// consumers that take it by pointer spell the optional the same
+        /// way and none of them re-derives it.
+        fn clientAddressOf(conn: *const ConnType) ?*const std.Io.net.IpAddress {
+            if (conn.client_address) |*address| {
+                return address;
             }
             return null;
         }

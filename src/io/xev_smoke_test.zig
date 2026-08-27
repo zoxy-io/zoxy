@@ -7,6 +7,7 @@
 //! under `src/io/`, the only place allowed to name xev and raw syscalls.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
 
 const XevIo = @import("XevIo.zig");
@@ -124,6 +125,111 @@ test "tcp: loopback echo across the full watcher surface" {
     try std.testing.expectEqualStrings(echo_token, echo.server_buffer[0..echo.server_read_len]);
     try std.testing.expectEqualStrings(echo_token, echo.client_buffer[0..echo.client_read_len]);
     try std.testing.expectEqual(@as(u32, 3), echo.close_count);
+}
+
+test "unix listener: the socket file's lifecycle (#303)" {
+    // The half no simulator can hold an opinion about: a real path in a
+    // real filesystem, which is where every UDS implementation keeps its
+    // bugs. Three facts, in the order an operator meets them.
+    var io: XevIo = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try io.init(arena_state.allocator(), 0, 2, 2, 512, XevIo.log_sink_stdout, null);
+    defer io.deinit();
+
+    const path = "/tmp/zoxy-xev-listener.sock";
+    _ = std.posix.system.unlink(path);
+    defer _ = std.posix.system.unlink(path);
+
+    // 1. A clean bind creates the file, and closing takes it away —
+    //    so an ordinary stop leaves nothing for the next start to trip
+    //    over.
+    {
+        const listener = try io.listen(&.{ .unix = path }, null);
+        try std.testing.expect(pathIsSocket(path));
+        io.listenClose(listener);
+        try std.testing.expect(!pathExists(path));
+    }
+
+    // 2. A file left behind by a killed process does not wedge the next
+    //    start. Bind, then leak it the way a SIGKILL would, then bind
+    //    again: without the startup unlink this is EADDRINUSE forever,
+    //    which is a proxy that cannot come back up after the incident
+    //    that killed it.
+    {
+        const abandoned = try io.listen(&.{ .unix = path }, null);
+        _ = abandoned;
+        try std.testing.expect(pathIsSocket(path));
+        var second: XevIo = undefined;
+        var second_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer second_arena.deinit();
+        try second.init(second_arena.allocator(), 0, 2, 2, 512, XevIo.log_sink_stdout, null);
+        defer second.deinit();
+        const listener = try second.listen(&.{ .unix = path }, null);
+        try std.testing.expect(pathIsSocket(path));
+        second.listenClose(listener);
+    }
+
+    // 3. A path that names something that is *not* a socket is refused,
+    //    not cleared. A typo in `bind` must not be a delete — this is
+    //    the whole reason the startup unlink is conditional.
+    {
+        _ = std.posix.system.unlink(path);
+        const fd = std.posix.system.open(
+            path,
+            .{ .ACCMODE = .WRONLY, .CREAT = true },
+            @as(std.posix.mode_t, 0o600),
+        );
+        try std.testing.expect(std.posix.errno(fd) == .SUCCESS);
+        _ = std.posix.system.close(@intCast(fd));
+        defer _ = std.posix.system.unlink(path);
+        try std.testing.expectError(error.PathNotSocket, io.listen(&.{ .unix = path }, null));
+        // And it is still there: the refusal did not take it.
+        try std.testing.expect(pathExists(path));
+    }
+}
+
+test "unix listener: a mode lands on the file (#303)" {
+    // The permission story the feature is sold on. Asserted against the
+    // filesystem rather than against the config, because the config is
+    // not what a connecting process is judged by.
+    var io: XevIo = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try io.init(arena_state.allocator(), 0, 1, 2, 512, XevIo.log_sink_stdout, null);
+    defer io.deinit();
+
+    const path = "/tmp/zoxy-xev-listener-mode.sock";
+    _ = std.posix.system.unlink(path);
+    defer _ = std.posix.system.unlink(path);
+
+    const listener = try io.listen(&.{ .unix = path }, .{ .bits = 0o660 });
+    defer io.listenClose(listener);
+    try std.testing.expectEqual(@as(u16, 0o660), permissionBitsOf(path));
+}
+
+fn pathExists(path: [*:0]const u8) bool {
+    return XevIo.fileTypeAt(path) != null;
+}
+
+fn pathIsSocket(path: [*:0]const u8) bool {
+    return XevIo.fileTypeAt(path) orelse false;
+}
+
+/// The permission bits on `path`, read the way `XevIo.fileTypeAt` reads
+/// a file type — the stdlib exposes no `stat` on Linux, so the raw
+/// `statx` syscall is the portable-within-Linux answer.
+fn permissionBitsOf(path: [*:0]const u8) u16 {
+    if (comptime builtin.os.tag == .linux) {
+        var info: std.os.linux.Statx = undefined;
+        const rc = std.os.linux.statx(std.posix.AT.FDCWD, path, 0, .{ .MODE = true }, &info);
+        assert(@as(isize, @bitCast(rc)) >= 0);
+        return @intCast(info.mode & 0o777);
+    }
+    var info: std.posix.Stat = undefined;
+    const rc = std.posix.system.fstatat(std.posix.AT.FDCWD, path, &info, 0);
+    assert(std.posix.errno(rc) == .SUCCESS);
+    return @intCast(info.mode & 0o777);
 }
 
 test "unix: the same echo over a socket path (#303)" {

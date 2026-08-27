@@ -413,7 +413,8 @@ pub const TestBed = struct {
         bed.routes = .{.{ .prefix = "/", .cluster_index = 0 }};
         bed.sni_routes = options.sni_routes;
         bed.listeners = .{.{
-            .bind_address = bindAddress(),
+            .bind_address = .{ .ip = bindAddress() },
+            .bind_mode = null,
             .routes = &bed.routes,
             .sni_routes = bed.sni_routes,
             .protocol = .l4,

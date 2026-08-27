@@ -343,7 +343,12 @@ pub const RequestView = struct {
     /// address here (32 bytes, past TIGER_STYLE's by-value threshold).
     /// No default: a site that forgot to wire it must not compile, or a
     /// `client` allowlist would silently judge a zero address.
-    client: *const std.Io.net.IpAddress,
+    ///
+    /// Null on a `unix:` listener, where there is none (#303). Nothing
+    /// here has to answer for that: the loader refuses a `client` match
+    /// on such a listener, so a rule that would read it cannot reach one
+    /// — which `clientMatches` asserts rather than assumes.
+    client: ?*const std.Io.net.IpAddress,
 };
 
 /// A terminal filter answer: the request is responded to here and never
@@ -557,11 +562,16 @@ fn matches(match: Match, view: RequestView) bool {
 /// Whether any prefix admits the client (#177) — the one any-of among
 /// the conjunction's predicates, because a `client` list reads as "from
 /// these ranges" and a client holds exactly one address.
-fn clientMatches(cidrs: []const Cidr, client: *const std.Io.net.IpAddress) bool {
+fn clientMatches(cidrs: []const Cidr, client: ?*const std.Io.net.IpAddress) bool {
     assert(cidrs.len >= 1);
+    // A rule carrying prefixes on a listener with no client address is
+    // a config the loader refuses (`ListenerUnixBindClientMatch`, #303),
+    // so reaching here without one is a caller past validation — and
+    // guessing an answer would be an allowlist judging a fiction.
+    const observed = client.?;
     for (cidrs) |*cidr| {
         assert(cidr.prefix_len <= 64);
-        if (cidr.contains(client)) {
+        if (cidr.contains(observed)) {
             return true;
         }
     }

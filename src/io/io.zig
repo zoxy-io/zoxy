@@ -154,6 +154,20 @@ pub const Address = union(enum) {
     }
 };
 
+/// The permission bits a `unix:` listener asks for its socket file
+/// (#303). A struct rather than a bare integer so a caller cannot pass a
+/// decimal literal where an octal one was meant — the classic way to
+/// widen a mode by accident.
+pub const FileMode = struct {
+    bits: u16,
+
+    /// Every bit a mode may set: the nine permission bits plus setuid,
+    /// setgid and sticky. A listener has no use for the top three, and
+    /// the loader refuses them, but the type states the file-system
+    /// vocabulary rather than one caller's subset.
+    pub const bits_max: u16 = 0o7777;
+};
+
 pub const ShutdownHow = enum(u8) {
     /// Force an armed *recv* to completion while the connection stays
     /// writable (#247). The write half is untouched, which is the whole
@@ -170,6 +184,13 @@ pub const ListenError = error{
     AddressUnavailable,
     /// Privileged port without the capability, or similar permission wall.
     AccessDenied,
+    /// A `unix:` bind path names something that already exists and is not
+    /// a socket (#303). Distinct from `AddressInUse` because the operator
+    /// action differs: `AddressInUse` sends them hunting a process, while
+    /// this one says the path itself is wrong — and a proxy that cleared
+    /// the way by deleting whatever it found would make a typo in `bind`
+    /// destructive.
+    PathNotSocket,
     Unexpected,
 };
 

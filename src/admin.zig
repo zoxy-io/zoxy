@@ -158,7 +158,10 @@ pub fn Admin(comptime IoType: type) type {
             assert(admin.state == .off);
             assert(!admin.listening);
             const bind = admin.bind_address orelse return;
-            admin.listener = try admin.server.io.listen(bind);
+            // The admin endpoint is IP-only and stays that way: it is
+            // reached by a scrape from elsewhere on the network, which
+            // is the one thing a socket file cannot serve (#303).
+            admin.listener = try admin.server.io.listen(&.{ .ip = bind }, null);
             admin.listening = true;
             admin.armAccept();
         }

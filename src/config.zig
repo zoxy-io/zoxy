@@ -318,7 +318,10 @@ pub const Config = struct {
     };
 
     pub const Listener = struct {
-        bind_address: std.Io.net.IpAddress,
+        bind_address: io_module.Address,
+        /// The #303 permission bits for a `unix:` bind's socket file, or
+        /// null for the umask's default. Always null on an IP bind.
+        bind_mode: ?io_module.FileMode,
         /// The §7 path-routing table, sorted longest-prefix-first and
         /// never empty. A listener configured with a single `"cluster"`
         /// resolves to one catch-all route (`prefix = "/"`); `l4`
@@ -675,6 +678,30 @@ pub const ValidationError = error{
     ListenersEmpty,
     ListenersOverLimit,
     ListenerBindInvalid,
+    /// A `unix:` bind path that is empty, past what a `sockaddr_un`
+    /// carries, or carries a byte an address may not (#303).
+    ListenerBindUnixPathInvalid,
+    /// A `unix:` bind path that is not absolute (#303).
+    ListenerBindUnixPathRelative,
+    /// A `mode` on a listener whose `bind` is an IP literal (#303):
+    /// there is no file to chmod.
+    ListenerModeWithoutUnixBind,
+    /// A `mode` that is not three or four octal digits, or that sets
+    /// setuid/setgid/sticky (#303).
+    ListenerModeInvalid,
+    /// A `unix:` listener with a `forwarded` block (#303): there is no
+    /// client address to state.
+    ListenerUnixBindForwarded,
+    /// A `unix:` listener with a filter matching on the client address
+    /// (#303): there is none to match.
+    ListenerUnixBindClientMatch,
+    /// A `unix:` listener routing to a cluster that is sticky on the
+    /// source IP (#303): there is none to key on.
+    ListenerUnixBindSourceIpHash,
+    /// A `unix:` listener routing to a cluster that announces a PROXY
+    /// header upstream (#303): the header names the client's source and
+    /// destination addresses, and this listener has neither.
+    ListenerUnixBindClusterSend,
     ListenerBindDuplicate,
     ListenerHttpOrL4,
     ClusterUnknown,
@@ -1984,6 +2011,12 @@ pub const LimitsJson = struct {
 /// not a body field — "both speak over a terminated session (§4, §7)".
 pub const ListenerJson = struct {
     bind: []const u8,
+    /// Permission bits for a `unix:` bind's socket file, as an octal
+    /// string (#303); absent leaves whatever the process umask gives.
+    /// Shared like `tls` because it is a property of the socket, not of
+    /// what is spoken over it — and rejected on an IP bind, which
+    /// creates no file to chmod.
+    mode: ?[]const u8 = null,
     /// Optional TLS termination (#125); absent is a plaintext socket.
     /// Shared, unlike everything in the bodies below.
     tls: ?TlsJson = null,
@@ -1998,7 +2031,17 @@ pub const ListenerJson = struct {
         "shared by both.";
     pub const schema_one_of = [_][]const u8{ "http", "l4" };
     pub const schema_fields = .{
-        .bind = .{ .desc = "IP:port literal to bind (hostnames are rejected — DNS is a non-goal)." },
+        .bind = .{
+            .desc = "What to bind: an `IP:port` literal (hostnames are rejected — " ++
+                "DNS is a non-goal), or `unix:` followed by the absolute path of " ++
+                "a socket file to create.",
+        },
+        .mode = .{
+            .desc = "Permission bits for a unix: socket file, as an octal string " ++
+                "(\"0660\"). Absent leaves the process umask's default. Rejected " ++
+                "on an IP bind, which creates no file.",
+            .min_length = 1,
+        },
         .tls = .{
             .desc = "Terminate TLS on this listener with the given certificate " ++
                 "and key; absent is a plaintext socket. Inbound only — the " ++
@@ -3356,22 +3399,146 @@ fn resolveEndpointAddress(
     literal: []const u8,
 ) ParseError!io_module.Address {
     if (std.mem.startsWith(u8, literal, unix_address_prefix)) {
-        const path = literal[unix_address_prefix.len..];
-        if (path.len == 0 or path.len > io_module.Address.unix_path_bytes_max) {
-            return error.EndpointUnixPathInvalid;
-        }
-        if (path[0] != '/') {
-            return error.EndpointUnixPathRelative;
-        }
-        if (!io_module.Address.pathIsRenderable(path)) {
-            return error.EndpointUnixPathInvalid;
-        }
-        // Duped so the address outlives the parsed JSON document, the
-        // same lifetime every other resolved string here takes.
-        return .{ .unix = try arena.dupe(u8, path) };
+        return .{ .unix = resolveUnixPath(arena, literal) catch |err| switch (err) {
+            error.Relative => return error.EndpointUnixPathRelative,
+            error.Invalid => return error.EndpointUnixPathInvalid,
+            error.OutOfMemory => return error.OutOfMemory,
+        } };
     }
     return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch {
         return error.EndpointInvalid;
+    } };
+}
+
+/// A `unix:` literal's path, validated and arena-duped. The rules argued
+/// at `resolveEndpointAddress`, applied once for both fields that take
+/// the grammar — an endpoint and a listener's `bind` — so the two cannot
+/// come to disagree about what a socket path is.
+fn resolveUnixPath(
+    arena: std.mem.Allocator,
+    literal: []const u8,
+) error{ Invalid, Relative, OutOfMemory }![]const u8 {
+    assert(std.mem.startsWith(u8, literal, unix_address_prefix));
+    const path = literal[unix_address_prefix.len..];
+    if (path.len == 0 or path.len > io_module.Address.unix_path_bytes_max) {
+        return error.Invalid;
+    }
+    if (path[0] != '/') {
+        return error.Relative;
+    }
+    if (!io_module.Address.pathIsRenderable(path)) {
+        return error.Invalid;
+    }
+    // Duped so the address outlives the parsed JSON document, the same
+    // lifetime every other resolved string here takes.
+    return try arena.dupe(u8, path);
+}
+
+/// The `mode` a `unix:` bind asks for its socket file (#303), as the
+/// octal string an operator writes in every other tool.
+///
+/// A string rather than a JSON number, because `0660` in JSON is not
+/// valid and `660` is decimal — the two spellings of the same intent
+/// differ by a factor of eight, and a mode that is silently wider than
+/// asked for is the failure this feature exists to avoid.
+fn resolveBindMode(
+    mode_json: ?[]const u8,
+    bind_address: io_module.Address,
+) ParseError!?io_module.FileMode {
+    const text = mode_json orelse return null;
+    // An IP bind creates no file, so a mode on one describes nothing.
+    if (bind_address != .unix) {
+        return error.ListenerModeWithoutUnixBind;
+    }
+    if (text.len == 0 or text.len > 4) {
+        return error.ListenerModeInvalid;
+    }
+    var bits: u16 = 0;
+    for (text) |digit| {
+        if (digit < '0' or digit > '7') {
+            return error.ListenerModeInvalid;
+        }
+        bits = bits * 8 + (digit - '0');
+    }
+    assert(bits <= io_module.FileMode.bits_max);
+    // setuid, setgid and sticky mean nothing on a socket and everything
+    // on the file it is confused with — refused rather than passed
+    // through to a chmod nobody meant to write.
+    if (bits & 0o7000 != 0) {
+        return error.ListenerModeInvalid;
+    }
+    return .{ .bits = bits };
+}
+
+/// The #303 refusals: what a `unix:` listener may not also ask for,
+/// because a request arriving on one has no client address to answer
+/// with. Refused at load rather than answered with a sentinel — a
+/// fabricated `0.0.0.0` would make `hash: source_ip` send every local
+/// client to one endpoint, `match.client` compare against a fiction, and
+/// `X-Forwarded-For` state an address no one connected from.
+fn rejectUnixClientAddressUsers(
+    listener: *const Config.Listener,
+    clusters: []const Config.Cluster,
+) ParseError!void {
+    if (listener.forwarded != null) {
+        return error.ListenerUnixBindForwarded;
+    }
+    for (listener.request_filters) |rule| {
+        if (rule.match.clients.len >= 1) {
+            return error.ListenerUnixBindClientMatch;
+        }
+    }
+    for (listener.routes) |route| {
+        try rejectUnixCluster(route.cluster_index, clusters);
+    }
+    // The SNI table is a *second* set of reachable clusters (#298), and
+    // `routes` does not summarise it: an l4 listener with a name table
+    // resolves `routes` to one provisional entry — the admitted cluster
+    // — and `finishSniPeek` replaces the exchange's cluster with the
+    // matched one before any dial. Checking only `routes` would hold the
+    // first name to these rules and let every other name past them.
+    for (listener.sni_routes) |route| {
+        try rejectUnixCluster(route.cluster_index, clusters);
+    }
+}
+
+/// One reachable cluster's half of the #303 refusals.
+fn rejectUnixCluster(
+    cluster_index: u16,
+    clusters: []const Config.Cluster,
+) ParseError!void {
+    assert(cluster_index < clusters.len);
+    const cluster = clusters[cluster_index];
+    if (cluster.pick == .hash and cluster.hash_key == .source_ip) {
+        return error.ListenerUnixBindSourceIpHash;
+    }
+    // A PROXY header announces the client's source and destination
+    // addresses. On this listener there is neither: the accepted socket
+    // has no peer address and no local one either, so the header could
+    // only be written with fictions. Refused as a pair, the shape
+    // `rejectTlsClusterSend` above already has.
+    if (cluster.proxy_protocol_send != null) {
+        return error.ListenerUnixBindClusterSend;
+    }
+}
+
+/// A listener's `bind` (#303): the same grammar as an endpoint, and the
+/// same validation, under this field's own error names — an operator
+/// reading `ListenerBindUnixPathRelative` should not have to work out
+/// which of the two fields the loader meant.
+fn resolveBindAddress(
+    arena: std.mem.Allocator,
+    literal: []const u8,
+) ParseError!io_module.Address {
+    if (std.mem.startsWith(u8, literal, unix_address_prefix)) {
+        return .{ .unix = resolveUnixPath(arena, literal) catch |err| switch (err) {
+            error.Relative => return error.ListenerBindUnixPathRelative,
+            error.Invalid => return error.ListenerBindUnixPathInvalid,
+            error.OutOfMemory => return error.OutOfMemory,
+        } };
+    }
+    return .{ .ip = std.Io.net.IpAddress.parseLiteral(literal) catch {
+        return error.ListenerBindInvalid;
     } };
 }
 
@@ -3467,16 +3634,15 @@ fn resolveListeners(
     const ByBind = struct {
         listeners: []const Config.Listener,
         fn lessThan(ctx: @This(), a: u16, b: u16) bool {
-            return bindOrder(ctx.listeners[a].bind_address) <
-                bindOrder(ctx.listeners[b].bind_address);
+            return bindLessThan(
+                &ctx.listeners[a].bind_address,
+                &ctx.listeners[b].bind_address,
+            );
         }
     };
     std.mem.sort(u16, order, ByBind{ .listeners = listeners }, ByBind.lessThan);
     for (order[1..], order[0 .. order.len - 1]) |current, previous| {
-        if (std.meta.eql(
-            listeners[current].bind_address,
-            listeners[previous].bind_address,
-        )) {
+        if (listeners[current].bind_address.eql(&listeners[previous].bind_address)) {
             return error.ListenerBindDuplicate;
         }
     }
@@ -3500,15 +3666,13 @@ fn resolveListener(
 ) ParseError!Config.Listener {
     assert(clusters.len >= 1);
     assert(head_buffer_bytes >= 1);
-    const bind_address = std.Io.net.IpAddress.parseLiteral(listener_json.bind) catch {
-        return error.ListenerBindInvalid;
-    };
+    const bind_address = try resolveBindAddress(arena, listener_json.bind);
     const tls = try resolveTls(listener_json.tls);
     // The tag dispatches, and every field it does not carry is one this
     // arm cannot be handed (#305): the seven "this key is meaningless on
     // that protocol" errors this replaced were the loader restating a
     // shape it now simply has.
-    const listener: Config.Listener = switch (try protocolOf(listener_json)) {
+    var listener: Config.Listener = switch (try protocolOf(listener_json)) {
         .http => try resolveHttpListener(
             arena,
             bind_address,
@@ -3520,6 +3684,10 @@ fn resolveListener(
         ),
         .l4 => try resolveL4Listener(arena, bind_address, tls, &listener_json.l4.?, clusters),
     };
+    listener.bind_mode = try resolveBindMode(listener_json.mode, bind_address);
+    if (bind_address == .unix) {
+        try rejectUnixClientAddressUsers(&listener, clusters);
+    }
     if (listener.protocol == .http) {
         try rejectHttpClusterSend(listener.routes, clusters);
     }
@@ -3534,7 +3702,7 @@ fn resolveListener(
 /// three §7 policies only a parsed request can mean anything to.
 fn resolveHttpListener(
     arena: std.mem.Allocator,
-    bind_address: std.Io.net.IpAddress,
+    bind_address: io_module.Address,
     tls: ?Config.Listener.Tls,
     http_json: *const HttpListenerJson,
     clusters: []const Config.Cluster,
@@ -3545,6 +3713,9 @@ fn resolveHttpListener(
     assert(head_buffer_bytes >= 1);
     return .{
         .bind_address = bind_address,
+        // Filled by `resolveListener`, which is where the `mode` field
+        // and the bind it describes are both in scope.
+        .bind_mode = null,
         .routes = try resolveRoutes(arena, http_json, clusters, head_buffer_bytes),
         .request_filters = try resolveRequestFilters(arena, http_json, head_buffer_bytes, bodies),
         .response_filters = try resolveResponseFilters(arena, http_json),
@@ -3568,7 +3739,7 @@ fn resolveHttpListener(
 /// byte has been read — see `admittedCluster`.
 fn resolveL4Listener(
     arena: std.mem.Allocator,
-    bind_address: std.Io.net.IpAddress,
+    bind_address: io_module.Address,
     tls: ?Config.Listener.Tls,
     l4_json: *const L4ListenerJson,
     clusters: []const Config.Cluster,
@@ -3594,6 +3765,8 @@ fn resolveL4Listener(
     assert(routes.len == 1);
     const listener: Config.Listener = .{
         .bind_address = bind_address,
+        // Filled by `resolveListener`, as on the http arm.
+        .bind_mode = null,
         .routes = routes,
         .sni_routes = sni_routes,
         .protocol = .l4,
@@ -3625,6 +3798,22 @@ fn resolveL4Listener(
 /// the ordering matters, never the value: equal keys are re-checked with
 /// `std.meta.eql`, so a collision costs a comparison rather than a wrong
 /// verdict.
+/// A total order on bind addresses, so duplicates fall adjacent after
+/// one sort. Not a single integer key any more (#303): a socket path
+/// does not fit one, so the families are ordered by tag first and the
+/// paths lexicographically within theirs.
+fn bindLessThan(a: *const io_module.Address, b: *const io_module.Address) bool {
+    const a_family: u8 = if (a.* == .ip) 0 else 1;
+    const b_family: u8 = if (b.* == .ip) 0 else 1;
+    if (a_family != b_family) {
+        return a_family < b_family;
+    }
+    return switch (a.*) {
+        .ip => |ip| bindOrder(ip) < bindOrder(b.ip),
+        .unix => |path| std.mem.order(u8, path, b.unix) == .lt,
+    };
+}
+
 fn bindOrder(address: std.Io.net.IpAddress) u160 {
     return switch (address) {
         .ip4 => |v4| (@as(u160, 0) << 152) |
@@ -5185,7 +5374,7 @@ test "config: the shipped example parses and resolves" {
     try std.testing.expectEqualStrings("/", parsed.listeners[0].routes[0].prefix);
     try std.testing.expectEqual(@as(u16, 0), parsed.listeners[0].routes[0].cluster_index);
     try std.testing.expectEqual(Config.Listener.Protocol.l4, parsed.listeners[0].protocol);
-    try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.getPort());
+    try std.testing.expectEqual(@as(u16, 8080), parsed.listeners[0].bind_address.ip.getPort());
     try std.testing.expectEqualStrings("origin", parsed.clusters[0].name);
     try std.testing.expectEqual(@as(u16, 9000), parsed.clusters[0].endpoints[0].ip.getPort());
     // The example carries both endpoint spellings (#174): a bare literal
@@ -7991,18 +8180,169 @@ test "config: an endpoint may be a Unix socket path (#303)" {
     }
 }
 
-test "config: a listener still binds an IP, not a socket path (#303)" {
-    // The listener half of #303 is a later slice: it needs answers for
-    // what a peer address is when there is none, which `hash: source_ip`,
-    // `match.client` and `X-Forwarded-For` all ask. Until then the
-    // grammar is refused here rather than half-accepted, so a config
-    // that looks like it works cannot be one that does not.
+test "config: a listener may bind a socket path (#303)" {
+    const tail = ",\"http\":{\"cluster\":\"a\"}}]," ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const head = "{\"listeners\":[{\"bind\":";
+
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ "\"unix:/run/zoxy.sock\"" ++ tail,
+        );
+        try std.testing.expectEqualStrings("/run/zoxy.sock", parsed.listeners[0].bind_address.unix);
+        // Absent leaves whatever the umask gives, which is what every
+        // other tool does and what an operator's directory permissions
+        // are already expressed against.
+        try std.testing.expect(parsed.listeners[0].bind_mode == null);
+    }
+    // The same path validation as an endpoint, under this field's own
+    // error names — an operator should not have to work out which of the
+    // two fields the loader meant.
     try expectParseError(
-        error.ListenerBindInvalid,
-        "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
+        error.ListenerBindUnixPathRelative,
+        head ++ "\"unix:run/zoxy.sock\"" ++ tail,
+    );
+    try expectParseError(error.ListenerBindUnixPathInvalid, head ++ "\"unix:\"" ++ tail);
+    try expectParseError(
+        error.ListenerBindUnixPathInvalid,
+        head ++ "\"unix:/run/a\\\"b.sock\"" ++ tail,
+    );
+    // Two listeners on one path are the same duplicate an IP:port pair
+    // is — and the check had to stop being a single integer key to see
+    // it, since a path does not fit one.
+    try expectParseError(
+        error.ListenerBindDuplicate,
+        "{\"listeners\":[{\"bind\":\"unix:/run/a.sock\",\"http\":{\"cluster\":\"a\"}}," ++
+            "{\"bind\":\"unix:/run/a.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
+}
+
+test "config: a socket file's mode is octal, and only a socket has one (#303)" {
+    const tail = ",\"http\":{\"cluster\":\"a\"}}]," ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const unix_head = "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\"";
+
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            unix_head ++ ",\"mode\":\"0660\"" ++ tail,
+        );
+        try std.testing.expectEqual(@as(u16, 0o660), parsed.listeners[0].bind_mode.?.bits);
+    }
+    // A string, not a number: `0660` is not valid JSON and `660` is
+    // decimal, and the two readings of one intent differ by a factor of
+    // eight — in the direction that widens the mode.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, unix_head ++ ",\"mode\":\"660\"" ++ tail);
+        try std.testing.expectEqual(@as(u16, 0o660), parsed.listeners[0].bind_mode.?.bits);
+    }
+    // An IP bind creates no file, so a mode on one describes nothing.
+    try expectParseError(
+        error.ListenerModeWithoutUnixBind,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"mode\":\"0660\"" ++ tail,
+    );
+    inline for (.{ "0680", "9", "", "00660", "abc" }) |bad| {
+        try expectParseError(
+            error.ListenerModeInvalid,
+            unix_head ++ ",\"mode\":\"" ++ bad ++ "\"" ++ tail,
+        );
+    }
+    // setuid, setgid and sticky mean nothing on a socket and everything
+    // on the file it would be confused with.
+    try expectParseError(
+        error.ListenerModeInvalid,
+        unix_head ++ ",\"mode\":\"4660\"" ++ tail,
+    );
+}
+
+test "config: a unix listener refuses what needs a client address (#303)" {
+    // A request arriving on a socket file has no client IP, and there is
+    // no honest sentinel: a fabricated `0.0.0.0` would make each of
+    // these quietly wrong rather than absent. Refused at load (§5).
+    const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const head = "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"";
+
+    try expectParseError(
+        error.ListenerUnixBindForwarded,
+        head ++ ",\"forwarded\":{\"mode\":\"replace\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerUnixBindClientMatch,
+        head ++ ",\"request_filters\":[{\"match\":{\"client\":[\"10.0.0.0/8\"]}," ++
+            "\"actions\":[{\"reject\":403}]}]" ++ tail,
+    );
+    try expectParseError(
+        error.ListenerUnixBindSourceIpHash,
+        "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
+            "\"pick\":{\"policy\":\"hash\",\"key\":\"source_ip\"}}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
+    // A hash on something the request carries is unaffected: the key is
+    // in the request, not in the connection.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        _ = try expectParseOk(
+            &arena_state,
+            "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"http\":{\"cluster\":\"a\"}}]," ++
+                "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
+                "\"pick\":{\"policy\":\"hash\",\"key\":\"header\",\"name\":\"x-tenant\"}}}," ++
+                "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+        );
+    }
+    // An SNI table is a second set of reachable clusters (#298), and
+    // the listener's `routes` does not summarise it: with a name table
+    // `routes` holds one provisional entry, and `finishSniPeek` replaces
+    // the exchange's cluster with the matched one before any dial. So a
+    // rule that walked only `routes` would hold the *first* name to it
+    // and wave every other one through — into an unwrap of the client
+    // address that is not there.
+    inline for (.{
+        "{\"policy\":\"hash\",\"key\":\"source_ip\"}",
+        "\"p2c\"",
+    }, .{
+        error.ListenerUnixBindSourceIpHash,
+        error.ListenerUnixBindClusterSend,
+    }) |pick, expected| {
+        const send = if (expected == error.ListenerUnixBindClusterSend)
+            ",\"proxy_protocol\":{\"send\":\"v2\"}"
+        else
+            "";
+        try expectParseError(
+            expected,
+            "{\"listeners\":[{\"bind\":\"unix:/run/zoxy.sock\",\"l4\":{\"routes\":[" ++
+                "{\"sni\":\"a.example\",\"cluster\":\"plain\"}," ++
+                "{\"sni\":\"b.example\",\"cluster\":\"second\"}]}}]," ++
+                "\"clusters\":{\"plain\":{\"endpoints\":[\"127.0.0.1:2\"]}," ++
+                "\"second\":{\"endpoints\":[\"127.0.0.1:3\"],\"pick\":" ++ pick ++
+                send ++ "}}," ++
+                "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+        );
+    }
+    // And an IP listener still takes all three, which is what says the
+    // rule is about the bind and not about the feature.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        _ = try expectParseOk(
+            &arena_state,
+            "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+                "\"forwarded\":{\"mode\":\"replace\"}" ++ tail,
+        );
+    }
 }
 
 test "config: proxy_status is off unless asked for, and is http-only" {

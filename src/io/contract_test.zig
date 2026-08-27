@@ -137,7 +137,7 @@ pub fn EchoScenario(comptime IoType: type) type {
         };
 
         pub fn start(scenario: *Scenario, bind_address: std.Io.net.IpAddress) !void {
-            scenario.listener = try scenario.io.listen(bind_address);
+            scenario.listener = try scenario.io.listen(&.{ .ip = bind_address }, null);
             scenario.io.accept(
                 scenario.listener,
                 &scenario.accept_completion,
@@ -423,7 +423,7 @@ fn GroupContract(comptime IoType: type) type {
 fn runGroupContract(comptime IoType: type, io: *IoType) !void {
     const Contract = GroupContract(IoType);
     var c: Contract = .{ .io = io };
-    const listener = try io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+    const listener = try io.listen(&.{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") }, null);
 
     // Selection, and the classic-recv continuation into the bound buffer.
     const client_a, const server_a = try c.pair(listener);
@@ -610,7 +610,7 @@ test "simio: a dropped accept is never delivered, where a live one is" {
     var live_io: SimIo = undefined;
     try live_io.init(arena_state.allocator(), .{ .seed = 3 });
     var live: DroppedAccept = .{ .io = &live_io };
-    const live_listener = try live_io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9301"));
+    const live_listener = try live_io.listen(&.{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9301") }, null);
     live_io.accept(live_listener, &live.completion, DroppedAccept, &live, DroppedAccept.onAccept);
     live_io.listenClose(live_listener);
     try live_io.run();
@@ -628,7 +628,7 @@ test "simio: a dropped accept is never delivered, where a live one is" {
         .dump_on_deadlock = false,
     });
     var stuck: DroppedAccept = .{ .io = &stuck_io };
-    const stuck_listener = try stuck_io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9301"));
+    const stuck_listener = try stuck_io.listen(&.{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:9301") }, null);
     stuck_io.accept(
         stuck_listener,
         &stuck.completion,
@@ -960,7 +960,8 @@ const ConnectedPair = struct {
 fn connectPair(xev_io: *XevIo) !ConnectedPair {
     var pair: Pair = .{ .io = xev_io };
     const listener = try xev_io.listen(
-        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+        &.{ .ip = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable },
+        null,
     );
     xev_io.accept(listener, &pair.accept_completion, Pair, &pair, Pair.onAccept);
     xev_io.connect(
@@ -1011,7 +1012,7 @@ test "xevio: a send after our own write shutdown is Reset, not kernel pressure" 
     // A connected loopback pair through the seam's own API — the echo
     // scenario closes both ends when it finishes, so this needs its own.
     var pair: Pair = .{ .io = &xev_io };
-    const listener = try xev_io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+    const listener = try xev_io.listen(&.{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") }, null);
     xev_io.accept(listener, &pair.accept_completion, Pair, &pair, Pair.onAccept);
     xev_io.connect(
         &.{ .ip = xev_io.listenerAddress(listener) },
@@ -1064,7 +1065,7 @@ test "xevio: bind failures are diagnosed distinctly, not all AddressInUse" {
     defer xev_io.deinit();
 
     const unavailable = std.Io.net.IpAddress.parseLiteral("203.0.113.1:0") catch unreachable;
-    try std.testing.expectError(error.AddressUnavailable, xev_io.listen(unavailable));
+    try std.testing.expectError(error.AddressUnavailable, xev_io.listen(&.{ .ip = unavailable }, null));
 }
 
 test "xevio: SO_REUSEPORT lets two listeners share one port" {
@@ -1083,7 +1084,8 @@ test "xevio: SO_REUSEPORT lets two listeners share one port" {
 
     // First listener takes an ephemeral port; read the concrete port back.
     const first = try xev_io.listen(
-        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+        &.{ .ip = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable },
+        null,
     );
     const port = xev_io.listenerAddress(first).getPort();
     try std.testing.expect(port != 0);
@@ -1091,7 +1093,7 @@ test "xevio: SO_REUSEPORT lets two listeners share one port" {
     // A second listener on the very same port must also succeed.
     var shared = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
     shared.setPort(port);
-    const second = try xev_io.listen(shared);
+    const second = try xev_io.listen(&.{ .ip = shared }, null);
     try std.testing.expectEqual(port, xev_io.listenerAddress(second).getPort());
 }
 
@@ -1138,7 +1140,7 @@ test "xevio: a port squatted without SO_REUSEPORT is AddressInUse" {
 
     var shared = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable;
     shared.setPort(port);
-    try std.testing.expectError(error.AddressInUse, xev_io.listen(shared));
+    try std.testing.expectError(error.AddressInUse, xev_io.listen(&.{ .ip = shared }, null));
 }
 
 test "xevio: binding a privileged port without the capability is AccessDenied" {
@@ -1156,7 +1158,7 @@ test "xevio: binding a privileged port without the capability is AccessDenied" {
     defer xev_io.deinit();
 
     const privileged = std.Io.net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
-    if (xev_io.listen(privileged)) |listener| {
+    if (xev_io.listen(&.{ .ip = privileged }, null)) |listener| {
         xev_io.listenClose(listener);
         return error.SkipZigTest;
     } else |err| {
@@ -1176,7 +1178,8 @@ test "xevio: a dial to a closed loopback port is Refused" {
     defer xev_io.deinit();
 
     const listener = try xev_io.listen(
-        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+        &.{ .ip = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable },
+        null,
     );
     const address = xev_io.listenerAddress(listener);
     assert(address.getPort() != 0);
@@ -1228,7 +1231,8 @@ test "xevio: closing a listener cancels its armed accept" {
     defer xev_io.deinit();
 
     const listener = try xev_io.listen(
-        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+        &.{ .ip = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable },
+        null,
     );
     var outcome: ?(Io.AcceptError!XevIo.Socket) = null;
     var completion: XevIo.Completion = .{};
@@ -1308,7 +1312,8 @@ test "xevio: closing a listener cancels an accept armed in the same tick" {
     defer xev_io.deinit();
 
     const listener = try xev_io.listen(
-        std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable,
+        &.{ .ip = std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") catch unreachable },
+        null,
     );
     var drain: SameTickDrain = .{ .io = &xev_io, .listener = listener };
     // Both at zero: one tick's timer batch runs both callbacks, with no
@@ -1449,14 +1454,14 @@ test "xevio: the listener table reserves a slot for the admin listener" {
     defer xev_io.deinit();
 
     const loopback = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
-    const configured = try xev_io.listen(loopback);
+    const configured = try xev_io.listen(&.{ .ip = loopback }, null);
     _ = configured;
     // The admin listener: this is the bind that used to fail.
-    const admin = try xev_io.listen(loopback);
+    const admin = try xev_io.listen(&.{ .ip = loopback }, null);
     _ = admin;
 
     // And the reservation is exactly one — not open-ended.
-    try std.testing.expectError(error.AddressUnavailable, xev_io.listen(loopback));
+    try std.testing.expectError(error.AddressUnavailable, xev_io.listen(&.{ .ip = loopback }, null));
 }
 
 /// The §4 contract a head-read verdict rests on (#247): a read-half
@@ -1477,7 +1482,7 @@ test "xevio: the listener table reserves a slot for the admin listener" {
 fn runReadShutdownContract(comptime IoType: type, io: *IoType) !void {
     const Contract = GroupContract(IoType);
     var c: Contract = .{ .io = io };
-    const listener = try io.listen(try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"));
+    const listener = try io.listen(&.{ .ip = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0") }, null);
     defer io.listenClose(listener);
     const client, const server = try c.pair(listener);
     defer io.closeNow(client);

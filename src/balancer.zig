@@ -448,7 +448,7 @@ pub const Balancer = struct {
         cluster_index: u16,
         load: *const upstream.Load,
         healthy: []const bool,
-        client_address: *const std.Io.net.IpAddress,
+        client_address: ?*const std.Io.net.IpAddress,
         request_key: RequestKey,
         tried: []const u16,
     ) Outcome {
@@ -747,7 +747,7 @@ pub const Balancer = struct {
         cluster_index: u16,
         eligible: []const u16,
         load: *const upstream.Load,
-        client_address: *const std.Io.net.IpAddress,
+        client_address: ?*const std.Io.net.IpAddress,
         request_key: RequestKey,
     ) u16 {
         assert(balancer.config.clusters[cluster_index].pick == .hash);
@@ -758,7 +758,13 @@ pub const Balancer = struct {
                 // else: an L7 request need not have been parsed yet, an
                 // L4 connection has nothing to parse.
                 assert(std.meta.activeTag(request_key) == .none);
-                return balancer.rendezvous(cluster_index, eligible, sourceKey(client_address));
+                // A listener with no client address cannot route to a
+                // source-IP-keyed cluster: the loader refuses the pair
+                // (`ListenerUnixBindSourceIpHash`, #303). Reaching here
+                // without one is a caller past validation, and any
+                // stand-in would send every local client to one
+                // endpoint while looking like stickiness.
+                return balancer.rendezvous(cluster_index, eligible, sourceKey(client_address.?));
             },
             .header => switch (request_key) {
                 .key => |key| return balancer.rendezvous(cluster_index, eligible, key),

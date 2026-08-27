@@ -1609,14 +1609,39 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   truncate one layer down. The abstract namespace is out of scope: it
   carries no filesystem permissions, which is most of the argument for
   the feature.
-  **Listeners stay IP-only** for now. That half has to answer what a
-  client address *is* when there is none — a question `hash: source_ip`,
-  a filter's `match.client` (family-strict, #177), the access log and
-  `X-Forwarded-For` all ask at once — and `bind: "unix:…"` is refused at
-  load rather than half-accepted. A `proxy_protocol` send block is
-  unaffected in either direction: the header announces the *client's*
-  addresses, which is a fact about the connection that arrived and not
-  about the leg the header is written on.
+  **A listener takes the same grammar**, and answers the question that
+  half turns on: a request arriving on a socket file has no client IP,
+  because the kernel has none to give. `Conn.client_address` becomes
+  optional rather than acquiring a sentinel — a fabricated `0.0.0.0`
+  would be believed by every consumer — and the loader refuses the four
+  features that would have to read one: a `forwarded` block, a filter
+  matching on `match.client` (#177), a route to a cluster sticky on
+  `source_ip`, and a route to a cluster announcing a PROXY header (which
+  names a source *and* a destination, and this listener has neither).
+  The last two are asked of every cluster the listener can *reach*, and
+  `routes` is not that set: an l4 listener with an SNI table (#298)
+  resolves `routes` to one provisional entry — the admitted cluster —
+  while `finishSniPeek` replaces the exchange's cluster with the matched
+  one before any dial, so a check reading only `routes` would hold the
+  first name to the rule and wave every other one through.
+  Each is a startup error naming the pair; the access log states `null`
+  for the same reason it does for an unpicked `upstream`, and every
+  unwrap left in the serving path cites the rule that makes it sound.
+  **The socket file's lifecycle is startup's problem, not the loop's.**
+  A path that does not exist is created; one that *is* a socket is
+  removed first, because a killed process leaves its file behind and
+  `EADDRINUSE` forever is a proxy that cannot return after the incident
+  that killed it; and one that is anything else — a file, a directory, a
+  symlink, judged as itself rather than followed — refuses the start. The
+  conditional is the point: a typo in `bind` must never be a delete. A
+  clean `listenClose` removes what it made, which is tidiness rather than
+  correctness — the startup rule is what makes an unclean stop survivable.
+  An optional `mode` chmods the socket after the bind, taken as an octal
+  *string* because `0660` is not JSON and `660` is decimal, and the two
+  readings differ eightfold in the direction that widens access.
+  One thing this family cannot do: **`SO_REUSEPORT` does not reach it**
+  (§3). Two processes cannot bind one path, so a socket-file listener is
+  for chaining on one host, never for spreading across processes.
 - **A pick chooses among the endpoints that are both healthy and under
   capacity**, in that order, and the two filters differ in what an empty
   result means. Health fails **open**: a cluster with every endpoint

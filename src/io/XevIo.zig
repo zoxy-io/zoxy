@@ -173,7 +173,7 @@ pub const Completion = xev.Completion;
 
 const ListenerEntry = struct {
     fd: posix.socket_t,
-    address: std.Io.net.IpAddress,
+    address: Io.Address,
     armed_accept: ?*xev.Completion,
     cancel_completion: xev.Completion,
     open: bool,
@@ -401,11 +401,140 @@ pub fn deinit(io: *XevIo) void {
     }
 }
 
-pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
+pub fn listen(io: *XevIo, address: *const Io.Address, mode: ?Io.FileMode) Io.ListenError!Listener {
     assert(io.listeners_count <= io.listeners.len);
     if (io.listeners_count == io.listeners.len) {
         return error.AddressUnavailable;
     }
+    switch (address.*) {
+        .ip => |ip| {
+            // A `mode` is a property of a file, and an IP listener binds
+            // none. The loader rejects the pairing (#303), so reaching
+            // here with one is a caller past config validation.
+            assert(mode == null);
+            return listenIp(io, ip);
+        },
+        .unix => |path| return listenUnix(io, path, mode),
+    }
+}
+
+/// Bind and listen on a filesystem socket (#303).
+///
+/// No `SO_REUSEPORT`: the option is meaningless for a pathname socket —
+/// two processes cannot bind one path — so the §3 scale-out story does
+/// not reach this family, and the listener half of #303 is for chaining
+/// on one host rather than for spreading across processes.
+fn listenUnix(io: *XevIo, path: []const u8, mode: ?Io.FileMode) Io.ListenError!Listener {
+    assert(path.len >= 1);
+    assert(io.listeners_count < io.listeners.len);
+    const address = xev.net.Address.initUnix(path) catch {
+        // The loader bounds the path (§5), so this is a caller past it.
+        return error.Unexpected;
+    };
+    try clearStaleSocket(&address);
+    const socket = xev.TCP.initAddress(address) catch return error.Unexpected;
+    const bind_rc = posix.system.bind(socket.fd, &address.any, address.getOsSockLen());
+    if (posix.errno(bind_rc) != .SUCCESS) {
+        const failure = bindErrorOf(bind_rc);
+        closeFd(socket.fd);
+        return failure;
+    }
+    if (posix.errno(posix.system.listen(socket.fd, constants.accept_backlog)) != .SUCCESS) {
+        closeFd(socket.fd);
+        return error.Unexpected;
+    }
+    // After the bind, because the file does not exist before it — and
+    // the window between the two is why an operator who needs the socket
+    // itself to be the ACL should also own the directory (§7).
+    if (mode) |requested| {
+        const path_z: [*:0]const u8 = @ptrCast(&address.un.path);
+        const rc = posix.system.fchmodat(posix.AT.FDCWD, path_z, requested.bits, 0);
+        if (posix.errno(rc) != .SUCCESS) {
+            closeFd(socket.fd);
+            _ = posix.system.unlink(path_z);
+            return error.AccessDenied;
+        }
+    }
+    return registerListener(io, .{ .unix = path }, socket.fd);
+}
+
+/// What a stale socket file costs, answered once at startup (#303): a
+/// path left behind by a killed process makes `bind` fail with
+/// `EADDRINUSE` forever, so the file is removed — but *only* when it is
+/// a socket. Anything else is refused, because a typo in `bind` must not
+/// be a delete.
+///
+/// The window between the look and the unlink, and between the unlink
+/// and the bind, is real and deliberately not closed: another process
+/// can recreate the path in either. Closing it would mean binding a
+/// temporary name and renaming over the target, which trades this race
+/// for a different one — the rename would silently replace whatever the
+/// refusal above exists to protect. The exposure is bounded by who can
+/// write the directory, which is the same permission this feature asks
+/// an operator to set anyway (§7), and the loser of the race is a
+/// startup that fails loudly rather than a request served wrongly.
+fn clearStaleSocket(address: *const xev.net.Address) Io.ListenError!void {
+    const path: [*:0]const u8 = @ptrCast(&address.un.path);
+    // Nothing there is the ordinary case, and every other failure to
+    // look is answered by the bind that follows — reporting it here
+    // would name the wrong syscall.
+    const is_socket = fileTypeAt(path) orelse return;
+    if (!is_socket) {
+        return error.PathNotSocket;
+    }
+    if (posix.errno(posix.system.unlink(path)) != .SUCCESS) {
+        return error.AccessDenied;
+    }
+}
+
+/// Whether `path` names a socket, or null when it names nothing.
+///
+/// `AT_SYMLINK_NOFOLLOW` throughout, so a symlink is judged as itself: a
+/// link pointing at a socket is not a stale socket this proxy left
+/// behind, and unlinking it would delete somebody's pointer.
+///
+/// Two spellings because the stdlib has two: on Linux `std.c.fstatat` is
+/// deliberately absent (glibc's versioned `stat` symbols), so the raw
+/// `statx` syscall is the portable-within-Linux answer, and everywhere
+/// else `fstatat` is what exists. This file is the one §4 lets carry
+/// that knowledge.
+pub fn fileTypeAt(path: [*:0]const u8) ?bool {
+    if (comptime builtin.os.tag == .linux) {
+        var info: std.os.linux.Statx = undefined;
+        const rc = std.os.linux.statx(
+            posix.AT.FDCWD,
+            path,
+            posix.AT.SYMLINK_NOFOLLOW,
+            .{ .TYPE = true },
+            &info,
+        );
+        // The sign, not `posix.errno`: this is a raw syscall return,
+        // and `posix.errno` under libc only reads `errno` when the
+        // result is exactly -1 — a raw `-ENOENT` would read as success
+        // and hand back an uninitialised mode. Which error it is does
+        // not matter here; that it failed does.
+        if (@as(isize, @bitCast(rc)) < 0) return null;
+        return info.mode & posix.S.IFMT == posix.S.IFSOCK;
+    }
+    var info: posix.Stat = undefined;
+    const rc = posix.system.fstatat(posix.AT.FDCWD, path, &info, posix.AT.SYMLINK_NOFOLLOW);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    return info.mode & posix.S.IFMT == posix.S.IFSOCK;
+}
+
+/// The bind failure map. Distinct diagnoses, because they send an
+/// operator to different places: a conflicting process, a permission
+/// wall, or a directory that is not there.
+fn bindErrorOf(rc: anytype) Io.ListenError {
+    return switch (posix.errno(rc)) {
+        .ADDRINUSE => error.AddressInUse,
+        .ACCES, .PERM => error.AccessDenied,
+        .NOENT, .NOTDIR, .ADDRNOTAVAIL => error.AddressUnavailable,
+        else => error.Unexpected,
+    };
+}
+
+fn listenIp(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener {
     const tcp = xev.TCP.init(address) catch return error.Unexpected;
     // SO_REUSEPORT before bind is what makes horizontal scale-out real
     // (§1, §3): N independent zoxy processes bind the same port and the
@@ -449,11 +578,17 @@ pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
         return error.Unexpected;
     });
     assert(effective.getPort() != 0);
+    return registerListener(io, .{ .ip = effective }, tcp.fd);
+}
 
+/// Take a bound, listening fd into the table. Shared by both families,
+/// so a listener's bookkeeping cannot differ by the address it answers.
+fn registerListener(io: *XevIo, address: Io.Address, fd: posix.socket_t) Listener {
+    assert(io.listeners_count < io.listeners.len);
     const index = io.listeners_count;
     io.listeners[index] = .{
-        .fd = tcp.fd,
-        .address = effective,
+        .fd = fd,
+        .address = address,
         .armed_accept = null,
         .cancel_completion = .{},
         .open = true,
@@ -467,7 +602,11 @@ pub fn listen(io: *XevIo, address: std.Io.net.IpAddress) Io.ListenError!Listener
 pub fn listenerAddress(io: *const XevIo, listener: Listener) std.Io.net.IpAddress {
     const entry = io.listenerEntryConst(listener);
     assert(entry.open);
-    return entry.address;
+    // The effective *port* is what this answers, which only an IP bind
+    // has: a socket file's effective address is the path the caller
+    // already holds, and nothing asks (#303).
+    assert(entry.address == .ip);
+    return entry.address.ip;
 }
 
 /// Hand the backend every op still queued, so an op armed during this
@@ -552,6 +691,26 @@ pub fn listenClose(io: *XevIo, listener: Listener) void {
     }
     closeFd(entry.fd);
     entry.open = false;
+    // A socket file outlives the socket, so a clean stop takes its own
+    // away (#303): the drain that closes listeners is the last moment
+    // this process knows the path was its own to remove. A kill leaves
+    // it behind, which is exactly what the startup unlink is for — this
+    // is the tidy path, not the correctness one.
+    if (entry.address == .unix) {
+        unlinkSocketPath(entry.address.unix);
+    }
+}
+
+/// Remove a socket file this process created. Best effort by
+/// construction: the path may already be gone, or replaced by something
+/// that is no longer ours, and a proxy on its way down has no verdict to
+/// deliver about either.
+fn unlinkSocketPath(path: []const u8) void {
+    // The same path bound successfully, so it fits — this cannot fail
+    // for a reason the caller could act on, and silently returning would
+    // leave the file behind with nothing said.
+    const address = xev.net.Address.initUnix(path) catch unreachable;
+    _ = posix.system.unlink(@as([*:0]const u8, @ptrCast(&address.un.path)));
 }
 
 /// Deliver the `Canceled` an armed accept is owed when its listener

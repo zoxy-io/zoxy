@@ -697,14 +697,86 @@ A [`proxy_protocol`](#telling-an-l4-origin-proxy-protocol) send block
 still works and still announces the *client's* addresses — the header
 describes the connection that arrived, not the leg it is written on.
 
+A listener can take the same grammar — see
+[accepting on a socket file](#accepting-on-a-socket-file).
+
 > [!NOTE]
-> Listeners are still IP-only: `bind` does not take a `unix:` path yet.
-> That half needs an answer for what a client address *is* when there is
-> none, which `hash: source_ip`, a filter's `match.client` and
-> `X-Forwarded-For` all ask, and shipping it half-answered would be
-> worse than not shipping it. The abstract namespace (a leading NUL) is
-> deliberately out of scope — it has no filesystem permissions, which is
-> most of the argument above.
+> The abstract namespace (a leading NUL) is deliberately out of scope: it
+> has no filesystem permissions, which is most of the argument above.
+
+#### Accepting on a socket file
+
+The mirror: `bind` takes the same `unix:` grammar, so something local
+reaches zoxy through a file rather than a port.
+
+```json
+{
+    "bind": "unix:/run/zoxy.sock",
+    "mode": "0660",
+    "http": { "cluster": "app" }
+}
+```
+
+The path rules are the endpoint's, exactly — absolute, ≤ 103 bytes,
+printable ASCII with no quote or backslash — and two listeners on one
+path are the same duplicate two on one `IP:port` are.
+
+**The socket file's lifecycle** is the part every implementation of this
+gets wrong, so it is worth stating plainly:
+
+| at startup, the path… | zoxy |
+|---|---|
+| does not exist | creates it |
+| is a socket | removes it, then creates it — a killed process must not wedge every later start |
+| is anything else (file, directory, symlink) | **refuses to start** and says so |
+
+A clean stop removes the file it made. A `SIGKILL` cannot, which is what
+the second row is for. The third row is why the second is conditional: a
+typo in `bind` must never be a delete, and a symlink is judged as itself
+rather than followed.
+
+**`mode`** sets the socket's permission bits after the bind, as the octal
+string every other tool takes. It is a string and not a number because
+`0660` is not valid JSON and `660` is decimal — two readings of one
+intent that differ by a factor of eight, in the direction that widens
+access. Absent leaves whatever the umask gives, which under a typical one
+is world-connectable; if the socket itself is meant to be the ACL rather
+than the directory holding it, write the field.
+
+**What a `unix:` listener may not also ask for.** A request arriving on a
+socket file has no client IP — the kernel has none to give — and rather
+than invent one, the loader refuses the four things that would need it:
+
+| rejected | because |
+|---|---|
+| a `forwarded` block | `X-Forwarded-For` would state an address nobody connected from |
+| a filter with `match.client` | an allowlist would be comparing against a fiction |
+| routing to a `hash` cluster keyed on `source_ip` | every local client would land on one endpoint while looking sticky |
+| routing to a cluster with `proxy_protocol` send | the header announces source *and* destination addresses; this listener has neither |
+
+The last two are checked against every cluster the listener can *reach*,
+which on an `l4` listener means each name in its
+[SNI table](#routing-an-l4-listener-by-tls-name-sni) as well as the one
+it admits under — a table routes to a different cluster per name, and
+the check would otherwise hold only the first name to the rule.
+
+Each is a startup error naming the pair, not a runtime surprise. The
+access log states the absence rather than hiding it:
+
+```json
+{"client":null, "upstream":"10.0.0.1:8080", ...}
+```
+
+Everything that does not depend on a client address is untouched: routing,
+header and path filters, `hash` on a header or cookie, TLS termination,
+upgrades, body limits, timeouts and the shed ladder all behave as they do
+on a TCP listener.
+
+> [!NOTE]
+> A `unix:` listener is not part of the `SO_REUSEPORT` scale-out story
+> (see [Under load](#under-load)): two processes cannot bind one path, so
+> the option is meaningless here. Run N processes behind a TCP listener,
+> or one process behind a socket file.
 
 ### Sticky sessions
 
