@@ -1477,12 +1477,25 @@ afterwards. That holds against the *unfixed* ztls, which is the point: the
 sizing removes the trigger, and the ztls fix makes the failure survivable
 if another deployment reaches it anyway.
 
-One thing this does **not** fix: once the heap has been exhausted even
-once, it never recovers, because the engine never drains OpenSSL's error
-queue and those entries allocate through the same hooks. Measured in the
-same issue; a restart is the only cure until that lands. Still true of
-zssl, and now ours to fix rather than an upstream's — the drain belongs
-next to `mem_hooks`, where the heap it protects is installed.
+One thing this does **not** fix: memory the error queue holds is never
+returned, because the engine never drains it and its entries allocate
+through the same hooks. Still true of zssl — checked, not assumed: no
+`ERR_*` call appears anywhere in its tree, though `openssl/err.h` is
+imported.
+
+The bound is worth stating precisely, because "never recovers" reads
+worse than the mechanism is. OpenSSL's queue is a **ring of
+`ERR_NUM_ERRORS` = 16 slots per thread** (`include/openssl/err.h.in`),
+and `err_get_slot` advances `bottom` behind `top` on wrap — so an
+undrained queue plateaus at sixteen entries' worth of data rather than
+growing without limit. That is a fixed occupancy, not a leak, which is
+why `tls-heap-proof`'s frontier plateaus at all. What is true is that
+those bytes are never given back, so a heap sized with no slack keeps
+them for the life of the process.
+
+The fix is one `ERR_clear_error()` on the failure paths in zssl's
+backend, next to `mem_hooks` where the heap it protects is installed.
+Cheap, and it turns a bounded-but-permanent occupancy into none.
 
 ### `shed_tls_crypto` has no gate, and why the obvious one does not work
 
