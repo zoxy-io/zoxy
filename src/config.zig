@@ -2072,9 +2072,12 @@ pub const HttpListenerJson = struct {
     /// Optional #180 upgrade allowlist; absent allows none, so an
     /// `Upgrade` stays the 501 it has always been.
     upgrades: ?UpgradesJson = null,
-    /// Optional #236 request-body cap; absent means one MiB, `0` means
-    /// no cap.
-    max_body_bytes: ?u64 = null,
+    /// The #236 request-body cap, `0` accepting any size (#305). Not
+    /// optional: `null` used to mean the default and `0` no cap, which
+    /// is three states for a two-state idea, and every other cap in this
+    /// config — `drain_deadline_ms`, `max_lifetime_ms`, `request_ms` —
+    /// already spells "no cap" as `0` with no third state to explain.
+    max_body_bytes: u64 = constants.request_body_bytes_default,
     /// Whether this listener names *why* it refused, in an RFC 9209
     /// `Proxy-Status` field (#300). Absent is off.
     proxy_status: bool = false,
@@ -2101,8 +2104,8 @@ pub const HttpListenerJson = struct {
                 "absent leaves the header untouched.",
         },
         .max_body_bytes = .{
-            .desc = "Cap on one request body in bytes; absent means 1 MiB, 0 " ++
-                "accepts any size. A body over the cap is refused 413 before the " ++
+            .desc = "Cap on one request body in bytes; 0 accepts any size, and " ++
+                "absent is 1 MiB. A body over the cap is refused 413 before the " ++
                 "origin is dialed where its length was declared, and the " ++
                 "connection closes.",
             .minimum = 0,
@@ -4939,8 +4942,7 @@ fn resolveRetries(retries: u16) ParseError!u16 {
 /// ignored: a byte relay parses no request to measure, so a cap there
 /// describes a proxy that is not running — the same refusal `forwarded`
 /// and `upgrades` get, for the same reason.
-fn resolveMaxBodyBytes(max_body_bytes: ?u64) ValidationError!u64 {
-    const cap = max_body_bytes orelse return constants.request_body_bytes_default;
+fn resolveMaxBodyBytes(cap: u64) ValidationError!u64 {
     if (cap > constants.request_body_bytes_max) {
         return error.ListenerMaxBodyBytesOutOfRange;
     }
@@ -4950,18 +4952,13 @@ fn resolveMaxBodyBytes(max_body_bytes: ?u64) ValidationError!u64 {
 /// Resolve a listener's #180 upgrade allowlist. Absent allows none, so
 /// an `Upgrade` keeps the `501` it has always got.
 ///
-/// The vocabulary is the `Upgrades` set's own field names, which *are*
-/// the JSON tokens — the same one-source-of-truth the `protocol` and
-/// `pick` matches use, so a token the proxy can carry and a token an
-/// operator may write cannot drift apart. Anything else is refused by
-/// name rather than ignored: a config that asked to tunnel `h2c` and got
-/// silence would believe it had, and after `101` there is no rule left
-/// to catch what came through.
-///
-/// An empty list is refused too. It reads as "allow nothing", which
-/// already has a spelling — omit the field — and configured this way it
-/// would demand a `limits.tunnels` for a listener that can never use
-/// one.
+/// The vocabulary is `UpgradesJson`'s own fields, held to the resolved
+/// set's by a comptime check there — so a protocol the proxy can carry
+/// and one an operator may write cannot drift apart. Anything else is
+/// refused by the strict parser rather than by a rule here (#305): a
+/// config that asked to tunnel `h2c` and got silence would believe it
+/// had, and after `101` there is no rule left to catch what came
+/// through.
 fn resolveUpgrades(
     upgrades_json: ?UpgradesJson,
 ) ValidationError!Config.Listener.Upgrades {
@@ -8410,6 +8407,65 @@ test "config: the body cap holds on both arms, exactly" {
             );
         }
     }
+}
+
+test "config: the body cap is two-valued, and 0 is how uncapped is spelled (#305)" {
+    // `null` used to mean 1 MiB and `0` no cap — three states for a
+    // two-state idea, and the odd one out in its own config:
+    // `drain_deadline_ms`, `max_lifetime_ms` and `request_ms` all spell
+    // "no cap" as `0` with nothing else to explain.
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // Absent is still the default it always was, so a config that never
+    // named the key keeps its cap.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
+        try std.testing.expectEqual(
+            constants.request_body_bytes_default,
+            parsed.listeners[0].max_body_bytes,
+        );
+    }
+    // And `0` is uncapped, unchanged.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ ",\"max_body_bytes\":0" ++ tail);
+        try std.testing.expectEqual(@as(u64, 0), parsed.listeners[0].max_body_bytes);
+    }
+    // The ceiling holds at its edge rather than near it.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const at_limit = std.fmt.comptimePrint(
+            ",\"max_body_bytes\":{d}",
+            .{constants.request_body_bytes_max},
+        );
+        const parsed = try expectParseOk(&arena_state, head ++ at_limit ++ tail);
+        try std.testing.expectEqual(
+            constants.request_body_bytes_max,
+            parsed.listeners[0].max_body_bytes,
+        );
+    }
+    try expectParseError(
+        error.ListenerMaxBodyBytesOutOfRange,
+        head ++ std.fmt.comptimePrint(
+            ",\"max_body_bytes\":{d}",
+            .{constants.request_body_bytes_max + 1},
+        ) ++ tail,
+    );
+    // An l4 relay measures no request, so the key does not exist there —
+    // the strict parser's refusal, not a rule's (#305).
+    try expectParseError(
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"max_body_bytes\":500}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
 }
 
 test "config: max_inflight resolves, defaults to uncapped, rejects the useless" {
