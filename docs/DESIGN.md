@@ -1331,7 +1331,8 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   because relaying it as interim would carry on reading bytes that are no
   longer HTTP.
 - **One client connection serves a bounded number of requests** (#237).
-  `limits.keepalive_requests`, 1000 by default — nginx's figure, and one
+  An `http` listener's `keepalive_requests`, 1000 by default — nginx's
+  figure, and one
   zoxy can honestly borrow because unlike a body cap it bounds *this
   proxy's* slot occupancy rather than stating anything about an origin.
   It is the only bound that reaches a **busy** connection: `idle_ms`

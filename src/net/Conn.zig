@@ -110,6 +110,10 @@ pub fn Conn(comptime IoType: type) type {
         /// The listener's #236 request-body cap, handed over at admission
         /// like the tables beside it; `0` accepts any size.
         max_body_bytes: u64,
+        /// The listener's #237 keep-alive request cap (#305), carried the
+        /// same way; `0` is unlimited. Per listener since the freeze, so
+        /// the serving path asks its own socket rather than the config.
+        keepalive_requests: u32,
         /// Requests this connection has served, for the #237 cap. On the
         /// connection rather than in `l7`, which resets at every
         /// turnaround — the whole point is a total that survives them.
@@ -316,6 +320,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.response_filters = &.{};
             conn.upgrades = .{};
             conn.max_body_bytes = 0;
+            conn.keepalive_requests = 0;
             conn.requests_served = 0;
             conn.forwarded = null;
             conn.proxy_status = false;

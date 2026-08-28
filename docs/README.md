@@ -1333,8 +1333,7 @@ reserves nor demands the ceiling's resources.
     "head_buffers": 1024,
     "upstream_head_buffers": 512,
     "head_buffer_bytes": 16384,
-    "tunnels": 512,
-    "keepalive_requests": 1000
+    "tunnels": 512
 }
 ```
 
@@ -1368,8 +1367,10 @@ relay-buffer pair (8200 bytes), held for the tunnel's whole life rather than
 for the duration of a request, which is why they are reserved apart from
 `relay_buffers` instead of drawn from it.
 
-`keepalive_requests` bounds how many requests one client connection may
-serve — **1000 by default**, nginx's figure, and `0` is unlimited. It is
+`keepalive_requests` — on an `http` listener, beside `max_body_bytes`,
+not in `limits`, because it reserves nothing and states policy — bounds
+how many requests one client connection may serve. **1000 by default**,
+nginx's figure, and `0` is unlimited. It is
 the one bound that reaches a *busy* connection: `idle_ms` reaps one that
 stops speaking and `max_lifetime_ms` one that has been open too long, but
 neither touches a connection that keeps asking, which is exactly the one

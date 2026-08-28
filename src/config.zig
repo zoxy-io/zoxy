@@ -406,6 +406,20 @@ pub const Config = struct {
         /// listener fronting an upload endpoint and another fronting an
         /// API want different numbers, and neither is a pool.
         max_body_bytes: u64 = constants.request_body_bytes_default,
+        /// Requests one client connection may serve before the next
+        /// response announces `Connection: close` (#237); `0` is
+        /// unlimited.
+        ///
+        /// Here for the reason above, applied to the field that used to
+        /// be the rule's standing exception (#305): a request count
+        /// reserves nothing either. It lived in `limits` on the argument
+        /// that a body cap states what an *origin* is asked to carry
+        /// while this bounds what a client occupies *here* — true, and
+        /// beside the point, since neither is a pool. One listener
+        /// fronting long-lived browser connections and another fronting
+        /// a service mesh want different numbers, which is the same
+        /// shape of answer as the cap above.
+        keepalive_requests: u32 = constants.keepalive_requests_default,
 
         /// The upgrade tokens a listener may allow, as a set rather than
         /// a list: the vocabulary is closed, so membership is a field
