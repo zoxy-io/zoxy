@@ -18,6 +18,7 @@ const parser = @import("http/parser.zig");
 const render = @import("http/render.zig");
 const shed = @import("shed.zig");
 const io_module = @import("io/io.zig");
+const json_schema = @import("json_schema.zig");
 
 const assert = std.debug.assert;
 
@@ -6861,6 +6862,284 @@ fn expectParseError(expected: ParseError, json_bytes: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectError(expected, parse(arena_state.allocator(), json_bytes));
+    try expectSchemaAgrees(expected, json_bytes);
+}
+
+/// #305's differential gate, run on every rejection this file states.
+///
+/// `zig build schema` says what a config may *look* like and the loader
+/// says what it may *mean*, and until this nothing checked that the two
+/// agree. A config the schema admits and the loader refuses is a
+/// cross-field rule that a shape could have carried instead — Part 1's
+/// whole argument — so each one has to be named here with the reason it
+/// stays the loader's. What the gate forbids is a *new* one appearing
+/// quietly.
+///
+/// Riding on `expectParseError` rather than on a corpus of its own is
+/// the point: there is no second list to drift, and a rejection added
+/// tomorrow is graded the day it is written.
+fn expectSchemaAgrees(expected: ParseError, json_bytes: []const u8) !void {
+    // A malformed document is the JSON parser's verdict, not the
+    // loader's, and the schema never sees one — `parseFromSlice` below
+    // would fail on exactly the same bytes for exactly the same reason.
+    if (!isValidationError(expected)) {
+        return;
+    }
+    var schema = try renderedSchema();
+    defer schema.deinit();
+    var instance = std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        json_bytes,
+        .{},
+    ) catch return;
+    defer instance.deinit();
+
+    var storage: [json_schema.path_bytes_max]u8 = undefined;
+    const failure = json_schema.validate(schema.value, instance.value, &storage);
+    if (failure == null and schemaGapOf(expected) == null) {
+        std.debug.print(
+            "\nthe schema admits what the loader refuses as {t}. Either the schema " ++
+                "should express it — in which case teach the emitter — or it cannot, " ++
+                "in which case add it to `schema_gaps` with the reason (#305).\n",
+            .{expected},
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// Why the schema cannot reject a config the loader refuses.
+///
+/// Not an excuse list: the categories are the argument. Seven of them
+/// are closed — a schema describes documents, and no document grammar
+/// can parse an address, sum a list of weights, or read another block —
+/// so entries there are permanent and correct. Two are **debt**: a fork or
+/// a bound the schema could carry and does not yet, which is exactly
+/// what #305 Part 1 called a cross-field rule that should have been a
+/// shape. Their counts are pinned below so they only ever fall.
+const SchemaGap = enum {
+    /// The value is text whose *meaning* only a parser knows: an address
+    /// literal, a canonical path or host, a CIDR, a header-name token, a
+    /// media type, an octal mode. A grammar can say "string"; it cannot
+    /// say "and it parses".
+    literal_syntax,
+    /// A length bound on a name the schema has no place to attach one.
+    /// Strictly an object *key* — `clusters`, `bodies` and `error_pages`
+    /// are keyed by operator-chosen names, and a key has no schema of
+    /// its own in this dialect (`propertyNames` is a keyword the emitter
+    /// deliberately does not reach for, #305's closed vocabulary). A
+    /// bound on a *value* is not this: it has somewhere to attach, so it
+    /// belongs in `expressible_bound` and two rows were moved there when
+    /// review caught them filed here.
+    name_length,
+    /// A name that must exist in another block — `cluster` naming a
+    /// cluster, `body` naming a body. A schema validates one document
+    /// against one grammar, not a document against itself.
+    cross_reference,
+    /// Uniqueness judged by a key the schema cannot compute: two binds
+    /// that differ as text and match as addresses, two routes that
+    /// differ in spelling and match after canonicalization.
+    duplicate,
+    /// The filesystem answered, not the document.
+    filesystem,
+    /// §5 arithmetic: a limit judged against another limit, against the
+    /// ring, or against whether any listener asked for the feature it
+    /// sizes. Closed-form budget reasoning, and the banner is where it
+    /// is explained.
+    budget,
+    /// A rule between two blocks the schema cannot hold at once — a
+    /// listener's shape against a cluster's, or against a sibling of its
+    /// own body.
+    cross_block,
+    /// **Debt.** A fork inside one block that `oneOf` could carry: a
+    /// field required exactly when a sibling takes a given value. Every
+    /// one of these is a cross-field rule the loader states in prose and
+    /// a shape could state instead.
+    expressible_fork,
+    /// **Debt.** A bound the schema could carry and the emitter does not
+    /// derive yet: an array's `maxItems`, or a string's `maxLength`
+    /// (`min_length` is emitted already, so only half of that pair
+    /// exists).
+    expressible_bound,
+};
+
+const SchemaGapEntry = struct { name: []const u8, gap: SchemaGap };
+
+/// Every loader rejection the schema does not catch, measured rather
+/// than guessed: the gate above prints what is missing, and this is the
+/// list it printed with a reason attached to each.
+///
+/// One direction only, and worth stating rather than discovering. A row
+/// that is *needed* is proved by the gate: remove it and the case that
+/// escapes the schema fails the build. A row that has become *stale* —
+/// its rule since made expressible — is not caught, and cannot be
+/// cheaply: one error is raised by several cases with different JSON,
+/// the schema may catch some of them and not others, so "the schema
+/// rejected this case" does not mean the row is unnecessary. Deciding
+/// that needs every case for an error collected before any verdict,
+/// which this harness has no hook for. So a paid-off rule has to be
+/// struck from here by whoever pays it off, and re-running the gate
+/// with the row removed is how they check.
+const schema_gaps = [_]SchemaGapEntry{
+    .{ .name = "AccessLogHeaderDuplicate", .gap = .duplicate },
+    .{ .name = "AccessLogHeaderNameInvalid", .gap = .literal_syntax },
+    .{ .name = "AccessLogHeaderNameTooLong", .gap = .expressible_bound },
+    .{ .name = "AccessLogPathMissing", .gap = .expressible_fork },
+    .{ .name = "AccessLogPathOnStdout", .gap = .expressible_fork },
+    .{ .name = "AdminBindInvalid", .gap = .literal_syntax },
+    .{ .name = "BodyContentTypeInvalid", .gap = .literal_syntax },
+    .{ .name = "BodyFileUnreadable", .gap = .filesystem },
+    .{ .name = "BodyNameEmpty", .gap = .name_length },
+    .{ .name = "BodyNameTooLong", .gap = .name_length },
+    .{ .name = "BodySourceAmbiguous", .gap = .expressible_fork },
+    .{ .name = "BodySourceMissing", .gap = .expressible_fork },
+    .{ .name = "BodyUnknown", .gap = .cross_reference },
+    .{ .name = "ClusterCheckHostInvalid", .gap = .literal_syntax },
+    .{ .name = "ClusterCheckHttpFieldOnTcp", .gap = .expressible_fork },
+    .{ .name = "ClusterCheckPathMissing", .gap = .expressible_fork },
+    .{ .name = "ClusterCheckPathNotCanonical", .gap = .literal_syntax },
+    .{ .name = "ClusterNameEmpty", .gap = .name_length },
+    .{ .name = "ClusterNameTooLong", .gap = .name_length },
+    .{ .name = "ClusterPickKeyMissing", .gap = .expressible_fork },
+    .{ .name = "ClusterPickKeyWithoutHash", .gap = .expressible_fork },
+    .{ .name = "ClusterPickNameInvalid", .gap = .literal_syntax },
+    .{ .name = "ClusterPickNameMissing", .gap = .expressible_fork },
+    .{ .name = "ClusterPickNameTooLong", .gap = .expressible_bound },
+    .{ .name = "ClusterPickNameUnexpected", .gap = .expressible_fork },
+    .{ .name = "ClusterProxyProtocolOnHttpListener", .gap = .cross_block },
+    .{ .name = "ClusterProxyProtocolOnTlsListener", .gap = .cross_block },
+    .{ .name = "ClusterUnknown", .gap = .cross_reference },
+    .{ .name = "EndpointInvalid", .gap = .literal_syntax },
+    .{ .name = "EndpointPortZero", .gap = .literal_syntax },
+    .{ .name = "EndpointUnixPathInvalid", .gap = .literal_syntax },
+    .{ .name = "EndpointUnixPathRelative", .gap = .literal_syntax },
+    .{ .name = "EndpointWeightsAllZero", .gap = .budget },
+    .{ .name = "ErrorPageStatusInvalid", .gap = .literal_syntax },
+    .{ .name = "FilterClientCidrHostBits", .gap = .literal_syntax },
+    .{ .name = "FilterClientCidrInvalid", .gap = .literal_syntax },
+    .{ .name = "FilterClientPrefixInvalid", .gap = .literal_syntax },
+    .{ .name = "FilterClientPrefixTooNarrow", .gap = .literal_syntax },
+    .{ .name = "FilterHeaderEditsOverLimit", .gap = .expressible_bound },
+    .{ .name = "FilterHeaderNameInvalid", .gap = .literal_syntax },
+    .{ .name = "FilterHeaderNameReserved", .gap = .literal_syntax },
+    .{ .name = "FilterHeaderValueInvalid", .gap = .literal_syntax },
+    .{ .name = "FilterRedirectTarget", .gap = .literal_syntax },
+    .{ .name = "LimitAccessLogBufferUnderLine", .gap = .budget },
+    .{ .name = "LimitAccessLogBufferWithoutSink", .gap = .budget },
+    .{ .name = "LimitConnSlotsOverCqFill", .gap = .budget },
+    .{ .name = "LimitHeadBuffersOutOfRange", .gap = .budget },
+    .{ .name = "LimitHeadBuffersOverConnSlots", .gap = .budget },
+    .{ .name = "LimitHeadBuffersWithoutHttpListener", .gap = .budget },
+    .{ .name = "LimitRelayBufferUnderSniRouting", .gap = .budget },
+    .{ .name = "LimitRelayBuffersOverConnSlots", .gap = .budget },
+    .{ .name = "LimitTlsEnginesOverConnSlots", .gap = .budget },
+    .{ .name = "LimitTlsEnginesWithoutTlsListener", .gap = .budget },
+    .{ .name = "LimitTunnelsOverConnSlots", .gap = .budget },
+    .{ .name = "LimitTunnelsRequired", .gap = .budget },
+    .{ .name = "LimitTunnelsWithoutUpgrades", .gap = .budget },
+    .{ .name = "LimitUpstreamHeadBuffersOutOfRange", .gap = .budget },
+    .{ .name = "LimitUpstreamHeadBuffersOverUpstreamSlots", .gap = .budget },
+    .{ .name = "LimitUpstreamHeadBuffersWithoutHttpListener", .gap = .budget },
+    .{ .name = "ListenerBindDuplicate", .gap = .duplicate },
+    .{ .name = "ListenerBindInvalid", .gap = .literal_syntax },
+    .{ .name = "ListenerBindUnixPathInvalid", .gap = .literal_syntax },
+    .{ .name = "ListenerBindUnixPathRelative", .gap = .literal_syntax },
+    .{ .name = "ListenerL4RequestKeyedHash", .gap = .cross_block },
+    .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
+    .{ .name = "ListenerModeWithoutUnixBind", .gap = .cross_block },
+    .{ .name = "ListenerTlsWithSniRoutes", .gap = .cross_block },
+    .{ .name = "ListenerUnixBindClientMatch", .gap = .cross_block },
+    .{ .name = "ListenerUnixBindClusterSend", .gap = .cross_block },
+    .{ .name = "ListenerUnixBindForwarded", .gap = .cross_block },
+    .{ .name = "ListenerUnixBindSourceIpHash", .gap = .cross_block },
+    .{ .name = "ResponseFilterHeaderEditsOverLimit", .gap = .expressible_bound },
+    .{ .name = "ResponseFilterRedirect", .gap = .expressible_fork },
+    .{ .name = "ResponseFilterReject", .gap = .expressible_fork },
+    .{ .name = "ResponseFilterRespond", .gap = .expressible_fork },
+    .{ .name = "ResponseFilterRewrite", .gap = .expressible_fork },
+    .{ .name = "RouteDuplicate", .gap = .duplicate },
+    .{ .name = "RouteHostNotCanonical", .gap = .literal_syntax },
+    .{ .name = "RoutePrefixNotCanonical", .gap = .literal_syntax },
+    .{ .name = "RouteSniIsAddress", .gap = .literal_syntax },
+    .{ .name = "TimeoutOrderInvalid", .gap = .budget },
+};
+
+comptime {
+    // 81 rows against 146 error members is ~12k comparisons, well past
+    // the default budget and still trivial at compile time.
+    @setEvalBranchQuota(200_000);
+    // Every name here must be a real member, or a renamed error would
+    // leave a row that excuses nothing and hides its successor.
+    for (schema_gaps) |entry| {
+        var found = false;
+        for (@typeInfo(ValidationError).error_set.?) |candidate| {
+            if (std.mem.eql(u8, candidate.name, entry.name)) found = true;
+        }
+        if (!found) @compileError("schema_gaps names no such ValidationError: " ++ entry.name);
+    }
+    // And no name twice, or one row would shadow a second reason.
+    for (schema_gaps, 0..) |entry, index| {
+        for (schema_gaps[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, entry.name, other.name)) {
+                @compileError("schema_gaps names " ++ entry.name ++ " twice");
+            }
+        }
+    }
+}
+
+fn schemaGapOf(expected: ParseError) ?SchemaGap {
+    inline for (schema_gaps) |entry| {
+        if (expected == @field(ValidationError, entry.name)) return entry.gap;
+    }
+    return null;
+}
+
+test "config: the schema's debt to the loader only ever falls (#305)" {
+    // The measurable definition of the freeze being done. Seven gap
+    // categories are closed by what a schema *is*; these two are things
+    // the emitter could express and does not, so they are the work that
+    // remains — pinned, so a new one cannot arrive quietly and an old
+    // one cannot be paid off without saying so.
+    var forks: usize = 0;
+    var bounds: usize = 0;
+    for (schema_gaps) |entry| {
+        switch (entry.gap) {
+            .expressible_fork => forks += 1,
+            .expressible_bound => bounds += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 14), forks);
+    try std.testing.expectEqual(@as(usize, 4), bounds);
+}
+
+/// Whether `expected` is the loader's own verdict rather than the JSON
+/// parser's. `ParseError` is the union of both, and only the loader's
+/// half is a claim about config *shape*.
+fn isValidationError(expected: ParseError) bool {
+    inline for (@typeInfo(ValidationError).error_set.?) |candidate| {
+        if (expected == @field(ValidationError, candidate.name)) return true;
+    }
+    return false;
+}
+
+/// The rendered schema, parsed fresh for each case rather than cached.
+///
+/// A cache would outlive the test that filled it and every allocator
+/// this suite runs under would call that a leak — which it would be. The
+/// document is 60 KiB and this is a test path, so re-rendering is the
+/// cheaper mistake to make.
+var schema_storage: [128 * 1024]u8 = undefined;
+
+fn renderedSchema() !std.json.Parsed(std.json.Value) {
+    var writer = std.Io.Writer.fixed(&schema_storage);
+    try @import("config_schema.zig").writeSchema(&writer);
+    return std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        writer.buffered(),
+        .{},
+    );
 }
 
 /// The success-path mirror of `expectParseError`: inits `arena_state`
@@ -6872,7 +7151,46 @@ fn expectParseError(expected: ParseError, json_bytes: []const u8) !void {
 /// early return would deinit an uninitialized arena.
 fn expectParseOk(arena_state: *std.heap.ArenaAllocator, json_bytes: []const u8) !Config {
     arena_state.* = std.heap.ArenaAllocator.init(std.testing.allocator);
-    return parse(arena_state.allocator(), json_bytes);
+    const parsed = try parse(arena_state.allocator(), json_bytes);
+    try expectSchemaAccepts(json_bytes);
+    return parsed;
+}
+
+/// The other half of #305's gate, and the cheaper one: whatever the
+/// loader accepts, the schema must accept too.
+///
+/// This direction has no exemptions and never will. A schema that
+/// rejects a working config is not a conservative schema — it is a lie
+/// told to every editor that reads it, and the operator who believes it
+/// deletes a key that was fine. `zig build schema` exists to be trusted
+/// by tools that will never run the loader.
+fn expectSchemaAccepts(json_bytes: []const u8) !void {
+    var schema = try renderedSchema();
+    defer schema.deinit();
+    var instance = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        json_bytes,
+        .{},
+    );
+    defer instance.deinit();
+
+    var storage: [json_schema.path_bytes_max]u8 = undefined;
+    if (json_schema.validate(schema.value, instance.value, &storage)) |failure| {
+        std.debug.print(
+            "\nthe schema rejects what the loader accepts: {s} at '{s}' (#305)\n",
+            .{ @tagName(failure.reason), failure.path },
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "config: the shipped example validates against its own schema (#305)" {
+    // The one config in the tree, held to the document `zig build schema`
+    // hands an editor. It is the example an operator starts from, so a
+    // schema that flags it would be wrong about the first file anybody
+    // writes.
+    try expectSchemaAccepts(@embedFile("example_config"));
 }
 
 test "config: a table far past the old caps parses, and is bounded only by itself" {
