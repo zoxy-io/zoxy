@@ -816,6 +816,34 @@ Rules:
   shape.
 - **The config arena is the only allocating region** — parse-once,
   immutable, shared read-only. (Carried verbatim; it worked.)
+- **`limits` holds reservations; policy lives where the policy applies.**
+  The rule sorts on one question — does the number decide what this
+  process *takes* at startup? — and it is written here rather than in a
+  field's doc comment because that is where the next field cannot find
+  it (#305 Part 2).
+  A pool size is a reservation: `conn_slots`, `relay_buffers`,
+  `head_buffers`, `tls_engines`, `tunnels`, `access_log_buffer_bytes`.
+  So is `cq_fill_eighths`, which is not a pool but sizes the ring this
+  process asks the kernel for — the block's rule is about reservation,
+  not about being a count of objects.
+  A cap that reserves nothing states policy and belongs on the thing it
+  governs. `max_body_bytes` argued this first, and `keepalive_requests`
+  was the standing exception until the freeze moved it beside that cap:
+  a per-connection request count takes nothing at startup either, and
+  the old defence — that a body cap says what an *origin* is asked to
+  carry while a request count bounds what a client occupies *here* — is
+  true and beside the point, since the rule asks about reservation and
+  neither is a pool.
+  **`timeouts` is a third home and stays one.** A deadline reserves
+  nothing and governs no single block, and `health_interval_ms` is why
+  the rule cannot simply push everything outward: it paces the *one*
+  global probe sweep (§7), sweep-end to sweep-start across every checked
+  cluster, and §5's closed-form probe reservation is derived from there
+  being exactly one. A cluster's `check` block holds what is genuinely
+  per cluster — `fall`, `rise`, `timeout_ms`, the HTTP fields — and the
+  pacing is not that. Moving it in would not be tidying two homes into
+  one; it would be a per-cluster prober, which is a different design and
+  a different budget.
 - **The config surface has a generated JSON Schema.** `zig build schema`
   reflects over the `*Json` parse structs and their co-located metadata
   (`src/config_schema.zig`) to emit a draft 2020-12 schema — structure,

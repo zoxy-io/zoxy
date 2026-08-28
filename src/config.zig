@@ -83,6 +83,15 @@ pub const Config = struct {
     /// HAProxy's `inter` (`constants.health_interval_ms_default`). Zero is
     /// rejected — a pause of nothing would probe in a tight loop. Each
     /// probe dials under `connect_timeout_ms`, its own budget.
+    ///
+    /// Here and not in the cluster's `check` block beside `fall`, `rise`
+    /// and `timeout_ms`, which #305 asked about. Those three are per
+    /// cluster; this is not. There is one sweep and one rest timer for
+    /// the whole process, pacing sweep-end to sweep-start across every
+    /// checked cluster at once, and §5's closed-form probe reservation
+    /// is derived from there being exactly one. A per-cluster interval
+    /// would be a per-cluster prober — a different design and a
+    /// different budget, not a tidier config.
     health_interval_ms: u32 = constants.health_interval_ms_default,
     /// Effective pool sizes (§5, §8). The comptime constants stay the
     /// hard, budget-asserted ceilings; config may only shrink below them
