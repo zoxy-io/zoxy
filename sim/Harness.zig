@@ -206,6 +206,10 @@ upgrades_http: bool,
 /// on every clean seed, since a `413` is a status its scripts did not ask
 /// for.
 max_body_bytes: u64,
+/// The #237 keep-alive request cap this run's http listener carries.
+/// On the listener since the freeze (#305), so the harness derives it
+/// beside the body cap rather than into `limits`.
+keepalive_requests: u32,
 /// The seed's http origin prefixes an interim `100 Continue` to every
 /// answer (#232). Drawn once per seed rather than per accept, so a clean
 /// seed's transcript stays exact — which is the point: the golden oracle
@@ -653,6 +657,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     deriveRetries(harness, random);
     deriveUpgrades(harness, random);
     harness.max_body_bytes = deriveMaxBodyBytes(harness.clean, random);
+    harness.keepalive_requests = deriveKeepaliveRequests(harness.clean, random);
     // A quarter of seeds. Clean ones included, deliberately: an
     // adversarial seed only holds the transcript to a legal *prefix*, so
     // a proxy that settled on the interim and dropped the real answer
@@ -850,7 +855,7 @@ fn deriveServerConfig(
         // capped connection announces a close its script did not ask for,
         // and a clean seed's golden transcript forbids that. `0` leaves it
         // unlimited, which is every clean seed and most others.
-        .limits = .{ .keepalive_requests = deriveKeepaliveRequests(harness.clean, random) },
+        .limits = .{},
         // Three seeds in four run with the access log on, so the sink,
         // its staging swap, and the per-request captures all take the
         // schedule fuzz; the fourth leaves it off, which is the shape
@@ -1404,6 +1409,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .forwarded = forwarded,
             .upgrades = .{ .websocket = harness.upgrades_http },
             .max_body_bytes = harness.max_body_bytes,
+            .keepalive_requests = harness.keepalive_requests,
         },
         .{
             .bind_address = .{ .ip = tlsBindAddress() },

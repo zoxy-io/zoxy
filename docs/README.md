@@ -386,15 +386,21 @@ full handshake.
 
 By default any request carrying `Upgrade` is answered `501` — the same as
 `CONNECT`, and what every config that does not name an allowlist keeps
-getting. An `http` listener opts in by naming the tokens it will carry:
+getting. An `http` listener opts in by naming what it will carry:
 
 ```json
 "listeners": [
     { "bind": "0.0.0.0:80", "http": { "cluster": "web",
-      "upgrades": ["websocket"] } }
+      "upgrades": { "websocket": true } } }
 ],
 "limits": { "tunnels": 512 }
 ```
+
+One flag per protocol rather than a list of tokens, so the vocabulary
+lives in the schema: an editor rejects `"h2c"` before the loader does,
+and there is no way to write the same token twice. Omitting the block,
+writing `{}`, or setting every flag `false` all mean the same thing —
+allow none, reserve nothing.
 
 zoxy does not speak WebSocket. It forwards the handshake, recognises the
 origin's `101 Switching Protocols`, and from that point relays bytes both
@@ -1327,8 +1333,7 @@ reserves nor demands the ceiling's resources.
     "head_buffers": 1024,
     "upstream_head_buffers": 512,
     "head_buffer_bytes": 16384,
-    "tunnels": 512,
-    "keepalive_requests": 1000
+    "tunnels": 512
 }
 ```
 
@@ -1362,8 +1367,10 @@ relay-buffer pair (8200 bytes), held for the tunnel's whole life rather than
 for the duration of a request, which is why they are reserved apart from
 `relay_buffers` instead of drawn from it.
 
-`keepalive_requests` bounds how many requests one client connection may
-serve — **1000 by default**, nginx's figure, and `0` is unlimited. It is
+`keepalive_requests` — on an `http` listener, beside `max_body_bytes`,
+not in `limits`, because it reserves nothing and states policy — bounds
+how many requests one client connection may serve. **1000 by default**,
+nginx's figure, and `0` is unlimited. It is
 the one bound that reaches a *busy* connection: `idle_ms` reaps one that
 stops speaking and `max_lifetime_ms` one that has been open too long, but
 neither touches a connection that keeps asking, which is exactly the one

@@ -83,6 +83,15 @@ pub const Config = struct {
     /// HAProxy's `inter` (`constants.health_interval_ms_default`). Zero is
     /// rejected — a pause of nothing would probe in a tight loop. Each
     /// probe dials under `connect_timeout_ms`, its own budget.
+    ///
+    /// Here and not in the cluster's `check` block beside `fall`, `rise`
+    /// and `timeout_ms`, which #305 asked about. Those three are per
+    /// cluster; this is not. There is one sweep and one rest timer for
+    /// the whole process, pacing sweep-end to sweep-start across every
+    /// checked cluster at once, and §5's closed-form probe reservation
+    /// is derived from there being exactly one. A per-cluster interval
+    /// would be a per-cluster prober — a different design and a
+    /// different budget, not a tidier config.
     health_interval_ms: u32 = constants.health_interval_ms_default,
     /// Effective pool sizes (§5, §8). The comptime constants stay the
     /// hard, budget-asserted ceilings; config may only shrink below them
@@ -406,6 +415,20 @@ pub const Config = struct {
         /// listener fronting an upload endpoint and another fronting an
         /// API want different numbers, and neither is a pool.
         max_body_bytes: u64 = constants.request_body_bytes_default,
+        /// Requests one client connection may serve before the next
+        /// response announces `Connection: close` (#237); `0` is
+        /// unlimited.
+        ///
+        /// Here for the reason above, applied to the field that used to
+        /// be the rule's standing exception (#305): a request count
+        /// reserves nothing either. It lived in `limits` on the argument
+        /// that a body cap states what an *origin* is asked to carry
+        /// while this bounds what a client occupies *here* — true, and
+        /// beside the point, since neither is a pool. One listener
+        /// fronting long-lived browser connections and another fronting
+        /// a service mesh want different numbers, which is the same
+        /// shape of answer as the cap above.
+        keepalive_requests: u32 = constants.keepalive_requests_default,
 
         /// The upgrade tokens a listener may allow, as a set rather than
         /// a list: the vocabulary is closed, so membership is a field
@@ -760,8 +783,6 @@ pub const ValidationError = error{
     RouteHostNotCanonical,
     RouteDuplicate,
     ListenerMaxBodyBytesOutOfRange,
-    ListenerUpgradesEmpty,
-    ListenerUpgradeTokenUnknown,
     ListenerForwardedModeUnknown,
     ListenerProxyProtocolModeUnknown,
     ListenerTlsWithSniRoutes,
@@ -2073,10 +2094,13 @@ pub const HttpListenerJson = struct {
     forwarded: ?ForwardedJson = null,
     /// Optional #180 upgrade allowlist; absent allows none, so an
     /// `Upgrade` stays the 501 it has always been.
-    upgrades: ?[]const []const u8 = null,
-    /// Optional #236 request-body cap; absent means one MiB, `0` means
-    /// no cap.
-    max_body_bytes: ?u64 = null,
+    upgrades: ?UpgradesJson = null,
+    /// The #236 request-body cap, `0` accepting any size (#305). Not
+    /// optional: `null` used to mean the default and `0` no cap, which
+    /// is three states for a two-state idea, and every other cap in this
+    /// config — `drain_deadline_ms`, `max_lifetime_ms`, `request_ms` —
+    /// already spells "no cap" as `0` with no third state to explain.
+    max_body_bytes: u64 = constants.request_body_bytes_default,
     /// Whether this listener names *why* it refused, in an RFC 9209
     /// `Proxy-Status` field (#300). Absent is off.
     proxy_status: bool = false,
@@ -2103,8 +2127,8 @@ pub const HttpListenerJson = struct {
                 "absent leaves the header untouched.",
         },
         .max_body_bytes = .{
-            .desc = "Cap on one request body in bytes; absent means 1 MiB, 0 " ++
-                "accepts any size. A body over the cap is refused 413 before the " ++
+            .desc = "Cap on one request body in bytes; 0 accepts any size, and " ++
+                "absent is 1 MiB. A body over the cap is refused 413 before the " ++
                 "origin is dialed where its length was declared, and the " ++
                 "connection closes.",
             .minimum = 0,
@@ -2120,10 +2144,51 @@ pub const HttpListenerJson = struct {
         .upgrades = .{
             .desc = "Protocol upgrades this listener will carry as tunnels; absent " ++
                 "allows none and an Upgrade stays 501. Requires limits.tunnels.",
-            .min_items = 1,
-            .items = SchemaItems.upgrade_token,
         },
     };
+};
+
+/// The #180 upgrade allowlist, one flag per protocol this proxy can
+/// recognise (#305 Part 2).
+///
+/// An object rather than the list of tokens this replaced, and the
+/// argument is the vocabulary: §7 requires it closed — a token zoxy
+/// cannot reason about must be refused by name, never ignored — and a
+/// list of strings can only be closed by the loader, in rules a reader
+/// of the schema never sees. As fields, the schema states the whole
+/// vocabulary, `additionalProperties: false` rejects an unknown token,
+/// and duplicates stop being expressible at all: the list form accepted
+/// `["websocket", "websocket"]` because nothing checked, and there is no
+/// spelling of that here.
+pub const UpgradesJson = struct {
+    websocket: bool = false,
+
+    pub const schema_doc =
+        "Which protocol upgrades this listener carries as tunnels. Absent, or " ++
+        "every flag false, allows none.";
+    pub const schema_fields = .{
+        .websocket = .{
+            .desc = "Carry a WebSocket handshake (RFC 6455) as a tunnel once the " ++
+                "origin answers 101. Requires limits.tunnels.",
+        },
+    };
+
+    comptime {
+        // The JSON shape and the resolved one are one vocabulary. A
+        // protocol added to either and forgotten on the other would let
+        // the config name an upgrade the serving path cannot gate, or
+        // hide one it can.
+        const resolved = @typeInfo(Config.Listener.Upgrades).@"struct".fields;
+        const json = @typeInfo(UpgradesJson).@"struct".fields;
+        if (resolved.len != json.len) {
+            @compileError("UpgradesJson and Config.Listener.Upgrades disagree on the set");
+        }
+        for (resolved) |field| {
+            if (!@hasField(UpgradesJson, field.name)) {
+                @compileError("UpgradesJson is missing " ++ field.name);
+            }
+        }
+    }
 };
 
 /// What an `l4` listener carries. It forks on the upstream the way an
@@ -3146,9 +3211,11 @@ pub const ClustersJson = struct {
 
 /// Marker for array-item vocabularies reflection can't infer from the
 /// element type alone. `http_method` means "the items are the registered
-/// HTTP method tokens" and `upgrade_token` "the #180 upgrade set's field
-/// names", each of which `config_schema.zig` emits as a token enum.
-pub const SchemaItems = enum { http_method, upgrade_token };
+/// HTTP method tokens", which `config_schema.zig` emits as a token
+/// enum. #180's upgrade set used to be the second member; it is a flag
+/// object now (#305), so the schema states its vocabulary as fields and
+/// needs no item marker.
+pub const SchemaItems = enum { http_method };
 
 /// The attribute keys a `schema_fields` entry may carry beyond `.desc`.
 /// `assert_meta_matches` rejects any other key at comptime, so a typo'd
@@ -4898,8 +4965,7 @@ fn resolveRetries(retries: u16) ParseError!u16 {
 /// ignored: a byte relay parses no request to measure, so a cap there
 /// describes a proxy that is not running — the same refusal `forwarded`
 /// and `upgrades` get, for the same reason.
-fn resolveMaxBodyBytes(max_body_bytes: ?u64) ValidationError!u64 {
-    const cap = max_body_bytes orelse return constants.request_body_bytes_default;
+fn resolveMaxBodyBytes(cap: u64) ValidationError!u64 {
     if (cap > constants.request_body_bytes_max) {
         return error.ListenerMaxBodyBytesOutOfRange;
     }
@@ -4909,40 +4975,28 @@ fn resolveMaxBodyBytes(max_body_bytes: ?u64) ValidationError!u64 {
 /// Resolve a listener's #180 upgrade allowlist. Absent allows none, so
 /// an `Upgrade` keeps the `501` it has always got.
 ///
-/// The vocabulary is the `Upgrades` set's own field names, which *are*
-/// the JSON tokens — the same one-source-of-truth the `protocol` and
-/// `pick` matches use, so a token the proxy can carry and a token an
-/// operator may write cannot drift apart. Anything else is refused by
-/// name rather than ignored: a config that asked to tunnel `h2c` and got
-/// silence would believe it had, and after `101` there is no rule left
-/// to catch what came through.
-///
-/// An empty list is refused too. It reads as "allow nothing", which
-/// already has a spelling — omit the field — and configured this way it
-/// would demand a `limits.tunnels` for a listener that can never use
-/// one.
+/// The vocabulary is `UpgradesJson`'s own fields, held to the resolved
+/// set's by a comptime check there — so a protocol the proxy can carry
+/// and one an operator may write cannot drift apart. Anything else is
+/// refused by the strict parser rather than by a rule here (#305): a
+/// config that asked to tunnel `h2c` and got silence would believe it
+/// had, and after `101` there is no rule left to catch what came
+/// through.
 fn resolveUpgrades(
-    upgrades_json: ?[]const []const u8,
+    upgrades_json: ?UpgradesJson,
 ) ValidationError!Config.Listener.Upgrades {
-    const tokens = upgrades_json orelse return .{};
-    if (tokens.len == 0) {
-        return error.ListenerUpgradesEmpty;
-    }
-    assert(tokens.len >= 1);
+    const asked = upgrades_json orelse return .{};
     var upgrades: Config.Listener.Upgrades = .{};
-    for (tokens) |token| {
-        var matched = false;
-        inline for (@typeInfo(Config.Listener.Upgrades).@"struct".fields) |field| {
-            if (std.mem.eql(u8, token, field.name)) {
-                @field(upgrades, field.name) = true;
-                matched = true;
-            }
-        }
-        if (!matched) {
-            return error.ListenerUpgradeTokenUnknown;
-        }
+    inline for (@typeInfo(UpgradesJson).@"struct".fields) |field| {
+        @field(upgrades, field.name) = @field(asked, field.name);
     }
-    assert(upgrades.any()); // A non-empty list of known tokens sets one.
+    // No rejection for "every flag false", and the shape is why. An
+    // empty *list* was a meaningless spelling of a set, so it was
+    // refused; a set of flags all false is the ordinary way to write
+    // "not this one" — which a templated config does constantly — and
+    // it already means exactly what omitting the block means. Nothing
+    // §5 rests on it either: the tunnel pool keys off `any()`, so an
+    // all-false block reserves nothing, same as absent.
     return upgrades;
 }
 
@@ -5139,7 +5193,17 @@ fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFea
         if (try protocolOf(&listener_json) == .http) features.http += 1;
         if (listener_json.tls != null) features.tls += 1;
         if (listener_json.http) |http_json| {
-            if (http_json.upgrades != null) features.upgrades += 1;
+            // What the pool is sized against is a listener that *allows*
+            // an upgrade, not one that mentions the key. Under the list
+            // form those were the same thing, because an empty list was
+            // refused; under the flag object they are not — `{}` and
+            // `{"websocket": false}` mean the same as absent (#305), and
+            // counting them would demand a tunnel pool for a listener
+            // that can never open one.
+            if (http_json.upgrades) |upgrades| {
+                const allowed = try resolveUpgrades(upgrades);
+                if (allowed.any()) features.upgrades += 1;
+            }
         }
         if (listener_json.l4) |l4_json| {
             if (l4_json.routes != null) features.sni += 1;
@@ -8368,6 +8432,65 @@ test "config: the body cap holds on both arms, exactly" {
     }
 }
 
+test "config: the body cap is two-valued, and 0 is how uncapped is spelled (#305)" {
+    // `null` used to mean 1 MiB and `0` no cap — three states for a
+    // two-state idea, and the odd one out in its own config:
+    // `drain_deadline_ms`, `max_lifetime_ms` and `request_ms` all spell
+    // "no cap" as `0` with nothing else to explain.
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    const tail = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+
+    // Absent is still the default it always was, so a config that never
+    // named the key keeps its cap.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
+        try std.testing.expectEqual(
+            constants.request_body_bytes_default,
+            parsed.listeners[0].max_body_bytes,
+        );
+    }
+    // And `0` is uncapped, unchanged.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ ",\"max_body_bytes\":0" ++ tail);
+        try std.testing.expectEqual(@as(u64, 0), parsed.listeners[0].max_body_bytes);
+    }
+    // The ceiling holds at its edge rather than near it.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const at_limit = std.fmt.comptimePrint(
+            ",\"max_body_bytes\":{d}",
+            .{constants.request_body_bytes_max},
+        );
+        const parsed = try expectParseOk(&arena_state, head ++ at_limit ++ tail);
+        try std.testing.expectEqual(
+            constants.request_body_bytes_max,
+            parsed.listeners[0].max_body_bytes,
+        );
+    }
+    try expectParseError(
+        error.ListenerMaxBodyBytesOutOfRange,
+        head ++ std.fmt.comptimePrint(
+            ",\"max_body_bytes\":{d}",
+            .{constants.request_body_bytes_max + 1},
+        ) ++ tail,
+    );
+    // An l4 relay measures no request, so the key does not exist there —
+    // the strict parser's refusal, not a rule's (#305).
+    try expectParseError(
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"max_body_bytes\":500}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
+}
+
 test "config: max_inflight resolves, defaults to uncapped, rejects the useless" {
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
@@ -9116,7 +9239,7 @@ test "config: the upgrade allowlist is closed, http-only, and never empty" {
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
-        const parsed = try expectParseOk(&arena_state, head ++ "[\"websocket\"]" ++ tail);
+        const parsed = try expectParseOk(&arena_state, head ++ "{\"websocket\":true}" ++ tail);
         try std.testing.expect(parsed.listeners[0].upgrades.websocket);
         try std.testing.expect(parsed.listeners[0].upgrades.any());
         // Per listener, and the l4 one beside it allows nothing — which is
@@ -9124,15 +9247,47 @@ test "config: the upgrade allowlist is closed, http-only, and never empty" {
         try std.testing.expect(!parsed.listeners[1].upgrades.any());
         try std.testing.expectEqual(@as(u32, 16), parsed.limits.tunnels);
     }
-    // A token this proxy cannot reason about is refused by name, never
-    // ignored: `h2c` would tunnel HTTP/2 to an origin it cannot parse,
-    // and a config that asked for it and got silence would believe it
-    // had — with no rule left after 101 to catch what came through.
-    try expectParseError(error.ListenerUpgradeTokenUnknown, head ++ "[\"h2c\"]" ++ tail);
-    try expectParseError(error.ListenerUpgradeTokenUnknown, head ++ "[\"websocket\",\"h2c\"]" ++ tail);
-    // "Allow nothing" already has a spelling — omit the field — and this
-    // one would demand a tunnel pool for a listener that can never use it.
-    try expectParseError(error.ListenerUpgradesEmpty, head ++ "[]" ++ tail);
+    // A protocol this proxy cannot reason about is refused by name,
+    // never ignored: `h2c` would tunnel HTTP/2 to an origin it cannot
+    // parse, and a config that asked for it and got silence would
+    // believe it had — with no rule left after 101 to catch what came
+    // through. As a field rather than a token, that refusal is the
+    // strict parser's and the schema's, not a rule of the loader's
+    // (#305) — and a duplicate stops being expressible at all, where
+    // the list form accepted `["websocket", "websocket"]` unchecked.
+    try expectParseError(error.UnknownField, head ++ "{\"h2c\":true}" ++ tail);
+    try expectParseError(
+        error.UnknownField,
+        head ++ "{\"websocket\":true,\"h2c\":true}" ++ tail,
+    );
+    // And "allow none" needs no rejection any more. An empty *list* was
+    // a meaningless spelling of a set; a set of flags all false is the
+    // ordinary way to write "not this one", means what omitting the
+    // block means, and reserves nothing — so the error this used to
+    // raise is gone rather than moved.
+    // Without a `tunnels` limit, because an all-false block reserves
+    // nothing — asking for a pool beside one is still the §5 mismatch
+    // it always was, and the case below pins that too.
+    const quiet_tail =
+        \\}},{"bind":"127.0.0.1:2","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    inline for (.{ "{}", "{\"websocket\":false}" }) |spelling| {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ spelling ++ quiet_tail);
+        try std.testing.expect(!parsed.listeners[0].upgrades.any());
+        // Reserves nothing, which is what says it is absence rather than
+        // a listener asking for a pool it can never use (§5).
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.tunnels);
+        // And it is exactly absence: a pool beside it is the same
+        // mismatch omitting the block would earn.
+        try expectParseError(
+            error.LimitTunnelsWithoutUpgrades,
+            head ++ spelling ++ tail,
+        );
+    }
 }
 
 test "config: upgrades are refused on an l4 listener" {
@@ -9141,7 +9296,7 @@ test "config: upgrades are refused on an l4 listener" {
     // refusal is the strict parser's rather than a rule's — a block that
     // quietly did nothing was never the alternative.
     try expectParseError(error.UnknownField,
-        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a","upgrades":["websocket"]}}],
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a","upgrades":{"websocket":true}}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "limits":{"tunnels":4},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
@@ -9151,7 +9306,7 @@ test "config: upgrades are refused on an l4 listener" {
 test "config: the tunnel pool has no derived default, and binds to the allowlist" {
     const with_upgrades =
         \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
-        \\ "upgrades":["websocket"]}}],
+        \\ "upgrades":{"websocket":true}}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}
     ;
@@ -9201,7 +9356,7 @@ test "config: the tunnel pool may not exceed the connections that hold one" {
         "{s}{d}{s}",
         .{
             \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
-            \\ "upgrades":["websocket"]}}],
+            \\ "upgrades":{"websocket":true}}}],
             \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
             \\ "limits":{"conn_slots":8,"tunnels":
             ,
@@ -9217,7 +9372,7 @@ test "config: the tunnel pool may not exceed the connections that hold one" {
 test "config: tunnel_ms defaults to an hour and has no off switch" {
     const head =
         \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a",
-        \\ "upgrades":["websocket"]}}],
+        \\ "upgrades":{"websocket":true}}}],
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:9"]}},
         \\ "limits":{"tunnels":4},
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1

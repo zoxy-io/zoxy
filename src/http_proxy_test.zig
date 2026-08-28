@@ -738,11 +738,11 @@ const Http1Bed = struct {
         bed.config = .{
             .listeners = &bed.listeners,
             .clusters = &bed.clusters,
-            // The #237 cap is read off the *config*, which is where the
-            // loader puts it; `InitOptions` sizes the pools. The bed keeps
-            // the rest of `limits` at its struct defaults, which is what
-            // every test before this one was measuring against.
-            .limits = .{ .keepalive_requests = options.keepalive_requests },
+            // `InitOptions` sizes the pools; the bed keeps `limits` at
+            // its struct defaults, which is what every test before this
+            // one was measuring against. The #237 cap moved onto the
+            // listener with the freeze (#305) and is set there.
+            .limits = .{},
             .connect_timeout_ms = connect_timeout_ms,
             .idle_timeout_ms = idle_timeout_ms,
             // Mirrors the idle window unless a test is about the split
@@ -778,6 +778,7 @@ const Http1Bed = struct {
             .protocol = .http,
             .upgrades = options.upgrades,
             .max_body_bytes = options.max_body_bytes,
+            .keepalive_requests = options.keepalive_requests,
             .forwarded = options.forwarded,
             .proxy_status = options.proxy_status,
             // Paths nothing reads: the bed embeds the PEMs, so what this

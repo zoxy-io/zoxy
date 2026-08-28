@@ -283,7 +283,6 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
             if (comptime @hasField(@TypeOf(meta), "items")) {
                 switch (meta.items) {
                     .http_method => try writeMethodEnum(out),
-                    .upgrade_token => try writeUpgradeEnum(out),
                 }
             } else {
                 try out.objectField("type");

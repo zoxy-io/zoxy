@@ -2238,12 +2238,12 @@ pub fn Proxy(comptime IoType: type) type {
         /// connection has none — and the occupancy this bounds is a client's, not an
         /// origin's. If an origin wants its own bound it can announce it,
         /// and §7 already honors what an origin says about persistence.
-        fn requestsCapReached(server: *const ServerType, conn: *const ConnType) bool {
+        fn requestsCapReached(conn: *const ConnType) bool {
             // Every caller answers a request that `routeRequest` already
             // counted, so a zero here would mean the cap was consulted for
             // a request nobody served.
             assert(conn.requests_served >= 1);
-            const cap = server.config.limits.keepalive_requests;
+            const cap = conn.keepalive_requests;
             if (cap == 0) return false; // Unlimited.
             return conn.requests_served >= cap;
         }
@@ -2272,7 +2272,7 @@ pub fn Proxy(comptime IoType: type) type {
         /// already closing for one of those never reaches the check.
         fn applyRequestCap(server: *ServerType, conn: *const ConnType, would_keep: bool) bool {
             if (!would_keep) return false;
-            if (!requestsCapReached(server, conn)) return true;
+            if (!requestsCapReached(conn)) return true;
             server.counters.increment("l7_keepalive_requests_capped");
             return false;
         }
@@ -2316,7 +2316,7 @@ pub fn Proxy(comptime IoType: type) type {
                 !server.keepAliveSuppressed();
             if (!would_keep) return .{ .keep = false, .capped = false };
             const persistence: StaticPersistence = blk: {
-                const capped = requestsCapReached(server, conn);
+                const capped = requestsCapReached(conn);
                 break :blk .{ .keep = !capped, .capped = capped };
             };
             // The negative space the struct's doc promises, checked on the

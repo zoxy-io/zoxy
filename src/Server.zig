@@ -384,6 +384,9 @@ pub fn Server(comptime IoType: type) type {
             /// own socket what it may carry.
             upgrades: config_module.Config.Listener.Upgrades,
             max_body_bytes: u64,
+            /// The listener's #237 keep-alive request cap (#305), carried
+            /// for the same reason as the caps beside it.
+            keepalive_requests: u32,
             /// The listener's §7 client-address forwarding mode (null = off),
             /// handed over the same way: trust depends on what is in front
             /// of this socket, so it cannot live on the cluster.
@@ -1081,6 +1084,7 @@ pub fn Server(comptime IoType: type) type {
                     .sni_routes = listener_config.sni_routes,
                     .upgrades = listener_config.upgrades,
                     .max_body_bytes = listener_config.max_body_bytes,
+                    .keepalive_requests = listener_config.keepalive_requests,
                     .request_filters = listener_config.request_filters,
                     .response_filters = listener_config.response_filters,
                     .forwarded = listener_config.forwarded,
@@ -1912,6 +1916,7 @@ pub fn Server(comptime IoType: type) type {
             conn.response_filters = listener.response_filters;
             conn.upgrades = listener.upgrades;
             conn.max_body_bytes = listener.max_body_bytes;
+            conn.keepalive_requests = listener.keepalive_requests;
             conn.forwarded = listener.forwarded;
             conn.proxy_status = listener.proxy_status;
             // The exchange's starting cluster, from the same listener and
