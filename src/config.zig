@@ -1886,12 +1886,16 @@ pub const AccessLogJson = struct {
                 "case-insensitively and logged lowercased; absent headers are " ++
                 "omitted from the line.",
             .max_items = constants.access_log_headers_max,
+            .item_min_length = 1,
+            .item_max_length = constants.access_log_header_name_bytes_max,
         },
         .response_headers = .{
             .desc = "Response headers to record under `response_headers`, on the " ++
                 "same terms — the origin's X-Cache, say. Ignored for l4 lines, " ++
                 "which have no response to read.",
             .max_items = constants.access_log_headers_max,
+            .item_min_length = 1,
+            .item_max_length = constants.access_log_header_name_bytes_max,
         },
     };
 };
@@ -2791,6 +2795,7 @@ pub const PickJson = struct {
             .desc = "The header or cookie name a request-derived key reads; " ++
                 "required for those keys, rejected for source_ip.",
             .min_length = 1,
+            .max_length = constants.pick_name_bytes_max,
         },
     };
 
@@ -2860,6 +2865,11 @@ pub const BodyJson = struct {
         "is served with. Referenced by name from error_pages (and any " ++
         "future body-serving feature), so one body is one buffer however " ++
         "many places serve it.";
+    /// The fork the doc above already describes, said in a way the
+    /// schema can act on (#305). It was expressible from the day
+    /// `oneOf` was emitted and simply never declared, which is what the
+    /// differential gate is for finding.
+    pub const schema_one_of = [_][]const u8{ "file", "inline" };
     pub const schema_fields = .{
         .file = .{
             .desc = "Path to the body's file, read once at startup; a change " ++
@@ -3221,8 +3231,9 @@ pub const SchemaItems = enum { http_method };
 /// `assert_meta_matches` rejects any other key at comptime, so a typo'd
 /// attribute is a compile error, not silently-ignored data.
 const schema_attributes = [_][]const u8{
-    "desc",       "minimum",    "maximum",   "min_items",  "max_items",
-    "min_length", "const_true", "enum_type", "int_values", "items",
+    "desc",       "minimum",         "maximum",         "min_items", "max_items",
+    "min_length", "max_length",      "const_true",      "enum_type", "int_values",
+    "items",      "item_min_length", "item_max_length",
 };
 
 /// Cross-check a DTO's schema metadata against its real fields at comptime:
@@ -7047,7 +7058,6 @@ const SchemaGapEntry = struct { name: []const u8, gap: SchemaGap };
 const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "AccessLogHeaderDuplicate", .gap = .duplicate },
     .{ .name = "AccessLogHeaderNameInvalid", .gap = .literal_syntax },
-    .{ .name = "AccessLogHeaderNameTooLong", .gap = .expressible_bound },
     .{ .name = "AccessLogPathMissing", .gap = .expressible_fork },
     .{ .name = "AccessLogPathOnStdout", .gap = .expressible_fork },
     .{ .name = "AdminBindInvalid", .gap = .literal_syntax },
@@ -7055,8 +7065,6 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "BodyFileUnreadable", .gap = .filesystem },
     .{ .name = "BodyNameEmpty", .gap = .name_length },
     .{ .name = "BodyNameTooLong", .gap = .name_length },
-    .{ .name = "BodySourceAmbiguous", .gap = .expressible_fork },
-    .{ .name = "BodySourceMissing", .gap = .expressible_fork },
     .{ .name = "BodyUnknown", .gap = .cross_reference },
     .{ .name = "ClusterCheckHostInvalid", .gap = .literal_syntax },
     .{ .name = "ClusterCheckHttpFieldOnTcp", .gap = .expressible_fork },
@@ -7068,7 +7076,6 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterPickKeyWithoutHash", .gap = .expressible_fork },
     .{ .name = "ClusterPickNameInvalid", .gap = .literal_syntax },
     .{ .name = "ClusterPickNameMissing", .gap = .expressible_fork },
-    .{ .name = "ClusterPickNameTooLong", .gap = .expressible_bound },
     .{ .name = "ClusterPickNameUnexpected", .gap = .expressible_fork },
     .{ .name = "ClusterProxyProtocolOnHttpListener", .gap = .cross_block },
     .{ .name = "ClusterProxyProtocolOnTlsListener", .gap = .cross_block },
@@ -7083,7 +7090,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "FilterClientCidrInvalid", .gap = .literal_syntax },
     .{ .name = "FilterClientPrefixInvalid", .gap = .literal_syntax },
     .{ .name = "FilterClientPrefixTooNarrow", .gap = .literal_syntax },
-    .{ .name = "FilterHeaderEditsOverLimit", .gap = .expressible_bound },
+    .{ .name = "FilterHeaderEditsOverLimit", .gap = .budget },
     .{ .name = "FilterHeaderNameInvalid", .gap = .literal_syntax },
     .{ .name = "FilterHeaderNameReserved", .gap = .literal_syntax },
     .{ .name = "FilterHeaderValueInvalid", .gap = .literal_syntax },
@@ -7116,7 +7123,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerUnixBindClusterSend", .gap = .cross_block },
     .{ .name = "ListenerUnixBindForwarded", .gap = .cross_block },
     .{ .name = "ListenerUnixBindSourceIpHash", .gap = .cross_block },
-    .{ .name = "ResponseFilterHeaderEditsOverLimit", .gap = .expressible_bound },
+    .{ .name = "ResponseFilterHeaderEditsOverLimit", .gap = .budget },
     .{ .name = "ResponseFilterRedirect", .gap = .expressible_fork },
     .{ .name = "ResponseFilterReject", .gap = .expressible_fork },
     .{ .name = "ResponseFilterRespond", .gap = .expressible_fork },
@@ -7173,8 +7180,8 @@ test "config: the schema's debt to the loader only ever falls (#305)" {
             else => {},
         }
     }
-    try std.testing.expectEqual(@as(usize, 14), forks);
-    try std.testing.expectEqual(@as(usize, 4), bounds);
+    try std.testing.expectEqual(@as(usize, 12), forks);
+    try std.testing.expectEqual(@as(usize, 0), bounds);
 }
 
 /// Whether `expected` is the loader's own verdict rather than the JSON

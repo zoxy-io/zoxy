@@ -52,6 +52,7 @@ pub const Keyword = enum {
     minimum,
     maximum,
     minLength,
+    maxLength,
     minItems,
     maxItems,
     minProperties,
@@ -72,6 +73,7 @@ pub const Keyword = enum {
             .minimum,
             .maximum,
             .minLength,
+            .maxLength,
             .minItems,
             .maxItems,
             .minProperties,
@@ -103,6 +105,7 @@ pub const Failure = struct {
         below_minimum,
         above_maximum,
         too_short,
+        too_long,
         too_few_items,
         too_few_properties,
         too_many_items,
@@ -264,6 +267,11 @@ fn checkString(
     if (object.get("minLength")) |bound| {
         if (@as(f64, @floatFromInt(text.len)) < numberOf(bound).?) {
             return path.fail(.too_short);
+        }
+    }
+    if (object.get("maxLength")) |bound| {
+        if (@as(f64, @floatFromInt(text.len)) > numberOf(bound).?) {
+            return path.fail(.too_long);
         }
     }
     return null;

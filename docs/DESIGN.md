@@ -893,9 +893,12 @@ Rules:
   resolves a name into another block, computes canonical equality, reads
   the filesystem, bounds an object *key*, or holds two blocks at once.
   Two are **debt** — a fork inside one block that `oneOf` could carry,
-  and a bound the emitter does not derive yet — and their counts are
-  pinned, so the shape work that remains is a number rather than an
-  opinion. The pin runs one way: removing a row that is still needed
+  and a bound the emitter does not derive — and their counts are pinned,
+  so the work that remains is a number rather than an opinion. The
+  bounds are paid: the emitter learned `maxLength` and its per-item
+  form, and the two rows that looked like bounds and were not — a cap on
+  the *sum* of header edits across a whole filter table — moved to
+  `budget`, where a schema genuinely cannot follow. The pin runs one way: removing a row that is still needed
   fails the build, while a row whose rule *became* expressible has to be
   struck by whoever made it so, because one error is raised by several
   cases and the schema catching one of them proves nothing about the

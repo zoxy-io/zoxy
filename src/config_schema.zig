@@ -244,6 +244,18 @@ fn writeStringShape(out: *Stringify, comptime meta: anytype) Writer.Error!void {
         try out.objectField("minLength");
         try out.write(meta.min_length);
     }
+    // The other half of the pair (#305). `min_length` shipped alone for
+    // as long as no field's ceiling was worth stating; the differential
+    // gate named two that were, and a bound the loader enforces and the
+    // schema omits is a rejection an editor cannot show you.
+    if (comptime @hasField(@TypeOf(meta), "max_length")) {
+        comptime assert(meta.max_length >= 1);
+        if (comptime @hasField(@TypeOf(meta), "min_length")) {
+            comptime assert(meta.max_length >= meta.min_length);
+        }
+        try out.objectField("maxLength");
+        try out.write(meta.max_length);
+    }
 }
 
 /// A slice field (`[]const Child`): an array with optional length bounds and
@@ -287,6 +299,22 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
             } else {
                 try out.objectField("type");
                 try out.write("string");
+                // Bounds on the *element*, not on the array — the field's
+                // own `min_length`/`max_length` would describe a string
+                // it does not have (#305). `access_log.request_headers`
+                // is the case that wanted this: the list is capped by
+                // `max_items` and each name by the loader, and only the
+                // second half was missing from the document.
+                if (comptime @hasField(@TypeOf(meta), "item_min_length")) {
+                    comptime assert(meta.item_min_length >= 1);
+                    try out.objectField("minLength");
+                    try out.write(meta.item_min_length);
+                }
+                if (comptime @hasField(@TypeOf(meta), "item_max_length")) {
+                    comptime assert(meta.item_max_length >= 1);
+                    try out.objectField("maxLength");
+                    try out.write(meta.item_max_length);
+                }
             }
         },
         // An integer element (the response-match `status` list, #175):
