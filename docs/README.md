@@ -386,15 +386,21 @@ full handshake.
 
 By default any request carrying `Upgrade` is answered `501` — the same as
 `CONNECT`, and what every config that does not name an allowlist keeps
-getting. An `http` listener opts in by naming the tokens it will carry:
+getting. An `http` listener opts in by naming what it will carry:
 
 ```json
 "listeners": [
     { "bind": "0.0.0.0:80", "http": { "cluster": "web",
-      "upgrades": ["websocket"] } }
+      "upgrades": { "websocket": true } } }
 ],
 "limits": { "tunnels": 512 }
 ```
+
+One flag per protocol rather than a list of tokens, so the vocabulary
+lives in the schema: an editor rejects `"h2c"` before the loader does,
+and there is no way to write the same token twice. Omitting the block,
+writing `{}`, or setting every flag `false` all mean the same thing —
+allow none, reserve nothing.
 
 zoxy does not speak WebSocket. It forwards the handshake, recognises the
 origin's `101 Switching Protocols`, and from that point relays bytes both
