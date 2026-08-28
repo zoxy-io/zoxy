@@ -22,6 +22,7 @@
 const std = @import("std");
 
 const config = @import("config.zig");
+const json_schema = @import("json_schema.zig");
 const constants = @import("constants.zig");
 const filter = @import("http/filter.zig");
 const parser = @import("http/parser.zig");
@@ -682,6 +683,27 @@ fn expectOneOf(object: *const std.json.ObjectMap, arms_expected: usize) !void {
         for (object.get("required").?.array.items) |already| {
             try std.testing.expect(!std.mem.eql(u8, already.string, name));
         }
+    }
+}
+
+test "config_schema: the emitted dialect is one the validator implements" {
+    // The two halves of #305's gate held together. `json_schema.zig`
+    // validates only the keywords it knows and would otherwise report
+    // "valid" for a constraint it never read — so the emitter is not
+    // free to reach for a new one silently. Teach the emitter a keyword
+    // and this fails until the validator learns it too.
+    var buffer: [64 * 1024]u8 = undefined;
+    const text = try renderInto(&buffer);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    if (json_schema.census(parsed.value)) |unknown| {
+        std.debug.print("\nemitted keyword the validator does not implement: {s}\n", .{unknown});
+        return error.TestUnexpectedResult;
     }
 }
 

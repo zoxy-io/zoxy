@@ -839,6 +839,41 @@ Rules:
   document without the proxy refusing to start over the pointer. It buys no
   general laxity — `$schemas`, or a `$schema` nested inside any other
   object, is still an unknown field.
+- **The schema and the loader are held to each other by a differential
+  gate** (#305 Part 2). Counting concessions in prose was the cheap half;
+  the expensive half is checking that the emitted document and the loader
+  actually agree, and it runs on every rejection stated through
+  `expectParseError` — which is most but not all of them: a handful of
+  `ValidationError` members have no test, and four are asserted against
+  `parse` directly, so the measured gap list is a floor rather than a
+  census of the error set.
+  `src/json_schema.zig` validates the dialect the emitter emits — not a
+  general validator, which would be a dependency (§4) or a second
+  reading of a spec nobody here has open, but a closed keyword set whose
+  `census` walks a rendered document and fails on anything it does not
+  implement. That census is what makes the gate mean something: a
+  validator that skips what it does not recognise reports "valid" by not
+  looking.
+  Two directions, and they are not symmetric. **The schema must accept
+  whatever the loader accepts** — no exemptions, ever: a schema that
+  refuses a working config is not conservative, it is a lie told to
+  every editor that reads it, and the operator who believes it deletes a
+  key that was fine. **What the loader refuses, the schema should refuse
+  too** — and where it cannot, `schema_gaps` names the rejection and why.
+  Seven of its categories are closed by what a schema *is*: no document
+  grammar parses an address, sums a list of weights against a budget,
+  resolves a name into another block, computes canonical equality, reads
+  the filesystem, bounds an object *key*, or holds two blocks at once.
+  Two are **debt** — a fork inside one block that `oneOf` could carry,
+  and a bound the emitter does not derive yet — and their counts are
+  pinned, so the shape work that remains is a number rather than an
+  opinion. The pin runs one way: removing a row that is still needed
+  fails the build, while a row whose rule *became* expressible has to be
+  struck by whoever made it so, because one error is raised by several
+  cases and the schema catching one of them proves nothing about the
+  rest. That is the measurable definition of the
+  freeze being done, and it replaces a review's judgement with a build
+  failure.
 - **A slot is released only when its armed-op set is empty.** Teardown is
   where the races live — a lesson paid for in implementation time and
   simulator seeds last iteration. Every op references a completion

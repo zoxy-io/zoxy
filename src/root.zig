@@ -13,6 +13,7 @@ pub const balancer = @import("balancer.zig");
 pub const Budget = @import("budget.zig").Budget;
 pub const config = @import("config.zig");
 pub const config_schema = @import("config_schema.zig");
+pub const json_schema = @import("json_schema.zig");
 pub const constants = @import("constants.zig");
 pub const counters = @import("counters.zig");
 /// L7 HTTP/1.1 modules (§7). `parser` wraps the vendored hparse behind
@@ -69,6 +70,7 @@ test {
     _ = @import("budget.zig");
     _ = config;
     _ = config_schema;
+    _ = json_schema;
     _ = constants;
     _ = counters;
     _ = http.parser;
