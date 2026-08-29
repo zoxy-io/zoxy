@@ -772,7 +772,6 @@ pub const ValidationError = error{
     AccessLogHeaderDuplicate,
     LimitAccessLogBufferUnderLine,
     FilterRespondStatus,
-    ResponseFilterRespond,
     ErrorPagesOverLimit,
     ErrorPageStatusInvalid,
     ErrorPageStatusUnknown,
@@ -813,9 +812,6 @@ pub const ValidationError = error{
     FilterRedirectTarget,
     FilterRedirectSchemeUnknown,
     FilterHeaderEditsOverLimit,
-    ResponseFilterReject,
-    ResponseFilterRedirect,
-    ResponseFilterRewrite,
     ResponseFilterStatusInvalid,
     ResponseFilterStatusClassUnknown,
     ResponseFilterStatusEmpty,
@@ -2409,6 +2405,51 @@ pub const HeaderMatchJson = struct {
 /// One action object carries exactly one field (the action's kind), the
 /// same "struct of optionals, validate exactly-one" shape the listener's
 /// cluster/routes fork uses — no JSON union parsing.
+/// What a #175 response rule may do: edit headers, and nothing else.
+///
+/// A type of its own rather than `ActionJson` with four of its members
+/// refused at load (#305). The four are request-side answers — `reject`,
+/// `redirect` and `respond` decide what to send *instead* of asking the
+/// origin, and `rewrite_prefix` changes what is asked — while a response
+/// rule runs when the origin has already answered. Sharing the request's
+/// union made those states representable and then rejected them one at
+/// a time; here they cannot be written down, which is the same verdict
+/// reached by the type rather than by a rule, and the schema states it
+/// too.
+pub const ResponseActionJson = struct {
+    header_set: ?HeaderEditJson = null,
+    header_add: ?HeaderEditJson = null,
+    header_remove: ?[]const u8 = null,
+
+    pub const schema_doc =
+        "One response-filter action. Exactly one field is set — the edit's " ++
+        "kind. Response rules edit headers only: the request-side actions " ++
+        "(reject, redirect, respond, rewrite_prefix) answer instead of " ++
+        "forwarding, and by the time these rules run the origin already has.";
+    pub const schema_one_of = [_][]const u8{
+        "header_set",
+        "header_add",
+        "header_remove",
+    };
+    pub const schema_fields = .{
+        .header_set = .{ .desc = "Set (replace) a response header." },
+        .header_add = .{ .desc = "Append a response header." },
+        .header_remove = .{ .desc = "Remove a response header by name." },
+    };
+
+    comptime {
+        // Every member must exist on the request action and mean the
+        // same thing: the two tables share `resolveHeaderEdit`, and a
+        // member here the request lacks would be an edit the renderer
+        // has never seen.
+        for (@typeInfo(ResponseActionJson).@"struct".fields) |field| {
+            if (!@hasField(ActionJson, field.name)) {
+                @compileError("ResponseActionJson." ++ field.name ++ " is not an ActionJson field");
+            }
+        }
+    }
+};
+
 pub const ActionJson = struct {
     reject: ?u16 = null,
     redirect: ?RedirectJson = null,
@@ -2518,7 +2559,7 @@ pub const RedirectJson = struct {
 /// here by their own names.
 pub const ResponseFilterJson = struct {
     match: ResponseMatchJson = .{},
-    actions: []const ActionJson,
+    actions: []const ResponseActionJson,
 
     pub const schema_doc =
         "One response filter rule: a match over the origin's response and " ++
@@ -2527,8 +2568,9 @@ pub const ResponseFilterJson = struct {
         .match = .{ .desc = "Response-match predicate; absent fields match anything." },
         .actions = .{
             .desc = "Header edits (header_set / header_add / header_remove) applied " ++
-                "in order when the rule matches; reject and rewrite_prefix are " ++
-                "request-side only.",
+                "in order when the rule matches. The request-side actions are not " ++
+                "fields here at all: by the time these rules run the origin has " ++
+                "already answered.",
             .min_items = 1,
         },
     };
@@ -4276,7 +4318,7 @@ fn resolveResponseMatch(
 /// not transfer rather than handed a generic kind error.
 fn resolveResponseEdits(
     arena: std.mem.Allocator,
-    actions_json: []const ActionJson,
+    actions_json: []const ResponseActionJson,
 ) ParseError![]const filter.AppliedHeaderEdit {
     if (actions_json.len == 0) {
         return error.FilterActionsEmpty;
@@ -4290,30 +4332,12 @@ fn resolveResponseEdits(
     return edits;
 }
 
-fn resolveResponseEdit(action_json: *const ActionJson) ParseError!filter.AppliedHeaderEdit {
-    // The shared kind fork runs before the arm rejections, so a
-    // two-kind object is a kind error here too, never a misleading
-    // arm one.
-    try requireOneActionKind(action_json);
-    if (action_json.reject != null) {
-        return error.ResponseFilterReject;
-    }
-    if (action_json.redirect != null) {
-        // A redirect is a request-side answer (#176): the client asked
-        // and is sent elsewhere. An origin response already exists by
-        // the time these rules run.
-        return error.ResponseFilterRedirect;
-    }
-    if (action_json.respond != null) {
-        // Also a request-side answer (#159): a response rule runs when
-        // the origin has already answered, and replacing that answer is
-        // not an *edit* — it is a different feature, and one this table
-        // deliberately does not have.
-        return error.ResponseFilterRespond;
-    }
-    if (action_json.rewrite_prefix != null) {
-        return error.ResponseFilterRewrite;
-    }
+fn resolveResponseEdit(action_json: *const ResponseActionJson) ParseError!filter.AppliedHeaderEdit {
+    // The kind fork, which for this table is now the whole check: the
+    // four request-side actions are not fields here, so a config naming
+    // one is refused by the strict parser rather than by four rules
+    // this function used to carry (#305).
+    try requireOneResponseActionKind(action_json);
     if (action_json.header_set) |edit| {
         const resolved = try resolveHeaderEdit(&edit);
         return .{ .kind = .set, .name = resolved.name, .value = resolved.value };
@@ -4548,6 +4572,20 @@ fn resolveActions(
 /// Exactly one action field may carry the kind — the "exactly one of"
 /// fork both action resolvers share, so a seventh kind cannot be
 /// counted in one table and forgotten in the other.
+/// The response table's kind fork (#305). Three members rather than the
+/// request's seven, and the same verdict — a rule naming none or two
+/// has no single action to apply.
+fn requireOneResponseActionKind(action_json: *const ResponseActionJson) ParseError!void {
+    const set: u8 = @as(u8, @intFromBool(action_json.header_set != null)) +
+        @intFromBool(action_json.header_add != null) +
+        @intFromBool(action_json.header_remove != null);
+    assert(set <= 3); // The response action object has three kind fields.
+    if (set != 1) {
+        return error.FilterActionKind;
+    }
+    assert(set == 1);
+}
+
 fn requireOneActionKind(action_json: *const ActionJson) ParseError!void {
     const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
         @intFromBool(action_json.redirect != null) +
@@ -6380,10 +6418,10 @@ test "config: redirect validation has its own errors" {
     // A literal Location is a header value the render emits verbatim:
     // injection-safety is proven at load.
     try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\\r\\nSet-Cookie: a\"}}]}]}}]," ++ tail);
-    // Two kinds is still a kind error; a redirect on the way out is
-    // refused by name.
+    // Two kinds is still a kind error; a redirect on the way out is not
+    // a field a response action has (#305), so the parser refuses it.
     try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\"},\"reject\":403}]}]}}]," ++ tail);
-    try expectParseError(error.ResponseFilterRedirect, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
+    try expectParseError(error.UnknownField, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
         "\"response_filters\":[{\"actions\":[{\"redirect\":{\"scheme\":\"https\"}}]}]}}]," ++ tail);
 }
 
@@ -6486,12 +6524,23 @@ test "config: response filter schema rejects what has no meaning on the way out"
         \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
     ;
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"response_filters\":[";
-    // The two request-side arms are rejected by their own names, so an
-    // operator is told which idea does not transfer.
-    try expectParseError(error.ResponseFilterReject, head ++ "{\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
-    try expectParseError(error.ResponseFilterRewrite, head ++ "{\"actions\":[{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b\"}}]}]}}]," ++ tail);
+    // The request-side actions are not fields on a response action at
+    // all (#305), so naming one is the strict parser's refusal rather
+    // than four rules this table used to carry — and the schema states
+    // the same thing, where before it could only be discovered at load.
+    inline for (.{
+        "{\"reject\":403}",
+        "{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b\"}}",
+        "{\"redirect\":{\"status\":301,\"location\":\"/x\"}}",
+        "{\"respond\":{\"status\":200,\"body\":\"b\"}}",
+    }) |action| {
+        try expectParseError(
+            error.UnknownField,
+            head ++ "{\"actions\":[" ++ action ++ "]}]}}]," ++ tail,
+        );
+    }
     // A two-kind action is still a kind error, never a misleading arm one.
-    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}}]," ++ tail);
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"header_set\":{\"name\":\"X\",\"value\":\"y\"},\"header_remove\":\"X\"}]}]}}]," ++ tail);
     try expectParseError(error.FilterActionsEmpty, head ++ "{\"actions\":[]}]}}]," ++ tail);
     // A status the parser can never produce is a rule that can never
     // fire — a typo, told at load.
@@ -7091,9 +7140,8 @@ const SchemaGap = enum {
     /// are keyed by operator-chosen names, and a key has no schema of
     /// its own in this dialect (`propertyNames` is a keyword the emitter
     /// deliberately does not reach for, #305's closed vocabulary). A
-    /// bound on a *value* is not this: it has somewhere to attach, so it
-    /// belongs in `expressible_bound` and two rows were moved there when
-    /// review caught them filed here.
+    /// bound on a *value* is not this: it has somewhere to attach, and
+    /// the emitter emits `maxLength` for it.
     name_length,
     /// A name that must exist in another block — `cluster` naming a
     /// cluster, `body` naming a body. A schema validates one document
@@ -7114,15 +7162,16 @@ const SchemaGap = enum {
     /// listener's shape against a cluster's, or against a sibling of its
     /// own body.
     cross_block,
-    /// **Debt.** A fork inside one block that `oneOf` could carry: a
-    /// field required exactly when a sibling takes a given value. Every
-    /// one of these is a cross-field rule the loader states in prose and
-    /// a shape could state instead.
+    /// **Debt, and currently empty.** A fork inside one block that
+    /// `oneOf` could carry: a field required exactly when a sibling
+    /// takes a given value. `SchemaVariants` carries these now, so a row
+    /// arriving here means a fork nobody declared rather than one the
+    /// emitter cannot state.
     expressible_fork,
-    /// **Debt.** A bound the schema could carry and the emitter does not
-    /// derive yet: an array's `maxItems`, or a string's `maxLength`
-    /// (`min_length` is emitted already, so only half of that pair
-    /// exists).
+    /// **Debt, and currently empty.** A bound the schema could carry:
+    /// an array's `maxItems`, or a string's `maxLength` and its
+    /// per-item form. All three are emitted, so a row here means a
+    /// field whose ceiling was never written down.
     expressible_bound,
 };
 
@@ -7204,10 +7253,6 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerUnixBindForwarded", .gap = .cross_block },
     .{ .name = "ListenerUnixBindSourceIpHash", .gap = .cross_block },
     .{ .name = "ResponseFilterHeaderEditsOverLimit", .gap = .budget },
-    .{ .name = "ResponseFilterRedirect", .gap = .expressible_fork },
-    .{ .name = "ResponseFilterReject", .gap = .expressible_fork },
-    .{ .name = "ResponseFilterRespond", .gap = .expressible_fork },
-    .{ .name = "ResponseFilterRewrite", .gap = .expressible_fork },
     .{ .name = "RouteDuplicate", .gap = .duplicate },
     .{ .name = "RouteHostNotCanonical", .gap = .literal_syntax },
     .{ .name = "RoutePrefixNotCanonical", .gap = .literal_syntax },
@@ -7246,11 +7291,20 @@ fn schemaGapOf(expected: ParseError) ?SchemaGap {
 }
 
 test "config: the schema's debt to the loader only ever falls (#305)" {
-    // The measurable definition of the freeze being done. Seven gap
-    // categories are closed by what a schema *is*; these two are things
-    // the emitter could express and does not, so they are the work that
-    // remains — pinned, so a new one cannot arrive quietly and an old
-    // one cannot be paid off without saying so.
+    // The measurable definition of the freeze being done, and it now
+    // reads zero. Seven gap categories are closed by what a schema *is*
+    // — no grammar parses an address, sums a list, resolves a name into
+    // another block, computes canonical equality, reads the filesystem,
+    // bounds an object key, or holds two blocks at once. These two are
+    // what the emitter *could* express, and everything that was in them
+    // has been expressed: the forks became `SchemaVariants`, the bounds
+    // became `maxLength` and its per-item form, and two rows that looked
+    // like bounds turned out to be sums and moved to `budget`.
+    //
+    // Zero is the interesting number to pin. Above zero it said how much
+    // work was left; at zero it says a new cross-field rule cannot be
+    // added without either shaping it or arguing, in this file, why a
+    // schema cannot follow.
     var forks: usize = 0;
     var bounds: usize = 0;
     for (schema_gaps) |entry| {
@@ -7260,7 +7314,7 @@ test "config: the schema's debt to the loader only ever falls (#305)" {
             else => {},
         }
     }
-    try std.testing.expectEqual(@as(usize, 4), forks);
+    try std.testing.expectEqual(@as(usize, 0), forks);
     try std.testing.expectEqual(@as(usize, 0), bounds);
 }
 
@@ -8470,9 +8524,10 @@ test "config: the respond action's vocabulary is closed, and request-side only" 
     );
     // And it is a request-side answer: a response rule runs when the
     // origin has already answered, so replacing that answer is not an
-    // edit this table has.
+    // edit this table has — and since #305 it is not a field there
+    // either, so the parser says so rather than a rule.
     try expectParseError(
-        error.ResponseFilterRespond,
+        error.UnknownField,
         "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++
             "\"response_filters\":[{\"actions\":[{\"respond\":{\"body\":\"x\"}}]}]}}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
