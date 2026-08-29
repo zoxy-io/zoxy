@@ -1545,9 +1545,11 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   conjunction over exact statuses, a status class (`"1xx"`..`"5xx"`)
   and response-header predicates — the request side's own header
   vocabulary, evaluated by the same code — and the actions are exactly
-  the three header verbs: reject and rewrite have no meaning on the
-  way out, and the loader refuses those arms by name rather than
-  ignoring them. Edits apply during the downstream re-render through
+  the three header verbs. The request-side actions have no meaning on
+  the way out, and since #305 they are not fields on a response action
+  at all — `ResponseActionJson` carries the three verbs and nothing
+  else, so naming one is the strict parser's refusal rather than four
+  rules the resolver used to carry, and the schema states it too. Edits apply during the downstream re-render through
   the same suppress-and-append machinery, under the same
   `header_edits_max` bound on the table's total — the render accepts
   one slot past it (`response_edits_max`), reserved for #178's

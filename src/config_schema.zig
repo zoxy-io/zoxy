@@ -128,6 +128,9 @@ fn writeVariants(out: *Stringify, comptime T: type) Writer.Error!void {
     if (!@hasDecl(T, "schema_variants")) return;
     const sets = T.schema_variants;
     comptime assert(sets.len >= 1);
+    // Each fork is a `oneOf`, and a `oneOf` needs arms to choose
+    // between — `assertVariantsMatch` refuses fewer than two.
+    inline for (sets) |set| comptime assert(set.branches.len >= 2);
     try out.objectField("allOf");
     try out.beginArray();
     inline for (sets) |set| {
@@ -148,6 +151,11 @@ fn writeVariantBranch(
     comptime on: []const u8,
     comptime branch: config.SchemaVariant,
 ) Writer.Error!void {
+    // `assertVariantsMatch` proved all three at comptime against the
+    // DTO's real fields; restated where this function depends on them.
+    comptime assert(on.len >= 1);
+    comptime assert(branch.value.len >= 1);
+    comptime assert(branch.require.len + branch.forbid.len >= 1);
     try out.beginObject();
     if (comptime !branch.default or branch.require.len >= 1) {
         try out.objectField("required");
@@ -373,6 +381,9 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
                 }
                 if (comptime @hasField(@TypeOf(meta), "item_max_length")) {
                     comptime assert(meta.item_max_length >= 1);
+                    if (comptime @hasField(@TypeOf(meta), "item_min_length")) {
+                        comptime assert(meta.item_max_length >= meta.item_min_length);
+                    }
                     try out.objectField("maxLength");
                     try out.write(meta.item_max_length);
                 }

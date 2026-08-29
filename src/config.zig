@@ -2438,13 +2438,18 @@ pub const ResponseActionJson = struct {
     };
 
     comptime {
-        // Every member must exist on the request action and mean the
-        // same thing: the two tables share `resolveHeaderEdit`, and a
+        // Every member must exist on the request action *and carry the
+        // same type*: the two tables share `resolveHeaderEdit`, so a
         // member here the request lacks would be an edit the renderer
-        // has never seen.
+        // has never seen, and one whose type diverged would be the same
+        // key meaning two things.
         for (@typeInfo(ResponseActionJson).@"struct".fields) |field| {
             if (!@hasField(ActionJson, field.name)) {
                 @compileError("ResponseActionJson." ++ field.name ++ " is not an ActionJson field");
+            }
+            if (@FieldType(ActionJson, field.name) != field.type) {
+                @compileError("ResponseActionJson." ++ field.name ++
+                    " has a different type than ActionJson's");
             }
         }
     }
@@ -3343,12 +3348,23 @@ pub const SchemaVariant = struct {
     /// Fields this arm rules out, emitted as a `false` schema — which
     /// nothing satisfies, and is how the dialect says "not here".
     forbid: []const []const u8 = &.{},
-    /// Whether the discriminator's *absence* selects this arm. True on
-    /// exactly the arm matching the field's Zig default, so a config
-    /// that omits the key lands where the loader would put it, and false
-    /// everywhere else — an arm that is not the default must say
-    /// `required`, or an absent discriminator would match every arm at
-    /// once and `oneOf` would reject a valid config.
+    /// Whether the discriminator's *absence* selects this arm — set on
+    /// the arm a config that omits the key should land on, and false
+    /// everywhere else. An arm that is not the default names the
+    /// discriminator in its `required`, or an absent key would satisfy
+    /// every arm's `properties` vacuously, `oneOf` would see several
+    /// matches, and a valid config would be rejected.
+    ///
+    /// Usually that is the arm matching the field's Zig default, and
+    /// `assertVariantsMatch` requires exactly one wherever the field can
+    /// be absent. `PickJson.key` is the case that shows what the rule
+    /// actually means: its Zig default is `null`, not `"source_ip"`, and
+    /// the `source_ip` arm is marked here because that is the *resolved*
+    /// fallback — `resolvePick` reads an absent key as `source_ip` for
+    /// the keyless policies. It stays sound because the sibling fork on
+    /// `policy` independently requires `key` whenever the policy is
+    /// `hash`, so the looser arm is unreachable exactly where it would
+    /// have been wrong.
     default: bool = false,
 };
 
@@ -3408,6 +3424,7 @@ pub fn assert_meta_matches(comptime T: type) void {
         }
     }
     assertOneOfMatches(T);
+    assertVariantsMatch(T);
 }
 
 /// A DTO's optional `schema_one_of` — the fields of which exactly one may
@@ -3420,6 +3437,92 @@ pub fn assert_meta_matches(comptime T: type) void {
 /// in `required`, so every branch would match at once and `oneOf` — which
 /// means exactly one — would reject every config. Both are silent in JSON
 /// Schema and loud here.
+/// Hold a DTO's declared forks to its real fields (#305), the way
+/// `assertOneOfMatches` holds its `schema_one_of`.
+///
+/// The emitter takes `on`, `require` and `forbid` as strings and writes
+/// them into the document; without this a typo would emit a keyword
+/// naming a field that does not exist — a dead constraint that looks
+/// like a live one, which is the failure `assert_meta_matches` exists to
+/// prevent one screen up.
+fn assertVariantsMatch(comptime T: type) void {
+    if (!@hasDecl(T, "schema_variants")) return;
+    for (T.schema_variants) |set| {
+        if (!@hasField(T, set.on)) {
+            @compileError(@typeName(T) ++ " schema_variants forks on '" ++ set.on ++
+                "', which is not a field");
+        }
+        // A fork needs arms to choose between; one arm is a constraint
+        // stated the hard way.
+        if (set.branches.len < 2) {
+            @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
+                "' needs at least two branches");
+        }
+        var defaults = 0;
+        for (set.branches) |branch| {
+            if (branch.default) defaults += 1;
+            if (branch.value.len == 0) {
+                @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
+                    "' has an empty branch value");
+            }
+            for (branch.require) |name| {
+                if (!@hasField(T, name)) {
+                    @compileError(@typeName(T) ++ " variant '" ++ branch.value ++
+                        "' requires '" ++ name ++ "', which is not a field");
+                }
+                if (std.mem.eql(u8, name, set.on)) {
+                    @compileError(@typeName(T) ++ " variant '" ++ branch.value ++
+                        "' names its own discriminator in require");
+                }
+            }
+            for (branch.forbid) |name| {
+                if (!@hasField(T, name)) {
+                    @compileError(@typeName(T) ++ " variant '" ++ branch.value ++
+                        "' forbids '" ++ name ++ "', which is not a field");
+                }
+                if (std.mem.eql(u8, name, set.on)) {
+                    @compileError(@typeName(T) ++ " variant '" ++ branch.value ++
+                        "' forbids its own discriminator");
+                }
+                // Requiring and forbidding the same key is an arm no
+                // document can satisfy — `oneOf` would then have one
+                // fewer arm than it appears to.
+                for (branch.require) |required| {
+                    if (std.mem.eql(u8, name, required)) {
+                        @compileError(@typeName(T) ++ " variant '" ++ branch.value ++
+                            "' both requires and forbids '" ++ name ++ "'");
+                    }
+                }
+            }
+        }
+        // Exactly one arm may absorb an absent discriminator, and only
+        // when the field can *be* absent. Two would make `oneOf` see
+        // both on an omitted key; none would reject a config the loader
+        // accepts by default.
+        const optional = @typeInfo(@FieldType(T, set.on)) == .optional or
+            defaultOf(T, set.on) != null;
+        if (optional and defaults != 1) {
+            @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
+                "' may be absent, so exactly one branch must be .default");
+        }
+        if (!optional and defaults != 0) {
+            @compileError(@typeName(T) ++ " schema_variants on '" ++ set.on ++
+                "' is required, so no branch may be .default");
+        }
+    }
+}
+
+/// Whether a field carries a Zig default, as an opaque marker — the
+/// value itself is not comparable across the types this walks.
+fn defaultOf(comptime T: type, comptime name: []const u8) ?void {
+    for (@typeInfo(T).@"struct".fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) {
+            return if (field.defaultValue() == null) null else {};
+        }
+    }
+    return null;
+}
+
 fn assertOneOfMatches(comptime T: type) void {
     if (!@hasDecl(T, "schema_one_of")) return;
     const names = T.schema_one_of;
@@ -3465,7 +3568,7 @@ pub const dto_types = .{
     ForwardedJson,      ProxyProtocolJson,   ClusterProxyProtocolJson, EndpointJson,
     ResponseFilterJson, ResponseMatchJson,   RedirectJson,             BodyJson,
     TlsJson,            PassiveEjectionJson, HttpListenerJson,         L4ListenerJson,
-    L4RouteJson,        RouteHeaderJson,
+    L4RouteJson,        RouteHeaderJson,     ResponseActionJson,
 };
 
 comptime {
@@ -7125,10 +7228,14 @@ fn expectSchemaAgrees(expected: ParseError, json_bytes: []const u8) !void {
 /// Not an excuse list: the categories are the argument. Seven of them
 /// are closed — a schema describes documents, and no document grammar
 /// can parse an address, sum a list of weights, or read another block —
-/// so entries there are permanent and correct. Two are **debt**: a fork or
-/// a bound the schema could carry and does not yet, which is exactly
-/// what #305 Part 1 called a cross-field rule that should have been a
-/// shape. Their counts are pinned below so they only ever fall.
+/// so entries there are permanent and correct. Two are **debt** — a fork
+/// or a bound the schema could carry — and both are now **empty**: the
+/// forks became `SchemaVariants` and the bounds became `maxLength` and
+/// its per-item form. Their counts are pinned below at zero, which is
+/// the useful place to pin them: above zero the pin said how much work
+/// remained, and at zero it says a new cross-field rule cannot be added
+/// without either giving it a shape or arguing here why a schema cannot
+/// follow.
 const SchemaGap = enum {
     /// The value is text whose *meaning* only a parser knows: an address
     /// literal, a canonical path or host, a CIDR, a header-name token, a
