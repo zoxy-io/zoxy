@@ -892,10 +892,21 @@ Rules:
   grammar parses an address, sums a list of weights against a budget,
   resolves a name into another block, computes canonical equality, reads
   the filesystem, bounds an object *key*, or holds two blocks at once.
-  Two are **debt** — a fork inside one block that `oneOf` could carry,
-  and a bound the emitter does not derive yet — and their counts are
-  pinned, so the shape work that remains is a number rather than an
-  opinion. The pin runs one way: removing a row that is still needed
+  Two are **debt**, and both are now **empty**. A fork inside one block
+  that `oneOf` could carry is emitted from `SchemaVariants`: one arm per
+  value of a discriminating field, each naming what that value requires
+  and what it rules out, with the arm matching the field's Zig default
+  omitting `required` so an absent discriminator lands there and nowhere
+  else. A bound the emitter could derive is emitted too — `maxLength`
+  and its per-item form joined `minLength` and `maxItems`. What is left
+  in the closed categories includes two rows that looked like bounds and
+  were not: a cap on the *sum* of header edits across a whole filter
+  table, which is arithmetic no grammar performs.
+  The counts are pinned at zero, and zero is the interesting number to
+  pin. Above it, the pin said how much work remained; at it, the pin
+  says a new cross-field rule cannot be added without either giving it a
+  shape or arguing in `schema_gaps` why a schema cannot follow — which
+  is the discipline #305 was asking for, rather than the tally. The pin runs one way: removing a row that is still needed
   fails the build, while a row whose rule *became* expressible has to be
   struck by whoever made it so, because one error is raised by several
   cases and the schema catching one of them proves nothing about the
@@ -1534,9 +1545,11 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   conjunction over exact statuses, a status class (`"1xx"`..`"5xx"`)
   and response-header predicates — the request side's own header
   vocabulary, evaluated by the same code — and the actions are exactly
-  the three header verbs: reject and rewrite have no meaning on the
-  way out, and the loader refuses those arms by name rather than
-  ignoring them. Edits apply during the downstream re-render through
+  the three header verbs. The request-side actions have no meaning on
+  the way out, and since #305 they are not fields on a response action
+  at all — `ResponseActionJson` carries the three verbs and nothing
+  else, so naming one is the strict parser's refusal rather than four
+  rules the resolver used to carry, and the schema states it too. Edits apply during the downstream re-render through
   the same suppress-and-append machinery, under the same
   `header_edits_max` bound on the table's total — the render accepts
   one slot past it (`response_edits_max`), reserved for #178's

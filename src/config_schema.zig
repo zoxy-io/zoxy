@@ -97,6 +97,7 @@ fn writeObjectBody(out: *Stringify, comptime T: type, comptime with_doc: bool) W
     try out.write(false);
 
     try writeOneOf(out, T);
+    try writeVariants(out, T);
 }
 
 /// Emit a DTO's "exactly one of these fields" fork as `oneOf`, one
@@ -115,6 +116,74 @@ fn writeObjectBody(out: *Stringify, comptime T: type, comptime with_doc: bool) W
 /// `additionalProperties: false` is unaffected — in draft 2020-12 that
 /// keyword only considers `properties` declared in the same schema
 /// object, never a sibling subschema's.
+/// Emit a DTO's discriminated forks (#305): one `oneOf` per declared
+/// fork, conjoined under `allOf` when there is more than one.
+///
+/// Each arm pins the discriminator with `const` and states what that
+/// value requires or rules out. The arm matching the field's Zig default
+/// omits `required`, so an absent discriminator satisfies it and no
+/// other — which is what keeps `oneOf`'s "exactly one" honest for a
+/// field that may be left out.
+fn writeVariants(out: *Stringify, comptime T: type) Writer.Error!void {
+    if (!@hasDecl(T, "schema_variants")) return;
+    const sets = T.schema_variants;
+    comptime assert(sets.len >= 1);
+    // Each fork is a `oneOf`, and a `oneOf` needs arms to choose
+    // between — `assertVariantsMatch` refuses fewer than two.
+    inline for (sets) |set| comptime assert(set.branches.len >= 2);
+    try out.objectField("allOf");
+    try out.beginArray();
+    inline for (sets) |set| {
+        try out.beginObject();
+        try out.objectField("oneOf");
+        try out.beginArray();
+        inline for (set.branches) |branch| {
+            try writeVariantBranch(out, set.on, branch);
+        }
+        try out.endArray();
+        try out.endObject();
+    }
+    try out.endArray();
+}
+
+fn writeVariantBranch(
+    out: *Stringify,
+    comptime on: []const u8,
+    comptime branch: config.SchemaVariant,
+) Writer.Error!void {
+    // `assertVariantsMatch` proved all three at comptime against the
+    // DTO's real fields; restated where this function depends on them.
+    comptime assert(on.len >= 1);
+    comptime assert(branch.value.len >= 1);
+    comptime assert(branch.require.len + branch.forbid.len >= 1);
+    try out.beginObject();
+    if (comptime !branch.default or branch.require.len >= 1) {
+        try out.objectField("required");
+        try out.beginArray();
+        // A non-default arm names the discriminator, or an absent one
+        // would satisfy every arm and the fork would reject what the
+        // loader accepts.
+        if (comptime !branch.default) try out.write(on);
+        inline for (branch.require) |name| try out.write(name);
+        try out.endArray();
+    }
+    try out.objectField("properties");
+    try out.beginObject();
+    try out.objectField(on);
+    try out.beginObject();
+    try out.objectField("const");
+    try out.write(branch.value);
+    try out.endObject();
+    inline for (branch.forbid) |name| {
+        try out.objectField(name);
+        // `false` accepts nothing, which is this dialect's way of saying
+        // the key has no meaning on this arm.
+        try out.write(false);
+    }
+    try out.endObject();
+    try out.endObject();
+}
+
 fn writeOneOf(out: *Stringify, comptime T: type) Writer.Error!void {
     if (!@hasDecl(T, "schema_one_of")) return;
     // `assertOneOfMatches` proved this at comptime; restated where the
@@ -244,6 +313,18 @@ fn writeStringShape(out: *Stringify, comptime meta: anytype) Writer.Error!void {
         try out.objectField("minLength");
         try out.write(meta.min_length);
     }
+    // The other half of the pair (#305). `min_length` shipped alone for
+    // as long as no field's ceiling was worth stating; the differential
+    // gate named two that were, and a bound the loader enforces and the
+    // schema omits is a rejection an editor cannot show you.
+    if (comptime @hasField(@TypeOf(meta), "max_length")) {
+        comptime assert(meta.max_length >= 1);
+        if (comptime @hasField(@TypeOf(meta), "min_length")) {
+            comptime assert(meta.max_length >= meta.min_length);
+        }
+        try out.objectField("maxLength");
+        try out.write(meta.max_length);
+    }
 }
 
 /// A slice field (`[]const Child`): an array with optional length bounds and
@@ -287,6 +368,25 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
             } else {
                 try out.objectField("type");
                 try out.write("string");
+                // Bounds on the *element*, not on the array — the field's
+                // own `min_length`/`max_length` would describe a string
+                // it does not have (#305). `access_log.request_headers`
+                // is the case that wanted this: the list is capped by
+                // `max_items` and each name by the loader, and only the
+                // second half was missing from the document.
+                if (comptime @hasField(@TypeOf(meta), "item_min_length")) {
+                    comptime assert(meta.item_min_length >= 1);
+                    try out.objectField("minLength");
+                    try out.write(meta.item_min_length);
+                }
+                if (comptime @hasField(@TypeOf(meta), "item_max_length")) {
+                    comptime assert(meta.item_max_length >= 1);
+                    if (comptime @hasField(@TypeOf(meta), "item_min_length")) {
+                        comptime assert(meta.item_max_length >= meta.item_min_length);
+                    }
+                    try out.objectField("maxLength");
+                    try out.write(meta.item_max_length);
+                }
             }
         },
         // An integer element (the response-match `status` list, #175):
