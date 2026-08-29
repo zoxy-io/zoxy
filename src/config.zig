@@ -1878,6 +1878,11 @@ pub const AccessLogJson = struct {
                 "append-only at startup (one extra fd), never truncated — so a " ++
                 "copy-truncate rotation is safe. Required by `sink:\"file\"`, " ++
                 "rejected beside `stdout`, which cannot use it.",
+            // An empty path is the same refusal as a missing one and
+            // wants the same answer (#305): the loader raises
+            // `AccessLogPathMissing` for both, so the schema has to
+            // catch both or the row cannot go.
+            .min_length = 1,
         },
         .request_headers = .{
             .desc = "Request headers to record under `request_headers` on each " ++
@@ -1898,6 +1903,17 @@ pub const AccessLogJson = struct {
             .item_max_length = constants.access_log_header_name_bytes_max,
         },
     };
+
+    /// A file sink needs somewhere to write and a stdout sink has
+    /// nowhere to be given (#305). `sink` has no default, so both arms
+    /// name it.
+    pub const schema_variants = [_]SchemaVariants{.{
+        .on = "sink",
+        .branches = &.{
+            .{ .value = "stdout", .forbid = &.{"path"} },
+            .{ .value = "file", .require = &.{"path"} },
+        },
+    }};
 };
 
 pub const AdminJson = struct {
@@ -2799,6 +2815,34 @@ pub const PickJson = struct {
         },
     };
 
+    /// Two forks over one object (#305), conjoined rather than nested.
+    ///
+    /// `key` names what a `hash` cluster is sticky on and means nothing
+    /// beside `p2c` or `rr`; `name` names the header or cookie a
+    /// request-derived key reads and means nothing beside `source_ip`.
+    /// Both are `oneOf`s over their own discriminator, and the second
+    /// covers the keyless policies for free: with no `key` present its
+    /// default arm applies, and that arm forbids `name` — which is the
+    /// same verdict the first fork reaches by a different route.
+    pub const schema_variants = [_]SchemaVariants{
+        .{
+            .on = "policy",
+            .branches = &.{
+                .{ .value = "p2c", .forbid = &.{ "key", "name" } },
+                .{ .value = "rr", .forbid = &.{ "key", "name" } },
+                .{ .value = "hash", .require = &.{"key"} },
+            },
+        },
+        .{
+            .on = "key",
+            .branches = &.{
+                .{ .value = "source_ip", .default = true, .forbid = &.{"name"} },
+                .{ .value = "header", .require = &.{"name"} },
+                .{ .value = "cookie", .require = &.{"name"} },
+            },
+        },
+    };
+
     /// The object form as a plain struct, so `innerParse` reads it with
     /// the loader's own strictness (unknown fields rejected) without
     /// recursing back into `jsonParse` below.
@@ -3045,6 +3089,18 @@ pub const CheckJson = struct {
             .maximum = 599,
         },
     };
+
+    /// A `tcp` probe sends nothing and reads nothing, so every
+    /// HTTP-shaped field beside it would be inert; an `http` probe has
+    /// to be told what to ask for (#305). `type` defaults to `tcp`, so
+    /// that arm carries the absence too.
+    pub const schema_variants = [_]SchemaVariants{.{
+        .on = "type",
+        .branches = &.{
+            .{ .value = "tcp", .default = true, .forbid = &.{ "path", "host" } },
+            .{ .value = "http", .require = &.{"path"} },
+        },
+    }};
 };
 
 /// One cluster's passive-ejection block (§7, #230). Two numbers and no
@@ -3230,6 +3286,38 @@ pub const SchemaItems = enum { http_method };
 /// The attribute keys a `schema_fields` entry may carry beyond `.desc`.
 /// `assert_meta_matches` rejects any other key at comptime, so a typo'd
 /// attribute is a compile error, not silently-ignored data.
+/// One arm of a discriminated block: the value of the deciding field,
+/// and what that value makes required or impossible (#305).
+///
+/// This is the last shape of cross-field rule the loader stated in prose
+/// and the schema could not — "`path` is required, but only when `sink`
+/// is `file`". A `oneOf` over the discriminator carries it, so an editor
+/// refuses the config before the loader has to.
+pub const SchemaVariant = struct {
+    /// The discriminator's value on this arm.
+    value: []const u8,
+    /// Fields this arm requires beyond the DTO's own required set.
+    require: []const []const u8 = &.{},
+    /// Fields this arm rules out, emitted as a `false` schema — which
+    /// nothing satisfies, and is how the dialect says "not here".
+    forbid: []const []const u8 = &.{},
+    /// Whether the discriminator's *absence* selects this arm. True on
+    /// exactly the arm matching the field's Zig default, so a config
+    /// that omits the key lands where the loader would put it, and false
+    /// everywhere else — an arm that is not the default must say
+    /// `required`, or an absent discriminator would match every arm at
+    /// once and `oneOf` would reject a valid config.
+    default: bool = false,
+};
+
+/// A discriminated fork over one field. A DTO may declare several, each
+/// independent — `pick` forks twice, on `policy` and then on `key` — and
+/// they are conjoined with `allOf` so neither shadows the other.
+pub const SchemaVariants = struct {
+    on: []const u8,
+    branches: []const SchemaVariant,
+};
+
 const schema_attributes = [_][]const u8{
     "desc",       "minimum",         "maximum",         "min_items", "max_items",
     "min_length", "max_length",      "const_true",      "enum_type", "int_values",
@@ -7058,8 +7146,6 @@ const SchemaGapEntry = struct { name: []const u8, gap: SchemaGap };
 const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "AccessLogHeaderDuplicate", .gap = .duplicate },
     .{ .name = "AccessLogHeaderNameInvalid", .gap = .literal_syntax },
-    .{ .name = "AccessLogPathMissing", .gap = .expressible_fork },
-    .{ .name = "AccessLogPathOnStdout", .gap = .expressible_fork },
     .{ .name = "AdminBindInvalid", .gap = .literal_syntax },
     .{ .name = "BodyContentTypeInvalid", .gap = .literal_syntax },
     .{ .name = "BodyFileUnreadable", .gap = .filesystem },
@@ -7067,16 +7153,10 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "BodyNameTooLong", .gap = .name_length },
     .{ .name = "BodyUnknown", .gap = .cross_reference },
     .{ .name = "ClusterCheckHostInvalid", .gap = .literal_syntax },
-    .{ .name = "ClusterCheckHttpFieldOnTcp", .gap = .expressible_fork },
-    .{ .name = "ClusterCheckPathMissing", .gap = .expressible_fork },
     .{ .name = "ClusterCheckPathNotCanonical", .gap = .literal_syntax },
     .{ .name = "ClusterNameEmpty", .gap = .name_length },
     .{ .name = "ClusterNameTooLong", .gap = .name_length },
-    .{ .name = "ClusterPickKeyMissing", .gap = .expressible_fork },
-    .{ .name = "ClusterPickKeyWithoutHash", .gap = .expressible_fork },
     .{ .name = "ClusterPickNameInvalid", .gap = .literal_syntax },
-    .{ .name = "ClusterPickNameMissing", .gap = .expressible_fork },
-    .{ .name = "ClusterPickNameUnexpected", .gap = .expressible_fork },
     .{ .name = "ClusterProxyProtocolOnHttpListener", .gap = .cross_block },
     .{ .name = "ClusterProxyProtocolOnTlsListener", .gap = .cross_block },
     .{ .name = "ClusterUnknown", .gap = .cross_reference },
@@ -7180,7 +7260,7 @@ test "config: the schema's debt to the loader only ever falls (#305)" {
             else => {},
         }
     }
-    try std.testing.expectEqual(@as(usize, 12), forks);
+    try std.testing.expectEqual(@as(usize, 4), forks);
     try std.testing.expectEqual(@as(usize, 0), bounds);
 }
 

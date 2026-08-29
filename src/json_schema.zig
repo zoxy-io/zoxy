@@ -49,6 +49,7 @@ pub const Keyword = enum {
     @"const",
     oneOf,
     anyOf,
+    allOf,
     minimum,
     maximum,
     minLength,
@@ -83,7 +84,7 @@ pub const Keyword = enum {
             // nothing to accept.
             .items, .additionalProperties => .schema,
             .properties => .schema_map,
-            .oneOf, .anyOf => .schema_list,
+            .oneOf, .anyOf, .allOf => .schema_list,
         };
     }
 };
@@ -111,6 +112,9 @@ pub const Failure = struct {
         too_many_items,
         no_branch_matched,
         many_branches_matched,
+        /// A `false` schema, which nothing satisfies — how this dialect
+        /// says a key is forbidden in the branch it appears under.
+        forbidden,
     };
 };
 
@@ -200,10 +204,14 @@ fn check(
     // overflow — the emitter's own output is checked against it by the
     // census, so a breach here is a document from somewhere else.
     assert(depth < depth_max);
-    // A schema that is not an object constrains nothing in this dialect;
-    // the emitter never writes one, and the census proves it.
+    // A boolean *is* a schema in draft 2020-12: `true` accepts anything
+    // and `false` accepts nothing. The emitter writes `false` to forbid
+    // a key inside a variant branch (#305) — `{"path": false}` under a
+    // `sink: "stdout"` arm says a stdout sink has no path — which is the
+    // whole reason this arm exists.
     const object = switch (schema) {
         .object => |map| map,
+        .bool => |accepts| return if (accepts) null else path.fail(.forbidden),
         else => return null,
     };
     if (object.get("type")) |wanted| {
@@ -385,6 +393,13 @@ fn checkCombinators(
         }
         if (!matched) {
             return path.fail(.no_branch_matched);
+        }
+    }
+    if (object.get("allOf")) |branches| {
+        for (branches.array.items) |branch| {
+            if (check(branch, instance, path, depth + 1)) |failure| {
+                return failure;
+            }
         }
     }
     if (object.get("oneOf")) |branches| {
@@ -632,6 +647,43 @@ test "json schema: oneOf is exactly one, which is the whole point of it" {
     try expectValid(schema, "{\"l4\":{}}");
     try expectInvalid(schema, "{}", .no_branch_matched, "");
     try expectInvalid(schema, "{\"http\":{},\"l4\":{}}", .many_branches_matched, "");
+}
+
+test "json schema: a variant branch pins a discriminator and forbids a key" {
+    // The shape #305's remaining forks take: one arm per value of a
+    // discriminating field, each naming what that value requires and
+    // what it rules out. `false` is how the ruling-out is said, and
+    // `allOf` is how two independent forks over the same object are
+    // conjoined without either shadowing the other.
+    const schema =
+        \\{"type":"object","properties":{"sink":{"type":"string"},"path":{"type":"string"}},
+        \\ "oneOf":[
+        \\  {"required":["sink"],"properties":{"sink":{"const":"stdout"},"path":false}},
+        \\  {"required":["sink","path"],"properties":{"sink":{"const":"file"}}}]}
+    ;
+    try expectValid(schema, "{\"sink\":\"stdout\"}");
+    try expectValid(schema, "{\"sink\":\"file\",\"path\":\"/var/log/z\"}");
+    // A file sink with nowhere to write: the rejection the loader used
+    // to own alone.
+    try expectInvalid(schema, "{\"sink\":\"file\"}", .no_branch_matched, "");
+    // And a stdout sink carrying a path it cannot use.
+    try expectInvalid(
+        schema,
+        "{\"sink\":\"stdout\",\"path\":\"/var/log/z\"}",
+        .no_branch_matched,
+        "",
+    );
+}
+
+test "json schema: allOf conjoins, and a false schema refuses on its own" {
+    try expectValid("true", "{}");
+    try expectInvalid("false", "{}", .forbidden, "");
+    const schema =
+        \\{"allOf":[{"type":"object"},{"required":["a"]}]}
+    ;
+    try expectValid(schema, "{\"a\":1}");
+    try expectInvalid(schema, "{}", .missing_required, "a");
+    try expectInvalid(schema, "[]", .type_mismatch, "");
 }
 
 test "json schema: bounds, enums and item counts" {

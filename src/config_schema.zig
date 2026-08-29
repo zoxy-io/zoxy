@@ -97,6 +97,7 @@ fn writeObjectBody(out: *Stringify, comptime T: type, comptime with_doc: bool) W
     try out.write(false);
 
     try writeOneOf(out, T);
+    try writeVariants(out, T);
 }
 
 /// Emit a DTO's "exactly one of these fields" fork as `oneOf`, one
@@ -115,6 +116,66 @@ fn writeObjectBody(out: *Stringify, comptime T: type, comptime with_doc: bool) W
 /// `additionalProperties: false` is unaffected — in draft 2020-12 that
 /// keyword only considers `properties` declared in the same schema
 /// object, never a sibling subschema's.
+/// Emit a DTO's discriminated forks (#305): one `oneOf` per declared
+/// fork, conjoined under `allOf` when there is more than one.
+///
+/// Each arm pins the discriminator with `const` and states what that
+/// value requires or rules out. The arm matching the field's Zig default
+/// omits `required`, so an absent discriminator satisfies it and no
+/// other — which is what keeps `oneOf`'s "exactly one" honest for a
+/// field that may be left out.
+fn writeVariants(out: *Stringify, comptime T: type) Writer.Error!void {
+    if (!@hasDecl(T, "schema_variants")) return;
+    const sets = T.schema_variants;
+    comptime assert(sets.len >= 1);
+    try out.objectField("allOf");
+    try out.beginArray();
+    inline for (sets) |set| {
+        try out.beginObject();
+        try out.objectField("oneOf");
+        try out.beginArray();
+        inline for (set.branches) |branch| {
+            try writeVariantBranch(out, set.on, branch);
+        }
+        try out.endArray();
+        try out.endObject();
+    }
+    try out.endArray();
+}
+
+fn writeVariantBranch(
+    out: *Stringify,
+    comptime on: []const u8,
+    comptime branch: config.SchemaVariant,
+) Writer.Error!void {
+    try out.beginObject();
+    if (comptime !branch.default or branch.require.len >= 1) {
+        try out.objectField("required");
+        try out.beginArray();
+        // A non-default arm names the discriminator, or an absent one
+        // would satisfy every arm and the fork would reject what the
+        // loader accepts.
+        if (comptime !branch.default) try out.write(on);
+        inline for (branch.require) |name| try out.write(name);
+        try out.endArray();
+    }
+    try out.objectField("properties");
+    try out.beginObject();
+    try out.objectField(on);
+    try out.beginObject();
+    try out.objectField("const");
+    try out.write(branch.value);
+    try out.endObject();
+    inline for (branch.forbid) |name| {
+        try out.objectField(name);
+        // `false` accepts nothing, which is this dialect's way of saying
+        // the key has no meaning on this arm.
+        try out.write(false);
+    }
+    try out.endObject();
+    try out.endObject();
+}
+
 fn writeOneOf(out: *Stringify, comptime T: type) Writer.Error!void {
     if (!@hasDecl(T, "schema_one_of")) return;
     // `assertOneOfMatches` proved this at comptime; restated where the
