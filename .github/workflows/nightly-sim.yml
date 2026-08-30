@@ -401,7 +401,7 @@ jobs:
             --arg sha "${SHA:0:7}" \
             --arg url "$RUN_URL" \
             '{
-              username: "zoxy sim",
+              username: "zoxy",
               embeds: [{
                 title: $title,
                 description: $detail,
