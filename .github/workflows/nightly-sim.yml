@@ -305,7 +305,12 @@ jobs:
 
       - name: Report to Discord
         env:
-          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          # A channel of its own, separate from the DISCORD_WEBHOOK the
+          # shared `discord.yml` posts repository events to. One report a
+          # night, always sent, pass or fail — that is a different kind of
+          # message from a stream of pushes and pull requests, and mixing
+          # them means the one that matters scrolls past.
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_NIGHTLY }}
           OUTCOME: ${{ needs.soak.result }}
           START: ${{ needs.plan.outputs.start }}
           LAST: ${{ needs.plan.outputs.last }}
@@ -385,7 +390,7 @@ jobs:
           fi
 
           if [ -z "${WEBHOOK:-}" ]; then
-            echo "::warning::DISCORD_WEBHOOK is not set; skipping the report."
+            echo "::warning::DISCORD_WEBHOOK_NIGHTLY is not set; skipping the report."
             printf '%s\n\n%s\n' "$title" "$detail" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
