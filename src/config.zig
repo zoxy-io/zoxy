@@ -273,7 +273,7 @@ pub const Config = struct {
         /// bound is the transform's and not the RFC's.
         relay_buffer_bytes: u32 = constants.relay_buffer_bytes_default,
         /// The §4 TLS engine pool: how many sessions may be handshaking
-        /// or terminated at once. An engine is ~91 KiB plus a plaintext
+        /// or terminated at once. An engine is ~92 KiB plus a plaintext
         /// buffer, far the largest per-connection object here, so this is
         /// the knob that decides what a TLS deployment costs in RSS. The
         /// loader resolves an omitted field to conn slots capped at
@@ -1588,7 +1588,7 @@ fn resolveCqFill(
 }
 
 /// The §4 engine pool follows conn slots when omitted, capped at
-/// `tls_engines_max` — an engine is ~91 KiB, so unlike a head buffer the
+/// `tls_engines_max` — an engine is ~92 KiB, so unlike a head buffer the
 /// default cannot simply be "one each" at every conn-slot count anyone
 /// might configure. Zero exactly when no listener terminates TLS: a
 /// plaintext-only deployment reserves nothing, and one that asked for
@@ -1992,7 +1992,7 @@ pub const LimitsJson = struct {
         },
         .tls_engines = .{
             .desc = "Concurrent TLS sessions — handshaking or terminated. The " ++
-                "largest per-connection object zoxy holds (~91 KiB plus a " ++
+                "largest per-connection object zoxy holds (~92 KiB plus a " ++
                 "plaintext buffer), so this is what a TLS deployment's memory " ++
                 "follows. Zero exactly when no listener terminates TLS.",
             .minimum = 1,
@@ -9326,7 +9326,7 @@ test "config: tls_engines follows the tls listeners, and refuses a mismatch" {
         error.LimitTlsEnginesOutOfRange,
         head ++ tls_block ++ tail ++ ",\"limits\":{\"tls_engines\":0}" ++ close,
     );
-    // Past the ceiling: an engine is ~91 KiB, so this bound is what
+    // Past the ceiling: an engine is ~92 KiB, so this bound is what
     // stands between a typo and a gigabyte.
     try expectParseError(
         error.LimitTlsEnginesOutOfRange,

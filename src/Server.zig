@@ -110,7 +110,7 @@ pub fn Server(comptime IoType: type) type {
         /// nothing — when no listener does, which is the shape `Pool`'s
         /// zero-slot support exists for.
         ///
-        /// A pool rather than a `Conn` field because an engine is ~91 KiB
+        /// A pool rather than a `Conn` field because an engine is ~92 KiB
         /// against a conn slot's ~1.7: a deployment pays for the TLS it
         /// serves concurrently, not for every slot it could admit (§5).
         tls_engines: Pool(TlsEngine),

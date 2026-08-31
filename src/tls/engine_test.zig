@@ -112,17 +112,23 @@ const Client = struct {
             client.records.advance(taken);
             remaining = remaining[taken..];
             while (try client.records.next()) |wire_record| {
-                switch (try client.hs.handleRecord(wire_record, &client.out)) {
-                    // `.connected` carries the client flight, so both
-                    // arms put bytes on the wire.
-                    .send, .connected => |bytes| to_server.write(bytes),
-                    .application_data => |bytes| {
-                        assert(client.app_len + bytes.len <= client.app.len);
-                        @memcpy(client.app[client.app_len..][0..bytes.len], bytes);
-                        client.app_len += @intCast(bytes.len);
-                    },
-                    .closed => client.saw_close = true,
-                    .ticket, .none => {},
+                // Drained to null: one record may carry several
+                // post-handshake messages, and zssl refuses the next
+                // record while any of them are still pending.
+                var next_event = try client.hs.handleRecord(wire_record, &client.out);
+                while (next_event) |event| : (next_event = try client.hs.drain(&client.out)) {
+                    switch (event) {
+                        // `.connected` carries the client flight, so both
+                        // arms put bytes on the wire.
+                        .send, .connected => |bytes| to_server.write(bytes),
+                        .application_data => |bytes| {
+                            assert(client.app_len + bytes.len <= client.app.len);
+                            @memcpy(client.app[client.app_len..][0..bytes.len], bytes);
+                            client.app_len += @intCast(bytes.len);
+                        },
+                        .closed => client.saw_close = true,
+                        .ticket => {},
+                    }
                 }
             }
         }

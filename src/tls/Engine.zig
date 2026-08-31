@@ -4,7 +4,7 @@
 //! allocation in the wrapper — libcrypto's own allocations ride the fixed
 //! heap of `libcrypto_heap.zig`.
 //!
-//! An engine is ~91 KiB — the outbox and flight scratch dominate, with
+//! An engine is ~92 KiB — the outbox and flight scratch dominate, with
 //! one record buffer, one out buffer and a ClientHello-sized reassembly
 //! beside them (`constants.tls_engine_bytes_max` states the ceiling) —
 //! so the serving path holds these in a
@@ -163,6 +163,23 @@ pub const plaintext_record_bytes_max = zssl.record.plaintext_bytes_max;
 /// tolerating a split is refusing a peer whose MTU chose it.
 const reassembly_bytes: usize = 16 * 1024;
 
+/// The key-exchange groups this server will negotiate, in preference
+/// order — one, because a 32-byte seed is what `Config` carries and
+/// x25519's scalar is exactly that. zssl asserts every entry is a group
+/// it can complete, so a widening here is caught at `init` rather than
+/// at the HelloRetryRequest it would otherwise send and fail to answer.
+const groups_offered = [_]u16{zssl.client_hello.group_x25519};
+
+comptime {
+    // The seed fills the scalar exactly, so the padding `init` writes is
+    // never read: x25519 is the only group offered, and its private half
+    // is the prefix zssl takes.
+    assert(groups_offered.len == 1);
+    const offered = zssl.backend.Group.fromWire(groups_offered[0]).?;
+    assert(offered.privateBytes() ==
+        @typeInfo(@FieldType(Config, "x25519_seed")).array.len);
+}
+
 /// Where zssl assembles the server flight before sealing it: the chain
 /// plus EncryptedExtensions, CertificateVerify and Finished around it.
 const flight_scratch_bytes: usize = @as(usize, constants.tls_cert_chain_bytes_max) + 1024;
@@ -186,6 +203,16 @@ const app_record_bytes_max: usize = @as(usize, constants.tls_app_chunk_bytes) + 
 /// construction" be read off each call site instead of reasoned about
 /// across all of them.
 const control_record_bytes_max: usize = 256;
+
+/// What one connected `pump` may stage: zssl answers each KeyUpdate the
+/// peer sends with one of its own, and a peer may pack a run of them
+/// into records this loop drains without pausing to write. zssl's flood
+/// guard is what makes the run finite — the 33rd consecutive KeyUpdate
+/// ends the connection instead of being answered — so the burst has a
+/// closed form, which is the only kind of number `stage`'s "overflow is
+/// impossible by construction" can be read off.
+const key_update_burst_bytes_max: usize =
+    @as(usize, zssl.flood.key_updates_max) * control_record_bytes_max;
 
 /// The largest record zoxy itself emits.
 ///
@@ -302,10 +329,24 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     // there is no keypair to generate and no failure to shed. That
     // retires #222's livelock at the source — the fallible P-256 keygen
     // it lived in is not on this path any more.
+    //
+    // zssl sizes the scalar for the widest group it can complete
+    // (secp384r1) and lets a shorter one take a prefix, so the tail here
+    // is padding that x25519 never reads — `groups` below is what makes
+    // that true, and the assert on it is what keeps the two agreeing.
+    var key_share_private: [zssl.backend.group_private_bytes_max]u8 = @splat(0);
+    key_share_private[0..config.x25519_seed.len].* = config.x25519_seed;
     engine.hs = .init(&.{
         .credentials = &config.credentials.inner,
         .server_random = config.random,
-        .x25519_private = config.x25519_seed,
+        .key_share_private = key_share_private,
+        // x25519 alone, which is what this proxy has always negotiated.
+        // zssl can complete secp256r1 and secp384r1 on the server side
+        // now, and offering them would widen interop — but a P-384
+        // scalar is 48 bytes where `acquireTlsEngine` draws 32, so
+        // taking them is an entropy-draw change and a decision of its
+        // own, not a consequence of a dependency bump (§4).
+        .groups = &groups_offered,
         .reassembly = &engine.reassembly,
         .flight = &engine.flight,
         // Offered only when this deployment can actually open one. A
@@ -361,11 +402,12 @@ pub fn received(engine: *Engine, n: usize, sink: *const Sink) !void {
     assert(n > 0);
     assert(n <= constants.tls_read_chunk_bytes);
     // What `pump` may stage: a handshake burst before the session is up, a
-    // control record after. Staging appends, so an in-flight send is
-    // undisturbed — its slice sits earlier in the outbox and never moves —
-    // but only while the append fits, which is what this demands.
+    // bounded run of KeyUpdate answers after. Staging appends, so an
+    // in-flight send is undisturbed — its slice sits earlier in the
+    // outbox and never moves — but only while the append fits, which is
+    // what this demands.
     const room_needed: usize = if (engine.isConnected())
-        control_record_bytes_max
+        key_update_burst_bytes_max
     else
         server_hello_bytes_max + flight_bytes_max;
     assert(engine.outboundRoom() >= room_needed);
@@ -392,6 +434,15 @@ pub fn feed(engine: *Engine, wire: []const u8, sink: *const Sink) !void {
         remaining = remaining[take..];
         try engine.received(take, sink);
     }
+}
+
+comptime {
+    // Both room requirements `received` states must be things a caller
+    // can actually hold: the relay and the L7 path gate a read on
+    // `emitted_record_bytes_max` of free outbox, so anything above that
+    // would be an assert no caller could satisfy rather than a bound.
+    assert(key_update_burst_bytes_max <= emitted_record_bytes_max);
+    assert(server_hello_bytes_max + flight_bytes_max <= emitted_record_bytes_max);
 }
 
 /// Room left to stage. The relay drives both directions at once, so a
@@ -529,7 +580,7 @@ fn openOfferedTicket(
     identity: []const u8,
     obfuscated_age: u32,
     psk_out: *[zssl.cipher_suite.hash_bytes_max]u8,
-) ?u8 {
+) ?zssl.ServerHandshake.Psk {
     _ = obfuscated_age;
     const engine: *Engine = @ptrCast(@alignCast(context));
     const tickets = engine.tickets orelse return null;
@@ -545,7 +596,12 @@ fn openOfferedTicket(
     // 0-RTT is not offered (§4): a replayed ticket buys a resumed
     // handshake and nothing else, which is what lets these tickets be
     // multi-use without the replay table that would defeat the point.
-    return @intCast(opened.psk.len);
+    // `early_data` is left null for that reason, and `issued` because
+    // RFC 8446 §4.6.1's lifetime is enforced above against the sealed
+    // stamp — a number the client cannot move — rather than by zssl
+    // against a clock this engine does not hand it (`Config.now_ms` is
+    // null).
+    return .{ .psk_bytes = @intCast(opened.psk.len), .kind = .resumption };
 }
 
 /// Stage an orderly TLS close (close_notify) for the transport.
@@ -591,38 +647,62 @@ fn pump(engine: *Engine, sink: *const Sink) !void {
     // are whole records staged.
     while (try engine.records.next()) |wire_record| {
         assert(wire_record.len > 0);
-        const event = try engine.hs.handleRecord(wire_record, &engine.out);
-        switch (event) {
-            // One arm where ztls had three. zssl assembles the server
-            // flight before it seals it and answers a KeyUpdate from
-            // inside the machine, so everything the peer is owed arrives
-            // as bytes to put on the wire — there is no borrowed-buffer
-            // handshake to complete afterwards.
-            .send => |wire| {
-                assert(wire.len > 0);
-                engine.stage(wire);
-            },
-            .application_data => |bytes| {
-                // The one place a peer chooses how many bytes land in a
-                // zoxy buffer, so it is checked rather than assumed —
-                // §5's sizing for `plaintext` is exactly this bound.
-                // zssl enforces it too (`protect.open` refuses a longer
-                // record), so this is the second of two locks on the
-                // same door; an error rather than an assert, because the
-                // input is the peer's and so should the consequence be.
-                if (bytes.len > plaintext_record_bytes_max) {
-                    return error.RecordTooLarge;
-                }
-                sink.appData(sink.ctx, bytes);
-            },
-            .closed => {
-                engine.peer_closed = true;
-                sink.closed(sink.ctx);
-            },
-            // The handshake completing is not news to the transport: it
-            // asks `isConnected` when it needs to know, and the bytes
-            // that carried it were staged by the `.send` before this.
-            .connected, .none => {},
+        // One record may carry several post-handshake messages — RFC
+        // 8446 §5.1 permits it and both Go and OpenSSL pack them — so
+        // zssl hands the first back from `handleRecord` and the rest
+        // from `drain`, and a caller that stops early is told
+        // `error.EventsPending` on the *next* record rather than losing
+        // an event silently.
+        //
+        // Bounded: `drain` answers null once the assembler holds no
+        // further complete message, and zssl's own flood guard caps how
+        // many one record may hold.
+        var next_event = try engine.hs.handleRecord(wire_record, &engine.out);
+        while (next_event) |event| : (next_event = try engine.hs.drain(&engine.out)) {
+            switch (event) {
+                // One arm where ztls had three. zssl assembles the
+                // server flight before it seals it and answers a
+                // KeyUpdate from inside the machine, so everything the
+                // peer is owed arrives as bytes to put on the wire —
+                // there is no borrowed-buffer handshake to complete
+                // afterwards.
+                .send => |wire| {
+                    assert(wire.len > 0);
+                    engine.stage(wire);
+                },
+                .application_data => |bytes| {
+                    // The one place a peer chooses how many bytes land
+                    // in a zoxy buffer, so it is checked rather than
+                    // assumed — §5's sizing for `plaintext` is exactly
+                    // this bound. zssl enforces it too (`protect.open`
+                    // refuses a longer record), so this is the second of
+                    // two locks on the same door; an error rather than
+                    // an assert, because the input is the peer's and so
+                    // should the consequence be.
+                    if (bytes.len > plaintext_record_bytes_max) {
+                        return error.RecordTooLarge;
+                    }
+                    sink.appData(sink.ctx, bytes);
+                },
+                // Unreachable by construction and refused rather than
+                // asserted: RFC 8446 §8's three opt-ins are all absent
+                // here — no clock is handed to zssl, no strike register,
+                // and every ticket this engine issues advertises no early
+                // data, so accepted 0-RTT cannot arrive. If a future pin
+                // makes it possible, the connection dies rather than the
+                // proxy relaying bytes that are neither forward secret
+                // nor replay-proof (§4).
+                .early_data => return error.UnexpectedEarlyData,
+                .closed => {
+                    engine.peer_closed = true;
+                    sink.closed(sink.ctx);
+                },
+                // The handshake completing is not news to the transport:
+                // it asks `isConnected` when it needs to know, and the
+                // bytes that carried it were staged by the `.send`
+                // before this.
+                .connected => {},
+            }
         }
     }
 }

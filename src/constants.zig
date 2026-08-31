@@ -337,7 +337,7 @@ comptime {
 /// The ceiling on one TLS engine's own footprint, asserted against
 /// `@sizeOf(Engine)` in `src/tls/Engine.zig` (§5: a budget is a stated
 /// number a thing must fit, not a number read back off whatever it grew
-/// to). Measured at 91 KiB — the record, out, flight and reassembly
+/// to). Measured at 92 KiB — the record, out, flight and reassembly
 /// buffers plus the outbox — with the headroom here for a pin that adds
 /// a field. It was 132 KiB under ztls, whose per-handshake buffers were
 /// wider; the pool costs the same slots for less. A bump past this is a
@@ -346,7 +346,7 @@ comptime {
 pub const tls_engine_bytes_max: u32 = 160 * 1024;
 
 /// The ceiling on `limits.tls_engines` — how many TLS sessions may be
-/// handshaking or terminated at once (§5). An engine is ~91 KiB plus its
+/// handshaking or terminated at once (§5). An engine is ~92 KiB plus its
 /// plaintext buffer, so this is the one pool whose count an operator
 /// notices in RSS: 1024 is ~170 MiB, and the ceiling exists so a typo in
 /// the config cannot ask for a gigabyte. Unlike the conn-slot ceiling it

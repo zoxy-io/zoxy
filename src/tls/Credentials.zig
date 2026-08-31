@@ -79,6 +79,16 @@ pub fn load(
         else => |remaining| return remaining,
     };
     errdefer inner.deinit();
+    // ECDSA only, and this is now zoxy's rule to keep: zssl's signer
+    // learned RSA-PSS, so `UnsupportedKey` no longer covers an RSA leaf
+    // and the module doc's promise would otherwise have left with the
+    // dependency bump. The reason it is a promise is the loop — an RSA
+    // sign is ~1-2 ms against the ~260 µs ECDSA handshake the single
+    // thread is sized for (IMPLEMENTATION_NOTES.md) — so the leaf is
+    // refused at startup rather than met as a latency cliff.
+    for (inner.signer.supported()) |supported| {
+        if (supported.keyKind() != .ecdsa) return error.UnsupportedCertKey;
+    }
     const decoded = inner.chain();
     assert(decoded.len >= 1);
 
@@ -117,13 +127,22 @@ pub fn deinit(credentials: *Credentials) void {
 }
 
 /// The CertificateVerify scheme zssl derived from the leaf's key.
+///
+/// One, singular: an ECDSA key signs under exactly the scheme its curve
+/// names, and `load` admits no other kind of key. An RSA leaf would
+/// offer three (one per digest), which is the case this asserts away.
 pub fn scheme(credentials: *const Credentials) zssl.backend.SignatureScheme {
     assert(credentials.chain.len >= 1);
-    return credentials.inner.signer.scheme;
+    const supported = credentials.inner.signer.supported();
+    assert(supported.len == 1);
+    assert(supported[0].keyKind() == .ecdsa);
+    return supported[0];
 }
 
 const fixture_cert_pem = @embedFile("testdata/cert.pem");
 const fixture_key_pem = @embedFile("testdata/key.pem");
+/// An RSA key with no certificate of its own — the one this refuses.
+const fixture_rsa_key_pem = @embedFile("testdata/rsa2048-key.pem");
 const pem_cert_begin = "-----BEGIN CERTIFICATE-----";
 const pem_cert_end = "-----END CERTIFICATE-----";
 
@@ -143,6 +162,20 @@ test "credentials: an ECDSA P-256 PEM pair loads with the right scheme" {
     // The parsed leaf DER round-trips through std.crypto's parser.
     const cert: std.crypto.Certificate = .{ .buffer = credentials.chain[0], .index = 0 };
     _ = try cert.parse();
+}
+
+test "credentials: an RSA key is refused, whatever zssl can sign with it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // zssl's signer takes this key and offers three RSA-PSS schemes for
+    // it; the refusal is zoxy's own, and this is the gate on it. An RSA
+    // leaf that loaded would serve — slowly, ~1-2 ms per handshake on
+    // the loop — rather than fail, which is exactly the silent downgrade
+    // the module doc refuses.
+    try std.testing.expectError(
+        error.UnsupportedCertKey,
+        Credentials.load(arena_state.allocator(), fixture_cert_pem, fixture_rsa_key_pem, .{}),
+    );
 }
 
 test "credentials: a PEM with no certificate block is rejected" {

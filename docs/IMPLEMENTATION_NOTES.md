@@ -27,6 +27,14 @@ GitHub issue once there's a concrete plan.
 > design, not of which library implements it. What changed is who
 > maintains the protocol layer, and that the five fork commits below are
 > no longer patches carried against an upstream: they are the tree.
+>
+> One mechanism did change under the policy, at zssl 91a985a: the
+> ECDSA-only rule below used to be a property of the *engine* — neither
+> ztls nor early zssl could load an RSA key at all — and zssl signs
+> RSA-PSS now. So the policy is `src/tls/Credentials.zig`'s to enforce,
+> at load, with a fixture of its own. The reasoning is unchanged and is
+> the whole of this section: an RSA sign is the ~1–2 ms number that once
+> argued for a worker pool, on a loop sized for a ~260 µs handshake.
 
 The design settled on **no worker threads** for TLS handshakes (§3,
 DESIGN.md; measured below in "TLS handshake CPU" and "TLS on the
