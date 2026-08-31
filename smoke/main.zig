@@ -42,6 +42,11 @@ const work_directory = ".zig-cache/zoxy-smoke";
 const config_path = work_directory ++ "/zoxy.json";
 const access_log_path = work_directory ++ "/access.log";
 const zoxy_log_path = work_directory ++ "/zoxy.log";
+/// #311's leg runs a second proxy of its own, so it needs its own config
+/// and its own output: the point of that leg is a process that *dies*,
+/// and it must not be the one every other verdict here is reading.
+const watchdog_config_path = work_directory ++ "/watchdog.json";
+const watchdog_log_path = work_directory ++ "/watchdog.log";
 
 /// The #159 bodies this run configures. `robots_body` goes through the
 /// **file** arm — written here, read by the real binary at startup — so
@@ -238,6 +243,21 @@ const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 
 /// the load is finished before SIGTERM is sent.
 const drain_deadline_ms: u32 = 300;
 
+/// #311's serving watchdog, armed for the whole run. The assertion it
+/// carries is the *negative* one, and it is the only tier that can make
+/// it: this gate spawns the real binary, so a watchdog that fired
+/// spuriously would take the process down and every verdict after it
+/// would fail — including the drain's own "exited 0". A simulator cannot
+/// say that, because the thing being claimed is that nothing real
+/// blocked the loop for this long.
+///
+/// Eight seconds, well above anything this run legitimately pauses for
+/// and well under the harness's own wedge deadline. A tighter number
+/// would be measuring the runner's scheduler rather than zoxy: the
+/// positive leg (`loopWatchdogPassed`) takes the floor instead, on a
+/// process it stops on purpose.
+const loop_watchdog_ms: u32 = 8_000;
+
 /// zoxy's pools, shrunk from the lean defaults (§5). Nothing here is a
 /// scenario — the load is a handful of connections — so the smallest
 /// config that serves it starts fastest and keeps the process's resident
@@ -335,7 +355,32 @@ comptime {
 /// most wants to catch loudly (a proxy that will not drain, #130's
 /// neighbourhood) is exactly the one that would otherwise wedge a build
 /// step until CI's own timeout killed it with no diagnosis.
-const watchdog_budget_ns: u64 = 30 * std.time.ns_per_s;
+const watchdog_budget_ns: u64 = 30 * std.time.ns_per_s + loop_watchdog_stall_ns;
+
+/// #311's leg, and the numbers it rests on.
+///
+/// The proxy under it is configured at the floor — the shortest bound the
+/// mechanism can express — because this is the one place a *tight*
+/// watchdog is safe: the process is stopped deliberately, so the stall is
+/// not the runner's scheduler being slow, it is `SIGSTOP`.
+const loop_watchdog_leg_ms: u32 = 2_000;
+
+/// How long the leg holds the proxy stopped. The alarm is refreshed every
+/// half-bound, so at the moment `SIGSTOP` lands it has somewhere between
+/// half a bound and a whole one left to run — `alarm(2)` counts real time
+/// and a stopped process does not stop the clock, so waiting a full bound
+/// past the longest of those is certain, and the rest is margin for a
+/// loaded runner's `SIGCONT` taking its time.
+const loop_watchdog_stall_ns: u64 =
+    (@as(u64, loop_watchdog_leg_ms) + 1_500) * std.time.ns_per_ms;
+
+/// What zoxy exits with when its serving watchdog fires (#311, §8), and
+/// what this leg is really asserting: 4 is a drain that could not finish,
+/// 5 is a loop that stopped answering during one, 6 is a loop that
+/// stopped answering while serving. Spelled out here rather than imported
+/// because this harness links no zoxy at all (§9) — it runs the real
+/// binary and reads what a supervisor would.
+const loop_watchdog_exit_code: u8 = 6;
 
 /// The origin's serve tasks take its address, and the clients hold
 /// readers and writers pointing into their own buffers — both want
@@ -378,6 +423,7 @@ const Stage = enum {
     https_request,
     https_close_notify,
     https_scrape,
+    watchdog_leg,
     drain,
     verdicts,
 
@@ -391,6 +437,7 @@ const Stage = enum {
             .sticky_leg => "the sticky leg (#178)",
             .bodies_leg => "the bodies leg (#159)",
             .https_handshake => "the https handshake",
+            .watchdog_leg => "the loop-watchdog leg (#311)",
             .https_request => "an https request",
             .https_close_notify => "the https close_notify",
             .https_scrape => "the https leg's scrape",
@@ -492,6 +539,12 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
 
+    // Its own proxy, its own port, and it ends by killing it — so it runs
+    // after every leg that needs the main child alive, and before the
+    // drain that ends it.
+    enterStage(.watchdog_leg);
+    const watchdog_ok = try loopWatchdogPassed(arena, io, flags.zoxy_path);
+
     enterStage(.drain);
     const drained_cleanly = try drain(io, &child, &running);
     enterStage(.verdicts);
@@ -502,7 +555,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        tls_ok and memory_ok and drain_ok and check_ok;
+        tls_ok and memory_ok and drain_ok and check_ok and watchdog_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -525,7 +578,8 @@ fn report(
     var memory_buffer: [64]u8 = undefined;
     std.debug.print(
         "smoke: {d} http + {d} l4 exchanges, {d} access-log lines, counters reconcile, " ++
-            "{d} probes in {d}ms, {s}, --check agrees, clean drain\n",
+            "{d} probes in {d}ms, {s}, --check agrees, watchdog ended a stopped " ++
+            "proxy, clean drain\n",
         .{
             lines.http,
             lines.l4,
@@ -1645,6 +1699,140 @@ fn readAccessLog(arena: std.mem.Allocator, io: Io) !LogCounts {
     return counts;
 }
 
+/// #311's positive leg: stop the loop for real, and watch the kernel
+/// finish the sentence.
+///
+/// This is the only tier that can make this claim. The simulator models
+/// the alarm as a deadline its run loop compares a virtual clock against,
+/// which proves the *wiring* — a stranded timer plane still reaches the
+/// give-up — but a virtual clock cannot be blocked, so what it cannot
+/// show is a real process, in a real kernel, that has stopped executing.
+/// `SIGSTOP` is exactly that: the process is off the CPU entirely, no
+/// completion is delivered, no timer runs, and `alarm(2)` keeps counting
+/// because it is the kernel's clock and not the loop's. On `SIGCONT` the
+/// pending SIGALRM is delivered before anything else the process was
+/// going to do, so the handler wins the race against the refresh by
+/// construction rather than by timing.
+///
+/// A separate proxy with its own config, port and log, because the
+/// assertion is that it *dies* — running this against the main child
+/// would take every verdict after it.
+fn loopWatchdogPassed(arena: std.mem.Allocator, io: Io, zoxy_path: []const u8) !bool {
+    const port = try reserveWatchdogPort(io);
+    try writeWatchdogConfig(arena, io, port, origin.port);
+    var child = try spawnWatchdogZoxy(io, zoxy_path);
+    var running = true;
+    // Every early return below leaves a stopped or dying process behind,
+    // and an orphan holding a port is what the next run trips over.
+    defer if (running) child.kill(io);
+    assert(child.id != null);
+    try awaitListening(io, port);
+
+    try std.posix.kill(child.id.?, .STOP);
+    // `try`, where the rest of this harness shrugs a sleep off as pacing:
+    // here the sleep *is* the argument. A short one would `SIGCONT` the
+    // proxy before the alarm was certain to have expired, and the leg
+    // would then report a watchdog that did not fire as a failure of the
+    // watchdog rather than of its own timing.
+    try io.sleep(Io.Duration.fromNanoseconds(loop_watchdog_stall_ns), .awake);
+    try std.posix.kill(child.id.?, .CONT);
+    const term = try child.wait(io);
+    running = false;
+
+    if (term != .exited or term.exited != loop_watchdog_exit_code) {
+        std.debug.print(
+            "FAIL: the loop watchdog (#311) did not end the stopped proxy: {any}\n",
+            .{term},
+        );
+        return false;
+    }
+    // The exit code is what a supervisor reads; the line is what an
+    // operator reads. A watchdog that took the process down without
+    // saying which silence it was reporting would be the hang it
+    // replaced, one layer down.
+    const said_so = try watchdogLogMentions(arena, io, "#311");
+    if (!said_so) {
+        std.debug.print(
+            "FAIL: the loop watchdog exited {d} without naming itself on stderr\n",
+            .{loop_watchdog_exit_code},
+        );
+    }
+    return said_so;
+}
+
+/// Whether the stopped proxy's own output carries `needle`. Read whole:
+/// this log is a banner and at most one watchdog line.
+fn watchdogLogMentions(arena: std.mem.Allocator, io: Io, needle: []const u8) !bool {
+    const bytes_max: usize = 64 * 1024;
+    const text = Io.Dir.cwd().readFileAlloc(
+        io,
+        watchdog_log_path,
+        arena,
+        .limited(bytes_max),
+    ) catch return false;
+    return std.mem.indexOf(u8, text, needle) != null;
+}
+
+/// One more kernel-assigned port, on `reservePorts`' terms and for its
+/// reason — this leg binds a listener of its own while the main proxy
+/// still holds all four of that one's.
+fn reserveWatchdogPort(io: Io) !u16 {
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try address.listen(io, .{ .mode = .stream });
+    const port = listener.socket.address.getPort();
+    listener.deinit(io);
+    assert(port != 0);
+    return port;
+}
+
+/// The smallest config that serves: one http listener, one cluster, and
+/// the watchdog this leg is about. Deliberately not the main template —
+/// nothing here needs TLS, an access log, health checks or filters, and a
+/// config that carried them would put failure modes into a leg whose one
+/// job is to be stopped.
+fn writeWatchdogConfig(
+    arena: std.mem.Allocator,
+    io: Io,
+    port: u16,
+    origin_port: u16,
+) !void {
+    assert(port != 0);
+    assert(origin_port != 0);
+    const config_json = try std.fmt.allocPrint(arena, watchdog_config_template, .{
+        port,
+        origin_port,
+        loop_watchdog_leg_ms,
+    });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = watchdog_config_path,
+        .data = config_json,
+    });
+}
+
+const watchdog_config_template =
+    \\{{
+    \\    "listeners": [
+    \\        {{ "bind": "127.0.0.1:{d}", "http": {{
+    \\          "routes": [{{ "prefix": "/", "cluster": "origin" }}] }} }}
+    \\    ],
+    \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
+    \\    "timeouts": {{ "loop_watchdog_ms": {d} }}
+    \\}}
+;
+
+/// `spawnZoxy` for the leg's own child: its own log, so the main proxy's
+/// output stays the thing `printZoxyLog` shows a failing run.
+fn spawnWatchdogZoxy(io: Io, zoxy_path: []const u8) !std.process.Child {
+    assert(zoxy_path.len >= 1);
+    const log_file = try Io.Dir.cwd().createFile(io, watchdog_log_path, .{});
+    defer log_file.close(io);
+    return std.process.spawn(io, .{
+        .argv = &.{ zoxy_path, watchdog_config_path },
+        .stdout = .{ .file = log_file },
+        .stderr = .{ .file = log_file },
+    });
+}
+
 /// Two loopback ports the kernel is not using, held open together so it
 /// cannot hand out the same one twice, then released for zoxy to bind.
 /// There is a window between the release and zoxy's bind; nothing can
@@ -1700,6 +1888,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         access_log_path,
         health_interval_ms,
         drain_deadline_ms,
+        loop_watchdog_ms,
         zoxy_limits.conn_slots,
         zoxy_limits.relay_buffers,
         zoxy_limits.upstream_slots,
@@ -1755,7 +1944,8 @@ const config_template =
     \\        "connect_ms": 2000,
     \\        "idle_ms": 30000,
     \\        "health_interval_ms": {d},
-    \\        "drain_deadline_ms": {d}
+    \\        "drain_deadline_ms": {d},
+    \\        "loop_watchdog_ms": {d}
     \\    }},
     \\    "limits": {{
     \\        "conn_slots": {d},

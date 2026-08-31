@@ -791,7 +791,7 @@ test "simio: an armed watchdog answers where a stranded timer cannot" {
     try std.testing.expectEqual(@as(u32, 1), sim_io.dropPendingOps(.timer));
     // Past the stranded timer's own deadline, so what fires is the alarm
     // and not some artefact of the clock stopping short of it.
-    sim_io.alarmStart(2 * std.time.ns_per_s, 5);
+    sim_io.alarmStart(2 * std.time.ns_per_s, 5, .drain_stalled);
 
     try sim_io.run();
     try std.testing.expect(sim_io.alarmFired());

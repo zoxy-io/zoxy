@@ -56,11 +56,12 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// config may pick (`cq_fill_eighths_default` = ⅞, 57344) with the
 /// parked-upstream, admin, access-log and health-probe reservations
 /// carved out first, this caps at
-/// `(57344 - 11) / (conn_ops_max + 1) = 11466` —
-/// comptime-derived below (the 11 is the fixed ops: two for the admin
+/// `(57344 - 12) / (conn_ops_max + 1) = 11466` —
+/// comptime-derived below (the 12 is the fixed ops: two for the admin
 /// listener [2], the admin client's op budget [3], the access log's
 /// in-flight sink write [1], the health prober's op budget [3], the signal
-/// wake [1], and the drain timer [1]). That clears a round 10k on a
+/// wake [1], the drain timer [1], and #311's loop-watchdog tick [1]).
+/// That clears a round 10k on a
 /// single ring; a deployment trades the ceiling back down for more burst
 /// headroom via `limits.cq_fill_eighths` (§8).
 ///
@@ -82,7 +83,7 @@ pub const admin_drain_scratch_bytes: u32 = 512;
 /// above the upstream ceiling is therefore capacity that cannot be served
 /// — slots that admit connections the pool has no upstream for — and one
 /// below it is a pool that can never be drawn down. `11466` is the
-/// largest N with `N * (conn_ops_max + 1) <= 57333`, which keeps both
+/// largest N with `N * (conn_ops_max + 1) <= 57332`, which keeps both
 /// ceilings clear of a round 10k: what §1 asks for, c10k reachable on
 /// either axis rather than a shape tuned for it.
 ///
@@ -921,6 +922,34 @@ pub const body_name_bytes_max: u16 = 64;
 /// this is almost certainly a units mistake in the config.
 pub const timeout_ms_max: u32 = 3_600_000;
 
+/// Floor on `timeouts.loop_watchdog_ms` (#311): the shortest serving-loop
+/// backstop an operator may name.
+///
+/// Two seconds because the mechanism is `alarm(2)` and the refresh is
+/// half the bound. The seam refuses to arm an alarm shorter than a second
+/// — production rounds up to whole seconds, so a finer bound would be one
+/// no deployment can actually have — and the tick that refreshes it must
+/// fit inside the bound with room to be late. Halving two seconds lands
+/// exactly on that floor, so this is the smallest number for which every
+/// assert below it holds rather than a round one chosen for taste.
+///
+/// It is also a floor worth having on its own terms: the alarm's whole
+/// value is that it fires when nothing else can, and a bound tight enough
+/// to be tripped by an ordinary scheduling hiccup would trade a hang for
+/// a restart loop. Whoever wants a tighter one wants a different
+/// mechanism.
+pub const loop_watchdog_ms_min: u32 = 2_000;
+
+comptime {
+    // The refresh is `loop_watchdog_ms / 2`, and the seam's floor is one
+    // whole second — so the smallest bound a config may name must still
+    // leave a legal tick under it. Stated here because the division lives
+    // in `Server` and the floor lives in the seam, and neither can see
+    // the other.
+    assert(loop_watchdog_ms_min / 2 >= 1000);
+    assert(loop_watchdog_ms_min <= timeout_ms_max);
+}
+
 /// Ceiling on `timeouts.tunnel_ms` (#180) — the one timeout allowed past
 /// `timeout_ms_max`, and deliberately. That bound exists because an
 /// ordinary timeout above an hour is almost certainly a units mistake;
@@ -1148,8 +1177,13 @@ pub const access_log_line_bytes_max: u32 = accessLogLineBytes(access_log_headers
 /// per admin client (its send/deadline/teardown peak), the access log's one
 /// in-flight sink write, `health_probe_ops_max` ops for each of the
 /// prober's `health_probes` concurrent probes (§7), the single async
-/// wakeup op for signals, and
-/// the server's one drain-deadline timer. Closed form so it can be
+/// wakeup op for signals, the server's one drain-deadline timer, and
+/// #311's loop-watchdog tick. That last one is reserved whether or not a
+/// config arms it, on the same terms as the admin and access-log
+/// reservations: a budget that moved with a `timeouts` key would make the
+/// ring depth a property of the operator's watchdog policy, and the point
+/// of reserving it here is that turning the backstop on can never be the
+/// thing that refuses a config. Closed form so it can be
 /// evaluated on the *effective* pool sizes too (XevIo's per-deployment CQ),
 /// not only the ceilings; the admin and access-log reservations are fixed
 /// — always covered even when a config leaves them off — and so is the
@@ -1186,7 +1220,7 @@ pub fn inFlightOps(
         streamSlotsFor(conn_slots) * stream_ops_max + upstream_slots +
         2 * (listeners + admin_listeners) +
         admin_conns * admin_conn_ops_max + access_log_ops_max +
-        health_probes * health_probe_ops_max + 1 + 1;
+        health_probes * health_probe_ops_max + 1 + 1 + 1;
 }
 
 /// Kernel maximum for an IORING_SETUP_CQSIZE completion queue
@@ -1494,6 +1528,11 @@ comptime {
     // count whose worst-case ops fit the ⅞-CQ budget (at the default =
     // loosest fill) after the fixed ops — the parked-upstream reservation
     // and the admin listener plus its one client op — are carved out (§8).
+    // The three bare `- 1`s below are the ones `inFlightOps` spells the
+    // same way and in the same order: the signal wake, the drain timer,
+    // and #311's loop-watchdog tick. They are the terms most easily left
+    // behind when one is added — `@divFloor` will absorb a missing op
+    // until it happens not to, which is a ceiling that is right by luck.
     // The pair is pinned (`upstream_slots_max = conn_slots_max`), so the
     // shared CQ line has one divisor — an admitted connection costs
     // `conn_ops_max` conn ops plus `stream_ops_max` for the one stream it
@@ -1504,7 +1543,7 @@ comptime {
         @divExact(completion_queue_entries, 8) * cq_fill_eighths_default -
             2 * admin_listeners -
             admin_conns * admin_conn_ops_max - access_log_ops_max -
-            health_probe_concurrency_max * health_probe_ops_max - 1 - 1,
+            health_probe_concurrency_max * health_probe_ops_max - 1 - 1 - 1,
         conn_ops_max + stream_ops_max + 1,
     ));
     assert(admin_listeners >= 1);

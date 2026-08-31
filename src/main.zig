@@ -153,8 +153,16 @@ fn serve(init: std.process.Init, arena: std.mem.Allocator, config_path: []const 
     if (resources.tls_credentials.len > 0) {
         server.setTlsCredentials(resources.tls_credentials);
     }
-    try server.start();
+    // Before `start`, which is a change #311 forced and an improvement on
+    // its own terms. The serving watchdog is armed at the end of `start`,
+    // and the seam refuses to arm an alarm whose handler is not installed
+    // — SIGALRM's default action is to terminate, so arming one first
+    // would turn a stall into a silent death. Installing here also means
+    // a SIGTERM that arrives *during* startup is recorded and drained
+    // once the loop runs, where before it took the default action and
+    // killed a process mid-bind.
     installSignalHandlers();
+    try server.start();
 
     try global_io.run();
 

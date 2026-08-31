@@ -1981,6 +1981,7 @@ fn labeledTestConfig(clusters: []const config_module.Config.Cluster) config_modu
         .idle_timeout_ms = 1,
         .head_timeout_ms = 1,
         .drain_deadline_ms = 1,
+        .loop_watchdog_ms = 0,
         .max_lifetime_ms = 0,
         .request_timeout_ms = 0,
         .tunnel_timeout_ms = constants.tunnel_ms_default,

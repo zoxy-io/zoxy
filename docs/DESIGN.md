@@ -2551,6 +2551,52 @@ The simulator models the alarm as a deadline its run loop checks directly
 rather than a pending op, which is what lets §9 strand every timer a
 schedule has and still demand a diagnostic instead of a hang.
 
+### The serving loop has the same backstop (#311)
+
+Everything above bounds a *drain*. The phase a process spends its life in
+had nothing: every deadline zoxy owns is an op the loop delivers, so a
+loop that stops delivering stops delivering the one that would have said
+so, and the observable result is a process that is alive, health-checked,
+holding its listeners and answering none of them. `SO_REUSEPORT` makes it
+worse rather than better — the kernel keeps hashing new connections onto
+a process that has stopped serving them, so one stalled instance degrades
+the group instead of shedding to its siblings. A process that exits is
+replaced; a process that hangs is not.
+
+So `timeouts.loop_watchdog_ms` arms the same `alarm(2)`, and a timer the
+loop *does* have to deliver refreshes it every half-bound. A loop that
+keeps ticking never lets the alarm land; a loop that stops refreshing
+gets one line on stderr and `_exit` **6** — the third code, and distinct
+for the reason the other two are: 4 is a drain that could not finish and
+named what held it, 5 is a loop that stopped answering during a drain, 6
+is a loop that stopped answering while it was serving traffic.
+
+What that proves is *delivery*, not progress: a loop can tick while doing
+nothing useful and this would not notice. That is the honest reading of
+the mechanism, and it is the failure actually seen (#310 — a synchronous
+write to a pipe nobody was draining, which parked the loop in `writev`
+for as long as the reader took).
+
+**Absent is off**, which is why the key is optional rather than a zero:
+the mechanism has a floor — `alarm(2)` counts whole seconds and the
+refresh takes half the bound — so the legal values are "none" and "at
+least `loop_watchdog_ms_min`", with nothing between. Opt-in for #226's
+reason in the other direction: the process this kills is one an operator
+has no other way to notice, but a bound nobody named is a restart this
+proxy chose on their behalf, and what counts as a stall is a property of
+the box rather than of the proxy.
+
+The two watchdogs share the one alarm a process has, so the serving one
+stands down at `beginDrain`: the drain arms its own, or — on the uncapped
+branch, which arms none — the alarm is cancelled outright. An operator
+who declined `drain_deadline_ms` asked for a wait with no bound, and a
+watchdog still counting down into it would overrule that.
+
+Its refresh tick is charged to the ring budget unconditionally
+(`inFlightOps`, §5), armed or not: a budget that moved with a `timeouts`
+key would make the ring depth a property of watchdog policy, and turning
+a backstop on must never be the thing that refuses a config.
+
 ## 9. Testing — required from day 0
 
 The deterministic-simulation seam is the single highest-leverage testing

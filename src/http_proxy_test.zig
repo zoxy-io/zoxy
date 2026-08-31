@@ -750,6 +750,7 @@ const Http1Bed = struct {
             // default would sit far above the window it must tighten.
             .head_timeout_ms = options.head_timeout_ms orelse idle_timeout_ms,
             .drain_deadline_ms = options.drain_deadline_ms,
+            .loop_watchdog_ms = 0,
             .max_lifetime_ms = options.max_lifetime_ms,
             .request_timeout_ms = options.request_timeout_ms,
             .tunnel_timeout_ms = constants.tunnel_ms_default,

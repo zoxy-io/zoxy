@@ -28,6 +28,16 @@ pub const Config = struct {
     connect_timeout_ms: u32,
     idle_timeout_ms: u32,
     drain_deadline_ms: u32,
+    /// #311's serving-loop backstop, in milliseconds; `0` is off, which
+    /// is what an absent key resolves to.
+    ///
+    /// Every other deadline in this file is an op the loop delivers, so
+    /// none of them can bound the loop itself. This one is `alarm(2)`:
+    /// the kernel raises it whatever the process is doing, and a tick the
+    /// loop *does* deliver is what keeps pushing it out. So the number an
+    /// operator writes here is "how long may this proxy go without
+    /// completing anything before it is declared stalled and killed".
+    loop_watchdog_ms: u32,
     /// Absolute cap on a connection's age, regardless of activity (§6): it
     /// rides the same per-connection deadline timer as the idle timeout,
     /// clamping the activity-refreshed deadline so a continuously busy
@@ -833,6 +843,12 @@ pub const ValidationError = error{
     TimeoutOverLimit,
     TimeoutOrderInvalid,
     TimeoutTunnelOutOfRange,
+    /// A `timeouts.loop_watchdog_ms` under `loop_watchdog_ms_min` (#311).
+    /// Named apart from `TimeoutZero` because the two say different
+    /// things: that one is a deadline zeroed into meaninglessness, this
+    /// is a bound the mechanism cannot express — `alarm(2)` counts whole
+    /// seconds, and the tick refreshing it takes half the bound.
+    LoopWatchdogTooShort,
     LimitConnSlotsOutOfRange,
     LimitRelayBuffersOutOfRange,
     LimitRelayBuffersOverConnSlots,
@@ -973,6 +989,11 @@ pub fn parseWithFiles(
         .connect_timeout_ms = parsed.timeouts.connect_ms,
         .idle_timeout_ms = parsed.timeouts.idle_ms,
         .drain_deadline_ms = parsed.timeouts.drain_deadline_ms,
+        // Absent is off, and `0` is how the rest of this struct spells
+        // that — so the optional collapses here rather than travelling
+        // any further. See `TimeoutsJson.loop_watchdog_ms` for why the
+        // JSON side spells it as absence instead of a zero.
+        .loop_watchdog_ms = parsed.timeouts.loop_watchdog_ms orelse 0,
         .max_lifetime_ms = parsed.timeouts.max_lifetime_ms,
         .head_timeout_ms = resolveHeadTimeout(&parsed.timeouts),
         .request_timeout_ms = parsed.timeouts.request_ms,
@@ -3207,6 +3228,19 @@ pub const TimeoutsJson = struct {
     /// because a request deadline is a policy an operator sets against
     /// their own origin's latency, not a value zoxy can pick for them.
     request_ms: u32 = 0,
+    /// Optional #311 serving-loop watchdog. **Absent is off**, and that
+    /// is why it is optional rather than a `0` like the two caps above:
+    /// the mechanism has a floor — `alarm(2)` is whole seconds and the
+    /// tick that refreshes it is half the bound — so the legal values are
+    /// "none" and "at least `loop_watchdog_ms_min`", with nothing in
+    /// between. Absence carries the "none" and the minimum carries the
+    /// rest, which is one rule a schema states exactly; a zero would have
+    /// needed a fork to say the same thing.
+    ///
+    /// Opt-in for #226's reason in the other direction: the process this
+    /// kills is one an operator has no other way to notice, but a bound
+    /// nobody named is a restart this proxy chose on their behalf.
+    loop_watchdog_ms: ?u32 = null,
     /// Optional #235 head-read budget. Absent is *derived* rather than
     /// fixed — see `resolveHeadTimeout`, which is what keeps every config
     /// written before this field behaving exactly as it did.
@@ -3235,6 +3269,12 @@ pub const TimeoutsJson = struct {
         .drain_deadline_ms = .{
             .desc = "Graceful-drain deadline on shutdown; 0 waits indefinitely.",
             .minimum = 0,
+            .maximum = constants.timeout_ms_max,
+        },
+        .loop_watchdog_ms = .{
+            .desc = "Serving-loop watchdog: kill this process if the event " ++
+                "loop completes nothing for this long. Absent is off.",
+            .minimum = constants.loop_watchdog_ms_min,
             .maximum = constants.timeout_ms_max,
         },
         .max_lifetime_ms = .{
@@ -5606,6 +5646,19 @@ fn validateTimeouts(timeouts: *const TimeoutsJson) ValidationError!void {
             return error.TimeoutOverLimit;
         }
     }
+    // #311's watchdog spells "off" as absence rather than zero, so what
+    // is left to check is a present value against a floor the mechanism
+    // imposes — `alarm(2)`'s whole seconds, halved for the tick that
+    // refreshes it. A number under it is not a tighter backstop, it is a
+    // bound the seam would refuse to arm.
+    if (timeouts.loop_watchdog_ms) |watchdog_ms| {
+        if (watchdog_ms < constants.loop_watchdog_ms_min) {
+            return error.LoopWatchdogTooShort;
+        }
+        if (watchdog_ms > constants.timeout_ms_max) {
+            return error.TimeoutOverLimit;
+        }
+    }
     // The one ordering between two configured values this loader enforces,
     // and it is a correctness bound rather than taste: a connection's first
     // deadline is armed at `connect_ms` (`Server.entryTimeoutMs`) and the
@@ -5894,6 +5947,54 @@ test "config: max_lifetime_ms accepts zero (a legal zero timeout) and real value
         );
         try std.testing.expectEqual(@as(u32, 1_800_000), parsed.max_lifetime_ms);
     }
+}
+
+test "config: the loop watchdog is absent-is-off, floored, and capped" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{
+    ;
+    const tail = "}}";
+    // Absent is off, and off is the `0` the resolved config spells it
+    // with — the whole reason the JSON side is optional instead (#311).
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ tail);
+        try std.testing.expectEqual(@as(u32, 0), parsed.loop_watchdog_ms);
+    }
+    // Present and at the floor: the smallest bound the mechanism can
+    // express, since `alarm(2)` counts whole seconds and the tick that
+    // refreshes it takes half.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            head ++ std.fmt.comptimePrint(
+                "\"loop_watchdog_ms\":{d}",
+                .{constants.loop_watchdog_ms_min},
+            ) ++ tail,
+        );
+        try std.testing.expectEqual(constants.loop_watchdog_ms_min, parsed.loop_watchdog_ms);
+    }
+    // One millisecond under it is refused rather than rounded. A bound
+    // the seam would not arm is a backstop an operator believes they have
+    // and do not, which is worse than the hang it was meant to catch.
+    try expectParseError(error.LoopWatchdogTooShort, head ++ std.fmt.comptimePrint(
+        "\"loop_watchdog_ms\":{d}",
+        .{constants.loop_watchdog_ms_min - 1},
+    ) ++ tail);
+    // Zero is refused by the same rule, and deliberately: it is the
+    // spelling of "off" everywhere else in this block, and accepting it
+    // here would make one key mean off two ways.
+    try expectParseError(error.LoopWatchdogTooShort, head ++ "\"loop_watchdog_ms\":0" ++ tail);
+    // And the shared units-mistake ceiling still applies.
+    try expectParseError(error.TimeoutOverLimit, head ++ std.fmt.comptimePrint(
+        "\"loop_watchdog_ms\":{d}",
+        .{constants.timeout_ms_max + 1},
+    ) ++ tail);
 }
 
 test "config: a listener's body key is what names its protocol" {
@@ -7786,24 +7887,30 @@ test "config: listeners that overflow the ring budget are refused at load" {
     // Where that line falls says something about the budget worth pinning.
     // `conn_slots_max` is derived against the *worst case* the prober can
     // ask for (`health_probe_concurrency_max` probes, #132), which leaves
-    // 3 ops of the 57344-op fill budget spare at zero listeners. This
+    // 2 ops of the 57344-op fill budget spare at zero listeners. This
     // config sets no `check` block anywhere, so its prober reserves the
     // floor of one probe and the other 45 ops are slack it may spend on
-    // listeners: 24 fit, and the 25th is one too many. A config that did
+    // listeners: 23 fit, and the 24th is one too many. A config that did
     // configure 16 checked endpoints would find that slack already spent
     // and be refused at two — which is the effective-versus-ceiling split
     // (§5, §8) showing up as a real difference between two configs, not
     // an accounting detail.
+    //
+    // The pair moved by one when #311's loop-watchdog tick joined the
+    // fixed reservations, and that is the reservation being visible
+    // rather than a number drifting: one more op at zero listeners is one
+    // fewer listener at the ceiling, and this test is where the budget
+    // says so out loud.
     const at_ceiling = std.fmt.comptimePrint(
         "\"limits\":{{\"conn_slots\":{d},\"upstream_slots\":{d}}},",
         .{ constants.conn_slots_max, constants.upstream_slots_max },
     );
-    try expectParseError(error.LimitConnSlotsOverCqFill, comptime listenersJson(25, at_ceiling));
-    // Twenty-four still fit, so the refusal above is the budget talking
+    try expectParseError(error.LimitConnSlotsOverCqFill, comptime listenersJson(24, at_ceiling));
+    // Twenty-three still fit, so the refusal above is the budget talking
     // and not the pools alone.
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
-    _ = try expectParseOk(&arena_state, comptime listenersJson(24, at_ceiling));
+    _ = try expectParseOk(&arena_state, comptime listenersJson(23, at_ceiling));
 }
 
 var fuzz_arena_buffer: [1 << 20]u8 = undefined;

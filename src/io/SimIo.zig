@@ -196,6 +196,10 @@ drop_next_taken: ?OpKind,
 /// from outside, and this is the thing that turns one into a diagnostic.
 alarm_at_ns: u64,
 alarm_exit_code: u8,
+/// Which watchdog armed it. Production picks the handler's line from
+/// this; here it is what a scenario asserts on to tell #311's serving
+/// watchdog from #226's drain one, since both give up the same way.
+alarm_reason: Io.AlarmReason,
 alarm_fired: bool,
 
 const blackholed_addresses_max: u8 = 4;
@@ -533,6 +537,7 @@ pub fn init(io: *SimIo, arena: std.mem.Allocator, options: Options) error{OutOfM
     io.drop_next_taken = null;
     io.alarm_at_ns = never_ns;
     io.alarm_exit_code = 0;
+    io.alarm_reason = .drain_stalled;
     io.alarm_fired = false;
     assert(io.sockets.isFullyReleased());
 }
@@ -1190,21 +1195,28 @@ fn kindBit(kind: OpKind) u16 {
     return @as(u16, 1) << @intCast(@intFromEnum(kind));
 }
 
-/// §8's drain watchdog (#226), the simulator's half. Production arms
+/// §8's two watchdogs (#226, #311), the simulator's half. Production arms
 /// `alarm(2)`; here it is a deadline the run loop compares the virtual
 /// clock against, with no completion in between — which is the property
 /// being modelled, not an implementation shortcut. A watchdog that rode
 /// the pending table would be exactly the timer this exists to replace.
-pub fn alarmStart(io: *SimIo, after_ns: u64, exit_code: u8) void {
+///
+/// Re-arming *replaces* the pending deadline rather than being refused,
+/// because that is what `alarm(2)` does and #311's serving watchdog is
+/// built on it: the refresh is one arm per tick, not a cancel and an arm.
+/// The assert that used to forbid it caught nothing a double-arm bug
+/// would show as here anyway — a replaced deadline is a later deadline,
+/// and a scenario asserting on `alarmFired` sees the difference.
+pub fn alarmStart(io: *SimIo, after_ns: u64, exit_code: u8, reason: Io.AlarmReason) void {
     assert(exit_code != 0); // A give-up is never a success.
     // The seam's floor, enforced here too: production rounds up to whole
     // seconds, so a scenario arming a shorter one would be testing a bound
     // no deployment can have.
     assert(after_ns >= std.time.ns_per_s);
-    assert(io.alarm_at_ns == never_ns);
     assert(!io.alarm_fired);
     io.alarm_at_ns = io.now_ns_value + after_ns;
     io.alarm_exit_code = exit_code;
+    io.alarm_reason = reason;
     assert(io.alarm_at_ns > io.now_ns_value);
     // Into the trace: a run that armed a watchdog is a different run from
     // one that did not, whether or not it ever fires.
@@ -1217,6 +1229,7 @@ pub fn alarmStart(io: *SimIo, after_ns: u64, exit_code: u8) void {
 pub fn alarmCancel(io: *SimIo) void {
     io.alarm_at_ns = never_ns;
     io.alarm_exit_code = 0;
+    io.alarm_reason = .drain_stalled;
     assert(io.alarm_at_ns == never_ns);
     io.mix(0);
 }
@@ -1226,6 +1239,12 @@ pub fn alarmCancel(io: *SimIo) void {
 /// bargain `abortedWith` makes.
 pub fn alarmFired(io: *const SimIo) bool {
     return io.alarm_fired;
+}
+
+/// Which watchdog is armed, or last fired — the assertion that tells
+/// #311's serving stall from #226's drain one.
+pub fn alarmReason(io: *const SimIo) Io.AlarmReason {
+    return io.alarm_reason;
 }
 
 /// The watchdog's whole behaviour: give up, with the code it was armed
