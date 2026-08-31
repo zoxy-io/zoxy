@@ -1115,7 +1115,7 @@ decide them; a filter table is read in exactly that sequence.
         "actions": [{ "header_set": { "name": "X-Role", "value": "admin" } }]
     },
     {
-        "match": { "path_prefix": "/admin" },
+        "match": { "path_prefix": "/admin", "client": ["203.0.113.0/24"] },
         "actions": [{ "reject": 403 }]
     },
     {
@@ -1131,6 +1131,13 @@ connection's address must fall inside. Actions are `reject` with a status,
 `redirect`, `respond` (answer from a configured body),
 `header_set` / `header_add` / `header_remove`, and `rewrite_prefix`.
 
+Only `reject`, `redirect` and `respond` are terminal. A rule whose actions
+are all edits — `header_set` above, or a `rewrite_prefix` — records what
+the render should do and evaluation carries on, so an edit never shields a
+request from a `reject` written beneath it. That is why the reject above
+names the range it refuses rather than sitting under an "allow" rule; see
+[matching the client address](#matching-the-client-address).
+
 Rules compile into immutable tables at load time and are interpreted with
 bounded loops — no plugins, no scripting, nothing that can allocate or run
 unbounded. A rewrite changes only what is *forwarded*: routing already chose
@@ -1138,17 +1145,37 @@ the cluster from the original path, so a rewrite never re-routes.
 
 #### Matching the client address
 
-The standard rule — `/admin` from the office range and nowhere else — is a
-`client` list on the allow rule and a reject beneath it:
+`client` is a list of CIDR ranges the connection's address must fall
+inside — any-of across the list, conjoined with the rest of the match. It
+refuses a range:
+
+```json
+"request_filters": [
+    { "match": { "path_prefix": "/admin", "client": ["203.0.113.0/24"] },
+      "actions": [{ "reject": 403 }] }
+]
+```
+
+and it tags traffic for the origin to judge, which costs the request
+nothing and stops nothing:
 
 ```json
 "request_filters": [
     { "match": { "path_prefix": "/admin",
                  "client": ["10.0.0.0/8", "192.168.1.0/24"] },
-      "actions": [{ "header_set": { "name": "X-Internal", "value": "1" } }] },
-    { "match": { "path_prefix": "/admin" }, "actions": [{ "reject": 403 }] }
+      "actions": [{ "header_set": { "name": "X-Internal", "value": "1" } }] }
 ]
 ```
+
+> [!IMPORTANT]
+> The inverse — `/admin` from the office range **and nowhere else** — is
+> not expressible today. A header edit is not terminal, so an "allow" rule
+> does not stop the walk: write a `reject` for `/admin` beneath the tagging
+> rule above and it answers `403` for the office range too, which is the
+> opposite of an allowlist. There is no `allow` action to stop on and no
+> way to negate a `client` list, so an allowlist belongs at the origin —
+> which is what the `X-Internal` tag is for — or in a firewall.
+> Tracked in [#331](https://github.com/zoxy-io/zoxy/issues/331).
 
 The address matched is the one zoxy actually believes: the TCP peer, or the
 [PROXY-protocol-announced client](#learning-it-behind-another-proxy-proxy-protocol)
@@ -1359,7 +1386,10 @@ number here when you want zoxy to give up before your platform does.
 
 Optional. The compiled constants are hard ceilings; this block sizes the
 actual pools anywhere from 1 up to them, so a small deployment neither
-reserves nor demands the ceiling's resources.
+reserves nor demands the ceiling's resources. The two conditional keys,
+`tls_engines` and `tunnels`, are absent below on purpose: each is refused
+unless the feature it sizes is configured, so neither belongs in a block
+copied as a starting shape. Both are described further down.
 
 ```json
 "limits": {
@@ -1368,8 +1398,7 @@ reserves nor demands the ceiling's resources.
     "upstream_slots": 4096,
     "head_buffers": 1024,
     "upstream_head_buffers": 512,
-    "head_buffer_bytes": 16384,
-    "tunnels": 512
+    "head_buffer_bytes": 16384
 }
 ```
 

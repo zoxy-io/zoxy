@@ -1497,9 +1497,17 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   owning phase module at compile time.
 - **A filter can match on who is connecting** (#177, settled
   2026-08-03). `match.client` is a CIDR list, any-of across the list
-  and conjoined with the rest — "/admin from the office range and
-  nowhere else" is one rule with a reject beneath it. It matches the
-  connection's client address, which is §6's settled principle rather
+  and conjoined with the rest. What shipped is the **denylist**
+  direction — a `client` list on a `reject` rule refuses that range —
+  and the tagging one, a header edit naming the range for the origin to
+  judge. The issue's own framing, "/admin from the office range and
+  nowhere else", is *not* what a reject beneath an allow rule spells:
+  edits are non-terminal (§7's own rule), so the walk reaches the reject
+  and the allowed range is refused with everyone else. Expressing it
+  needs either a terminal `allow` or a negated predicate, neither of
+  which the closed enum and the positive-conjunction `Match` carry;
+  #331 holds the decision, and the doc states the gap rather than the
+  promise. It matches the connection's client address, which is §6's settled principle rather
   than a new trust decision: the observed peer, or the PROXY-announced
   client on a `proxy_protocol` listener — never an `X-Forwarded-For`
   chain, because an allowlist keyed on client-supplied text is not an
