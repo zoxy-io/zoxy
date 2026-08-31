@@ -167,11 +167,20 @@
         // That is the hazard v2.1.0 was itself chosen to close, in the
         // BoringSSL form; this is the same trap wearing the next mask.
         //
-        // Now both sides resolve to one zssl and one libcrypto. The
-        // harness still imports `src/constants.zig` as a leaf rather than
-        // the `zoxy` module — see build.zig, where the reason is now
-        // squarely the optimize-mode module collision again, since the C
-        // dependency is no longer split between two pins.
+        // Both sides resolved to one zssl and one libcrypto when this
+        // line was written. **Half of that is no longer true**: zoxy's
+        // zssl moved to 91a985a and this zrk pin still carries 992ee9d,
+        // so the two are one zssl apart until zrk repins. What keeps it
+        // harmless is that neither binary holds both — `zoxy-bench` and
+        // `zoxy-profile-harness` name zrk's zssl, the proxy under test
+        // is a separate process, and the harness imports
+        // `src/constants.zig` as a leaf rather than the `zoxy` module
+        // (see build.zig, where the reason is squarely the optimize-mode
+        // module collision). One libcrypto still holds outright: both
+        // zssl commits pin the same zoxy-io/openssl this file does.
+        // Comparability is unaffected either way — it is a property of
+        // the *generator*, and zrk's own TLS is what a client's would
+        // be. Bring the two back together when zrk moves.
         //
         // The zio bump beside it is not optional. zrk carries zio 0.17.0 at
         // 3820667, and the rule below — that this file's zio must be
@@ -443,14 +452,106 @@
         // the upstream origination §7's cluster `tls` block describes.
         //
         // What it costs: this tree is now the audit surface. zssl's own
-        // gates — RFC 8448 replayed byte for byte, interop against real
-        // openssl and `std.crypto.tls` in both directions, fuzz targets
-        // over every parser — are the evidence, and its docs/BOGO.md
-        // names the adversarial gate still missing. Read that before
-        // trusting this pin further than the fork it replaced.
+        // gates are the evidence, and the paragraphs below are the
+        // record of reading them.
+        //
+        // Re-audit for 91a985a, signed off 2026-08-31, and the largest
+        // single move this pin will ever make: ~130 commits, +11k lines
+        // under `src/`. The 992ee9d record ended by saying docs/BOGO.md
+        // "names the adversarial gate still missing" — that sentence is
+        // what moved. BoGo runs (`zig build bogo`: 454 passing against a
+        // floor, 6490 declined by the shim, 13 suppressed on a ledger),
+        // and two more adversarial oracles arrived beside it: tlsfuzzer
+        // driving our server (22 of 62 scripts) and TLS-Anvil's
+        // RFC-derived corpus (115 passing, 321 declined as DTLS, QUIC or
+        // pre-1.3). Each holds a counted floor, so a quiet suppression
+        // fails the build rather than reading as a pass.
+        //
+        // The reason to take the pin is what those three found, and the
+        // parts of it that land on the path zoxy actually serves:
+        //
+        //   - `flood.zig`: 32 consecutive empty records, 32 KeyUpdates,
+        //     4 warning alerts, then the connection ends. All three are
+        //     legal records that cost a decryption and return nothing —
+        //     RFC 8446 caps none of them, so before this a peer could
+        //     buy unbounded work per connection for free. Counters reset
+        //     on progress, so real traffic never approaches them.
+        //   - `protect`: RFC 8446 §5.4's cap on the *inner* plaintext,
+        //     enforced rather than compensated for downstream.
+        //   - `record`: a length the message type cannot have is
+        //     refused, a record refused at its header now draws the
+        //     alert it owes, and the ChangeCipherSpec payload is read
+        //     instead of assumed (a hundred 0x01s in one record used to
+        //     pass as filler).
+        //   - `der_bounds`: `std.crypto.Certificate.parse` computes the
+        //     next element's offset from the last one's end and reads
+        //     there unchecked, so seven bytes of hostile DER *panic*
+        //     rather than erroring — a remote abort in ReleaseSafe,
+        //     which is the build release.yml ships (#283). A framing
+        //     pre-pass now runs first. Not on zoxy's serving path today
+        //     (no client certificates are asked for), but it is on the
+        //     client handshake §7's cluster `tls` block will use.
+        //
+        // Five API changes had to be taken here, and each is a decision
+        // rather than a rename:
+        //
+        //   1. `handleRecord` answers `?Event` and `drain` returns the
+        //      rest — one record may legally carry several
+        //      post-handshake messages, and a caller that stops early is
+        //      told `error.EventsPending` on the *next* record instead
+        //      of silently losing one. `Engine.pump` is that loop now,
+        //      and the outbox room `received` demands moved with it:
+        //      from one control record to the KeyUpdate burst the flood
+        //      guard bounds, which is a closed form only because the
+        //      guard exists.
+        //   2. `x25519_private` became `key_share_private`, sized for
+        //      secp384r1, beside a `groups` list defaulting to all three
+        //      groups zssl can now complete server-side. zoxy pins
+        //      x25519 alone: `acquireTlsEngine` draws 32 bytes of seed,
+        //      a P-384 scalar is 48, and widening the offer is an
+        //      entropy-draw decision of its own rather than a
+        //      consequence of a bump.
+        //   3. `PskLookup` answers a `Psk` — length, kind, optional
+        //      issuance and early-data terms — not a length. zoxy
+        //      answers `.resumption` with both optionals null: RFC 8446
+        //      §4.6.1's lifetime stays enforced against the sealed stamp
+        //      the client cannot move, and a ticket that permits no
+        //      early data is one of the three opt-ins 0-RTT needs.
+        //   4. `Event` gained `.early_data`, deliberately as its own arm
+        //      so an embedder has to answer for it. zoxy refuses it: no
+        //      clock, no strike register, no ticket terms, so accepted
+        //      0-RTT cannot arrive, and if a later pin makes it possible
+        //      the connection dies rather than the proxy relaying bytes
+        //      that are neither forward secret nor replay-proof.
+        //   5. **The one that changes behaviour without changing a call
+        //      site.** `backend.Signer` learned RSA-PSS, so
+        //      `error.UnsupportedKey` no longer refuses an RSA leaf —
+        //      and zoxy's ECDSA-only promise (an RSA sign is ~1-2 ms
+        //      against the ~260 µs handshake the single loop is sized
+        //      for) would have left with this bump. It is
+        //      `tls/Credentials.zig`'s own rule now, with its own test
+        //      and its own fixture.
+        //
+        // What it costs, stated because §5 is closed-form: the server
+        // machine grows 1248 -> 2128 bytes, so `@sizeOf(Engine)` goes
+        // 93,568 -> 94,448 — the ~91 KiB in the banner, DESIGN.md §5's
+        // table and four doc comments is ~92 KiB now, and
+        // `tls_engine_bytes_max` (160 KiB) is untouched. Against that,
+        // the server does one scalar multiplication per handshake
+        // instead of two: `EVP_PKEY_new_raw_private_key` leaves the
+        // public half absent and OpenSSL derives it on import, so
+        // deriving the share and then agreeing multiplied twice. zssl's
+        // own bench puts a full handshake at 175 µs where it was 495;
+        // most of that is a client-side verify move, but the key-share
+        // half is ours.
+        //
+        // Newly available and deliberately not taken, each its own
+        // slice: server-side secp256r1/secp384r1 (see 2 above), mTLS via
+        // RFC 8446 §4.3.2's CertificateRequest, RFC 5705 exporters, and
+        // 0-RTT with the strike register RFC 8446 §8.2 needs.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#992ee9d1de1694f1766fc67b3995b308883d7acf",
-            .hash = "zssl-0.0.1-5ocyiPiKBgDH51EtHsMwAgVqckTbQULx4VlaCxxDg5li",
+            .url = "git+https://github.com/zoxy-io/zssl#91a985a4a1b408702d36e14986211cbc29953e9f",
+            .hash = "zssl-0.0.1-5ocyiNepEAAWCUGlH-CSBBwkdmjUf31MPSjD-hk5QRCo",
         },
     },
     .paths = .{

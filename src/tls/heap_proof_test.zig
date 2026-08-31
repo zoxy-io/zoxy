@@ -80,7 +80,8 @@ fn handshake(credentials: *const Credentials) !void {
     var server: zssl.ServerHandshake = .init(&.{
         .credentials = &credentials.inner,
         .server_random = @splat(0x43),
-        .x25519_private = @splat(0x42),
+        .key_share_private = @splat(0x42),
+        .groups = &.{zssl.client_hello.group_x25519},
         .reassembly = &server_reassembly,
         .flight = &server_flight,
     });
@@ -146,17 +147,24 @@ fn feed(machine: anytype, out: []u8, peer_wire: []u8, to_peer: *Wire) !void {
         records.advance(taken);
         remaining = remaining[taken..];
         while (try records.next()) |wire_record| {
-            switch (try machine.handleRecord(wire_record, out)) {
-                .send => |bytes| to_peer.write(bytes),
-                // The client's `.connected` carries its flight; the
-                // server's carries nothing, which is why this is matched
-                // by shape rather than by name. Sound because Zig prunes
-                // the untaken comptime branch per instantiation, so the
-                // void-payload side never type-checks the slice arm.
-                .connected => |payload| {
-                    if (@TypeOf(payload) == []const u8) to_peer.write(payload);
-                },
-                else => {},
+            // Drained to null, the same as every other zssl caller here:
+            // one record may carry several post-handshake messages, and
+            // the machine refuses the next record while any are pending.
+            var next_event = try machine.handleRecord(wire_record, out);
+            while (next_event) |event| : (next_event = try machine.drain(out)) {
+                switch (event) {
+                    .send => |bytes| to_peer.write(bytes),
+                    // The client's `.connected` carries its flight; the
+                    // server's carries nothing, which is why this is
+                    // matched by shape rather than by name. Sound because
+                    // Zig prunes the untaken comptime branch per
+                    // instantiation, so the void-payload side never
+                    // type-checks the slice arm.
+                    .connected => |payload| {
+                        if (@TypeOf(payload) == []const u8) to_peer.write(payload);
+                    },
+                    else => {},
+                }
             }
         }
     }

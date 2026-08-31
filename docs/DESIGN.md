@@ -524,7 +524,7 @@ a raised `RLIMIT_NOFILE`:
 | upstream slots | 1311 | 11457 | ~48 B state |
 | head buffers (ring) | = conn slots | 11457 | `head_buffer_bytes` + 1 B |
 | upstream head buffers | = upstream slots | 11457 | `head_buffer_bytes` + 24 B |
-| tls engines | 0, or min(conn slots, 1024) | 1024 | ~91 KiB + plaintext |
+| tls engines | 0, or min(conn slots, 1024) | 1024 | ~92 KiB + plaintext |
 | tunnels | 0 (off) | 11457 | 2 × `relay_buffer_bytes` |
 | **pool memory** | **~66 MiB** | **~653 MiB** | |
 
@@ -623,7 +623,7 @@ while `tunnels ≤ conn_slots` holds, which is why that is a rejection at
 load rather than advice.
 
 The **TLS engine pool** (§4) is the one whose default is not "one per
-connection", and the row above says so: an engine is ~91 KiB of zssl
+connection", and the row above says so: an engine is ~92 KiB of zssl
 record and reassembly buffers plus *two* plaintext destinations —
 `max(head_buffer_bytes, 32 KiB)` for the head, which the response head
 then renders back over, and a further 32 KiB for the request body, which

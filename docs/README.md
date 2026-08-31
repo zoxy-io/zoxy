@@ -1355,7 +1355,7 @@ default 8 KiB.
 `tls_engines` bounds *TLS sessions in flight* — handshaking or terminated —
 and is zero unless some listener has a `tls` block. It is the knob that
 decides what a TLS deployment costs: an engine is by far the largest
-per-connection object zoxy holds, about 91 KiB plus a 32 KiB plaintext
+per-connection object zoxy holds, about 92 KiB plus a 32 KiB plaintext
 buffer, so 1024 of them is roughly 170 MiB. It defaults to your connection
 slots capped at 1024, and the startup banner prints the total either way —
 lower it if that is more concurrent TLS than you serve.

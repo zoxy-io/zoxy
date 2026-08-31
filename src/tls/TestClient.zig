@@ -609,30 +609,46 @@ pub fn TestClient(comptime IoType: type) type {
                 client.records.advance(take);
                 remaining = remaining[take..];
                 while (try client.records.next()) |wire_record| {
-                    switch (try client.hs.handleRecord(wire_record, &client.out)) {
-                        // `.connected` carries the client flight, so both
-                        // arms are the same instruction: put it on the
-                        // wire.
-                        .send, .connected => |bytes| client.pending_send = bytes,
-                        .closed => client.saw_close = true,
-                        .application_data => |bytes| {
-                            assert(client.app_received_len + bytes.len <=
-                                client.app_received.len);
-                            @memcpy(
-                                client.app_received[client.app_received_len..][0..bytes.len],
-                                bytes,
-                            );
-                            client.app_received_len += @intCast(bytes.len);
-                        },
-                        .ticket => |issued| {
-                            // Keep the *first* only. A server issues
-                            // several and they are interchangeable, so
-                            // storing one keeps this a fixed-size client
-                            // and makes "the ticket" unambiguous in the
-                            // test that offers it back.
-                            if (!client.ticket_captured) client.captureTicket(&issued);
-                        },
-                        .none => {},
+                    // Drained to null, because one record may carry
+                    // several post-handshake messages and zssl refuses
+                    // the *next* record while any are still pending.
+                    var next_event = try client.hs.handleRecord(wire_record, &client.out);
+                    while (next_event) |event| : (next_event = try client.hs.drain(&client.out)) {
+                        switch (event) {
+                            // `.connected` carries the client flight, so
+                            // both arms are the same instruction: put it
+                            // on the wire.
+                            .send, .connected => |bytes| {
+                                // Every event borrows `client.out`, so a
+                                // second send out of one record would not
+                                // merely replace the first — it would
+                                // overwrite bytes this client still owes
+                                // the wire. `nextStep` writes what is
+                                // staged before it reads again, so the
+                                // stage is empty here, and this says so.
+                                assert(client.pending_send.len == 0);
+                                client.pending_send = bytes;
+                            },
+                            .closed => client.saw_close = true,
+                            .application_data => |bytes| {
+                                assert(client.app_received_len + bytes.len <=
+                                    client.app_received.len);
+                                @memcpy(
+                                    client.app_received[client.app_received_len..][0..bytes.len],
+                                    bytes,
+                                );
+                                client.app_received_len += @intCast(bytes.len);
+                            },
+                            .ticket => |issued| {
+                                // Keep the *first* only. A server issues
+                                // several and they are interchangeable,
+                                // so storing one keeps this a fixed-size
+                                // client and makes "the ticket"
+                                // unambiguous in the test that offers it
+                                // back.
+                                if (!client.ticket_captured) client.captureTicket(&issued);
+                            },
+                        }
                     }
                 }
                 if (client.hs.state == .connected) client.handshake_done = true;
