@@ -1098,6 +1098,13 @@ top-down against each request. Each has a match predicate — absent fields
 match anything — and actions applied in order. As with routes, nothing caps
 the list but the file you write.
 
+Order is the rule here, not a tie-break: the first terminal action a
+matching rule carries — `reject`, `redirect` or `respond` — answers the
+request, and no rule beneath it is read. Write the specific rule above the
+general one. That is the opposite of [routes](#routing), which are sorted
+by specificity at load precisely so the sequence you wrote them in cannot
+decide them; a filter table is read in exactly that sequence.
+
 ```json
 "request_filters": [
     {
@@ -1155,16 +1162,27 @@ guess which.
 #### Redirects
 
 The two most common edge rules are one action each — no second server
-needed in front of a load balancer to answer them:
+needed in front of a load balancer to answer them. Both belong on the
+plaintext `:80` listener: a request that already arrived over TLS sent
+back to `https://` is a loop, and since the scheme is what the rule
+states rather than what the hop was, only the config can keep the two
+apart.
 
 ```json
 "request_filters": [
-    { "actions": [{ "redirect": { "status": 301, "scheme": "https" } }] },
     { "match": { "host": "www.example.com" },
       "actions": [{ "redirect": { "status": 308, "scheme": "https",
-                                  "host": "example.com" } }] }
+                                  "host": "example.com" } }] },
+    { "actions": [{ "redirect": { "status": 301, "scheme": "https" } }] }
 ]
 ```
+
+The apex rule is written first because the rule under it matches
+*everything*: reversed, `www.example.com` takes the catch-all's 301 to its
+own name and never reaches the 308. A bare catch-all shadows every rule
+beneath it, which is why a listener that redirects is usually a listener
+that does nothing else — it still needs a `cluster` or `routes` the loader
+can check, but filters run before routing, so nothing is ever dialed.
 
 A composed target replaces the scheme (required — zoxy never guesses it,
 since behind a TLS terminator every hop it sees is plaintext) and
