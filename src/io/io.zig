@@ -34,13 +34,15 @@
 //!       file sink only — swap the sink fd between writes, never under one)
 //!   timerStart(io, c, delay_ns, U, u, cb(u, TimerError!void))
 //!   timerCancel(io, timer_c, cancel_c, U, u, cb(u))     (the one legal cancel)
-//!   alarmStart(io, after_ns, exit_code) void            (sync; §8's drain
-//!       watchdog — a deadline with no completion, so it survives a loop
+//!   alarmStart(io, after_ns, exit_code, reason) void    (sync; §8's two
+//!       watchdogs — a deadline with no completion, so it survives a loop
 //!       that has stopped delivering. Takes the process down itself.
 //!       `after_ns` is at least a second: production is `alarm(2)`, whose
 //!       granularity is whole seconds, and both sides enforce the floor so
 //!       a caller cannot ask the simulator for a bound production would
-//!       silently round.)
+//!       silently round. Re-arming replaces the pending deadline, which is
+//!       `alarm(2)`'s own contract and what lets #311's serving watchdog
+//!       refresh one rather than cancel and re-arm every tick.)
 //!   alarmCancel(io) void                                (sync)
 //!   signalWait(io, U, u, cb(u, Signal))                 (persistent waiter)
 //!   setNodelay / setLingerRst (io, socket) SetOptionError!void   (sync)
@@ -80,6 +82,25 @@ pub const Signal = enum(u8) {
     /// (§1 non-goal: the §5 pools are startup-fixed, so a config change
     /// is a restart), and claiming the signal for the log says so.
     reopen_log,
+};
+
+/// Which watchdog armed the alarm, and so which line the handler writes
+/// when it fires (§8).
+///
+/// The seam carries this rather than the message itself because the
+/// handler reads it from a signal context: one atomic `u8` cannot be
+/// read half-updated, where a pointer and a length refreshed on the loop
+/// thread can be — and a torn pair would have the handler write one
+/// message's bytes at another's length. What a caller loses is the
+/// freedom to invent wording; what it keeps is the only distinction an
+/// operator reading a status with no output actually has.
+pub const AlarmReason = enum(u8) {
+    /// The drain could not finish and nothing could say so (#226).
+    drain_stalled,
+    /// The serving loop stopped delivering (#311). Distinct because the
+    /// two happen in different phases and mean different things: one
+    /// process was on its way out, the other was answering traffic.
+    loop_stalled,
 };
 
 /// A dial destination (#303): an IP address, or the path of a

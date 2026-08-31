@@ -633,6 +633,7 @@ const Harness = struct {
             .idle_timeout_ms = 5000,
             .head_timeout_ms = 5000,
             .drain_deadline_ms = 1000,
+            .loop_watchdog_ms = 0,
             .max_lifetime_ms = 0,
             .request_timeout_ms = 0,
             .tunnel_timeout_ms = constants.tunnel_ms_default,

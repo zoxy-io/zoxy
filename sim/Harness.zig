@@ -838,6 +838,19 @@ fn deriveServerConfig(
             idle_timeout_ms,
         ),
         .drain_deadline_ms = deriveDrainDeadlineMs(harness.drain_at_ns, random),
+        // #311's serving watchdog is off for the whole sweep, and not
+        // because it is untested — `server_test.zig` provokes it and
+        // asserts the exit code. It is off because arming it here would
+        // change what this gate *measures*: a tick every second of
+        // virtual time mixes into every seed's trace, so all 4096
+        // schedules would shift and the coverage this sweep has
+        // accumulated would go with them. Worse, `.timer` is in the
+        // strand draw (#226) — the seeds that strand it are the ones that
+        // reach the drain watchdog, and a serving watchdog armed over
+        // them would end those runs in its own give-up instead, which is
+        // the sweep's most interesting cases answering a different
+        // question.
+        .loop_watchdog_ms = 0,
         // The §6 age cap: measured from the connection's birth, so the
         // clamp sometimes reaps an actively-relaying connection.
         .max_lifetime_ms = deriveOptionalDeadlineMs(random),

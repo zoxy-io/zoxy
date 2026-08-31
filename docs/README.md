@@ -1311,6 +1311,24 @@ dial or idle budget is a mistake rather than a policy.
 | `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity — bounds a request that is merely slow, where `idle_ms` only bounds one that has stalled; `0` disables |
 | `tunnel_ms` | `3600000` | whole life of a [tunnelled upgrade](#tunnelled-upgrades-websocket), replacing the three above once one is established; 1 s to 1 day, and `0` is **not** legal |
 | `health_interval_ms` | `2000` | pause between health-probe sweeps |
+| `loop_watchdog_ms` | absent | kill this process if its event loop completes nothing for this long. Absent is off; 2 s minimum |
+
+`loop_watchdog_ms` is the one deadline here that is not about a
+connection. Every other row is a timer the event loop delivers, so none of
+them can bound the loop itself — a loop parked in a blocking call delivers
+nothing, including the timer that would have reported it, and what you see
+is a process that is alive, passing health checks, holding its listeners
+and answering nothing. Set this and the kernel gets a bound the loop
+cannot silence: `alarm(2)`, pushed out by a tick the loop has to deliver,
+which fires only when the loop stops. The process writes one line to
+stderr and exits **6**, so a supervisor replaces it.
+
+Off unless you name a number, because what counts as a stall is a
+property of your box — one that swaps has longer legitimate pauses than
+one that does not — and a false positive restarts a healthy proxy. Under
+`SO_REUSEPORT` it earns itself fastest: the kernel keeps hashing new
+connections onto a stalled process, so one that exits is replaced while
+one that hangs takes its share of the group down with it.
 
 `drain_deadline_ms` defaults to waiting indefinitely because there is no
 figure to borrow: nginx, HAProxy and Caddy all wait forever by default,
@@ -1663,6 +1681,10 @@ dies.** Every limit has a defined answer rather than an unbounded queue.
   shedding, so clients get an immediate signal rather than a timeout.
 - **`SIGTERM` drains.** Listeners close, keep-alive stops being honored,
   in-flight work finishes under `drain_deadline_ms`, then the process exits 0.
+- **A stalled loop is a death, not a hang** — if you ask for one.
+  `timeouts.loop_watchdog_ms` arms an `alarm(2)` that a tick the loop
+  delivers keeps pushing out, so a loop that stops delivering is ended by
+  the kernel with exit **6** and one line on stderr. Off unless configured.
 - **The budget is printed, not hoped for.** Startup prints the closed-form
   memory, file-descriptor and ring-op totals it will never exceed, and
   asserts the fd count against `RLIMIT_NOFILE` before serving anything.

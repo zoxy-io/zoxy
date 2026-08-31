@@ -285,6 +285,12 @@ pub const TestBed = struct {
         max_lifetime_ms: u32 = 0,
         connect_timeout_ms: u32 = 50,
         drain_deadline_ms: u32 = 1000,
+        /// #311's serving watchdog. Off by default, exactly as a config
+        /// with no `loop_watchdog_ms` is: a bed that armed one would put
+        /// a re-arming timer under every scenario here, and a simulated
+        /// run with a timer that always has another tick has no quiet
+        /// point to end at.
+        loop_watchdog_ms: u32 = 0,
         /// Turn the §8 access log on. Off by default so every existing
         /// scenario keeps paying nothing for it.
         access_log: bool = false,
@@ -434,6 +440,7 @@ pub const TestBed = struct {
             .idle_timeout_ms = options.idle_timeout_ms,
             .head_timeout_ms = options.idle_timeout_ms,
             .drain_deadline_ms = options.drain_deadline_ms,
+            .loop_watchdog_ms = options.loop_watchdog_ms,
             .max_lifetime_ms = options.max_lifetime_ms,
             // L4 only: the §8 request deadline is an L7 exchange bound and
             // this bed never routes one.
@@ -762,6 +769,83 @@ test "server: kernel-pressure on the upstream dial is witnessed and the conn tor
     // the wire shape is the seed's.
     try std.testing.expectEqual(@as(u8, 1), bed.scenario.outcomeCount(.eof));
     try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
+    try bed.expectDrained();
+}
+
+test "watchdog: a loop that stops delivering is ended by the alarm it stopped refreshing" {
+    // #311, and the property is the one no timer in this proxy has: every
+    // other bound here is an op the loop delivers, so a loop that has
+    // stopped delivering has stopped delivering the thing that would have
+    // said so. The alarm is not an op — production is `alarm(2)`, raised
+    // by the kernel whatever the process is doing, and the simulator
+    // models it as a deadline the run loop compares its clock against
+    // (`SimIo.alarmStart`).
+    //
+    // Stranding the timer plane is how a stall is provoked here, and it
+    // is the same shape as the real one: `dropPendingOps(.timer)` takes
+    // the armed watchdog tick and never delivers it, exactly as a loop
+    // parked in a blocking syscall never gets round to it. Nothing else
+    // in the run can end it — that is what makes the assertion below
+    // about the alarm rather than about anything the loop did.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 41 },
+        // Long enough that neither can be what ends the run: the alarm at
+        // 2 s is the first deadline in play, and it is the only one that
+        // can fire through a stranded timer plane anyway.
+        .idle_timeout_ms = 60_000,
+        .loop_watchdog_ms = constants.loop_watchdog_ms_min,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, false);
+    // `start` armed the tick; taking it is taking the refresh.
+    try std.testing.expect(bed.sim_io.dropPendingOps(.timer) >= 1);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.sim_io.alarmFired());
+    // The serving code, not the drain's: an operator reading a status
+    // with no output has only this to tell the two silences apart.
+    try std.testing.expectEqual(
+        @as(?u8, ServerSim.loop_watchdog_exit_code),
+        bed.sim_io.abortedWith(),
+    );
+    try std.testing.expectEqual(io_module.AlarmReason.loop_stalled, bed.sim_io.alarmReason());
+}
+
+test "watchdog: an uncapped drain is not killed by the watchdog that was serving" {
+    // The other half of #311, and the one that decides whether the
+    // feature is safe to turn on: `drain_deadline_ms: 0` asks for a drain
+    // that waits for the last connection however long it takes, and a
+    // serving watchdog still counting down into it would overrule that
+    // configuration rather than backstop it — #226's lesson in the other
+    // direction, and the reason `beginDrain` cancels the alarm on the
+    // branch that arms no drain watchdog of its own.
+    //
+    // The discriminator is that the run *ends by draining*. The watchdog
+    // bound is shorter than the drain this scenario takes, so a watchdog
+    // that kept its alarm would have fired first and `alarmFired` would
+    // say so.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 41 },
+        // The straggler leaves on the idle deadline, which is what ends
+        // an uncapped drain — and it is deliberately past the watchdog's
+        // bound, so the two cannot both be right.
+        .idle_timeout_ms = 3_000,
+        .connect_timeout_ms = 10,
+        .drain_deadline_ms = 0,
+        .loop_watchdog_ms = constants.loop_watchdog_ms_min,
+    });
+    defer bed.tearDown();
+
+    bed.startClients(1, false);
+    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 5_000_000);
+    try bed.sim_io.run();
+
+    try std.testing.expect(!bed.sim_io.alarmFired());
+    try std.testing.expectEqual(@as(?u8, null), bed.sim_io.abortedWith());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("completed"));
     try bed.expectDrained();
 }
 

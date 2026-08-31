@@ -321,6 +321,12 @@ pub fn Server(comptime IoType: type) type {
         /// The backstop behind that deadline: a teardown that cannot
         /// finish has nothing else watching it (#203, `onDrainStuck`).
         drain_stuck_completion: IoType.Completion,
+        /// #311's serving watchdog, which is a tick rather than a
+        /// deadline: it refreshes an alarm the kernel owns, so what it
+        /// proves is that the loop is still delivering *something*.
+        /// Armed for the whole serving phase when a config names a bound,
+        /// and never re-armed once the drain starts (§8).
+        loop_watchdog_completion: IoType.Completion,
         /// The one timer covering every parked upstream (§5): a parked
         /// connection holds no armed op, so this sweep compares stored
         /// deadlines against the clock and reaps overdue connections with
@@ -857,6 +863,7 @@ pub fn Server(comptime IoType: type) type {
             server.last_pressure_errno = 0;
             server.drain_deadline_completion = .{};
             server.drain_stuck_completion = .{};
+            server.loop_watchdog_completion = .{};
             server.upstream_sweep_completion = .{};
             server.upstream_sweep_armed = false;
             assert(!server.draining);
@@ -1105,7 +1112,105 @@ pub fn Server(comptime IoType: type) type {
             try server.admin.start();
             server.health.start();
             server.io.signalWait(Self, server, onSignal);
+            // Last, and after every op above is armed: the watchdog bounds
+            // a loop that has work to deliver, so arming it before there
+            // is any would be counting a startup that has not finished
+            // against a proxy that has not begun.
+            if (server.config.loop_watchdog_ms != 0) server.armLoopWatchdog();
         }
+
+        /// #311's serving watchdog: the one bound in this proxy that is
+        /// not an op.
+        ///
+        /// Every deadline the server owns — the idle timer, the request
+        /// deadline, the drain's own two — is submitted to the loop and
+        /// delivered by it, so none of them can bound the loop itself. A
+        /// loop parked in a blocking syscall delivers nothing, including
+        /// the timer that would have said so, and the observable result
+        /// is a process that is alive, health-checked, holding its
+        /// listeners and answering none of them. Worse under
+        /// `SO_REUSEPORT`, where the kernel keeps hashing new connections
+        /// onto it: a process that exits is replaced, a process that
+        /// hangs takes its share of the group down with it.
+        ///
+        /// So the bound is `alarm(2)`, which the kernel raises whatever
+        /// this process is doing, and the thing that keeps pushing it out
+        /// is a timer the loop *does* have to deliver. A loop that keeps
+        /// ticking never lets the alarm land; a loop that stops delivering
+        /// stops refreshing, and the kernel finishes the sentence.
+        ///
+        /// What it proves is delivery, not progress — a loop can tick
+        /// while doing nothing useful, and this would not notice. That is
+        /// the honest reading of the mechanism and it is the failure
+        /// actually seen in the field (#310): not a busy loop, a blocked
+        /// one.
+        ///
+        /// Only when the operator names a bound. #226's lesson in the
+        /// other direction: a watchdog nobody asked for is a restart this
+        /// proxy chose on its own, and the number depends on what the
+        /// deployment considers a stall — a box that swaps has longer
+        /// legitimate pauses than one that does not.
+        fn armLoopWatchdog(server: *Self) void {
+            assert(!server.draining);
+            assert(server.config.loop_watchdog_ms != 0);
+            assert(server.config.loop_watchdog_ms >= constants.loop_watchdog_ms_min);
+            const bound_ns = @as(u64, server.config.loop_watchdog_ms) *
+                std.time.ns_per_ms;
+            // Re-arming replaces the pending alarm — `alarm(2)`'s own
+            // contract, and what makes the refresh one syscall instead of
+            // a cancel and an arm.
+            server.io.alarmStart(bound_ns, loop_watchdog_exit_code, .loop_stalled);
+            // Half the bound, so a tick has to be missed *twice* before
+            // the alarm lands and one late delivery is not a kill. It is
+            // also why `loop_watchdog_ms_min` is what it is: the seam
+            // refuses an alarm under a second, and this is the division
+            // that has to clear it.
+            const refresh_ns = bound_ns / 2;
+            assert(refresh_ns >= std.time.ns_per_s);
+            assert(refresh_ns < bound_ns);
+            server.io.timerStart(
+                &server.loop_watchdog_completion,
+                refresh_ns,
+                Self,
+                server,
+                onLoopWatchdogTick,
+            );
+        }
+
+        /// The loop is alive: push the alarm out and ask again.
+        ///
+        /// Reaching this at all is the whole signal. It carries no state
+        /// and inspects nothing — a tick that had to read the server to
+        /// decide anything would be a tick that could fail for reasons
+        /// other than the loop stopping.
+        fn onLoopWatchdogTick(server: *Self, result: Io.TimerError!void) void {
+            // Only ever armed by `armLoopWatchdog`, which the config gates
+            // — so reaching here without one is a tick from a watchdog
+            // that was never configured.
+            assert(server.config.loop_watchdog_ms != 0);
+            // Nothing cancels this timer: the drain lets the last one
+            // expire rather than reaping it, for the same reason the
+            // drain deadline is never cancelled either.
+            result catch unreachable;
+            // The drain owns the alarm from `beginDrain` onward, and the
+            // two want different bounds — a drain legitimately takes
+            // longer than a serving tick, so refreshing here would keep
+            // resetting a deadline the drain watchdog set deliberately.
+            // Standing down is also what leaves an uncapped drain
+            // uncapped: the operator who declined `drain_deadline_ms`
+            // asked for a wait with no bound, and a serving watchdog that
+            // kept firing into it would overrule that (§8).
+            if (server.draining) return;
+            server.armLoopWatchdog();
+        }
+
+        /// Distinct from the drain's two so a supervisor reading a status
+        /// with no output can tell the three silences apart: 4 is a drain
+        /// that could not finish and said which plane held it, 5 is a
+        /// loop that stopped answering *during* a drain, 6 is a loop that
+        /// stopped answering while serving traffic — the one that means
+        /// the connections it was holding were live.
+        pub const loop_watchdog_exit_code: u8 = 6;
 
         /// Drain, not just death (§8): close listeners (armed accepts
         /// cancel), let admitted work finish under one server-owned drain
@@ -1147,6 +1252,15 @@ pub fn Server(comptime IoType: type) type {
                 );
                 server.armDrainWatchdog();
             } else {
+                // No drain watchdog to take the alarm over, so #311's
+                // serving one has to let go of it here rather than at its
+                // next tick — which may be a second away, and by then the
+                // alarm it armed is counting down against a drain the
+                // operator explicitly declined to bound. Unconditional:
+                // `alarmCancel` on an unarmed alarm is a no-op on both
+                // sides of the seam, so this does not have to ask whether
+                // the watchdog was configured.
+                server.io.alarmCancel();
                 if (server.tunnel_buffers.slots.len >= 1) {
                     // A zero deadline says "wait for the last connection",
                     // and a tunnel has no message boundary to be the last
@@ -1273,6 +1387,7 @@ pub fn Server(comptime IoType: type) type {
             server.io.alarmStart(
                 deadline_ns + drain_stuck_grace_ns + drain_watchdog_margin_ns,
                 drain_watchdog_exit_code,
+                .drain_stalled,
             );
         }
 

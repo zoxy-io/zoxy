@@ -1394,6 +1394,11 @@ pub fn signalWait(
 /// nothing between the kernel and the exit is the loop's (#226).
 var alarm_exit_code = std.atomic.Value(u8).init(0);
 var alarm_handler_installed = std.atomic.Value(bool).init(false);
+/// Which watchdog is armed, so the handler's one line says which silence
+/// it is reporting. A single `u8` for the reason `Io.AlarmReason` gives:
+/// the handler reads it from a signal context, and one atomic cannot be
+/// caught half-written the way a pointer and a length can.
+var alarm_reason = std.atomic.Value(u8).init(@intFromEnum(Io.AlarmReason.drain_stalled));
 
 /// §8's drain watchdog (#226): a deadline that is not a completion.
 ///
@@ -1410,7 +1415,7 @@ var alarm_handler_installed = std.atomic.Value(bool).init(false);
 /// re-entering the loop. Coarse — whole seconds — which is right for a
 /// backstop measured in them, and the informative report still comes from
 /// `onDrainStuck` when the loop is alive to produce one.
-pub fn alarmStart(io: *XevIo, after_ns: u64, exit_code: u8) void {
+pub fn alarmStart(io: *XevIo, after_ns: u64, exit_code: u8, reason: Io.AlarmReason) void {
     _ = io;
     assert(exit_code != 0); // A give-up is never a success.
     assert(after_ns >= std.time.ns_per_s);
@@ -1422,7 +1427,13 @@ pub fn alarmStart(io: *XevIo, after_ns: u64, exit_code: u8) void {
     const seconds = (after_ns + std.time.ns_per_s - 1) / std.time.ns_per_s;
     assert(seconds >= 1);
     assert(seconds <= std.math.maxInt(c_uint));
+    alarm_reason.store(@intFromEnum(reason), .release);
     alarm_exit_code.store(exit_code, .release);
+    // `alarm(2)` replaces whatever was pending and returns the seconds
+    // that were left on it, which is what makes #311's refresh one
+    // syscall rather than a cancel and an arm — and what lets the drain
+    // watchdog take the alarm over from the serving one at `beginDrain`
+    // without either knowing about the other.
     _ = std.c.alarm(@intCast(seconds));
 }
 
@@ -1451,8 +1462,24 @@ pub fn alarmHandlerInstalled() void {
 /// are syscalls and those live here (§4); `main` owns only the sigaction
 /// that points at it.
 pub fn onAlarmFromHandler() noreturn {
-    const message = "zoxy: drain watchdog fired, the event loop stopped " ++
+    const drain_message = "zoxy: drain watchdog fired, the event loop stopped " ++
         "delivering (DESIGN.md §8, #226)\n";
+    const loop_message = "zoxy: loop watchdog fired, the event loop stopped " ++
+        "delivering while serving (DESIGN.md §8, #311)\n";
+    // Both are string literals, so both live in the binary's constant
+    // data for the whole process: nothing here dereferences anything a
+    // refresh could have moved.
+    // Switched on the raw byte rather than through `@enumFromInt`: that
+    // conversion carries a safety check whose failure path is a panic,
+    // and a panic is not async-signal-safe. Only `alarmStart` ever writes
+    // this and only from an `Io.AlarmReason`, so the else is unreachable
+    // by inspection — and answering it with the drain's line rather than
+    // asserting keeps the one thing this handler owes an operator, which
+    // is a line at all.
+    const message = switch (alarm_reason.load(.acquire)) {
+        @intFromEnum(Io.AlarmReason.loop_stalled) => loop_message,
+        else => drain_message,
+    };
     _ = std.c.write(2, message.ptr, message.len);
     const code = alarm_exit_code.load(.acquire);
     // Armed with a non-zero code, so a zero here would mean the alarm

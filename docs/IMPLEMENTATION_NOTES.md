@@ -445,6 +445,67 @@ the strand hit. Disarming the watchdog fails exactly
 those two with `error.Deadlock`, which is what the whole class looked like
 before this existed.
 
+### The serving loop gets the same watchdog (#311)
+
+#226 built the mechanism and armed it for one phase. This arms it for the
+phase the process spends its life in, and the decisions worth recording
+are the three that were not obvious.
+
+**What refreshes it is a timer op, not a tick.** The issue's own sketch
+was per-tick, and per-tick is wrong twice here. `XevIo.run` is one
+`loop.run(.until_done)` call, so there is no tick to hook without turning
+it into a manual `.once` loop — and `.once` *blocks* until a completion
+arrives, so an idle proxy would sit in the wait, refresh nothing, and be
+killed for having no traffic. A timer the loop delivers has neither
+problem: it fires whether or not anyone is connected, and the loop
+delivering it is exactly the liveness being claimed. It costs one ring op,
+charged unconditionally in `inFlightOps` — which moved the listener
+ceiling in `cqFillFits` by one, and that test pins the new pair.
+
+**Half the bound, so one late tick is not a kill.** The alarm is re-armed
+at the full bound every half of it, so a delivery has to be missed twice
+before the kernel lands it. That division is also where
+`loop_watchdog_ms_min` comes from rather than taste: the seam refuses an
+alarm under a second (`alarm(2)` counts whole seconds, and rounding a
+finer bound would hand back a backstop nobody asked for), so the smallest
+bound whose refresh still clears that floor is two seconds.
+
+**The sweep does not arm it, deliberately.** Putting it in the 4096-seed
+draw looked free and is not: a tick every second of virtual time mixes
+into every seed's trace, so all 4096 schedules shift and the coverage this
+gate has accumulated goes with them. Worse, `.timer` is in the strand draw
+— the seeds that strand it are the ones that reach #226's drain watchdog,
+and a serving watchdog armed over them would end those runs in its own
+give-up instead. So the sweep stays as it was and the mechanism is gated
+by two directed simulator tests plus the live leg below.
+
+**What the live gate can say that the simulator cannot.** The simulator
+proves the wiring — strand the timer plane and the give-up still happens —
+but a virtual clock cannot be blocked, so it cannot show a real process
+that has stopped executing. `SIGSTOP` can: the process is off the CPU
+entirely, `alarm(2)` keeps counting because it is the kernel's clock, and
+on `SIGCONT` the pending SIGALRM is delivered before the process resumes
+what it was doing, so the handler wins the race against the refresh by
+construction rather than by timing. The smoke gate spawns a second proxy
+at the floor, stops it, and asserts exit 6 with the line. #310's
+provocation would have worked too, but it was fixed; this one needs no
+defect to exist.
+
+**It found one thing before it fired.** `main` installed its signal
+handlers *after* `Server.start`, and the seam refuses to arm an alarm
+whose handler is not installed (SIGALRM's default action is to terminate,
+so arming one first would turn a stall into a silent death). The order is
+now handlers-then-start, which also means a SIGTERM arriving during
+startup is recorded and drained rather than killing a process mid-bind.
+
+**Open: it proves delivery, not progress.** A loop that ticks while making
+no progress passes this, and refreshing on *completions delivered*
+instead would be a stronger claim and a fussier one — an idle proxy
+legitimately delivers nothing for a long time, so the refresh would need a
+notion of "idle" that this deliberately does not have. Delivery is the
+failure that has actually been seen (#310: a synchronous write parked in
+`writev`), so the weaker claim is the one worth shipping first.
+
 ### Rotating from the seal (#202)
 
 The interval was the open question, not the mechanism — six hours against
