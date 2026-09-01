@@ -182,6 +182,20 @@ pub const Action = union(enum) {
     /// other reference to the same body and status, so the action
     /// carries a pointer, and serving it is the static path's one send.
     respond: *const shed.StaticPage,
+    /// Stop the walk and forward, answering nothing (#331). The fourth
+    /// terminal, and the only one that is not a response: `reject` stops
+    /// with a status, `redirect` with a `Location`, `respond` with a
+    /// body, and this one stops with the request intact.
+    ///
+    /// It is what makes an *allowlist* expressible — an `allow` rule
+    /// naming the admitted range, a `reject` beneath it for everyone
+    /// else. Without it that shape refused the admitted range too: a
+    /// header edit is not terminal (§7's own rule), so the walk carried
+    /// on into the reject, and the only expressible direction was the
+    /// denylist. Nothing below a matched `allow` runs — not a reject,
+    /// not an edit, not a rewrite — which is what "stops the walk"
+    /// means in both interpreters here.
+    allow,
     /// Set (replacing any existing), add (append), or remove a header on
     /// the forwarded request, applied during the head render.
     header_set: HeaderEdit,
@@ -371,6 +385,12 @@ pub const Verdict = union(enum) {
 /// header/rewrite edits are then moot (they apply only to a request
 /// that forwards, handled at the render). Bounded loops over immutable
 /// arena data; no allocation.
+///
+/// Null covers two different histories — no rule matched, and an
+/// `allow` stopped the walk (#331) — because the caller does the same
+/// thing with both: forward. What separates them is what runs *after*,
+/// and `collectForward` stops at that same `allow`, so the two walks
+/// agree on where the table ended for this request.
 pub fn firstVerdict(rules: []const Rule, view: RequestView) ?Verdict {
     assert(view.path.len >= 1);
     assert(view.path[0] == '/');
@@ -392,6 +412,10 @@ pub fn firstVerdict(rules: []const Rule, view: RequestView) ?Verdict {
                     assert(shed.isPageStatus(page.status));
                     return .{ .respond = page };
                 },
+                // The terminal that answers nothing (#331): the request
+                // forwards, and no rule beneath this one is read — here
+                // or in `collectForward`.
+                .allow => return null,
                 // Edits apply at the render, only when the request
                 // forwards; a terminal anywhere in a matched rule stops it.
                 .header_set, .header_add, .header_remove, .rewrite_prefix => {},
@@ -427,6 +451,13 @@ pub const Forward = struct {
 /// immutable arena data; no allocation. Called at render (a matched reject
 /// would already have stopped the request at routing, so here every matched
 /// rule forwards).
+///
+/// A matched `allow` ends the scan (#331), because it ended the routing
+/// one: the two interpreters must agree about where this request's table
+/// stopped, or a rule beneath an allow would edit a head that `firstVerdict`
+/// had already decided never to read. Actions before it in the same rule
+/// are collected first — action order inside a rule is the same order
+/// there.
 pub fn collectForward(
     rules: []const Rule,
     view: RequestView,
@@ -437,7 +468,7 @@ pub fn collectForward(
     assert(out.len <= constants.header_edits_max);
     var rewrite: ?Rewrite = null;
     var count: usize = 0;
-    for (rules) |rule| {
+    scan: for (rules) |rule| {
         if (!matches(rule.match, view)) {
             continue;
         }
@@ -452,6 +483,7 @@ pub fn collectForward(
                     rewrite = candidate;
                 }
             },
+            .allow => break :scan,
             .reject, .redirect, .respond => {},
         };
     }
@@ -466,7 +498,7 @@ fn appliedEdit(action: Action) AppliedHeaderEdit {
         .header_set => |e| .{ .kind = .set, .name = e.name, .value = e.value },
         .header_add => |e| .{ .kind = .add, .name = e.name, .value = e.value },
         .header_remove => |name| .{ .kind = .remove, .name = name, .value = "" },
-        .reject, .redirect, .respond, .rewrite_prefix => unreachable,
+        .reject, .redirect, .respond, .allow, .rewrite_prefix => unreachable,
     };
 }
 
@@ -918,9 +950,11 @@ test "filter: a client predicate is any-of, conjoined with the rest" {
         .address = std.Io.net.IpAddress.parse("192.168.1.0", 0) catch unreachable,
         .prefix_len = 24,
     };
-    // The issue's own rule: /admin from the office ranges and nowhere
-    // else — spelled as a reject of everything the allowlist misses,
-    // conjoined with the path.
+    // The *tagging* direction (#177): a rule that names the office
+    // ranges and edits a header for the origin to judge, over a blanket
+    // reject of /admin. Not an allowlist — an edit is not terminal, so
+    // the office reaches the reject too, which the verdict below pins
+    // now that `allow` is what an allowlist is written with (#331).
     const rules = [_]Rule{
         .{
             .match = .{ .path_prefix = "/admin", .clients = &.{ office, lab } },
@@ -971,6 +1005,123 @@ test "filter: a client predicate is any-of, conjoined with the rest" {
         .client = &office_client,
     }, &buffer);
     try std.testing.expectEqual(@as(usize, 0), off_path.edits.len);
+    // The verdict the edits above cannot see, and the whole of #331: the
+    // tag rule matched the office and stopped nothing, so the office is
+    // refused with the stranger. This shape is a denylist with a label
+    // on it, never an allowlist.
+    try std.testing.expectEqual(@as(u16, 403), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = empty,
+        .client = &office_client,
+    }).?.reject);
+}
+
+test "filter: an allow rule stops the walk before the reject beneath it" {
+    // #331's shape, the one the tagging rule above cannot spell: /admin
+    // from the office range and nowhere else, as an `allow` naming the
+    // range over a reject of the rest.
+    const office: Cidr = .{
+        .address = std.Io.net.IpAddress.parse("10.0.0.0", 0) catch unreachable,
+        .prefix_len = 8,
+    };
+    const rules = [_]Rule{
+        .{
+            .match = .{ .path_prefix = "/admin", .clients = &.{office} },
+            .actions = &.{.allow},
+        },
+        .{ .match = .{ .path_prefix = "/admin" }, .actions = &.{.{ .reject = 403 }} },
+    };
+    const empty: []const parser.Header = &.{};
+    const office_client = std.Io.net.IpAddress.parseLiteral("10.1.2.3:40000") catch unreachable;
+    const stranger = std.Io.net.IpAddress.parseLiteral("203.0.113.9:40000") catch unreachable;
+
+    // The admitted range forwards: the allow answered nothing and the
+    // reject beneath it was never read.
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = empty,
+        .client = &office_client,
+    }));
+    // Everyone else reaches the reject.
+    try std.testing.expectEqual(@as(u16, 403), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = empty,
+        .client = &stranger,
+    }).?.reject);
+    // Off the guarded path neither rule matches, so an allowlist on
+    // /admin refuses nothing anywhere else.
+    try std.testing.expectEqual(@as(?Verdict, null), firstVerdict(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/public",
+        .headers = empty,
+        .client = &stranger,
+    }));
+}
+
+test "filter: an allow stops the render walk exactly where it stopped the verdict" {
+    // The two interpreters must end the table at the same rule (#331):
+    // edits above the allow apply, edits below it — and the rewrite
+    // below it — do not, or the render would edit a head the verdict
+    // walk had already stopped reading rules for.
+    const rules = [_]Rule{
+        .{
+            .match = .{},
+            .actions = &.{.{ .header_set = .{ .name = "X-Above", .value = "1" } }},
+        },
+        .{
+            .match = .{ .path_prefix = "/admin" },
+            .actions = &.{
+                .{ .header_set = .{ .name = "X-Same-Rule", .value = "1" } },
+                .allow,
+                // Past the allow in its own rule: unreachable, on the
+                // same action-order rule the verdict walk applies.
+                .{ .header_set = .{ .name = "X-After-Allow", .value = "1" } },
+            },
+        },
+        .{
+            .match = .{},
+            .actions = &.{
+                .{ .header_set = .{ .name = "X-Below", .value = "1" } },
+                .{ .rewrite_prefix = .{ .from = "/admin", .to = "/private" } },
+            },
+        },
+    };
+    const empty: []const parser.Header = &.{};
+    const client = std.Io.net.IpAddress.parseLiteral("10.1.2.3:40000") catch unreachable;
+    var buffer: [constants.header_edits_max]AppliedHeaderEdit = undefined;
+
+    const allowed = collectForward(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = empty,
+        .client = &client,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 2), allowed.edits.len);
+    try std.testing.expectEqualStrings("X-Above", allowed.edits[0].name);
+    try std.testing.expectEqualStrings("X-Same-Rule", allowed.edits[1].name);
+    try std.testing.expectEqual(@as(?Rewrite, null), allowed.rewrite);
+
+    // A path the allow rule misses walks the whole table, which is what
+    // makes the truncation above a property of the allow and not of the
+    // match.
+    const untouched = collectForward(&rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/public",
+        .headers = empty,
+        .client = &client,
+    }, &buffer);
+    try std.testing.expectEqual(@as(usize, 2), untouched.edits.len);
+    try std.testing.expectEqualStrings("X-Above", untouched.edits[0].name);
+    try std.testing.expectEqualStrings("X-Below", untouched.edits[1].name);
 }
 
 test "filter: response rules match on status, class and headers" {

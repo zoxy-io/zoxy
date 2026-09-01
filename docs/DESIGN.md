@@ -1497,21 +1497,20 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   owning phase module at compile time.
 - **A filter can match on who is connecting** (#177, settled
   2026-08-03). `match.client` is a CIDR list, any-of across the list
-  and conjoined with the rest. What shipped is the **denylist**
-  direction — a `client` list on a `reject` rule refuses that range —
-  and the tagging one, a header edit naming the range for the origin to
-  judge. The issue's own framing, "/admin from the office range and
-  nowhere else", is *not* what a reject beneath an allow rule spells:
-  edits are non-terminal (§7's own rule), so the walk reaches the reject
-  and the allowed range is refused with everyone else. Expressing it
-  needs either a terminal `allow` or a negated predicate, neither of
-  which the closed enum and the positive-conjunction `Match` carry;
-  #331 holds the decision, and the doc states the gap rather than the
-  promise. It matches the connection's client address, which is §6's settled principle rather
-  than a new trust decision: the observed peer, or the PROXY-announced
-  client on a `proxy_protocol` listener — never an `X-Forwarded-For`
-  chain, because an allowlist keyed on client-supplied text is not an
-  allowlist. The prefix is mandatory and bounded per family — /32 for
+  and conjoined with the rest. It refuses a range — the list on a
+  `reject` rule — and it tags one, a header edit naming the range for
+  the origin to judge. The issue's own framing, "/admin from the office
+  range and nowhere else", is the third direction and needed a terminal
+  to stop the walk on, which #177 did not ship: it is the list on an
+  `allow` rule with a reject beneath (#331 below), because edits are
+  non-terminal (§7's own rule) and an "allow" spelled as one lets the
+  walk reach the reject.
+  It matches the connection's client address, which is §6's settled
+  principle rather than a new trust decision: the observed peer, or the
+  PROXY-announced client on a `proxy_protocol` listener — never an
+  `X-Forwarded-For` chain, because an allowlist keyed on
+  client-supplied text is not an allowlist.
+  The prefix is mandatory and bounded per family — /32 for
   IPv4, **/64 for IPv6**, the same client identity a `source_ip`-keyed
   hash pick keys on, so two features cannot disagree about what a
   client is — and host bits past the prefix are refused: `10.0.0.1/8`
@@ -1519,6 +1518,29 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   which. Containment is a masked-prefix compare over the compiled
   table, family-strict; the accept and PROXY paths both normalize
   mapped v6 forms before storage.
+- **A filter can stop the walk without answering** (#331, settled
+  2026-09-01). `allow` is the fourth terminal action and the only one
+  that is not a response: the request forwards, and no rule beneath the
+  matched one is read. Both interpreters honour it — `firstVerdict` at
+  routing and `collectForward` at the render — and they must, or a rule
+  below an allow would edit a head the verdict walk had already stopped
+  reading rules for; the two ending the table at the same rule is the
+  invariant, not an optimization.
+  It exists because the allowlist was not expressible. The terminal set
+  was reject/redirect/respond, so the admitting rule could only carry an
+  edit, edits do not stop the walk, and the reject beneath refused the
+  admitted range along with everyone else — which the docs promised as
+  the standard shape from #177 until #333 corrected them, and which the
+  in-tree test covering that shape could not catch, asserting the edits
+  it collected rather than the verdict. The alternative was negation on `client`: rejected
+  because `Match` is a positive conjunction, and a second axis there
+  asks the same question of every other predicate, where one more member
+  of an already-closed action enum asks nothing. `allow`/`deny` is also
+  the vocabulary an operator arrives with.
+  Spelled `{"allow": true}`: an action object carries exactly one field
+  naming its kind, so a payload-free action still needs a value, and
+  `true` is the only one it may hold — `allow: false` names an action
+  and unsays it, refused at load like `present: false`.
 - **A filter can answer with a redirect** (#176, settled 2026-08-03).
   `redirect` beside `reject`, closed status set `301/302/307/308` —
   the four with distinct permanent/temporary × method-preserving

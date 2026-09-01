@@ -1099,9 +1099,10 @@ match anything — and actions applied in order. As with routes, nothing caps
 the list but the file you write.
 
 Order is the rule here, not a tie-break: the first terminal action a
-matching rule carries — `reject`, `redirect` or `respond` — answers the
-request, and no rule beneath it is read. Write the specific rule above the
-general one. That is the opposite of [routes](#routing), which are sorted
+matching rule carries — `reject`, `redirect`, `respond` or `allow` — ends
+the walk, and no rule beneath it is read. The first three answer the
+request; `allow` forwards it. Write the specific rule above the general
+one. That is the opposite of [routes](#routing), which are sorted
 by specificity at load precisely so the sequence you wrote them in cannot
 decide them; a filter table is read in exactly that sequence.
 
@@ -1128,14 +1129,15 @@ decide them; a filter table is read in exactly that sequence.
 Match on `method`, `host`, `path_prefix`, header predicates
 (`present` / `equals` / `contains`), and `client` — CIDR ranges the
 connection's address must fall inside. Actions are `reject` with a status,
-`redirect`, `respond` (answer from a configured body),
-`header_set` / `header_add` / `header_remove`, and `rewrite_prefix`.
+`redirect`, `respond` (answer from a configured body), `allow` (forward and
+stop reading rules), `header_set` / `header_add` / `header_remove`, and
+`rewrite_prefix`.
 
-Only `reject`, `redirect` and `respond` are terminal. A rule whose actions
-are all edits — `header_set` above, or a `rewrite_prefix` — records what
-the render should do and evaluation carries on, so an edit never shields a
-request from a `reject` written beneath it. That is why the reject above
-names the range it refuses rather than sitting under an "allow" rule; see
+Only `reject`, `redirect`, `respond` and `allow` end the walk. A rule whose
+actions are all edits — `header_set` above, or a `rewrite_prefix` — records
+what the render should do and evaluation carries on, so an edit never
+shields a request from a `reject` written beneath it. An `allow` does, which
+is what an allowlist is written with; see
 [matching the client address](#matching-the-client-address).
 
 Rules compile into immutable tables at load time and are interpreted with
@@ -1156,26 +1158,36 @@ refuses a range:
 ]
 ```
 
-and it tags traffic for the origin to judge, which costs the request
-nothing and stops nothing:
+and, with `allow`, it admits one and refuses everyone else — `/admin` from
+the office ranges **and nowhere else**, which is two rules whose order is
+the whole rule:
 
 ```json
 "request_filters": [
     { "match": { "path_prefix": "/admin",
                  "client": ["10.0.0.0/8", "192.168.1.0/24"] },
-      "actions": [{ "header_set": { "name": "X-Internal", "value": "1" } }] }
+      "actions": [{ "allow": true }] },
+    { "match": { "path_prefix": "/admin" }, "actions": [{ "reject": 403 }] }
 ]
 ```
 
+`allow` answers nothing and edits nothing: it forwards the request and
+stops the walk, so the office ranges never reach the `reject` beneath and
+everyone else does. `true` is the only value it takes.
+
 > [!IMPORTANT]
-> The inverse — `/admin` from the office range **and nowhere else** — is
-> not expressible today. A header edit is not terminal, so an "allow" rule
-> does not stop the walk: write a `reject` for `/admin` beneath the tagging
-> rule above and it answers `403` for the office range too, which is the
-> opposite of an allowlist. There is no `allow` action to stop on and no
-> way to negate a `client` list, so an allowlist belongs at the origin —
-> which is what the `X-Internal` tag is for — or in a firewall.
-> Tracked in [#331](https://github.com/zoxy-io/zoxy/issues/331).
+> The rule that admits must be terminal. A `header_set` in its place —
+> tagging the office range for the origin to judge — is an edit, and edits
+> do not stop the walk, so the `reject` beneath still answers `403` to the
+> office too. Tagging is its own idiom and a useful one, but it is a rule
+> with no rule beneath it:
+>
+> ```json
+> "request_filters": [
+>     { "match": { "path_prefix": "/admin", "client": ["10.0.0.0/8"] },
+>       "actions": [{ "header_set": { "name": "X-Internal", "value": "1" } }] }
+> ]
+> ```
 
 The address matched is the one zoxy actually believes: the TCP peer, or the
 [PROXY-protocol-announced client](#learning-it-behind-another-proxy-proxy-protocol)
@@ -1240,8 +1252,9 @@ routine edge work an origin you do not control cannot do for you: add
 A response rule matches on `status` (exact codes), `status_class`
 (`"1xx"` through `"5xx"`), and response-header predicates — the same
 `present` / `equals` / `contains` vocabulary. Its actions are the three
-header verbs only: `reject` and `rewrite_prefix` are request-side ideas,
-and the loader says so by name if you reach for them here.
+header verbs only: `reject`, `allow` and `rewrite_prefix` are request-side
+ideas — whether to forward at all, and what to forward — and the loader
+says so by name if you reach for them here.
 
 The same guardrails hold in both directions: filters may not touch the
 headers zoxy owns (`Content-Length`, `Transfer-Encoding`, `Connection`
