@@ -119,7 +119,7 @@ weights_http: [2]u16,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
-request_filters_http: [5]zoxy.http.filter.Rule,
+request_filters_http: [7]zoxy.http.filter.Rule,
 /// The #175 response rules beside them: the always-on stamp the client
 /// oracle requires on every proxied 200, and the 5xx rule whose edit
 /// must never appear (the scripted origin answers no 5xx).
@@ -1374,6 +1374,20 @@ fn wireFilters(harness: *Harness) void {
         .{
             .match = .{ .path_prefix = "/rewrite" },
             .actions = &.{.{ .rewrite_prefix = .{ .from = "/rewrite", .to = "/sim" } }},
+        },
+        // #331's pair, and the only rules here whose meaning is in their
+        // *order*: the allow stops the walk, so the reject beneath it
+        // never fires — and a sweep where it did would answer 403 to a
+        // script whose golden outcome is the origin's 200. The reject is
+        // what makes the allow observable at all; without it the first
+        // rule would be indistinguishable from no rule.
+        .{
+            .match = .{ .path_prefix = "/allow" },
+            .actions = &.{.allow},
+        },
+        .{
+            .match = .{ .path_prefix = "/allow" },
+            .actions = &.{.{ .reject = 403 }},
         },
     };
     // #175 response rules, always on: every response the render forwards

@@ -2311,6 +2311,65 @@ test "l7: filter header edits reach the origin, applied once" {
     try bed.expectDrained();
 }
 
+test "l7: an allow rule forwards and stops every rule beneath it" {
+    // #331's allowlist, end to end: the first rule admits `/ok` and
+    // answers nothing, so the reject beneath it never fires and the edit
+    // beside that reject never reaches the origin. A path the allow rule
+    // misses still walks into the reject, which is what makes the first
+    // half a property of the allow rather than of the table.
+    const rules = [_]filter.Rule{
+        .{ .match = .{ .path_prefix = "/ok" }, .actions = &.{.allow} },
+        .{ .match = .{}, .actions = &.{
+            .{ .header_set = .{ .name = "X-Below", .value = "1" } },
+            .{ .reject = 403 },
+        } },
+    };
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 31,
+            .request_filters = &rules,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /ok HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_filtered"));
+        try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+        var storage: parser.HeaderStorage = undefined;
+        const forwarded = try forwardedRequest(&bed, &storage);
+        try std.testing.expectEqual(
+            @as(?[]const u8, null),
+            parser.headerValue(forwarded.headers, "x-below"),
+        );
+        try bed.expectDrained();
+    }
+    {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{
+            .seed = 32,
+            .request_filters = &rules,
+            .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        });
+        defer bed.tearDown();
+
+        try bed.exchange("GET /other HTTP/1.1\r\nHost: o\r\n\r\n");
+
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n" ++ expected_date ++ "\r\n",
+            bed.client.response(),
+        );
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+        try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
+        try bed.expectDrained();
+    }
+}
+
 test "l7: a filter rewrite changes only the forwarded path, not the route" {
     // Routing keys off the original path (/old matches the route); the
     // rewrite swaps that prefix for /new on the way out, so the origin sees

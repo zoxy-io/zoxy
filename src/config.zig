@@ -2428,10 +2428,11 @@ pub const HeaderMatchJson = struct {
 /// cluster/routes fork uses — no JSON union parsing.
 /// What a #175 response rule may do: edit headers, and nothing else.
 ///
-/// A type of its own rather than `ActionJson` with four of its members
-/// refused at load (#305). The four are request-side answers — `reject`,
+/// A type of its own rather than `ActionJson` with five of its members
+/// refused at load (#305). The five are request-side decisions — `reject`,
 /// `redirect` and `respond` decide what to send *instead* of asking the
-/// origin, and `rewrite_prefix` changes what is asked — while a response
+/// origin, `allow` decides to ask it after all (#331), and
+/// `rewrite_prefix` changes what is asked — while a response
 /// rule runs when the origin has already answered. Sharing the request's
 /// union made those states representable and then rejected them one at
 /// a time; here they cannot be written down, which is the same verdict
@@ -2445,8 +2446,9 @@ pub const ResponseActionJson = struct {
     pub const schema_doc =
         "One response-filter action. Exactly one field is set — the edit's " ++
         "kind. Response rules edit headers only: the request-side actions " ++
-        "(reject, redirect, respond, rewrite_prefix) answer instead of " ++
-        "forwarding, and by the time these rules run the origin already has.";
+        "(reject, redirect, respond, allow, rewrite_prefix) decide whether " ++
+        "to forward at all, and by the time these rules run the origin " ++
+        "already has answered.";
     pub const schema_one_of = [_][]const u8{
         "header_set",
         "header_add",
@@ -2480,6 +2482,12 @@ pub const ActionJson = struct {
     reject: ?u16 = null,
     redirect: ?RedirectJson = null,
     respond: ?RespondJson = null,
+    /// #331's terminal, spelled `{"allow": true}`: an action with no
+    /// payload still needs a value in this "struct of optionals, exactly
+    /// one set" shape, and `true` is the only one it may carry —
+    /// `allow: false` names no action, exactly as `present: false` names
+    /// no predicate.
+    allow: ?bool = null,
     header_set: ?HeaderEditJson = null,
     header_add: ?HeaderEditJson = null,
     header_remove: ?[]const u8 = null,
@@ -2491,6 +2499,7 @@ pub const ActionJson = struct {
         "reject",
         "redirect",
         "respond",
+        "allow",
         "header_set",
         "header_add",
         "header_remove",
@@ -2507,6 +2516,13 @@ pub const ActionJson = struct {
         .respond = .{
             .desc = "Answer the request from a configured body instead of " ++
                 "forwarding it — this proxy as the origin.",
+        },
+        .allow = .{
+            .desc = "Forward the request and stop reading rules — no answer, no " ++
+                "edit. What an allowlist is written with: an allow rule naming " ++
+                "the admitted traffic, a reject beneath it for everything else " ++
+                "(allow: false is rejected).",
+            .const_true = true,
         },
         .header_set = .{ .desc = "Set (replace) a request header." },
         .header_add = .{ .desc = "Append a request header." },
@@ -4367,6 +4383,9 @@ fn resolveRequestFilters(
 
 /// The number of header-edit actions (set/add/remove) in a rule — the
 /// reject and rewrite actions contribute no render-time header edit.
+/// An `allow` contributes none either, and only ever *shortens* a
+/// request's walk (#331), so the whole-table sum this feeds stays an
+/// upper bound on what one render can materialize.
 fn countHeaderEdits(actions: []const filter.Action) u32 {
     // Reached only through `resolveActions`, which rejects an empty
     // action list — so the caps this function once asserted against are
@@ -4376,7 +4395,7 @@ fn countHeaderEdits(actions: []const filter.Action) u32 {
     for (actions) |action| {
         switch (action) {
             .header_set, .header_add, .header_remove => count += 1,
-            .reject, .redirect, .respond, .rewrite_prefix => {},
+            .reject, .redirect, .respond, .allow, .rewrite_prefix => {},
         }
     }
     assert(count <= actions.len); // Edits are a subset of the actions.
@@ -4713,10 +4732,10 @@ fn resolveActions(
 }
 
 /// Exactly one action field may carry the kind — the "exactly one of"
-/// fork both action resolvers share, so a seventh kind cannot be
+/// fork both action resolvers share, so an eighth kind cannot be
 /// counted in one table and forgotten in the other.
 /// The response table's kind fork (#305). Three members rather than the
-/// request's seven, and the same verdict — a rule naming none or two
+/// request's eight, and the same verdict — a rule naming none or two
 /// has no single action to apply.
 fn requireOneResponseActionKind(action_json: *const ResponseActionJson) ParseError!void {
     const set: u8 = @as(u8, @intFromBool(action_json.header_set != null)) +
@@ -4733,11 +4752,12 @@ fn requireOneActionKind(action_json: *const ActionJson) ParseError!void {
     const set: u8 = @as(u8, @intFromBool(action_json.reject != null)) +
         @intFromBool(action_json.redirect != null) +
         @intFromBool(action_json.respond != null) +
+        @intFromBool(action_json.allow != null) +
         @intFromBool(action_json.header_set != null) +
         @intFromBool(action_json.header_add != null) +
         @intFromBool(action_json.header_remove != null) +
         @intFromBool(action_json.rewrite_prefix != null);
-    assert(set <= 7); // The action object has seven kind fields.
+    assert(set <= 8); // The action object has eight kind fields.
     if (set != 1) {
         return error.FilterActionKind;
     }
@@ -4773,6 +4793,15 @@ fn resolveAction(
         // than on the serving path.
         assert(shed.isPageStatus(page.status));
         return .{ .respond = page };
+    }
+    if (action_json.allow) |allow| {
+        // `allow: false` is the same non-predicate `present: false` is:
+        // a key that names an action and then unsays it. Refused rather
+        // than read as "not allow", which is not an action either.
+        if (!allow) {
+            return error.FilterActionKind;
+        }
+        return .allow;
     }
     if (action_json.header_set) |edit| {
         return .{ .header_set = try resolveHeaderEdit(&edit) };
@@ -6499,6 +6528,46 @@ test "config: filters compile into rules with matches and actions" {
     try std.testing.expectEqualStrings("/new", rule1.actions[1].rewrite_prefix.to);
 }
 
+test "config: an allow rule compiles into the terminal that answers nothing" {
+    // The #331 allowlist, in the spelling the README carries: the rule
+    // that admits, then the reject the admitted range never reaches.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const parsed = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a","request_filters":[
+        \\   {"match":{"path_prefix":"/admin","client":["203.0.113.0/24"]},
+        \\    "actions":[{"allow":true}]},
+        \\   {"match":{"path_prefix":"/admin"},"actions":[{"reject":403}]}]}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    const rules = parsed.listeners[0].request_filters;
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqual(@as(usize, 1), rules[0].actions.len);
+    try std.testing.expectEqual(filter.Action.allow, rules[0].actions[0]);
+    try std.testing.expectEqual(@as(u8, 24), rules[0].match.clients[0].prefix_len);
+    try std.testing.expectEqual(@as(u16, 403), rules[1].actions[0].reject);
+    // The compiled table is what the interpreter reads, so assert the
+    // verdict rather than only the shape: the named range forwards, and
+    // everyone else is refused by the rule beneath.
+    const admitted = std.Io.net.IpAddress.parseLiteral("203.0.113.7:40000") catch unreachable;
+    const stranger = std.Io.net.IpAddress.parseLiteral("198.51.100.7:40000") catch unreachable;
+    try std.testing.expectEqual(@as(?filter.Verdict, null), filter.firstVerdict(rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = &.{},
+        .client = &admitted,
+    }));
+    try std.testing.expectEqual(@as(u16, 403), filter.firstVerdict(rules, .{
+        .method = .get,
+        .host = null,
+        .path = "/admin",
+        .headers = &.{},
+        .client = &stranger,
+    }).?.reject);
+}
+
 test "config: filter schema rejects malformed rules" {
     const tail =
         \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
@@ -6518,6 +6587,11 @@ test "config: filter schema rejects malformed rules" {
     try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{}]}]}}]," ++ tail);
     // An action object with two kinds set.
     try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"reject\":403,\"header_remove\":\"X\"}]}]}}]," ++ tail);
+    // `allow` carries a value only because this shape needs one, and
+    // `true` is the whole of it: `false` names an action and unsays it
+    // (#331), the way `present: false` names no predicate.
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"allow\":false}]}]}}]," ++ tail);
+    try expectParseError(error.FilterActionKind, head ++ "{\"actions\":[{\"allow\":true,\"reject\":403}]}]}}]," ++ tail);
     // A reject status outside the policy set.
     try expectParseError(error.FilterRejectStatus, head ++ "{\"actions\":[{\"reject\":503}]}]}}]," ++ tail);
     // An unknown / lowercase method token.
@@ -6734,6 +6808,7 @@ test "config: response filter schema rejects what has no meaning on the way out"
     // the same thing, where before it could only be discovered at load.
     inline for (.{
         "{\"reject\":403}",
+        "{\"allow\":true}",
         "{\"rewrite_prefix\":{\"from\":\"/a\",\"to\":\"/b\"}}",
         "{\"redirect\":{\"status\":301,\"location\":\"/x\"}}",
         "{\"respond\":{\"status\":200,\"body\":\"b\"}}",
@@ -7926,7 +8001,8 @@ var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 /// `drain_deadline_ms` gives it no path to that branch of the parser.
 const fuzz_seed_json =
     \\{"listeners":[{"bind":"127.0.0.1:8080","http":{"routes":[{"prefix":"/","cluster":"o"}],
-    \\ "request_filters":[{"match":{"client":["10.0.0.0/8"]},"actions":[{"reject":403}]},
+    \\ "request_filters":[{"match":{"path_prefix":"/admin","client":["10.0.0.0/8"]},"actions":[{"allow":true}]},
+    \\ {"match":{"path_prefix":"/admin"},"actions":[{"reject":403}]},
     \\ {"match":{"path_prefix":"/old"},"actions":[{"redirect":{"status":301,"scheme":"https"}}]},
     \\ {"match":{"path_prefix":"/robots.txt"},"actions":[{"respond":{"status":200,"body":"oops"}}]}]}},
     \\ {"bind":"127.0.0.1:8443","tls":{"cert":"/c.pem","key":"/k.pem"},"l4":{"cluster":"t"}}],
@@ -7948,7 +8024,8 @@ const fuzz_seed_json =
 // `path` key only one of them may carry — both endpoint spellings
 // (#174), both pick spellings (#178: the object form with its key/name
 // grammar here, the bare string in the example), and every terminal
-// filter action (`reject`, `redirect` #176, `respond` #159) — so each
+// filter action (`reject`, `redirect` #176, `respond` #159, `allow`
+// #331, whose `true` is the one value it may carry) — so each
 // grammar is a starting point rather than a shape the mutator must
 // blindly discover. The `inline` body arm is the one it can reach:
 // `parse` refuses `file` sources outright, since the fuzzer has no
@@ -7973,10 +8050,13 @@ test "config: the fuzz seed carrying every block parses" {
     try std.testing.expectEqual(@as(usize, 1), parsed.error_pages.len);
     try std.testing.expectEqual(@as(u16, 503), parsed.error_pages[0].status);
     const rules = parsed.listeners[0].request_filters;
-    try std.testing.expectEqual(@as(usize, 3), rules.len);
-    try std.testing.expectEqual(@as(u16, 403), rules[0].actions[0].reject);
-    try std.testing.expectEqual(@as(u16, 301), rules[1].actions[0].redirect.status);
-    try std.testing.expectEqual(@as(u16, 200), rules[2].actions[0].respond.status);
+    try std.testing.expectEqual(@as(usize, 4), rules.len);
+    // The #331 allowlist pair leads: the terminal that answers nothing,
+    // over the reject it shields the named range from.
+    try std.testing.expectEqual(filter.Action.allow, rules[0].actions[0]);
+    try std.testing.expectEqual(@as(u16, 403), rules[1].actions[0].reject);
+    try std.testing.expectEqual(@as(u16, 301), rules[2].actions[0].redirect.status);
+    try std.testing.expectEqual(@as(u16, 200), rules[3].actions[0].respond.status);
     // The #125 grammar and the limit that follows it: both in the seed, so
     // the mutator has the vocabulary for either branch.
     try std.testing.expectEqualStrings("/c.pem", parsed.listeners[1].tls.?.cert_path);

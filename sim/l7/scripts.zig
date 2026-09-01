@@ -126,6 +126,13 @@ pub const Script = enum(u8) {
     /// *neither* response-side stamp, which is how the sweep proves
     /// from outside that a page bypasses the response render.
     filter_respond,
+    /// A GET under `/allow`: a §7 `allow` rule stops the filter walk
+    /// before the 403 written beneath it (#331), so the request routes
+    /// and the origin answers it like any other. The golden outcome is
+    /// a plain GET's 200 — which is exactly the point: an allow that
+    /// failed to stop the walk would answer 403 here, and a reject that
+    /// leaked past one would too.
+    filter_allow,
     /// A GET under `/edit`: a §7 filter adds a header to the forwarded
     /// request. It routes and succeeds (200); the origin's §7 oracle proves
     /// the edited head still forwards canonical.
@@ -676,6 +683,19 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         .allowed_statuses = &.{ 200, 408, 503 },
         .respond_page = true,
     },
+    .filter_allow = .{
+        // Routes and forwards like a plain GET — the allow answers
+        // nothing — so the §8 rungs and a killed dial can precede the
+        // 200, and 403 is *not* in the legal set: the reject beneath the
+        // allow is unreachable for this target, under every schedule.
+        .request = "GET /allow HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .expected_responses = 1,
+        .transcript_cap = 1,
+        .golden_status = 200,
+        .method = .get,
+        .allowed_statuses = statuses_routed,
+        .routed_canonical = true,
+    },
     .filter_edit = .{
         // Routes and forwards like a plain GET, so the §8 rungs and a
         // killed dial can precede the 200.
@@ -819,6 +839,7 @@ pub const terminating_scripts = [_]Script{
     .filter_reject,
     .filter_redirect,
     .filter_respond,
+    .filter_allow,
     .filter_edit,
     .filter_rewrite,
     .forwarded_inbound,

@@ -194,11 +194,34 @@ const sticky_exchanges: u32 = 3;
 /// describing a run whose every request was routed.
 const body_exchanges: u32 = 2;
 
+/// The #331 leg: two exchanges on one connection, both under rules that
+/// match the path they name — a request under the prefix an `allow` rule
+/// admits this host's own address on, which must reach the origin, and
+/// one under a prefix whose `allow` names a range this host is not in,
+/// which must be refused by the reject beneath it. What a live gate adds
+/// over the directed tests is that the *order* decides on the real
+/// binary: an allow that stopped nothing answers 403 to the first
+/// request, and a reject reached past a matched allow answers it to
+/// both. Runs after the scrapes above like the two legs before it.
+const allowlist_exchanges: u32 = 2;
+/// The one of those the proxy answers itself. Named apart because the
+/// log partition below counts what the *origin* served, and this line
+/// carries a policy status no origin sent.
+const allowlist_refused: u32 = 1;
+/// The two prefixes that leg drives, each carrying an `allow` rule over
+/// a `reject`. They differ only in the range the allow names: the first
+/// is this host's own loopback /8, the second a documentation range no
+/// client here can be in — so one request is admitted and the other is
+/// refused by rules of identical shape, which is what makes the verdict
+/// a property of the client match and not of the path.
+const allowed_path = "/allowed";
+const refused_path = "/refused";
+
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
-const access_log_lines_expected: u32 =
-    http_exchanges + sticky_exchanges + body_exchanges + tls_requests + l4_connections;
+const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
+    body_exchanges + allowlist_exchanges + tls_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -221,10 +244,11 @@ const rss_growth_kb_max: u64 = 64;
 /// connections nobody made.
 const sticky_connections: u32 = 1;
 const body_connections: u32 = 1;
+const allowlist_connections: u32 = 1;
 const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
-    body_connections + tls_connections + readiness_probes;
+    body_connections + allowlist_connections + tls_connections + readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -232,7 +256,10 @@ const connections_expected: u32 = keep_alive_connections +
 /// sticky cluster, whose pool parks its own upstream connection (§5
 /// pools key by cluster, so the origin cluster's parked one is not
 /// reused for it).
-const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 + 1;
+/// One more for the #331 leg, whose allowed request forwards: it reuses
+/// a parked upstream connection whenever one is free, and a dial of its
+/// own is the case this headroom covers.
+const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 + 1 + 1;
 
 /// The drain's cap on waiting for the connections left open above. A
 /// drain cannot tell an idle keep-alive connection from one about to send
@@ -419,6 +446,7 @@ const Stage = enum {
     counter_scrape,
     sticky_leg,
     bodies_leg,
+    allowlist_leg,
     https_handshake,
     https_request,
     https_close_notify,
@@ -436,6 +464,7 @@ const Stage = enum {
             .counter_scrape => "the counter scrapes",
             .sticky_leg => "the sticky leg (#178)",
             .bodies_leg => "the bodies leg (#159)",
+            .allowlist_leg => "the allowlist leg (#331)",
             .https_handshake => "the https handshake",
             .watchdog_leg => "the loop-watchdog leg (#311)",
             .https_request => "an https request",
@@ -535,6 +564,10 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const sticky_ok = try stickyPassed(arena, io, &ports);
     enterStage(.bodies_leg);
     const bodies_ok = try bodiesPassed(arena, io, &ports);
+    // Last of the plaintext legs, so its scrape is the one that sees
+    // every filter verdict this run produced.
+    enterStage(.allowlist_leg);
+    const allowlist_ok = try allowlistPassed(arena, io, &ports);
     // Last, so its scrape sees the whole run — and so a wedged handshake
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
@@ -555,7 +588,8 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        tls_ok and memory_ok and drain_ok and check_ok and watchdog_ok;
+        allowlist_ok and tls_ok and memory_ok and drain_ok and check_ok and
+        watchdog_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
 
@@ -680,9 +714,10 @@ const LogCounts = struct {
     /// HTTP lines that both completed and carried the origin's status —
     /// the outcome every request in this load is owed.
     http_ok: u32 = 0,
-    /// The #159 leg's lines: one page-wearing `404` and one `respond`
-    /// answer. Neither is `ok` — no origin served them — so they are
-    /// counted apart rather than weakening the ok-equality.
+    /// The lines no origin served: the #159 leg's page-wearing `404` and
+    /// its `respond` answer, and the #331 leg's `403` from outside the
+    /// allowed range. None is `ok`, so they are counted apart rather
+    /// than weakening the ok-equality.
     http_rejected: u32 = 0,
     http_responded: u32 = 0,
     /// The #140 headers as the log actually spelled them.
@@ -701,8 +736,8 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // The https leg's requests land here with every other L7 one: a
     // terminated request is an ordinary request by the time it is logged,
     // and a log that told them apart would be the defect.
-    const http_lines_expected =
-        http_exchanges + sticky_exchanges + body_exchanges + tls_requests;
+    const http_lines_expected = http_exchanges + sticky_exchanges +
+        body_exchanges + allowlist_exchanges + tls_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -723,20 +758,23 @@ fn accessLogPassed(lines: *const LogCounts) bool {
         std.debug.print("FAIL: {d} access-log lines of no known kind\n", .{lines.other});
         passed = false;
     }
-    // Every line but the #159 leg's two carries the origin's 200; those
-    // two carry the outcomes only a configured page produces, so the
-    // three counts partition the http lines exactly.
-    if (lines.http_ok + body_exchanges != lines.http) {
+    // Every line but the #159 leg's two and the #331 leg's refusal
+    // carries the origin's 200; those three carry outcomes only this
+    // proxy produces, so the counts partition the http lines exactly.
+    if (lines.http_ok + body_exchanges + allowlist_refused != lines.http) {
         std.debug.print(
             "FAIL: {d} of {d} http lines did not complete with the origin's 200\n",
             .{ lines.http - lines.http_ok, lines.http },
         );
         passed = false;
     }
-    if (lines.http_rejected != 1 or lines.http_responded != 1) {
+    // Two refusals: the #159 leg's unroutable request, wearing the
+    // configured page, and the #331 leg's request from outside the
+    // allowed range. One `responded`, from the `respond` action.
+    if (lines.http_rejected != 1 + allowlist_refused or lines.http_responded != 1) {
         std.debug.print(
-            "FAIL: {d} rejected and {d} responded lines, not 1 each (#159)\n",
-            .{ lines.http_rejected, lines.http_responded },
+            "FAIL: {d} rejected and {d} responded lines, not {d} and 1 (#159, #331)\n",
+            .{ lines.http_rejected, lines.http_responded, 1 + allowlist_refused },
         );
         passed = false;
     }
@@ -764,15 +802,16 @@ fn loggedHeadersPassed(lines: *const LogCounts) bool {
         passed = false;
     }
     // The origin's tag rides only the lines whose exchange reached it —
-    // never the page or the respond answer, which no origin served.
-    // Asserted rather than assumed: a near-empty log would otherwise
-    // underflow this subtraction into a panic, where the whole point of
-    // this function is to print a verdict.
-    assert(lines.http >= body_exchanges);
-    if (lines.http_with_origin_tag != lines.http - body_exchanges) {
+    // never the page, the respond answer or the #331 leg's refusal,
+    // which no origin served. Asserted rather than assumed: a near-empty
+    // log would otherwise underflow this subtraction into a panic, where
+    // the whole point of this function is to print a verdict.
+    const origin_served = body_exchanges + allowlist_refused;
+    assert(lines.http >= origin_served);
+    if (lines.http_with_origin_tag != lines.http - origin_served) {
         std.debug.print(
             "FAIL: {d} of {d} origin-served lines carried the logged X-Origin-Tag (#140)\n",
-            .{ lines.http_with_origin_tag, lines.http - body_exchanges },
+            .{ lines.http_with_origin_tag, lines.http - origin_served },
         );
         passed = false;
     }
@@ -973,11 +1012,12 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
         );
         passed = false;
     }
-    // Minus the three legs that deliberately run after this scrape (see
-    // `sticky_exchanges`, `body_exchanges` and `tls_requests`); the
-    // whole-run equality is asserted on the last of their scrapes.
-    const opened_so_far = connections_expected -
-        sticky_connections - body_connections - tls_connections;
+    // Minus the four legs that deliberately run after this scrape (see
+    // `sticky_exchanges`, `body_exchanges`, `allowlist_exchanges` and
+    // `tls_requests`); the whole-run equality is asserted on the last of
+    // their scrapes.
+    const opened_so_far = connections_expected - sticky_connections -
+        body_connections - allowlist_connections - tls_connections;
     if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
@@ -1246,7 +1286,8 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // The accept count with this leg in, but still short the connections
     // the #159 and TLS legs open after it — the whole-run equality lands
     // on the last scrape of the run.
-    const opened_by_here = connections_expected - body_connections - tls_connections;
+    const opened_by_here = connections_expected - body_connections -
+        allowlist_connections - tls_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1295,15 +1336,89 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         std.debug.print("FAIL: l7_no_route reads {d}, not 1\n", .{no_route});
         passed = false;
     }
-    // Short only the TLS leg's connection, which opens after this scrape
-    // and carries the whole-run equality.
-    const opened_by_here = connections_expected - tls_connections;
+    // Short the #331 and TLS legs' connections, which open after this
+    // scrape; the last of them carries the whole-run equality.
+    const opened_by_here = connections_expected - allowlist_connections - tls_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened by here\n",
             .{ accepted, opened_by_here },
         );
+        passed = false;
+    }
+    return passed;
+}
+
+/// The #331 leg against the live binary: the allowlist, both directions,
+/// on one connection. `allowed_path` carries an `allow` rule naming the
+/// loopback range this harness connects from, over a `reject`;
+/// `refused_path` carries that same pair with a range no client here can
+/// be in. So one request must reach the origin and the other must be
+/// refused — and the build this issue was filed against, where an
+/// "allow" rule was a header edit and stopped nothing, answers 403 to
+/// both. That is the whole of what a live gate adds here: the two
+/// verdicts come off the real binary's own walk over a real config.
+///
+/// Runs after the legs above and takes its own scrape, so `l7_filtered`
+/// reads exactly the one refusal — a reject reached past a matched allow
+/// would count two, which no assertion on the *responses* alone could
+/// tell from a client that asked twice.
+fn allowlistPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.http != 0);
+    assert(ports.admin != 0);
+    var host_buffer: [32]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.http});
+    try single_client.connect(io, ports.http);
+    defer single_client.close();
+
+    // Admitted: the allow stopped the walk before the reject beneath it,
+    // so what follows is an ordinary proxied exchange — the origin's
+    // body and the listener's #175 stamp, judged as the load's are.
+    const allowed = try single_client.get(host, allowed_path, .keep_alive, null);
+    try expectResponse(allowed, origin_module.body.len, .http);
+
+    // Refused: the allow above this rule named a range this client is
+    // not in, so it never matched and the reject decides.
+    const refused = try single_client.get(host, refused_path, .close, null);
+    var passed = expectRefusedResponse(refused);
+    if (!expectProxyDate(refused, "allowlist reject")) passed = false;
+
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const filtered = counterOf(&scrape, "l7_filtered") orelse return false;
+    if (filtered != allowlist_refused) {
+        std.debug.print(
+            "FAIL: l7_filtered reads {d}, not the {d} request this run refused (#331)\n",
+            .{ filtered, allowlist_refused },
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// The #331 leg's refusal, judged on what a policy reject *is*: the
+/// status the rule named, an empty body — no `error_pages` entry claims
+/// `403` in this config — and no response-side stamp, because a static
+/// never crosses the render the #175 rule lives in.
+fn expectRefusedResponse(response: client_module.Response) bool {
+    assert(response.status >= 100);
+    var passed = true;
+    if (response.status != 403) {
+        std.debug.print(
+            "FAIL: the allowlist refused a request with {d}, not 403\n",
+            .{response.status},
+        );
+        passed = false;
+    }
+    if (response.body_bytes != 0) {
+        std.debug.print(
+            "FAIL: the allowlist reject carried {d} body bytes, not 0\n",
+            .{response.body_bytes},
+        );
+        passed = false;
+    }
+    if (response.edited) {
+        std.debug.print("FAIL: the allowlist reject carried the response-filter stamp\n", .{});
         passed = false;
     }
     return passed;
@@ -1875,6 +1990,10 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
     assert(ports.http != 0);
     const config_json = try std.fmt.allocPrint(arena, config_template, .{
         ports.http,
+        allowed_path,
+        allowed_path,
+        refused_path,
+        refused_path,
         ports.l4,
         ports.tls,
         tls_cert_path,
@@ -1912,7 +2031,13 @@ const config_template =
     \\          ],
     \\          "request_filters": [
     \\              {{ "match": {{ "path_prefix": "/robots.txt" }},
-    \\                "actions": [{{ "respond": {{ "status": 200, "body": "robots" }} }}] }}
+    \\                "actions": [{{ "respond": {{ "status": 200, "body": "robots" }} }}] }},
+    \\              {{ "match": {{ "path_prefix": "{s}", "client": ["127.0.0.0/8"] }},
+    \\                "actions": [{{ "allow": true }}] }},
+    \\              {{ "match": {{ "path_prefix": "{s}" }}, "actions": [{{ "reject": 403 }}] }},
+    \\              {{ "match": {{ "path_prefix": "{s}", "client": ["203.0.113.0/24"] }},
+    \\                "actions": [{{ "allow": true }}] }},
+    \\              {{ "match": {{ "path_prefix": "{s}" }}, "actions": [{{ "reject": 403 }}] }}
     \\          ],
     \\          "response_filters": [
     \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
