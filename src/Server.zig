@@ -243,9 +243,9 @@ pub fn Server(comptime IoType: type) type {
         /// keeps the wall clock *off* the per-response path (§9).
         ///
         /// `nowWallNs` is deliberately precise and deliberately uncached —
-        /// it exists for access-log durations, where a coarse granule
-        /// would report 0 µs and a per-tick cache would give every request
-        /// in one batch the same start. Neither property is worth paying
+        /// it exists to date an access-log line, and a line names the
+        /// moment its own request began, not the moment whichever earlier
+        /// request shared its batch did. Neither property is worth paying
         /// for here: a `Date` is a *second*, and a shed storm answers a
         /// whole completion batch from this one line. So the wall clock is
         /// read at most once per tick — §4 guarantees `nowNs` returns one
@@ -951,7 +951,7 @@ pub fn Server(comptime IoType: type) type {
         /// has not. Without it a shed storm — the load this path exists
         /// for (§8) — would pay one precise `CLOCK_REALTIME` read per
         /// response, on the path that is otherwise one send from memory
-        /// that is neither assembled nor copied. `nowNs` is the coarse,
+        /// that is neither assembled nor copied. `nowNs` is the
         /// tick-cached clock §4 already refreshes once per tick, so the
         /// gate costs a load and a compare and a whole completion batch
         /// reads the wall clock once between them.
@@ -2058,15 +2058,15 @@ pub fn Server(comptime IoType: type) type {
             // capture at all, and its line would otherwise report
             // whatever the slot's *previous* occupant sent.
             server.resetLogHeaders(conn);
-            // An L4 connection is its own log unit and starts its line
+            // An L4 connection is its own log unit and starts its clocks
             // here — the first point at which a listener has said it is
             // one. An L7 exchange starts only when its first head byte
             // lands, so an idle keep-alive connection reaped without ever
-            // being asked anything owes no line. Both are gated on the log
-            // being on, so a deployment without one reads no clock here.
-            if (listener.protocol == .l4 and server.access_log.sink != null) {
-                conn.stream.log.started_wall_ns = server.io.nowWallNs();
-            }
+            // being asked anything owes no line. The stamping itself is
+            // `beginRequest`'s, called rather than repeated: two copies of
+            // "which clock is conditional on what" is exactly the shape
+            // that drifted once already (#237).
+            if (listener.protocol == .l4) server.beginRequest(conn);
             assert(conn.routes.len >= 1);
             assert(conn.stream.conn == conn);
         }
@@ -3478,22 +3478,40 @@ pub fn Server(comptime IoType: type) type {
             server.maybeStopAfterDrain();
         }
 
-        /// Start this connection's access-log clock, if it owes a line and
-        /// has not started one (§8). The L7 path calls it when a request's
-        /// first head byte lands — which is when the request begins, not
-        /// when its head finishes parsing, so a slowloris's line reports
-        /// the whole time it spent dribbling.
+        /// Start this log unit's clocks, if it has not started them (§8).
+        /// The L7 path calls it when a request's first head byte lands —
+        /// which is when the request begins, not when its head finishes
+        /// parsing, so a slowloris's line reports the whole time it spent
+        /// dribbling. The L4 path calls it at admission, where the unit is
+        /// the whole connection rather than a request on it; the two
+        /// clocks and the guard between them are the same either way,
+        /// which is why there is one function and not two.
         ///
-        /// Stamped whether or not an access log is configured, and that
-        /// is #299's doing: the §8 latency histogram measures the same
-        /// interval this starts, so gating the stamp on a sink would have
-        /// left every deployment without an access log — the default —
-        /// reporting no latency at all, or worse, a duration measured
-        /// from zero. The cost is one `CLOCK_REALTIME` read per request
-        /// where there was none: a vDSO call, against the ~25 us of loop
-        /// time a request already costs at the Tier-1 band.
+        /// Two stamps, on two clocks, for two different questions, and
+        /// only the first is unconditional:
+        ///
+        ///   - `started_ns` is the monotonic per-tick clock (§4) and the
+        ///     interval every duration is measured over — the #299
+        ///     histogram's and the log's alike. Always taken, because the
+        ///     histogram is always on and the read is free: the tick has
+        ///     already refreshed the clock.
+        ///   - `started_wall_ns` is the calendar date a log line prints,
+        ///     and it is a real `CLOCK_REALTIME` read, so it is taken only
+        ///     when a sink is configured to print it.
+        ///
+        /// That split is what #299 was missing. It needed a duration in
+        /// every deployment, correctly rejected gating the stamp on a sink
+        /// (which would have left the default deployment reporting no
+        /// latency at all), and reached for the wall clock it already had —
+        /// putting two `CLOCK_REALTIME` reads per request on a path that
+        /// had none, log or no log. §9 priced them at ~100 cycles per
+        /// request. The duration never needed a wall clock; it needed a
+        /// stopwatch, and §4's tick clock had been one all along.
         pub fn beginRequest(server: *Self, conn: *ConnType) void {
-            if (conn.stream.log.started_wall_ns != 0) return;
+            if (conn.stream.log.started_ns != 0) return;
+            conn.stream.log.started_ns = server.io.nowNs();
+            assert(conn.stream.log.started_ns != 0);
+            if (server.access_log.sink == null) return;
             conn.stream.log.started_wall_ns = server.io.nowWallNs();
             assert(conn.stream.log.started_wall_ns != 0);
         }
@@ -3512,9 +3530,23 @@ pub fn Server(comptime IoType: type) type {
             if (conn.stream.log.emitted) return;
             // Nothing was asked of this connection: an L7 slot that idled
             // out between requests, or one reaped before its first byte.
-            if (conn.stream.log.started_wall_ns == 0) return;
+            // The monotonic stamp is the one that answers this, because it
+            // is the one taken unconditionally; the wall stamp beside it
+            // says only whether a date was wanted.
+            if (conn.stream.log.started_ns == 0) return;
             conn.stream.log.emitted = true;
-            const now_wall_ns = server.io.nowWallNs();
+            // Reached only past the `sink == null` return above, and the
+            // sink is fixed at startup — `init` is its one writer, and
+            // SIGHUP reopens the file behind it without ever clearing it.
+            // So a stamp taken under "the log is on" cannot be missing by
+            // the time the line is written.
+            assert(conn.stream.log.started_wall_ns != 0);
+            // One clock for the interval, and it is not this line's date
+            // clock. `nowNs` is monotonic and cannot step backwards, so
+            // the subtraction below needs no saturation — where the wall
+            // clock this used to read needed it against NTP.
+            const now_ns = server.io.nowNs();
+            assert(now_ns >= conn.stream.log.started_ns);
             // Both indices are pool/config positions this connection has
             // carried since routing; a stale one would name another
             // operator's backend in the line, so they are checked here
@@ -3533,10 +3565,7 @@ pub fn Server(comptime IoType: type) type {
                 },
                 .outcome = conn.stream.log.outcome,
                 .started_wall_ns = conn.stream.log.started_wall_ns,
-                // Saturating: the wall clock can step backwards under NTP,
-                // and a duration that wrapped to eighteen quintillion
-                // microseconds would be read as a stall that never happened.
-                .duration_ns = now_wall_ns -| conn.stream.log.started_wall_ns,
+                .duration_ns = now_ns - conn.stream.log.started_ns,
                 .client = conn.client_address,
                 .upstream = if (conn.stream.log.endpoint_index == stream_module.LogState.endpoint_none)
                     null
@@ -3558,7 +3587,6 @@ pub fn Server(comptime IoType: type) type {
             // always names a start: both are what `renderLine` prints
             // without checking, so they are checked here.
             assert(entry.started_wall_ns != 0);
-            assert(entry.duration_ns <= now_wall_ns);
             server.access_log.record(&entry);
         }
 

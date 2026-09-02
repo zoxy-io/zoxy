@@ -3375,15 +3375,22 @@ pub fn Proxy(comptime IoType: type) type {
             // `reconciles` noticed the histogram had drifted.
             assert(conn.stream.log.status != 0);
             {
+                // The §4 per-tick clock, monotonic and already refreshed
+                // by the tick that delivered this completion — so the
+                // measurement costs no syscall. It cannot step backwards
+                // either, which is why the subtraction is plain: the wall
+                // clock this used to read had to saturate against an NTP
+                // step, or a wrapped duration would land the exchange in
+                // `+Inf` and add eighteen quintillion nanoseconds to the
+                // sum. `started_ns` is set by `beginRequest`, which every
+                // path to a response has passed through.
+                const now_ns = server.io.nowNs();
+                assert(conn.stream.log.started_ns != 0);
+                assert(now_ns >= conn.stream.log.started_ns);
                 server.labeled.observeExchange(
                     conn.stream.upstream.?.cluster_index,
                     conn.stream.log.status,
-                    // Saturating on `logExchange`'s reasoning: the wall
-                    // clock can step backwards under NTP, and a wrapped
-                    // duration would land every such exchange in the
-                    // `+Inf` bucket and add eighteen quintillion
-                    // nanoseconds to the sum.
-                    server.io.nowWallNs() -| conn.stream.log.started_wall_ns,
+                    now_ns - conn.stream.log.started_ns,
                 );
             }
             // The whole response reached the client: the line goes out
@@ -3495,14 +3502,16 @@ pub fn Proxy(comptime IoType: type) type {
             // gate every read, and this zeroes those.
             // Either the line went out, or there was no sink for it to go
             // to, or nothing was asked of this connection. The middle arm
-            // is #299's: the request's start is stamped whether or not an
-            // access log is configured, because the §8 latency histogram
-            // measures that same interval — so "started" no longer
-            // implies "will be logged", and this assert used to read the
-            // two as one fact.
+            // is #299's: the §8 latency histogram measures every exchange,
+            // so the *monotonic* start is stamped whether or not an access
+            // log is configured — "started" does not imply "will be
+            // logged", and this assert used to read the two as one fact.
+            // The third arm asks the unconditional stamp, because that is
+            // the one that answers "was anything asked"; `started_wall_ns`
+            // would fold it into the middle arm and assert nothing.
             assert(conn.stream.log.emitted or
                 conn.server.access_log.sink == null or
-                conn.stream.log.started_wall_ns == 0);
+                conn.stream.log.started_ns == 0);
             // The request's head buffer goes back to the ring before the
             // idle wait begins — an idle connection holds no head bytes
             // (§5). Conditional because the static-response path already

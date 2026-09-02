@@ -898,10 +898,10 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     // Regression for the stale-cached_now bug (review finding 1): the
     // io_uring backend only marks the clock outdated per tick and refreshes
     // it lazily, so nowNs must refresh when the flag is set rather than
-    // returning the time of the last timer arm. The monotonic clock strictly
-    // advances between two update_now syscalls, so a correct nowNs returns a
-    // larger value on the second read; the buggy version returned the frozen
-    // cached_now unchanged.
+    // returning the time of the last timer arm. A correct nowNs answers from
+    // a reading taken since the flag was set; the buggy version returned the
+    // frozen cached_now unchanged, which the poison below makes unmistakable
+    // without having to assume the clock advanced between two reads.
     //
     // io_uring-only: other backends (kqueue on macOS) refresh cached_now
     // every tick and have no now_outdated flag to simulate staleness with.
@@ -914,16 +914,17 @@ test "xevio: nowNs refreshes a stale clock instead of returning a frozen value" 
     try initTestIo(&xev_io, arena_state.allocator(), 0);
     defer xev_io.deinit();
 
-    // Force a coarse refresh for the baseline too — init() seeds cached_now
-    // with a precise read, and the coarse clock lags precise by up to a tick,
-    // so comparing across the two sources would spuriously fail.
+    // Take the baseline through the same refresh path the assertion below
+    // exercises. Both are precise reads of one monotonic timeline now, so
+    // this no longer has to paper over a coarse-versus-precise mismatch —
+    // it just keeps the two readings comparable by construction.
     xev_io.loop.flags.now_outdated = true;
     const first = xev_io.nowNs();
     // Poison the cache with an obviously-stale value and mark it outdated —
     // exactly the relay-activity case where the old code left the clock
-    // frozen. A correct nowNs must refresh *past* the poison; asserting the
-    // poison is gone (rather than strict advancement between two reads) also
-    // holds for the coarse clock, whose two rapid reads can read equal.
+    // frozen. A correct nowNs must refresh *past* the poison. The assertion
+    // is `>=` rather than strict advancement because two reads this close
+    // together may legitimately land on the same nanosecond.
     xev_io.loop.cached_now = .{ .sec = 0, .nsec = 0 };
     xev_io.loop.flags.now_outdated = true;
     const second = xev_io.nowNs();

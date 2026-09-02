@@ -1,8 +1,12 @@
-//! Per-rung and lifecycle counters (DESIGN.md §8): written only by the
-//! loop thread as relaxed atomics — one writer, any number of readers —
-//! so a future metrics/admin thread reads without a data race and
-//! single-writer stays intact. The simulator asserts `reconcile` under
-//! every seed: work is never lost, every shed is witnessed.
+//! Per-rung and lifecycle counters (DESIGN.md §8): written and read only
+//! by the loop thread, as plain `u64` — one writer, and every reader is
+//! that same writer, so there is no race for an ordering to rule out.
+//! These were relaxed atomics until the §9 profile priced the `lock`
+//! prefix on the #299 exchange path; `Value` carries the full reasoning.
+//! A metrics or admin *thread* would change that answer, and nothing in
+//! §4's one-thread-one-ring model proposes one. The simulator asserts
+//! `reconcile` under every seed: work is never lost, every shed is
+//! witnessed.
 
 const std = @import("std");
 
@@ -570,7 +574,52 @@ pub const Counters = struct {
     /// Drain deadline tore down stragglers (§8).
     drained_at_deadline: Value = Value.init(0),
 
-    const Value = std.atomic.Value(u64);
+    /// One counter cell. A plain `u64`, not `std.atomic.Value(u64)`.
+    ///
+    /// Nothing here is shared between threads, so nothing here needs a
+    /// locked read-modify-write. `src/` spawns no thread — scale-out is N
+    /// processes behind `SO_REUSEPORT`, never threads sharing memory
+    /// (DESIGN.md §4) — the Prometheus render runs on the event loop that
+    /// writes these, and SIGUSR1 stopped reading them in #310, which was
+    /// the one asynchronous reader they ever had. The `.monotonic` orders
+    /// these carried bought nothing on x86 either: an ordering is a
+    /// promise between threads, and there is only one.
+    ///
+    /// It was not free. `fetchAdd` lowers to a `lock`-prefixed RMW — ~20
+    /// cycles apiece, uncontended — and #299 put four of them on every
+    /// exchange. The §9 profile priced the pair of them (`observeExchange`
+    /// plus the `fetchAdd` line) at ~45 cycles per request.
+    ///
+    /// The method names say what they do rather than borrowing the atomic
+    /// spelling: a `fetchAdd` that is not atomic would read as one that is.
+    const Value = struct {
+        /// `total`, not `count`: most of these cells tally events, but
+        /// `cluster_duration_sum_ns` holds a sum of nanoseconds, and a
+        /// field named `count` would say the wrong thing about it.
+        total: u64,
+
+        pub fn init(initial: u64) Value {
+            return .{ .total = initial };
+        }
+
+        /// Add `delta` and answer the total *before* it — the shape every
+        /// caller wants, because each one asserts the counter did not wrap.
+        pub fn add(value: *Value, delta: u64) u64 {
+            const previous = value.total;
+            assert(previous <= std.math.maxInt(u64) - delta);
+            value.total = previous + delta;
+            assert(value.total >= previous);
+            return previous;
+        }
+
+        pub fn get(value: *const Value) u64 {
+            return value.total;
+        }
+
+        pub fn set(value: *Value, to: u64) void {
+            value.total = to;
+        }
+    };
 
     /// Every counter's field name, in declaration order — the one place
     /// the set is enumerated. `render` walks it, `render_bytes_max` sizes
@@ -673,12 +722,12 @@ pub const Counters = struct {
 
     /// Loop thread only — the single writer (§8).
     pub fn increment(counters: *Counters, comptime name: []const u8) void {
-        const previous = @field(counters, name).fetchAdd(1, .monotonic);
+        const previous = @field(counters, name).add(1);
         assert(previous < std.math.maxInt(u64));
     }
 
     pub fn get(counters: *const Counters, comptime name: []const u8) u64 {
-        return @field(counters, name).load(.monotonic);
+        return @field(counters, name).get();
     }
 
     /// The metric-name prefix for the Prometheus exposition rendering
@@ -910,8 +959,8 @@ pub const Counters = struct {
 };
 
 /// The per-cluster and per-endpoint breakdown of the exposition (§8,
-/// #179): which backend, not only how many. Same single-writer
-/// relaxed-atomic discipline as `Counters`, in tables sized by the loaded
+/// #179): which backend, not only how many. Same single-writer,
+/// single-reader discipline as `Counters`, in tables sized by the loaded
 /// config's endpoint index space (`EndpointKeys`) rather than by a field
 /// list — the first counter tables among the §7 endpoint-keyed state.
 ///
@@ -981,7 +1030,7 @@ pub const Labeled = struct {
     /// (buckets + 1)`, indexed `cluster * stride + bucket`, with the
     /// final slot the `+Inf` overflow. Counts are per bucket, not
     /// cumulative — the render accumulates, so an observation is one
-    /// atomic add rather than a walk.
+    /// add rather than a walk.
     cluster_duration_buckets: []Value,
     /// Nanoseconds observed and observations made, per cluster: the
     /// `_sum` and `_count` a Prometheus histogram owes. `_count` equals
@@ -1329,7 +1378,7 @@ pub const Labeled = struct {
         assert(key < labeled.keys.count);
         assert(labeled.endpoint_labels[key].len >= 1);
         const table = @field(labeled, @tagName(family));
-        const previous = table[key].fetchAdd(1, .monotonic);
+        const previous = table[key].add(1);
         assert(previous < std.math.maxInt(u64));
     }
 
@@ -1353,7 +1402,7 @@ pub const Labeled = struct {
         const class = StatusClass.of(status);
         const class_at = @as(usize, cluster_index) * StatusClass.count + @intFromEnum(class);
         assert(class_at < labeled.cluster_responses.len);
-        const class_previous = labeled.cluster_responses[class_at].fetchAdd(1, .monotonic);
+        const class_previous = labeled.cluster_responses[class_at].add(1);
         assert(class_previous < std.math.maxInt(u64));
 
         // The first bound this duration does not exceed, or the `+Inf`
@@ -1371,15 +1420,15 @@ pub const Labeled = struct {
         assert(bucket < duration_bucket_count);
         const bucket_at = @as(usize, cluster_index) * duration_bucket_count + bucket;
         assert(bucket_at < labeled.cluster_duration_buckets.len);
-        const bucket_previous = labeled.cluster_duration_buckets[bucket_at].fetchAdd(1, .monotonic);
+        const bucket_previous = labeled.cluster_duration_buckets[bucket_at].add(1);
         assert(bucket_previous < std.math.maxInt(u64));
         // The one counter here that does not add one: it takes a whole
         // duration, so it is the only place in this file where the
         // guard is about the *addend* as much as the total.
         const sum_previous =
-            labeled.cluster_duration_sum_ns[cluster_index].fetchAdd(duration_ns, .monotonic);
+            labeled.cluster_duration_sum_ns[cluster_index].add(duration_ns);
         assert(sum_previous <= std.math.maxInt(u64) - duration_ns);
-        const count_previous = labeled.cluster_duration_count[cluster_index].fetchAdd(1, .monotonic);
+        const count_previous = labeled.cluster_duration_count[cluster_index].add(1);
         assert(count_previous < std.math.maxInt(u64));
     }
 
@@ -1390,7 +1439,7 @@ pub const Labeled = struct {
     ) void {
         assert(cluster_index < labeled.cluster_labels.len);
         const table = @field(labeled, @tagName(family));
-        const previous = table[cluster_index].fetchAdd(1, .monotonic);
+        const previous = table[cluster_index].add(1);
         assert(previous < std.math.maxInt(u64));
     }
 
@@ -1443,7 +1492,7 @@ pub const Labeled = struct {
                     metric_prefix,
                     comptime family.name(),
                     labeled.endpoint_labels[key],
-                    table[key].load(.monotonic),
+                    table[key].get(),
                 }) catch unreachable;
             }
         }
@@ -1465,7 +1514,7 @@ pub const Labeled = struct {
                 metric_prefix,
                 comptime family.name(),
                 label,
-                value.load(.monotonic),
+                value.get(),
             }) catch unreachable;
         }
     }
@@ -1492,7 +1541,7 @@ pub const Labeled = struct {
                     metric_prefix,
                     label[0 .. label.len - 1],
                     comptime class.label(),
-                    labeled.cluster_responses[at].load(.monotonic),
+                    labeled.cluster_responses[at].get(),
                 }) catch unreachable;
             }
         }
@@ -1503,7 +1552,7 @@ pub const Labeled = struct {
     ///
     /// Buckets are stored per-bucket and accumulated here, because
     /// Prometheus wants cumulative `le` counts and an observation should
-    /// be one atomic add rather than a walk over the ladder.
+    /// be one add rather than a walk over the ladder.
     fn renderDuration(labeled: *const Labeled, writer: *std.Io.Writer) void {
         assert(labeled.cluster_duration_buckets.len ==
             labeled.cluster_labels.len * duration_bucket_count);
@@ -1518,7 +1567,7 @@ pub const Labeled = struct {
             var cumulative: u64 = 0;
             const base = cluster_index * duration_bucket_count;
             inline for (constants.duration_buckets_ns, 0..) |bound, index| {
-                cumulative += labeled.cluster_duration_buckets[base + index].load(.monotonic);
+                cumulative += labeled.cluster_duration_buckets[base + index].get();
                 // Seconds, as Prometheus base units require, rendered from
                 // the integer nanoseconds the ladder is written in so the
                 // boundary text cannot drift from the comparison.
@@ -1531,11 +1580,11 @@ pub const Labeled = struct {
                 }) catch unreachable;
             }
             cumulative += labeled.cluster_duration_buckets[base + constants.duration_buckets_ns.len]
-                .load(.monotonic);
+                .get();
             writer.print("{s}cluster_duration_seconds_bucket{s},le=\"+Inf\"}} {d}\n", .{
                 metric_prefix, inner, cumulative,
             }) catch unreachable;
-            const sum_ns = labeled.cluster_duration_sum_ns[cluster_index].load(.monotonic);
+            const sum_ns = labeled.cluster_duration_sum_ns[cluster_index].get();
             writer.print("{s}cluster_duration_seconds_sum{s} {d}.{d:0>9}\n", .{
                 metric_prefix,
                 label,
@@ -1545,12 +1594,12 @@ pub const Labeled = struct {
             writer.print("{s}cluster_duration_seconds_count{s} {d}\n", .{
                 metric_prefix,
                 label,
-                labeled.cluster_duration_count[cluster_index].load(.monotonic),
+                labeled.cluster_duration_count[cluster_index].get(),
             }) catch unreachable;
             // The `+Inf` bucket is every observation, which is what
             // `_count` reports — a histogram whose two disagreed would be
             // rejected by a scraper rather than merely wrong.
-            assert(cumulative == labeled.cluster_duration_count[cluster_index].load(.monotonic));
+            assert(cumulative == labeled.cluster_duration_count[cluster_index].get());
         }
     }
 
@@ -1711,7 +1760,7 @@ pub const Labeled = struct {
         assert(values.len >= 1);
         var total: u64 = 0;
         for (values) |*value| {
-            total += value.load(.monotonic);
+            total += value.get();
         }
         return total;
     }
@@ -1857,7 +1906,7 @@ test "counters: render bound holds at the maximum value" {
     var counters: Counters = .{};
     inline for (@typeInfo(Counters).@"struct".fields) |field| {
         if (field.type == Counters.Value) {
-            @field(counters, field.name).store(std.math.maxInt(u64), .monotonic);
+            @field(counters, field.name).set(std.math.maxInt(u64));
         }
     }
     var gauges: Counters.Gauges = undefined;
@@ -2161,7 +2210,7 @@ test "counters: labeled render bound is exact at the maximum values" {
         labeled.l4_shed_inflight,        labeled.cluster_responses,
         labeled.cluster_duration_sum_ns, labeled.cluster_duration_count,
     }) |table| {
-        for (table) |*value| value.store(std.math.maxInt(u64), .monotonic);
+        for (table) |*value| value.set(std.math.maxInt(u64));
     }
     // The histogram is the one table that cannot be saturated slot by
     // slot: its rows render *cumulatively*, so a maximal reading is the
@@ -2170,7 +2219,7 @@ test "counters: labeled render bound is exact at the maximum values" {
     // what the bound prices and the only way it can be reached.
     for (labeled.cluster_duration_buckets, 0..) |*value, index| {
         const first = index % Labeled.duration_bucket_count == 0;
-        value.store(if (first) std.math.maxInt(u64) else 0, .monotonic);
+        value.set(if (first) std.math.maxInt(u64) else 0);
     }
     // The widest live view either owner can produce: both u16 tables
     // saturated (the inflight bound is their sum, not a u32's), and a

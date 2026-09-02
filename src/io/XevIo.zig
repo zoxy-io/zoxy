@@ -1646,57 +1646,69 @@ pub fn fillRandom(io: *XevIo, buffer: []u8) void {
     }
 }
 
+/// Monotonic nanoseconds, refreshed at most once per tick (DESIGN.md §4):
+/// every `nowNs` inside one tick answers with the same value.
+///
+/// The io_uring backend does NOT refresh `cached_now` each tick — the tick
+/// only marks it `now_outdated` and refreshes lazily (in `loop.now()`, or
+/// when a timer is armed). Reading the field raw would return the time of
+/// the last timer submission, arbitrarily stale, so deadlines set on
+/// activity would never actually move. Refresh here when stale, through
+/// libxev's own `update_now` — which only assigns on a successful read, so
+/// a failed one leaves the flag set and the next caller retries.
+///
+/// **Precise**, where this read `CLOCK_MONOTONIC_COARSE` until now (#39).
+/// That choice was right for the consumers it had: every one was a
+/// second-scale deadline (idle/connect/drain/max-lifetime), ~ms resolution
+/// was ample, and the coarse read is a vvar-page load with no TSC access.
+/// #299 gave the clock a consumer of a different kind — the §8 latency
+/// histogram, and the access log's duration beside it — and for a 45 µs
+/// exchange a millisecond granule is not a rounding error, it is the whole
+/// measurement. Paying the precise read *here* is what buys those two the
+/// right to be free: one read per tick, amortized across the completion
+/// batch, in place of the two `clock_gettime`s per *request* that #299
+/// first put on the exchange path. §9 measured the swap.
+///
+/// The added cost is small and partly already spent: `update_now` is the
+/// same call libxev makes whenever it arms a timer, so a tick that touches
+/// any deadline pays nothing new. It also retires the coarse/precise split
+/// that let one tick's `cached_now` be coarse and the next one's precise —
+/// one clock, one resolution, and a timeline that cannot step backwards,
+/// which is what lets the duration sites subtract without saturating.
+///
+/// The hash pin (build.zig.zon) fixes the field layout reached into here.
+/// The kqueue backend (macOS bench runs) has no `now_outdated` flag: its
+/// tick refreshes `cached_now` itself, so the raw read is already current.
 pub fn nowNs(io: *XevIo) u64 {
-    // The io_uring backend does NOT refresh cached_now each tick — the tick
-    // only marks it `now_outdated` and refreshes lazily (in loop.now() or
-    // when a timer is armed). Reading the field raw would return the time
-    // of the last timer submission, arbitrarily stale, so deadlines set on
-    // activity would never actually move (DESIGN.md §4). Refresh here when
-    // stale — but with CLOCK_MONOTONIC_COARSE, not update_now()'s plain
-    // CLOCK_MONOTONIC. Every consumer of this clock is a second-scale
-    // deadline (idle/connect/drain/max-lifetime), so ~ms resolution is ample,
-    // and the coarse read is a vvar-page vDSO load with no TSC access — the
-    // flamegraph (§9) showed the monotonic read at ~7% of on-CPU under load,
-    // and coarse is several times cheaper. Writing cached_now + clearing the
-    // flag mirrors update_now() exactly, so the §4 once-per-tick invariant
-    // still holds (every nowNs within a tick returns the same value) and
-    // libxev's own timer_next shares this value for the rest of the tick; the
-    // hash pin (build.zig.zon) fixes the field layout reached into. Coarse and
-    // precise are the same monotonic timeline, so a tick that arms a timer
-    // before any nowNs (update_now writes precise) then reads nowNs differs by
-    // at most one coarse granule (~ms) — absorbed by second-scale deadlines
-    // and the §4 lazy re-arm. The kqueue backend (macOS bench runs) has no
-    // now_outdated flag: its tick refreshes cached_now, so raw is safe.
     if (comptime @hasField(@FieldType(xev.Loop, "flags"), "now_outdated")) {
-        if (io.loop.flags.now_outdated) {
-            var ts: linux.timespec = undefined;
-            if (posix.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC_COARSE, &ts)) == .SUCCESS) {
-                io.loop.cached_now = ts;
-                io.loop.flags.now_outdated = false;
-            }
-        }
+        if (io.loop.flags.now_outdated) io.loop.update_now();
     }
     const cached = io.loop.cached_now;
+    // `update_now` reads CLOCK_MONOTONIC, which is non-negative on a
+    // running kernel; the casts below would panic rather than wrap, so the
+    // invariant is stated where it is relied on.
+    assert(cached.sec >= 0);
+    assert(cached.nsec >= 0);
     return @as(u64, @intCast(cached.sec)) * std.time.ns_per_s +
         @as(u64, @intCast(cached.nsec));
 }
 
-/// Wall-clock nanoseconds since the Unix epoch, for the access log (§8) —
-/// both a line's timestamp and, read again at the end, its duration.
+/// Wall-clock nanoseconds since the Unix epoch: the *date* an access-log
+/// line carries (§8), and nothing else.
 ///
-/// A second clock beside `nowNs`, deliberately, and on the opposite side of
-/// both of that one's trade-offs. It is *precise*, not coarse: `nowNs`
-/// feeds second-scale deadlines where a millisecond granule is free, while
-/// a duration quantized to the coarse granule would report 0 µs for every
-/// request a loopback or LAN hop actually serves. And it is *not* cached
-/// per tick: a cached read would give every request in one completion batch
-/// the same start and end, which is the same failure a second time.
+/// A second clock beside `nowNs` because the two answer different
+/// questions. `nowNs` is a monotonic stopwatch — it says how far apart two
+/// moments are and is immune to an NTP step, which is what a duration
+/// wants and what every duration now uses. This one names a moment on the
+/// operator's calendar, which no monotonic clock can do; a line has to say
+/// *when*, not only *how long*.
 ///
-/// The cost is bounded by being rare — two vDSO reads per *logged request*,
-/// against `nowNs`'s one per tick — and it is paid only when an operator
-/// turned the log on. Deriving durations from a wall clock does mean an NTP
-/// step lands in whichever line spans it; the saturating subtraction at the
-/// call site keeps that a wrong number rather than a wrapped one.
+/// Read once per logged request, and only when a sink is configured — the
+/// callers restore that guard, so a deployment with the log off (the
+/// default) reads this clock zero times per request. It used to be read
+/// twice per exchange whether or not anyone had asked for a log, because
+/// #299 borrowed it for the histogram's duration; that borrowing is what
+/// the swap to `nowNs` undid.
 pub fn nowWallNs(io: *XevIo) u64 {
     _ = io;
     var ts: posix.timespec = undefined;
