@@ -315,9 +315,12 @@ fn writeNamedHeaders(
 }
 
 /// RFC 3339 UTC to the millisecond, the spelling every log pipeline reads
-/// without configuration. Milliseconds because that is the resolution of
-/// the coarse clock the stamp comes from (§4) — printing more digits would
-/// be inventing them.
+/// without configuration. Milliseconds because that is the useful
+/// resolution of a *date*: the stamp comes from `nowWallNs`, which is a
+/// precise `CLOCK_REALTIME` read, but a wall clock is NTP-disciplined and
+/// its extra digits describe the daemon's steering, not the request. The
+/// duration beside it is where sub-millisecond detail lives, and that is
+/// measured on the monotonic clock (§4).
 fn writeTimestamp(writer: *std.Io.Writer, wall_ns: u64) std.Io.Writer.Error!void {
     const epoch: std.time.epoch.EpochSeconds = .{
         .secs = @divFloor(wall_ns, std.time.ns_per_s),

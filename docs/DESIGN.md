@@ -330,12 +330,19 @@ primitives trusted institutionally.
 - **Clock.** `Io.now_ns` is refreshed once per loop tick (the previous
   iteration measured per-callback `clock_gettime` at ~3% of data-path CPU)
   and is the seam the simulator's virtual clock replaces. The refresh
-  reads the *coarse* monotonic clock — every consumer is a second-scale
-  deadline, and the precise read was measured at ~7% of on-CPU
+  reads the *precise* monotonic clock, through libxev's own `update_now`
+  — which is the read it already makes to arm a timer, so a tick that
+  touches a deadline pays nothing extra. It read `CLOCK_MONOTONIC_COARSE`
+  until #299 gave the clock a second kind of consumer: deadlines are
+  second-scale and a ~ms granule was ample for them, but the §8 latency
+  histogram and the access log's duration measure tens of microseconds,
+  and one precise read per *tick* is far cheaper than the two per
+  *request* that measuring them any other way costs
   (`IMPLEMENTATION_NOTES.md`). Anything
   computed from it may be stale by up to one tick's completion batch —
-  deadline logic must stay correct under that bound, and the simulator
-  makes the staleness adversarial (§9).
+  deadline logic must stay correct under that bound, durations are only
+  taken across intervals that span ticks, and the simulator makes the
+  staleness adversarial (§9).
 - **Deadlines.** One timer per connection holding an *absolute* deadline.
   A state transition only *stores* the new deadline value — the armed op
   is never touched. When the timer fires, the callback compares the
@@ -356,12 +363,13 @@ primitives trusted institutionally.
   reader that stalls cannot stall the loop. `peerAddress` is asked once
   per admitted connection rather than at log time, when the socket may
   already be closed and the fd number reused. `nowWallNs` is a *second*
-  clock: precise and uncached, where `now_ns` is coarse and refreshed once
-  per tick. Both of those properties are wrong for a log — a line needs a
-  date, which a monotonic clock cannot give, and a duration measured
-  against the tick would read 0 µs for every request served inside one
-  completion batch. It costs two vDSO reads per logged request, against
-  `now_ns`'s one per tick, and only when a deployment turns the log on.
+  clock, and it exists for one thing `now_ns` cannot do: name a moment on
+  the operator's calendar. A line needs a date, which no monotonic clock
+  can give. The *duration* beside it is not this clock's job — that is
+  `now_ns`, which is monotonic (so an NTP step cannot land inside a
+  measured interval) and free (the tick has already read it). So a logged
+  request costs one vDSO read, not two, and a deployment with the log off
+  — the default — costs none.
 - **Plain ops only.** Multishot accept/recv, `send_zc`, `splice` stay
   behind measurement — the previous iteration never became CPU-bound
   without them, and this one is latency-bound with CPU headroom. Each
@@ -2261,11 +2269,14 @@ origin, not one this proxy can pick for them.
   timeout could evict; its flag and engage counter exist for the
   operator, who sizes `limits.head_buffers` by the crossings before the
   wall starts refusing.
-- **Metrics witness every shed.** Every rung has a counter, written only
-  by the loop thread as a relaxed atomic — one writer, any number of
-  readers. The admin plane reads them on the loop itself (§3: there is no
-  second thread); the relaxed atomic costs nothing on the write side and
-  keeps any out-of-loop reader race-free by construction. The simulator
+- **Metrics witness every shed.** Every rung has a counter, written and
+  read only by the loop thread, as a plain `u64`. The admin plane reads
+  them on the loop itself (§3: there is no second thread), so the writer
+  and every reader are the same thread and there is no race for an
+  ordering to rule out. They were relaxed atomics until the §9 profile
+  priced the `lock` prefix on the #299 exchange path, which put four
+  read-modify-writes on every response; a metrics or admin *thread* is
+  the decision that would bring them back. The simulator
   asserts counters reconcile (admitted = completed + shed + in-flight)
   under every seed. Counters live in `counters.zig` (§10); exposure is
   the admin/metrics listener's Prometheus rendering (`admin.zig`, one
@@ -2877,7 +2888,7 @@ src/
     libcrypto_heap.zig // libcrypto's mallocs into one fixed startup buffer (§4, §5)
   balancer.zig        // upstream endpoint pick: rr | p2c | hash (§7)
   shed.zig            // exhaustion ladder: decisions + static responses (incl. configured pages, #159)
-  counters.zig        // per-rung counters: loop-written, relaxed-atomic reads
+  counters.zig        // per-rung counters: loop-written, loop-read, plain u64
   admin.zig           // admin/metrics listener: one reserved scrape slot (§8)
   access_log.zig      // JSON access log: double-buffered sink, drop rung, named headers (§8)
 sim/                  // simulator harness + invariants

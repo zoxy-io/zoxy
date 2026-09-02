@@ -188,16 +188,34 @@ pub const ClientWrite = struct {
 /// clearing 500-odd bytes per request would be work for an invariant that
 /// already holds — the same argument `Conn.head` makes.
 pub const LogState = struct {
-    /// Wall-clock nanoseconds at which this request — or, on L4, this
-    /// connection — began. Zero means nothing is in flight, which is what
-    /// keeps an idle keep-alive connection reaped by its deadline from
-    /// emitting a line about a request nobody made; it is also why nothing
-    /// sets it while the log is off, so a disabled log reads no clock.
+    /// Monotonic nanoseconds at which this request — or, on L4, this
+    /// connection — began: `Io.nowNs`, the per-tick clock (§4). Zero means
+    /// nothing is in flight, which is what keeps an idle keep-alive
+    /// connection reaped by its deadline from emitting a line about a
+    /// request nobody made, and what `logExchange` and `observeExchange`
+    /// both check before they measure anything.
     ///
-    /// Wall-clock rather than the monotonic deadline clock because a line
-    /// needs both a date and a duration, and one precise read at each end
-    /// answers both — where `Io.now_ns` is coarse and cached per tick (§4),
-    /// which would report 0 µs for every request served inside one batch.
+    /// This is the stamp every *duration* is taken from — the §8 histogram
+    /// (#299) and the access log alike. Monotonic, so an NTP step cannot
+    /// land inside a measured interval, and per-tick, so it is free: the
+    /// tick has already read the clock by the time any exchange asks. That
+    /// it is shared across a completion batch is the one thing it gives up,
+    /// and it is affordable here because both consumers measure an interval
+    /// that *spans* ticks — an exchange with an upstream round trip in it
+    /// cannot begin and end inside one batch. The set of sites that could
+    /// answer in one tick is exactly the set that never reaches these two:
+    /// `finishExchange` asserts an upstream, and a locally-answered reject
+    /// or `respond` has none.
+    ///
+    /// Always set, unlike `started_wall_ns` — reading it costs no syscall,
+    /// so there is nothing for a guard to save.
+    started_ns: u64 = 0,
+    /// Wall-clock nanoseconds at which the same moment fell on the
+    /// operator's calendar — the *date* a log line prints, and nothing
+    /// else. Set only when a sink is configured, so a deployment with the
+    /// log off reads no wall clock; `logExchange` returns early in that
+    /// case, which is what keeps "a line is being written" and "this is
+    /// non-zero" the same condition.
     started_wall_ns: u64 = 0,
     /// Bytes read from the client and written to it, for this request.
     bytes_in: u64 = 0,
@@ -238,6 +256,7 @@ pub const LogState = struct {
     /// Start a fresh request's accounting. Only the scalars: the three
     /// captures are read through their lengths, which this zeroes.
     pub fn reset(state: *LogState) void {
+        state.started_ns = 0;
         state.started_wall_ns = 0;
         state.bytes_in = 0;
         state.bytes_out = 0;
@@ -674,6 +693,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             assert(stream.l7.request_leg == .idle);
             assert(!stream.log.emitted);
             assert(stream.log.bytes_in == 0);
+            assert(stream.log.started_ns == 0);
             assert(stream.log.started_wall_ns == 0);
         }
 

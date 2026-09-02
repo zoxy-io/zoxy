@@ -547,7 +547,7 @@ fn endpointCounter(
     endpoint_index: u16,
 ) u64 {
     const table = @field(server.labeled, @tagName(family));
-    return table[server.upstreams.keys.key(cluster_index, endpoint_index)].load(.monotonic);
+    return table[server.upstreams.keys.key(cluster_index, endpoint_index)].get();
 }
 
 const Http1Bed = struct {

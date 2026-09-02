@@ -787,14 +787,94 @@ Verify it is active: `perf -e io_uring:io_uring_create` → flags
 `0x3100`. Kernels < 6.1 reject the flags; `XevIo.init` degrades to a
 plain ring on EINVAL rather than refusing to start.
 
-## Coarse deadline clock — landed (#39)
+## Coarse deadline clock — landed (#39), superseded (#299)
 
 The idle-deadline refresh's `CLOCK_MONOTONIC` read was ~7% of on-CPU
-under load. `XevIo.nowNs` now reads `CLOCK_MONOTONIC_COARSE` (a
-vvar-page vDSO load, no TSC access): <1%. Sound because every consumer
-of that clock is a second-scale deadline, so ~ms resolution is ample.
-No fork change; `nowNs` documents the field-layout reach-in that the
-hash pin fixes.
+under load. `XevIo.nowNs` read `CLOCK_MONOTONIC_COARSE` (a vvar-page
+vDSO load, no TSC access) from #39: <1%. Sound at the time, because
+every consumer of that clock was a second-scale deadline, so ~ms
+resolution was ample. No fork change; `nowNs` documents the
+field-layout reach-in that the hash pin fixes.
+
+**`nowNs` is precise again.** Not a reversal of #39's measurement — a
+change in what the clock is for. #39 priced a precise read taken on
+every *deadline refresh*; the read is now taken once per *tick*, and it
+is libxev's own `update_now`, which already runs on any tick that arms a
+timer. What forced the question was #299 giving the clock a consumer
+that is not a deadline: a latency histogram over ~45 µs exchanges, for
+which a millisecond granule is the whole measurement rather than a
+rounding error. The alternative — measuring durations off the wall
+clock, uncached — is what #299 actually shipped, and what the note below
+priced. Cost of the swap: one coarse read per tick becomes one precise
+read per tick. Benefit: two `clock_gettime`s per request become zero.
+
+The staleness this buys is bounded by one completion batch and is only
+ever spent on intervals that *span* ticks — an exchange with an upstream
+round trip in it cannot begin and end inside one batch, and the sites
+that could (a filter `reject`, a `respond`) never reach `observeExchange`,
+which asserts an upstream. The access log's duration rides the same
+clock; only its *date* still reads `nowWallNs`, once per logged request
+and only when a sink is configured.
+
+## The RED triad put a wall clock on the exchange path (#299)
+
+Found by A/B-profiling v0.7.0 against v0.8.1 (§9, `--protocol http`,
+both ReleaseSafe, fixed 100 k req/s, three reps): **+384 userspace
+cycles per request, +11.6%**, with ring ops per request identical at
+4.01 — pure compute, no new I/O. p50 rose from 36/39/45 µs to 47/48/52 µs
+across the reps. The L4 control showed no regression (32 → 29 µs), which
+is what localized it: L4 runs no HTTP exchange.
+
+Attribution, in cycles per request: `__vdso_clock_gettime` 0 → 99.9,
+`observeExchange` 0 → 30.1, plus ~13 of `nowWallNs`/glue — **~143, or
+37% of the total regression, from #299 alone**. The rest was diffuse:
+`assert` +58 (ReleaseSafe assertion growth across the #274 stream split),
+`arm`/`beginNextRequest`/`delivered` ~+84 (the split itself), routing
+~+34 (#302's header matching). `foldHeader` +28.7 against `analyzeHeaders`
+−21.0 is not new work — it is the TIGER_STYLE function split (d3eaf7d)
+losing an inline, and it very nearly cancels.
+
+The mechanism: #299 removed the `access_log.sink == null` guard from the
+request-start stamp and added a second unguarded `nowWallNs` in
+`finishExchange`, taking a path that read the clock **zero** times with
+the log off — the default — to **two** `CLOCK_REALTIME` reads per
+request. Its own comment priced this as "one `CLOCK_REALTIME` read per
+request … against the ~25 us of loop time a request already costs". Two
+corrections: it was two reads, and the denominator is wrong — the
+relevant base is zoxy's *own* userspace work (~3300 cycles/request), not
+the wall latency, which is mostly kernel and network. Against that, ~100
+cycles is ~3%, not ~0.1%.
+
+Worth keeping in mind for any future clock on a hot path: this box has
+`clocksource=tsc`, so `clock_gettime` takes the vDSO fast path at ~50
+cycles. Where the clocksource falls back to `acpi_pm`, or on a VM without
+a stable TSC, the same call is a real syscall at ~1 µs — the same code
+would have cost ~2 µs per request, 30× worse. The cost of a clock read is
+a property of the deployment, not of the source.
+
+Fixed by taking the duration off `nowNs` (see #39 above), restoring the
+sink guard on the wall-clock date, and dropping the counter atomics
+(below).
+
+## Counters are not atomic (#299 follow-on)
+
+`Counters.Value` was `std.atomic.Value(u64)`, so every `increment` was a
+`lock`-prefixed RMW — ~20 cycles apiece uncontended on x86, and #299 put
+*four* of them on each exchange (`observeExchange`: status class, bucket,
+sum, count). The §9 profile priced `observeExchange` plus the `fetchAdd`
+line at ~45 cycles per request.
+
+They bought nothing. `src/` spawns no thread — DESIGN.md §4 is one thread
+owning one ring and every pool, and scale-out is N processes behind
+`SO_REUSEPORT` — the Prometheus render runs on the same loop that writes
+the counters, and SIGUSR1 stopped reading them in #310, which was the one
+asynchronous reader they ever had. An ordering is a promise between
+threads, and there is only one. `Value` is now a plain `u64` behind
+`add`/`get`/`set`; the names deliberately do not borrow the atomic
+spelling, because a `fetchAdd` that is not atomic reads as one that is.
+
+Reopen this only if a metrics or admin *thread* is ever proposed — that,
+not the counter type, is the decision that would change the answer.
 
 ## CQE reaping — profiled and shelved (#40)
 

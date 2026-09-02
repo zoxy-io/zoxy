@@ -81,7 +81,7 @@ pub fn Checker(comptime IoType: type) type {
         /// and a cluster may configure either without the other.
         passive_streaks: []u8,
         /// When a passively ejected endpoint may be let back, on the §4
-        /// coarse clock; zero for an endpoint that is not passively
+        /// tick clock; zero for an endpoint that is not passively
         /// ejected. Recorded at the ejection and consumed by the
         /// re-admission sweep — recovery cannot itself be passive,
         /// because an ejected endpoint receives no traffic to learn from.
