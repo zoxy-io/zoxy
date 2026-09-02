@@ -44,14 +44,22 @@ does up to the banner, then exits without binding a port:
 
 ```console
 $ zoxy --check config.json
-zoxy 0.0.9
+zoxy 0.8.2
 budgets (DESIGN.md §5/§8; closed-form except where marked):
-  memory  total 47127 KiB = conn slots 1386 x 440 B + stream slots 1386 x 1448 B
-          …
-  fds     4094 required (asserted against RLIMIT_NOFILE)
-  ring    4096 entries, completion queue 8192, in-flight ops <= 6871
-  config  1 listener(s), 1 cluster(s), 0 error page(s), access log stdout
-  rlimit  RLIMIT_NOFILE 524288 soft, 524288 hard (a start raises the soft limit to the fd budget)
+  memory  total 48142 KiB = conn slots 1386 x 720 B + stream slots 1386 x 1968 B
+          + relay buffers 1386 x 32808 B
+          + upstream slots 1311 x 48 B + head buffers 0 x 8192 B (+ ring 0 B)
+          + upstream head buffers 0 x 8216 B + head scratch 8192 B
+          + access log 0 KiB (+ logged headers 0 B)
+          + endpoint tables 29 B (1 cluster(s) x 1 wide)
+          + labeled metrics 26450 B (tables, labels and render buffers)
+          + tunnels 0 x 0 B (their own relay buffers, never HTTP's)
+          + tls engines 0 x 0 B (+ plaintext 0 B each, libcrypto heap 0 KiB)
+          + config arena 2 KiB (measured, not closed-form)
+  fds     4093 required (asserted against RLIMIT_NOFILE)
+  ring    4096 entries, completion queue 8192, in-flight ops <= 6869
+  config  1 listener(s), 1 cluster(s), 0 error page(s), access log off
+  rlimit  RLIMIT_NOFILE 1048576 soft, unlimited hard (a start raises the soft limit to the fd budget)
   check   config.json: valid, and this box can start it
 ```
 
