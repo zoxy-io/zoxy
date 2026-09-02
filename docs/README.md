@@ -46,7 +46,7 @@ does up to the banner, then exits without binding a port:
 $ zoxy --check config.json
 zoxy 0.8.2
 budgets (DESIGN.md §5/§8; closed-form except where marked):
-  memory  total 48142 KiB = conn slots 1386 x 720 B + stream slots 1386 x 1968 B
+  memory  total 47297 KiB = conn slots 1386 x 512 B + stream slots 1386 x 1552 B
           + relay buffers 1386 x 32808 B
           + upstream slots 1311 x 48 B + head buffers 0 x 8192 B (+ ring 0 B)
           + upstream head buffers 0 x 8216 B + head scratch 8192 B
@@ -59,7 +59,7 @@ budgets (DESIGN.md §5/§8; closed-form except where marked):
   fds     4093 required (asserted against RLIMIT_NOFILE)
   ring    4096 entries, completion queue 8192, in-flight ops <= 6869
   config  1 listener(s), 1 cluster(s), 0 error page(s), access log off
-  rlimit  RLIMIT_NOFILE 1048576 soft, unlimited hard (a start raises the soft limit to the fd budget)
+  rlimit  RLIMIT_NOFILE 1024 soft, 524288 hard (a start raises the soft limit to the fd budget)
   check   config.json: valid, and this box can start it
 ```
 
