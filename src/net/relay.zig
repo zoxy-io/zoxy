@@ -241,7 +241,12 @@ pub fn Relay(comptime IoType: type) type {
                 /// a resume must not re-encrypt bytes already gone.
                 /// Chunked by the pump's own buffer, which is sized at
                 /// `relay_buffer_bytes` and so already within what the
-                /// engine accepts in one record.
+                /// engine accepts in one record. That last step is a
+                /// *loader* guarantee rather than a comptime one since
+                /// the relay ceiling rose past one record: a config that
+                /// terminates TLS is refused above `tls_app_chunk_bytes`
+                /// (`LimitRelayBufferOverTlsRecord`), and `sendApp`
+                /// asserts the same bound as a backstop.
                 pub fn transformOut(conn: *ConnType, consumed: u32) bool {
                     if (direction != .upstream_to_client) return true;
                     const engine = conn.tls orelse return true;

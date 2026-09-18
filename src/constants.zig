@@ -130,17 +130,26 @@ pub const relay_buffer_bytes_min: u32 = 1024;
 /// Ceiling, and it is an IMPLEMENTATION bound rather than a protocol one.
 /// RFC 8446 §5.1 caps a RECORD at 2^14, not a buffer;
 /// `ResponseBodyPolicy.transformOut` hands a whole relay chunk to
-/// `Engine.sendApp` with no loop around it, so one chunk is one record and
-/// a larger buffer has nowhere to go. Two things follow, and neither is
-/// obvious from the number: a plaintext deployment needs no such cap and
-/// would take a larger buffer happily — the limit is global because
-/// `limits` is — and lifting it means chunking inside the transform, or
-/// making the bound conditional on whether any listener terminates TLS.
+/// `Engine.sendApp` with no loop around it, so on a *terminating* listener
+/// one chunk is one record and a buffer past `tls_app_chunk_bytes` has
+/// nowhere to go. That was once the reason this number was 16 KiB for
+/// everyone; the bound is conditional now, which is the second of the two
+/// exits the previous comment named. A config whose listeners all speak
+/// plaintext may take the full ceiling here; one that terminates TLS is
+/// refused above `tls_app_chunk_bytes` at load
+/// (`LimitRelayBufferOverTlsRecord`) rather than emitting a record no peer
+/// may accept — §5's rule that a shape which cannot serve is a config
+/// error, not a runtime surprise. Chunking inside the transform is the
+/// other exit and stays open; it would retire that refusal.
 ///
-/// Keeping this equal to `tls_app_chunk_bytes` is also what lets the
-/// engine's outbox stay comptime-sized while the relay pool became a
-/// runtime slab.
-pub const relay_buffer_bytes_max: u32 = 16 * 1024;
+/// 32 KiB because the relay buffer sets how many event-loop round trips a
+/// body costs, and the large-body band is where that is visible: a 100 KiB
+/// response is 7 chunks at 16 KiB and 4 at 32 (IMPLEMENTATION_NOTES.md,
+/// "The relay buffer sets the TLS record size" for the 4 → 16 KiB move
+/// this follows). The price is the pool term below, which doubles with
+/// it — `relay_buffers` x 2 x this — so the ceiling is what an operator
+/// moving large bodies may reach for, never what they get by default.
+pub const relay_buffer_bytes_max: u32 = 32 * 1024;
 
 /// Most bytes a PROXY protocol header may occupy before the listener
 /// rejects the peer (#142). The bound is ours, not the spec's: a v2
@@ -217,12 +226,18 @@ pub const proxy_header_bytes_max: u32 = 512;
 /// loader will refuse SNI routes on a listener whose `relay_buffer_bytes`
 /// cannot hold one — §5's rule that a shape which cannot serve is a
 /// config error, not a runtime surprise. That check arrives with the
-/// config surface; today nothing reads SNI routes yet. That staging is also where the
-/// number comes from: the widest half a config can ask for. A maximal
-/// record is five bytes larger (the header sits outside the fragment
-/// length), which no ClientHello approaches and which a peer could only
-/// reach by padding one deliberately.
-pub const client_hello_bytes_max: u32 = relay_buffer_bytes_max;
+/// config surface; today nothing reads SNI routes yet. A maximal record
+/// is five bytes larger (the header sits outside the fragment length),
+/// which no ClientHello approaches and which a peer could only reach by
+/// padding one deliberately.
+///
+/// The number comes from the record layer, not from the relay buffer.
+/// This aliased `relay_buffer_bytes_max` while the two were equal and the
+/// coupling read as intent; it was not. A hello cannot exceed one
+/// record's fragment whatever a relay buffer is sized to, so a wider
+/// relay ceiling must not widen this — it would only raise how much a
+/// peer may make an `l4` listener stage before the peek gives up.
+pub const client_hello_bytes_max: u32 = tls_record_plaintext_bytes_max;
 
 /// §8 "watermarks before walls": each pool flips a pressure flag before
 /// it hits the wall so the proxy sheds *idle* capacity before it must
@@ -321,8 +336,17 @@ pub const tls_read_chunk_bytes: u32 = tls_record_plaintext_bytes_max;
 /// negotiation, no conformance risk — and it is what keeps the engine's
 /// outbound staging a fixed size instead of a function of
 /// `limits.head_buffer_bytes`, which the operator may set to 1 MiB. Set
-/// to the relay buffer's size so an L4 chunk crosses in one record.
-pub const tls_app_chunk_bytes: u32 = relay_buffer_bytes_max;
+/// to the record ceiling itself: the largest a chunk may be and still
+/// cross in one record, which is what `transformOut` emits.
+///
+/// Pinned here rather than to `relay_buffer_bytes_max` so that raising the
+/// relay ceiling for plaintext deployments costs a terminating one
+/// nothing: `Engine`'s outbox is `2 x (this + 256)` at comptime, so the
+/// two numbers moving together would have grown every engine for a
+/// benefit only the plaintext path collects. The loader keeps the pairing
+/// true where it matters by refusing a relay buffer above this on any
+/// config that terminates TLS (`LimitRelayBufferOverTlsRecord`).
+pub const tls_app_chunk_bytes: u32 = tls_record_plaintext_bytes_max;
 
 comptime {
     // A read that could not hold a record header plus something would
@@ -1462,6 +1486,22 @@ comptime {
     assert(relay_buffer_bytes_min >= 512);
     assert(relay_buffer_bytes_min <= relay_buffer_bytes_default);
     assert(relay_buffer_bytes_default <= relay_buffer_bytes_max);
+    // Each loader refusal leaves a legal range, and each range must be
+    // non-empty or the config it governs could not be written at all.
+    // The TLS-terminating refusal is an *upper* bound, so its range is
+    // [min, tls_app_chunk_bytes] and the floor is what can close it.
+    assert(tls_app_chunk_bytes >= relay_buffer_bytes_min);
+    // The SNI refusal is a *lower* bound, so its range is
+    // [client_hello_bytes_max, max] and the ceiling is what can close it.
+    assert(client_hello_bytes_max <= relay_buffer_bytes_max);
+    // And one config may hold both a terminating listener and an SNI
+    // routing one (different listeners; the two are refused on the *same*
+    // listener by `ListenerTlsWithSniRoutes`). `limits` is global, so a
+    // single `relay_buffer_bytes` must be able to satisfy the SNI floor
+    // and the TLS ceiling at once. True today only because both alias
+    // `tls_record_plaintext_bytes_max`; pinned so drifting them apart
+    // fails here rather than at some operator's startup.
+    assert(client_hello_bytes_max <= tls_app_chunk_bytes);
     // The PROXY header stages in the relay buffer's client→upstream half
     // and must admit the largest header either spec version allows
     // (v2's 16-byte prelude + AF_UNIX's 216-byte block; v1's 107 line).

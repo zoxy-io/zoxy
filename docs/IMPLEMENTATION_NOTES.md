@@ -1004,12 +1004,25 @@ constant, defaulting to 16 KiB. The knob is not decoration: the c10k
 ceiling multiplies this term by 11457 pairs, ~358 MiB of relay pool at
 the default against ~90 MiB at 4 KiB, and a deployment moving small
 bodies at high concurrency should turn it down. `tls_app_chunk_bytes` is
-pinned to `relay_buffer_bytes_max` rather than to the runtime value,
-which is what lets the TLS engine's outbox stay comptime-sized while the
-relay pool became a startup slab. The 16 KiB ceiling is an
-implementation bound, not a protocol one — `transformOut` emits one
-record per chunk with no loop, and a plaintext deployment would take a
-larger buffer happily.
+pinned to a comptime constant rather than to the runtime value, which is
+what lets the TLS engine's outbox stay comptime-sized while the relay
+pool became a startup slab. The 16 KiB ceiling is an implementation
+bound, not a protocol one — `transformOut` emits one record per chunk
+with no loop, and a plaintext deployment would take a larger buffer
+happily.
+
+**Superseded on both counts, 2026-09-18.** That last sentence named the
+exit and it has since been taken: `relay_buffer_bytes_max` is 32 KiB, and
+the bound is conditional rather than global — a config that terminates
+TLS is refused above `tls_app_chunk_bytes` at load
+(`LimitRelayBufferOverTlsRecord`), a plaintext one may take the ceiling.
+`tls_app_chunk_bytes` and `client_hello_bytes_max` are pinned to
+`tls_record_plaintext_bytes_max` now, not to `relay_buffer_bytes_max`, so
+the engine outbox no longer moves when the relay ceiling does — the two
+numbers are deliberately different. The default stays 16 KiB, so every
+measurement above still describes what a stock zoxy does. See
+"The 100k band is round-trip bound, not CPU bound" below for why the
+ceiling moved.
 
 **Loopback, one machine, one session.** The direction should hold or
 strengthen on a real network — fewer round trips is fewer syscalls
@@ -1019,6 +1032,76 @@ any of this: `zig build bench` and `zig build profile` serve ~20-byte
 bodies and the cloud nightly requests `/1k`, none of which fill even a
 4 KiB buffer. The large-body band is the only place it is visible, which
 is why it went unmeasured for so long.
+
+## The 100k band is round-trip bound, not CPU bound (2026-09-18)
+
+The cross-proxy nightly (zoxy-io/benchmark, run `20260918-014014`, four
+1-CPU proxies pinned to core 0 against a four-node nginx origin, open-loop
+ramp to 100k) put zoxy last on the 100 KiB body band. It is the only band
+it loses, and the CPU column says why it is not a throughput problem.
+
+| band | body | zoxy | nginx | zoxy CPU at knee | zoxy rps/core |
+|---|---|---|---|---|---|
+| c1k-64 | 64 B | **62,772** | 28,440 | 0.97 | 64,927 |
+| c1k | 1 KiB | **61,301** | 26,488 | 0.97 | 62,896 |
+| c1k-100k | 100 KiB | 4,228 | 5,838 | **0.47** | 9,066 |
+
+zoxy is 2.2-2.3x nginx where a body is one relay chunk, with the core
+saturated. At 100 KiB it stops at **0.466 of one core** — 0.875 at its
+worst overload, never near the wall — while nginx, pingora and haproxy
+all reach 0.94-1.00. Everyone else converts CPU into throughput; zoxy
+runs out of something else first.
+
+That something is not shedding. Of zoxy's errors, **5,586 were timeouts
+and 85 were connect** — it refuses almost nothing, it gets slow, and the
+generator's 1 s timeout turns the latency into lost throughput. nginx
+recorded zero errors of any kind. Latency past the knee is where the two
+part company:
+
+| offered | zoxy p50 | nginx p50 |
+|---|---|---|
+| 4,026 | 2.0 ms | 3.7 ms |
+| 4,358 | 2.5 ms | 6.9 ms |
+| 5,024 | **379 ms** | 112 ms |
+| 5,356 | **868 ms** | 92 ms |
+
+Below the knee zoxy is *faster* (p99 32 ms against nginx's 378 ms at
+4,026). Past it zoxy goes superlinear and nginx does not.
+
+**The mechanism, and why the buffer is the lever.** 100 KiB is the first
+body that does not fit one relay buffer: 7 chunks at the 16 KiB default,
+each a full recv→CQE→callback→send→CQE→callback cycle, strictly
+serialized (§6; `pump.zig` arms the next recv only once the send drains).
+That is ~14 event-loop turns per response. nginx runs `proxy_buffering
+off` in this harness, so it has no read-ahead either — but epoll over
+non-blocking sockets lets it drain a whole body inside *one* handler with
+back-to-back syscalls, ~1-2 turns. As loop depth grows, zoxy multiplies
+the queueing delay ~14x and nginx ~2x. It predicts exactly the shape
+above: parity or better at one chunk, divergence at seven.
+
+So the lever is the chunk count, and `relay_buffer_bytes_max` moved 16 →
+32 KiB to allow it (7 chunks → 4). Two things that ceiling is **not**:
+it is not the default (still 16 KiB), and it is not available to a
+terminating listener, which is refused above `tls_app_chunk_bytes` at
+load — see the superseded paragraph under "The relay buffer sets the TLS
+record size" above.
+
+**Unverified.** No run has yet measured 32 KiB on this band; the
+prediction is that throughput scales with the turn reduction, and the
+honest test is one ramp. Two caveats travel with the table. zoxy's
+*peak* window hit 5,452 rps / 559 MB/s against nginx's 656 MB/s, so raw
+capability is ~15% apart rather than 38% — the rest is the keepup metric
+(achieved ≥ 90% of offered) punishing a post-knee collapse. And the
+proxy VM's NIC carries proxied traffic twice, so at these rates the rig
+itself may be in play; `cloud/variables.tf` warns that standard-v3
+scales NIC bandwidth with vCPUs.
+
+**The 10 KiB control is missing and matters most.** zoxy has no c1k-10k
+row in this run at all — it failed to start (`error: AddressInUse`, the
+EADDRINUSE class that harness has hit before). 10 KiB is the last body
+that fits one 16 KiB buffer, so it is precisely the point that separates
+"one chunk" from "many" and would confirm or break the story above.
+Re-take it before trusting any of this.
 
 ## What the kernel time is doing (2026-08-24)
 
