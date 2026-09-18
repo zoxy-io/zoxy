@@ -556,14 +556,21 @@ at 4 KiB, the two together measured ~40% of bulk latency
 multiplies hardest: 11457 pairs is ~358 MiB of relay pool at the default
 against ~90 MiB at 4 KiB, which is why a deployment moving small bodies
 at high concurrency is exactly who should turn it down. The ceiling is
-one TLS
-record, and that is an IMPLEMENTATION bound rather than a protocol one:
+32 KiB, and the bound that matters is conditional rather than global:
 RFC 8446 caps a record, not a buffer, but `transformOut` hands a whole
-chunk to `sendApp` as a single record with no loop around it (§4). A
-plaintext deployment needs no such cap and would take a larger buffer
-happily; the limit is global because `limits` is. Lifting it means
-chunking inside the transform, or making the bound conditional on whether
-any listener terminates TLS — neither done here.
+chunk to `sendApp` as a single record with no loop around it (§4), so a
+listener that *terminates* still cannot carry a chunk past one record.
+That is now a refusal at load (`LimitRelayBufferOverTlsRecord`) rather
+than a ceiling everyone pays: a config whose listeners all speak
+plaintext may take the full 32 KiB, and one that terminates TLS is told
+to stay at or under `tls_app_chunk_bytes` instead of silently emitting a
+record no conforming peer may accept. `tls_app_chunk_bytes` and
+`client_hello_bytes_max` are pinned to the record ceiling itself, not to
+this one, so widening the relay ceiling leaves the TLS engine's outbox
+(`2 × (tls_app_chunk_bytes + 256)`, comptime) and the SNI peek's staging
+bound exactly where they were. Chunking inside the transform is the
+other exit and stays open; it would retire the refusal and let a
+terminating listener take the wider buffer too.
 
 `head_buffer_bytes` defaults to 8 KiB and is the largest head accepted
 (oversize → 414/431, §7), with a 1 KiB floor and a 1 MiB ceiling: a size

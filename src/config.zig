@@ -798,6 +798,7 @@ pub const ValidationError = error{
     RouteSniIsAddress,
     RouteHeaderMatchKind,
     LimitRelayBufferUnderSniRouting,
+    LimitRelayBufferOverTlsRecord,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
     ClusterProxyProtocolSendUnknown,
@@ -1488,6 +1489,18 @@ fn resolveLimits(
     if (features.sni >= 1 and relay_buffer_bytes < constants.client_hello_bytes_max) {
         return error.LimitRelayBufferUnderSniRouting;
     }
+    // §4's `transformOut` encrypts a whole relay chunk into one record,
+    // and RFC 8446 §5.1 caps a record's plaintext at 2^14 — so on a
+    // terminating listener a buffer past `tls_app_chunk_bytes` could only
+    // produce a record no conforming peer may accept. The ceiling is
+    // wider than that for the plaintext deployments that can use it
+    // (`relay_buffer_bytes_max`), which makes this the paired refusal:
+    // the shape is legal, just not with TLS on it. Refused at load for
+    // the reason the SNI check above is — the alternative is a proxy that
+    // serves small bodies and tears down large ones.
+    if (features.tls >= 1 and relay_buffer_bytes > constants.tls_app_chunk_bytes) {
+        return error.LimitRelayBufferOverTlsRecord;
+    }
     const feature_pools = try resolveFeaturePools(
         limits_json,
         conn_slots,
@@ -2007,7 +2020,10 @@ pub const LimitsJson = struct {
             .desc = "Bytes per relay direction; a pair costs twice this. Sets " ++
                 "how many round trips a body costs and the size of the TLS " ++
                 "records a terminating listener emits. Lower it when " ++
-                "concurrency matters more than bulk throughput.",
+                "concurrency matters more than bulk throughput. A listener " ++
+                "that terminates TLS caps this at one record's plaintext " ++
+                "(16 KiB); the range above that is for plaintext deployments, " ++
+                "which pay no record framing.",
             .minimum = constants.relay_buffer_bytes_min,
             .maximum = constants.relay_buffer_bytes_max,
         },
@@ -6385,6 +6401,32 @@ test "config: sni routing needs a relay buffer that can stage a hello" {
     );
 }
 
+test "config: a relay buffer past one record is refused only with TLS on it" {
+    // `transformOut` encrypts a whole chunk into one record, so a
+    // terminating listener cannot carry a buffer wider than
+    // `tls_app_chunk_bytes` — the ceiling above it exists for the
+    // plaintext deployments that can use it (§4, §6).
+    try expectParseError(error.LimitRelayBufferOverTlsRecord,
+        \\{"listeners":[{"bind":"127.0.0.1:1",
+        \\   "tls":{"cert":"/c.pem","key":"/k.pem"},
+        \\   "http":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "limits":{"relay_buffer_bytes":32768},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    // The same width is what the ceiling is for, with no listener
+    // terminating: this is the shape the large-body band runs.
+    var arena_state: std.heap.ArenaAllocator = undefined;
+    defer arena_state.deinit();
+    const config = try expectParseOk(&arena_state,
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"]}},
+        \\ "limits":{"relay_buffer_bytes":32768},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    );
+    try std.testing.expectEqual(@as(u32, 32768), config.limits.relay_buffer_bytes);
+}
+
 test "config: explicit routes resolve, sorted longest-prefix-first" {
     var arena_state: std.heap.ArenaAllocator = undefined;
     defer arena_state.deinit();
@@ -7513,6 +7555,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "LimitHeadBuffersOutOfRange", .gap = .budget },
     .{ .name = "LimitHeadBuffersOverConnSlots", .gap = .budget },
     .{ .name = "LimitHeadBuffersWithoutHttpListener", .gap = .budget },
+    .{ .name = "LimitRelayBufferOverTlsRecord", .gap = .budget },
     .{ .name = "LimitRelayBufferUnderSniRouting", .gap = .budget },
     .{ .name = "LimitRelayBuffersOverConnSlots", .gap = .budget },
     .{ .name = "LimitTlsEnginesOverConnSlots", .gap = .budget },
