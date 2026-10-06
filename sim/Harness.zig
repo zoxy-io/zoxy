@@ -46,6 +46,18 @@ const tls_clients_max: u8 = 2;
 /// to the next, and a second resumer would only re-cover it while
 /// doubling the handshake crypto every TLS seed pays for.
 const tls_client_slots: u8 = tls_clients_max + 1;
+/// Every downstream connection one seed's population can hold at once:
+/// the plaintext clients, the terminating ones, and the resumer. Not
+/// `clients_max` — the clean-seed pools were sized off that alone, so a
+/// seed drawing the full population of both (6 + 2 + 1) held exactly the
+/// 9 of 12 that engages the §8 watermark, and seed 284647213's
+/// `keepalive_pair` met a pressure-announced close on a clean seed.
+const connections_max: u8 = clients_max + tls_client_slots;
+/// Every pool's capacity on a clean seed, sized so its §8 pressure
+/// watermark sits above `connections_max`: a golden outcome must never
+/// meet a pressure-announced close or a shortened deadline — correct
+/// behavior, but not the script's exact transcript.
+const clean_pool_capacity: u32 = 2 * connections_max;
 /// Bytes each terminating client echoes. Small: what this population is
 /// for is the handshake and the transform, not throughput.
 const tls_token_bytes: u8 = 24;
@@ -102,6 +114,9 @@ comptime {
     // sweeps validated for the HTTP origin's dial churn.
     assert(Origin.conns_max >= @as(u64, clients_max) + probe_sweeps_max);
     assert(HttpOrigin.conns_max >= 32 + probe_sweeps_max);
+    // The clean-seed margin, as a proof rather than a comment: the whole
+    // population held at once still stops short of the watermark.
+    assert(zoxy.constants.poolPressureOn(clean_pool_capacity) > connections_max);
 }
 
 io: SimIo,
@@ -338,9 +353,11 @@ pub fn setUp(harness: *Harness, arena: std.mem.Allocator, seed: u64) !void {
     harness.force_exhaustion = !harness.clean and random.uintLessThan(u8, 4) == 0;
     harness.head_buffers = if (harness.force_exhaustion)
         1 + random.uintLessThan(u32, 3)
+    else if (harness.clean)
+        // The clean-seed watermark margin, same as the clean-seed pools
+        // in `deriveInitOptions`.
+        clean_pool_capacity
     else
-        // The clean-seed watermark margin, same reasoning as the pools
-        // below in `startServerAndOrigins`.
         2 * clients_max;
     try harness.io.init(arena, .{
         .seed = seed,
@@ -1553,23 +1570,23 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
         .{
             .tunnels = harness.tunnels,
             .access_log_buffer_bytes = access_log_buffer_bytes,
-            // Clean seeds size every pool so its §8 pressure
-            // watermark (ceil of 3/4 capacity: 9 of 12) sits above
-            // the whole client population (6): a golden outcome must
-            // never meet a pressure-announced close or a shortened
-            // parked deadline — correct behavior, but not the
-            // script's exact transcript. All three flags (relay,
-            // conn, upstream) ride this margin; a clean-seed client
-            // bump must re-check it, and the upstream margin also
+            // Clean seeds size every pool at `clean_pool_capacity`
+            // (watermark 14 of 18, over a population of 9); the
+            // comptime block at the top proves the margin, so a
+            // population bump fails there. The upstream margin also
             // rides the single-endpoint topology (checkout-before-
             // dial caps acquired at the live client count — parked
             // conns per endpoint could accumulate past it under a
-            // multi-endpoint clean topology).
-            .conn_slots = 2 * clients_max,
-            .relay_buffers = if (harness.clean) 2 * clients_max else clients_max,
-            .upstream_slots = 2 * clients_max,
+            // multi-endpoint clean topology). Adversarial seeds keep
+            // the tighter pools: meeting pressure is their coverage.
+            .conn_slots = if (harness.clean) clean_pool_capacity else 2 * clients_max,
+            .relay_buffers = if (harness.clean) clean_pool_capacity else clients_max,
+            .upstream_slots = if (harness.clean) clean_pool_capacity else 2 * clients_max,
             .head_buffers = harness.head_buffers,
-            .upstream_head_buffers = 2 * clients_max,
+            .upstream_head_buffers = if (harness.clean)
+                clean_pool_capacity
+            else
+                2 * clients_max,
             .tls_engines = deriveTlsEngines(harness.tls_clients, force_exhaustion),
         };
 }
