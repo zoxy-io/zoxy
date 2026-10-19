@@ -189,6 +189,9 @@
         .zrk = .{
             .url = "git+https://github.com/zoxy-io/zrk?ref=main#391145c959dcd87b6a625126f533fa5c385a83a1",
             .hash = "zrk-2.3.0-WqdFO8ivBgAuhlauaaH-f0kFVtb7HN-Whto424YYd2AT",
+            // Lazy, and only asked for under -Dbench (the default): see
+            // `addLoadGenerator` in build.zig for why both halves are needed.
+            .lazy = true,
         },
         // zrk embeds its load off a zio (io_uring) runtime, not the default
         // std.Io.Threaded backend — plain Threaded is missing pieces zrk
@@ -219,6 +222,9 @@
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",
             .hash = "zio-0.17.0-xHbVVK-DKABkbm_XZgK-21SgNvYr9U5zr1MgOw7Q6JtM",
+            // Lazy, and only asked for under -Dbench (the default): see
+            // `addLoadGenerator` in build.zig for why both halves are needed.
+            .lazy = true,
         },
         // Audited fork: zoxy-io/hparse, pinned by content hash; the pin
         // moves only after re-audit, and the paragraphs below are that
