@@ -344,21 +344,6 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke", "Tier-0.5 live gate: the real binary against a live origin");
     smoke_step.dependOn(&smoke_run.step);
 
-    // §9 Tier 1: the loopback band harness embeds zrk (pinned by hash) as
-    // its load generator — that role stays ReleaseFast regardless of what
-    // zoxy itself ships as; it isn't the thing under test, it just needs
-    // to generate load fast enough not to be the bottleneck.
-    const zrk_dependency = b.dependency("zrk", .{
-        .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseFast,
-    });
-    // zrk embeds its load off a zio (io_uring) runtime rather than the
-    // default std.Io.Threaded backend, so the harness must build its own
-    // zio.Runtime to drive zrk's runner (bench/run.zig, bench/profile.zig).
-    const zio_dependency = b.dependency("zio", .{
-        .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseFast,
-    });
     // The zoxy under test is ReleaseSafe — matching the shipped binary
     // (release.yml) — whatever -Doptimize says for the default install.
     // ReleaseSafe still selects the LLVM backend (Zig 0.16's default for
@@ -432,34 +417,20 @@ pub fn build(b: *std.Build) void {
     );
     smoke_release_step.dependOn(&smoke_release_run.step);
 
-    // The harness itself (drives zrk against release_zoxy over the wire)
-    // stays ReleaseFast for the same reason zrk/zio do above.
-    const bench_exe = b.addExecutable(.{
-        .name = "zoxy-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/run.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
-                .{ .name = "zio", .module = zio_dependency.module("zio") },
-            },
-        }),
-    });
-    const bench_run = b.addRunArtifact(bench_exe);
-    // Drive the ReleaseSafe zoxy, not the default-optimize install
-    // artifact — a Debug zoxy scalarizes hparse and benchmarks the wrong
-    // binary (§9). bench/run.zig takes it via --zoxy.
-    bench_run.addArg("--zoxy");
-    bench_run.addArtifactArg(release_zoxy);
-    if (b.args) |args| {
-        bench_run.addArgs(args);
-    }
+    // §9 Tier 1 and the Tier-0 profile: the two harnesses that drive zrk.
+    // Registered whatever `-Dbench` says, so `zig build -l` lists them
+    // either way; see `addLoadGenerator` for what the option gates.
+    const load_generator = addLoadGenerator(b, target, release_zoxy);
     const bench_step = b.step(
         "bench",
         "Tier-1 loopback bands: -- [--rate N] [--seconds N] [--origin host:port]",
     );
-    bench_step.dependOn(&bench_run.step);
+    bench_step.dependOn(load_generator.bench_run);
+    const profile_step = b.step(
+        "profile",
+        "Pinned perf + flamegraph of zoxy under load (Linux; needs the dev shell)",
+    );
+    profile_step.dependOn(load_generator.profile_run);
 
     // §9 Tier 0: micro binaries for manual poop A/B; installed, never run
     // in CI (counter deltas on shared runners are noise). They reuse the
@@ -480,75 +451,6 @@ pub fn build(b: *std.Build) void {
         });
         micro_step.dependOn(&b.addInstallArtifact(micro_exe, .{}).step);
     }
-
-    // §9 Tier 0: pinned perf + flamegraph of zoxy under load. The zoxy
-    // under test is ReleaseSafe (shipped-binary fidelity); the harness
-    // (bench/profile.zig) — which spawns nginx + zoxy, pins zoxy to one
-    // core so the PMU and LBR call-graph stay on a single core type,
-    // drives zrk load, and folds perf into a flamegraph — stays
-    // ReleaseFast, same reasoning as bench_exe above. Linux-only —
-    // perf/flamegraph/nginx live in the dev shell. Tooling in Zig, not
-    // bash (TIGER_STYLE §Tooling).
-    const profile_harness = b.addExecutable(.{
-        .name = "zoxy-profile-harness",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/profile.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
-                .{ .name = "zio", .module = zio_dependency.module("zio") },
-                // For `constants` alone: the harness sizes the conn-slot
-                // limit it writes into zoxy's config against the compiled
-                // ceiling. Duplicating that number here would track a
-                // *lowered* ceiling loudly (the config is rejected at
-                // startup) but a *raised* one silently — a profile aimed at
-                // the new maximum would cap below it and say nothing.
-                //
-                // `src/constants.zig` directly rather than the whole
-                // `zoxy` module, which imports zssl. Two reasons, and the
-                // second is newer than the first.
-                //
-                // One: this executable also imports zrk, and the two
-                // instantiations differ in optimize mode — ReleaseSafe for
-                // the zoxy under test, ReleaseFast for the load generator.
-                // Where both sides reach one TLS package, Zig treats that
-                // as two modules rooted at one file and refuses to
-                // compile:
-                //
-                //     error: file exists in modules 'zssl' and 'zssl0'
-                //     note: files must belong to only one module
-                //
-                // That reason is live again now that zrk pins the same
-                // zssl this file does: one TLS package reached from both
-                // sides at two optimize modes is exactly the collision
-                // above. It briefly had a second reason — while zrk still
-                // linked ztls over the pre-split openssl, the harness
-                // would have carried two pins of the same C library — and
-                // that is closed, but the first reason alone is enough.
-                //
-                // Importing a leaf that depends on nothing but `std` keeps
-                // both optimize choices, which are deliberate, and takes
-                // the whole question out of the link. It only became
-                // possible to hit once libcrypto stopped being one
-                // system-wide shared object and became a per-configuration
-                // artifact (#279).
-                .{ .name = "zoxy_constants", .module = b.createModule(.{
-                    .root_source_file = b.path("src/constants.zig"),
-                    .target = target,
-                    .optimize = .ReleaseFast,
-                }) },
-            },
-        }),
-    });
-    const profile_run = b.addRunArtifact(profile_harness);
-    profile_run.addArtifactArg(release_zoxy);
-    if (b.args) |args| profile_run.addArgs(args);
-    const profile_step = b.step(
-        "profile",
-        "Pinned perf + flamegraph of zoxy under load (Linux; needs the dev shell)",
-    );
-    profile_step.dependOn(&profile_run.step);
 
     const lint_run = b.addRunArtifact(lint_exe);
     lint_run.addDirectoryArg(b.path("src"));
@@ -595,8 +497,8 @@ pub fn build(b: *std.Build) void {
     // which is the worst time to find out a measurement tool is dead. A
     // build is enough to catch that, and it is the cheapest thing that is.
     ci_step.dependOn(micro_step);
-    ci_step.dependOn(&bench_exe.step);
-    ci_step.dependOn(&profile_harness.step);
+    ci_step.dependOn(load_generator.bench_exe);
+    ci_step.dependOn(load_generator.profile_harness);
 
     // Line coverage via kcov (Linux-only, in the dev shell): the unit-test
     // binary plus a simulator sweep, merged — the simulator reaches error
@@ -712,6 +614,182 @@ fn resolveBuildId(b: *std.Build) []const u8 {
         .ignore,
     ) catch return "";
     return std.mem.trim(u8, described, " \t\r\n");
+}
+
+/// The steps that need zrk: the two load-driving harnesses, which `ci`
+/// compiles and `bench` and `profile` run. When zrk is not wired, all four
+/// are one shared fail step.
+const LoadGenerator = struct {
+    bench_exe: *std.Build.Step,
+    bench_run: *std.Build.Step,
+    profile_harness: *std.Build.Step,
+    profile_run: *std.Build.Step,
+};
+
+/// zrk and zio are lazy in build.zig.zon, and in Zig 0.16 a lazy
+/// dependency is fetched whenever configure *asks* for one — whichever
+/// step was requested, since `build()` cannot see which. So laziness
+/// alone saves nothing; `-Dbench=false` is what stops the ask. The
+/// nightly soak passes it: it runs only `sim`, and before this its shard
+/// builds cloned zrk from GitHub every night — one of them failed on a
+/// DNS error doing it, and swept nothing.
+///
+/// The default stays true so a developer's `zig build bench` and CI's
+/// `zig build ci` work as they did. Off, the three steps that need zrk
+/// fail with a reason rather than quietly doing less: a green `ci` that
+/// skipped compiling the harnesses would be claiming more than it checked.
+fn addLoadGenerator(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    release_zoxy: *std.Build.Step.Compile,
+) LoadGenerator {
+    const enabled = b.option(
+        bool,
+        "bench",
+        "wire zrk and zio for bench, profile and ci (false: skip fetching them)",
+    ) orelse true;
+    if (enabled) {
+        // Both harnesses embed zrk (pinned by hash) as their load
+        // generator — that role stays ReleaseFast regardless of what
+        // zoxy itself ships as; it isn't the thing under test, it just needs
+        // to generate load fast enough not to be the bottleneck.
+        const zrk_dependency = b.lazyDependency("zrk", .{
+            .target = target,
+            .optimize = std.builtin.OptimizeMode.ReleaseFast,
+        });
+        // zrk embeds its load off a zio (io_uring) runtime rather than the
+        // default std.Io.Threaded backend, so the harness must build its own
+        // zio.Runtime to drive zrk's runner (bench/run.zig, bench/profile.zig).
+        const zio_dependency = b.lazyDependency("zio", .{
+            .target = target,
+            .optimize = std.builtin.OptimizeMode.ReleaseFast,
+        });
+        // Both asked for before either is checked, so one configure pass
+        // names both and the runner fetches them together. Either null
+        // means that fetch is pending: the runner re-runs configure once
+        // it lands, so the fail step below is never what gets built.
+        if (zrk_dependency != null and zio_dependency != null) {
+            const bench_exe = addBenchHarness(b, target, zrk_dependency.?, zio_dependency.?);
+            const bench_run = b.addRunArtifact(bench_exe);
+            // Drive the ReleaseSafe zoxy, not the default-optimize install
+            // artifact — a Debug zoxy scalarizes hparse and benchmarks the wrong
+            // binary (§9). bench/run.zig takes it via --zoxy.
+            bench_run.addArg("--zoxy");
+            bench_run.addArtifactArg(release_zoxy);
+            if (b.args) |args| {
+                bench_run.addArgs(args);
+            }
+
+            const profile_harness = addProfileHarness(b, target, zrk_dependency.?, zio_dependency.?);
+            const profile_run = b.addRunArtifact(profile_harness);
+            profile_run.addArtifactArg(release_zoxy);
+            if (b.args) |args| profile_run.addArgs(args);
+            return .{
+                .bench_exe = &bench_exe.step,
+                .bench_run = &bench_run.step,
+                .profile_harness = &profile_harness.step,
+                .profile_run = &profile_run.step,
+            };
+        }
+    }
+    const fail = b.addFail("needs -Dbench=true: zrk and zio are not wired into this build");
+    return .{
+        .bench_exe = &fail.step,
+        .bench_run = &fail.step,
+        .profile_harness = &fail.step,
+        .profile_run = &fail.step,
+    };
+}
+
+/// §9 Tier 1: the loopback band harness. It drives zrk against the
+/// ReleaseSafe zoxy over the wire, and stays ReleaseFast for the same
+/// reason zrk and zio do (see `addLoadGenerator`).
+fn addBenchHarness(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    zrk_dependency: *std.Build.Dependency,
+    zio_dependency: *std.Build.Dependency,
+) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "zoxy-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/run.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
+                .{ .name = "zio", .module = zio_dependency.module("zio") },
+            },
+        }),
+    });
+}
+
+/// §9 Tier 0: pinned perf + flamegraph of zoxy under load. The zoxy
+/// under test is ReleaseSafe (shipped-binary fidelity); the harness
+/// (bench/profile.zig) — which spawns nginx + zoxy, pins zoxy to one
+/// core so the PMU and LBR call-graph stay on a single core type,
+/// drives zrk load, and folds perf into a flamegraph — stays
+/// ReleaseFast, same reasoning as `addBenchHarness`. Linux-only —
+/// perf/flamegraph/nginx live in the dev shell. Tooling in Zig, not
+/// bash (TIGER_STYLE §Tooling).
+fn addProfileHarness(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    zrk_dependency: *std.Build.Dependency,
+    zio_dependency: *std.Build.Dependency,
+) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "zoxy-profile-harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/profile.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
+                .{ .name = "zio", .module = zio_dependency.module("zio") },
+                // For `constants` alone: the harness sizes the conn-slot
+                // limit it writes into zoxy's config against the compiled
+                // ceiling. Duplicating that number here would track a
+                // *lowered* ceiling loudly (the config is rejected at
+                // startup) but a *raised* one silently — a profile aimed at
+                // the new maximum would cap below it and say nothing.
+                //
+                // `src/constants.zig` directly rather than the whole
+                // `zoxy` module, which imports zssl. Two reasons, and the
+                // second is newer than the first.
+                //
+                // One: this executable also imports zrk, and the two
+                // instantiations differ in optimize mode — ReleaseSafe for
+                // the zoxy under test, ReleaseFast for the load generator.
+                // Where both sides reach one TLS package, Zig treats that
+                // as two modules rooted at one file and refuses to
+                // compile:
+                //
+                //     error: file exists in modules 'zssl' and 'zssl0'
+                //     note: files must belong to only one module
+                //
+                // That reason is live again now that zrk pins the same
+                // zssl this file does: one TLS package reached from both
+                // sides at two optimize modes is exactly the collision
+                // above. It briefly had a second reason — while zrk still
+                // linked ztls over the pre-split openssl, the harness
+                // would have carried two pins of the same C library — and
+                // that is closed, but the first reason alone is enough.
+                //
+                // Importing a leaf that depends on nothing but `std` keeps
+                // both optimize choices, which are deliberate, and takes
+                // the whole question out of the link. It only became
+                // possible to hit once libcrypto stopped being one
+                // system-wide shared object and became a per-configuration
+                // artifact (#279).
+                .{ .name = "zoxy_constants", .module = b.createModule(.{
+                    .root_source_file = b.path("src/constants.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }) },
+            },
+        }),
+    });
 }
 
 /// zssl's C surface: the protocol layer is Zig, the primitives are

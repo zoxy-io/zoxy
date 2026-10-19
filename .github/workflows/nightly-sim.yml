@@ -184,8 +184,33 @@ jobs:
       # invariants: a green gate that stopped looking. ReleaseSafe keeps
       # the assertions but is slower than Debug here, so Debug wins on
       # both counts and there is no trade left to make.
+      #
+      # Retried, because this step is where the night meets the network —
+      # the first `devenv shell` realizes the Nix shell, and the first
+      # `zig build` fetches packages — and a shard whose Build fails sweeps
+      # nothing. Twice in October that cost a whole shard to a transient:
+      # a DNS failure cloning zrk (run #80) and an invalid Nix store path
+      # (run #88). Neither range is ever revisited, since ranges are keyed
+      # to the run number, so a few minutes of retry is cheap against a
+      # million unswept seeds. A real compile error fails all three
+      # attempts identically and still fails the shard.
+      #
+      # `-Dbench=false` on both steps keeps zrk and zio, the bench's load
+      # generator, out of the build: lazy dependencies are fetched only
+      # when configure asks for them, and this job never runs load. Sweep
+      # must pass it too, or its own configure would ask and fetch.
       - name: Build
-        run: devenv shell -- zig build
+        run: |
+          for attempt in 1 2 3; do
+            if devenv shell -- zig build -Dbench=false; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::Build attempt $attempt failed; retrying in $(( attempt * 30 ))s"
+              sleep $(( attempt * 30 ))
+            fi
+          done
+          exit 1
 
       - name: Sweep
         id: sweep
@@ -199,7 +224,7 @@ jobs:
           shard_last=$(( shard_start + SEEDS - 1 ))
           began=$(date +%s)
           set +e
-          devenv shell -- zig build sim -- "$shard_start" "$SEEDS" keep-going 2>&1 \
+          devenv shell -- zig build -Dbench=false sim -- "$shard_start" "$SEEDS" keep-going 2>&1 \
             | tee "sweep-${SHARD}.log"
           status=${PIPESTATUS[0]}
           set -e
