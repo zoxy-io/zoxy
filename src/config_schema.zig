@@ -42,7 +42,7 @@ pub fn writeSchema(w: *Writer) Writer.Error!void {
     // could never be satisfied, so guard the shapes at comptime. The
     // protocol vocabulary is no longer among them: it is the listener's
     // body key now, not a string field with an enum (#305).
-    comptime assert(@typeInfo(Pick).@"enum".fields.len >= 1);
+    comptime assert(@typeInfo(Pick).@"enum".field_names.len >= 1);
     comptime assert(filter.reject_statuses.len >= 1);
 
     var out: Stringify = .{ .writer = w, .options = .{ .whitespace = .indent_2 } };
@@ -68,8 +68,8 @@ pub fn writeSchema(w: *Writer) Writer.Error!void {
 /// default, so the schema's required set is derived, never hand-listed.
 fn writeObjectBody(out: *Stringify, comptime T: type, comptime with_doc: bool) Writer.Error!void {
     comptime config.assert_meta_matches(T);
-    const fields = @typeInfo(T).@"struct".fields;
-    comptime assert(fields.len >= 1);
+    const info = @typeInfo(T).@"struct";
+    comptime assert(info.field_names.len >= 1);
 
     try out.objectField("type");
     try out.write("object");
@@ -80,16 +80,16 @@ fn writeObjectBody(out: *Stringify, comptime T: type, comptime with_doc: bool) W
 
     try out.objectField("properties");
     try out.beginObject();
-    inline for (fields) |field| {
-        try out.objectField(field.name);
-        try writeFieldSchema(out, T, field);
+    inline for (info.field_names, 0..) |name, field_index| {
+        try out.objectField(name);
+        try writeFieldSchema(out, T, field_index);
     }
     try out.endObject();
 
     try out.objectField("required");
     try out.beginArray();
-    inline for (fields) |field| {
-        if (comptime field.defaultValue() == null) try out.write(field.name);
+    inline for (info.field_names, info.field_attrs) |name, attrs| {
+        if (comptime attrs.default_value_ptr == null) try out.write(name);
     }
     try out.endArray();
 
@@ -208,10 +208,13 @@ fn writeOneOf(out: *Stringify, comptime T: type) Writer.Error!void {
 fn writeFieldSchema(
     out: *Stringify,
     comptime T: type,
-    comptime field: std.builtin.Type.StructField,
+    comptime field_index: usize,
 ) Writer.Error!void {
-    const meta = @field(T.schema_fields, field.name);
-    const Base = comptime optionalChild(field.type);
+    const info = @typeInfo(T).@"struct";
+    comptime assert(field_index < info.field_names.len);
+    const FieldType = info.field_types[field_index];
+    const meta = @field(T.schema_fields, info.field_names[field_index]);
+    const Base = comptime optionalChild(FieldType);
 
     try out.beginObject();
     try out.objectField("description");
@@ -240,8 +243,8 @@ fn writeFieldSchema(
         else => try writeShape(out, Base, meta),
     }
 
-    if (comptime @typeInfo(field.type) != .optional) {
-        if (comptime field.defaultValue()) |default| {
+    if (comptime @typeInfo(FieldType) != .optional) {
+        if (comptime info.field_attrs[field_index].defaultValue(FieldType)) |default| {
             switch (@typeInfo(Base)) {
                 .int => {
                     try out.objectField("default");
@@ -458,11 +461,11 @@ fn writePickField(out: *Stringify) Writer.Error!void {
 /// vocabulary the loader accepts, since the field names ARE the JSON tokens
 /// (`protocol` via a literal match, `pick` via `std.meta.stringToEnum`).
 fn writeEnum(out: *Stringify, comptime Enum: type) Writer.Error!void {
-    const fields = @typeInfo(Enum).@"enum".fields;
-    comptime assert(fields.len >= 1);
+    const names = @typeInfo(Enum).@"enum".field_names;
+    comptime assert(names.len >= 1);
     try out.objectField("enum");
     try out.beginArray();
-    inline for (fields) |field| try out.write(field.name);
+    inline for (names) |name| try out.write(name);
     try out.endArray();
 }
 
@@ -474,11 +477,11 @@ fn writeEnum(out: *Stringify, comptime Enum: type) Writer.Error!void {
 /// variants; the closedness it publishes is the same, and it is the
 /// point: a token absent from here is one no rule could catch after 101.
 fn writeUpgradeEnum(out: *Stringify) Writer.Error!void {
-    const fields = @typeInfo(config.Config.Listener.Upgrades).@"struct".fields;
-    comptime assert(fields.len >= 1);
+    const names = @typeInfo(config.Config.Listener.Upgrades).@"struct".field_names;
+    comptime assert(names.len >= 1);
     try out.objectField("enum");
     try out.beginArray();
-    inline for (fields) |field| try out.write(field.name);
+    inline for (names) |name| try out.write(name);
     try out.endArray();
 }
 
@@ -490,9 +493,9 @@ fn writeMethodEnum(out: *Stringify) Writer.Error!void {
     try out.objectField("enum");
     try out.beginArray();
     comptime var emitted = false;
-    inline for (@typeInfo(parser.Method).@"enum".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "extension")) continue;
-        try out.write(upperToken(field.name));
+    inline for (@typeInfo(parser.Method).@"enum".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "extension")) continue;
+        try out.write(upperToken(name));
         emitted = true;
     }
     try out.endArray();
@@ -697,12 +700,12 @@ test "config_schema: pick accepts both spellings, and only the object names hash
     const properties = object_arm.get("properties").?.object;
     const policies = properties.get("policy").?.object.get("enum").?.array;
     try std.testing.expectEqual(
-        @typeInfo(config.Config.Cluster.Pick).@"enum".fields.len,
+        @typeInfo(config.Config.Cluster.Pick).@"enum".field_names.len,
         policies.items.len,
     );
     const keys = properties.get("key").?.object.get("enum").?.array;
     try std.testing.expectEqual(
-        @typeInfo(std.meta.Tag(config.Config.Cluster.HashKey)).@"enum".fields.len,
+        @typeInfo(std.meta.Tag(config.Config.Cluster.HashKey)).@"enum".field_names.len,
         keys.items.len,
     );
 }
@@ -839,12 +842,12 @@ test "config_schema: the method enum matches what the parser accepts" {
     // Every token the schema emits must be one the loader resolves, and no
     // more than the registered methods (extension names no token).
     var accepted: u32 = 0;
-    inline for (@typeInfo(parser.Method).@"enum".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "extension")) continue;
-        const token = upperToken(field.name);
+    inline for (@typeInfo(parser.Method).@"enum".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "extension")) continue;
+        const token = upperToken(name);
         try std.testing.expect(parser.methodFromToken(&token) != null);
         accepted += 1;
     }
-    try std.testing.expectEqual(@as(u32, @typeInfo(parser.Method).@"enum".fields.len - 1), accepted);
+    try std.testing.expectEqual(@as(u32, @typeInfo(parser.Method).@"enum".field_names.len - 1), accepted);
     try std.testing.expect(parser.methodFromToken("NOTAMETHOD") == null);
 }

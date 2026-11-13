@@ -134,7 +134,7 @@ pub fn Pump(
         }
 
         fn directionState(conn: *ConnType) *stream_module.DirectionState {
-            return &conn.stream.directions[@intFromEnum(direction)];
+            return &conn.stream.directions[@backingInt(direction)];
         }
 
         fn buffer(conn: *ConnType) []u8 {

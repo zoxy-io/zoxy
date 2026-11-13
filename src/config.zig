@@ -21,6 +21,7 @@ const io_module = @import("io/io.zig");
 const json_schema = @import("json_schema.zig");
 
 const assert = std.debug.assert;
+const repeat = @import("testing/bytes.zig").repeat;
 
 pub const Config = struct {
     listeners: []const Listener,
@@ -2231,14 +2232,14 @@ pub const UpgradesJson = struct {
         // protocol added to either and forgotten on the other would let
         // the config name an upgrade the serving path cannot gate, or
         // hide one it can.
-        const resolved = @typeInfo(Config.Listener.Upgrades).@"struct".fields;
-        const json = @typeInfo(UpgradesJson).@"struct".fields;
+        const resolved = @typeInfo(Config.Listener.Upgrades).@"struct".field_names;
+        const json = @typeInfo(UpgradesJson).@"struct".field_names;
         if (resolved.len != json.len) {
             @compileError("UpgradesJson and Config.Listener.Upgrades disagree on the set");
         }
-        for (resolved) |field| {
-            if (!@hasField(UpgradesJson, field.name)) {
-                @compileError("UpgradesJson is missing " ++ field.name);
+        for (resolved) |name| {
+            if (!@hasField(UpgradesJson, name)) {
+                @compileError("UpgradesJson is missing " ++ name);
             }
         }
     }
@@ -2482,12 +2483,13 @@ pub const ResponseActionJson = struct {
         // member here the request lacks would be an edit the renderer
         // has never seen, and one whose type diverged would be the same
         // key meaning two things.
-        for (@typeInfo(ResponseActionJson).@"struct".fields) |field| {
-            if (!@hasField(ActionJson, field.name)) {
-                @compileError("ResponseActionJson." ++ field.name ++ " is not an ActionJson field");
+        const info = @typeInfo(ResponseActionJson).@"struct";
+        for (info.field_names, info.field_types) |name, FieldType| {
+            if (!@hasField(ActionJson, name)) {
+                @compileError("ResponseActionJson." ++ name ++ " is not an ActionJson field");
             }
-            if (@FieldType(ActionJson, field.name) != field.type) {
-                @compileError("ResponseActionJson." ++ field.name ++
+            if (@FieldType(ActionJson, name) != FieldType) {
+                @compileError("ResponseActionJson." ++ name ++
                     " has a different type than ActionJson's");
             }
         }
@@ -2836,12 +2838,14 @@ pub const EndpointJson = struct {
         // The two shapes are one contract: a field added to either and
         // forgotten on the other would let the schema advertise a key
         // the parser rejects, or the parser accept one the schema hides.
-        const outer = @typeInfo(EndpointJson).@"struct".fields;
-        const inner = @typeInfo(ObjectForm).@"struct".fields;
-        assert(outer.len == inner.len);
-        for (outer, inner) |a, b| {
-            assert(std.mem.eql(u8, a.name, b.name));
-            assert(a.type == b.type);
+        const outer = @typeInfo(EndpointJson).@"struct";
+        const inner = @typeInfo(ObjectForm).@"struct";
+        assert(outer.field_names.len == inner.field_names.len);
+        for (outer.field_names, inner.field_names) |a, b| {
+            assert(std.mem.eql(u8, a, b));
+        }
+        for (outer.field_types, inner.field_types) |a, b| {
+            assert(a == b);
         }
     }
 
@@ -2956,12 +2960,14 @@ pub const PickJson = struct {
         // The two shapes are one contract: a field added to either and
         // forgotten on the other would let the schema advertise a key
         // the parser rejects, or the parser accept one the schema hides.
-        const outer = @typeInfo(PickJson).@"struct".fields;
-        const inner = @typeInfo(ObjectForm).@"struct".fields;
-        assert(outer.len == inner.len);
-        for (outer, inner) |a, b| {
-            assert(std.mem.eql(u8, a.name, b.name));
-            assert(a.type == b.type);
+        const outer = @typeInfo(PickJson).@"struct";
+        const inner = @typeInfo(ObjectForm).@"struct";
+        assert(outer.field_names.len == inner.field_names.len);
+        for (outer.field_names, inner.field_names) |a, b| {
+            assert(std.mem.eql(u8, a, b));
+        }
+        for (outer.field_types, inner.field_types) |a, b| {
+            assert(a == b);
         }
     }
 
@@ -3470,28 +3476,28 @@ pub fn assert_meta_matches(comptime T: type) void {
     }
     const Meta = @TypeOf(T.schema_fields);
     // Every field has a documented, described entry.
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (!@hasField(Meta, field.name)) {
-            @compileError(@typeName(T) ++ "." ++ field.name ++ " has no schema_fields entry");
+    inline for (@typeInfo(T).@"struct".field_names) |name| {
+        if (!@hasField(Meta, name)) {
+            @compileError(@typeName(T) ++ "." ++ name ++ " has no schema_fields entry");
         }
-        const entry = @field(T.schema_fields, field.name);
+        const entry = @field(T.schema_fields, name);
         if (!@hasField(@TypeOf(entry), "desc")) {
-            @compileError(@typeName(T) ++ "." ++ field.name ++ " schema entry is missing .desc");
+            @compileError(@typeName(T) ++ "." ++ name ++ " schema entry is missing .desc");
         }
     }
     // Every entry maps to a real field and carries only known attributes.
-    inline for (@typeInfo(Meta).@"struct".fields) |entry_field| {
-        if (!@hasField(T, entry_field.name)) {
-            @compileError(@typeName(T) ++ " schema_fields entry '" ++ entry_field.name ++ "' has no matching field");
+    inline for (@typeInfo(Meta).@"struct".field_names) |entry_name| {
+        if (!@hasField(T, entry_name)) {
+            @compileError(@typeName(T) ++ " schema_fields entry '" ++ entry_name ++ "' has no matching field");
         }
-        const entry = @field(T.schema_fields, entry_field.name);
-        inline for (@typeInfo(@TypeOf(entry)).@"struct".fields) |attr| {
+        const entry = @field(T.schema_fields, entry_name);
+        inline for (@typeInfo(@TypeOf(entry)).@"struct".field_names) |attr_name| {
             comptime var known = false;
             inline for (schema_attributes) |name| {
-                if (comptime std.mem.eql(u8, name, attr.name)) known = true;
+                if (comptime std.mem.eql(u8, name, attr_name)) known = true;
             }
             if (!known) {
-                @compileError(@typeName(T) ++ "." ++ entry_field.name ++ " has unknown schema attribute '" ++ attr.name ++ "'");
+                @compileError(@typeName(T) ++ "." ++ entry_name ++ " has unknown schema attribute '" ++ attr_name ++ "'");
             }
         }
     }
@@ -3587,9 +3593,10 @@ fn assertVariantsMatch(comptime T: type) void {
 /// Whether a field carries a Zig default, as an opaque marker — the
 /// value itself is not comparable across the types this walks.
 fn defaultOf(comptime T: type, comptime name: []const u8) ?void {
-    for (@typeInfo(T).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) {
-            return if (field.defaultValue() == null) null else {};
+    const info = @typeInfo(T).@"struct";
+    for (info.field_names, info.field_attrs) |field_name, attrs| {
+        if (std.mem.eql(u8, field_name, name)) {
+            return if (attrs.default_value_ptr == null) null else {};
         }
     }
     return null;
@@ -3617,9 +3624,10 @@ fn assertOneOfMatches(comptime T: type) void {
                 @compileError(@typeName(T) ++ " schema_one_of names '" ++ name ++ "' twice");
             }
         }
-        inline for (@typeInfo(T).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, name)) {
-                if (comptime field.defaultValue() == null) {
+        const info = @typeInfo(T).@"struct";
+        inline for (info.field_names, info.field_attrs) |field_name, attrs| {
+            if (comptime std.mem.eql(u8, field_name, name)) {
+                if (comptime attrs.default_value_ptr == null) {
                     @compileError(@typeName(T) ++ ".schema_one_of names '" ++ name ++
                         "', which is required — every arm would match and the fork would reject everything");
                 }
@@ -4477,7 +4485,7 @@ fn resolveResponseMatch(
     if (match_json.status_class) |literal| {
         const class = std.meta.stringToEnum(filter.StatusClass, literal) orelse
             return error.ResponseFilterStatusClassUnknown;
-        match.status_class = @intFromEnum(class);
+        match.status_class = @backingInt(class);
         // The digit contract `responseMatches` asserts on its side of
         // the seam, proven where it is produced.
         assert(match.status_class.? >= 1);
@@ -5312,8 +5320,8 @@ fn resolveUpgrades(
 ) ValidationError!Config.Listener.Upgrades {
     const asked = upgrades_json orelse return .{};
     var upgrades: Config.Listener.Upgrades = .{};
-    inline for (@typeInfo(UpgradesJson).@"struct".fields) |field| {
-        @field(upgrades, field.name) = @field(asked, field.name);
+    inline for (@typeInfo(UpgradesJson).@"struct".field_names) |name| {
+        @field(upgrades, name) = @field(asked, name);
     }
     // No rejection for "every flag false", and the shape is why. An
     // empty *list* was a meaningless spelling of a set, so it was
@@ -7594,8 +7602,8 @@ comptime {
     // leave a row that excuses nothing and hides its successor.
     for (schema_gaps) |entry| {
         var found = false;
-        for (@typeInfo(ValidationError).error_set.?) |candidate| {
-            if (std.mem.eql(u8, candidate.name, entry.name)) found = true;
+        for (@typeInfo(ValidationError).error_set.error_names.?) |candidate| {
+            if (std.mem.eql(u8, candidate, entry.name)) found = true;
         }
         if (!found) @compileError("schema_gaps names no such ValidationError: " ++ entry.name);
     }
@@ -7648,8 +7656,8 @@ test "config: the schema's debt to the loader only ever falls (#305)" {
 /// parser's. `ParseError` is the union of both, and only the loader's
 /// half is a claim about config *shape*.
 fn isValidationError(expected: ParseError) bool {
-    inline for (@typeInfo(ValidationError).error_set.?) |candidate| {
-        if (expected == @field(ValidationError, candidate.name)) return true;
+    inline for (@typeInfo(ValidationError).error_set.error_names.?) |candidate| {
+        if (expected == @field(ValidationError, candidate)) return true;
     }
     return false;
 }
@@ -8031,12 +8039,15 @@ test "config: listeners that overflow the ring budget are refused at load" {
     _ = try expectParseOk(&arena_state, comptime listenersJson(23, at_ceiling));
 }
 
+// Coverage-guided mode (`zig build test --fuzz`) is not a gate. Zig 0.16.0
+// could not build it at all (its bundled test runner failed to compile
+// under -ffuzz); 0.17's can, and its first run tripped the parser's
+// cursor-against-one-shot oracle on a head with no terminator — so it
+// stays a manual tool until `HeadCursor` and that oracle agree on what
+// `Incomplete` means. The corpus still runs deterministically as part of
+// `zig build test`.
 var fuzz_arena_buffer: [1 << 20]u8 = undefined;
 
-// Coverage-guided mode (`zig build test --fuzz`) is currently blocked by a
-// Zig 0.16.0 toolchain bug: the bundled compiler/test_runner.zig fails to
-// compile under -ffuzz (StackTrace type mismatch, line 566). The corpus
-// still runs deterministically as part of `zig build test`.
 /// A second corpus seed carrying the blocks the shipped example leaves to
 /// their defaults. The example is the better *documentation* for having
 /// dropped its `timeouts` block, but a corpus seed is judged on the token
@@ -8259,8 +8270,8 @@ test "config: the access-log block resolves a sink, absent leaves it off" {
 
 test "config: a cluster name is bounded, because the access log echoes it" {
     const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"";
-    const long_name = "n" ** (constants.cluster_name_bytes_max + 1);
-    const at_limit = "n" ** constants.cluster_name_bytes_max;
+    const long_name = repeat("n", constants.cluster_name_bytes_max + 1);
+    const at_limit = repeat("n", constants.cluster_name_bytes_max);
 
     // At the cap it resolves; one byte over fails. Without the bound a log
     // line's width would be a function of the config file rather than of
@@ -8442,7 +8453,7 @@ test "config: a request-derived pick name is required, bounded, and a token" {
     );
     // The bound is exact: at `pick_name_bytes_max` the name loads, one
     // past it fails — the stamp's Set-Cookie scratch is sized by it.
-    const at_limit = "x" ** constants.pick_name_bytes_max;
+    const at_limit = repeat("x", constants.pick_name_bytes_max);
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
@@ -8589,7 +8600,7 @@ test "config: a body names exactly one source, and its grammar is enforced" {
     );
     try expectParseError(
         error.BodyNameTooLong,
-        bodies_head ++ "\"bodies\":{\"" ++ ("n" ** (constants.body_name_bytes_max + 1)) ++
+        bodies_head ++ "\"bodies\":{\"" ++ repeat("n", constants.body_name_bytes_max + 1) ++
             "\":{\"inline\":\"a\",\"content_type\":\"t/p\"}}," ++ bodies_tail,
     );
     // `parse` without a file source refuses every file arm — the fuzzer
@@ -8725,7 +8736,7 @@ test "config: logged header names are lowercased, deduped and bounded (#140)" {
     try expectParseError(
         error.AccessLogHeaderNameTooLong,
         head ++ ",\"request_headers\":[\"" ++
-            ("x" ** (constants.access_log_header_name_bytes_max + 1)) ++ "\"]" ++ tail,
+            repeat("x", constants.access_log_header_name_bytes_max + 1) ++ "\"]" ++ tail,
     );
 }
 
@@ -9065,7 +9076,7 @@ test "config: an endpoint may be a Unix socket path (#303)" {
     // a shortened path names a *different* socket, and the kernel would
     // have no way to say so.
     {
-        const too_long = "/" ++ ("p" ** constants.unix_socket_path_bytes_max);
+        const too_long = "/" ++ repeat("p", constants.unix_socket_path_bytes_max);
         try expectParseError(
             error.EndpointUnixPathInvalid,
             head ++ "\"unix:" ++ too_long ++ "\"" ++ tail,

@@ -1,6 +1,6 @@
 # zoxy — bullet-proof L4/L7 proxy
 
-An L4/L7 proxy in Zig 0.16 in the spirit of Cloudflare's Pingora, with two
+An L4/L7 proxy in Zig 0.17 in the spirit of Cloudflare's Pingora, with two
 hard constraints: **nothing allocates on the hot path** and **exhaustion
 sheds load — it never crashes, never queues unboundedly, never allocates.**
 Steady-state operation issues zero heap allocations and zero allocating
@@ -239,8 +239,9 @@ institutionally rather than instrumenting them; the safety this surface
 does get is the audited Zig above it, the fixed heap beside it, and §9's
 `smoke-release` running the mode that ships.
 And the pinned hash is an *audited commit*, never a branch tip — libxev's
-Zig 0.16 support is a self-described compatibility shim (PR #220) with
-real fixes still unmerged behind it — so a pin moves only after re-audit;
+Zig 0.16 support arrived as a self-described compatibility shim (PR #220),
+and real fixes are still unmerged behind its 0.17 port (#249) — so a pin
+moves only after re-audit;
 for zssl that audit means the Zig protocol layer read line by line, the C
 primitives trusted institutionally.
 
@@ -281,7 +282,7 @@ primitives trusted institutionally.
   `xev` directly; it calls `src/io/io.zig`, a comptime-selected facade with
   two backends: `XevIo` (production) and `SimIo` (deterministic
   simulation — virtual sockets, virtual clock, seeded adversarial
-  scheduler, §9). The Zig 0.16 std landscape still rules out building this
+  scheduler, §9). The Zig 0.17 std landscape still rules out building this
   on `std.Io` directly — `std.Io.Threaded` allocates per task, the
   evented executor has stubbed networking and offers only work-stealing
   scheduling, and `std.crypto.tls` is client-only — each re-verified

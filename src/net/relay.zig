@@ -64,7 +64,7 @@ pub fn Relay(comptime IoType: type) type {
                 }
 
                 fn state(conn: *ConnType) *stream_module.DirectionState {
-                    return &conn.stream.directions[@intFromEnum(direction)];
+                    return &conn.stream.directions[@backingInt(direction)];
                 }
 
                 pub fn beforeRecv(conn: *ConnType) void {
@@ -355,7 +355,7 @@ pub fn Relay(comptime IoType: type) type {
             assert(conn.state == .relaying);
             assert(conn.stream.upstream_socket != null);
             const client_to_upstream =
-                &conn.stream.directions[@intFromEnum(Direction.client_to_upstream)];
+                &conn.stream.directions[@backingInt(Direction.client_to_upstream)];
             if (client_to_upstream.owed() >= 1) {
                 // Payload that arrived coalesced behind a PROXY header
                 // (#142): the receive phase staged it at the buffer's

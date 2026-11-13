@@ -25,26 +25,50 @@
     .fingerprint = 0xa872299f36b5e445, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // Audited fork: zoxy-io/libxev branch zoxy-buffer-group = upstream
-        // 9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf (the audited snapshot)
-        // plus six commits, each its own stacked PR:
-        //   c369817 expose io_uring setup flags through Options
-        //   6bd950d expose the CQ depth (IORING_SETUP_CQSIZE) — the c10k
-        //           lever
-        //   b3d6b55 keep the raw errno on the Completion (zoxy-io/libxev#2)
-        //   24da6d0 recv_group — provided-buffer receives (zoxy-io/libxev#3)
-        //   fe5a07b leave readiness to the wait in submit (kqueue)
-        //   010be2a let connect address an AF_UNIX pathname socket
-        //           (zoxy-io/libxev#5, #303)
+        // Audited fork: zoxy-io/libxev branch zoxy-zig-0.17 = upstream
+        // 451a2bc03644c2b70fb28a808313d12989bfa8e3 (upstream's Zig 0.17
+        // port of the audited snapshot 9ce8e8e) plus six commits, each its
+        // own stacked PR, replayed onto it unchanged — audited as the left
+        // SHA, pinned as the right:
+        //   c369817 66867ab expose io_uring setup flags through Options
+        //   6bd950d e0ec7a0 expose the CQ depth (IORING_SETUP_CQSIZE) —
+        //                   the c10k lever
+        //   b3d6b55 b87aed5 keep the raw errno on the Completion
+        //                   (zoxy-io/libxev#2)
+        //   24da6d0 9151a66 recv_group — provided-buffer receives
+        //                   (zoxy-io/libxev#3)
+        //   fe5a07b 813b4b0 leave readiness to the wait in submit (kqueue)
+        //   010be2a b0268b1 let connect address an AF_UNIX pathname socket
+        //                   (zoxy-io/libxev#5, #303)
         // Diff against that upstream commit to audit; the pin moves only
         // after re-audit.
+        //
+        // Re-audit for b0268b1 (Zig 0.17), 2026-11-13. Two halves, and
+        // neither changes what a zoxy build runs.
+        //
+        // The base moved 9ce8e8e -> 451a2bc, which is upstream's 0.17 port
+        // (mitchellh/libxev#249: 2c916b8 build.zig, 819ffa1 the tree) and
+        // nothing else — 9ce8e8e is its parent. Read in full: `**` becomes
+        // `@splat` in tests, `@typeInfo(...).decls` becomes `decl_names` in
+        // two comptime API checks, dynamic.zig follows one std type rename,
+        // and a test buffer is filled by a loop. No backend, op, error
+        // mapping or `Completion` field is touched.
+        //
+        // The six commits replayed without a conflict, and
+        // `git range-diff 9ce8e8e..010be2a 451a2bc..b0268b1` marks every one
+        // `=` — patch-identical to what the records below audited. Checked
+        // under 0.17.1: libxev's own suite (147 pass, 4 skip) in Debug and
+        // ReleaseSafe on Linux, and its test binary compiled for
+        // aarch64-macos and x86_64-macos, where fe5a07b's kqueue path lives.
+        // On this side, `zoxy --check` prices the example config and a TLS
+        // one byte-for-byte as v0.9.0 does, so no §5 number moves.
         //
         // Re-audit for 010be2a, signed off 2026-08-27. `Completion.connect`
         // carries a `net.Address`, whose union members top out at 28 bytes;
@@ -139,8 +163,8 @@
         // arms discard which errno failed, which is what left a c10k run
         // reporting 227,628 indistinguishable failures.
         .libxev = .{
-            .url = "git+https://github.com/zoxy-io/libxev#010be2aa1a7e760031f213ad4ed8ff3f1b68a4d0",
-            .hash = "libxev-0.0.0-86vtc6d2FADTmwZO_3A6KLpUc8d0dzRsy018hm65aNuI",
+            .url = "git+https://github.com/zoxy-io/libxev#b0268b106fe4a1d274d759581d821f8490a40978",
+            .hash = "libxev-0.0.0-86vtc2l2FACqC0P-gGqU0h_zG2B2WYWGtILfBGq5lUGt",
         },
         // Load generator, §9 Tier 0/1 only — never linked into the proxy
         // (no `src/` file imports it), so a bump moves what the benchmark
@@ -149,46 +173,38 @@
         // come off the same generator; runs on mismatched versions are not
         // comparable, which is a trap this pin exists to close.
         //
-        // **A commit on `main` (2.3.0), not a tag, and that is a
-        // deliberate exception to the paragraph above.** The comparability
-        // rule wants this pin to match zoxy-io/benchmark's, and right now
-        // it does not: the benchmark repo still runs v2.1.0. So a local
-        // band measured today is **not comparable to a fleet number**
-        // until that repo moves. Read the nightly report, not a local
-        // figure, while this says so.
+        // **A tag, v3.0.1, and still an exception to the paragraph
+        // above.** The comparability rule wants this pin to match
+        // zoxy-io/benchmark's, and it does not: the benchmark repo runs
+        // v2.4.2. So a local band measured today is **not comparable to a
+        // fleet number** until that repo moves. Read the nightly report,
+        // not a local figure, while this says so.
         //
-        // It moved anyway because the alternative was worse. zrk swapped
-        // ztls and its own `openssl` pin for zssl (zoxy-io/zrk 3183923),
-        // and pins the *same* zssl commit this file does. Held at v2.1.0
-        // instead, `zoxy-profile-harness` would link zrk's ztls over the
-        // pre-split openssl beside zoxy's zssl over the split one — two
-        // pins of the same C library, with different artifact names, in
-        // the one binary whose job is producing trustworthy measurements.
-        // That is the hazard v2.1.0 was itself chosen to close, in the
-        // BoringSSL form; this is the same trap wearing the next mask.
+        // It moved because it had to: no 2.x builds on Zig 0.17, and
+        // v3.0.1 is the first release that does (zoxy-io/zrk#99). It is a
+        // major version — HTTP/2 and HTTP/3 clients, wrk-style Lua scripts
+        // on LuaJIT, a Workload interface — and none of that is reached
+        // from here. bench/run.zig and bench/profile.zig compiled against
+        // it unchanged, and every field 3.0 added to `cli.Config` defaults
+        // off (`http2`, `http3`, `workload` and `script_path` null,
+        // `streams` 1), so the bands are still HTTP/1.1 from the same
+        // runner. What does reach here is LuaJIT's build: C, compiled into
+        // both harnesses. A C surface in the *measurement* binaries, never
+        // the proxy — no `src/` file imports zrk.
         //
-        // Both sides resolved to one zssl and one libcrypto when this
-        // line was written. **Half of that is no longer true**: zoxy's
-        // zssl moved to 91a985a and this zrk pin still carries 992ee9d,
-        // so the two are one zssl apart until zrk repins. What keeps it
-        // harmless is that neither binary holds both — `zoxy-bench` and
-        // `zoxy-profile-harness` name zrk's zssl, the proxy under test
-        // is a separate process, and the harness imports
-        // `src/constants.zig` as a leaf rather than the `zoxy` module
-        // (see build.zig, where the reason is squarely the optimize-mode
-        // module collision). One libcrypto still holds outright: both
-        // zssl commits pin the same zoxy-io/openssl this file does.
-        // Comparability is unaffected either way — it is a property of
-        // the *generator*, and zrk's own TLS is what a client's would
-        // be. Bring the two back together when zrk moves.
+        // The zssl gap the previous record left open is closed: v3.0.1
+        // pins zssl 827c7e5, the commit this file pins, and both reach the
+        // one zoxy-io/openssl 0377b65. The optimize-mode collision that
+        // keeps `zoxy-profile-harness` off the `zoxy` module (see
+        // build.zig) is unaffected and still reason enough on its own.
         //
-        // The zio bump beside it is not optional. zrk carries zio 0.17.0 at
-        // 3820667, and the rule below — that this file's zio must be
+        // The zio bump beside it is not optional. zrk carries zio 0.20.1 at
+        // c0a6b58, and the rule below — that this file's zio must be
         // *exactly* zrk's — is what keeps the harness and zrk's runner on
         // one runtime.
         .zrk = .{
-            .url = "git+https://github.com/zoxy-io/zrk?ref=main#391145c959dcd87b6a625126f533fa5c385a83a1",
-            .hash = "zrk-2.3.0-WqdFO8ivBgAuhlauaaH-f0kFVtb7HN-Whto424YYd2AT",
+            .url = "git+https://github.com/zoxy-io/zrk?ref=v3.0.1#518e5d2f2a2da91d148100312722d9ee6ce76667",
+            .hash = "zrk-3.0.1-WqdFOyTkDQCqDocn7xp4MLGWm_lQOzlEExpy41dEUBio",
             // Lazy, and only asked for under -Dbench (the default): see
             // `addLoadGenerator` in build.zig for why both halves are needed.
             .lazy = true,
@@ -204,15 +220,16 @@
         // not patch is a second thing to keep in sync with zrk's pin, and
         // the only way it can differ from upstream is by being wrong.
         //
-        // 3820667 is what zrk 2.3.0 carries — which is the only reason
-        // this line has that value. It moved with the zrk bump above and
-        // for no other reason; the lockstep rule is the whole content of
+        // c0a6b58 (v0.20.1) is what zrk v3.0.1 carries — which is the only
+        // reason this line has that value. It moved with the zrk bump above
+        // and for no other reason; the lockstep rule is the whole content of
         // this pin.
         //
-        // It is 121 commits ahead of the b822fda this used to pin, and zero
-        // behind, so the fix that pin existed for is contained rather than
-        // lost: zio#628, "flush a full submission queue instead of dropping
-        // SQEs". Before it, zio dropped a cancel when the io_uring SQ was
+        // It is 202 commits ahead of the 3820667 this used to pin, and zero
+        // behind (`compare/3820667...c0a6b58`). That one was itself 121
+        // ahead of b822fda and zero behind, so the fix b822fda was pinned
+        // for is still contained rather than lost: zio#628, "flush a full
+        // submission queue instead of dropping SQEs". Before it, zio dropped a cancel when the io_uring SQ was
         // full, leaving the target completion stuck `.running` forever and the
         // awaiting task blocked with it — which a c10k load reaches reliably,
         // since ten thousand per-operation timeouts expiring together submit
@@ -220,8 +237,8 @@
         // `compare/b822fda...df666c2` before moving, because "the fix is still
         // in there" is exactly the assumption a bump is where you lose.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=main#38206678edca2abf4e27ce18bb963bfa6f4297ab",
-            .hash = "zio-0.17.0-xHbVVK-DKABkbm_XZgK-21SgNvYr9U5zr1MgOw7Q6JtM",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#c0a6b5877c9bbc71d2d2c0b3374ce7fa61a4ec12",
+            .hash = "zio-0.20.1-xHbVVI0wLwDgE2dXWDCWH0UfCQYEhnBYHs1Td12oAGeR",
             // Lazy, and only asked for under -Dbench (the default): see
             // `addLoadGenerator` in build.zig for why both halves are needed.
             .lazy = true,
@@ -229,6 +246,14 @@
         // Audited fork: zoxy-io/hparse, pinned by content hash; the pin
         // moves only after re-audit, and the paragraphs below are that
         // record.
+        //
+        // Re-audit for 7f57ef8 (Zig 0.17), 2026-11-13: one commit on, and no
+        // verdict moves. Its whole `src/root.zig` delta is the `keys` and
+        // `values` span defaults spelled `@splat(.{})` instead of
+        // `** max_headers`. Everything else is harness — the fuzz target's
+        // two `@cImport`s become translated modules and the vendored fuzz
+        // test runner is deleted — and none of it links here. No table is
+        // in the diff.
         //
         // Re-audit for 2dcaf45, six commits on and performance only. Two of
         // them never reach this build — 2f2c6cd re-measures the README, 0db3856
@@ -411,8 +436,8 @@
         // terminator and one-shot parses a head already known to be
         // complete, and the comment there says why.
         .hparse = .{
-            .url = "git+https://github.com/zoxy-io/hparse#2dcaf4599dcd22628fcc6b7c5ea7a666d2ac8cc1",
-            .hash = "hparse-0.2.0-IukW0vD7AwCZKtRWydtUnnrsIsiHHYvVNPRsyty5M7GX",
+            .url = "git+https://github.com/zoxy-io/hparse#7f57ef8183f15ebd62f5f9ca631f69a9afdbc421",
+            .hash = "hparse-0.2.0-IukW0jqfAwDmg7ZWyJSUjHGaocYJuqDaNIo8A9URJOjo",
         },
         // libcrypto, built by Zig rather than found on the system.
         //
@@ -460,6 +485,33 @@
         // What it costs: this tree is now the audit surface. zssl's own
         // gates are the evidence, and the paragraphs below are the
         // record of reading them.
+        //
+        // Re-audit for 827c7e5 (Zig 0.17), 2026-11-13 — the commit zrk
+        // v3.0.1 pins, which puts the two back on one zssl (see zrk
+        // above). Six commits on from 91a985a, read for what reaches zoxy:
+        //
+        //   - 827c7e5 is the port. zssl's one `@cImport` became a
+        //     translated module, `libcrypto`, which zssl's build.zig makes
+        //     from the headers of the same zoxy-io/openssl pin this file
+        //     carries — one libcrypto still, and now one header tree. The
+        //     rest is `**`, reflection and builtin renames.
+        //   - a9f5638 is the one on zoxy's serving path: the server's
+        //     `awaiting_finished` splits into WAIT_CERT, WAIT_CV and
+        //     WAIT_FINISHED (#18). zoxy sets no `client_auth`, so
+        //     `afterServerFlight` answers `.awaiting_finished` exactly as
+        //     the assignment it replaced did, and `awaitingClientFlight()`
+        //     admits the states the old switch listed. No alert moves.
+        //   - d2ee876, f249ad9 and c68966b are the client's: Appendix
+        //     A.1's flight order in the state type, a bare Finished
+        //     standing in for EncryptedExtensions refused, and an empty
+        //     ticket nonce accepted. zoxy reaches `ClientHandshake` only
+        //     from tests — `TestClient`, the engine and heap-proof tests —
+        //     and they pass.
+        //   - 911ed54 is bench prose.
+        //
+        // What it costs: nothing. `zoxy --check` on a TLS config prices
+        // `tls engines 1024 x 94448 B`, the line v0.9.0 prints, so
+        // `@sizeOf(Engine)` and §5's ~92 KiB stand.
         //
         // Re-audit for 91a985a, signed off 2026-08-31, and the largest
         // single move this pin will ever make: ~130 commits, +11k lines
@@ -556,8 +608,8 @@
         // RFC 8446 §4.3.2's CertificateRequest, RFC 5705 exporters, and
         // 0-RTT with the strike register RFC 8446 §8.2 needs.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#91a985a4a1b408702d36e14986211cbc29953e9f",
-            .hash = "zssl-0.0.1-5ocyiNepEAAWCUGlH-CSBBwkdmjUf31MPSjD-hk5QRCo",
+            .url = "git+https://github.com/zoxy-io/zssl#827c7e5002aef45cc2a14f99200bdf288f4a0f0c",
+            .hash = "zssl-0.0.1-5ocyiJXbEACoixJ3negjZSa8wikXraZUW4VPpKKa_5bO",
         },
     },
     .paths = .{

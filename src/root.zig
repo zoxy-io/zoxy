@@ -62,6 +62,8 @@ pub const tls = struct {
 pub const testing = struct {
     pub const Origin = @import("testing/origin.zig").Origin;
     pub const Mode = @import("testing/origin.zig").Mode;
+    /// Comptime byte repetition, for the simulator's canned wire bytes.
+    pub const repeat = @import("testing/bytes.zig").repeat;
 };
 
 test {
@@ -94,6 +96,7 @@ test {
     _ = @import("net/relay.zig");
     _ = @import("net/upstream.zig");
     _ = @import("testing/origin.zig");
+    _ = @import("testing/bytes.zig");
     _ = @import("net/pump_transform_test.zig");
     _ = @import("io/contract_test.zig");
     _ = @import("io/sim_io_test.zig");

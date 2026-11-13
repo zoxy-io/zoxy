@@ -40,6 +40,7 @@ const Credentials = @import("tls/Credentials.zig");
 const TlsClient = @import("tls/TestClient.zig").TestClient(SimIo);
 
 const assert = std.debug.assert;
+const repeat = @import("testing/bytes.zig").repeat;
 
 // The throwaway self-signed fixtures (`tls/testdata/README.md`),
 // embedded rather than read: this file runs under the Io seam.
@@ -1031,7 +1032,7 @@ test "l7: oversize request line is 414, oversize header section is 431" {
         try bed.setUp(std.testing.allocator, .{ .seed = 2 });
         defer bed.tearDown();
 
-        const long_target = "/" ++ ("a" ** 9000);
+        const long_target = "/" ++ repeat("a", 9000);
         try bed.exchange("GET " ++ long_target ++ " HTTP/1.1\r\n");
 
         try std.testing.expectEqualStrings(
@@ -1046,7 +1047,7 @@ test "l7: oversize request line is 414, oversize header section is 431" {
         try bed.setUp(std.testing.allocator, .{ .seed = 3 });
         defer bed.tearDown();
 
-        const filler = "X-Filler: " ++ ("v" ** 200) ++ "\r\n";
+        const filler = "X-Filler: " ++ repeat("v", 200) ++ "\r\n";
         var request: [10000]u8 = undefined;
         var len: usize = 0;
         const prefix = "GET / HTTP/1.1\r\nHost: a\r\n";
@@ -1130,9 +1131,9 @@ test "l7: a head that fits on arrival but not after forwarding is 431" {
         // arrival size is what rejects it.
         const rules = [_]filter.Rule{.{
             .match = .{},
-            .actions = &.{.{ .rewrite_prefix = .{ .from = "/r", .to = "/" ++ ("b" ** 5000) } }},
+            .actions = &.{.{ .rewrite_prefix = .{ .from = "/r", .to = "/" ++ repeat("b", 5000) } }},
         }};
-        const request = "GET /r/" ++ ("c" ** 4000) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
+        const request = "GET /r/" ++ repeat("c", 4000) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
 
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{
@@ -2026,7 +2027,7 @@ test "l7: the configured head size is the accepted head size" {
 
     // 1100 path bytes: past the 1024 buffer with no newline in sight —
     // the request line alone overflows, which is the 414 shape.
-    const oversize = "GET /" ++ ("a" ** 1100) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
+    const oversize = "GET /" ++ repeat("a", 1100) ++ " HTTP/1.1\r\nHost: o\r\n\r\n";
     bed.client2.send_delay_ms = 50;
     bed.client2.request = oversize;
     bed.client2.start(&bed.sim_io, &bed.server, Http1Bed.bindAddress());
@@ -2763,7 +2764,7 @@ test "l7: an origin response head the proxy cannot parse is 502" {
         // nowhere to land.
         const unterminated = "HTTP/1.1 200 OK\r\nX-Pad: ";
         const response = unterminated ++
-            ("p" ** (constants.head_buffer_bytes_default - unterminated.len));
+            repeat("p", constants.head_buffer_bytes_default - unterminated.len);
 
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, .{ .seed = 8, .origin_response = response });
@@ -5485,7 +5486,7 @@ test "l7: a terminated listener honours the configured head limit" {
 
     // A header section comfortably over the 1 KiB limit and comfortably
     // under the engine's 32 KiB buffer — the window the bug lived in.
-    const filler = "X-Pad: " ++ ("p" ** 2000) ++ "\r\n";
+    const filler = "X-Pad: " ++ repeat("p", 2000) ++ "\r\n";
     const request = "GET /x HTTP/1.1\r\nHost: o\r\n" ++ filler ++ "\r\n";
 
     var client: TlsClient = undefined;
@@ -5912,7 +5913,7 @@ test "l7: an origin that only ever sends interims is cut at the bound" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
         .seed = 302,
-        .origin_response = "HTTP/1.1 103 Early Hints\r\n\r\n" ** 12,
+        .origin_response = repeat("HTTP/1.1 103 Early Hints\r\n\r\n", 12),
     });
     defer bed.tearDown();
 
@@ -6241,7 +6242,7 @@ test "l7: a declared body over the cap is refused before the origin is dialed" {
     defer bed.tearDown();
 
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
-        "Content-Length: 64\r\n\r\n" ++ ("x" ** 64));
+        "Content-Length: 64\r\n\r\n" ++ repeat("x", 64));
 
     try std.testing.expectEqualStrings(
         "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n" ++ expected_date ++ "Connection: close\r\n\r\n",
@@ -6272,8 +6273,8 @@ test "l7: a chunked body cannot slip past the cap by announcing no size" {
     // Two 16-byte chunks: the first already passes the 8-byte cap.
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
         "Transfer-Encoding: chunked\r\n\r\n" ++
-        "10\r\n" ++ ("x" ** 16) ++ "\r\n" ++
-        "10\r\n" ++ ("y" ** 16) ++ "\r\n0\r\n\r\n");
+        "10\r\n" ++ repeat("x", 16) ++ "\r\n" ++
+        "10\r\n" ++ repeat("y", 16) ++ "\r\n0\r\n\r\n");
 
     // Coalesced with its head, so the cap is met before the response leg
     // is armed and the client still earns a status. A body large enough
@@ -6303,7 +6304,7 @@ test "l7: a body under the cap, and an opted-out listener, are untouched" {
     defer bed.tearDown();
 
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
-        "Content-Length: 64\r\nConnection: close\r\n\r\n" ++ ("x" ** 64));
+        "Content-Length: 64\r\nConnection: close\r\n\r\n" ++ repeat("x", 64));
 
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
@@ -6334,7 +6335,7 @@ test "l7: a chunked body that outgrows the cap while streaming is cut" {
     // reaches the body pump rather than riding in with the head.
     try bed.exchange("POST /upload HTTP/1.1\r\nHost: o\r\n" ++
         "Transfer-Encoding: chunked\r\n\r\n" ++
-        "6000\r\n" ++ ("z" ** 24576) ++ "\r\n0\r\n\r\n");
+        "6000\r\n" ++ repeat("z", 24576) ++ "\r\n0\r\n\r\n");
 
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_cut_mid_stream"));
     // Not the answered rung, and not a framing verdict: the body was

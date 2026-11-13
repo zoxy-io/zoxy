@@ -34,6 +34,7 @@ const constants = @import("constants.zig");
 const Io = @import("io/io.zig");
 
 const assert = std.debug.assert;
+const repeat = @import("testing/bytes.zig").repeat;
 
 /// What a line describes. The two data paths answer different questions —
 /// an HTTP line is about one request, an L4 line about one connection —
@@ -758,7 +759,7 @@ test "access log: a line at every cap still fits the bound (#140)" {
     // Control bytes: JSON's 6x worst case, which is what the per-header
     // term budgets for.
     @memset(value, 0x01);
-    const name = "x" ** constants.access_log_header_name_bytes_max;
+    const name = repeat("x", constants.access_log_header_name_bytes_max);
 
     var names: [constants.access_log_headers_max][]const u8 = undefined;
     var values: [constants.access_log_headers_max][]const u8 = undefined;
@@ -776,8 +777,8 @@ test "access log: a line at every cap still fits the bound (#140)" {
     var entry = testRecord();
     entry.path = path;
     entry.host = host;
-    entry.method = "M" ** constants.access_log_method_bytes_max;
-    entry.cluster = "c" ** constants.cluster_name_bytes_max;
+    entry.method = repeat("M", constants.access_log_method_bytes_max);
+    entry.cluster = repeat("c", constants.cluster_name_bytes_max);
     entry.client = try std.Io.net.IpAddress.parseLiteral("[2001:db8::1]:65535");
     entry.upstream = .{ .ip = try std.Io.net.IpAddress.parseLiteral("[2001:db8::2]:65535") };
     entry.duration_ns = std.math.maxInt(u64);

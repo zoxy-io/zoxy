@@ -160,7 +160,7 @@ pub fn seal(
     var payload: [payload_bytes]u8 = @splat(0);
     payload[0] = @intCast(psk.len);
     @memcpy(payload[1..][0..psk.len], psk);
-    std.mem.writeInt(u16, payload[1 + psk_bytes_max ..][0..2], @intFromEnum(suite), .big);
+    std.mem.writeInt(u16, payload[1 + psk_bytes_max ..][0..2], @backingInt(suite), .big);
     std.mem.writeInt(u64, payload[1 + psk_bytes_max + 2 ..][0..8], now_unix, .big);
 
     const slot = &tickets.slots[tickets.current];
@@ -251,7 +251,7 @@ test "tickets: a sealed ticket opens to what went into it" {
     tickets.init();
     tickets.rotate(testKey(0x11), 0);
 
-    const psk = [_]u8{0xab} ** 32;
+    const psk: [32]u8 = @splat(0xab);
     var buf: [ticket_bytes]u8 = undefined;
     const ticket = try tickets.seal(&buf, &psk, .aes_128_gcm_sha256, 1000, @splat(7));
 
@@ -268,7 +268,7 @@ test "tickets: sealing needs a key" {
     var buf: [ticket_bytes]u8 = undefined;
     try testing.expectError(
         error.NoKey,
-        tickets.seal(&buf, &[_]u8{0x01} ** 32, .aes_128_gcm_sha256, 0, @splat(0)),
+        tickets.seal(&buf, &@as([32]u8, @splat(0x01)), .aes_128_gcm_sha256, 0, @splat(0)),
     );
 }
 
@@ -307,7 +307,7 @@ test "tickets: a wall clock that steps backwards does not rotate every seal" {
     // And the key still seals while the clock is behind: rotation being
     // undue is not the same as the key being unusable.
     var buf: [ticket_bytes]u8 = undefined;
-    _ = try tickets.seal(&buf, &[_]u8{0xab} ** 32, .aes_128_gcm_sha256, 1_000_000, @splat(2));
+    _ = try tickets.seal(&buf, &@as([32]u8, @splat(0xab)), .aes_128_gcm_sha256, 1_000_000, @splat(2));
 }
 
 test "tickets: a ticket outlives one rotation and not two" {
@@ -315,7 +315,7 @@ test "tickets: a ticket outlives one rotation and not two" {
     tickets.init();
     tickets.rotate(testKey(0x11), 0);
 
-    const psk = [_]u8{0xcd} ** 32;
+    const psk: [32]u8 = @splat(0xcd);
     var buf: [ticket_bytes]u8 = undefined;
     const sealed = try tickets.seal(&buf, &psk, .aes_128_gcm_sha256, 100, @splat(1));
     var ticket: [ticket_bytes]u8 = undefined;
@@ -339,7 +339,7 @@ test "tickets: an expired ticket does not open" {
     tickets.rotate(testKey(0x44), 0);
 
     var buf: [ticket_bytes]u8 = undefined;
-    const ticket = try tickets.seal(&buf, &[_]u8{0x01} ** 32, .aes_128_gcm_sha256, 100, @splat(2));
+    const ticket = try tickets.seal(&buf, &@as([32]u8, @splat(0x01)), .aes_128_gcm_sha256, 100, @splat(2));
 
     var psk_out: [psk_bytes_max]u8 = undefined;
     try testing.expect(tickets.open(ticket, &psk_out, 100 + 3600, 3600) != null);
@@ -354,7 +354,7 @@ test "tickets: a tampered ticket does not open" {
     tickets.rotate(testKey(0x55), 0);
 
     var buf: [ticket_bytes]u8 = undefined;
-    const sealed = try tickets.seal(&buf, &[_]u8{0x02} ** 32, .aes_128_gcm_sha256, 0, @splat(3));
+    const sealed = try tickets.seal(&buf, &@as([32]u8, @splat(0x02)), .aes_128_gcm_sha256, 0, @splat(3));
     var psk_out: [psk_bytes_max]u8 = undefined;
 
     // Every byte matters: the key id is authenticated data, the rest is
@@ -376,7 +376,7 @@ test "tickets: a ticket from another server does not open" {
     theirs.rotate(testKey(0x77), 0);
 
     var buf: [ticket_bytes]u8 = undefined;
-    const ticket = try theirs.seal(&buf, &[_]u8{0x03} ** 32, .aes_128_gcm_sha256, 0, @splat(4));
+    const ticket = try theirs.seal(&buf, &@as([32]u8, @splat(0x03)), .aes_128_gcm_sha256, 0, @splat(4));
 
     var psk_out: [psk_bytes_max]u8 = undefined;
     try testing.expect(mine.open(ticket, &psk_out, 0, 3600) == null);
@@ -388,8 +388,8 @@ test "tickets: a wrong-sized identity is not a ticket" {
     tickets.rotate(testKey(0x88), 0);
     var psk_out: [psk_bytes_max]u8 = undefined;
     try testing.expect(tickets.open(&.{}, &psk_out, 0, 3600) == null);
-    try testing.expect(tickets.open(&[_]u8{0} ** 8, &psk_out, 0, 3600) == null);
-    try testing.expect(tickets.open(&[_]u8{0} ** 512, &psk_out, 0, 3600) == null);
+    try testing.expect(tickets.open(&@as([8]u8, @splat(0)), &psk_out, 0, 3600) == null);
+    try testing.expect(tickets.open(&@as([512]u8, @splat(0)), &psk_out, 0, 3600) == null);
 }
 
 test "tickets: a ticket's length says nothing about the suite" {
@@ -399,7 +399,7 @@ test "tickets: a ticket's length says nothing about the suite" {
 
     var short_buf: [ticket_bytes]u8 = undefined;
     var long_buf: [ticket_bytes]u8 = undefined;
-    const short = try tickets.seal(&short_buf, &[_]u8{1} ** 32, .aes_128_gcm_sha256, 0, @splat(5));
-    const long = try tickets.seal(&long_buf, &[_]u8{2} ** 48, .aes_256_gcm_sha384, 0, @splat(6));
+    const short = try tickets.seal(&short_buf, &@as([32]u8, @splat(1)), .aes_128_gcm_sha256, 0, @splat(5));
+    const long = try tickets.seal(&long_buf, &@as([48]u8, @splat(2)), .aes_256_gcm_sha384, 0, @splat(6));
     try testing.expectEqual(short.len, long.len);
 }

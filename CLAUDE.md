@@ -1,6 +1,6 @@
 # zoxy
 
-Bullet-proof L4/L7 proxy in Zig 0.16 (toolchain pinned via devenv/Nix;
+Bullet-proof L4/L7 proxy in Zig 0.17 (toolchain pinned via devenv/Nix;
 direnv activates the shell). Read before writing code:
 
 - [docs/DESIGN.md](docs/DESIGN.md) — the settled design: what's shipped

@@ -330,7 +330,7 @@ const Builder = struct {
         b.byte(handshake_type_client_hello);
         b.slice(&.{ 0, 0, 0 }); // patched below
         b.int16(0x0303);
-        b.slice(&[_]u8{0} ** 32); // random
+        b.slice(&@as([32]u8, @splat(0))); // random
         b.byte(0); // legacy_session_id: empty
         b.int16(0); // cipher_suites: empty
         b.byte(0); // legacy_compression_methods: empty
@@ -454,7 +454,7 @@ test "client_hello: malformed bodies are refused, never trapped" {
     // A record longer than the cap: the peer's number, refused by ours.
     {
         var bytes: [16]u8 = .{ record_type_handshake, 0x03, 0x01, 0xFF, 0xFF } ++
-            [_]u8{0} ** 11;
+            @as([11]u8, @splat(0));
         try testing.expect(parse(&bytes) == .invalid);
     }
     // An empty host_name names nothing, which RFC 6066 forbids.

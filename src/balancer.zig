@@ -933,10 +933,10 @@ const test_counts_len = test_keys.count;
 
 /// The no-prober baseline every pre-mask test picks through: all healthy,
 /// exactly what `Checker.init` hands a server whose clusters never check.
-const test_healthy_all = [_]bool{true} ** test_keys.count;
+const test_healthy_all: [test_keys.count]bool = @splat(true);
 
 /// The L4 half of the load view, all zero: what a pure-L7 test sees.
-const test_l4_idle = [_]u16{0} ** test_keys.count;
+const test_l4_idle: [test_keys.count]u16 = @splat(0);
 
 /// A load view over an L7 lease table, for the tests that only vary
 /// that half. The pair-of-tables shape is what production passes.
@@ -997,7 +997,7 @@ test "balancer: rr cycles endpoints and wraps per cluster" {
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
     // Rotation is exact whatever the load table says: rr ignores it.
-    var counts = [_]u16{0} ** test_counts_len;
+    var counts: [test_counts_len]u16 = @splat(0);
     counts[test_keys.key(0, 0)] = 100;
     const expected = [_]u16{ 0, 1, 2, 0, 1 };
     for (expected) |want_index| {
@@ -1021,7 +1021,7 @@ test "balancer: a single-endpoint cluster short-circuits without a draw" {
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
     const state_before = balancer.pick_state;
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     var round: u32 = 0;
     while (round < 10) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none, test_untried).dial;
@@ -1050,7 +1050,7 @@ test "balancer: p2c prefers the less-loaded of its two candidates" {
     // Endpoint 1 is drowning; 0 and 2 are idle. Whatever pair is drawn,
     // the pick must never be the drowning endpoint: any pair containing
     // it also contains an idle endpoint that wins the comparison.
-    var counts = [_]u16{0} ** test_counts_len;
+    var counts: [test_counts_len]u16 = @splat(0);
     counts[test_keys.key(0, 1)] = 100;
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
@@ -1076,8 +1076,8 @@ test "balancer: p2c spreads across endpoints under equal load" {
 
     // With every count equal the tie rule keeps the first candidate — a
     // uniform draw — so all endpoints must be hit over a modest run.
-    const counts = [_]u16{0} ** test_counts_len;
-    var hits = [_]u32{0} ** 3;
+    const counts: [test_counts_len]u16 = @splat(0);
+    var hits: [3]u32 = @splat(0);
     var round: u32 = 0;
     while (round < 300) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none, test_untried).dial;
@@ -1108,7 +1108,7 @@ test "balancer: same seed, same picks — the p2c draw is deterministic" {
 
     // The simulator replays every seed twice and hashes the traces (§9);
     // two same-seed balancers must agree draw for draw.
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     var round: u32 = 0;
     while (round < 100) : (round += 1) {
         try std.testing.expectEqual(
@@ -1137,7 +1137,7 @@ test "balancer: rr rotates over the healthy endpoints only" {
     // never the ejected one.
     var healthy = test_healthy_all;
     healthy[test_keys.key(0, 1)] = false;
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const expected = [_]u16{ 0, 2, 0, 2, 0 };
     for (expected) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
@@ -1164,7 +1164,7 @@ test "balancer: rr honors weights, and the schedule is smooth" {
     // endpoint's hits are spread through the cycle (0,1,0), not bunched
     // (0,0,1): the "smooth" in smooth WRR, which is what keeps a weight-3
     // backend from taking three consecutive requests as one burst.
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const expected = [_]u16{ 0, 1, 0, 0, 1, 0 };
     for (expected) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none, test_untried).dial;
@@ -1190,7 +1190,7 @@ test "balancer: rr weight zero drains an endpoint, past fail-open" {
 
     // The drained endpoint never rotates in: the survivors alternate as
     // if the cluster had two endpoints.
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const expected = [_]u16{ 0, 2, 0, 2 };
     for (expected) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none, test_untried).dial;
@@ -1199,7 +1199,7 @@ test "balancer: rr weight zero drains an endpoint, past fail-open" {
     // Fail-open re-admits the ejected, never the drained: a weight of 0
     // is the operator's statement, not a probe's verdict, so even a
     // fully-ejected cluster keeps routing around it.
-    const none_healthy = [_]bool{false} ** test_keys.count;
+    const none_healthy: [test_keys.count]bool = @splat(false);
     var round: u32 = 0;
     while (round < 20) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &none_healthy, &test_client, .none, test_untried).dial;
@@ -1227,8 +1227,8 @@ test "balancer: p2c candidacy follows weight" {
     // pick distribution is the candidacy distribution — and candidacy is
     // the weighted draw. The 8-weight endpoint must dominate, and the
     // 1-weight endpoints must still appear: bias, not exclusion.
-    const counts = [_]u16{0} ** test_counts_len;
-    var hits = [_]u32{0} ** 3;
+    const counts: [test_counts_len]u16 = @splat(0);
+    var hits: [3]u32 = @splat(0);
     var round: u32 = 0;
     while (round < 400) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none, test_untried).dial;
@@ -1267,7 +1267,7 @@ test "balancer: p2c at unit weights draws exactly as the unweighted form" {
     var spelled: Balancer = undefined;
     try spelled.init(spelled_arena.allocator(), &spelled_config, testKeysFor(&spelled_config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     var round: u32 = 0;
     while (round < 100) : (round += 1) {
         try std.testing.expectEqual(
@@ -1297,7 +1297,7 @@ test "balancer: p2c never picks an ejected endpoint" {
     // health outranks load (§7).
     var healthy = test_healthy_all;
     healthy[test_keys.key(0, 1)] = false;
-    var counts = [_]u16{0} ** test_counts_len;
+    var counts: [test_counts_len]u16 = @splat(0);
     counts[test_keys.key(0, 0)] = 50;
     counts[test_keys.key(0, 2)] = 50;
     var round: u32 = 0;
@@ -1326,7 +1326,7 @@ test "balancer: p2c narrowed to one healthy endpoint spends no draw" {
     // the same no-draw rule as a single-endpoint cluster.
     var healthy = test_healthy_all;
     healthy[test_keys.key(0, 0)] = false;
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     var round: u32 = 0;
     while (round < 10) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
@@ -1356,7 +1356,7 @@ test "balancer: a fully-ejected cluster fails open to every endpoint" {
     healthy[test_keys.key(0, 0)] = false;
     healthy[test_keys.key(0, 1)] = false;
     healthy[test_keys.key(0, 2)] = false;
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const expected = [_]u16{ 0, 1, 2, 0, 1 };
     for (expected) |want_index| {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, test_untried).dial;
@@ -1381,7 +1381,7 @@ test "balancer: policies keep independent state across clusters" {
 
     // Interleaving a p2c cluster's draws must not perturb the rr
     // cluster's rotation: cursor and PRNG are separate state.
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const expected = [_]u16{ 0, 1, 0, 1, 0 };
     for (expected) |want_index| {
         try std.testing.expectEqual(want_index, balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .none, test_untried).dial.endpoint_index);
@@ -1420,7 +1420,7 @@ test "balancer: hash sends one client to one endpoint, every time" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const client = testAddress("203.0.113.9:51000");
     const first = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &client, .none, test_untried).dial.endpoint_index;
     var round: u32 = 0;
@@ -1431,7 +1431,7 @@ test "balancer: hash sends one client to one endpoint, every time" {
     }
     // The load table is what p2c reads; hash must ignore it, or two
     // processes under different load would disagree about one client.
-    var loaded = [_]u16{0} ** test_counts_len;
+    var loaded: [test_counts_len]u16 = @splat(0);
     loaded[test_keys.key(0, first)] = 10_000;
     try std.testing.expectEqual(
         first,
@@ -1453,7 +1453,7 @@ test "balancer: hash spends no PRNG state and needs none" {
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
     const state_before = balancer.pick_state;
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     var index: u16 = 0;
     while (index < 500) : (index += 1) {
         _ = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none, test_untried);
@@ -1472,9 +1472,9 @@ test "balancer: hash spreads distinct clients across every endpoint" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const clients: u16 = 4000;
-    var hits = [_]u32{0} ** 8;
+    var hits: [8]u32 = @splat(0);
     var index: u16 = 0;
     while (index < clients) : (index += 1) {
         hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none, test_untried).dial.endpoint_index] += 1;
@@ -1506,7 +1506,7 @@ test "balancer: ejecting an endpoint moves its clients and nobody else's" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const clients: u16 = 4000;
     var before: [clients]u16 = undefined;
     var index: u16 = 0;
@@ -1570,9 +1570,9 @@ test "balancer: hash spreads clients in proportion to weight" {
     // Replica-max scoring holds the argmax for weight/total of the key
     // space, so a 3:1 pair splits clients ~3:1 — not the ~3.4:1 that
     // naive score *scaling* gives, which is why the replicas exist.
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const clients: u16 = 4000;
-    var hits = [_]u32{0} ** 2;
+    var hits: [2]u32 = @splat(0);
     var index: u16 = 0;
     while (index < clients) : (index += 1) {
         hits[balancer.pick(0, &testLoad(&counts), &test_healthy_all, &testClientAt(index), .none, test_untried).dial.endpoint_index] += 1;
@@ -1593,7 +1593,7 @@ test "balancer: re-weighting an endpoint disrupts only the clients it gains" {
     const flat_clusters = [_]config_module.Config.Cluster{
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
-    var weights = [_]u16{1} ** 8;
+    var weights: [8]u16 = @splat(1);
     weights[3] = 2;
     const weighted_clusters = [_]config_module.Config.Cluster{
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash, .weights = &weights },
@@ -1610,7 +1610,7 @@ test "balancer: re-weighting an endpoint disrupts only the clients it gains" {
     var weighted: Balancer = undefined;
     try weighted.init(weighted_arena.allocator(), &weighted_config, testKeysFor(&weighted_config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const clients: u16 = 4000;
     var moved: u32 = 0;
     var index: u16 = 0;
@@ -1634,7 +1634,7 @@ test "balancer: hash weight zero drains an endpoint, past fail-open" {
     const flat_clusters = [_]config_module.Config.Cluster{
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash },
     };
-    var weights = [_]u16{1} ** 8;
+    var weights: [8]u16 = @splat(1);
     weights[3] = 0;
     const drained_clusters = [_]config_module.Config.Cluster{
         .{ .name = "sticky", .endpoints = &endpoints, .pick = .hash, .weights = &weights },
@@ -1655,8 +1655,8 @@ test "balancer: hash weight zero drains an endpoint, past fail-open" {
     // drained endpoint's clients move, and the mapping is what the
     // healthy-mask ejection of the same endpoint produces — the next
     // replica down the same preference order.
-    const counts = [_]u16{0} ** test_counts_len;
-    const none_healthy = [_]bool{false} ** test_keys.count;
+    const counts: [test_counts_len]u16 = @splat(0);
+    const none_healthy: [test_keys.count]bool = @splat(false);
     var ejected_mask = test_healthy_all;
     ejected_mask[test_keys.key(0, 3)] = false;
     var index: u16 = 0;
@@ -1705,7 +1705,7 @@ test "balancer: two processes agree, and so do a config's reorderings" {
     var right: Balancer = undefined;
     try right.init(right_arena.allocator(), &reversed_config, testKeysFor(&reversed_config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     var index: u16 = 0;
     while (index < 1000) : (index += 1) {
         const client = testClientAt(index);
@@ -1731,7 +1731,7 @@ test "balancer: an IPv6 client keeps its endpoint when its /64 does" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const first = testAddress("[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:51000");
     const rotated = testAddress("[2001:db8:1:2:1111:2222:3333:4444]:52000");
     try std.testing.expectEqual(
@@ -1813,8 +1813,8 @@ test "balancer: a fully ejected hash cluster still answers, deterministically" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
-    const none_healthy = [_]bool{false} ** test_keys.count;
+    const counts: [test_counts_len]u16 = @splat(0);
+    const none_healthy: [test_keys.count]bool = @splat(false);
     var index: u16 = 0;
     while (index < 500) : (index += 1) {
         const client = testClientAt(index);
@@ -1857,7 +1857,7 @@ test "balancer: hash on a header keys on the value, not the client" {
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
     const state_before = balancer.pick_state;
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const key: Balancer.RequestKey = .{ .key = Balancer.bytesKey("tenant-a") };
     const first = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, key, test_untried).dial.endpoint_index;
     // A different client with the same header value is the same tenant:
@@ -1869,7 +1869,7 @@ test "balancer: hash on a header keys on the value, not the client" {
     );
     // Load on the winner must not move the tenant, and no PRNG state may
     // be spent: a keyed pick is a pure function, like source_ip's.
-    var loaded = [_]u16{0} ** test_counts_len;
+    var loaded: [test_counts_len]u16 = @splat(0);
     loaded[test_keys.key(0, first)] = 10_000;
     try std.testing.expectEqual(
         first,
@@ -1879,7 +1879,7 @@ test "balancer: hash on a header keys on the value, not the client" {
 
     // Distinct values are distinct tenants and must spread: a run of them
     // has to reach several endpoints, or the value is not really keying.
-    var hits = [_]u32{0} ** 8;
+    var hits: [8]u32 = @splat(0);
     var tenant: u16 = 0;
     while (tenant < 64) : (tenant += 1) {
         var name_buffer: [16]u8 = undefined;
@@ -1914,9 +1914,9 @@ test "balancer: a request without its keyed material places by load" {
     // any candidate pair containing the drowning endpoint also contains
     // a calmer one, so it must never win — and the idle endpoints must
     // both be reached, or this is not placement but a constant.
-    var counts = [_]u16{0} ** test_counts_len;
+    var counts: [test_counts_len]u16 = @splat(0);
     counts[test_keys.key(0, 1)] = 100;
-    var hits = [_]u32{0} ** 3;
+    var hits: [3]u32 = @splat(0);
     var round: u32 = 0;
     while (round < 200) : (round += 1) {
         const picked = balancer.pick(0, &testLoad(&counts), &test_healthy_all, &test_client, .absent, test_untried).dial;
@@ -1949,7 +1949,7 @@ test "balancer: a cookie tag names its endpoint through any load" {
     // honoured path spends no PRNG state.
     const wanted: u16 = 5;
     const tagged: Balancer.RequestKey = .{ .endpoint = balancer.endpointIdentity(0, wanted) };
-    var loaded = [_]u16{0} ** test_counts_len;
+    var loaded: [test_counts_len]u16 = @splat(0);
     loaded[test_keys.key(0, wanted)] = 10_000;
     var round: u32 = 0;
     while (round < 50) : (round += 1) {
@@ -1962,7 +1962,7 @@ test "balancer: a cookie tag names its endpoint through any load" {
 
 test "balancer: a tag naming nothing eligible re-homes by load" {
     const endpoints = testHashEndpoints(3);
-    var weights = [_]u16{1} ** 3;
+    var weights: [3]u16 = @splat(1);
     weights[2] = 0;
     const clusters = [_]config_module.Config.Cluster{
         .{
@@ -1983,7 +1983,7 @@ test "balancer: a tag naming nothing eligible re-homes by load" {
     // the endpoint was drained (#174), or the tag was forged whole. Each
     // re-homes among the eligible — "healthy and under-capacity, in that
     // order" — rather than erroring or honouring the dead letter.
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     var ejected_mask = test_healthy_all;
     ejected_mask[test_keys.key(0, 0)] = false;
     const ejected_tag: Balancer.RequestKey = .{ .endpoint = balancer.endpointIdentity(0, 0) };
@@ -2058,8 +2058,8 @@ test "balancer: p2c weighs L4 connections, not only L7 leases" {
     // spread uniformly while presenting as load-aware. Endpoint 1 is
     // drowning in relayed connections; any pair containing it also
     // contains a calmer endpoint, so it must never win.
-    const l7_idle = [_]u16{0} ** test_counts_len;
-    var l4 = [_]u16{0} ** test_counts_len;
+    const l7_idle: [test_counts_len]u16 = @splat(0);
+    var l4: [test_counts_len]u16 = @splat(0);
     l4[test_keys.key(0, 1)] = 100;
     const load: upstream.Load = .{ .l7 = &l7_idle, .l4 = &l4 };
     var round: u32 = 0;
@@ -2086,8 +2086,8 @@ test "balancer: p2c compares the sum of both protocols" {
     // carries 1 request and 9 connections. Reading either table alone
     // picks the wrong one — only the total (5 against 10) is the load
     // the origin actually feels.
-    var l7 = [_]u16{0} ** test_counts_len;
-    var l4 = [_]u16{0} ** test_counts_len;
+    var l7: [test_counts_len]u16 = @splat(0);
+    var l4: [test_counts_len]u16 = @splat(0);
     l7[test_keys.key(0, 0)] = 5;
     l7[test_keys.key(0, 1)] = 1;
     l4[test_keys.key(0, 1)] = 9;
@@ -2120,7 +2120,7 @@ test "balancer: a capped endpoint is skipped while another has room" {
     // Endpoint 0 is at its cap, endpoint 1 is not. Rotation must land on
     // 1 every time — a cap narrows the eligible set, it does not shed
     // while any endpoint can still take work.
-    var l7 = [_]u16{0} ** test_counts_len;
+    var l7: [test_counts_len]u16 = @splat(0);
     l7[test_keys.key(0, 0)] = 2;
     const load = testLoad(&l7);
     var round: u32 = 0;
@@ -2150,7 +2150,7 @@ test "balancer: a fully capped cluster refuses rather than failing open" {
     // difference from the health mask, which fails *open* — an ejected
     // cluster means "we do not know", a capped one means "we know they
     // are full", and dialing anyway is what the cap exists to stop.
-    var l7 = [_]u16{0} ** test_counts_len;
+    var l7: [test_counts_len]u16 = @splat(0);
     l7[test_keys.key(0, 0)] = 3;
     l7[test_keys.key(0, 1)] = 3;
     try std.testing.expectEqual(
@@ -2181,8 +2181,8 @@ test "balancer: the cap counts both protocols, and covers one endpoint" {
     // A single-endpoint cluster takes the fast path when uncapped; with
     // a cap it must not, or the one endpoint could never be protected.
     // Three L7 requests and one L4 connection is four: at the cap.
-    var l7 = [_]u16{0} ** test_counts_len;
-    var l4 = [_]u16{0} ** test_counts_len;
+    var l7: [test_counts_len]u16 = @splat(0);
+    var l4: [test_counts_len]u16 = @splat(0);
     l7[test_keys.key(0, 0)] = 3;
     l4[test_keys.key(0, 0)] = 1;
     const load: upstream.Load = .{ .l7 = &l7, .l4 = &l4 };
@@ -2214,7 +2214,7 @@ test "balancer: capacity is judged over the endpoints health left" {
     // healthy endpoint is full must not be handed the request anyway.
     var healthy = test_healthy_all;
     healthy[test_keys.key(0, 0)] = false;
-    var l7 = [_]u16{0} ** test_counts_len;
+    var l7: [test_counts_len]u16 = @splat(0);
     l7[test_keys.key(0, 1)] = 1;
     try std.testing.expectEqual(
         Balancer.Outcome.capped,
@@ -2245,7 +2245,7 @@ test "balancer: a tried endpoint is excluded from the retry" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     // Whatever the rotation would have handed back, the endpoint this
     // request already dialed is not it — and the retry after that skips
     // both. Every remaining pick is still a real rotation over what is
@@ -2284,7 +2284,7 @@ test "balancer: fail-open cannot resurrect the endpoint that just failed" {
     // open over, and the maybe-dead endpoint is dialed rather than none.
     var healthy = test_healthy_all;
     healthy[test_keys.key(0, 1)] = false;
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const tried = [_]u16{0};
     const retry = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, &tried).dial;
     try std.testing.expectEqual(@as(u16, 1), retry.endpoint_index);
@@ -2309,7 +2309,7 @@ test "balancer: every routable endpoint tried is exhausted, never capped" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const one_left = [_]u16{0};
     try std.testing.expectEqual(
         @as(u16, 1),
@@ -2340,7 +2340,7 @@ test "balancer: a single-endpoint cluster cannot retry" {
     // The uncapped single-endpoint fast path must not answer a retry with
     // the endpoint the retry exists to avoid — it is the one short-circuit
     // that returns before the eligible set is ever built.
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const tried = [_]u16{0};
     try std.testing.expectEqual(
         Balancer.Outcome.exhausted,
@@ -2365,7 +2365,7 @@ test "balancer: a retry whose survivors are all full is capped, not exhausted" {
     // Endpoint 0 refused; endpoint 1 is untried but at its §8 cap. The
     // two empty answers must stay apart: this is the origin carrying all
     // it agreed to (503), not the request running out of places to go.
-    var l7 = [_]u16{0} ** test_counts_len;
+    var l7: [test_counts_len]u16 = @splat(0);
     l7[test_keys.key(0, 1)] = 2;
     const tried = [_]u16{0};
     try std.testing.expectEqual(
@@ -2392,13 +2392,13 @@ test "balancer: a hash retry lands where ejection would send the key" {
     var balancer: Balancer = undefined;
     try balancer.init(balancer_arena.allocator(), &config, testKeysFor(&config));
 
-    const counts = [_]u16{0} ** test_counts_len;
+    const counts: [test_counts_len]u16 = @splat(0);
     const failed: u16 = 3;
     var healthy = test_healthy_all;
     healthy[test_keys.key(0, failed)] = false;
     const tried = [_]u16{failed};
 
-    var spread = [_]u32{0} ** 8;
+    var spread: [8]u32 = @splat(0);
     var retried: u32 = 0;
     var index: u16 = 0;
     while (index < 4000) : (index += 1) {

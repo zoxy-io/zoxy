@@ -505,8 +505,10 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     .interim_flood => {
                         // Never answers: the proxy's own bound is what
                         // ends this, which is the whole point of the mode.
-                        conn.response_bytes = canon.interim_hints **
-                            (zoxy.constants.interim_responses_max + 2);
+                        conn.response_bytes = zoxy.testing.repeat(
+                            canon.interim_hints,
+                            zoxy.constants.interim_responses_max + 2,
+                        );
                         conn.drain_only = true;
                         conn.armRecv();
                     },

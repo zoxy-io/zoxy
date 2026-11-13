@@ -688,11 +688,12 @@ fn benchPassed(
         // baseline is: haproxy missing the offer means the *offer* is wrong,
         // and a comparison against a reference that could not keep up
         // measures nothing.
-        inline for (@typeInfo(Runs).@"struct".fields) |field| {
-            comptime assert(field.type == zrk.runner.Report);
-            if (!rateHeld(band.label, field.name, offered, &@field(band.runs, field.name))) {
+        const runs_info = @typeInfo(Runs).@"struct";
+        inline for (runs_info.field_names, runs_info.field_types) |name, FieldType| {
+            comptime assert(FieldType == zrk.runner.Report);
+            if (!rateHeld(band.label, name, offered, &@field(band.runs, name))) {
                 bands_ok = false;
-                if (comptime std.mem.eql(u8, field.name, "direct")) {
+                if (comptime std.mem.eql(u8, name, "direct")) {
                     std.debug.print("       (the origin, not the proxy, is the limit here)\n", .{});
                 }
             }

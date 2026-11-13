@@ -19,9 +19,14 @@ fn guardNativeLibc(b: *std.Build, target: std.Build.ResolvedTarget, libcrypto: *
     // Only native builds probe the host. A cross target uses the libc Zig
     // ships for it and needs nothing from this machine.
     if (!target.query.isNative()) return;
+    // Both checks below read the environment, and Zig's configuration
+    // cache keys on neither it nor PATH. Left pure, a configuration made
+    // with ZIG_LIBC set would be replayed after it was unset — guard and
+    // all missing. `findProgram` poisons on its own, but only if reached.
+    b.graph.poisonCache();
     // An explicit libc description answers the same question `cc` would.
     if (b.graph.environ_map.get("ZIG_LIBC") != null) return;
-    if (b.findProgram(&.{ "cc", "gcc", "clang" }, &.{})) |_| return else |_| {}
+    if (b.findProgram(.{ .names = &.{ "cc", "gcc", "clang" } }) != null) return;
 
     libcrypto.step.dependOn(&b.addFail(
         \\no C compiler on PATH, so Zig cannot detect this machine's libc.
@@ -87,9 +92,9 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // libxev is pinned by content hash to the zoxy-io fork's
-    // zoxy-ring-flags branch: the audited upstream snapshot plus the
-    // setup-flags commit (DESIGN.md §4); see build.zig.zon. The pin moves
-    // only after re-audit.
+    // zoxy-zig-0.17 branch: upstream's Zig 0.17 port plus the six audited
+    // commits (DESIGN.md §4); see build.zig.zon. The pin moves only after
+    // re-audit.
     const xev_dependency = b.dependency("libxev", .{
         .target = target,
         .optimize = optimize,
@@ -152,7 +157,7 @@ pub fn build(b: *std.Build) void {
     libcrypto.root_module.sanitize_c = .off;
     const openssl_fast_dependency = b.dependency("openssl", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .optimize = std.lang.Optimize.safe,
     });
     const libcrypto_fast = openssl_fast_dependency.artifact("crypto");
     // Same reason, and this is the archive that matters most: the twin
@@ -213,9 +218,7 @@ pub fn build(b: *std.Build) void {
 
     const run_command = b.addRunArtifact(exe);
     run_command.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_command.addArgs(args);
-    }
+    run_command.addPassthruArgs();
     const run_step = b.step("run", "Run zoxy");
     run_step.dependOn(&run_command.step);
 
@@ -274,9 +277,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const sim_run = b.addRunArtifact(sim_exe);
-    if (b.args) |args| {
-        sim_run.addArgs(args);
-    }
+    sim_run.addPassthruArgs();
     const sim_step = b.step("sim", "Deterministic simulation: -- [seed] [iterations] | fuzz");
     sim_step.dependOn(&sim_run.step);
 
@@ -338,15 +339,13 @@ pub fn build(b: *std.Build) void {
     const smoke_run = b.addRunArtifact(smoke_exe);
     smoke_run.addArg("--zoxy");
     smoke_run.addArtifactArg(exe);
-    if (b.args) |args| {
-        smoke_run.addArgs(args);
-    }
+    smoke_run.addPassthruArgs();
     const smoke_step = b.step("smoke", "Tier-0.5 live gate: the real binary against a live origin");
     smoke_step.dependOn(&smoke_run.step);
 
     // The zoxy under test is ReleaseSafe — matching the shipped binary
     // (release.yml) — whatever -Doptimize says for the default install.
-    // ReleaseSafe still selects the LLVM backend (Zig 0.16's default for
+    // ReleaseSafe still selects the LLVM backend (Zig 0.17's default for
     // every release mode, not just ReleaseFast), so hparse's SIMD paths
     // are emitted; only a Debug/self-hosted zoxy scalarizes them and
     // would benchmark the wrong code. hparse_fast_dependency keeps its
@@ -354,17 +353,17 @@ pub fn build(b: *std.Build) void {
     // though it's no longer the *fastest* build mode.
     const hparse_fast_dependency = b.dependency("hparse", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .optimize = std.lang.Optimize.safe,
     });
     const zssl_fast_dependency = b.dependency("zssl", .{
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .optimize = std.lang.Optimize.safe,
     });
     zssl_fast_dependency.module("zssl").linkLibrary(libcrypto_fast);
     const zoxy_fast_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
@@ -381,7 +380,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{
                 .{ .name = "zoxy", .module = zoxy_fast_module },
             },
@@ -407,9 +406,7 @@ pub fn build(b: *std.Build) void {
     const smoke_release_run = b.addRunArtifact(smoke_exe);
     smoke_release_run.addArg("--zoxy");
     smoke_release_run.addArtifactArg(release_zoxy);
-    if (b.args) |args| {
-        smoke_release_run.addArgs(args);
-    }
+    smoke_release_run.addPassthruArgs();
     smoke_release_run.step.dependOn(&smoke_run.step);
     const smoke_release_step = b.step(
         "smoke-release",
@@ -443,7 +440,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("bench/micro/{s}.zig", .{micro_name})),
                 .target = target,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
                 .imports = &.{
                     .{ .name = "zoxy", .module = zoxy_fast_module },
                 },
@@ -529,16 +526,22 @@ pub fn build(b: *std.Build) void {
 
     // Absolute src root: kcov filters recorded files by this prefix, and the
     // cobertura patch below rewrites it back to the repo-relative "src".
-    const src_abs = b.path("src").getPath(b);
-    const include_arg = b.fmt("--include-path={s}", .{src_abs});
+    // Resolved by the Run step at make time rather than here: configure
+    // sees the build root only as the cwd, and an absolute path baked into
+    // the cached configuration would go stale the moment the checkout moved.
+    const src_root = b.path("src");
+    const include_arg: std.Build.Step.Run.PathArgOptions = .{
+        .prefix = "--include-path=",
+        .make_absolute = true,
+    };
 
     const kcov_tests = b.addSystemCommand(&.{"kcov"});
-    kcov_tests.addArg(include_arg);
+    kcov_tests.addDirectoryArg2(src_root, include_arg);
     const tests_cov = kcov_tests.addOutputDirectoryArg("cov-tests");
     kcov_tests.addArtifactArg(cov_tests);
 
     const kcov_sim = b.addSystemCommand(&.{"kcov"});
-    kcov_sim.addArg(include_arg);
+    kcov_sim.addDirectoryArg2(src_root, include_arg);
     const sim_cov = kcov_sim.addOutputDirectoryArg("cov-sim");
     kcov_sim.addArtifactArg(cov_sim);
     kcov_sim.addArgs(&.{ "0", "150" });
@@ -551,11 +554,12 @@ pub fn build(b: *std.Build) void {
     // kcov writes an absolute <source> root; Coveralls resolves each file by
     // joining source + filename before fetching from GitHub, so the root must
     // be repo-relative or every file reads "source not available".
-    const patch_cov = b.addSystemCommand(&.{
-        "sed",
-        "-i",
-        // kcov appends a trailing slash to the source root; `/*` absorbs it.
-        b.fmt("s|<source>{s}/*</source>|<source>src</source>|", .{src_abs}),
+    const patch_cov = b.addSystemCommand(&.{ "sed", "-i" });
+    // kcov appends a trailing slash to the source root; `/*` absorbs it.
+    patch_cov.addDirectoryArg2(src_root, .{
+        .prefix = "s|<source>",
+        .suffix = "/*</source>|<source>src</source>|",
+        .make_absolute = true,
     });
     patch_cov.addFileArg(merged_cov.path(b, "kcov-merged/cobertura.xml"));
 
@@ -602,6 +606,12 @@ fn resolveBuildId(b: *std.Build) []const u8 {
     if (b.option([]const u8, "build-id", "Build identifier, e.g. git describe output")) |given| {
         return given;
     }
+    // Zig's configuration cache keys on the command line, not on what a
+    // spawned program answers, and `runAllowFail` does not poison it the
+    // way `findProgram` does. Left pure, a build after a commit — or after
+    // the tree went clean — would replay the old description. Only this
+    // branch pays: `-Dbuild-id`, which release.yml passes, keeps the cache.
+    b.graph.poisonCache();
     // `runAllowFail` reports a non-zero exit as an error and only then
     // writes `exit_code`, so the catch is the whole failure path — reading
     // the code on success would read whatever the variable held. It is
@@ -626,7 +636,7 @@ const LoadGenerator = struct {
     profile_run: *std.Build.Step,
 };
 
-/// zrk and zio are lazy in build.zig.zon, and in Zig 0.16 a lazy
+/// zrk and zio are lazy in build.zig.zon, and in Zig 0.17 a lazy
 /// dependency is fetched whenever configure *asks* for one — whichever
 /// step was requested, since `build()` cannot see which. So laziness
 /// alone saves nothing; `-Dbench=false` is what stops the ask. The
@@ -655,14 +665,14 @@ fn addLoadGenerator(
         // to generate load fast enough not to be the bottleneck.
         const zrk_dependency = b.lazyDependency("zrk", .{
             .target = target,
-            .optimize = std.builtin.OptimizeMode.ReleaseFast,
+            .optimize = std.lang.Optimize.fast,
         });
         // zrk embeds its load off a zio (io_uring) runtime rather than the
         // default std.Io.Threaded backend, so the harness must build its own
         // zio.Runtime to drive zrk's runner (bench/run.zig, bench/profile.zig).
         const zio_dependency = b.lazyDependency("zio", .{
             .target = target,
-            .optimize = std.builtin.OptimizeMode.ReleaseFast,
+            .optimize = std.lang.Optimize.fast,
         });
         // Both asked for before either is checked, so one configure pass
         // names both and the runner fetches them together. Either null
@@ -676,14 +686,12 @@ fn addLoadGenerator(
             // binary (§9). bench/run.zig takes it via --zoxy.
             bench_run.addArg("--zoxy");
             bench_run.addArtifactArg(release_zoxy);
-            if (b.args) |args| {
-                bench_run.addArgs(args);
-            }
+            bench_run.addPassthruArgs();
 
             const profile_harness = addProfileHarness(b, target, zrk_dependency.?, zio_dependency.?);
             const profile_run = b.addRunArtifact(profile_harness);
             profile_run.addArtifactArg(release_zoxy);
-            if (b.args) |args| profile_run.addArgs(args);
+            profile_run.addPassthruArgs();
             return .{
                 .bench_exe = &bench_exe.step,
                 .bench_run = &bench_run.step,
@@ -715,7 +723,7 @@ fn addBenchHarness(
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/run.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
                 .{ .name = "zio", .module = zio_dependency.module("zio") },
@@ -743,7 +751,7 @@ fn addProfileHarness(
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/profile.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{
                 .{ .name = "zrk", .module = zrk_dependency.module("zrk") },
                 .{ .name = "zio", .module = zio_dependency.module("zio") },
@@ -785,7 +793,7 @@ fn addProfileHarness(
                 .{ .name = "zoxy_constants", .module = b.createModule(.{
                     .root_source_file = b.path("src/constants.zig"),
                     .target = target,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                 }) },
             },
         }),

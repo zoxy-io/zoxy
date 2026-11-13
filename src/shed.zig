@@ -402,8 +402,8 @@ pub const StaticTable = struct {
 
     /// The #240 answer for one persistence choice.
     pub fn getOptions(table: *StaticTable, persistence: Persistence) StaticResponse {
-        const template = options_templates[@intFromEnum(persistence)];
-        const slot = &table.options[@intFromEnum(persistence)];
+        const template = options_templates[@backingInt(persistence)];
+        const slot = &table.options[@backingInt(persistence)];
         assert(template.date_offset + date_bytes <= template.bytes.len);
         return .{
             .bytes = slot[0..template.bytes.len],
@@ -458,8 +458,8 @@ pub const StaticTable = struct {
     ) StaticResponse {
         if (proxy_status) {
             if (comptime variantIndex(status, cause)) |index| {
-                const template = proxy_status_templates[index][@intFromEnum(persistence)];
-                const slot = &table.proxy_status_storage[index][@intFromEnum(persistence)];
+                const template = proxy_status_templates[index][@backingInt(persistence)];
+                const slot = &table.proxy_status_storage[index][@backingInt(persistence)];
                 assert(template.date_offset + date_bytes <= template.bytes.len);
                 return .{
                     .bytes = slot[0..template.bytes.len],
@@ -468,8 +468,8 @@ pub const StaticTable = struct {
             }
         }
         const index = comptime staticStatusIndex(status).?;
-        const template = templates[index][@intFromEnum(persistence)];
-        const slot = &table.storage[index][@intFromEnum(persistence)];
+        const template = templates[index][@backingInt(persistence)];
+        const slot = &table.storage[index][@backingInt(persistence)];
         assert(template.date_offset + date_bytes <= template.bytes.len);
         return .{
             .bytes = slot[0..template.bytes.len],
@@ -715,8 +715,7 @@ test "shed: every token this proxy emits is one the registry defines" {
         "http_response_timeout",
     };
     var seen: usize = 0;
-    inline for (@typeInfo(ProxyStatusCause).@"enum".fields) |field| {
-        const cause: ProxyStatusCause = @enumFromInt(field.value);
+    inline for (comptime std.enums.values(ProxyStatusCause)) |cause| {
         const token = comptime causeToken(cause) orelse continue;
         seen += 1;
         var found = false;

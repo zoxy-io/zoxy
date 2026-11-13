@@ -6,7 +6,10 @@
 
 const std = @import("std");
 
+const zoxy = @import("zoxy");
+
 const assert = std.debug.assert;
+const repeat = zoxy.testing.repeat;
 
 /// The #140 logged headers: a request header two scripts send and a
 /// response header the sized origin answers with, plus the one value
@@ -122,7 +125,7 @@ pub const page_content_type = "text/plain";
 /// 8192. Sent at accept time, it races the request legs into the
 /// deferred-render path (§7 buffer rotation) and must die as a clean
 /// 502 or teardown, never a crash.
-pub const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ ("p" ** 8162) ++ "\r\n\r\n";
+pub const oversize_head = "HTTP/1.1 200 OK\r\nx-pad: " ++ repeat("p", 8162) ++ "\r\n\r\n";
 
 /// The `101` a WebSocket origin answers an upgrade request with (#180).
 /// Carries the participating pair the proxy must let travel: strip

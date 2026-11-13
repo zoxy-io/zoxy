@@ -19,7 +19,7 @@ in
 {
   packages =
     [
-      pkgs.zig_0_16
+      pkgs.zig_0_17
       # ztls's crypto primitives (§4). Every zoxy build links libcrypto, so
       # this belongs to the CI closure rather than the dev-only set below —
       # without it `zig build` cannot find `-lcrypto` at all. The `.dev`
