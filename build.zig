@@ -230,6 +230,12 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("scripts/lint.zig"),
             .target = b.graph.host,
+            // ReleaseSafe whatever -Doptimize says: the lint walks every
+            // byte of src/ several times, and Zig 0.17's self-hosted Debug
+            // backend runs that walk in 109 s against 1.6 s here (6.4 s
+            // even as LLVM Debug), which made it the slowest gate in `ci`.
+            // Safe rather than Fast because its asserts are the point.
+            .optimize = .safe,
         }),
     });
 
