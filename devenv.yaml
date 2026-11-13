@@ -1,5 +1,5 @@
 # devenv inputs (https://devenv.sh/inputs/). Pinned to the same nixpkgs
-# branch as flake.nix so both surfaces resolve the same zig_0_16 toolchain;
+# branch as flake.nix so both surfaces resolve the same zig_0_17 toolchain;
 # the exact revision lands in devenv.lock.
 inputs:
   nixpkgs:

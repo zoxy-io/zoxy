@@ -152,7 +152,7 @@ jobs:
             -Dtarget="${{ matrix.zig_target }}" \
             ${{ matrix.cpu && format('-Dcpu={0}', matrix.cpu) || '' }} \
             ${{ matrix.static && '-Dstatic' || '' }} \
-            -Doptimize=ReleaseSafe \
+            -Doptimize=safe \
             -Dbuild-id="${{ steps.ver.outputs.tag }}" --prefix out
 
           # Nothing from the build machine may follow the binary out.

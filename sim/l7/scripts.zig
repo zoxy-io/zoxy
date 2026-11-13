@@ -16,6 +16,7 @@ const constants = zoxy.constants;
 const parser = zoxy.http.parser;
 
 const assert = std.debug.assert;
+const repeat = zoxy.testing.repeat;
 
 /// The valid shapes, the §7 reject shapes (each pinned to its exact
 /// verdict on clean seeds), and the connection patterns (keep-alive
@@ -475,7 +476,7 @@ const specs = std.enums.EnumArray(Script, Spec).init(.{
         // buffer with no newline in sight: 414, not 431. The §5 head
         // ring gates the read before any byte accumulates, so its 503
         // can precede the verdict.
-        .request = "GET /" ++ ("a" ** 8500) ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
+        .request = "GET /" ++ repeat("a", 8500) ++ " HTTP/1.1\r\nHost: sim\r\n\r\n",
         .expected_responses = 1,
         .transcript_cap = 1,
         .golden_status = 414,

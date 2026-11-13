@@ -519,11 +519,11 @@ const Census = struct {
         }
         for (std.enums.values(SimIo.OpKind)) |kind| {
             if (kind == .none) continue;
-            const before = census.ops[@intFromEnum(kind)];
-            census.ops[@intFromEnum(kind)] += harness.io.deliveredCount(kind);
+            const before = census.ops[@backingInt(kind)];
+            census.ops[@backingInt(kind)] += harness.io.deliveredCount(kind);
             // As the counter loop above: a wrap would read as an op going
             // quiet, which is the one thing this table exists to notice.
-            assert(census.ops[@intFromEnum(kind)] >= before);
+            assert(census.ops[@backingInt(kind)] >= before);
         }
     }
 
@@ -586,7 +586,7 @@ const Census = struct {
         var carried: usize = 0;
         for (std.enums.values(SimIo.OpKind)) |kind| {
             if (kind == .none) continue;
-            const delivered = census.ops[@intFromEnum(kind)];
+            const delivered = census.ops[@backingInt(kind)];
             if (delivered != 0) carried += 1;
             const reason = opReasonFor(kind);
             if (reason == null and delivered == 0) {

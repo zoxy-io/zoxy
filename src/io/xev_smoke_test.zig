@@ -1,4 +1,4 @@
-//! Smoke tests pinning the exact libxev 0.16 API shapes that `XevIo`
+//! Smoke tests pinning the exact API shapes of the pinned libxev that `XevIo`
 //! (slice 6) wraps: loop init at our ring size, timer fire + fresh-run
 //! re-arm + cancel through a second completion, async wakeup, and a TCP
 //! loopback echo across accept/connect/read/write/close. Every callback

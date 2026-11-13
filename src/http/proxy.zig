@@ -1979,7 +1979,7 @@ pub fn Proxy(comptime IoType: type) type {
             /// The framed window lives wherever the transform put it.
             pub fn sendSlice(conn: *ConnType) []const u8 {
                 const state = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.client_to_upstream)
+                    @backingInt(StreamType.Direction.client_to_upstream)
                 ];
                 if (state.owed() == 0) return &.{};
                 if (conn.tls) |engine| return state.pending(engine.body_plaintext);
@@ -3237,7 +3237,7 @@ pub fn Proxy(comptime IoType: type) type {
             pub fn sendSlice(conn: *ConnType) []const u8 {
                 if (conn.tls) |engine| return engine.outbound();
                 const state = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.upstream_to_client)
+                    @backingInt(StreamType.Direction.upstream_to_client)
                 ];
                 if (state.owed() == 0) return &.{};
                 return state.pending(conn.stream.relay_buffer.?.upstream_to_client);
@@ -3248,7 +3248,7 @@ pub fn Proxy(comptime IoType: type) type {
             /// pump's contract for a transforming send.
             pub fn creditSend(conn: *ConnType, sent: u32) void {
                 const state = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.upstream_to_client)
+                    @backingInt(StreamType.Direction.upstream_to_client)
                 ];
                 if (conn.tls) |engine| {
                     engine.outboundSent(sent);

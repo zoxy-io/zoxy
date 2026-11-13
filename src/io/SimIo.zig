@@ -1150,7 +1150,7 @@ pub fn dropPendingOps(io: *SimIo, kind: OpKind) u32 {
     }
     // Into the trace, so a run that dropped a different number of ops
     // cannot hash equal to one that dropped this many.
-    io.mix(@intFromEnum(kind));
+    io.mix(@backingInt(kind));
     io.mix(dropped);
     return dropped;
 }
@@ -1192,7 +1192,7 @@ pub fn droppedNextOp(io: *const SimIo) ?OpKind {
 fn kindBit(kind: OpKind) u16 {
     comptime assert(std.enums.values(OpKind).len <= @bitSizeOf(u16));
     assert(kind != .none);
-    return @as(u16, 1) << @intCast(@intFromEnum(kind));
+    return @as(u16, 1) << @intCast(@backingInt(kind));
 }
 
 /// §8's two watchdogs (#226, #311), the simulator's half. Production arms
@@ -1559,7 +1559,7 @@ fn maybeDropOnSubmit(io: *SimIo, completion: *Completion) void {
     // match, so the rest of the teardown proceeds as the schedule wrote it.
     io.drop_next_kinds = 0;
     io.drop_next_taken = kind;
-    io.mix(@intFromEnum(kind));
+    io.mix(@backingInt(kind));
 }
 
 fn unlink(io: *SimIo, completion: *Completion) void {
@@ -1906,7 +1906,7 @@ fn deliverDueSignals(io: *SimIo) void {
         if (pending_signal.at_ns <= io.now_ns_value) {
             io.pending_signals[index] = io.pending_signals[io.pending_signals_count - 1];
             io.pending_signals_count -= 1;
-            io.mix(@as(u64, @intFromEnum(pending_signal.signal)) +% 0x5349474e);
+            io.mix(@as(u64, @backingInt(pending_signal.signal)) +% 0x5349474e);
             io.signal_callback.?(io.signal_userdata, pending_signal.signal);
         } else {
             index += 1;
@@ -2095,16 +2095,16 @@ fn closeEntryWithReset(io: *SimIo, socket: Socket) void {
 /// Deliveries of one op kind so far this run (§9).
 pub fn deliveredCount(io: *const SimIo, kind: OpKind) u64 {
     assert(kind != .none);
-    return io.delivered[@intFromEnum(kind)];
+    return io.delivered[@backingInt(kind)];
 }
 
 fn traceMix(io: *SimIo, completion: *const Completion, result: *const Result) void {
     // Every delivery funnels through here, which is what makes one
     // increment enough to count them all.
     assert(completion.op != .none);
-    io.delivered[@intFromEnum(completion.op)] += 1;
-    io.mix(@intFromEnum(completion.op));
-    io.mix(@intFromEnum(result.*));
+    io.delivered[@backingInt(completion.op)] += 1;
+    io.mix(@backingInt(completion.op));
+    io.mix(@backingInt(result.*));
     const detail: u64 = switch (result.*) {
         .recv => |r| if (r) |n| n else |err| 1000 + @intFromError(err),
         // Both halves matter to a trace: the same bytes landing in a

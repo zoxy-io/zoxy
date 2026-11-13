@@ -538,7 +538,7 @@ fn runRandomContract(comptime IoType: type, io: *IoType) !void {
     io.fillRandom(bounded[0..1]);
     try std.testing.expectEqualSlices(
         u8,
-        &[_]u8{random_sentinel} ** (Io.random_bytes_max - 1),
+        &@as([Io.random_bytes_max - 1]u8, @splat(random_sentinel)),
         bounded[1..],
     );
 }

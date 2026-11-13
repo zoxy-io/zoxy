@@ -76,8 +76,7 @@ comptime {
     for (protected_names) |name| {
         assert(parser.classifyHeaderName(name).protected());
     }
-    for (@typeInfo(parser.HeaderName).@"enum".fields) |field| {
-        const tag: parser.HeaderName = @enumFromInt(field.value);
+    for (std.enums.values(parser.HeaderName)) |tag| {
         if (tag.hopByHop()) assert(nameListHas(&hop_by_hop_names, tag.text()));
         if (tag.protected()) assert(nameListHas(&protected_names, tag.text()));
         // `isHopByHop` tests hop-by-hop first, so a name in both sets

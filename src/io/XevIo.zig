@@ -79,8 +79,8 @@ const delivers_accept_cancel = reportsCanceled(xev.AcceptError);
 /// to ask rather than assume, or it fails to compile on the backend that
 /// cannot.
 fn reportsCanceled(comptime Set: type) bool {
-    for (@typeInfo(Set).error_set.?) |candidate| {
-        if (std.mem.eql(u8, candidate.name, "Canceled")) return true;
+    for (@typeInfo(Set).error_set.error_names.?) |candidate| {
+        if (std.mem.eql(u8, candidate, "Canceled")) return true;
     }
     return false;
 }
@@ -770,7 +770,7 @@ pub fn accept(
             io_inner.clearArmedAccept(accept_completion);
             io_inner.recordPressure(accept_completion);
             callback(context.?, if (result) |conn|
-                @as(Socket, @enumFromInt(conn.fd))
+                @as(Socket, @fromBackingInt(@intCast(conn.fd)))
             else |err|
                 mapAcceptError(err));
             return .disarm;
@@ -813,7 +813,7 @@ pub fn connect(
             const io_inner: *XevIo = @fieldParentPtr("loop", loop);
             io_inner.recordPressure(connect_completion);
             if (result) |_| {
-                callback(context.?, @as(Socket, @enumFromInt(socket.fd)));
+                callback(context.?, @as(Socket, @fromBackingInt(@intCast(socket.fd))));
             } else |err| {
                 closeFd(socket.fd);
                 // Widened to anyerror: each xev backend exposes a different
@@ -911,7 +911,7 @@ pub fn recv(
     comptime callback: fn (*Userdata, Io.RecvError!u32) void,
 ) void {
     assert(buffer.len >= 1);
-    const tcp = xev.TCP.initFd(@intFromEnum(socket));
+    const tcp = xev.TCP.initFd(@backingInt(socket));
     tcp.read(&io.loop, completion, .{ .slice = buffer }, Userdata, userdata, (struct {
         fn adapter(
             context: ?*Userdata,
@@ -956,7 +956,7 @@ pub fn recvGroup(
         assert(io.group_br != null);
         completion.* = .{
             .op = .{ .recv_group = .{
-                .fd = @intFromEnum(socket),
+                .fd = @backingInt(socket),
                 .group_id = buffer_group_id,
                 .max_len = io.group_bytes,
             } },
@@ -1028,7 +1028,7 @@ fn recvGroupEmulated(
     }
     io.group_free_len -= 1;
     const id = io.group_free[io.group_free_len];
-    const tcp = xev.TCP.initFd(@intFromEnum(socket));
+    const tcp = xev.TCP.initFd(@backingInt(socket));
     tcp.read(&io.loop, completion, .{ .slice = io.sliceForId(id) }, Userdata, userdata, (struct {
         fn adapter(
             context: ?*Userdata,
@@ -1125,7 +1125,7 @@ pub fn send(
     comptime callback: fn (*Userdata, Io.SendError!u32) void,
 ) void {
     assert(bytes.len >= 1);
-    const tcp = xev.TCP.initFd(@intFromEnum(socket));
+    const tcp = xev.TCP.initFd(@backingInt(socket));
     tcp.write(&io.loop, completion, .{ .slice = bytes }, Userdata, userdata, (struct {
         fn adapter(
             context: ?*Userdata,
@@ -1278,7 +1278,7 @@ pub fn logWrite(
 /// per connection, never per request.
 pub fn peerAddress(io: *XevIo, socket: Socket) std.Io.net.IpAddress {
     _ = io;
-    return addressOf(@intFromEnum(socket), posix.system.getpeername);
+    return addressOf(@backingInt(socket), posix.system.getpeername);
 }
 
 /// This end of the pair: the address the peer connected *to*, which is
@@ -1287,7 +1287,7 @@ pub fn peerAddress(io: *XevIo, socket: Socket) std.Io.net.IpAddress {
 /// stored — the socket is live for the whole call by construction.
 pub fn localAddress(io: *XevIo, socket: Socket) std.Io.net.IpAddress {
     _ = io;
-    return addressOf(@intFromEnum(socket), posix.system.getsockname);
+    return addressOf(@backingInt(socket), posix.system.getsockname);
 }
 
 pub fn close(
@@ -1298,7 +1298,7 @@ pub fn close(
     userdata: *Userdata,
     comptime callback: fn (*Userdata) void,
 ) void {
-    const tcp = xev.TCP.initFd(@intFromEnum(socket));
+    const tcp = xev.TCP.initFd(@backingInt(socket));
     tcp.close(&io.loop, completion, Userdata, userdata, (struct {
         fn adapter(
             context: ?*Userdata,
@@ -1398,7 +1398,7 @@ var alarm_handler_installed = std.atomic.Value(bool).init(false);
 /// it is reporting. A single `u8` for the reason `Io.AlarmReason` gives:
 /// the handler reads it from a signal context, and one atomic cannot be
 /// caught half-written the way a pointer and a length can.
-var alarm_reason = std.atomic.Value(u8).init(@intFromEnum(Io.AlarmReason.drain_stalled));
+var alarm_reason = std.atomic.Value(u8).init(@backingInt(Io.AlarmReason.drain_stalled));
 
 /// §8's drain watchdog (#226): a deadline that is not a completion.
 ///
@@ -1427,7 +1427,7 @@ pub fn alarmStart(io: *XevIo, after_ns: u64, exit_code: u8, reason: Io.AlarmReas
     const seconds = (after_ns + std.time.ns_per_s - 1) / std.time.ns_per_s;
     assert(seconds >= 1);
     assert(seconds <= std.math.maxInt(c_uint));
-    alarm_reason.store(@intFromEnum(reason), .release);
+    alarm_reason.store(@backingInt(reason), .release);
     alarm_exit_code.store(exit_code, .release);
     // `alarm(2)` replaces whatever was pending and returns the seconds
     // that were left on it, which is what makes #311's refresh one
@@ -1477,7 +1477,7 @@ pub fn onAlarmFromHandler() noreturn {
     // asserting keeps the one thing this handler owes an operator, which
     // is a line at all.
     const message = switch (alarm_reason.load(.acquire)) {
-        @intFromEnum(Io.AlarmReason.loop_stalled) => loop_message,
+        @backingInt(Io.AlarmReason.loop_stalled) => loop_message,
         else => drain_message,
     };
     _ = std.c.write(2, message.ptr, message.len);
@@ -1535,14 +1535,14 @@ fn recordPressure(io: *XevIo, completion: *const Completion) void {
             .ADDRNOTAVAIL => .address_unavailable,
             else => .other,
         },
-        .errno = @intFromEnum(errno),
+        .errno = @backingInt(errno),
     };
 }
 
 pub fn setNodelay(io: *XevIo, socket: Socket) Io.SetOptionError!void {
     const enable: i32 = 1;
     posix.setsockopt(
-        @intFromEnum(socket),
+        @backingInt(socket),
         posix.IPPROTO.TCP,
         posix.TCP.NODELAY,
         std.mem.asBytes(&enable),
@@ -1568,7 +1568,7 @@ comptime {
 pub fn setLingerRst(io: *XevIo, socket: Socket) Io.SetOptionError!void {
     const value: posix.linger = .{ .onoff = 1, .linger = 0 };
     posix.setsockopt(
-        @intFromEnum(socket),
+        @backingInt(socket),
         posix.SOL.SOCKET,
         posix.SO.LINGER,
         std.mem.asBytes(&value),
@@ -1590,7 +1590,7 @@ pub fn shutdown(io: *XevIo, socket: Socket, how: Io.ShutdownHow) void {
         .write => posix.SHUT.WR,
         .both => posix.SHUT.RDWR,
     };
-    const rc = posix.system.shutdown(@intFromEnum(socket), posix_how);
+    const rc = posix.system.shutdown(@backingInt(socket), posix_how);
     const errno = posix.errno(rc);
     // NOTCONN: the peer tore the connection down first — a legal race.
     assert(errno == .SUCCESS or errno == .NOTCONN);
@@ -1598,7 +1598,7 @@ pub fn shutdown(io: *XevIo, socket: Socket, how: Io.ShutdownHow) void {
 
 pub fn closeNow(io: *XevIo, socket: Socket) void {
     _ = io;
-    closeFd(@intFromEnum(socket));
+    closeFd(@backingInt(socket));
 }
 
 /// Key material for the TLS engine (§4): the OS CSPRNG, read here because
@@ -1854,7 +1854,7 @@ fn onCancelReaped(
 }
 
 fn signalBit(signal: Io.Signal) u8 {
-    const shift: u3 = @intCast(@intFromEnum(signal));
+    const shift: u3 = @intCast(@backingInt(signal));
     return @as(u8, 1) << shift;
 }
 

@@ -82,13 +82,13 @@ topology; read the nightly report rather than any number quoted here.
 
 ### Requirements
 
-- **Zig 0.16** (pinned by [devenv](devenv.nix): `zig_0_16` + `zls`).
+- **Zig 0.17** (pinned by [devenv](devenv.nix): `zig_0_17` + `zls`).
 
 With [devenv](https://devenv.sh), `.envrc` activates the same shell
 automatically on `cd`:
 
 ```sh
-devenv shell                    # zig 0.16, zls, kcov
+devenv shell                    # zig 0.17, zls, kcov
 zig build                       # build zig-out/bin/zoxy
 zig build ci                    # the per-change gate: tests + lint + simulation + smoke
 zig build test                  # unit tests
@@ -115,7 +115,7 @@ catch a bug whose only symptom is a wrong *rate*.
 > [!NOTE]
 > The bench harness is always built ReleaseFast, but it measures the
 > `zig-out/bin/zoxy` you last built — and plain `zig build` produces a
-> Debug binary. Run `zig build -Doptimize=ReleaseFast` first before
+> Debug binary. Run `zig build -Doptimize=fast` first before
 > quoting numbers against haproxy.
 
 ## License

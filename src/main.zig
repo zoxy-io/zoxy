@@ -267,7 +267,7 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
     // The one failure with no budget to report: nothing was loaded, so
     // there is no config to price and this arm answers without a banner.
     const config = readConfig(init.io, arena, config_path) catch |err|
-        return @intFromEnum(checkExitFor(err));
+        return @backingInt(checkExitFor(err));
     const config_arena_bytes = init.arena.queryCapacity() - arena_before;
     const demands = BudgetXev.demandsFor(&config);
     assert(demands.fds > 0);
@@ -285,7 +285,7 @@ fn checkConfig(init: std.process.Init, arena: std.mem.Allocator, config_path: []
         .nofile = nofile,
         .verdict = verdict,
     });
-    return @intFromEnum(verdict);
+    return @backingInt(verdict);
 }
 
 /// Ask the box for exactly what a start asks it for, and give it back.
@@ -914,9 +914,9 @@ test "checkExitFor: the box's refusals are told from the config's" {
     try testing.expectEqual(CheckExit.invalid_config, checkExitFor(error.MissingField));
     // The codes themselves are the CI contract, so they are asserted
     // rather than left to the declaration order.
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(CheckExit.ok));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(CheckExit.invalid_config));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(CheckExit.does_not_fit));
+    try testing.expectEqual(@as(u8, 0), @backingInt(CheckExit.ok));
+    try testing.expectEqual(@as(u8, 1), @backingInt(CheckExit.invalid_config));
+    try testing.expectEqual(@as(u8, 2), @backingInt(CheckExit.does_not_fit));
 }
 
 test "rlimitText: an infinite limit reads as one" {

@@ -629,9 +629,10 @@ pub const Counters = struct {
     /// else.
     pub const names: []const []const u8 = blk: {
         var collected: []const []const u8 = &.{};
-        for (@typeInfo(Counters).@"struct".fields) |field| {
-            if (field.type != Value) continue;
-            collected = collected ++ [_][]const u8{field.name};
+        const info = @typeInfo(Counters).@"struct";
+        for (info.field_names, info.field_types) |name, FieldType| {
+            if (FieldType != Value) continue;
+            collected = collected ++ [_][]const u8{name};
         }
         break :blk collected;
     };
@@ -749,9 +750,10 @@ pub const Counters = struct {
             total += "# TYPE ".len + name_len + " counter\n".len;
             total += name_len + " ".len + u64_digits_max + "\n".len;
         }
-        for (@typeInfo(Gauges).@"struct".fields) |field| {
-            assert(field.type == u32);
-            const name_len = metric_prefix.len + field.name.len;
+        const gauge_info = @typeInfo(Gauges).@"struct";
+        for (gauge_info.field_names, gauge_info.field_types) |name, FieldType| {
+            assert(FieldType == u32);
+            const name_len = metric_prefix.len + name.len;
             total += "# TYPE ".len + name_len + " gauge\n".len;
             total += name_len + " ".len + u32_digits_max + "\n".len;
         }
@@ -787,16 +789,16 @@ pub const Counters = struct {
             ) catch unreachable;
             cursor += written.len;
         }
-        inline for (@typeInfo(Gauges).@"struct".fields) |field| {
+        inline for (@typeInfo(Gauges).@"struct".field_names) |name| {
             // Same argument as the counter loop above, against the gauge
             // half of the bound: the format string is comptime and every
             // gauge is a u32, whose widest rendering `render_bytes_max`
             // reserves 10 digits for.
             const written = std.fmt.bufPrint(
                 buffer[cursor..],
-                "# TYPE " ++ metric_prefix ++ field.name ++ " gauge\n" ++
-                    metric_prefix ++ field.name ++ " {d}\n",
-                .{@field(gauges, field.name)},
+                "# TYPE " ++ metric_prefix ++ name ++ " gauge\n" ++
+                    metric_prefix ++ name ++ " {d}\n",
+                .{@field(gauges, name)},
             ) catch unreachable;
             cursor += written.len;
         }
@@ -1097,7 +1099,7 @@ pub const Labeled = struct {
         client_error,
         server_error,
 
-        pub const count = @typeInfo(StatusClass).@"enum".fields.len;
+        pub const count = @typeInfo(StatusClass).@"enum".field_names.len;
 
         /// The `class` label's value, which is Prometheus convention and
         /// the same spelling `passive_ejection`'s config accepts.
@@ -1400,7 +1402,7 @@ pub const Labeled = struct {
         assert(status >= 100);
         assert(status <= 599);
         const class = StatusClass.of(status);
-        const class_at = @as(usize, cluster_index) * StatusClass.count + @intFromEnum(class);
+        const class_at = @as(usize, cluster_index) * StatusClass.count + @backingInt(class);
         assert(class_at < labeled.cluster_responses.len);
         const class_previous = labeled.cluster_responses[class_at].add(1);
         assert(class_previous < std.math.maxInt(u64));
@@ -1531,7 +1533,7 @@ pub const Labeled = struct {
         ) catch unreachable;
         for (labeled.cluster_labels, 0..) |label, cluster_index| {
             inline for (comptime std.enums.values(StatusClass)) |class| {
-                const at = cluster_index * StatusClass.count + @intFromEnum(class);
+                const at = cluster_index * StatusClass.count + @backingInt(class);
                 // The label is rendered `{cluster="x"}`, so the class
                 // joins it by replacing the closing brace — one splice
                 // rather than a second label table to keep in step.
@@ -1870,10 +1872,10 @@ test "counters: render emits Prometheus exposition for every field" {
         search = at + "# TYPE ".len;
     }
     var field_count: usize = 0;
-    inline for (@typeInfo(Counters).@"struct".fields) |field| {
-        if (field.type == Counters.Value) field_count += 1;
+    inline for (@typeInfo(Counters).@"struct".field_types) |FieldType| {
+        if (FieldType == Counters.Value) field_count += 1;
     }
-    field_count += @typeInfo(Counters.Gauges).@"struct".fields.len;
+    field_count += @typeInfo(Counters.Gauges).@"struct".field_names.len;
     try std.testing.expectEqual(field_count, type_lines);
 }
 
@@ -1904,14 +1906,15 @@ test "counters: render bound holds at the maximum value" {
     // and every gauge at maxInt(u32) — the widest possible sample lines —
     // so a saturated proxy never truncates or overruns the buffer.
     var counters: Counters = .{};
-    inline for (@typeInfo(Counters).@"struct".fields) |field| {
-        if (field.type == Counters.Value) {
-            @field(counters, field.name).set(std.math.maxInt(u64));
+    const info = @typeInfo(Counters).@"struct";
+    inline for (info.field_names, info.field_types) |name, FieldType| {
+        if (FieldType == Counters.Value) {
+            @field(counters, name).set(std.math.maxInt(u64));
         }
     }
     var gauges: Counters.Gauges = undefined;
-    inline for (@typeInfo(Counters.Gauges).@"struct".fields) |field| {
-        @field(gauges, field.name) = std.math.maxInt(u32);
+    inline for (@typeInfo(Counters.Gauges).@"struct".field_names) |name| {
+        @field(gauges, name) = std.math.maxInt(u32);
     }
     var buffer: [Counters.render_bytes_max]u8 = undefined;
     const text = counters.render(&gauges, &buffer);
@@ -1943,16 +1946,17 @@ test "counters: the gate identity sums exactly today's admission rungs" {
         "shed_draining",
     };
     comptime var actual_count: usize = 0;
-    inline for (@typeInfo(Counters).@"struct".fields) |field| {
-        if (field.type != Counters.Value) continue;
-        if (!comptime std.mem.startsWith(u8, field.name, Counters.shed_prefix)) continue;
+    const info = @typeInfo(Counters).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, FieldType| {
+        if (FieldType != Counters.Value) continue;
+        if (!comptime std.mem.startsWith(u8, field_name, Counters.shed_prefix)) continue;
         actual_count += 1;
         comptime var listed = false;
         inline for (expected) |name| {
-            if (comptime std.mem.eql(u8, name, field.name)) listed = true;
+            if (comptime std.mem.eql(u8, name, field_name)) listed = true;
         }
         if (!listed) {
-            std.debug.print("unlisted shed counter: {s}\n", .{field.name});
+            std.debug.print("unlisted shed counter: {s}\n", .{field_name});
             return error.UnlistedShedCounter;
         }
     }
@@ -2132,11 +2136,11 @@ test "counters: labeled render speaks the exposition dialect" {
     labeled.incrementEndpoint(.responses, labeled_test_keys.key(0, 1));
     labeled.incrementCluster(.l7_shed_inflight, 1);
 
-    var l7 = [_]u16{0} ** labeled_test_keys.count;
-    var l4 = [_]u16{0} ** labeled_test_keys.count;
+    var l7: [labeled_test_keys.count]u16 = @splat(0);
+    var l4: [labeled_test_keys.count]u16 = @splat(0);
     l7[labeled_test_keys.key(0, 0)] = 3;
     l4[labeled_test_keys.key(0, 0)] = 2;
-    var healthy = [_]bool{true} ** labeled_test_keys.count;
+    var healthy: [labeled_test_keys.count]bool = @splat(true);
     healthy[labeled_test_keys.key(0, 1)] = false;
     const views: Labeled.LiveViews = .{
         .load = .{ .l7 = &l7, .l4 = &l4 },
@@ -2224,9 +2228,9 @@ test "counters: labeled render bound is exact at the maximum values" {
     // The widest live view either owner can produce: both u16 tables
     // saturated (the inflight bound is their sum, not a u32's), and a
     // healthy verdict — "1" — on every checked endpoint.
-    var l7 = [_]u16{std.math.maxInt(u16)} ** labeled_test_keys.count;
-    var l4 = [_]u16{std.math.maxInt(u16)} ** labeled_test_keys.count;
-    const healthy = [_]bool{true} ** labeled_test_keys.count;
+    var l7: [labeled_test_keys.count]u16 = @splat(std.math.maxInt(u16));
+    var l4: [labeled_test_keys.count]u16 = @splat(std.math.maxInt(u16));
+    const healthy: [labeled_test_keys.count]bool = @splat(true);
     const views: Labeled.LiveViews = .{
         .load = .{ .l7 = &l7, .l4 = &l4 },
         .healthy = &healthy,

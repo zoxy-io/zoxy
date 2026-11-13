@@ -47,6 +47,7 @@ const Io = @import("../io/io.zig");
 const SimIo = @import("../io/SimIo.zig");
 
 const assert = std.debug.assert;
+const repeat = @import("../testing/bytes.zig").repeat;
 
 const ServerSim = server_module.Server(SimIo);
 const ConnSim = conn_module.Conn(SimIo);
@@ -121,7 +122,7 @@ const Scratch = struct {
 fn Base(comptime direction: Direction) type {
     return struct {
         fn state(conn: *ConnSim) *stream_module.DirectionState {
-            return &conn.stream.directions[@intFromEnum(direction)];
+            return &conn.stream.directions[@backingInt(direction)];
         }
 
         fn targetSocket(conn: *const ConnSim) SimIo.Socket {
@@ -360,7 +361,7 @@ const ToClientPolicy = struct {
         scratch.outbound_sent += sent;
         assert(scratch.outbound_sent <= scratch.outbound_len);
         if (scratch.outbound_sent < scratch.outbound_len) return;
-        const direction_state = &conn.stream.directions[@intFromEnum(Direction.upstream_to_client)];
+        const direction_state = &conn.stream.directions[@backingInt(Direction.upstream_to_client)];
         direction_state.credit(direction_state.owed());
     }
 };
@@ -863,7 +864,7 @@ test "transform: a frame the peer framed illegally sheds the connection" {
 test "transform: a chunk too large to stage sheds the connection" {
     // Whole deliveries, so the origin's answer arrives in one chunk and the
     // framed length really does exceed what one frame can carry.
-    const oversize = "z" ** (payload_max + 1);
+    const oversize = repeat("z", payload_max + 1);
 
     var bed: Harness = undefined;
     try bed.setUp(std.testing.allocator, .{

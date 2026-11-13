@@ -27,6 +27,7 @@ const hparse = @import("hparse");
 const constants = @import("../constants.zig");
 
 const assert = std.debug.assert;
+const repeat = @import("../testing/bytes.zig").repeat;
 
 /// Request methods. The nine registered methods parse to their tags; any
 /// other RFC 9110 token (PROPFIND, MKCOL, ...) parses to `.extension`
@@ -175,8 +176,7 @@ comptime {
     // postcondition in `classifyHeaderName` cost ~540 instructions per
     // request — it is decidable here for free, and a runtime assert on a
     // fact the compiler already knows is the expensive way to be sure.
-    for (@typeInfo(HeaderName).@"enum".fields) |field| {
-        const tag: HeaderName = @enumFromInt(field.value);
+    for (std.enums.values(HeaderName)) |tag| {
         if (tag == .other) continue;
         assert(classifyHeaderName(tag.text()) == tag);
     }
@@ -613,8 +613,7 @@ pub fn parseResponseHead(
 /// why no "this name was truncated" flag is needed anywhere.
 const trailer_name_bytes_max: u8 = trailer_name_bytes: {
     var longest: u8 = 0;
-    for (@typeInfo(HeaderName).@"enum".fields) |field| {
-        const tag: HeaderName = @enumFromInt(field.value);
+    for (std.enums.values(HeaderName)) |tag| {
         longest = @max(longest, tag.text().len);
     }
     break :trailer_name_bytes longest + 1;
@@ -624,8 +623,7 @@ comptime {
     // The property above, said where a reviewer can check it: every
     // managed spelling fits with a byte to spare, so "the buffer filled"
     // and "longer than any managed name" are the same statement.
-    for (@typeInfo(HeaderName).@"enum".fields) |field| {
-        const tag: HeaderName = @enumFromInt(field.value);
+    for (std.enums.values(HeaderName)) |tag| {
         assert(tag.text().len < trailer_name_bytes_max);
     }
 }
@@ -2139,7 +2137,7 @@ test "http parser: partial heads are Incomplete until the buffer fills" {
 }
 
 test "http parser: header-array overflow is 431-class, not 400" {
-    const head = "GET / HTTP/1.1\r\nHost: a\r\n" ++ ("X-Filler: 1\r\n" ** constants.headers_max) ++ "\r\n";
+    const head = "GET / HTTP/1.1\r\nHost: a\r\n" ++ repeat("X-Filler: 1\r\n", constants.headers_max) ++ "\r\n";
     try expectRequestError(error.HeadTooLarge, head, false);
 }
 
@@ -2370,7 +2368,7 @@ test "chunked: an ordinary trailer still forwards, however long its name (#244)"
     // past the buffer keeps only a prefix, and the prefix must classify
     // `.other` exactly as the whole name does — a truncation that could
     // collide with a managed spelling would refuse a legal trailer.
-    const long_name = "X-" ++ ("a" ** (trailer_name_bytes_max * 2));
+    const long_name = "X-" ++ repeat("a", trailer_name_bytes_max * 2);
     const bodies = [_][]const u8{
         "0\r\nX-Checksum: 3f21\r\n\r\n",
         "0\r\nX-Checksum: 3f21\r\nX-Signature: ab\r\n\r\n",
@@ -2418,7 +2416,7 @@ test "chunked: framing violations are malformed" {
 
 test "chunked: size lines and trailers hit their static bounds" {
     // A size line longer than the bound (extensions included).
-    const long_line = "1;" ++ ("e" ** constants.chunked_line_bytes_max) ++ "\r\na\r\n0\r\n\r\n";
+    const long_line = "1;" ++ repeat("e", constants.chunked_line_bytes_max) ++ "\r\na\r\n0\r\n\r\n";
     try testing.expectEqual(
         @as(?ChunkedScanner.Error, error.Oversize),
         chunkedOutcome(long_line, long_line.len).failure,
@@ -2432,7 +2430,7 @@ test "chunked: size lines and trailers hit their static bounds" {
     // A trailer section past its bound.
     const trailer_line = "X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
     const repeats = constants.chunked_trailer_bytes_max / trailer_line.len + 1;
-    const long_trailer = "0\r\n" ++ (trailer_line ** repeats) ++ "\r\n";
+    const long_trailer = "0\r\n" ++ repeat(trailer_line, repeats) ++ "\r\n";
     try testing.expectEqual(
         @as(?ChunkedScanner.Error, error.Oversize),
         chunkedOutcome(long_trailer, long_trailer.len).failure,
@@ -2576,8 +2574,9 @@ test "fuzz: heads and chunked framing — parse or reject, no third outcome" {
 //
 // `std.testing.fuzz` hands corpus entries to `Smith`, which reads structure
 // out of them, so a seed never reaches the parser as the bytes it was written
-// as — and coverage-guided mode cannot run on Zig 0.16.0. Neither path
-// exercises these shapes, so they are run directly.
+// as — and coverage-guided mode, which could, is in no gate (see the note
+// above `fuzz_arena_buffer` in config.zig). Neither path exercises these
+// shapes, so they are run directly.
 //
 // Every entry is a head whose terminator sits below the point hparse can say
 // anything about it: it answers Incomplete from LENGTH checks that examine no

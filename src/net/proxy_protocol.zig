@@ -32,6 +32,7 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 
 const assert = std.debug.assert;
+const repeat = @import("../testing/bytes.zig").repeat;
 
 /// The verdict on a byte prefix. `need_more` never asks past
 /// `constants.proxy_header_bytes_max` (asserted in `parse`), so the
@@ -594,14 +595,14 @@ test "proxy protocol v1: incomplete lines wait, hopeless ones do not" {
 test "proxy protocol v1: the 107-byte line bound is exact" {
     // "PROXY UNKNOWN " + filler + CRLF: UNKNOWN ignores the filler, so
     // the only judgment left is the length's.
-    const line_105 = "PROXY UNKNOWN " ++ ("x" ** 91) ++ "\r\n";
+    const line_105 = "PROXY UNKNOWN " ++ repeat("x", 91) ++ "\r\n";
     comptime assert(line_105.len == 107);
     try expectClient(line_105, null, 107);
-    const line_108 = "PROXY UNKNOWN " ++ ("x" ** 92) ++ "\r\n";
+    const line_108 = "PROXY UNKNOWN " ++ repeat("x", 92) ++ "\r\n";
     comptime assert(line_108.len == 108);
     try expectVerdict(line_108, .invalid);
     // 107 bytes and still no CRLF: no v1 line can be forming.
-    try expectVerdict("PROXY UNKNOWN " ++ ("x" ** 93), .invalid);
+    try expectVerdict("PROXY UNKNOWN " ++ repeat("x", 93), .invalid);
 }
 
 test "proxy protocol v1: field discipline is strict" {
@@ -646,8 +647,8 @@ test "proxy protocol v2: the binary form parses to its client" {
     // INET6 with a mapped source unwraps to the IPv4 client (one client,
     // one hash, however conveyed).
     const mapped = v2_signature ++ "\x21\x21\x00\x24" ++
-        ("\x00" ** 10) ++ "\xff\xff" ++ "\xc6\x33\x64\x01" ++
-        ("\x00" ** 15) ++ "\x01" ++ "\xdc\x04" ++ "\x01\xbb";
+        repeat("\x00", 10) ++ "\xff\xff" ++ "\xc6\x33\x64\x01" ++
+        repeat("\x00", 15) ++ "\x01" ++ "\xdc\x04" ++ "\x01\xbb";
     comptime assert(mapped.len == 52);
     try expectClient(mapped, client_v4, 52);
 }
@@ -659,9 +660,9 @@ test "proxy protocol v2: LOCAL and non-TCP families keep the observed peer" {
     // PROXY over UNSPEC, DGRAM, and UNIX: valid statements about peers
     // this TCP listener cannot route by.
     try expectClient(v2_signature ++ "\x21\x00\x00\x00", null, 16);
-    const dgram = v2_signature ++ "\x21\x12\x00\x0c" ++ ("\x00" ** 12);
+    const dgram = v2_signature ++ "\x21\x12\x00\x0c" ++ repeat("\x00", 12);
     try expectClient(dgram, null, 28);
-    const unix = v2_signature ++ "\x21\x31\x00\xd8" ++ ("\x00" ** 216);
+    const unix = v2_signature ++ "\x21\x31\x00\xd8" ++ repeat("\x00", 216);
     comptime assert(unix.len == 232);
     try expectClient(unix, null, 232);
 }

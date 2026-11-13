@@ -1186,12 +1186,12 @@ test "filter: response rules match on status, class and headers" {
 test "filter: the status-class vocabulary maps each token to its digit" {
     // The enum's field names ARE the JSON tokens and its values the
     // class digits — the loader leans on both, so pin the pairing.
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(StatusClass.@"1xx"));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(StatusClass.@"2xx"));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(StatusClass.@"3xx"));
-    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(StatusClass.@"4xx"));
-    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(StatusClass.@"5xx"));
-    try std.testing.expectEqual(@as(usize, 5), @typeInfo(StatusClass).@"enum".fields.len);
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(StatusClass.@"1xx"));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(StatusClass.@"2xx"));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(StatusClass.@"3xx"));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(StatusClass.@"4xx"));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(StatusClass.@"5xx"));
+    try std.testing.expectEqual(@as(usize, 5), @typeInfo(StatusClass).@"enum".field_names.len);
 }
 
 test "filter: rewritePath reports Oversize when the result would not fit" {

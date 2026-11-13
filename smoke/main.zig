@@ -476,7 +476,7 @@ const Stage = enum {
     }
 };
 
-var current_stage = std.atomic.Value(u8).init(@intFromEnum(Stage.starting));
+var current_stage = std.atomic.Value(u8).init(@backingInt(Stage.starting));
 
 /// Which https request is in flight, 1-based, for the stage that repeats.
 /// The distinction it draws is the one worth having: the first request on
@@ -488,7 +488,7 @@ var current_https_request = std.atomic.Value(u32).init(0);
 /// watchdog's acquire load: the label must be readable by the time the
 /// wait it describes can hang.
 fn enterStage(stage: Stage) void {
-    current_stage.store(@intFromEnum(stage), .release);
+    current_stage.store(@backingInt(stage), .release);
 }
 
 const Flags = struct {
@@ -655,7 +655,7 @@ fn watchdogTask(io: Io) void {
         assert(err == error.Canceled);
         return;
     };
-    const stage: Stage = @enumFromInt(current_stage.load(.acquire));
+    const stage: Stage = @fromBackingInt(@intCast(current_stage.load(.acquire)));
     const seconds = watchdog_budget_ns / std.time.ns_per_s;
     if (stage == .https_request) {
         std.debug.print(

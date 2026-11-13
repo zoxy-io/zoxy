@@ -87,7 +87,7 @@ pub fn main() void {
         // Consume the outputs so nothing is dead-code-eliminated.
         checksum +%= upstream[upstream.len - 1];
         checksum +%= downstream[downstream.len - 1];
-        checksum +%= @intFromEnum(request.method);
+        checksum +%= @backingInt(request.method);
         checksum +%= response.status;
         checksum +%= target.path.len;
     }

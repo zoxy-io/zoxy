@@ -39,7 +39,7 @@ const ServerType = zoxy.Server(zoxy.Io.XevIo);
 const ConnType = ServerType.ConnType;
 const StreamType = ServerType.StreamType;
 
-/// `std.time` carries only constants in 0.16 — `Instant`/`Timer` moved out —
+/// `std.time` carries only constants since 0.16 — `Instant`/`Timer` moved out —
 /// and this bench has no `Io` runtime to borrow a clock from, so it reads
 /// CLOCK_MONOTONIC directly. Precise, not COARSE: XevIo's millisecond
 /// granule is fine for second-scale deadlines but would quantise a

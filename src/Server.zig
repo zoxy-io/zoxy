@@ -2656,7 +2656,7 @@ pub fn Server(comptime IoType: type) type {
                 // origin never receives, so it stays uncounted.
                 conn.stream.log.bytes_in += leftover_len;
                 const direction = &conn.stream.directions[
-                    @intFromEnum(StreamType.Direction.client_to_upstream)
+                    @backingInt(StreamType.Direction.client_to_upstream)
                 ];
                 assert(direction.phase == .idle);
                 direction.phase = .receiving;
@@ -2817,7 +2817,7 @@ pub fn Server(comptime IoType: type) type {
             // to the backend.
             conn.stream.log.bytes_in += conn.stream.head_len;
             const direction = &conn.stream.directions[
-                @intFromEnum(StreamType.Direction.client_to_upstream)
+                @backingInt(StreamType.Direction.client_to_upstream)
             ];
             assert(direction.phase == .idle);
             direction.phase = .receiving;
@@ -3108,7 +3108,7 @@ pub fn Server(comptime IoType: type) type {
             // At the buffer's front, which is where `sendSlice` reads a
             // TLS direction's pending window from.
             const direction = &conn.stream.directions[
-                @intFromEnum(StreamType.Direction.client_to_upstream)
+                @backingInt(StreamType.Direction.client_to_upstream)
             ];
             assert(direction.phase == .idle);
             direction.phase = .receiving;
@@ -3184,7 +3184,7 @@ pub fn Server(comptime IoType: type) type {
                 .v2 => proxy_protocol.writeV2(&header_buffer, client_address, &local_address),
             };
             const direction = &conn.stream.directions[
-                @intFromEnum(StreamType.Direction.client_to_upstream)
+                @backingInt(StreamType.Direction.client_to_upstream)
             ];
             const staging = conn.stream.relay_buffer.?.client_to_upstream;
             const framed = direction.framed_len;
