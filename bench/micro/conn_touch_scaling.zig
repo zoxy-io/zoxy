@@ -29,7 +29,7 @@
 //!   zig build bench-micro && ./zig-out/bin/zoxy-bench-conn_touch_scaling
 
 const std = @import("std");
-const linux = std.os.linux;
+const posix = std.posix;
 
 const zoxy = @import("zoxy");
 
@@ -44,10 +44,15 @@ const StreamType = ServerType.StreamType;
 /// CLOCK_MONOTONIC directly. Precise, not COARSE: XevIo's millisecond
 /// granule is fine for second-scale deadlines but would quantise a
 /// nanosecond-per-op measurement into uselessness.
+///
+/// Through `posix.system`, as `XevIo` reads its clock, so the return
+/// convention matches the `posix.errno` that checks it: libc's on macOS,
+/// the kernel's on Linux (#184). Naming `std.os.linux` here also stopped
+/// compiling for macOS under 0.17, whose vDSO lookup has no Darwin spelling.
 fn monotonicNs() u64 {
-    var ts: linux.timespec = undefined;
-    const rc = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
-    assert(std.posix.errno(rc) == .SUCCESS);
+    var ts: posix.timespec = undefined;
+    const rc = posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    assert(posix.errno(rc) == .SUCCESS);
     assert(ts.sec >= 0);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
