@@ -241,10 +241,7 @@ pub fn Pump(
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(op(stream), bit);
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             if (@hasDecl(Policy, "onRecvEntry")) Policy.onRecvEntry(stream);
             const received = result catch |err| return Policy.onRecvError(server, stream, err);
             assert(received >= 1);
@@ -325,10 +322,7 @@ pub fn Pump(
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(op(stream), bit);
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             if (@hasDecl(Policy, "onSendEntry")) {
                 if (Policy.onSendEntry(server, stream)) return;
             }
@@ -354,8 +348,11 @@ pub fn Pump(
             // chunk's `owe` demand a clean slate.
             assert(directionState(stream).owed() == 0);
             // A full chunk moved: this is activity — push the idle deadline
-            // out (§6); the armed timer op is not touched.
-            server.storeDeadline(conn, server.idleTimeoutMs());
+            // out (§6); the armed timer op is not touched. The exchange's
+            // deadline, which on the stream an L4 relay or a tunnel runs on
+            // — always its connection's admission stream — is the
+            // connection's: the store routes by the stream, not the pump.
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             if (Policy.framingDone(stream)) {
                 Policy.onComplete(server, stream);
             } else {
