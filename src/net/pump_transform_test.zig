@@ -51,6 +51,8 @@ const repeat = @import("../testing/bytes.zig").repeat;
 
 const ServerSim = server_module.Server(SimIo);
 const ConnSim = conn_module.Conn(SimIo);
+const ConnType = ConnSim;
+const StreamType = ConnSim.StreamType;
 const Direction = ConnSim.StreamType.Direction;
 
 /// `[u16 big-endian length][payload]` — the smallest framing with a real
@@ -121,13 +123,14 @@ const Scratch = struct {
 /// dead code — the transform seam is this file's only job.
 fn Base(comptime direction: Direction) type {
     return struct {
-        fn state(conn: *ConnSim) *stream_module.DirectionState {
-            return &conn.stream.directions[@backingInt(direction)];
+        fn state(stream: *StreamType) *stream_module.DirectionState {
+            return &stream.directions[@backingInt(direction)];
         }
 
-        fn targetSocket(conn: *const ConnSim) SimIo.Socket {
+        fn targetSocket(stream: *const StreamType) SimIo.Socket {
+            const conn = stream.conn;
             return switch (direction) {
-                .client_to_upstream => conn.stream.upstream_socket.?,
+                .client_to_upstream => stream.upstream_socket.?,
                 .upstream_to_client => conn.client_socket,
             };
         }
@@ -135,14 +138,16 @@ fn Base(comptime direction: Direction) type {
         /// Unlike the production L4 policy this admits `.receiving` twice in
         /// a row: a transform that yielded no whole frame re-arms the read
         /// with no send in between (pump.zig).
-        pub fn beforeRecv(conn: *ConnSim) void {
+        pub fn beforeRecv(stream: *StreamType) void {
+            const conn = stream.conn;
             assert(conn.state == .relaying);
-            state(conn).phase = .receiving;
+            state(stream).phase = .receiving;
         }
 
-        pub fn beforeSend(conn: *ConnSim) void {
+        pub fn beforeSend(stream: *StreamType) void {
+            const conn = stream.conn;
             assert(conn.state == .relaying);
-            const direction_state = state(conn);
+            const direction_state = state(stream);
             assert(direction_state.phase == .receiving or direction_state.phase == .sending);
             direction_state.phase = .sending;
         }
@@ -150,13 +155,15 @@ fn Base(comptime direction: Direction) type {
         /// Framing sees payload bytes and relays all of them, exactly as the
         /// L4 policy does: the transform is invisible here, which is the
         /// seam's whole point.
-        pub fn feed(conn: *ConnSim, chunk: []const u8) pump.FeedResult {
+        pub fn feed(stream: *StreamType, chunk: []const u8) pump.FeedResult {
+            const conn = stream.conn;
             _ = conn;
             assert(chunk.len >= 1);
             return .{ .consumed = @intCast(chunk.len), .done = false, .malformed = false };
         }
 
-        pub fn framingDone(conn: *ConnSim) bool {
+        pub fn framingDone(stream: *StreamType) bool {
+            const conn = stream.conn;
             _ = conn;
             return false;
         }
@@ -165,41 +172,46 @@ fn Base(comptime direction: Direction) type {
         /// once both directions have. Reached from a socket EOF and — on the
         /// read side — from the transform's own end marker, which is the
         /// point: an in-band EOF must land exactly where a real one does.
-        fn finish(server: *ServerSim, conn: *ConnSim) void {
+        fn finish(server: *ServerSim, stream: *StreamType) void {
+            const conn = stream.conn;
             assert(conn.state == .relaying);
             // Negative space behind the comment above: a direction ends
             // once. Reaching here twice would mean a socket EOF and an
             // in-band one both claimed the same side.
-            assert(state(conn).phase != .finished);
-            state(conn).phase = .finished;
-            server.io.shutdown(targetSocket(conn), .write);
-            if (conn.stream.directions[0].phase == .finished and
-                conn.stream.directions[1].phase == .finished)
+            assert(state(stream).phase != .finished);
+            state(stream).phase = .finished;
+            server.io.shutdown(targetSocket(stream), .write);
+            if (stream.directions[0].phase == .finished and
+                stream.directions[1].phase == .finished)
             {
                 server.beginTeardown(conn);
             }
         }
 
-        pub fn onRecvError(server: *ServerSim, conn: *ConnSim, err: Io.RecvError) void {
+        pub fn onRecvError(server: *ServerSim, stream: *StreamType, err: Io.RecvError) void {
+            const conn = stream.conn;
             if (err == error.EndOfStream) {
-                finish(server, conn);
+                finish(server, stream);
                 return;
             }
             server.beginTeardown(conn);
         }
 
-        pub fn onSendError(server: *ServerSim, conn: *ConnSim, err: Io.SendError) void {
+        pub fn onSendError(server: *ServerSim, stream: *StreamType, err: Io.SendError) void {
+            const conn = stream.conn;
             server.witnessKernelPressure(.send, err);
             server.beginTeardown(conn);
         }
 
-        pub fn onDrained(server: *ServerSim, conn: *ConnSim) void {
+        pub fn onDrained(server: *ServerSim, stream: *StreamType) void {
+            const conn = stream.conn;
             _ = server;
             _ = conn;
             unreachable; // `feed` consumes every byte it is given.
         }
 
-        pub fn onComplete(server: *ServerSim, conn: *ConnSim) void {
+        pub fn onComplete(server: *ServerSim, stream: *StreamType) void {
+            const conn = stream.conn;
             _ = server;
             _ = conn;
             unreachable; // `framingDone` is always false.
@@ -221,7 +233,8 @@ const ToUpstreamPolicy = struct {
 
     /// The end marker arrived with no whole frame in front of it, so there
     /// is nothing to forward first.
-    pub fn transformEnded(conn: *ConnSim) bool {
+    pub fn transformEnded(stream: *StreamType) bool {
+        const conn = stream.conn;
         _ = conn;
         return scratch.inbound_ended;
     }
@@ -230,7 +243,8 @@ const ToUpstreamPolicy = struct {
     /// chunk was non-empty, so `transformEnded` was never asked; this is
     /// where the pump learns the stream ended, once the bytes that shared
     /// the read with the marker are on their way.
-    pub fn framingDone(conn: *ConnSim) bool {
+    pub fn framingDone(stream: *StreamType) bool {
+        const conn = stream.conn;
         _ = conn;
         return scratch.inbound_ended;
     }
@@ -239,22 +253,23 @@ const ToUpstreamPolicy = struct {
     /// anything rode with it. Exactly one fires, exactly once — which is
     /// what makes the coverage flags evidence rather than decoration, so it
     /// is asserted rather than left to the tests to notice.
-    pub fn onDrained(server: *ServerSim, conn: *ConnSim) void {
+    pub fn onDrained(server: *ServerSim, stream: *StreamType) void {
         assert(scratch.inbound_ended);
         assert(!scratch.ended_via_drain and !scratch.ended_via_complete);
         scratch.ended_via_drain = true;
-        base.finish(server, conn);
+        base.finish(server, stream);
     }
 
-    pub fn onComplete(server: *ServerSim, conn: *ConnSim) void {
+    pub fn onComplete(server: *ServerSim, stream: *StreamType) void {
         assert(scratch.inbound_ended);
         assert(!scratch.ended_via_drain and !scratch.ended_via_complete);
         scratch.ended_via_complete = true;
-        base.finish(server, conn);
+        base.finish(server, stream);
     }
 
     /// After whatever fragment the last read left, never the relay buffer.
-    pub fn recvBuffer(conn: *ConnSim) []u8 {
+    pub fn recvBuffer(stream: *StreamType) []u8 {
+        const conn = stream.conn;
         _ = conn;
         // A whole frame always fits, so the scratch cannot fill without a
         // frame completing and freeing it.
@@ -266,11 +281,11 @@ const ToUpstreamPolicy = struct {
     /// An empty result means "no whole frame yet"; null means the peer
     /// framed something illegal, which is this connection's failure and not
     /// an invariant violation (§8).
-    pub fn transformIn(conn: *ConnSim, chunk: []u8) ?[]const u8 {
+    pub fn transformIn(stream: *StreamType, chunk: []u8) ?[]const u8 {
         assert(chunk.len >= 1);
         scratch.inbound_len += @intCast(chunk.len);
         assert(scratch.inbound_len <= scratch.inbound.len);
-        const out = conn.stream.relay_buffer.?.client_to_upstream;
+        const out = stream.relay_buffer.?.client_to_upstream;
         var out_len: u32 = 0;
         // Bounded by the scratch: each turn either consumes a whole frame or
         // breaks out.
@@ -329,13 +344,13 @@ const ToClientPolicy = struct {
     /// Frame the chunk once, before the first send. A payload the frame
     /// cannot carry fails the connection — the seam's fallible path, and the
     /// reason `transformOut` returns a bool rather than asserting.
-    pub fn transformOut(conn: *ConnSim, consumed: u32) bool {
+    pub fn transformOut(stream: *StreamType, consumed: u32) bool {
         assert(consumed >= 1);
         // The previous frame left the wire before this one is staged: this
         // runs exactly once per framed chunk.
         assert(scratch.outbound_len == scratch.outbound_sent);
         if (consumed > payload_max) return false;
-        const body = conn.stream.relay_buffer.?.upstream_to_client[0..consumed];
+        const body = stream.relay_buffer.?.upstream_to_client[0..consumed];
         std.mem.writeInt(u16, scratch.outbound[0..2], @intCast(consumed), .big);
         @memcpy(scratch.outbound[header_bytes..][0..consumed], body);
         scratch.outbound_len = header_bytes + consumed;
@@ -346,7 +361,8 @@ const ToClientPolicy = struct {
     /// The staged frame under its own cursor, capped so a frame takes several
     /// sends. Empty once drained, which is how the pump asks "anything left
     /// to write?".
-    pub fn sendSlice(conn: *ConnSim) []const u8 {
+    pub fn sendSlice(stream: *StreamType) []const u8 {
+        const conn = stream.conn;
         _ = conn;
         const left = scratch.outbound_len - scratch.outbound_sent;
         if (left == 0) return &.{};
@@ -356,12 +372,12 @@ const ToClientPolicy = struct {
     /// Credit the wire cursor; settle the framed debt only when the whole
     /// frame is out, because a partly written frame has delivered no payload
     /// the caller may account for.
-    pub fn creditSend(conn: *ConnSim, sent: u32) void {
+    pub fn creditSend(stream: *StreamType, sent: u32) void {
         assert(sent >= 1);
         scratch.outbound_sent += sent;
         assert(scratch.outbound_sent <= scratch.outbound_len);
         if (scratch.outbound_sent < scratch.outbound_len) return;
-        const direction_state = &conn.stream.directions[@backingInt(Direction.upstream_to_client)];
+        const direction_state = &stream.directions[@backingInt(Direction.upstream_to_client)];
         direction_state.credit(direction_state.owed());
     }
 };
@@ -726,8 +742,8 @@ const Harness = struct {
         conn.state = .relaying;
         bed.conn = conn;
         bed.server.storeDeadline(conn, 5_000);
-        PumpToUpstream.armRecv(&bed.server, conn);
-        PumpToClient.armRecv(&bed.server, conn);
+        PumpToUpstream.armRecv(&bed.server, conn.stream);
+        PumpToClient.armRecv(&bed.server, conn.stream);
     }
 
     /// Every scenario ends the same way: the connection is gone, every

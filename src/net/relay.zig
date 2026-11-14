@@ -56,20 +56,22 @@ pub fn Relay(comptime IoType: type) type {
         /// FIN'd.
         fn Policy(comptime direction: Direction) type {
             return struct {
-                fn targetSocket(conn: *const ConnType) IoType.Socket {
+                fn targetSocket(stream: *const StreamType) IoType.Socket {
+                    const conn = stream.conn;
                     return switch (direction) {
-                        .client_to_upstream => conn.stream.upstream_socket.?,
+                        .client_to_upstream => stream.upstream_socket.?,
                         .upstream_to_client => conn.client_socket,
                     };
                 }
 
-                fn state(conn: *ConnType) *stream_module.DirectionState {
-                    return &conn.stream.directions[@backingInt(direction)];
+                fn state(stream: *StreamType) *stream_module.DirectionState {
+                    return &stream.directions[@backingInt(direction)];
                 }
 
-                pub fn beforeRecv(conn: *ConnType) void {
+                pub fn beforeRecv(stream: *StreamType) void {
+                    const conn = stream.conn;
                     assert(conn.state == .relaying);
-                    const direction_state = state(conn);
+                    const direction_state = state(stream);
                     // Idle on entry, sending once a send has completed —
                     // and `receiving` again when a transform yielded
                     // nothing and the pump read on for the rest of a unit
@@ -83,30 +85,34 @@ pub fn Relay(comptime IoType: type) type {
                     direction_state.phase = .receiving;
                 }
 
-                pub fn beforeSend(conn: *ConnType) void {
+                pub fn beforeSend(stream: *StreamType) void {
+                    const conn = stream.conn;
                     assert(conn.state == .relaying);
-                    const direction_state = state(conn);
+                    const direction_state = state(stream);
                     assert(direction_state.phase == .receiving or direction_state.phase == .sending);
                     direction_state.phase = .sending;
                 }
 
                 /// Completion-time re-checks: the invariants must still hold
                 /// after the in-flight await, not only when the op was armed.
-                pub fn onRecvEntry(conn: *ConnType) void {
+                pub fn onRecvEntry(stream: *StreamType) void {
+                    const conn = stream.conn;
                     assert(conn.state == .relaying);
-                    assert(state(conn).phase == .receiving);
+                    assert(state(stream).phase == .receiving);
                 }
 
-                pub fn onSendEntry(server: *ServerType, conn: *ConnType) bool {
+                pub fn onSendEntry(server: *ServerType, stream: *StreamType) bool {
+                    const conn = stream.conn;
                     _ = server;
                     assert(conn.state == .relaying);
-                    assert(state(conn).phase == .sending);
+                    assert(state(stream).phase == .sending);
                     return false; // Relay never diverts: it has no verdict.
                 }
 
                 /// No framing: every received byte is relayed and the
                 /// message never ends short of a FIN, so `done` stays false.
-                pub fn feed(conn: *ConnType, chunk: []const u8) pump.FeedResult {
+                pub fn feed(stream: *StreamType, chunk: []const u8) pump.FeedResult {
+                    const conn = stream.conn;
                     _ = conn;
                     return .{ .consumed = @intCast(chunk.len), .done = false, .malformed = false };
                 }
@@ -120,41 +126,44 @@ pub fn Relay(comptime IoType: type) type {
                 /// thing here as they do on an HTTP line — bytes that
                 /// crossed the wire to and from the client — rather than
                 /// bytes the origin happened to see.
-                pub fn afterFeed(conn: *ConnType, received: u32, fr: pump.FeedResult) void {
+                pub fn afterFeed(stream: *StreamType, received: u32, fr: pump.FeedResult) void {
                     _ = received;
                     if (direction == .client_to_upstream) {
-                        conn.stream.log.bytes_in += fr.consumed;
+                        stream.log.bytes_in += fr.consumed;
                     }
                 }
 
-                pub fn afterSend(conn: *ConnType, sent: u32) void {
+                pub fn afterSend(stream: *StreamType, sent: u32) void {
                     if (direction == .upstream_to_client) {
-                        conn.stream.log.bytes_out += sent;
+                        stream.log.bytes_out += sent;
                     }
                 }
 
                 /// A FIN never arrives through here (relay has no length to
                 /// count down); the loop only leaves on EOF or teardown.
-                pub fn framingDone(conn: *ConnType) bool {
+                pub fn framingDone(stream: *StreamType) bool {
+                    const conn = stream.conn;
                     _ = conn;
                     return false;
                 }
 
-                pub fn onRecvError(server: *ServerType, conn: *ConnType, err: Io.RecvError) void {
+                pub fn onRecvError(server: *ServerType, stream: *StreamType, err: Io.RecvError) void {
+                    const conn = stream.conn;
                     if (err == error.EndOfStream) {
                         // Half-close (§6): propagate the FIN, keep the other
                         // direction relaying under the deadline.
-                        state(conn).phase = .finished;
-                        server.io.shutdown(targetSocket(conn), .write);
+                        state(stream).phase = .finished;
+                        server.io.shutdown(targetSocket(stream), .write);
                         server.storeDeadline(conn, server.idleTimeoutMs());
-                        maybeFinish(server, conn);
+                        maybeFinish(server, stream);
                         return;
                     }
                     server.witnessKernelPressure(.recv, err);
                     server.beginTeardown(conn);
                 }
 
-                pub fn onSendError(server: *ServerType, conn: *ConnType, err: Io.SendError) void {
+                pub fn onSendError(server: *ServerType, stream: *StreamType, err: Io.SendError) void {
+                    const conn = stream.conn;
                     server.witnessKernelPressure(.send, err);
                     server.beginTeardown(conn);
                 }
@@ -170,19 +179,21 @@ pub fn Relay(comptime IoType: type) type {
                 /// follow: the TCP connection stays open for the other
                 /// direction, so a relay that waited for one would hold a
                 /// cleanly-ended session until the idle deadline reaped it.
-                pub fn onDrained(server: *ServerType, conn: *ConnType) void {
+                pub fn onDrained(server: *ServerType, stream: *StreamType) void {
+                    const conn = stream.conn;
                     assert(conn.state == .relaying);
                     assert(direction == .client_to_upstream);
                     assert(conn.tls != null);
                     assert(conn.tls.?.peerClosed());
-                    state(conn).phase = .finished;
-                    server.io.shutdown(targetSocket(conn), .write);
+                    state(stream).phase = .finished;
+                    server.io.shutdown(targetSocket(stream), .write);
                     server.storeDeadline(conn, server.idleTimeoutMs());
-                    maybeFinish(server, conn);
+                    maybeFinish(server, stream);
                 }
 
                 /// Unreachable for L4: `framingDone` is always false.
-                pub fn onComplete(server: *ServerType, conn: *ConnType) void {
+                pub fn onComplete(server: *ServerType, stream: *StreamType) void {
+                    const conn = stream.conn;
                     _ = server;
                     _ = conn;
                     unreachable;
@@ -201,11 +212,12 @@ pub fn Relay(comptime IoType: type) type {
                 /// buffer: reassembly happens there, and the plaintext
                 /// destination is where it decrypts *to*, so it cannot also
                 /// be the read target.
-                pub fn recvBuffer(conn: *ConnType) []u8 {
+                pub fn recvBuffer(stream: *StreamType) []u8 {
+                    const conn = stream.conn;
                     if (direction == .client_to_upstream) {
                         if (conn.tls) |engine| return engine.recvBuffer();
                     }
-                    return @field(conn.stream.relay_buffer.?, @tagName(direction));
+                    return @field(stream.relay_buffer.?, @tagName(direction));
                 }
 
                 /// Decrypt, so framing sees plaintext and never learns a
@@ -213,10 +225,11 @@ pub fn Relay(comptime IoType: type) type {
                 /// carried no application data — a fragment, an alert, a
                 /// KeyUpdate — which the pump reads on for; and nothing for
                 /// close_notify, which `transformEnded` tells apart.
-                pub fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
+                pub fn transformIn(stream: *StreamType, chunk: []u8) ?[]const u8 {
+                    const conn = stream.conn;
                     if (direction != .client_to_upstream) return chunk;
                     const engine = conn.tls orelse return chunk;
-                    if (!hasOutboundRoom(conn.server, conn)) return null;
+                    if (!hasOutboundRoom(conn.server, stream)) return null;
                     var out: Decrypted = .{ .conn = conn };
                     const sink = out.sink();
                     engine.received(chunk.len, &sink) catch {
@@ -231,7 +244,8 @@ pub fn Relay(comptime IoType: type) type {
                 /// socket EOF need follow, so without this the direction
                 /// waits for bytes that will never come until the deadline
                 /// reaps a connection that said a clean goodbye.
-                pub fn transformEnded(conn: *ConnType) bool {
+                pub fn transformEnded(stream: *StreamType) bool {
+                    const conn = stream.conn;
                     if (direction != .client_to_upstream) return false;
                     const engine = conn.tls orelse return false;
                     return engine.peerClosed();
@@ -247,12 +261,13 @@ pub fn Relay(comptime IoType: type) type {
                 /// terminates TLS is refused above `tls_app_chunk_bytes`
                 /// (`LimitRelayBufferOverTlsRecord`), and `sendApp`
                 /// asserts the same bound as a backstop.
-                pub fn transformOut(conn: *ConnType, consumed: u32) bool {
+                pub fn transformOut(stream: *StreamType, consumed: u32) bool {
+                    const conn = stream.conn;
                     if (direction != .upstream_to_client) return true;
                     const engine = conn.tls orelse return true;
-                    if (!hasOutboundRoom(conn.server, conn)) return false;
+                    if (!hasOutboundRoom(conn.server, stream)) return false;
                     engine.sendApp(
-                        conn.stream.relay_buffer.?.upstream_to_client[0..consumed],
+                        stream.relay_buffer.?.upstream_to_client[0..consumed],
                     ) catch {
                         conn.server.counters.increment("tls_relay_failed");
                         return false;
@@ -263,15 +278,16 @@ pub fn Relay(comptime IoType: type) type {
                 /// Plaintext leaves the buffer it decrypted into;
                 /// ciphertext leaves the outbox, which carries its own
                 /// cursor. Plain: the framed window still owed.
-                pub fn sendSlice(conn: *ConnType) []const u8 {
-                    const direction_state = state(conn);
+                pub fn sendSlice(stream: *StreamType) []const u8 {
+                    const conn = stream.conn;
+                    const direction_state = state(stream);
                     if (conn.tls) |engine| {
                         if (direction == .upstream_to_client) return engine.outbound();
                         if (direction_state.owed() == 0) return &.{};
                         return direction_state.pending(engine.plaintext);
                     }
                     if (direction_state.owed() == 0) return &.{};
-                    return direction_state.pending(@field(conn.stream.relay_buffer.?, @tagName(direction)));
+                    return direction_state.pending(@field(stream.relay_buffer.?, @tagName(direction)));
                 }
 
                 /// Credit whichever cursor tracks the wire. Only the
@@ -280,8 +296,9 @@ pub fn Relay(comptime IoType: type) type {
                 /// counts, so the debt settles all at once when the outbox
                 /// empties — the pump's stated contract for a transforming
                 /// send.
-                pub fn creditSend(conn: *ConnType, sent: u32) void {
-                    const direction_state = state(conn);
+                pub fn creditSend(stream: *StreamType, sent: u32) void {
+                    const conn = stream.conn;
+                    const direction_state = state(stream);
                     if (direction == .upstream_to_client) {
                         if (conn.tls) |engine| {
                             engine.outboundSent(sent);
@@ -301,7 +318,8 @@ pub fn Relay(comptime IoType: type) type {
         /// Checked rather than asserted: the room depends on how fast the
         /// far side is draining, which is the peer's business, not an
         /// invariant of ours.
-        fn hasOutboundRoom(server: *ServerType, conn: *ConnType) bool {
+        fn hasOutboundRoom(server: *ServerType, stream: *StreamType) bool {
+            const conn = stream.conn;
             assert(conn.state == .relaying);
             assert(conn.tls != null);
             if (conn.tls.?.outboundRoom() >= TlsEngine.emitted_record_bytes_max) return true;
@@ -351,11 +369,12 @@ pub fn Relay(comptime IoType: type) type {
         const PumpClientToUpstream = pump.Pump(IoType, .client_to_upstream, Policy(.client_to_upstream));
         const PumpUpstreamToClient = pump.Pump(IoType, .upstream_to_client, Policy(.upstream_to_client));
 
-        pub fn start(server: *ServerType, conn: *ConnType) void {
+        pub fn start(server: *ServerType, stream: *StreamType) void {
+            const conn = stream.conn;
             assert(conn.state == .relaying);
-            assert(conn.stream.upstream_socket != null);
+            assert(stream.upstream_socket != null);
             const client_to_upstream =
-                &conn.stream.directions[@backingInt(Direction.client_to_upstream)];
+                &stream.directions[@backingInt(Direction.client_to_upstream)];
             if (client_to_upstream.owed() >= 1) {
                 // Payload that arrived coalesced behind a PROXY header
                 // (#142): the receive phase staged it at the buffer's
@@ -365,26 +384,27 @@ pub fn Relay(comptime IoType: type) type {
                 // framing. The send drains the debt, then rejoins the
                 // recv loop; no byte is read ahead of it (§6).
                 assert(client_to_upstream.phase == .receiving);
-                PumpClientToUpstream.armSend(server, conn);
+                PumpClientToUpstream.armSend(server, stream);
             } else {
                 assert(client_to_upstream.phase == .idle);
-                PumpClientToUpstream.armRecv(server, conn);
+                PumpClientToUpstream.armRecv(server, stream);
             }
-            assert(conn.stream.directions[1].phase == .idle);
-            PumpUpstreamToClient.armRecv(server, conn);
+            assert(stream.directions[1].phase == .idle);
+            PumpUpstreamToClient.armRecv(server, stream);
         }
 
         /// Both directions drained: the orderly end of an L4 connection.
-        fn maybeFinish(server: *ServerType, conn: *ConnType) void {
+        fn maybeFinish(server: *ServerType, stream: *StreamType) void {
+            const conn = stream.conn;
             assert(conn.state == .relaying);
-            if (conn.stream.directions[0].phase == .finished) {
-                if (conn.stream.directions[1].phase == .finished) {
+            if (stream.directions[0].phase == .finished) {
+                if (stream.directions[1].phase == .finished) {
                     // The one L4 ending that is not a failure: both peers
                     // said goodbye. Every other way this connection can end
                     // — a reset, a deadline, a drain straggler — leaves the
                     // access log's default `aborted` in place (§8), so the
                     // line distinguishes a completed relay from a cut one.
-                    conn.stream.log.outcome = .closed;
+                    stream.log.outcome = .closed;
                     server.beginTeardown(conn);
                 }
             }

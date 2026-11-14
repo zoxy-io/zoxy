@@ -29,7 +29,11 @@ pub fn Conn(comptime IoType: type) type {
         /// The §5 stream slot carrying this connection's exchange
         /// (#274). Exactly one for now, held for the connection's life,
         /// which is what keeps the ring budget where it was; #173 turns
-        /// this into the set a multiplexed connection owns.
+        /// this into the set a multiplexed connection owns. The exchange
+        /// is already keyed on it — the proxy, the pump and the relay take
+        /// the stream and reach this slot through `stream.conn`, and every
+        /// op the stream owns is delivered to the stream — so the set is a
+        /// change to how a stream is found, not to what runs on one.
         ///
         /// Not optional: a connection without a stream could not run an
         /// exchange at all, and the 1:1 cap means the acquire past the
