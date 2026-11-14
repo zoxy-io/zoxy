@@ -28,8 +28,15 @@ pub const Slot = struct {
     recv_unacked: u32,
     recv_delivered: u32,
     /// What the client's WINDOW_UPDATEs and SETTINGS allow this side to
-    /// send on the stream.
+    /// send on the stream. SETTINGS can push it below zero (§6.9.2).
     send_window: i64,
+    /// Whether the final (non-informational) response head is staged:
+    /// body and trailers may follow it, and nothing may precede it.
+    head_sent: bool,
+    /// What a send cut short is waiting for, and the outbox room it needs
+    /// — the scheduler's state for this stream.
+    send_wait: SendWait,
+    send_room_needed: u32,
     /// The request's `content-length`, and the DATA octets seen against it
     /// (RFC 9113 §8.1.1).
     content_length: ?u64,
@@ -38,13 +45,27 @@ pub const Slot = struct {
     reset_code: h2.frame.ErrorCode,
 
     pub const State = enum(u8) {
-        /// The client may still send DATA and trailers.
+        /// Both sides may still send.
         open,
         /// The client sent END_STREAM (§5.1); only this side has more to say.
         half_closed_remote,
+        /// This side sent END_STREAM; the client is still sending its body.
+        half_closed_local,
         /// The caller reset it. RST_STREAM goes out when the outbox has
         /// room, and the slot is free after that.
         reset_pending,
+    };
+
+    pub const SendWait = enum(u8) {
+        /// Not cut short: free to send, or nothing to send.
+        none,
+        /// A field block, or an END_STREAM with no octets: waiting for
+        /// `send_room_needed` octets of outbox room. No window governs it.
+        room,
+        /// Body octets: waiting for both windows to open and for room for
+        /// a frame — or, cut short by its turn, for the streams queued
+        /// ahead of it.
+        data,
     };
 
     const free: Slot = .{
@@ -54,6 +75,9 @@ pub const Slot = struct {
         .recv_unacked = 0,
         .recv_delivered = 0,
         .send_window = 0,
+        .head_sent = false,
+        .send_wait = .none,
+        .send_room_needed = 0,
         .content_length = null,
         .data_received = 0,
         .reset_code = .no_error,
