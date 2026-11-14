@@ -545,10 +545,14 @@ point of the separate pool, and including a ceiling nobody reaches would
 misprice the common case. The two HTTP/2 pools (#275) are off on the same
 terms, unless a listener speaks HTTP/2: the sessions are a pool because
 the unit is ~100 KiB, which on every conn slot would cost a GiB at c10k,
-and running short of one is graceful — ALPN offers `http/1.1` while the
-pool is empty. The shared stream slots are what HTTP/2 multiplexes, each
-charged a stream's two ring ops beside the per-connection divisor, which
-is why `limits.stream_slots` is required rather than guessed. Both are
+and running short of one is graceful — admission reserves a session
+before the handshake may offer `h2`, and offers `http/1.1` alone while
+the pool is empty, so a client is answered in the handshake rather than
+turned away after it; a reservation the client did not take goes back
+when the handshake ends. The shared stream slots are what HTTP/2
+multiplexes, each charged a stream's two ring ops beside the
+per-connection divisor, which is why `limits.stream_slots` is required
+rather than guessed. Both are
 priced and reserved ahead of the serving path, and read zero until a
 listener can speak HTTP/2. A deployment that does configure tunnels at the
 ceiling pays the same `relay_buffer_bytes` term twice. Both figures track

@@ -167,6 +167,10 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.phase == .reading_head);
             assert(stream.head_len == 0);
             assert(stream.head_buffer_id == StreamType.head_buffer_none);
+            // An HTTP/1.1 connection holds no HTTP/2 session: one reserved
+            // for an ALPN offer the client did not take went back at the
+            // handshake's end (#275).
+            assert(conn.h2 == null);
             if (conn.tls != null) {
                 // Plaintext the handshake's last flight carried in with it
                 // is already in the head buffer, at its front — a client
