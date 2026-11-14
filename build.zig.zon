@@ -192,11 +192,16 @@
         // both harnesses. A C surface in the *measurement* binaries, never
         // the proxy — no `src/` file imports zrk.
         //
-        // The zssl gap the previous record left open is closed: v3.0.1
-        // pins zssl 827c7e5, the commit this file pins, and both reach the
-        // one zoxy-io/openssl 0377b65. The optimize-mode collision that
-        // keeps `zoxy-profile-harness` off the `zoxy` module (see
-        // build.zig) is unaffected and still reason enough on its own.
+        // The two are one zssl commit apart again: v3.0.1 pins 827c7e5, and
+        // this file moved to 5f5c582 for #271's server-side ALPN (see the
+        // zssl record). Harmless for the reason it was harmless before:
+        // neither binary holds both — the harnesses link zrk's, the proxy
+        // under test is a separate process linking this one — and both
+        // reach the one zoxy-io/openssl 0377b65. The commit between them
+        // touches only the server, which zrk never runs. The
+        // optimize-mode collision that keeps `zoxy-profile-harness` off
+        // the `zoxy` module (see build.zig) is unaffected and still
+        // reason enough on its own. Bring them together when zrk next moves.
         //
         // The zio bump beside it is not optional. zrk carries zio 0.20.1 at
         // c0a6b58, and the rule below — that this file's zio must be
@@ -486,6 +491,40 @@
         // gates are the evidence, and the paragraphs below are the
         // record of reading them.
         //
+        // Re-audit for 5f5c582, 2026-11-14 (zoxy-io/zoxy#271): one commit
+        // on, server-side ALPN, written for this proxy's HTTP/2.
+        //
+        //   - `Config.alpn` (one protocol) becomes `alpn_protocols`, a
+        //     server-preference list, and `alpnSelected()` reports the
+        //     choice. RFC 7301 §3.2 leaves the choice to the server: the
+        //     first of ours the client also offered wins, whatever order
+        //     the client listed them in. That is what lets #275 offer `h2`
+        //     ahead of `http/1.1` and branch on the answer.
+        //   - The selection loop's private stop at sixteen names becomes
+        //     the hello parser's `alpn_entries_max` (32). Before, an offer
+        //     of seventeen parsed cleanly and was then refused as
+        //     malformed, but only by a server with ALPN configured. That
+        //     server is now this one, so the inconsistency would have
+        //     shipped with #271.
+        //   - `EarlyData.alpn`, required: 0-RTT is refused when the resumed
+        //     session's ALPN differs from the ticket's, which RFC 8446
+        //     §4.2.10 makes a MUST and `admitEarlyData` did not check.
+        //     Not reachable here, because zoxy answers `.resumption` with
+        //     no early-data terms (record below), but a preference list is
+        //     what made the gap wide, so it closed in the same commit.
+        //
+        // Nothing else moves: no suite, group, record or alert path
+        // changes. What it costs, stated because §5 is closed-form:
+        // nothing. `@sizeOf(Engine)` stays 94,448 B, measured with
+        // `zoxy --check` on a TLS config, because the new selection byte
+        // fits in padding the handshake already had. (#271's own engine
+        // flag is what moves it, in the commit after this one.) zssl still returns
+        // `error.NoApplicationProtocol` and leaves the alert to its
+        // embedder, which is why `Engine.refuseApplicationProtocol`
+        // exists. Gates on the zssl side: tests 178/178 in Debug and
+        // ReleaseSafe, interop five legs, BoGo 454 at its floor,
+        // tlsfuzzer 22/22.
+        //
         // Re-audit for 827c7e5 (Zig 0.17), 2026-11-13 — the commit zrk
         // v3.0.1 pins, which puts the two back on one zssl (see zrk
         // above). Six commits on from 91a985a, read for what reaches zoxy:
@@ -608,8 +647,8 @@
         // RFC 8446 §4.3.2's CertificateRequest, RFC 5705 exporters, and
         // 0-RTT with the strike register RFC 8446 §8.2 needs.
         .zssl = .{
-            .url = "git+https://github.com/zoxy-io/zssl#827c7e5002aef45cc2a14f99200bdf288f4a0f0c",
-            .hash = "zssl-0.0.1-5ocyiJXbEACoixJ3negjZSa8wikXraZUW4VPpKKa_5bO",
+            .url = "git+https://github.com/zoxy-io/zssl#5f5c5820e28e6f5ad40fb449db0df7f28547c352",
+            .hash = "zssl-0.0.1-5ocyiFkHEQBi4TIgT1Yh7RnCsa3274ieVA9wZwd9gGQR",
         },
     },
     .paths = .{
