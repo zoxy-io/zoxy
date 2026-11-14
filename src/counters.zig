@@ -263,6 +263,11 @@ pub const Counters = struct {
     /// identity's shed sum on purpose — the connection was admitted, and
     /// it counts as completed when it goes.
     h2_shed_sessions: Value = Value.init(0),
+    /// HTTP/2 requests refused with REFUSED_STREAM because the shared
+    /// stream pool, or the stream heads beside it, were empty (#275): the
+    /// stream is refused before any work, which the client may retry, and
+    /// the connection goes on serving the others.
+    h2_shed_streams: Value = Value.init(0),
     /// Requests refused for a body over the listener's cap (#236).
     /// Distinct from `l7_body_too_large` beside it, which answers the
     /// same `413` for a different question — that one is a *buffer*

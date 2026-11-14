@@ -412,6 +412,23 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// this slot — and on the L4 path the exchange simply lasts as
         /// long as the connection does.
         log: LogState,
+        /// The HTTP/2 stream this exchange answers (#275), on a shared slot:
+        /// its identifier on `conn.h2`'s session — zero on an admission
+        /// stream, whose client is the connection itself. A shared stream's
+        /// client half is that session: its request arrives as a field
+        /// section and leaves as frames, and nothing of it touches a socket.
+        h2_id: u31,
+        /// The head buffer its request was written out into, from the §5
+        /// stream-head pool — what `headBytes` reads where an admission
+        /// stream reads the ring or its engine's plaintext.
+        h2_head: ?*upstream_module.HeadBuffer,
+        /// The next exchange multiplexed on the same connection: the list
+        /// `Conn.h2_streams` heads, which is how a frame's stream identifier
+        /// finds its exchange and a teardown finds every one.
+        h2_next: ?*Self,
+        /// The answer's head is staged on the session, so what is left of
+        /// `client_write.pending` is its body.
+        h2_head_staged: bool,
 
         const Self = @This();
 
@@ -712,6 +729,13 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             // listener says it is one, and an L7 exchange only when its
             // first head byte lands.
             stream.log = .{};
+            // An admission stream's client is its connection; a shared one
+            // is bound to its HTTP/2 stream after this (`Server`'s
+            // `acquireSharedStream`).
+            stream.h2_id = 0;
+            stream.h2_head = null;
+            stream.h2_next = null;
+            stream.h2_head_staged = false;
             assert(stream.armedCount() == 0);
             assert(stream.relay_buffer == null);
             assert(stream.head_len == 0);
@@ -724,14 +748,22 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             assert(stream.log.started_wall_ns == 0);
         }
 
-        /// Move the exchange within `.l7` (#275). Only the connection's own
-        /// `enter` moves an exchange into or out of the protocol, so a move
-        /// here on a connection that has left it — torn down, or tunneling
-        /// after `101` — is the bug the phase split could otherwise hide:
-        /// a phase that says "exchanging" on a connection that is not.
+        /// Move the exchange within `.l7` — or within `.h2`, for one of the
+        /// exchanges an HTTP/2 connection multiplexes (#275). Only the
+        /// connection's own `enter` moves an exchange into or out of the
+        /// protocol, so a move here on a connection that has left it — torn
+        /// down, or tunneling after `101` — is the bug the phase split could
+        /// otherwise hide: a phase that says "exchanging" on a connection
+        /// that is not.
         pub fn moveTo(stream: *Self, phase: Phase) void {
             assert(phase != .none);
-            assert(stream.conn.state == .l7);
+            // An HTTP/2 connection's exchanges each have a phase of their
+            // own, while the connection's state stays `.h2` (#275).
+            if (stream.h2_id == 0) {
+                assert(stream.conn.state == .l7);
+            } else {
+                assert(stream.conn.state == .h2);
+            }
             stream.phase = phase;
         }
 

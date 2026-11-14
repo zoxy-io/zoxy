@@ -339,6 +339,13 @@ const uncovered = [_]Uncovered{
             "session pool directly",
     },
     .{
+        .name = "h2_shed_streams",
+        .why = .unreached,
+        .reason = "the simulator does not speak HTTP/2 yet — its client is " ++
+            "#275's last slice; src/http_proxy_test.zig exhausts the " ++
+            "shared stream pool directly",
+    },
+    .{
         .name = "tunnels_drained",
         .why = .unreached,
         .reason = "structural rather than a gap in ambition: the production " ++

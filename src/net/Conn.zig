@@ -133,6 +133,11 @@ pub fn Conn(comptime IoType: type) type {
         /// or null on any connection that does not speak HTTP/2. Held for
         /// the connection's life once taken, and returned at teardown.
         h2: ?*H2Slot,
+        /// The exchanges this HTTP/2 connection is multiplexing (#275), each
+        /// on a shared stream slot: the head of the list `Stream.h2_next`
+        /// links. Empty on every other connection, whose one exchange is
+        /// `stream`.
+        h2_streams: ?*StreamType,
         /// The listener's #175 response filter rules, same lifetime:
         /// matched against the origin's parsed response head at the
         /// re-render (empty on L4 and when none are configured).
@@ -342,6 +347,7 @@ pub fn Conn(comptime IoType: type) type {
             conn.request_filters = &.{};
             conn.h2c = false;
             conn.h2 = null;
+            conn.h2_streams = null;
             conn.response_filters = &.{};
             conn.upgrades = .{};
             conn.max_body_bytes = 0;

@@ -627,6 +627,18 @@ pub fn resetStream(session: *Session, stream: u31, code: frame.ErrorCode) void {
     session.pending = true;
 }
 
+/// Whether `stream` is still sending while this side has finished: its
+/// END_STREAM is staged and the client's is not in, so the request's rest
+/// is arriving for an exchange that answered without it — the case
+/// RST_STREAM(NO_ERROR) exists to stop (§8.1). False once the stream is
+/// gone, which is where a client that had finished first leaves it.
+pub fn awaitingClient(session: *Session, stream: u31) bool {
+    assert(stream != 0);
+    assert(session.state != .closed);
+    const slot = session.streams.find(stream) orelse return false;
+    return slot.state == .half_closed_local;
+}
+
 /// End the connection gracefully (§6.8): GOAWAY(NO_ERROR) naming the last
 /// stream the caller was handed, every stream after it refused, and the
 /// connection over once the ones before it finish — a drain, not an error,

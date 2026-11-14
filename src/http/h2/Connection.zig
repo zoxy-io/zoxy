@@ -24,15 +24,14 @@
 //! engine's outbox. Nothing about the session changes: it never learns its
 //! octets were encrypted.
 //!
-//! What a stream becomes is the next slice's: until the exchange runs on a
-//! shared stream, every request is refused with REFUSED_STREAM (RFC 9113
-//! §8.7, "no processing has occurred"), so this is a conforming HTTP/2
-//! connection that serves nothing — gated on its own before the exchange
-//! is wired through it.
+//! What a stream becomes is `exchange.zig`'s: a request runs §7 on a
+//! shared stream slot, and its answer comes back through the session. This
+//! file only hands each stream event to the exchange it belongs to.
 
 const std = @import("std");
 
 const Session = @import("Session.zig");
+const Exchange = @import("exchange.zig");
 const Io = @import("../../io/io.zig");
 const TlsEngine = @import("../../tls/Engine.zig");
 const constants = @import("../../constants.zig");
@@ -83,6 +82,7 @@ pub fn Driver(comptime IoType: type) type {
     const ServerType = @import("../../Server.zig").Server(IoType);
     const ConnType = @import("../../net/Conn.zig").Conn(IoType);
     const StreamType = ConnType.StreamType;
+    const ExchangeType = Exchange.Exchange(IoType);
 
     return struct {
         /// The most session steps one completion runs before it must have
@@ -197,14 +197,18 @@ pub fn Driver(comptime IoType: type) type {
                     // The outbox is full: the send completion steps again.
                     .flush_first => return flush(server, conn, slot),
                     .closed => return close(server, conn, slot),
-                    // No exchange runs on a shared stream yet (#275's next
-                    // slice), so a request is refused before it is worked
-                    // on — REFUSED_STREAM, which the client may retry.
-                    .request => |request| slot.session.resetStream(request.stream, .refused_stream),
-                    // A refused stream raises nothing after its reset, and
-                    // nothing here sends a body to wait on.
-                    .data, .trailers, .reset, .writable => unreachable,
+                    .request => |request| ExchangeType.open(server, conn, &request),
+                    // No exchange forwards a body yet: it is answered by §7
+                    // or refused, so what the client sends after its head
+                    // is read and dropped, and its trailers with it.
+                    .data => |data| ExchangeType.discardData(conn, &data),
+                    .trailers => |trailers| assert(ExchangeType.find(conn, trailers.stream) != null),
+                    .reset => |reset| ExchangeType.onReset(server, conn, &reset),
+                    .writable => |writable| ExchangeType.onWritable(server, conn, writable.stream),
                 }
+                // What fails on a stream ends the stream, never the
+                // connection: an exchange resets, and the session goes on.
+                assert(!conn.isTearingDown());
             }
         }
 
