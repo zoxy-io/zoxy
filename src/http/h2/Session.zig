@@ -639,6 +639,15 @@ pub fn awaitingClient(session: *Session, stream: u31) bool {
     return slot.state == .half_closed_local;
 }
 
+/// Whether `stream` is still this side's to reset: the session holds it
+/// and nothing has ended it — the client's reset, or one already said.
+pub fn resettable(session: *Session, stream: u31) bool {
+    assert(stream != 0);
+    if (session.state == .closed) return false;
+    const slot = session.streams.find(stream) orelse return false;
+    return slot.state != .reset_pending;
+}
+
 /// End the connection gracefully (§6.8): GOAWAY(NO_ERROR) naming the last
 /// stream the caller was handed, every stream after it refused, and the
 /// connection over once the ones before it finish — a drain, not an error,

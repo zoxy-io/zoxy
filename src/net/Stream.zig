@@ -429,6 +429,17 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// The answer's head is staged on the session, so what is left of
         /// `client_write.pending` is its body.
         h2_head_staged: bool,
+        /// Its END_STREAM is staged: the answer is whole on the session.
+        h2_ended: bool,
+        /// A multiplexed exchange is ending on its own, its connection
+        /// serving on (#275): what it has in flight is being forced, and the
+        /// slot goes back once the last of it delivers. An admission
+        /// stream's exchange ends only with its connection, and never sets it.
+        ending: bool,
+        /// A multiplexed exchange's next deadline, on the connection's one
+        /// timer (#275), or zero for none. An admission stream's is its
+        /// connection's own `deadline_ns`.
+        deadline_ns: u64,
 
         const Self = @This();
 
@@ -736,6 +747,9 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             stream.h2_head = null;
             stream.h2_next = null;
             stream.h2_head_staged = false;
+            stream.h2_ended = false;
+            stream.ending = false;
+            stream.deadline_ns = 0;
             assert(stream.armedCount() == 0);
             assert(stream.relay_buffer == null);
             assert(stream.head_len == 0);

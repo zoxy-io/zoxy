@@ -425,9 +425,9 @@ pub const Config = struct {
         upgrades: Upgrades = .{},
         /// Whether this plaintext listener takes h2c by prior knowledge
         /// (#275, RFC 9113 §3.3): a connection opening with HTTP/2's
-        /// preface speaks HTTP/2. No key yet — the session layer answers
-        /// every stream with REFUSED_STREAM until the exchange runs on
-        /// one, and the key (`http.h2c`) arrives with that.
+        /// preface speaks HTTP/2. No key yet — a request with a body is
+        /// refused with REFUSED_STREAM until request bodies are forwarded,
+        /// and the key (`http.h2c`) arrives with that.
         h2c: bool = false,
         /// Whether refusals name their RFC 9209 cause on the wire
         /// (#300). Per listener and off by default, on `forwarded`'s
@@ -5456,7 +5456,7 @@ fn resolveAlpn(
     for (asked) |token| {
         const named = alpn.Protocol.fromToken(token) orelse return error.ListenerTlsAlpnUnknown;
         // A protocol the serving path speaks only in part is not one an
-        // operator can name yet: `h2` refuses every stream (#275).
+        // operator can name yet: `h2` forwards no request body (#275).
         if (!named.configurable()) return error.ListenerTlsAlpnUnknown;
         if (seen[@backingInt(named)]) return error.ListenerTlsAlpnDuplicate;
         seen[@backingInt(named)] = true;

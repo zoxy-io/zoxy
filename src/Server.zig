@@ -388,8 +388,9 @@ pub fn Server(comptime IoType: type) type {
         pub const ConnType = conn_module.Conn(IoType);
         pub const StreamType = ConnType.StreamType;
         pub const AccessLogType = access_log_module.AccessLog(IoType);
-        const Proxy = proxy.Proxy(IoType);
+        pub const Proxy = proxy.Proxy(IoType);
         const H2Driver = H2Connection.Driver(IoType);
+        const H2ExchangeType = H2Exchange.Exchange(IoType);
 
         /// Pool sizes are injectable so tests and the simulator can force
         /// every exhaustion rung; production passes the config's resolved
@@ -767,11 +768,23 @@ pub fn Server(comptime IoType: type) type {
             const streams_max = conn.h2.?.session.config.concurrent_streams_max;
             assert(stream.h2_id != 0);
             assert(stream.armedCount() == 0);
-            assert(stream.relay_buffer == null);
-            assert(stream.upstream == null);
             // No tunnel is ever claimed for one: HTTP/2 refuses `upgrade` as
             // connection-specific (RFC 9113 §8.2.2) before §7 could read it.
             assert(conn.tunnel_buffer == null);
+            // An exchange ended mid-flight still holds its upstream half:
+            // nothing is armed on it any more, so it closes synchronously.
+            if (stream.upstream_socket) |socket| {
+                server.io.closeNow(socket);
+                stream.upstream_socket = null;
+            }
+            if (stream.upstream) |leased| {
+                server.releaseUpstream(leased);
+                stream.upstream = null;
+            }
+            if (stream.relay_buffer) |buffer| {
+                server.releaseRelayBuffer(buffer);
+                stream.relay_buffer = null;
+            }
             server.logExchange(stream);
             server.releaseStaticSend(stream);
             if (stream.h2_head != null) server.returnHeadBuffer(stream);
@@ -788,6 +801,21 @@ pub fn Server(comptime IoType: type) type {
                 return;
             }
             unreachable; // A shared stream is on its connection's list.
+        }
+
+        /// The teardown's first pass over the exchanges an HTTP/2 connection
+        /// multiplexes: each forced, none released — the release is the last
+        /// op's, or the teardown's once nothing is armed at all.
+        fn quiesceSharedStreams(server: *Self, conn: *ConnType) void {
+            const slot = conn.h2 orelse return;
+            const streams_max = slot.session.config.concurrent_streams_max;
+            var cursor = conn.h2_streams;
+            var visited: u32 = 0;
+            while (cursor) |stream| : (cursor = stream.h2_next) {
+                assert(visited < streams_max);
+                visited += 1;
+                if (!stream.ending) server.quiesceSharedStream(stream);
+            }
         }
 
         /// Every exchange an HTTP/2 connection is multiplexing, ended with
@@ -3737,6 +3765,9 @@ pub fn Server(comptime IoType: type) type {
             if (conn.stream.armed.connect and !conn.stream.armed.connect_cancel) {
                 server.armConnectCancel(conn.stream);
             }
+            // Every exchange it multiplexes ends with it (#275): forced now,
+            // released once the last of their ops delivers.
+            server.quiesceSharedStreams(conn);
             // A dial rebase (§8) may already have this timer's cancel in
             // flight (onDeadlineRebase); submitting a second would double-arm
             // the op. Its drain routes to teardown via the isTearingDown
@@ -3856,6 +3887,7 @@ pub fn Server(comptime IoType: type) type {
             // impossible, and which the sim finds on the first idle
             // timeout when it is got wrong.
             if (conn.armedCount() != 0 or conn.stream.armedCount() != 0) return;
+            if (sharedStreamsArmed(conn)) return;
             // Nothing armed on either slot: no op references either fd,
             // which is what makes the synchronous closes and the two
             // releases safe.
@@ -4312,14 +4344,76 @@ pub fn Server(comptime IoType: type) type {
         pub fn storeExchangeDeadline(server: *Self, stream: *StreamType, timeout_ms: u32) void {
             assert(stream.conn.stream == stream or stream.h2_id != 0);
             assert(timeout_ms >= 1);
+            if (stream.h2_id != 0) return server.storeSharedDeadline(stream, timeout_ms);
             server.storeDeadline(stream.conn, timeout_ms);
+        }
+
+        /// A multiplexed exchange's deadline (#275): its own, clamped under
+        /// its request cap as an admission stream's is under the
+        /// connection's — and covered by the connection's one timer, which
+        /// a deadline earlier than its target moves and re-bases. A later
+        /// one is found when the timer next fires (`H2Driver.expire`).
+        fn storeSharedDeadline(server: *Self, stream: *StreamType, timeout_ms: u32) void {
+            const conn = stream.conn;
+            assert(conn.state == .h2);
+            var deadline_ns = server.io.nowNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
+            if (stream.l7.request_deadline_ns != 0) {
+                deadline_ns = @min(deadline_ns, stream.l7.request_deadline_ns);
+            }
+            stream.deadline_ns = deadline_ns;
+            assert(stream.deadline_ns != 0);
+            if (deadline_ns >= conn.deadline_ns) return;
+            conn.deadline_ns = deadline_ns;
+            server.rebaseTimer(conn);
+        }
+
+        /// An HTTP/2 connection's own idle window, from its client's latest
+        /// activity (#275): kept in its slot apart from the exchanges'
+        /// deadlines, the connection's timer aimed at the first of them all.
+        /// Only ever later than before, so the lazy re-arm finds it (§4).
+        pub fn storeH2IdleDeadline(server: *Self, conn: *ConnType) void {
+            const slot = conn.h2.?;
+            assert(conn.state == .h2);
+            server.storeDeadline(conn, server.idleTimeoutMs());
+            slot.idle_deadline_ns = conn.deadline_ns;
+            refreshH2Deadline(conn);
+        }
+
+        /// Aim an HTTP/2 connection's stored deadline at the first of its
+        /// idle window and its exchanges' deadlines.
+        pub fn refreshH2Deadline(conn: *ConnType) void {
+            const slot = conn.h2.?;
+            assert(conn.state == .h2);
+            var deadline_ns = slot.idle_deadline_ns;
+            const streams_max = slot.session.config.concurrent_streams_max;
+            var cursor = conn.h2_streams;
+            var visited: u32 = 0;
+            while (cursor) |stream| : (cursor = stream.h2_next) {
+                assert(visited < streams_max);
+                visited += 1;
+                // An ending exchange waits on its forced ops, not a clock.
+                if (stream.ending) continue;
+                if (stream.deadline_ns != 0) deadline_ns = @min(deadline_ns, stream.deadline_ns);
+            }
+            assert(deadline_ns != 0);
+            conn.deadline_ns = deadline_ns;
+        }
+
+        /// The §6 max-lifetime cap has passed for `conn`.
+        pub fn lifetimeOver(server: *const Self, conn: *const ConnType) bool {
+            assert(conn.birth_ns != 0);
+            if (server.config.max_lifetime_ms == 0) return false;
+            const cap_ns = conn.birth_ns + @as(u64, server.config.max_lifetime_ms) * std.time.ns_per_ms;
+            return server.io.nowNs() >= cap_ns;
         }
 
         /// Re-base the timer under an exchange's narrowed deadline: its
         /// connection's, for the reason `storeExchangeDeadline` gives.
         pub fn rebaseExchangeDeadline(server: *Self, stream: *StreamType) void {
-            assert(stream.conn.stream == stream);
             assert(!stream.conn.isTearingDown());
+            // A multiplexed exchange's store re-based already, if it had to.
+            if (stream.h2_id != 0) return;
+            assert(stream.conn.stream == stream);
             server.rebaseDeadline(stream.conn);
         }
 
@@ -4331,15 +4425,82 @@ pub fn Server(comptime IoType: type) type {
         /// changes the answer here rather than at every op.
         pub fn exchangeEnding(stream: *const StreamType) bool {
             assert(stream.conn.stream == stream or stream.h2_id != 0);
-            return stream.conn.isTearingDown();
+            if (stream.ending) assert(stream.h2_id != 0);
+            return stream.ending or stream.conn.isTearingDown();
         }
 
         /// Go on with whatever is ending the exchange — its connection's
         /// teardown — now that one more of its ops has delivered.
         pub fn continueExchangeEnd(server: *Self, stream: *StreamType) void {
             assert(exchangeEnding(stream));
+            if (stream.h2_id != 0) return server.continueSharedStreamEnd(stream);
             assert(stream.conn.state == .tearing_down);
             server.continueTeardown(stream.conn);
+        }
+
+        /// End an exchange that cannot finish, its client told so: an
+        /// admission stream's by tearing its connection down, which is the
+        /// one way its client can be told; a multiplexed one's by resetting
+        /// its stream, the connection serving on (#275).
+        pub fn endExchange(server: *Self, stream: *StreamType) void {
+            assert(!exchangeEnding(stream));
+            if (stream.h2_id == 0) return server.beginTeardown(stream.conn);
+            H2ExchangeType.fail(server, stream);
+        }
+
+        /// A multiplexed exchange ends on its own (#275): everything it has
+        /// in flight forced — its upstream shut, its dial cancelled — and
+        /// its slot back once the last of that delivers. Idempotent: an
+        /// exchange already ending is on its way.
+        pub fn endSharedStream(server: *Self, stream: *StreamType) void {
+            assert(stream.h2_id != 0);
+            if (stream.ending) return;
+            server.quiesceSharedStream(stream);
+            server.continueSharedStreamEnd(stream);
+        }
+
+        /// What `endSharedStream` and a connection's teardown both do to a
+        /// multiplexed exchange before waiting for it: mark it ending, and
+        /// force every op it has armed to deliver.
+        fn quiesceSharedStream(server: *Self, stream: *StreamType) void {
+            assert(stream.h2_id != 0);
+            assert(!stream.ending);
+            stream.ending = true;
+            // Its deadline no longer applies: the forced ops end it.
+            stream.deadline_ns = 0;
+            if (stream.upstream_socket) |socket| server.io.shutdown(socket, .both);
+            // A dial-timeout verdict may already have its cancel in flight.
+            if (stream.armed.connect and !stream.armed.connect_cancel) {
+                server.armConnectCancel(stream);
+            }
+        }
+
+        /// One more of an ending multiplexed exchange's ops delivered: once
+        /// none is left, the slot goes back — and a connection tearing down
+        /// that waited on it goes on.
+        fn continueSharedStreamEnd(server: *Self, stream: *StreamType) void {
+            assert(stream.h2_id != 0);
+            assert(stream.ending);
+            assert(stream.deadline_ns == 0);
+            if (stream.armedCount() != 0) return;
+            const conn = stream.conn;
+            server.releaseSharedStream(stream);
+            if (conn.isTearingDown()) server.continueTeardown(conn);
+        }
+
+        /// Whether any exchange this connection multiplexes still has an op
+        /// in flight: a teardown waits for every one (§5's release rule).
+        fn sharedStreamsArmed(conn: *const ConnType) bool {
+            const slot = conn.h2 orelse return false;
+            const streams_max = slot.session.config.concurrent_streams_max;
+            var cursor = conn.h2_streams;
+            var visited: u32 = 0;
+            while (cursor) |stream| : (cursor = stream.h2_next) {
+                assert(visited < streams_max);
+                visited += 1;
+                if (stream.armedCount() != 0) return true;
+            }
+            return false;
         }
 
         /// `exchangeEnding`, and if so `continueExchangeEnd`: the shape every
@@ -4401,7 +4562,7 @@ pub fn Server(comptime IoType: type) type {
             stream.l7.request_deadline_ns = 0;
         }
 
-        fn armDeadline(server: *Self, conn: *ConnType) void {
+        pub fn armDeadline(server: *Self, conn: *ConnType) void {
             const delay_ns = conn.deadline_ns -| server.io.nowNs();
             conn.arm(&conn.op_deadline, "deadline");
             server.io.timerStart(
@@ -4470,6 +4631,16 @@ pub fn Server(comptime IoType: type) type {
             // `narrowDeadline`, which is what establishes "earlier" for it
             // rather than assuming it.
             assert(conn.stream.phase == .dialing or conn.stream.phase == .reading_head);
+            server.rebaseTimer(conn);
+        }
+
+        /// The mechanics of a re-base, for `rebaseDeadline`'s callers and
+        /// for a multiplexed exchange's earlier deadline (#275): cancel the
+        /// armed timer so it re-arms at the stored target, or arm one if
+        /// none is out.
+        fn rebaseTimer(server: *Self, conn: *ConnType) void {
+            assert(!conn.isTearingDown());
+            assert(conn.deadline_ns != 0);
             // A prior dial's rebase cancel can still be draining if the
             // exchange outran it across a keep-alive turnaround. It re-arms
             // the timer at the target this dial just stored (deadline_ns is
@@ -4570,6 +4741,9 @@ pub fn Server(comptime IoType: type) type {
             // Both verdict branches re-arm: the caller must have drained the
             // rebase cancel first, or it could match the fresh timer (§8).
             assert(!conn.armed.deadline_cancel);
+            // An HTTP/2 connection's timer serves many deadlines, and its
+            // driver looks for which are due (#275).
+            if (conn.state == .h2) return H2Driver.expire(server, conn);
             server.counters.increment("deadline_expired");
             // Before either verdict branch stores its grace window: both
             // grace deadlines run through `storeDeadline`, which would
@@ -4641,7 +4815,7 @@ pub fn Server(comptime IoType: type) type {
         /// dial (§4: the one cancel outside data-op drain). Callers guard
         /// the double-arm themselves: a verdict cancel may already be in
         /// flight when teardown starts.
-        fn armConnectCancel(server: *Self, stream: *StreamType) void {
+        pub fn armConnectCancel(server: *Self, stream: *StreamType) void {
             assert(stream.armed.connect);
             assert(!stream.armed.connect_cancel);
             stream.arm(&stream.op_connect_cancel, "connect_cancel");
