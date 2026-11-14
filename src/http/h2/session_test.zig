@@ -13,6 +13,7 @@ const StreamTable = @import("StreamTable.zig");
 const frame = h2.frame;
 const hpack = h2.hpack;
 const testing = std.testing;
+const seed = @import("../../testing/bytes.zig").fuzzSeed;
 const assert = std.debug.assert;
 
 const header_list_size: u32 = 8192;
@@ -1812,18 +1813,6 @@ const empty_settings = "\x00\x00\x00\x04\x00\x00\x00\x00\x00";
 /// as a literal on its static name.
 const headers_get_1 = "\x00\x00\x06\x01\x05\x00\x00\x00\x01\x82\x87\x84\x01\x01a";
 const headers_get_3 = "\x00\x00\x06\x01\x05\x00\x00\x00\x03\x82\x87\x84\x01\x01a";
-
-/// A corpus entry as `Smith.slice` reads one: a little-endian `u32` length,
-/// then the octets. Written bare, an entry's first four octets are read as
-/// that length, and the target never sees the seed it was written as.
-fn seed(comptime bytes: []const u8) []const u8 {
-    const encoded = comptime encoded: {
-        var length: [4]u8 = undefined;
-        std.mem.writeInt(u32, &length, bytes.len, .little);
-        break :encoded length ++ bytes[0..bytes.len].*;
-    };
-    return &encoded;
-}
 
 test "fuzz: h2 session — any octets, any split: answered or closed, never a third outcome" {
     // Corpus entries lead with the harness's control octet (see
