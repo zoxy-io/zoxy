@@ -1348,7 +1348,7 @@ fn h2AnswerFor(answers: []const H2Answer, stream: u31) !*const H2Answer {
     return error.NoSuchStream;
 }
 
-test "h2: §7 answers each stream itself — no route, a filter, a redirect, a malformed path, a HEAD" {
+test "h2: §7 answers each stream itself — no route, a filter, a redirect, a malformed path, a HEAD, a CONNECT" {
     const rules = [_]filter.Rule{
         .{ .match = .{ .path_prefix = "/deny" }, .actions = &.{.{ .reject = 403 }} },
         .{
@@ -1365,7 +1365,7 @@ test "h2: §7 answers each stream itself — no route, a filter, a redirect, a m
     try bed.setUp(std.testing.allocator, options);
     defer bed.tearDown();
 
-    // Six streams in one write, each answered on its own: what §7 decides
+    // Seven streams in one write, each answered on its own: what §7 decides
     // for one says nothing about the next.
     var wire: H2Wire = .{};
     wire.preface(&.{});
@@ -1375,11 +1375,14 @@ test "h2: §7 answers each stream itself — no route, a filter, a redirect, a m
     wire.get(7, "GET", "nopath"); // Not origin-form: the downgrade refuses it.
     wire.get(9, "HEAD", "/nowhere");
     wire.get(11, "GET", "/api/x"); // Routed: the origin answers.
+    // §8.5's CONNECT, an authority and nothing else: it reaches §7 as the
+    // HTTP/1.1 CONNECT it stands for, and is refused as that one is.
+    wire.headers(13, &.{ .{ ":method", "CONNECT" }, .{ ":authority", "a:443" } }, true);
     try bed.exchange(wire.written());
 
     var storage: [8]H2Answer = undefined;
     const answers = try h2Answers(bed.client.response(), &storage);
-    try std.testing.expectEqual(@as(usize, 6), answers.len);
+    try std.testing.expectEqual(@as(usize, 7), answers.len);
     const no_route = try h2AnswerFor(answers, 1);
     try std.testing.expectEqual(@as(u16, 404), no_route.status);
     try std.testing.expectEqual(@as(usize, test_page_body.len), no_route.body);
@@ -1398,6 +1401,7 @@ test "h2: §7 answers each stream itself — no route, a filter, a redirect, a m
     const proxied = try h2AnswerFor(answers, 11);
     try std.testing.expectEqual(@as(u16, 200), proxied.status);
     try std.testing.expectEqual(@as(usize, 2), proxied.body);
+    try std.testing.expectEqual(@as(u16, 501), (try h2AnswerFor(answers, 13)).status);
     // Every answer ended its stream, and none needed a reset: each request
     // had ended its own half.
     for (answers) |*answer| {
@@ -1408,8 +1412,9 @@ test "h2: §7 answers each stream itself — no route, a filter, a redirect, a m
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_redirected"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_not_implemented"));
     // A line per stream, each its own exchange's.
-    try std.testing.expectEqual(@as(u64, 6), bed.server.counters.get("access_log_lines"));
+    try std.testing.expectEqual(@as(u64, 7), bed.server.counters.get("access_log_lines"));
     const line = try accessLogLineFor(&bed, "\"path\":\"/deny\"");
     try std.testing.expect(std.mem.indexOf(u8, line, "\"status\":403") != null);
     try bed.expectDrained();
@@ -1639,6 +1644,33 @@ test "h2: a request body goes to the origin — a declared length as sent, an un
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
         try bed.expectDrained();
     }
+}
+
+test "h2: the origin hears :authority as its one Host, and the cookie crumbs as one line" {
+    // A client that names one authority in `:authority` and another in a
+    // `host` field: the one that routed is the one the origin hears, once,
+    // as #233 settled for an absolute-form target — the other is gone.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2BedOptions(42));
+    defer bed.tearDown();
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.headers(1, &.{
+        .{ ":method", "GET" },  .{ ":scheme", "http" },   .{ ":path", "/h2" },
+        .{ ":authority", "a" }, .{ "host", "evil.test" }, .{ "cookie", "a=1" },
+        .{ "cookie", "b=2" },
+    }, true);
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    const oconn = &bed.origin.conns[0];
+    const head = oconn.request_buffer[0..oconn.request_len];
+    try std.testing.expect(std.ascii.findIgnoreCase(head, "\r\nhost: a\r\n") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(head, "evil.test") == null);
+    try std.testing.expect(std.ascii.findIgnoreCase(head, "\r\ncookie: a=1; b=2\r\n") != null);
+    try bed.expectDrained();
 }
 
 test "h2: a body past the buffer before the client heard the window is held, and arrives whole" {

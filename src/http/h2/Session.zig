@@ -185,6 +185,20 @@ pub fn fieldsFor(list_size_max: u32) u32 {
 /// of the shared stream pool one client can hold (#275).
 pub const concurrent_streams_advertised_max: u32 = 100;
 
+/// The resets a session remembers (`reset_ring`): the last this many,
+/// however few streams opened meanwhile — twice what one client can have
+/// open, so a client's whole table reset at once, and the next, are still
+/// remembered while their trailers arrive. A reset forgotten turns a late
+/// trailer on it into the connection's PROTOCOL_ERROR; reaching that takes
+/// this many resets in between, which a client earns by being reset that
+/// often, and losing such a connection is the shed rather than the fault.
+pub const reset_ring_len: u32 = 2 * concurrent_streams_advertised_max;
+
+comptime {
+    assert(reset_ring_len >= concurrent_streams_advertised_max);
+    assert(reset_ring_len >= 1); // `reset_ring_next` wraps modulo it.
+}
+
 /// What one session's buffers are, for a connection advertising
 /// `header_list_size_max` and `concurrent_streams_max` — the unit
 /// `limits.h2_connections` reserves (§5) — and how they are laid out in
@@ -437,6 +451,16 @@ send_window: i64,
 /// up, so every one at or below this is open or closed and every one above
 /// is idle.
 last_peer_stream: u31,
+/// The streams this side reset most recently: the one case in which a
+/// frame on a closed stream is a client's frame in flight rather than a
+/// protocol error (§5.1 — "MUST ignore frames that it receives on closed
+/// streams after it has sent a RST_STREAM"). A ring, so the oldest are
+/// forgotten first, and a client that sends on one of those that late is
+/// treated as one that never opened it.
+reset_ring: [reset_ring_len]u31,
+/// Where the next reset is written: the oldest remembered, once the ring
+/// is full. Always below `reset_ring_len`.
+reset_ring_next: u32,
 /// The highest stream that reached the caller as `.request` — what a
 /// GOAWAY of ours names as the last one this side may have acted on.
 last_accepted_stream: u31,
@@ -494,6 +518,8 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
         .recv_delivered = 0,
         .send_window = window_default,
         .last_peer_stream = 0,
+        .reset_ring = @splat(0),
+        .reset_ring_next = 0,
         .last_accepted_stream = 0,
         .streams_refused = 0,
         .encoder = buffers.encoder.encoder(.dynamic),
@@ -1379,12 +1405,15 @@ fn handleBlock(session: *Session, block: *const frame.BlockAssembler.Block) void
         .connection => |code| return session.fail(code),
         .malformed, .ok => {},
     }
-    // At or below the high-water mark and not open: a stream already
-    // closed, whose late frames §6.4 has in flight — the trailers of a
-    // request reset before its client read the reset. Ignored. (A client
-    // that skipped an identifier and later opens it, which §5.1.1 makes a
-    // PROTOCOL_ERROR, looks the same without per-identifier state.)
-    if (!opening) return;
+    // At or below the high-water mark and not open. A stream this side
+    // reset may still have the client's trailers in flight, which §5.1
+    // says to ignore; anything else — an identifier the client skipped and
+    // now opens, or a closed stream it sends on again — is §5.1.1's
+    // PROTOCOL_ERROR, since a client's identifiers only go up.
+    if (!opening) {
+        if (session.resetByUs(block.stream_identifier)) return;
+        return session.fail(.protocol_error);
+    }
     session.last_peer_stream = block.stream_identifier;
     // Either side's GOAWAY: the client said it would open nothing more,
     // or this side said it would accept nothing more. Refused either way —
@@ -1675,6 +1704,19 @@ fn stageReset(session: *Session, stream: u31, code: frame.ErrorCode) void {
     assert(stream != 0);
     assert(session.state != .closed);
     session.stage(&.{ .rst_stream = .{ .error_code = code } }, stream, 0);
+    assert(session.reset_ring_next < reset_ring_len);
+    session.reset_ring[session.reset_ring_next] = stream;
+    session.reset_ring_next = (session.reset_ring_next + 1) % reset_ring_len;
+}
+
+/// Whether this side reset `stream` recently enough to remember it.
+fn resetByUs(session: *const Session, stream: u31) bool {
+    assert(stream != 0); // The ring's empty entries never match.
+    assert(stream <= session.last_peer_stream);
+    for (session.reset_ring) |id| {
+        if (id == stream) return true;
+    }
+    return false;
 }
 
 /// A connection error (§5.4.1): GOAWAY, and nothing more is read.
