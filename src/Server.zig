@@ -249,6 +249,12 @@ pub fn Server(comptime IoType: type) type {
         /// Whether `header_scratch` is out on loan (see the field). Only
         /// ever true inside one parse-and-consume window.
         header_scratch_lent: bool,
+        /// A multiplexed exchange whose interim head was handed to its
+        /// session while a response parse held the header scratch (#275):
+        /// the next step parses again, and must wait for that borrow to end
+        /// (`Proxy.parseResponseAndDispatch` runs it then). At most one: the
+        /// parse that defers it runs it before any other can.
+        h2_interim_owed: ?*StreamType,
         /// The serving path's render scratches, on exactly the terms
         /// `header_scratch` sets out and for the same measured reason:
         /// these are the locals the render path was still filling once the
@@ -692,6 +698,12 @@ pub fn Server(comptime IoType: type) type {
             options: *const InitOptions,
         ) error{OutOfMemory}!void {
             assert(options.h2_connections <= options.conn_slots);
+            // A test double that sizes its op ring for fewer shared streams
+            // than production allows says so, and is held to it here — the
+            // one place every scenario's pool size passes (§9).
+            if (@hasDecl(IoType, "stream_slots_max")) {
+                assert(options.stream_slots <= IoType.stream_slots_max);
+            }
             if (options.h2_connections == 0) assert(options.stream_slots == 0);
             try server.initH2Sessions(arena, options);
             try server.shared_streams.init(arena, options.stream_slots);
@@ -936,6 +948,19 @@ pub fn Server(comptime IoType: type) type {
             server.header_scratch_lent = false;
         }
 
+        /// Whether a parse holds the header scratch now — what decides
+        /// whether a multiplexed exchange's next parse can run at once, and
+        /// whether its driver may step its session (#275).
+        pub fn headerScratchLent(server: *const Self) bool {
+            return server.header_scratch_lent;
+        }
+
+        /// Whether a render holds the render scratches now, for the same
+        /// reason (#275).
+        pub fn renderScratchLent(server: *const Self) bool {
+            return server.render_scratch_lent;
+        }
+
         /// Lend the serving path's render scratches for one head render
         /// and the send it feeds. The window ends where the callback does,
         /// same as the header scratch, and for the same §7 reason: the
@@ -1131,6 +1156,7 @@ pub fn Server(comptime IoType: type) type {
             // this one, at startup, instead of one per parse.
             server.header_scratch = undefined;
             server.header_scratch_lent = false;
+            server.h2_interim_owed = null;
             server.render_scratch = undefined;
             server.render_scratch_lent = false;
             server.armed_ops_peak = 0;

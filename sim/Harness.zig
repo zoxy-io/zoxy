@@ -26,6 +26,7 @@ const ServerSim = zoxy.Server(SimIo);
 const Origin = zoxy.testing.Origin(SimIo);
 const HttpOrigin = l7.HttpOrigin(SimIo);
 const HttpClient = l7.Client(SimIo);
+const H2Client = l7.H2Client(SimIo);
 const EchoClient = l4.Client(SimIo);
 const TlsClient = zoxy.tls.TestClient(SimIo);
 
@@ -171,6 +172,10 @@ origin: Origin,
 origin_http: HttpOrigin,
 clients: [clients_max]EchoClient,
 l7_clients: [clients_max]HttpClient,
+/// The HTTP/2 population (#275): h2c clients on the http listener, drawn
+/// from the same coin flips as the HTTP/1.1 ones on a seed that speaks it.
+h2_clients: [clients_max]H2Client,
+h2_count: u8,
 /// The §4 terminating population (#125) and its credentials. Held on the
 /// harness because the server borrows the table for its life, and because
 /// a `Credentials` owns a libcrypto key that `tearDown` must free — the
@@ -258,6 +263,13 @@ keepalive_requests: u32,
 /// seeds.
 interim_http: bool,
 tunnels: u32,
+/// The seed's http listener takes h2c (#275), and has the HTTP/2 pools to
+/// serve it: sessions and the shared streams they multiplex. Off on some
+/// seeds, so the plaintext listener keeps proving HTTP/1.1 alone; small on
+/// a share of adversarial ones, so the session and stream sheds fire.
+h2c_http: bool,
+h2_connections: u32,
+stream_slots: u32,
 /// Decided before `io.init` (the ring the sim registers must equal the
 /// limit the server accounts against — Server.init asserts the match),
 /// consumed by `startServerAndOrigins` for the rest of the pool shape.
@@ -691,6 +703,30 @@ fn deriveUpgrades(harness: *Harness, random: std.Random) void {
     assert(harness.tunnels <= clients_max);
 }
 
+fn deriveHttp2(harness: *Harness, random: std.Random) void {
+    if (random.uintLessThan(u8, 4) == 0) {
+        harness.h2c_http = false;
+        harness.h2_connections = 0;
+        harness.stream_slots = 0;
+        return;
+    }
+    harness.h2c_http = true;
+    // A clean seed has room for every client's every stream, so its golden
+    // oracle never meets a shed; an adversarial one is sometimes starved to
+    // one session and a stream or two.
+    const starved = !harness.clean and random.uintLessThan(u8, 3) == 0;
+    // Starved: one session, so a second h2c client is turned away, or two
+    // over a stream or two, so the shared pool runs out while each
+    // session's own advertisement still has room.
+    harness.h2_connections = if (starved) 1 + random.uintLessThan(u32, 2) else clients_max;
+    harness.stream_slots = if (starved)
+        1 + random.uintLessThan(u32, 2)
+    else
+        @as(u32, clients_max) * H2Client.streams_max;
+    assert(harness.stream_slots <= SimIo.stream_slots_max);
+    assert(harness.h2_connections >= 1);
+}
+
 fn deriveTopology(harness: *Harness, random: std.Random) void {
     harness.endpoints_l4 = .{.{ .ip = originAddress() }};
     harness.endpoints_http = .{
@@ -699,6 +735,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     };
     deriveRetries(harness, random);
     deriveUpgrades(harness, random);
+    deriveHttp2(harness, random);
     harness.max_body_bytes = deriveMaxBodyBytes(harness.clean, random);
     harness.keepalive_requests = deriveKeepaliveRequests(harness.clean, random);
     // A quarter of seeds. Clean ones included, deliberately: an
@@ -1482,6 +1519,7 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             .protocol = .http,
             .forwarded = forwarded,
             .upgrades = .{ .websocket = harness.upgrades_http },
+            .h2c = harness.h2c_http,
             .max_body_bytes = harness.max_body_bytes,
             .keepalive_requests = harness.keepalive_requests,
         },
@@ -1596,6 +1634,13 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             // this seed meets the tunnel rung, which is coverage rather
             // than a loss.
             .tunnels = @min(harness.tunnels, harness.head_buffers),
+            // Clamped like the tunnels, and for the same reason: a session
+            // is a connection's, and a starved seed's slots may be fewer.
+            .h2_connections = @min(harness.h2_connections, harness.head_buffers),
+            .stream_slots = if (@min(harness.h2_connections, harness.head_buffers) == 0)
+                0
+            else
+                harness.stream_slots,
             // Capacity 1: the first render engages the pressure flag, so
             // the engage counter stays reachable even though the shed
             // rung itself is relay-shadowed (see sim/main.zig uncovered).
@@ -1606,6 +1651,8 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
     else
         .{
             .tunnels = harness.tunnels,
+            .h2_connections = harness.h2_connections,
+            .stream_slots = harness.stream_slots,
             .access_log_buffer_bytes = access_log_buffer_bytes,
             // Clean seeds size every pool at `clean_pool_capacity`
             // (watermark 14 of 18, over a population of 9); the
@@ -1717,6 +1764,19 @@ fn populateTlsClients(harness: *Harness, random: std.Random) void {
     }
 }
 
+/// One of the HTTP/2 population (#275): its streams drawn, and its end
+/// counted with every other client's.
+fn prepareH2Client(harness: *Harness, random: std.Random) void {
+    assert(harness.h2c_http);
+    assert(harness.h2_count < clients_max);
+    const client = &harness.h2_clients[harness.h2_count];
+    harness.h2_count += 1;
+    const streams = 1 + random.uintLessThan(u8, H2Client.streams_max);
+    client.prepare(&harness.io, httpBindAddress(), streams, harness.clean);
+    client.on_ended = clientEndedHook;
+    client.context = harness;
+}
+
 fn populateClients(harness: *Harness, random: std.Random) void {
     // Each client flips a protocol coin: mixed populations put both
     // serving paths under one schedule and shared pools.
@@ -1726,14 +1786,22 @@ fn populateClients(harness: *Harness, random: std.Random) void {
     harness.clients_count = plaintext_count + harness.tls_clients;
     harness.l4_count = 0;
     harness.l7_count = 0;
+    harness.h2_count = 0;
     harness.ended_count = 0;
     harness.populateTlsClients(random);
     harness.clients = @splat(.{});
     harness.l7_clients = @splat(.{});
+    harness.h2_clients = @splat(.{});
     harness.l4_announced_len = @splat(0);
     var index: u8 = 0;
     while (index < plaintext_count) : (index += 1) {
         if (random.boolean()) {
+            // On a seed that speaks it, a share of the http population
+            // speaks HTTP/2 (#275) to the same listener.
+            if (harness.h2c_http and random.uintLessThan(u8, 3) == 0) {
+                harness.prepareH2Client(random);
+                continue;
+            }
             const client = &harness.l7_clients[harness.l7_count];
             harness.l7_count += 1;
             // A seed that enables upgrades puts its first two http
@@ -1788,7 +1856,7 @@ fn populateClients(harness: *Harness, random: std.Random) void {
             client.context = harness;
         }
     }
-    assert(harness.l4_count + harness.l7_count + harness.tls_clients ==
+    assert(harness.l4_count + harness.l7_count + harness.h2_count + harness.tls_clients ==
         harness.clients_count);
 }
 
@@ -1864,12 +1932,15 @@ fn recordAnnounced(harness: *Harness, l4_index: u8, octet: u8, port: u16) void {
 
 pub fn startClients(harness: *Harness) void {
     assert(harness.clients_count >= 1);
-    assert(harness.l4_count + harness.l7_count + harness.tls_clients ==
+    assert(harness.l4_count + harness.l7_count + harness.h2_count + harness.tls_clients ==
         harness.clients_count);
     for (harness.clients[0..harness.l4_count]) |*client| {
         client.begin();
     }
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
+        client.begin();
+    }
+    for (harness.h2_clients[0..harness.h2_count]) |*client| {
         client.begin();
     }
     harness.startTlsClients();
@@ -2461,6 +2532,9 @@ fn endScenario(harness: *Harness) void {
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         client.cancelIfStuck();
     }
+    for (harness.h2_clients[0..harness.h2_count]) |*client| {
+        client.cancelIfStuck();
+    }
     for (harness.tls_clients_storage[0..harness.tls_clients_live]) |*client| {
         client.cancelIfStuck();
     }
@@ -2504,6 +2578,9 @@ pub fn verify(harness: *Harness) !void {
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
         client.closeIfOpen();
     }
+    for (harness.h2_clients[0..harness.h2_count]) |*client| {
+        client.closeIfOpen();
+    }
     harness.origin.closeRemaining();
     harness.origin_http.closeRemaining();
 
@@ -2528,6 +2605,9 @@ pub fn verify(harness: *Harness) !void {
         try client.verifyIntegrity();
     }
     for (harness.l7_clients[0..harness.l7_count]) |*client| {
+        try client.verify();
+    }
+    for (harness.h2_clients[0..harness.h2_count]) |*client| {
         try client.verify();
     }
     try harness.verifyTlsSessions();

@@ -631,12 +631,23 @@ pub fn resetStream(session: *Session, stream: u31, code: frame.ErrorCode) void {
 /// END_STREAM is staged and the client's is not in, so the request's rest
 /// is arriving for an exchange that answered without it — the case
 /// RST_STREAM(NO_ERROR) exists to stop (§8.1). False once the stream is
-/// gone, which is where a client that had finished first leaves it.
+/// gone, which is where a client that had finished first leaves it — and
+/// once the session is: the answer that ended a draining connection's
+/// last stream closed it.
 pub fn awaitingClient(session: *Session, stream: u31) bool {
     assert(stream != 0);
-    assert(session.state != .closed);
+    if (session.state == .closed) return false;
     const slot = session.streams.find(stream) orelse return false;
     return slot.state == .half_closed_local;
+}
+
+/// What `step` stages before it reads: the RST_STREAMs, WINDOW_UPDATEs and
+/// GOAWAY this side owes — without reading input or raising an event, for
+/// a caller that could not take one now (`Driver.kick` under a borrow).
+pub fn stagePending(session: *Session) void {
+    if (session.state == .closed) return;
+    assert(session.event == null);
+    if (session.pending) session.flushPending();
 }
 
 /// Whether `stream` is still this side's to reset: the session holds it

@@ -25,6 +25,11 @@ pub const http = struct {
     pub const router = @import("http/router.zig");
     pub const filter = @import("http/filter.zig");
     pub const proxy = @import("http/proxy.zig");
+    /// What a client outside `src/http/h2/` needs to read a server's
+    /// HTTP/2 field sections (#275): the simulator's h2c client.
+    pub const h2 = struct {
+        pub const ResponseReader = @import("http/h2/ResponseReader.zig");
+    };
 };
 pub const Io = @import("io/io.zig");
 pub const Pool = @import("mem/Pool.zig").Pool;

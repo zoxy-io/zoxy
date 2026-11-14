@@ -13,3 +13,5 @@ pub const OriginMode = @import("l7/origin.zig").OriginMode;
 pub const HttpOrigin = @import("l7/origin.zig").HttpOrigin;
 pub const Client = @import("l7/client.zig").Client;
 pub const ClientError = @import("l7/client.zig").ClientError;
+pub const H2Client = @import("l7/h2_client.zig").Client;
+pub const H2ClientError = @import("l7/h2_client.zig").ClientError;

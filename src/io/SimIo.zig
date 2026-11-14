@@ -51,18 +51,28 @@ comptime {
 /// what a deployment may configure. At the shared pool ceilings this is
 /// at least what any scenario can arm.
 ///
-/// Without the shared HTTP/2 stream pool (#275): no scenario multiplexes
-/// yet, and the bound sizes `flush`'s stack buffer, which Debug fills on
-/// every call — so the term joins when the simulator first speaks HTTP/2,
-/// not before.
+/// The shared HTTP/2 stream pool (#275) at the simulator's own ceiling,
+/// not production's: the bound sizes `flush`'s stack buffer, which Debug
+/// fills on every call, and no scenario multiplexes more than this.
 const pending_ops_max: u32 = constants.inFlightOps(
     constants.conn_slots_max,
-    0,
+    stream_slots_max,
     constants.upstream_slots_max,
     listeners_max,
     constants.health_probe_concurrency_max,
 );
 const pending_signals_max: u8 = 8;
+
+/// The most shared HTTP/2 streams a scenario run under the simulator may
+/// configure (#275) — the term `pending_ops_max` is sized by. `Server.init`
+/// asserts every pool it is handed under SimIo against it, so a bed or a
+/// harness past it fails there rather than overflowing the pending list.
+pub const stream_slots_max: u32 = 64;
+
+comptime {
+    assert(stream_slots_max >= 1);
+    assert(stream_slots_max <= constants.stream_slots_max);
+}
 /// The clock starts at one virtual second, not zero, so code that would
 /// misbehave at t=0 gets caught.
 const clock_start_ns: u64 = 1_000_000_000;
