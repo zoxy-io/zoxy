@@ -349,6 +349,11 @@ pub fn build(b: *std.Build) void {
     // *config* input — the harness writes both files into its work
     // directory and points the proxy at them, exactly as an operator
     // would — so nothing here links zssl or libcrypto (§4, §9).
+    // The HTTP/2 leg reads the binary's field sections with the `h2`
+    // package's HPACK decoder — the harness judging what was sent, not a
+    // second implementation of the codec. The confinement the lint keeps
+    // is the server's own source tree; this is its test client.
+    smoke_exe.root_module.addImport("h2", h2_module);
     smoke_exe.root_module.addAnonymousImport("tls_cert_pem", .{
         .root_source_file = b.path("src/tls/testdata/cert.pem"),
     });

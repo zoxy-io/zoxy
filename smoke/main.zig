@@ -31,6 +31,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const client_module = @import("client.zig");
+const h2c_module = @import("h2c.zig");
 const origin_module = @import("origin.zig");
 const scrape_module = @import("scrape.zig");
 
@@ -224,11 +225,18 @@ const allowlist_refused: u32 = 1;
 const allowed_path = "/allowed";
 const refused_path = "/refused";
 
+/// The #275 leg: HTTP/2 to the plaintext http listener, by prior
+/// knowledge, on one connection — every stream an ordinary exchange the
+/// origin answers, and a line of its own in the log. Runs after the
+/// scrapes above, before the TLS leg, like the legs before it.
+const h2c_exchanges: u32 = h2c_module.streams;
+const h2c_connections: u32 = 1;
+
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
-    body_exchanges + allowlist_exchanges + tls_requests + l4_connections;
+    body_exchanges + allowlist_exchanges + h2c_exchanges + tls_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -255,7 +263,8 @@ const allowlist_connections: u32 = 1;
 const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
-    body_connections + allowlist_connections + https_leg_connections + readiness_probes;
+    body_connections + allowlist_connections + h2c_connections + https_leg_connections +
+    readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -265,8 +274,10 @@ const connections_expected: u32 = keep_alive_connections +
 /// reused for it).
 /// One more for the #331 leg, whose allowed request forwards: it reuses
 /// a parked upstream connection whenever one is free, and a dial of its
-/// own is the case this headroom covers.
-const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 + 1 + 1;
+/// own is the case this headroom covers. And the #275 leg's streams, all
+/// in flight at once, each of which may dial its own.
+const origin_connections_peak: u8 = keep_alive_connections + l4_connections + 2 + 1 + 1 +
+    h2c_module.streams;
 
 /// The drain's cap on waiting for the connections left open above. A
 /// drain cannot tell an idle keep-alive connection from one about to send
@@ -307,6 +318,8 @@ const zoxy_limits = .{
     .relay_buffers = 16,
     .upstream_slots = 16,
     .tls_engines = 2,
+    // The #275 leg's streams, with room to spare.
+    .stream_slots = 16,
 };
 
 /// The head buffer zoxy binds for this run — `limits.head_buffer_bytes`
@@ -454,6 +467,7 @@ const Stage = enum {
     sticky_leg,
     bodies_leg,
     allowlist_leg,
+    h2c_leg,
     https_alpn_refusal,
     https_handshake,
     https_request,
@@ -473,6 +487,7 @@ const Stage = enum {
             .sticky_leg => "the sticky leg (#178)",
             .bodies_leg => "the bodies leg (#159)",
             .allowlist_leg => "the allowlist leg (#331)",
+            .h2c_leg => "the h2c leg (#275)",
             .https_alpn_refusal => "the ALPN refusal (#271)",
             .https_handshake => "the https handshake",
             .watchdog_leg => "the loop-watchdog leg (#311)",
@@ -577,6 +592,8 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     // every filter verdict this run produced.
     enterStage(.allowlist_leg);
     const allowlist_ok = try allowlistPassed(arena, io, &ports);
+    enterStage(.h2c_leg);
+    const h2c_ok = try h2cPassed(arena, io, &ports);
     // Last, so its scrape sees the whole run — and so a wedged handshake
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
@@ -597,7 +614,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        allowlist_ok and tls_ok and memory_ok and drain_ok and check_ok and
+        allowlist_ok and h2c_ok and tls_ok and memory_ok and drain_ok and check_ok and
         watchdog_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
@@ -746,7 +763,7 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // terminated request is an ordinary request by the time it is logged,
     // and a log that told them apart would be the defect.
     const http_lines_expected = http_exchanges + sticky_exchanges +
-        body_exchanges + allowlist_exchanges + tls_requests;
+        body_exchanges + allowlist_exchanges + h2c_exchanges + tls_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -1026,7 +1043,7 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
     // `tls_requests`); the whole-run equality is asserted on the last of
     // their scrapes.
     const opened_so_far = connections_expected - sticky_connections -
-        body_connections - allowlist_connections - https_leg_connections;
+        body_connections - allowlist_connections - h2c_connections - https_leg_connections;
     if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
@@ -1296,7 +1313,7 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // the #159 and TLS legs open after it — the whole-run equality lands
     // on the last scrape of the run.
     const opened_by_here = connections_expected - body_connections -
-        allowlist_connections - https_leg_connections;
+        allowlist_connections - h2c_connections - https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1347,7 +1364,8 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     }
     // Short the #331 and TLS legs' connections, which open after this
     // scrape; the last of them carries the whole-run equality.
-    const opened_by_here = connections_expected - allowlist_connections - https_leg_connections;
+    const opened_by_here = connections_expected - allowlist_connections - h2c_connections -
+        https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1399,6 +1417,48 @@ fn allowlistPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool 
         std.debug.print(
             "FAIL: l7_filtered reads {d}, not the {d} request this run refused (#331)\n",
             .{ filtered, allowlist_refused },
+        );
+        passed = false;
+    }
+    return passed;
+}
+
+/// The #275 leg: every stream the origin's 200, its whole body, the
+/// listener's stamp and the origin's tag — what the load's HTTP/1.1
+/// exchanges are held to — and one HTTP/2 connection counted.
+fn h2cPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.http != 0);
+    assert(ports.admin != 0);
+    var answers: [h2c_module.streams]h2c_module.Answer = @splat(.{});
+    // A verdict, not an abort: the TLS leg after this one still runs.
+    h2c_module.run(io, ports.http, &answers) catch |err| {
+        std.debug.print("FAIL: the h2c leg did not complete ({t})\n", .{err});
+        return false;
+    };
+    var passed = true;
+    for (&answers, 0..) |*answer, index| {
+        const whole = answer.status == 200 and answer.ended and !answer.reset and
+            answer.body_bytes == origin_module.body.len;
+        if (!whole or !answer.edited or !answer.origin_tagged) {
+            std.debug.print(
+                "FAIL: h2c stream {d} came back {d} with {d} body bytes " ++
+                    "(ended {}, reset {}, stamped {}, origin-tagged {})\n",
+                .{
+                    h2c_module.streamId(@intCast(index)), answer.status,
+                    answer.body_bytes,                    answer.ended,
+                    answer.reset,                         answer.edited,
+                    answer.origin_tagged,
+                },
+            );
+            passed = false;
+        }
+    }
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const connections = counterOf(&scrape, "h2_connections") orelse return false;
+    if (connections != h2c_connections) {
+        std.debug.print(
+            "FAIL: h2_connections reads {d}, not the {d} this run opened\n",
+            .{ connections, h2c_connections },
         );
         passed = false;
     }
@@ -2105,6 +2165,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         zoxy_limits.relay_buffers,
         zoxy_limits.upstream_slots,
         zoxy_limits.tls_engines,
+        zoxy_limits.stream_slots,
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 }
@@ -2134,7 +2195,8 @@ const config_template =
     \\          ],
     \\          "response_filters": [
     \\              {{ "actions": [{{ "header_set": {{ "name": "X-Zoxy-Smoke", "value": "1" }} }}] }}
-    \\          ] }} }},
+    \\          ],
+    \\          "h2c": true }} }},
     \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
     \\        {{ "bind": "127.0.0.1:{d}",
     \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}] }},
@@ -2169,7 +2231,8 @@ const config_template =
     \\        "conn_slots": {d},
     \\        "relay_buffers": {d},
     \\        "upstream_slots": {d},
-    \\        "tls_engines": {d}
+    \\        "tls_engines": {d},
+    \\        "stream_slots": {d}
     \\    }}
     \\}}
     \\

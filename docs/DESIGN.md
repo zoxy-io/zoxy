@@ -2715,7 +2715,12 @@ equalities a shared runner's noise cannot move.
    keep-alive/pipelined/silent patterns — against scripted origins
    (sized, chunked, until-close, truncated, reset, mute, and instant
    origins that answer before the request finishes), and every byte they
-   receive must be a prefix of a legal transcript. A quarter of seeds run
+   receive must be a prefix of a legal transcript. On most seeds a share
+   of them speak HTTP/2 instead (#275): h2c by prior knowledge, a few
+   streams on one connection, each held to the same allowed statuses and
+   canonical bodies — whole frames only, every stream answered at most
+   once — with the session and stream pools starved on some seeds so
+   their sheds fire too. A quarter of seeds run
    clean — adversary off, origin well-behaved — hardening the L7 oracle
    from prefix-legality to each script's exact golden outcome, so a
    silently torn-down exchange that should have been answered fails the
