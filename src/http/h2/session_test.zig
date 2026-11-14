@@ -697,18 +697,49 @@ test "h2 session: a request head surfaces as an event, with its fields" {
 }
 
 test "h2 session: a request that breaks §8's rules is reset, and HPACK stays in step for the next" {
+    // One verdict per rule of the downgrade (#275): each of these, written
+    // out as HTTP/1.1, would tell the origin something the client was not
+    // entitled to say — or could not be written out at all.
+    const method, const scheme, const authority, const path, const agent = request_fields;
     const malformed = [_][]const hpack.Field{
-        // §8.2.2: connection-specific, the downgrade-smuggling field.
+        // §8.2.2: the connection-specific fields, each a way to tell an
+        // HTTP/1.1 origin how the bytes after it are framed.
         &(request_fields ++ [_]hpack.Field{.{ .name = "connection", .value = "keep-alive" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "keep-alive", .value = "timeout=5" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "proxy-connection", .value = "keep-alive" }}),
         &(request_fields ++ [_]hpack.Field{.{ .name = "transfer-encoding", .value = "chunked" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "upgrade", .value = "websocket" }}),
         // §8.2.2's one exception, and only for `trailers`.
         &(request_fields ++ [_]hpack.Field{.{ .name = "te", .value = "gzip" }}),
         // §8.2.1: an uppercase name.
         &(request_fields ++ [_]hpack.Field{.{ .name = "User-Agent", .value = "x" }}),
-        // §8.3.1: no `:path`.
-        request_fields[0..3],
-        // A value an HTTP/1.1 parser would read as two lines.
+        // §8.3.1: each pseudo-header a request must carry, missing.
+        &[_]hpack.Field{ scheme, authority, path, agent },
+        &[_]hpack.Field{ method, authority, path, agent },
+        &[_]hpack.Field{ method, scheme, authority, agent },
+        // §8.3: a pseudo-header after a regular field, a second one, and
+        // one a request does not define — a response's, and an unknown.
+        &[_]hpack.Field{ method, scheme, authority, agent, path },
+        &[_]hpack.Field{ method, scheme, authority, path, path, agent },
+        &[_]hpack.Field{ method, scheme, authority, path, .{ .name = ":status", .value = "200" } },
+        &[_]hpack.Field{ method, scheme, authority, path, .{ .name = ":tenant", .value = "a" } },
+        // RFC 8441's `:protocol`: extended CONNECT, which this server's
+        // SETTINGS never offer — so WebSocket over HTTP/2 ends here.
+        &[_]hpack.Field{
+            .{ .name = ":method", .value = "CONNECT" }, .{ .name = ":protocol", .value = "websocket" },
+            scheme,                                     authority,
+            path,
+        },
+        // §8.2.1: octets an HTTP/1.1 parser reads as a line's end, or that
+        // end a C string — HPACK carries any octet, HTTP/1.1's grammar
+        // none of these. CRLF, either half alone, NUL; in a value, and in
+        // a name, where they would split one field into two.
         &(request_fields ++ [_]hpack.Field{.{ .name = "x-split", .value = "a\r\nb: c" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "x-split", .value = "a\nb: c" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "x-split", .value = "a\rb: c" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "x-split", .value = "a\x00b" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "x-split\r\nhost", .value = "other.test" }}),
+        &(request_fields ++ [_]hpack.Field{.{ .name = "x-\x00split", .value = "a" }}),
     };
     for (malformed) |fields| {
         var fixture: Fixture = .{};
@@ -730,6 +761,99 @@ test "h2 session: a request that breaks §8's rules is reset, and HPACK stays in
         try testing.expectEqual(@as(usize, 1), events.len);
         try testing.expectEqual(@as(u31, 3), events[0].stream);
     }
+}
+
+test "h2 session: `te: trailers`, §8.2.2's one exception, is a request like any other" {
+    var fixture: Fixture = .{};
+    fixture.init();
+    var blocks: Blocks = .{};
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    const fields = request_fields ++ [_]hpack.Field{.{ .name = "te", .value = "trailers" }};
+    putHeaders(&input, 1, blocks.encode(&fields), true);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    var reader = fixture.replies();
+    try testing.expect(reader.nextSkippingAcks() == null);
+    const events = fixture.eventsOf();
+    try testing.expectEqual(@as(usize, 1), events.len);
+    try testing.expectEqual(.request, events[0].kind);
+    try testing.expectEqual(@as(u32, fields.len), events[0].fields);
+}
+
+test "h2 session: a client's identifiers only go up — a skipped one or a closed one reopened ends the connection" {
+    // §5.1.1: "MUST be numerically greater than all streams that the
+    // initiating endpoint has opened". Stream 1 after 3 is one the client
+    // skipped; stream 1 after it was answered and gone is one it reuses.
+    const Reopened = enum { skipped, reused };
+    for (std.enums.values(Reopened)) |reopened| {
+        var fixture: Fixture = .{};
+        fixture.init();
+        fixture.caller = .respond;
+        var blocks: Blocks = .{};
+        blocks.init();
+        var input: Wire = .empty;
+        defer input.deinit(testing.allocator);
+        putOpening(&input);
+        switch (reopened) {
+            .skipped => putHeaders(&input, 3, blocks.encode(&request_fields), true),
+            .reused => putHeaders(&input, 1, blocks.encode(&request_fields), true),
+        }
+        try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+        try testing.expectEqual(@as(u32, 0), fixture.session.streams.used);
+        var again: Wire = .empty;
+        defer again.deinit(testing.allocator);
+        putHeaders(&again, 1, blocks.encode(&request_fields), true);
+        try testing.expectEqual(Session.Step.closed, fixture.feed(again.items));
+        try expectGoaway(&fixture, .protocol_error);
+        // Only the first stream ever reached the caller.
+        try testing.expectEqual(@as(usize, 1), fixture.eventsOf().len);
+    }
+}
+
+test "h2 session: a client's frames in flight on a stream this side reset are ignored, until the reset is forgotten" {
+    // §5.1: "MUST ignore frames that it receives on closed streams after
+    // it has sent a RST_STREAM". The client's body and trailers were on
+    // their way when the reset left; they end nothing — and the trailers'
+    // block is still decoded, which the next request leans on.
+    var fixture: Fixture = .{};
+    fixture.init();
+    fixture.caller = .reset_on_open;
+    var blocks: Blocks = .{};
+    blocks.init();
+    const trailer = hpack.Field{ .name = "x-checksum", .value = "0123456789abcdef" };
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    putHeaders(&input, 1, blocks.encode(&post_fields), false);
+    putData(&input, 1, "in flight", false);
+    putHeaders(&input, 1, blocks.encode(&.{trailer}), true);
+    putHeaders(&input, 3, blocks.encode(&(request_fields ++ [_]hpack.Field{trailer})), true);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    try testing.expectEqual(@as(?frame.ErrorCode, null), fixture.session.closed_with);
+    var reader = fixture.replies();
+    try expectReset(reader.nextSkippingAcks(), 1, .refused_stream);
+    try expectReset(reader.nextSkippingAcks(), 3, .refused_stream);
+    const events = fixture.eventsOf();
+    try testing.expectEqual(@as(usize, 2), events.len);
+    try testing.expectEqual(@as(u31, 3), events[1].stream);
+    // A reset is remembered for as long as the ring holds it: past that
+    // many later resets, a frame on stream 1 is no longer one in flight
+    // but a client reopening a stream it closed.
+    var later: Wire = .empty;
+    defer later.deinit(testing.allocator);
+    var stream: u31 = 5;
+    while (stream < 5 + 2 * Session.reset_ring_len) : (stream += 2) {
+        putHeaders(&later, stream, blocks.encode(&request_fields), true);
+    }
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(later.items));
+    try testing.expectEqual(@as(?frame.ErrorCode, null), fixture.session.closed_with);
+    var forgotten: Wire = .empty;
+    defer forgotten.deinit(testing.allocator);
+    putHeaders(&forgotten, 1, blocks.encode(&.{trailer}), true);
+    try testing.expectEqual(Session.Step.closed, fixture.feed(forgotten.items));
+    try expectGoaway(&fixture, .protocol_error);
 }
 
 test "h2 session: past the table, a stream is refused — and its block still decoded" {

@@ -79,7 +79,9 @@ pub const Out = struct {
 
 /// Map the rendered HTTP/1.1 head at the front of `rendered` to the field
 /// section HTTP/2 sends. `method` is the request's: it decides whether a
-/// body follows (a HEAD response has none, whatever it declares).
+/// body follows (a HEAD response has none, whatever it declares). A
+/// CONNECT's answer can only be §7's refusal, framed as a GET's; a 2xx to
+/// one would open a tunnel, and is refused.
 pub fn responseHead(
     rendered: []const u8,
     method: parser.Method,
@@ -90,9 +92,17 @@ pub fn responseHead(
     // The parser's own bound, stated here where a caller would cross it:
     // `rendered` is a head buffer's contents, coalesced body and all.
     assert(rendered.len <= constants.head_buffer_bytes_max);
-    assert(method != .connect); // §7 answers CONNECT itself.
-    const parsed = parser.parseResponseHead(rendered, true, storage, method) catch return error.Malformed;
+    // No origin is dialed for a CONNECT, so a head here for one is §7's
+    // own refusal — its 501, or whatever it decided first — and that body
+    // is framed as a GET's would be. The parser, which reads origins'
+    // heads, has no CONNECT answer to frame, and is not asked for one.
+    const framed_as: parser.Method = if (method == .connect) .get else method;
+    assert(framed_as != .connect);
+    const parsed = parser.parseResponseHead(rendered, true, storage, framed_as) catch return error.Malformed;
     if (parsed.status == 101) return error.Malformed;
+    // A 2xx to CONNECT opens a tunnel (RFC 9110 §9.3.6), which this proxy
+    // never does: no such head is ever rendered, and none is carried.
+    if (method == .connect and parsed.status / 100 == 2) return error.Malformed;
     if (out.fields.len == 0) return error.TooLarge;
     if (out.bytes.len < 3) return error.TooLarge;
     var digits: [3]u8 = undefined;
@@ -225,6 +235,19 @@ test "response: an interim head is marked so, and 101 has no HTTP/2 form" {
     try testing.expectError(error.Malformed, fixture.map("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", .get));
 }
 
+test "response: §7's refusal of a CONNECT is framed as any answer, and a 2xx to one is refused" {
+    // An HTTP/2 CONNECT reaches §7 (#275), which answers it 501 without
+    // dialing; that answer comes back through here like every other.
+    var fixture: Fixture = .{};
+    const refused = try fixture.map("HTTP/1.1 501 Not Implemented\r\nContent-Length: 3\r\n\r\nno\n", .connect);
+    try testing.expectEqual(@as(u16, 501), refused.status);
+    try testing.expectEqual(parser.BodyFraming{ .content_length = 3 }, refused.framing);
+    try expectFields(&.{ .{ ":status", "501" }, .{ "content-length", "3" } }, refused.fields);
+    try expectValid(refused.fields);
+    // A 2xx would tell the client a tunnel is open.
+    try testing.expectError(error.Malformed, fixture.map("HTTP/1.1 200 OK\r\n\r\n", .connect));
+}
+
 test "response: every connection-specific field goes, and the trailer announcement with them" {
     var fixture: Fixture = .{};
     const rendered = "HTTP/1.1 200 OK\r\nKeep-Alive: timeout=5\r\nProxy-Connection: keep-alive\r\n" ++
@@ -266,6 +289,7 @@ test "fuzz: response — whatever the HTTP/1.1 parser accepts maps to fields HTT
         seed("\x01HTTP/1.1 304 Not Modified\r\nETag: x\r\nConnection: keep-alive\r\n\r\n"),
         seed("\x00HTTP/1.0 103 Hints\r\nLink: <a>\r\n\r\n"),
         seed("\x00HTTP/1.1 200 OK\r\nTrailer: X\r\nUpgrade: y\r\nContent-Length: 3\r\n\r\nabc"),
+        seed("\x03HTTP/1.1 501 Not Implemented\r\nContent-Length: 2\r\n\r\nno"),
     } });
 }
 
@@ -280,17 +304,20 @@ fn fuzzResponse(context: void, smith: *std.testing.Smith) !void {
     var input: [2048]u8 = undefined;
     const input_len = smith.slice(&input);
     if (input_len < 2) return;
-    const methods = [_]parser.Method{ .get, .head, .post };
+    // CONNECT among them: §7's refusal of one comes back through here.
+    const methods = [_]parser.Method{ .get, .head, .post, .connect };
     const method = methods[input[0] % methods.len];
     const rendered = input[1..input_len];
     var check_storage: parser.HeaderStorage = undefined;
-    const parsed = parser.parseResponseHead(rendered, true, &check_storage, method) catch return;
+    const framed_as: parser.Method = if (method == .connect) .get else method;
+    const parsed = parser.parseResponseHead(rendered, true, &check_storage, framed_as) catch return;
     var fixture: Fixture = .{};
     const response = fixture.map(rendered, method) catch |err| {
         assert(err == error.Malformed);
-        assert(parsed.status == 101);
+        assert(parsed.status == 101 or (method == .connect and parsed.status / 100 == 2));
         return;
     };
+    assert(method != .connect or parsed.status / 100 != 2);
     assert(response.status == parsed.status);
     assert(response.head_len == parsed.head_len);
     expectValid(response.fields) catch unreachable;
