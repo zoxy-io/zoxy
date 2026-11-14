@@ -392,6 +392,11 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// teardown alongside the conn slot (§5). Null outside exchanges
         /// and on the whole L4 path.
         upstream: ?*UpstreamType,
+        /// Where this exchange is (§7, #275). Moved here from the
+        /// connection's state because a multiplexed connection carries
+        /// several exchanges, each at its own point; `Conn.enter` keeps the
+        /// two in step for the one exchange an HTTP/1.1 connection carries.
+        phase: Phase,
         /// L7 exchange bookkeeping (§7); reset per exchange.
         l7: L7State,
 
@@ -409,6 +414,27 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         log: LogState,
 
         const Self = @This();
+
+        pub const Phase = enum(u8) {
+            /// Not an HTTP exchange: an L4 connection's, one before its
+            /// protocol starts, a #180 tunnel's after `101`, or one being
+            /// torn down.
+            none,
+            /// Accumulating the request head and retrying the parse,
+            /// resuming the search where the last read left off.
+            reading_head,
+            /// Awaiting the upstream connect.
+            dialing,
+            /// Running the two legs — request out, response back — each
+            /// with its own sub-state in `l7`.
+            exchanging,
+            /// Writing a static response (§8).
+            responding,
+            /// Half-closed after a response, draining the client's
+            /// remaining input so the close does not RST that response
+            /// away (§7 lingering close).
+            draining_request,
+        };
 
         /// "This exchange holds no head-ring buffer." Out of range by
         /// construction: a group never publishes more than
@@ -489,8 +515,8 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             ///
             /// Unlike `request_deadline_ns` above, the §7 replay does *not*
             /// carry this across its rebuild, and does not need to: a
-            /// replay runs from `.l7_exchanging` and moves to
-            /// `.l7_dialing`, so it never re-enters the `.l7_reading_head`
+            /// replay runs from `.exchanging` and moves to
+            /// `.dialing`, so it never re-enters the `.reading_head`
             /// state `installHeadBudget` asserts on. There is no second
             /// head to budget, so a flag reset to false is inert rather
             /// than a budget silently reissued.
@@ -623,8 +649,8 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         /// clear, and its connection only once that has happened (§5).
         ///
         /// The peak is two, not four, and the disjointness is why: a dial
-        /// and its cancel belong to `.connecting`/`.l7_dialing`, the data
-        /// pair to `.relaying`/`.l7_exchanging`, and no state arms one
+        /// and its cancel belong to `.connecting`/`.dialing`, the data
+        /// pair to `.relaying`/`.exchanging`, and no state arms one
         /// kind while the other is outstanding. `constants.stream_ops_max`
         /// is that claim as a number, and `arm` below is where it fails if
         /// it is ever wrong.
@@ -673,6 +699,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             stream.client_write = .{};
             stream.upstream_socket = null;
             stream.upstream = null;
+            stream.phase = .none;
             stream.l7 = .{};
             // The listener's, and so not known until the admission tail
             // resolves one (`finishAdmission`); on the L7 path `routeRequest`
@@ -695,6 +722,17 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             assert(stream.log.bytes_in == 0);
             assert(stream.log.started_ns == 0);
             assert(stream.log.started_wall_ns == 0);
+        }
+
+        /// Move the exchange within `.l7` (#275). Only the connection's own
+        /// `enter` moves an exchange into or out of the protocol, so a move
+        /// here on a connection that has left it — torn down, or tunneling
+        /// after `101` — is the bug the phase split could otherwise hide:
+        /// a phase that says "exchanging" on a connection that is not.
+        pub fn moveTo(stream: *Self, phase: Phase) void {
+            assert(phase != .none);
+            assert(stream.conn.state == .l7);
+            stream.phase = phase;
         }
 
         /// Records the arm in the op and the armed set; call immediately

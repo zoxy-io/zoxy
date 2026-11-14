@@ -217,20 +217,12 @@ pub fn Conn(comptime IoType: type) type {
             tls_handshaking,
             connecting,
             relaying,
-            // L7 states (§7): `l7_reading_head` accumulates the request
-            // head and retries the parse, resuming the search where the
-            // last read left off; `l7_dialing` awaits the
-            // upstream connect; `l7_exchanging` runs the two legs (request
-            // out, response back — each with its own sub-state in `l7`);
-            // `l7_responding` writes a static error response (§8); and
-            // `l7_draining_request` half-closes the write side after a
-            // response and drains the client's remaining input so the
-            // close does not RST away that response (§7 lingering close).
-            l7_reading_head,
-            l7_dialing,
-            l7_exchanging,
-            l7_responding,
-            l7_draining_request,
+            /// Serving HTTP (§7). Where in an exchange the connection is —
+            /// reading a head, dialing, exchanging, answering, draining —
+            /// is the exchange's own state, `Stream.phase` (#275): a
+            /// multiplexed connection is in one state while its streams are
+            /// each in their own phase.
+            l7,
             /// Teardown begun: sockets shut down, pending ops draining.
             /// The delivery that empties the armed set closes both fds
             /// synchronously and releases the slot (§5) — there is no
@@ -238,6 +230,23 @@ pub fn Conn(comptime IoType: type) type {
             /// straggle into the closes.
             tearing_down,
         };
+
+        /// Move to `state`, and the exchange this connection carries with
+        /// it: an HTTP connection's exchange enters reading its head, and
+        /// no other state carries one at all (#275). Every move into or
+        /// out of `.l7` goes through here, which is what keeps
+        /// `stream.phase == .x` meaning exactly what `state == .l7_x` meant
+        /// before the phase moved to the stream — teardown and the #180
+        /// tunnel leave the exchange's phase at `.none`, not where it was.
+        /// The moves *within* `.l7` are the exchange's, on its stream.
+        pub fn enter(conn: *Self, state: State) void {
+            // The phase written below is this connection's own exchange's —
+            // the pairing `prepare` states, asserted where it is relied on.
+            assert(conn.stream.conn == conn);
+            conn.state = state;
+            conn.stream.phase = if (state == .l7) .reading_head else .none;
+            assert((conn.state == .l7) == (conn.stream.phase != .none));
+        }
 
         /// True once teardown has begun.
         pub fn isTearingDown(conn: *const Self) bool {
@@ -253,11 +262,7 @@ pub fn Conn(comptime IoType: type) type {
                 .tls_handshaking,
                 .connecting,
                 .relaying,
-                .l7_reading_head,
-                .l7_dialing,
-                .l7_exchanging,
-                .l7_responding,
-                .l7_draining_request,
+                .l7,
                 => true,
                 .tearing_down => false,
             };
@@ -286,8 +291,7 @@ pub fn Conn(comptime IoType: type) type {
         /// Admission-time reset. `pool_next` and `generation` are owned
         /// by the pool and deliberately untouched. `buffer` is the L4
         /// relay buffer, or null on the L7 path (§5); `state` is the
-        /// protocol's entry state (`.connecting` for L4, `.l7_reading_head`
-        /// for L7).
+        /// protocol's entry state (`.connecting` for L4, `.l7` for L7).
         pub fn prepare(
             conn: *Self,
             server: *ServerType,
@@ -297,13 +301,13 @@ pub fn Conn(comptime IoType: type) type {
             protocol: config_module.Config.Listener.Protocol,
             client_address: ?std.Io.net.IpAddress,
         ) void {
-            assert(state == .connecting or state == .l7_reading_head);
+            assert(state == .connecting or state == .l7);
             conn.server = server;
             // Deliberately not set here: the slot's stream was acquired
             // with the slot itself (`admitConn`) and is already paired.
             // A reset that installed one would be a reset that could
             // orphan the one already held.
-            conn.state = state;
+            conn.enter(state);
             conn.client_socket = client_socket;
             conn.tunnel_buffer = null;
             conn.deadline_ns = 0;
