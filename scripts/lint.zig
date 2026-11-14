@@ -3,11 +3,12 @@
 //! named only under `src/io/`, with an explicit allowlist for `main.zig`
 //! startup work (rlimits, sigaction). The `hparse` import is likewise
 //! confined to `src/http/parser.zig` — the wrapper that owns the trust
-//! boundary (§7) — and `zssl` to `src/tls/`, the wrapper that owns the
-//! crypto boundary (§4). `@cImport` is forbidden everywhere: the codebase's
-//! one C surface is inside zssl, behind its Zig protocol layer, and a
-//! second one opened here would not be (§4). Runs as `zig build lint` with
-//! the source root as its single argument.
+//! boundary (§7) — `h2` to `src/http/h2/`, the HTTP/2 session that owns
+//! framing semantics over that codec (#275), and `zssl` to `src/tls/`, the
+//! wrapper that owns the crypto boundary (§4). `@cImport` is forbidden
+//! everywhere: the codebase's one C surface is inside zssl, behind its Zig
+//! protocol layer, and a second one opened here would not be (§4). Runs as
+//! `zig build lint` with the source root as its single argument.
 
 const std = @import("std");
 
@@ -43,6 +44,11 @@ const boundaries = [_]Boundary{
         .needle = "@import(\"hparse\")",
         .confined_to = "http/parser.zig",
         .message = "hparse is imported only by src/http/parser.zig — the trust boundary (DESIGN.md §7)",
+    },
+    .{
+        .needle = "@import(\"h2\")",
+        .confined_to = "http/h2/",
+        .message = "h2 is imported only under src/http/h2/ — the HTTP/2 framing boundary (#275)",
     },
     .{
         .needle = "@import(\"xev\")",
@@ -420,6 +426,13 @@ test "lintLine: hparse import is confined to the http parser wrapper" {
     try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "http/proxy.zig") != null);
     // Not even src/io/ may reach around the wrapper.
     try std.testing.expect(lintLine("const hparse = @import(\"hparse\");", "io/XevIo.zig") != null);
+}
+
+test "lintLine: h2 import is confined to the HTTP/2 session" {
+    try std.testing.expect(lintLine("const h2 = @import(\"h2\");", "http/h2/Session.zig") == null);
+    try std.testing.expect(lintLine("const h2 = @import(\"h2\");", "http/proxy.zig") != null);
+    try std.testing.expect(lintLine("const h2 = @import(\"h2\");", "http/parser.zig") != null);
+    try std.testing.expect(lintLine("const h2 = @import(\"h2\");", "Server.zig") != null);
 }
 
 test "lintLine: zssl import is confined to the TLS engine wrapper" {

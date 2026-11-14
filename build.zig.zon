@@ -444,6 +444,37 @@
             .url = "git+https://github.com/zoxy-io/hparse#7f57ef8183f15ebd62f5f9ca631f69a9afdbc421",
             .hash = "hparse-0.2.0-IukW0jqfAwDmg7ZWyJSUjHGaocYJuqDaNIo8A9URJOjo",
         },
+        // HTTP/2's codec (#173, #275): RFC 9113's frame layer and §8 message
+        // rules, with RFC 7541 HPACK from zoxy-io/hpack (2fd3820) beneath
+        // it. "Bytes in, frames and header fields out" — it reads no socket
+        // and holds no connection state, so the session that does both is
+        // zoxy's own (`src/http/h2/`), on the model of `http/parser.zig`
+        // owning framing semantics over hparse's syntax. Like hparse it is
+        // imported only from there, and the lint enforces it.
+        //
+        // Audit at 6ef0d25, 2026-11-14, as a new dependency rather than a
+        // move. What clears §4's bar is structural rather than promised:
+        // there is no allocator in the package at all, so every buffer is
+        // a slice the caller sized, and the HPACK dynamic table's storage
+        // is a comptime-capacity `Storage(N)` the caller owns. Its bounds
+        // are the ones a server needs and RFC 7541 does not set: the
+        // integer codec's continuation-octet run, Huffman padding validity
+        // (two conforming decoders must not disagree about the same
+        // bytes), a field block's octets and frame count across
+        // CONTINUATION, and a declared length checked before any slice is
+        // taken. It classifies every violation as a connection or a stream
+        // error from the nine header octets, which is what lets this side
+        // answer GOAWAY or RST_STREAM without re-deriving RFC 9113 §5.4.
+        //
+        // The same commit zrk v3.0.1 pins (hash identical), and the tree
+        // of h2's `main`. Built here with `.assertions = true`, against
+        // zrk's `false`: TIGER_STYLE keeps assertions on in every build,
+        // and the two never share a binary — no harness imports the
+        // `zoxy` module.
+        .h2 = .{
+            .url = "git+https://github.com/zoxy-io/h2#6ef0d254941ebad95de66f65ac430fd7b97f723d",
+            .hash = "h2-0.0.0--ngLt3paAwAQ-uHQ-iI5k5VsIYc3EGztzQF-c2OBj1Z_",
+        },
         // libcrypto, built by Zig rather than found on the system.
         //
         // This is what buys back cross-compilation. `linkSystemLibrary("crypto")`
