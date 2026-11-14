@@ -968,12 +968,6 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.phase == .reading_head);
             assert(stream.l7.request_deadline_ns == 0);
             if (server.config.request_timeout_ms == 0) return;
-            // The connection's one timer serves its own exchange's cap. A
-            // multiplexed exchange is answered by §7 in the frame that asked
-            // (#275) — what can outlast that is an answer the client will
-            // not take, which the connection's idle window bounds — so it
-            // has no cap to arm until its upstream half can wait on one.
-            if (stream.h2_id != 0) return;
             const now_ns = server.io.nowNs();
             stream.l7.request_deadline_ns = now_ns +
                 @as(u64, server.config.request_timeout_ms) * std.time.ns_per_ms;
@@ -1145,10 +1139,12 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, stream, 404, "l7_no_route");
             };
 
-            // A multiplexed exchange has no upstream half yet (#275): one
-            // that would need an origin is refused before anything is
+            // A multiplexed exchange forwards no request body yet (#275):
+            // one that has a body to forward is refused before anything is
             // acquired for it, which the client may retry (RFC 9113 §8.7).
-            if (stream.h2_id != 0) return H2Exchange.abandon(server, stream, .refused_stream);
+            if (stream.h2_id != 0 and request.framing != .none) {
+                return H2Exchange.abandon(server, stream, .refused_stream);
+            }
             stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, stream, 503, "l7_shed_relay_buffers");
             };
@@ -2985,8 +2981,12 @@ pub fn Proxy(comptime IoType: type) type {
             // Feed the framing tracker over the body excess that arrived
             // coalesced with the head.
             const excess = upstreamHeadBytes(upstream)[response.head_len..upstream.head_len];
-            const feed = feedFraming(&stream.l7.response_framing, excess);
-            if (feed.malformed) {
+            // What rides the head on: the origin's framed octets for an
+            // HTTP/1.1 client, which reads the same framing; for an HTTP/2
+            // stream, the payload alone — DATA frames the body itself, so a
+            // chunked one is dechunked, in place, at the front (#275).
+            const fed = payloadFraming(&stream.l7.response_framing, excess, stream.h2_id != 0);
+            if (fed.feed.malformed) {
                 upstreamFailed(server, stream);
                 return;
             }
@@ -2994,7 +2994,7 @@ pub fn Proxy(comptime IoType: type) type {
                 server,
                 stream,
                 @intCast(rendered.len),
-                excess[0..feed.consumed],
+                excess[0..fed.forward_len],
             );
 
             commitResponse(server, stream, response, verdict, head_write_len);
@@ -3303,11 +3303,11 @@ pub fn Proxy(comptime IoType: type) type {
         fn afterResponseExcess(server: *ServerType, stream: *StreamType) void {
             assert(stream.phase == .exchanging);
             stream.l7.response_leg = .pumping_body;
-            if (framingDoneOf(&stream.l7.response_framing)) {
-                finishExchange(server, stream);
-            } else {
-                armResponseBodyRecv(server, stream);
-            }
+            if (framingDoneOf(&stream.l7.response_framing)) return finishExchange(server, stream);
+            // The session is a multiplexed exchange's client (#275): its
+            // body pump offers DATA rather than sending.
+            if (stream.h2_id != 0) return H2Exchange.pumpBody(server, stream);
+            armResponseBodyRecv(server, stream);
         }
 
         /// The response leg's body pump (origin → client, §7). Framed by the
@@ -3520,6 +3520,15 @@ pub fn Proxy(comptime IoType: type) type {
             if (stream.l7.upstream_reusable and request_complete and !server.draining) {
                 parkUpstream(server, stream);
             }
+            // A multiplexed exchange's end is its stream's (#275): there is
+            // no connection of its own to keep or close, so what it holds
+            // goes back and the stream is finished.
+            if (stream.h2_id != 0) {
+                detachUpstream(server, stream);
+                server.releaseRelayBuffer(stream.relay_buffer.?);
+                stream.relay_buffer = null;
+                return H2Exchange.finish(server, stream);
+            }
             const keep_downstream = !stream.l7.downstream_close_announced and
                 request_complete and !server.draining;
             if (keep_downstream) {
@@ -3676,6 +3685,41 @@ pub fn Proxy(comptime IoType: type) type {
                 return false;
             }
             return true;
+        }
+
+        /// A multiplexed exchange's deadline is due (#275): §8's verdicts, as
+        /// `Server.expireDeadline` gives an admission stream's — a 504 for
+        /// an exchange that can still be answered, the dial cancel for one
+        /// still dialing — and otherwise the stream reset, where an
+        /// admission stream's connection would be torn down. The timer is
+        /// the connection's, re-armed by its driver after the scan.
+        pub fn expireExchange(server: *ServerType, stream: *StreamType) void {
+            assert(stream.h2_id != 0);
+            assert(!stream.ending);
+            ServerType.clearRequestDeadline(stream);
+            stream.deadline_ns = 0;
+            // The verdicts' grace, as an admission stream's: the configured
+            // idle window, never the pressure-biased one.
+            const grace_ms = server.config.idle_timeout_ms;
+            // `beginExpiry` forces an op to carry the verdict; an exchange
+            // with none armed — an interim head waiting on the session —
+            // has nothing to force, and is ended instead.
+            const forcible = stream.armed.data_client_to_upstream or
+                stream.armed.data_upstream_to_client;
+            if (stream.phase == .exchanging and stream.l7.pending_verdict == .none and
+                forcible and expiryAnswerable(stream))
+            {
+                server.storeExchangeDeadline(stream, grace_ms);
+                return beginExpiry(server, stream);
+            }
+            if (stream.phase == .dialing and stream.l7.pending_verdict == .none) {
+                assert(stream.armed.connect);
+                assert(!stream.armed.connect_cancel);
+                stream.l7.pending_verdict = .gateway_timeout;
+                server.storeExchangeDeadline(stream, grace_ms);
+                return server.armConnectCancel(stream);
+            }
+            server.endExchange(stream);
         }
 
         /// The labeled twin of a `504` (#179, #230): this endpoint was
@@ -3941,7 +3985,6 @@ pub fn Proxy(comptime IoType: type) type {
         /// half-sent response cannot be repaired, and an armed op holds the
         /// completion the answer would need.
         fn upstreamFailed(server: *ServerType, stream: *StreamType) void {
-            const conn = stream.conn;
             assert(stream.phase == .exchanging);
             assert(stream.l7.pending_verdict == .none); // Handlers divert first.
             if (replayEligible(stream)) {
@@ -3957,7 +4000,7 @@ pub fn Proxy(comptime IoType: type) type {
             if (stream.l7.response_started or stream.armed.data_client_to_upstream or
                 stream.armed.data_upstream_to_client)
             {
-                server.beginTeardown(conn);
+                server.endExchange(stream);
                 return;
             }
             // #230, the third and last shape of "this endpoint said
@@ -4136,16 +4179,27 @@ pub fn Proxy(comptime IoType: type) type {
         /// a stream — logged, its head buffer back if a redirect rendered
         /// into it, and the stream finished. There is no connection to
         /// keep or close: the next request is the client's next stream.
-        pub fn h2AnswerDelivered(server: *ServerType, stream: *StreamType) void {
+        pub fn h2WriteDelivered(server: *ServerType, stream: *StreamType) void {
             assert(stream.h2_id != 0);
             assert(stream.client_write.pending.len == 0);
             const then = stream.client_write.then;
-            assertWriteContinuation(stream, then);
             switch (then) {
                 .lingering_close, .next_request => {},
-                .redirect_lingering_close, .redirect_next_request => server.returnHeadBuffer(stream),
-                // Only a static answer reaches a multiplexed exchange yet.
-                .response_excess, .response_body, .interim_sent, .tunnel_start => unreachable,
+                .redirect_lingering_close, .redirect_next_request => {},
+                // The proxied continuations, as `onClientWritten` runs them —
+                // a body chunk's included, which the HTTP/1.1 pump sends on
+                // its own and a multiplexed exchange's hands over here.
+                .interim_sent => return resumeAfterInterim(server, stream),
+                .response_excess => return sendResponseExcess(server, stream),
+                .response_body => return afterResponseExcess(server, stream),
+                // No upgrade reaches HTTP/2 (RFC 9113 §8.6).
+                .tunnel_start => unreachable,
+            }
+            // A static answer's endings, said for a stream: the redirect's
+            // stream head held through the answer it rendered, then given back.
+            assertWriteContinuation(stream, then);
+            if (then == .redirect_lingering_close or then == .redirect_next_request) {
+                server.returnHeadBuffer(stream);
             }
             server.releaseStaticSend(stream);
             server.logExchange(stream);
@@ -4694,6 +4748,39 @@ pub fn Proxy(comptime IoType: type) type {
         }
 
         const FeedResult = pump.FeedResult;
+
+        /// What one feed carries on: `feedFraming`'s verdict, and how many of
+        /// the octets at the front of `bytes` go to the client. All it
+        /// consumed for an HTTP/1.1 client, which reads the same framing;
+        /// for an HTTP/2 stream (`payload`), the payload alone — a chunked
+        /// body dechunked in place, sizes and trailers dropped (#275).
+        pub const PayloadFeed = struct {
+            feed: FeedResult,
+            forward_len: u32,
+        };
+
+        /// `feedFraming` over a received chunk, and what of it goes on —
+        /// in place, so the forwarded octets are `bytes[0..forward_len]`.
+        pub fn payloadFraming(framing: *Framing, bytes: []u8, payload: bool) PayloadFeed {
+            assert(bytes.len <= std.math.maxInt(u32));
+            if (!payload or framing.* != .chunked or bytes.len == 0) {
+                const feed = feedFraming(framing, bytes);
+                return .{ .feed = feed, .forward_len = feed.consumed };
+            }
+            const dechunked = framing.chunked.dechunk(bytes) catch {
+                return .{ .feed = .{ .consumed = 0, .done = false, .malformed = true }, .forward_len = 0 };
+            };
+            assert(dechunked.payload_len <= dechunked.consumed);
+            return .{
+                .feed = .{ .consumed = dechunked.consumed, .done = dechunked.done, .malformed = false },
+                .forward_len = dechunked.payload_len,
+            };
+        }
+
+        pub fn framingDone(stream: *const StreamType) bool {
+            assert(stream.l7.response_started);
+            return framingDoneOf(&stream.l7.response_framing);
+        }
 
         /// Advance a framing tracker over `bytes`, reporting how many of
         /// them belong to the message. Consumed < bytes.len means the

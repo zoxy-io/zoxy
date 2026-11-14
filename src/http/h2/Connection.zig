@@ -66,6 +66,13 @@ pub const Slot = struct {
     /// The session is done: once what it staged is sent — its GOAWAY, if
     /// it ended the connection — the connection is torn down.
     closing: bool,
+    /// The connection's own idle window (#275), apart from the deadlines
+    /// of the exchanges it multiplexes: the connection's timer is aimed at
+    /// whichever of them is first (`Server.storeH2IdleDeadline`).
+    idle_deadline_ns: u64,
+    /// A `drive` pass is running: what an exchange stages now is flushed
+    /// when the pass ends, and `kick` must not start a second one inside it.
+    driving: bool,
 
     /// Back to the state a fresh connection finds it in. The carve stays:
     /// it is the slab's layout, not the connection's.
@@ -74,6 +81,8 @@ pub const Slot = struct {
         slot.sending = 0;
         slot.receiving = false;
         slot.closing = false;
+        slot.idle_deadline_ns = 0;
+        slot.driving = false;
         assert(slot.buffers.inbound.len >= Session.frame_bytes_max);
     }
 };
@@ -137,6 +146,65 @@ pub fn Driver(comptime IoType: type) type {
             drive(server, conn);
         }
 
+        /// The connection's timer is due. It serves the connection's own
+        /// idle window and every multiplexed exchange's deadline (#275), so
+        /// what is due is found by looking: each exchange past its deadline
+        /// gets §8's verdict, and the connection itself expires only once
+        /// its window is past with nothing open — or its lifetime is up,
+        /// open or not. A connection with exchanges in flight is not idle,
+        /// so its window starts over. The timer is re-armed at what is next.
+        pub fn expire(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .h2);
+            assert(!conn.armed.deadline); // Delivered; re-armed only below.
+            const slot = conn.h2.?;
+            const now = server.io.nowNs();
+            const idle_due = now >= slot.idle_deadline_ns;
+            if (idle_due and (conn.h2_streams == null or server.lifetimeOver(conn))) {
+                server.counters.increment("deadline_expired");
+                return server.beginTeardown(conn);
+            }
+            if (idle_due) server.storeH2IdleDeadline(conn);
+            // A pass, as far as `kick` can tell: an expiry that resets its
+            // stream stages a frame, and a session stepped now could end
+            // other streams, or the connection, under this scan. What the
+            // expiries staged goes out in one pass after it.
+            slot.driving = true;
+            const streams_max = slot.session.config.concurrent_streams_max;
+            var cursor = conn.h2_streams;
+            var visited: u32 = 0;
+            while (cursor) |stream| {
+                assert(visited < streams_max);
+                visited += 1;
+                // Taken first: an expiry can end its own exchange and give
+                // the slot back — its own, and no other.
+                cursor = stream.h2_next;
+                if (stream.ending or stream.deadline_ns == 0) continue;
+                if (now < stream.deadline_ns) continue;
+                server.counters.increment("deadline_expired");
+                ServerType.Proxy.expireExchange(server, stream);
+            }
+            slot.driving = false;
+            assert(conn.state == .h2);
+            ServerType.refreshH2Deadline(conn);
+            if (!conn.armed.deadline and !conn.armed.deadline_cancel) server.armDeadline(conn);
+            kick(server, conn);
+        }
+
+        /// An exchange staged frames from outside a `drive` pass — an
+        /// origin's completion answered its stream, or ended it — so step
+        /// the session and send them. Inside a pass, the pass sends them.
+        pub fn kick(server: *ServerType, conn: *ConnType) void {
+            // Torn down: nothing goes out. Still the caller's slot to read —
+            // a teardown releases it only once its armed set is empty, and
+            // a speaking connection always has its read armed.
+            if (conn.state != .h2) return;
+            assert(conn.h2 != null);
+            const slot = conn.h2.?;
+            if (slot.driving) return;
+            if (slot.closing) return; // `close` is already sending its last.
+            drive(server, conn);
+        }
+
         /// The server is draining (§8): end gracefully — GOAWAY(NO_ERROR),
         /// the streams already accepted finished, nothing new taken.
         pub fn beginDrain(server: *ServerType, conn: *ConnType) void {
@@ -165,7 +233,7 @@ pub fn Driver(comptime IoType: type) type {
             // The idle window, not the head budget a slow preface earned:
             // an HTTP/2 connection is idle between frames, and §4's lazy
             // timer moves later on its own.
-            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.storeH2IdleDeadline(conn);
             assert(stream.phase == .none);
         }
 
@@ -175,6 +243,9 @@ pub fn Driver(comptime IoType: type) type {
         fn drive(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .h2);
             const slot = conn.h2.?;
+            assert(!slot.driving);
+            slot.driving = true;
+            defer slot.driving = false;
             var passes: u32 = 0;
             while (true) : (passes += 1) {
                 assert(passes < drive_passes_max);
@@ -282,7 +353,7 @@ pub fn Driver(comptime IoType: type) type {
             } else {
                 slot.session.received(received);
             }
-            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.storeH2IdleDeadline(conn);
             drive(server, conn);
         }
 
@@ -304,10 +375,10 @@ pub fn Driver(comptime IoType: type) type {
                 server.beginTeardown(conn);
                 return false;
             };
-            // The client's close_notify: it will write no more. Nothing it
-            // opened is being served — every stream is refused — so there
-            // is nothing left to answer, and the connection ends as a
-            // socket EOF would end it.
+            // The client's close_notify: it will write no more. HTTP/2 has
+            // no half-closed connection — a client done with one says
+            // GOAWAY first (RFC 9113 §6.8) — so this ends the connection,
+            // and whatever it had open with it, as a socket EOF would.
             if (engine.peerClosed()) {
                 server.beginTeardown(conn);
                 return false;
