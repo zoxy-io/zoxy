@@ -219,7 +219,7 @@ pub fn Driver(comptime IoType: type) type {
             slot.session.received(@intCast(take));
             slot.backlog = slot.backlog[take..];
             if (slot.backlog.len == 0 and conn.stream.head_buffer_id != StreamType.head_buffer_none) {
-                server.returnHeadBuffer(conn);
+                server.returnHeadBuffer(conn.stream);
             }
         }
 

@@ -4942,6 +4942,32 @@ test "l7: a line reports the named headers from both directions (#140)" {
     try std.testing.expect(std.mem.indexOf(u8, line, "user-agent") == null);
 }
 
+test "l7: named headers are captured beside reserved shared streams (#140, #275)" {
+    // The capture table is laid out over both stream pools, the admission
+    // streams first: with shared streams reserved it is longer than the
+    // admission pool alone, and an exchange on an admission stream must
+    // still find its own slice of it.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 64,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        .access_log = true,
+        .access_log_request_headers = &.{"x-request-id"},
+        .h2_connections = 2,
+        .stream_slots = 4,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /path HTTP/1.1\r\nHost: o\r\nX-Request-Id: abc-123\r\n" ++
+        "Connection: close\r\n\r\n");
+    try bed.expectDrained();
+
+    const line = try onlyAccessLogLine(&bed);
+    try std.testing.expect(
+        std.mem.indexOf(u8, line, "\"request_headers\":{\"x-request-id\":\"abc-123\"}") != null,
+    );
+}
+
 test "l7: a keep-alive turnaround does not carry the last request's headers (#140)" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{
