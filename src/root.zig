@@ -80,6 +80,8 @@ test {
     _ = http.router;
     _ = http.filter;
     _ = http.proxy;
+    _ = @import("http/h2/Session.zig");
+    _ = @import("http/h2/session_test.zig");
     _ = Io;
     _ = Server;
     _ = shed;
