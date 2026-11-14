@@ -22,9 +22,22 @@
 //! promise this side cannot keep. A malformed stream is reset without
 //! disturbing its siblings, and a client's reset surfaces as `.reset`.
 //!
-//! Not yet: the response side — HEADERS and DATA out, and the send windows
-//! that pace them. That is the next slice; until it lands, a stream ends
-//! only when the caller `close`s or `resetStream`s it.
+//! The streams, outbound: `sendHead`, `sendData` and `sendTrailers` stage
+//! the response, its field sections HPACK-encoded against the client's
+//! table and checked against the same §8 rules on the way out. A field
+//! block is started only when it can be finished, so the tables never fall
+//! out of step and nothing lands inside one (§4.3). Body octets go out as
+//! both send windows allow. A send cut short — by a window, by outbox room,
+//! or by its turn — waits, and `step` hands the waiting streams `.writable`
+//! round-robin as each can go on: while others wait for the room or the
+//! connection's window, a stream sends one frame per turn, so N streams
+//! share the socket by frame and none starves. A stream is gone once both
+//! halves have ended (§5.1).
+//!
+//! Left to the caller, which alone knows the request: that a body adds up
+//! to the `content-length` its head declared (§8.1.1 — a HEAD response
+//! declares one it never sends), and whether a head is past the client's
+//! advisory SETTINGS_MAX_HEADER_LIST_SIZE.
 
 const std = @import("std");
 const h2 = @import("h2");
@@ -67,6 +80,28 @@ pub const reply_bytes_max: u32 = frame.Header.octets + frame.Header.ping_payload
 /// while `reply_bytes_max` stays in reserve behind it.
 const control_bytes: u32 = frame.Header.octets + frame.Header.window_increment_octets;
 
+/// What a send leaves free in the outbox: one reply and one control frame,
+/// so neither `step`'s answer to the next frame nor `flushPending`'s next
+/// credit waits behind body octets.
+pub const send_reserve: u32 = reply_bytes_max + control_bytes;
+
+/// HPACK's integers, at the protocol's width: every index, length and table
+/// size here fits a `u32`.
+const Integer = hpack.integer.Integer(u32);
+
+/// The most octets a field's index takes: the static table's entries plus
+/// the most a `header_table_size` table holds, at the narrowest prefix any
+/// representation uses (RFC 7541 §6.2.2's four bits).
+const index_bytes_max: u32 = 3;
+
+/// The table-size updates one block may start with: at most two (RFC 7541
+/// §4.2), each at most `header_table_size` behind a 5-bit prefix (§6.3).
+const size_updates_bytes_max: u32 = 2 * Integer.encodedLength(header_table_size, 5);
+
+/// The HPACK encoder's arena for response blocks: RFC 7541's default, the
+/// size the client's decoder starts at.
+pub const EncoderStorage = hpack.Encoder.Storage(header_table_size);
+
 const settings_entry_bytes: u32 = 6;
 const settings_entries_max: u32 = 3;
 const settings_bytes_max: u32 = frame.Header.octets + settings_entry_bytes * settings_entries_max;
@@ -87,6 +122,11 @@ comptime {
     assert(reply_bytes_max == 17);
     assert(control_bytes == 13);
     assert(control_bytes <= reply_bytes_max);
+    const index_max = hpack.static_table.entries.len + hpack.DynamicTable.entriesRequired(header_table_size);
+    assert(Integer.encodedLength(index_max, 4) <= index_bytes_max);
+    // An empty outbox always has room past the reserve for a frame header
+    // and one octet: the floor every waiting body send is woken against.
+    assert(outbox_bytes_min > send_reserve + frame.Header.octets);
     // The starting window must itself be a legal one; that each window
     // then stays at or under where it started is the three-way identity
     // `creditStream` and `creditConnection` assert.
@@ -124,9 +164,13 @@ pub const Buffers = struct {
     fields: []hpack.Field,
     /// Exactly `concurrent_streams_max` slots.
     streams: []StreamTable.Slot,
-    /// At least `outbox_bytes_min`.
+    /// At least `outbox_bytes_min`, and what bounds a response head: a field
+    /// section whose encoding could not fit it is refused.
     outbox: []u8,
+    /// HPACK tables: the decoder's for requests, the encoder's for
+    /// responses. Both are reset by `init`.
     table: *TableStorage,
+    encoder: *EncoderStorage,
 };
 
 /// The most fields a list within `list_size_max` can carry: RFC 7541
@@ -138,13 +182,15 @@ pub fn fieldsFor(list_size_max: u32) u32 {
 
 /// What the caller does next.
 pub const Step = union(enum) {
-    /// Everything buffered was handled; read more into `recvBuffer`.
+    /// Everything buffered was handled, nothing staged is owed, and no
+    /// waiting stream can go on; read more into `recvBuffer`.
     need_input,
     /// The outbox is too full to answer the next frame, or to stage what
     /// this side owes. Send `outbound`, then `step` again before reading.
     flush_first,
-    /// The connection is over. Send what `outbound` holds — the GOAWAY,
-    /// if this side ended it — and close.
+    /// The connection is over, and every stream with it: nothing more may
+    /// be sent or asked on any of them. Send what `outbound` holds — the
+    /// GOAWAY, if this side ended it — and close.
     closed,
     /// A stream opened with a well-formed request head.
     request: Request,
@@ -157,6 +203,10 @@ pub const Step = union(enum) {
     /// raised for a stream the caller reset itself — from `resetStream` on,
     /// a stream raises nothing more.
     reset: Reset,
+    /// A send cut short on this stream can go on: offer its next octets, or
+    /// the field section that waited, again. Its turn — not offering is
+    /// fine, and the next waiting stream is named at the next `step`.
+    writable: Writable,
 
     /// Every borrowed slice below is valid until the next `step`.
     pub const Request = struct {
@@ -179,6 +229,31 @@ pub const Step = union(enum) {
         stream: u31,
         code: frame.ErrorCode,
     };
+    pub const Writable = struct {
+        stream: u31,
+    };
+};
+
+/// What staging a field section came to.
+pub const Sent = enum {
+    /// Staged whole.
+    staged,
+    /// Not now: the outbox lacks room for the block. Nothing was staged;
+    /// `.writable` names the stream once there is room.
+    blocked,
+    /// Never: fields HTTP/2 cannot carry (§8.2, §8.3.2, §8.6), or a block
+    /// past what the outbox could hold empty. Nothing was staged, and the
+    /// stream is the caller's to reset.
+    refused,
+};
+
+/// What a body send came to.
+pub const DataSent = struct {
+    /// Octets of `bytes` staged. Fewer than offered means the stream waits
+    /// for `.writable` before the rest.
+    taken: u32,
+    /// The stream's END_STREAM went out with them.
+    ended: bool,
 };
 
 const State = enum {
@@ -240,6 +315,16 @@ last_peer_stream: u31,
 last_accepted_stream: u31,
 /// Streams answered with REFUSED_STREAM because the table was full.
 streams_refused: u32,
+/// The response blocks' encoder, and the table-size change owed at the
+/// start of the next block (RFC 7541 §4.2): the lowest capacity the client
+/// set since the last block, and the last one.
+encoder: hpack.Encoder,
+encoder_resize_low: ?u32,
+encoder_resize_final: u32,
+/// How many streams wait for `.writable`, and the slot the round-robin
+/// looks at first.
+send_waiting: u32,
+send_cursor: u32,
 
 pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
     assert(config.concurrent_streams_max >= 1);
@@ -250,6 +335,8 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
     assert(buffers.fields.len >= fieldsFor(config.header_list_size_max));
     assert(buffers.streams.len == config.concurrent_streams_max);
     assert(buffers.block.len >= 1);
+    buffers.table.* = .{};
+    buffers.encoder.* = .{};
     session.* = .{
         .state = .awaiting_preface,
         .config = config,
@@ -280,6 +367,11 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
         .last_peer_stream = 0,
         .last_accepted_stream = 0,
         .streams_refused = 0,
+        .encoder = buffers.encoder.encoder(.dynamic),
+        .encoder_resize_low = null,
+        .encoder_resize_final = header_table_size,
+        .send_waiting = 0,
+        .send_cursor = 0,
     };
     // §3.4: the server's preface is a SETTINGS frame, and it may go out
     // before the client's arrives — so it is staged now, first.
@@ -360,7 +452,9 @@ pub fn outbound(session: *const Session) []const u8 {
 }
 
 /// `count` octets of `outbound` reached the wire. Staged bytes never move,
-/// so a send in flight can borrow them while `step` appends more.
+/// so a send in flight can borrow them while `step` appends more. Room
+/// comes back once all of it is sent, and the caller steps then, input or
+/// not: a stream waiting for that room hears of it from `step`.
 pub fn outboundSent(session: *Session, count: u32) void {
     assert(count >= 1);
     assert(session.outbox_sent + count <= session.outbox_len);
@@ -391,29 +485,375 @@ pub fn consume(session: *Session, stream: u31, count: u32) void {
 /// End `stream` from this side with `code`: RST_STREAM goes out at the
 /// next `step`. For a stream the caller cannot finish — an origin that
 /// failed (INTERNAL_ERROR), a shed before any work (REFUSED_STREAM, which
-/// the client may retry) — never for one it did.
+/// the client may retry) — never for one it did. NO_ERROR only once the
+/// response is complete, to stop a request body nobody will read (§8.1).
 pub fn resetStream(session: *Session, stream: u31, code: frame.ErrorCode) void {
     assert(stream != 0);
-    assert(code != .no_error);
     const slot = session.streams.find(stream).?;
     assert(slot.state != .reset_pending);
+    if (code == .no_error) assert(slot.state == .half_closed_local);
+    session.unwait(slot);
     slot.state = .reset_pending;
     slot.reset_code = code;
     session.pending = true;
 }
 
-/// `stream` is finished on both sides: its slot goes back. After the
-/// client's GOAWAY, the last one closed is the connection's end too.
-pub fn close(session: *Session, stream: u31) void {
-    assert(stream != 0);
-    const slot = session.streams.find(stream).?;
-    assert(slot.state == .half_closed_remote);
-    session.releaseStream(slot);
+/// Stage a response head on `stream`: interim ones (1xx) first, as many as
+/// there are, then the final one — with END_STREAM when no body follows.
+/// The fields borrow nothing past the call. After the client's half and
+/// this one have both ended, the stream is gone.
+pub fn sendHead(session: *Session, stream: u31, fields: []const hpack.Field, end_stream: bool) Sent {
+    const slot = session.sendable(stream);
+    assert(!slot.head_sent);
+    const status = responseStatus(fields) orelse return .refused;
+    // §8.6: HTTP/2 has no 101; and §8.1: an interim response ends nothing.
+    if (status == 101) return .refused;
+    const interim = status < 200;
+    if (interim) assert(!end_stream);
+    const sent = session.sendFields(slot, fields, .response, end_stream);
+    if (sent != .staged) return sent;
+    if (!interim) slot.head_sent = true;
+    if (end_stream) session.endLocal(slot);
+    return .staged;
+}
+
+/// Stage `stream`'s trailer section: after the final head and its body,
+/// and it ends the stream (§8.1).
+pub fn sendTrailers(session: *Session, stream: u31, fields: []const hpack.Field) Sent {
+    const slot = session.sendable(stream);
+    assert(slot.head_sent);
+    const sent = session.sendFields(slot, fields, .trailer, true);
+    if (sent == .staged) session.endLocal(slot);
+    return sent;
+}
+
+/// Stage body octets on `stream`, after its final head: as many as both
+/// windows, the client's frame size and the outbox allow — one frame only
+/// while other streams wait their turn. END_STREAM goes with the last
+/// octet, or alone when `bytes` is empty.
+pub fn sendData(session: *Session, stream: u31, bytes: []const u8, end_stream: bool) DataSent {
+    const slot = session.sendable(stream);
+    assert(slot.head_sent);
+    if (bytes.len == 0) assert(end_stream);
+    if (bytes.len == 0) {
+        if (session.sendRoom() < frame.Header.octets) {
+            session.wait(slot, .room, frame.Header.octets);
+            return .{ .taken = 0, .ended = false };
+        }
+        session.stageData(slot, &.{}, true);
+        return .{ .taken = 0, .ended = true };
+    }
+    assert(bytes.len <= std.math.maxInt(u32));
+    const length: u32 = @intCast(bytes.len);
+    // Every pass stages at least one octet or stops, so the octets bound it.
+    const frames_max: u32 = if (session.othersCompeting(slot)) 1 else length;
+    var taken: u32 = 0;
+    var frames: u32 = 0;
+    while (frames < frames_max) : (frames += 1) {
+        const room = session.sendRoom();
+        const window = @min(slot.send_window, session.send_window);
+        if (room <= frame.Header.octets or window <= 0) break;
+        const count: u32 = @intCast(@min(length - taken, window, session.peer_frame_size_max, room - frame.Header.octets));
+        assert(count >= 1);
+        const last = taken + count == length;
+        session.stageData(slot, bytes[taken..][0..count], last and end_stream);
+        taken += count;
+        if (last) break;
+    }
+    assert(taken <= length);
+    const sent: DataSent = .{ .taken = taken, .ended = taken == length and end_stream };
+    // An ended stream may be gone already; one with more to say waits.
+    if (sent.ended) return sent;
+    if (taken == length) {
+        session.unwait(slot);
+    } else {
+        session.wait(slot, .data, 0);
+    }
+    return sent;
 }
 
 fn outboxRoom(session: *const Session) u32 {
     assert(session.outbox_len <= session.outbox.len);
     return @intCast(session.outbox.len - session.outbox_len);
+}
+
+/// The room a send may take: all of it but `send_reserve`.
+fn sendRoom(session: *const Session) u32 {
+    const room = session.outboxRoom() -| send_reserve;
+    assert(room + send_reserve <= session.outbox.len);
+    return room;
+}
+
+/// The slot of a stream this side may still send on: open, or with only
+/// this side's half left. Anything else is the caller's error — it heard
+/// the stream end, or ended it.
+fn sendable(session: *Session, stream: u31) *StreamTable.Slot {
+    assert(stream != 0);
+    assert(session.state == .open);
+    const slot = session.streams.find(stream).?;
+    assert(slot.state == .open or slot.state == .half_closed_remote);
+    return slot;
+}
+
+/// The three-digit `:status` a response head leads with (§8.3.2), or null
+/// when it does not — a head the validator would refuse anyway, read here
+/// first to tell an interim response from the final one.
+fn responseStatus(fields: []const hpack.Field) ?u16 {
+    if (fields.len == 0) return null;
+    if (!std.mem.eql(u8, fields[0].name, ":status")) return null;
+    const value = fields[0].value;
+    if (value.len != 3) return null;
+    if (value[0] < '1' or value[0] > '5') return null;
+    const status = std.fmt.parseUnsigned(u16, value, 10) catch return null;
+    assert(status >= 100);
+    assert(status <= 599);
+    return status;
+}
+
+/// One field section, validated as §8 wants it and staged whole — or not
+/// at all, when it waits for room or can never be sent.
+fn sendFields(session: *Session, slot: *StreamTable.Slot, fields: []const hpack.Field, kind: MessageValidator.Kind, end_stream: bool) Sent {
+    assert(slot.state == .open or slot.state == .half_closed_remote);
+    assert(kind != .request);
+    if (!fieldsValid(fields, kind)) return .refused;
+    const block_max = blockBound(fields);
+    const needed = block_max + frame.Header.octets * framesFor(block_max, session.peer_frame_size_max);
+    if (needed > session.outbox.len - send_reserve) return .refused;
+    if (needed > session.sendRoom()) {
+        session.wait(slot, .room, @intCast(needed));
+        return .blocked;
+    }
+    session.unwait(slot);
+    session.stageBlock(slot.id, fields, @intCast(block_max), end_stream);
+    return .staged;
+}
+
+/// The same `.strict` rules a request is read under: these fields are an
+/// HTTP/1.1 origin's, and nothing it says reaches the client that the
+/// client's own HTTP/2 stack would call malformed.
+fn fieldsValid(fields: []const hpack.Field, kind: MessageValidator.Kind) bool {
+    assert(kind != .request);
+    assert(fields.len <= std.math.maxInt(u32));
+    var validator = MessageValidator.init(.{ .kind = kind, .rules = .strict });
+    for (fields) |*field| validator.field(field) catch return false;
+    validator.finish() catch return false;
+    return true;
+}
+
+/// An upper bound on the octets `fields` encode to, table-size updates
+/// included. Only a block known to fit is started: one cut short would
+/// leave the two HPACK tables out of step or another frame inside it.
+fn blockBound(fields: []const hpack.Field) u64 {
+    var bound: u64 = size_updates_bytes_max;
+    for (fields) |*field| bound += fieldBound(field);
+    assert(bound >= size_updates_bytes_max);
+    return bound;
+}
+
+/// RFC 7541 §6: every representation is at most an index, a name and a
+/// value, each string behind its length. Huffman coding is used only when
+/// it is shorter, so the raw lengths bound the coded ones.
+fn fieldBound(field: *const hpack.Field) u64 {
+    assert(field.name.len <= std.math.maxInt(u32));
+    assert(field.value.len <= std.math.maxInt(u32));
+    const name: u32 = @intCast(field.name.len);
+    const value: u32 = @intCast(field.value.len);
+    return @as(u64, index_bytes_max) + Integer.encodedLength(name, 7) + name +
+        Integer.encodedLength(value, 7) + value;
+}
+
+/// The frames a block of `octets` takes at `fragment_max` octets each: a
+/// HEADERS, and a CONTINUATION per further fragment (§6.10).
+fn framesFor(octets: u64, fragment_max: u32) u64 {
+    assert(fragment_max >= frame.Header.max_frame_size_min);
+    if (octets == 0) return 1;
+    const frames = std.math.divCeil(u64, octets, fragment_max) catch unreachable;
+    assert(frames * fragment_max >= octets);
+    return frames;
+}
+
+/// Encode `fields` behind the next frame header, then spread the block
+/// over as many frames as the client's frame size makes it. The room was
+/// checked against `block_max`, which the encoding cannot pass.
+fn stageBlock(session: *Session, stream: u31, fields: []const hpack.Field, block_max: u32, end_stream: bool) void {
+    const start = session.outbox_len + frame.Header.octets;
+    const target = session.outbox[start..][0..block_max];
+    var written = session.encodeResize(target);
+    const encoded = session.encoder.encode(target[written..], fields);
+    assert(encoded.fields == fields.len); // The bound held.
+    written += encoded.written;
+    assert(written <= block_max);
+    session.spreadBlock(stream, written, end_stream);
+}
+
+/// RFC 7541 §4.2: a table size the client changed since the last block is
+/// signalled at the start of this one — the lowest it went to, then where
+/// it ended. Both are clamped to the arena, so neither can be refused.
+fn encodeResize(session: *Session, target: []u8) u32 {
+    assert(target.len >= size_updates_bytes_max);
+    const low = session.encoder_resize_low orelse return 0;
+    session.encoder_resize_low = null;
+    const final = session.encoder_resize_final;
+    if (low == final and final == session.encoder.table.capacity) return 0;
+    var written = session.encoder.encodeSizeUpdate(target, low) catch unreachable;
+    if (final != low) {
+        written += session.encoder.encodeSizeUpdate(target[written..], final) catch unreachable;
+    }
+    assert(written <= size_updates_bytes_max);
+    return written;
+}
+
+/// The block sits behind one frame header; give each fragment past the
+/// first its own CONTINUATION header, moving the fragments back to front
+/// so none is overwritten before it moved. END_STREAM rides the HEADERS
+/// frame and END_HEADERS the last (§6.2, §6.10).
+fn spreadBlock(session: *Session, stream: u31, length: u32, end_stream: bool) void {
+    const fragment_max = session.peer_frame_size_max;
+    const frames: u32 = @intCast(framesFor(length, fragment_max));
+    const first = session.outbox_len;
+    var moving: u32 = frames;
+    while (moving > 1) {
+        moving -= 1;
+        const from = first + frame.Header.octets + moving * fragment_max;
+        const fragment = @min(fragment_max, length - moving * fragment_max);
+        const to = from + moving * frame.Header.octets;
+        std.mem.copyBackwards(u8, session.outbox[to..][0..fragment], session.outbox[from..][0..fragment]);
+    }
+    var index: u32 = 0;
+    while (index < frames) : (index += 1) {
+        const at = first + index * (frame.Header.octets + fragment_max);
+        var flags: u8 = 0;
+        if (index == 0 and end_stream) flags |= frame.Flag.end_stream.bit();
+        if (index + 1 == frames) flags |= frame.Flag.end_headers.bit();
+        const header: frame.Header = .{
+            .length = @intCast(@min(fragment_max, length - index * fragment_max)),
+            .frame_type = if (index == 0) .headers else .continuation,
+            .flags = flags,
+            .stream_identifier = stream,
+        };
+        _ = header.render(session.outbox[at..]) catch unreachable;
+    }
+    session.outbox_len += length + frames * frame.Header.octets;
+    assert(session.outbox_len <= session.outbox.len - send_reserve);
+}
+
+/// One DATA frame, in room already checked, paid for from both windows.
+fn stageData(session: *Session, slot: *StreamTable.Slot, bytes: []const u8, end_stream: bool) void {
+    assert(bytes.len <= session.peer_frame_size_max);
+    assert(frame.Header.octets + bytes.len <= session.sendRoom());
+    const flags: u8 = if (end_stream) frame.Flag.end_stream.bit() else 0;
+    session.stage(&.{ .data = .{ .data = bytes, .padding = null } }, slot.id, flags);
+    if (bytes.len >= 1) {
+        slot.send_window -= @intCast(bytes.len);
+        session.send_window -= @intCast(bytes.len);
+        assert(slot.send_window >= 0);
+        assert(session.send_window >= 0);
+    }
+    if (end_stream) session.endLocal(slot);
+}
+
+/// This side's END_STREAM is staged: the stream is half closed, or — the
+/// client's half already over — closed, and its slot goes back.
+fn endLocal(session: *Session, slot: *StreamTable.Slot) void {
+    assert(slot.id != 0);
+    assert(session.state == .open);
+    session.unwait(slot);
+    switch (slot.state) {
+        .open => slot.state = .half_closed_local,
+        .half_closed_remote => session.releaseStream(slot),
+        .half_closed_local, .reset_pending => unreachable, // `sendable` refused these.
+    }
+}
+
+/// The client's END_STREAM: the stream is half closed, or — this side's
+/// half already over — closed, and its slot goes back.
+fn endRemote(session: *Session, slot: *StreamTable.Slot) void {
+    assert(slot.id != 0);
+    // Only a stream whose own half is open can be waiting to send.
+    if (slot.send_wait != .none) assert(slot.state == .open);
+    switch (slot.state) {
+        .open => slot.state = .half_closed_remote,
+        .half_closed_local => session.releaseStream(slot),
+        .half_closed_remote, .reset_pending => unreachable, // Answered before here.
+    }
+}
+
+/// A send cut short: the stream waits for `.writable`, needing `room`
+/// octets of outbox for a field block or an empty END_STREAM, or open
+/// windows and room for one frame for body octets.
+fn wait(session: *Session, slot: *StreamTable.Slot, wait_for: StreamTable.Slot.SendWait, room: u32) void {
+    assert(wait_for != .none);
+    assert((wait_for == .room) == (room >= 1));
+    if (slot.send_wait == .none) session.send_waiting += 1;
+    slot.send_wait = wait_for;
+    slot.send_room_needed = room;
+    assert(session.send_waiting <= session.streams.used);
+}
+
+fn unwait(session: *Session, slot: *StreamTable.Slot) void {
+    assert(slot.id != 0);
+    if (slot.send_wait == .none) return;
+    assert(session.send_waiting >= 1);
+    session.send_waiting -= 1;
+    slot.send_wait = .none;
+    slot.send_room_needed = 0;
+}
+
+/// Whether another waiting stream wants what this send would take — the
+/// outbox and the connection's window, which every stream shares. One
+/// stalled on its own window wants neither, so it costs the others no
+/// turn: a client slow to read one stream does not throttle the rest.
+fn othersCompeting(session: *const Session, slot: *const StreamTable.Slot) bool {
+    const own: u32 = @intFromBool(slot.send_wait != .none);
+    assert(session.send_waiting >= own);
+    assert(session.send_waiting <= session.streams.used);
+    if (session.send_waiting == own) return false;
+    for (session.streams.slots) |*other| {
+        if (other.id == 0 or other == slot) continue;
+        switch (other.send_wait) {
+            .none => {},
+            .room => return true,
+            .data => if (other.send_window > 0) return true,
+        }
+    }
+    return false;
+}
+
+/// The scheduler: the next waiting stream, round-robin from the slot after
+/// the last one named, whose send can now make progress. At most one per
+/// `step`; the one named stops waiting, and offers again or not.
+fn nextWritable(session: *Session) ?u31 {
+    if (session.send_waiting == 0) return null;
+    const slots = session.streams.slots;
+    assert(session.send_cursor < slots.len);
+    for (0..slots.len) |offset| {
+        const index = (session.send_cursor + offset) % slots.len;
+        const slot = &slots[index];
+        if (slot.id == 0 or !session.canSend(slot)) continue;
+        session.send_cursor = @intCast((index + 1) % slots.len);
+        session.unwait(slot);
+        assert(slot.send_wait == .none);
+        return slot.id;
+    }
+    return null;
+}
+
+/// Whether what `slot` waits for is there: a frame's room, and for body
+/// octets an open window on both levels — the same tests the next send
+/// makes, so a stream named can go on. (A field block can wait again if
+/// the client shrank its frame size in between, which adds frames to it;
+/// it then waits afresh, and nothing spins.)
+fn canSend(session: *const Session, slot: *const StreamTable.Slot) bool {
+    assert(slot.id != 0);
+    // A stream waits only while its own half is open: ending it, or a reset,
+    // took it out of the queue.
+    if (slot.send_wait != .none) assert(slot.state == .open or slot.state == .half_closed_remote);
+    return switch (slot.send_wait) {
+        .none => false,
+        .room => session.sendRoom() >= slot.send_room_needed,
+        .data => session.sendRoom() > frame.Header.octets and
+            slot.send_window > 0 and session.send_window > 0,
+    };
 }
 
 /// Every whole frame is handled. What a full outbox held back is tried
@@ -435,6 +875,7 @@ fn inputDrained(session: *Session, consumed: u32) Step {
         assert(session.outbox_len >= 1);
         return .flush_first;
     }
+    if (session.nextWritable()) |stream| return .{ .writable = .{ .stream = stream } };
     return .need_input;
 }
 
@@ -581,7 +1022,7 @@ fn handleSettings(session: *Session, header: frame.Header, settings: frame.paylo
                 if (entry.value > frame.Header.max_frame_size_max) return session.fail(.protocol_error);
                 session.peer_frame_size_max = entry.value;
             },
-            .header_table_size => session.peer_header_table_size = entry.value,
+            .header_table_size => session.retuneEncoder(entry.value),
             .max_header_list_size => session.peer_header_list_size_max = entry.value,
             // It bounds the streams *this* side may open, and a server
             // that never pushes opens none.
@@ -608,6 +1049,18 @@ fn retunePeerWindows(session: *Session, size: u31) bool {
         if (slot.send_window > window_max) return false;
     }
     return true;
+}
+
+/// The client's decoder bound (§6.5.2). The encoder follows it down, and
+/// back up only as far as its own arena; the update goes out at the start
+/// of the next block, which is after this SETTINGS' ACK on the wire.
+fn retuneEncoder(session: *Session, value: u32) void {
+    const capacity = @min(value, header_table_size);
+    assert(capacity <= value);
+    assert(capacity <= session.encoder.table.capacityMax());
+    session.peer_header_table_size = value;
+    session.encoder_resize_low = @min(session.encoder_resize_low orelse capacity, capacity);
+    session.encoder_resize_final = capacity;
 }
 
 /// Our SETTINGS took effect at the client (§6.5.3). If they changed the
@@ -684,7 +1137,7 @@ fn handleData(session: *Session, header: frame.Header, data: frame.payload.Data)
         return;
     };
     switch (slot.state) {
-        .open => {},
+        .open, .half_closed_local => {},
         .half_closed_remote => {
             session.recv_unacked += header.length;
             return session.resetAccepted(slot, .stream_closed); // §5.1.
@@ -711,7 +1164,7 @@ fn handleData(session: *Session, header: frame.Header, data: frame.payload.Data)
 /// The request body's octets, past every window: §8.1.1's content-length
 /// rule, then the event.
 fn deliverData(session: *Session, slot: *StreamTable.Slot, bytes: []const u8, end_stream: bool) void {
-    assert(slot.state == .open);
+    assert(slot.state == .open or slot.state == .half_closed_local);
     const length: u32 = @intCast(bytes.len);
     slot.data_received += length;
     if (slot.content_length) |declared| {
@@ -728,9 +1181,10 @@ fn deliverData(session: *Session, slot: *StreamTable.Slot, bytes: []const u8, en
     }
     session.recv_delivered += length;
     slot.recv_delivered += length;
-    if (end_stream) slot.state = .half_closed_remote;
+    const stream = slot.id;
+    if (end_stream) session.endRemote(slot);
     if (length == 0 and !end_stream) return; // Nothing to hand over.
-    session.event = .{ .data = .{ .stream = slot.id, .bytes = bytes, .end_stream = end_stream } };
+    session.event = .{ .data = .{ .stream = stream, .bytes = bytes, .end_stream = end_stream } };
 }
 
 /// A complete field block: a new stream's request, an open stream's
@@ -814,7 +1268,7 @@ fn handleTrailers(session: *Session, slot: *StreamTable.Slot, block: *const fram
         .ok => |ok| ok.count,
     };
     switch (slot.state) {
-        .open => {},
+        .open, .half_closed_local => {},
         .half_closed_remote => return session.resetAccepted(slot, .stream_closed), // §5.1.
         .reset_pending => return, // Its reset is already owed.
     }
@@ -823,8 +1277,9 @@ fn handleTrailers(session: *Session, slot: *StreamTable.Slot, block: *const fram
     if (slot.content_length) |declared| {
         if (slot.data_received != declared) return session.resetAccepted(slot, .protocol_error);
     }
-    slot.state = .half_closed_remote;
-    session.event = .{ .trailers = .{ .stream = slot.id, .fields = session.fields[0..count.?] } };
+    const stream = slot.id;
+    session.endRemote(slot);
+    session.event = .{ .trailers = .{ .stream = stream, .fields = session.fields[0..count.?] } };
 }
 
 const Decoded = union(enum) {
@@ -945,6 +1400,7 @@ fn resetAccepted(session: *Session, slot: *StreamTable.Slot, code: frame.ErrorCo
 /// window has nothing left to grant.
 fn releaseStream(session: *Session, slot: *StreamTable.Slot) void {
     assert(slot.id != 0);
+    session.unwait(slot);
     assert(slot.recv_window + slot.recv_unacked + slot.recv_delivered == session.streamWindow());
     assert(session.recv_delivered >= slot.recv_delivered);
     session.recv_delivered -= slot.recv_delivered;
@@ -994,7 +1450,7 @@ fn flushPending(session: *Session) void {
 /// threshold, and whatever adds them sets `pending` itself.
 fn creditStream(session: *Session, slot: *StreamTable.Slot) void {
     const window: i64 = session.streamWindow();
-    assert(slot.state == .open);
+    assert(slot.state == .open or slot.state == .half_closed_local);
     assert(slot.recv_window + slot.recv_unacked + slot.recv_delivered == window);
     if (slot.recv_unacked == 0) return;
     if (slot.recv_unacked * 2 < window) return;
@@ -1063,14 +1519,15 @@ fn putSetting(bytes: []u8, used: u32, identifier: frame.payload.Settings.Identif
 
 /// Append one frame to the outbox. Room is a precondition: `step` holds
 /// back any frame that might need more than `reply_bytes_max`,
-/// `flushPending` keeps that reserve behind what it stages, and `init`
-/// stages only the SETTINGS the outbox was sized for.
+/// `flushPending` keeps that reserve behind what it stages, a send keeps
+/// `send_reserve` behind what it stages, and `init` stages only the
+/// SETTINGS the outbox was sized for.
 fn stage(session: *Session, payload: *const frame.Payload, stream: u31, flags: u8) void {
     assert(session.outbox_len <= session.outbox.len);
     const target = session.outbox[session.outbox_len..];
-    // Every frame staged here is a fixed-shape control frame, rendered
-    // into room checked for it — so neither of render's refusals (an
-    // unknown type, a target too short) can happen.
+    // Every frame staged here is a known type rendered into room checked
+    // for it — so neither of render's refusals (an unknown type, a target
+    // too short) can happen.
     const written = frame.payload.render(payload, stream, flags, target) catch unreachable;
     assert(written >= frame.Header.octets);
     assert(written <= target.len);
