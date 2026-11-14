@@ -84,6 +84,9 @@ const HttpClient = struct {
     /// the only way to reach the read that ends an *idle* kept-alive
     /// connection, which no `Connection: close` scenario can.
     close_after_response: bool = false,
+    /// Never read: a client whose socket fills and stays full, so what the
+    /// proxy sends it waits on room that never comes.
+    reads: bool = true,
     sent_len: u32 = 0,
     send_in_flight: bool = false,
     /// Twice the proxy's head buffer: a response that fills that buffer and
@@ -115,7 +118,7 @@ const HttpClient = struct {
 
     fn onConnect(client: *HttpClient, result: Io.ConnectError!SimIo.Socket) void {
         client.socket = result catch unreachable;
-        client.armRecv();
+        if (client.reads) client.armRecv();
         // An empty request is a client that connects and says nothing —
         // a legal shape the proxy has its own answer for (the idle
         // window, never the #235 head budget), and one the simulator's
@@ -1055,7 +1058,7 @@ test "h2c: a preface is answered in HTTP/2 — SETTINGS, its ACK, and the origin
 
     var frames: [8]H2Frame = undefined;
     const count = try h2Frames(bed.client.response(), &frames);
-    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(usize, 5), count);
     // The server's preface: its SETTINGS, which leads whatever else it says.
     try std.testing.expectEqual(@as(u8, 0x4), frames[0].frame_type);
     try std.testing.expectEqual(@as(u8, 0), frames[0].flags);
@@ -1070,6 +1073,13 @@ test "h2c: a preface is answered in HTTP/2 — SETTINGS, its ACK, and the origin
     try std.testing.expectEqual(@as(u16, 200), answers[0].status);
     try std.testing.expectEqual(@as(usize, 2), answers[0].body);
     try std.testing.expect(answers[0].ended);
+    // And once it sat idle, the end of it said: GOAWAY(NO_ERROR), naming
+    // the stream it served (RFC 9113 §6.8).
+    const goaway = frames[count - 1];
+    try std.testing.expectEqual(@as(u8, 0x7), goaway.frame_type);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, goaway.payload[0..4], .big));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, goaway.payload[4..8], .big));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
     // Nothing of HTTP/1.1 happened: no request began, no line, no verdict.
@@ -1140,6 +1150,29 @@ test "h2c: a client overrunning a budget is told ENHANCE_YOUR_CALM, counted by t
     try std.testing.expectEqual(@as(u32, 0xb), std.mem.readInt(u32, goaway.payload[4..8], .big)); // ENHANCE_YOUR_CALM.
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_calm_ping"));
     try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try bed.expectDrained();
+}
+
+test "h2c: a GOAWAY its client never reads is given one window more, then the connection is closed" {
+    // A one-octet socket the client never reads: the server's SETTINGS
+    // never get out, so neither does the idle window's GOAWAY behind them.
+    var options = h2BedOptions(9);
+    options.inbox_bytes = 1;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    bed.client.reads = false;
+    bed.client.drain_on_finish = false;
+    // Past two idle windows: the one that said GOAWAY, and the one that
+    // ended the connection for never hearing it.
+    bed.armDrainTimer(3 * Http1Bed.idle_timeout_ms);
+    try bed.exchange(h2_preface ++ h2_settings);
+
+    // Counted once, by the window that said it; torn down by the next.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    bed.sim_io.closeNow(bed.client.socket);
     try bed.expectDrained();
 }
 
@@ -1571,14 +1604,16 @@ test "h2: a pool's rung answers its stream — and the sibling holding the pool 
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get(rung.counter));
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
         try expectAnsweredAfterShed(bed.client.response(), 3, 1);
-        // What ended the connection is its idle window, after both.
+        // What ended the connection is its idle window, after both, and
+        // it said so with the one GOAWAY.
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
         try bed.expectDrained();
     }
 }
 
-/// The shed stream's head went out before the held one's, and the
-/// connection heard no GOAWAY: the shed ended nothing but its stream.
+/// The shed stream's head went out before the held one's, and the one
+/// GOAWAY the connection heard is NO_ERROR: the shed ended nothing but
+/// its stream.
 fn expectAnsweredAfterShed(response: []const u8, shed_stream: u31, held_stream: u31) !void {
     var frames: [32]H2Frame = undefined;
     const count = try h2Frames(response, &frames);
@@ -1588,12 +1623,14 @@ fn expectAnsweredAfterShed(response: []const u8, shed_stream: u31, held_stream: 
     for (frames[0..count], 0..) |frame, index| {
         if (frame.frame_type == 0x1 and frame.stream == shed_stream) shed_head = shed_head orelse index;
         if (frame.frame_type == 0x1 and frame.stream == held_stream) held_head = held_head orelse index;
-        if (frame.frame_type == 0x7) goaways += 1;
+        if (frame.frame_type != 0x7) continue;
+        goaways += 1;
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, frame.payload[4..8], .big));
     }
     try std.testing.expect(shed_head != null);
     try std.testing.expect(held_head != null);
     try std.testing.expect(shed_head.? < held_head.?);
-    try std.testing.expectEqual(@as(u32, 0), goaways);
+    try std.testing.expectEqual(@as(u32, 1), goaways);
 }
 
 test "h2: an origin's body comes back as DATA — chunking undone, a close-delimited one ended at its FIN" {

@@ -66,6 +66,10 @@ pub const Slot = struct {
     /// The session is done: once what it staged is sent — its GOAWAY, if
     /// it ended the connection — the connection is torn down.
     closing: bool,
+    /// The idle window passed with nothing open, and the session was told
+    /// to go away: counted then, so the window after it — which ends a
+    /// client that never read the GOAWAY — is not counted again.
+    idle_told: bool,
     /// The connection's own idle window (#275), apart from the deadlines
     /// of the exchanges it multiplexes: the connection's timer is aimed at
     /// whichever of them is first (`Server.storeH2IdleDeadline`).
@@ -90,6 +94,7 @@ pub const Slot = struct {
         slot.sending = 0;
         slot.receiving = false;
         slot.closing = false;
+        slot.idle_told = false;
         slot.idle_deadline_ns = 0;
         slot.driving = false;
         slot.held = null;
@@ -160,20 +165,37 @@ pub fn Driver(comptime IoType: type) type {
         /// idle window and every multiplexed exchange's deadline (#275), so
         /// what is due is found by looking: each exchange past its deadline
         /// gets §8's verdict, and the connection itself expires only once
-        /// its window is past with nothing open — or its lifetime is up,
-        /// open or not. A connection with exchanges in flight is not idle,
-        /// so its window starts over. The timer is re-armed at what is next.
+        /// its window is past with nothing open — told so with a GOAWAY,
+        /// and closed once that is out or a second window is past — or
+        /// its lifetime is up with exchanges open, which ends it at once.
+        /// A connection with exchanges in flight is not idle, so its
+        /// window starts over. The timer is re-armed at what is next.
         pub fn expire(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .h2);
             assert(!conn.armed.deadline); // Delivered; re-armed only below.
             const slot = conn.h2.?;
             const now = server.io.nowNs();
             const idle_due = now >= slot.idle_deadline_ns;
-            if (idle_due and (conn.h2_streams == null or server.lifetimeOver(conn))) {
-                server.counters.increment("deadline_expired");
-                return server.beginTeardown(conn);
+            if (idle_due) {
+                // The age cap: a hard end, open or not (§6) — a window
+                // more would be clamped to it anyway.
+                if (server.lifetimeOver(conn)) return idleEnd(server, conn, slot);
+                // Nothing open — no exchange, which is the stricter test
+                // here: a session stream no exchange took (a block still
+                // arriving) holds no work, and the GOAWAY's own window
+                // bounds a session that cannot close for it.
+                if (conn.h2_streams == null) {
+                    if (goingAway(slot)) return idleEnd(server, conn, slot);
+                    // Said with GOAWAY(NO_ERROR), as RFC 9113 §6.8 asks of
+                    // every close, closed once it is out — and given one
+                    // more window to get out in.
+                    server.counters.increment("deadline_expired");
+                    slot.idle_told = true;
+                    slot.session.goAway();
+                    assert(slot.session.self_going_away);
+                }
+                server.storeH2IdleDeadline(conn);
             }
-            if (idle_due) server.storeH2IdleDeadline(conn);
             // A pass, as far as `kick` can tell: an expiry that resets its
             // stream stages a frame, and a session stepped now could end
             // other streams, or the connection, under this scan. What the
@@ -198,6 +220,24 @@ pub fn Driver(comptime IoType: type) type {
             ServerType.refreshH2Deadline(conn);
             if (!conn.armed.deadline and !conn.armed.deadline_cancel) server.armDeadline(conn);
             kick(server, conn);
+        }
+
+        /// Whether the connection was already told it is ending — by its
+        /// idle window, a drain, or a session that closed — so a window
+        /// past that is one its client spent not reading what it was told.
+        fn goingAway(slot: *const Slot) bool {
+            if (slot.closing) return true;
+            if (slot.session.state == .closed) return true;
+            return slot.session.self_going_away;
+        }
+
+        /// The idle window's hard end: torn down, counted once — not
+        /// again for a connection whose GOAWAY already was.
+        fn idleEnd(server: *ServerType, conn: *ConnType, slot: *const Slot) void {
+            assert(conn.state == .h2);
+            assert(conn.h2.? == slot);
+            if (!slot.idle_told) server.counters.increment("deadline_expired");
+            server.beginTeardown(conn);
         }
 
         /// An exchange staged frames from outside a `drive` pass — an
