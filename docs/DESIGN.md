@@ -2912,7 +2912,12 @@ equalities a shared runner's noise cannot move.
    The load generator is zrk — a pure-Zig wrk2 rewrite: *constant-throughput*
    (open-loop) pacing with coordinated-omission-corrected HdrHistogram
    latency, so a stalling proxy accrues the stall instead of hiding it.
-   h2load returns only if/when HTTP/2 does.
+   It speaks HTTP/2 too (h2c by prior knowledge, `h2` over ALPN, and a
+   stream depth per connection), so the h2 band is zrk's and not
+   h2load's (#277): one generator, no second toolchain, and bands that
+   compare with the HTTP/1.1 ones because the pacing and the histogram
+   are the same code. Its agreement with zoxy is not conformance
+   evidence — both pin `zoxy-io/h2` — which is item 5's job.
    - **Tier 0 (micro, decision tool) —
      [poop](https://github.com/andrewrk/poop) over `bench/micro/`.**
      Standalone binaries exercising one hot function each (parser wrapper,
@@ -2927,8 +2932,9 @@ equalities a shared runner's noise cannot move.
    - **Tier 1 (merge gate, run on demand) — `bench/run.zig`, loopback.**
      (Tooling in Zig, per TIGER_STYLE — no shell harness.) nginx origin
      (or `--origin host:port`), direct baseline vs proxied path (L4 and
-     L7, keep-alive and `Connection: close`), roles pinned to disjoint
-     cores. Compare *bands* across runs, never single numbers (p50 swings
+     L7, keep-alive and `Connection: close`, and HTTP/2 through both
+     transports with `--streams` in flight per connection), roles pinned
+     to disjoint cores. Compare *bands* across runs, never single numbers (p50 swings
      3× between identical back-to-back runs) — which is why this is not a
      blind per-change CI step. A PR that regresses the band explains
      itself or does not merge. The run's *hard* invariants are machine-
@@ -2937,7 +2943,9 @@ equalities a shared runner's noise cannot move.
      the pools are lazily resident, so a saturating warmup drives RSS
      toward the bound first; the shrunken overload band still holds
      *flat* RSS, its whole budget being smaller than the tolerance), a
-     clean SIGTERM drain, and a sub-1% proxied socket-error rate.
+     clean SIGTERM drain, and a sub-1% proxied socket-error rate — the
+     h2 band held to the same, its pools sized to what it opens so the
+     ceiling stays as tight as the HTTP/1.1 bands keep it.
    - **Tier 2 (comparison, on demand) — same harness + HAProxy.** The dev
      shell provides `haproxy` as a Nix package; the script runs the
      identical scenario through it on the same pinned cores. No
