@@ -1149,6 +1149,279 @@ test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a prefa
 }
 
 // ---------------------------------------------------------------------------
+// HTTP/2 exchanges (#275): a stream's request run through §7 on a shared
+// stream slot. The client's octets are composed here — every field a
+// literal without indexing on a new name (RFC 7541 §6.2.2), the one
+// representation that needs no table — and the server's field sections
+// are read back through `ResponseReader`, which lends `h2`'s decoder.
+// ---------------------------------------------------------------------------
+
+const ResponseReader = @import("http/h2/ResponseReader.zig");
+
+/// A client's octets, frame by frame.
+const H2Wire = struct {
+    bytes: [4096]u8 = undefined,
+    len: usize = 0,
+
+    /// The client preface (RFC 9113 §3.4): the magic, then its SETTINGS.
+    fn preface(wire: *H2Wire, settings: []const [2]u32) void {
+        wire.append(h2_preface);
+        const start = wire.frameHeader(settings.len * 6, 0x4, 0, 0);
+        for (settings, 0..) |setting, index| {
+            std.mem.writeInt(u16, wire.bytes[start + index * 6 ..][0..2], @intCast(setting[0]), .big);
+            std.mem.writeInt(u32, wire.bytes[start + index * 6 + 2 ..][0..4], setting[1], .big);
+        }
+        wire.len = start + settings.len * 6;
+    }
+
+    fn headers(wire: *H2Wire, id: u31, fields: []const [2][]const u8, end_stream: bool) void {
+        const start = wire.frameHeader(0, 0x1, 0x4 | @as(u8, if (end_stream) 0x1 else 0), id);
+        wire.len = start;
+        for (fields) |field| {
+            wire.append("\x00");
+            wire.literal(field[0]);
+            wire.literal(field[1]);
+        }
+        std.mem.writeInt(u24, wire.bytes[start - 9 ..][0..3], @intCast(wire.len - start), .big);
+    }
+
+    /// A bodiless request for `path`, from the static `GET http://a`.
+    fn get(wire: *H2Wire, id: u31, method: []const u8, path: []const u8) void {
+        wire.headers(id, &.{ .{ ":method", method }, .{ ":scheme", "http" }, .{ ":path", path }, .{ ":authority", "a" } }, true);
+    }
+
+    fn data(wire: *H2Wire, id: u31, bytes: []const u8, end_stream: bool) void {
+        const start = wire.frameHeader(bytes.len, 0x0, if (end_stream) 0x1 else 0, id);
+        wire.len = start;
+        wire.append(bytes);
+    }
+
+    fn windowUpdate(wire: *H2Wire, id: u31, increment: u31) void {
+        const start = wire.frameHeader(4, 0x8, 0, id);
+        std.mem.writeInt(u32, wire.bytes[start..][0..4], increment, .big);
+        wire.len = start + 4;
+    }
+
+    fn written(wire: *const H2Wire) []const u8 {
+        return wire.bytes[0..wire.len];
+    }
+
+    fn frameHeader(wire: *H2Wire, length: usize, frame_type: u8, flags: u8, id: u31) usize {
+        const header = wire.bytes[wire.len..][0..9];
+        std.mem.writeInt(u24, header[0..3], @intCast(length), .big);
+        header[3] = frame_type;
+        header[4] = flags;
+        std.mem.writeInt(u32, header[5..9], id, .big);
+        return wire.len + 9;
+    }
+
+    fn literal(wire: *H2Wire, bytes: []const u8) void {
+        assert(bytes.len < 127); // A one-octet length (RFC 7541 §5.1).
+        wire.bytes[wire.len] = @intCast(bytes.len);
+        wire.len += 1;
+        wire.append(bytes);
+    }
+
+    fn append(wire: *H2Wire, bytes: []const u8) void {
+        @memcpy(wire.bytes[wire.len..][0..bytes.len], bytes);
+        wire.len += bytes.len;
+    }
+};
+
+/// What one stream got back: its final status, a `location` if it carried
+/// one, its body's length, whether it ended, and how it was reset if it was.
+const H2Answer = struct {
+    stream: u31,
+    status: u16 = 0,
+    content_length: ?u64 = null,
+    location: [32]u8 = undefined,
+    location_len: usize = 0,
+    body: usize = 0,
+    ended: bool = false,
+    reset: ?u32 = null,
+
+    fn locationSlice(answer: *const H2Answer) []const u8 {
+        return answer.location[0..answer.location_len];
+    }
+};
+
+/// Every stream's answer in `bytes`, field sections decoded in the order
+/// they went out — the decoder's table carries from one to the next.
+fn h2Answers(bytes: []const u8, out: []H2Answer) ![]H2Answer {
+    var frames: [32]H2Frame = undefined;
+    const count = try h2Frames(bytes, &frames);
+    var reader: ResponseReader = undefined;
+    reader.init();
+    var answers: usize = 0;
+    for (frames[0..count]) |one| {
+        if (one.stream == 0) continue;
+        const answer = for (out[0..answers]) |*known| {
+            if (known.stream == one.stream) break known;
+        } else blk: {
+            out[answers] = .{ .stream = one.stream };
+            answers += 1;
+            break :blk &out[answers - 1];
+        };
+        switch (one.frame_type) {
+            0x1 => {
+                try std.testing.expect(one.flags & 0x4 != 0); // Whole, one frame.
+                const fields = try reader.decode(one.payload);
+                answer.status = try std.fmt.parseUnsigned(u16, ResponseReader.value(fields, ":status").?, 10);
+                if (ResponseReader.value(fields, "content-length")) |length| {
+                    answer.content_length = try std.fmt.parseUnsigned(u64, length, 10);
+                }
+                if (ResponseReader.value(fields, "location")) |location| {
+                    @memcpy(answer.location[0..location.len], location);
+                    answer.location_len = location.len;
+                }
+            },
+            0x0 => answer.body += one.payload.len,
+            0x3 => answer.reset = std.mem.readInt(u32, one.payload[0..4], .big),
+            else => {},
+        }
+        if (one.frame_type <= 0x1 and one.flags & 0x1 != 0) answer.ended = true;
+    }
+    return out[0..answers];
+}
+
+fn h2AnswerFor(answers: []const H2Answer, stream: u31) !*const H2Answer {
+    for (answers) |*answer| {
+        if (answer.stream == stream) return answer;
+    }
+    return error.NoSuchStream;
+}
+
+test "h2: §7 answers each stream itself — no route, a filter, a redirect, a malformed path, a HEAD" {
+    const rules = [_]filter.Rule{
+        .{ .match = .{ .path_prefix = "/deny" }, .actions = &.{.{ .reject = 403 }} },
+        .{
+            .match = .{ .path_prefix = "/old" },
+            .actions = &.{.{ .redirect = .{ .status = 301, .target = .{ .location = "https://a/new" } } }},
+        },
+    };
+    var options = h2BedOptions(21);
+    options.request_filters = &rules;
+    options.route_prefix = "/api";
+    options.error_pages = &.{&TestNotFound.page};
+    options.access_log = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    // Six streams in one write, each answered on its own: what §7 decides
+    // for one says nothing about the next.
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/nowhere");
+    wire.get(3, "GET", "/deny");
+    wire.get(5, "GET", "/old");
+    wire.get(7, "GET", "nopath"); // Not origin-form: the downgrade refuses it.
+    wire.get(9, "HEAD", "/nowhere");
+    wire.get(11, "GET", "/api/x"); // Routed: no upstream half yet.
+    try bed.exchange(wire.written());
+
+    var storage: [8]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 6), answers.len);
+    const no_route = try h2AnswerFor(answers, 1);
+    try std.testing.expectEqual(@as(u16, 404), no_route.status);
+    try std.testing.expectEqual(@as(usize, test_page_body.len), no_route.body);
+    try std.testing.expect(no_route.ended);
+    try std.testing.expectEqual(@as(u16, 403), (try h2AnswerFor(answers, 3)).status);
+    const moved = try h2AnswerFor(answers, 5);
+    try std.testing.expectEqual(@as(u16, 301), moved.status);
+    try std.testing.expectEqualStrings("https://a/new", moved.locationSlice());
+    try std.testing.expectEqual(@as(u16, 400), (try h2AnswerFor(answers, 7)).status);
+    // A HEAD's answer: the page's head, its length, and no body.
+    const head = try h2AnswerFor(answers, 9);
+    try std.testing.expectEqual(@as(u16, 404), head.status);
+    try std.testing.expectEqual(@as(?u64, test_page_body.len), head.content_length);
+    try std.testing.expectEqual(@as(usize, 0), head.body);
+    try std.testing.expect(head.ended);
+    // Every answer ended its stream, and none needed a reset — each
+    // request had ended its own half — but the routed one, refused.
+    for (answers) |*answer| {
+        if (answer.stream == 11) continue;
+        try std.testing.expect(answer.ended);
+        try std.testing.expectEqual(@as(?u32, null), answer.reset);
+    }
+    try std.testing.expectEqual(@as(?u32, 0x7), (try h2AnswerFor(answers, 11)).reset);
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_no_route"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_filtered"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_redirected"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_request"));
+    // A line per stream, each its own exchange's.
+    try std.testing.expectEqual(@as(u64, 6), bed.server.counters.get("access_log_lines"));
+    const line = try accessLogLineFor(&bed, "\"path\":\"/deny\"");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"status\":403") != null);
+    try bed.expectDrained();
+}
+
+test "h2: an answer the window holds back goes on at WINDOW_UPDATE, and a body still arriving is dropped" {
+    var options = h2BedOptions(23);
+    options.route_prefix = "/api";
+    options.error_pages = &.{&TestNotFound.page};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    // A window of nothing: the 404's head goes out, its body waits. The
+    // request's body arrives meanwhile, for an exchange that will never
+    // read it, and is consumed so the client's window does not starve.
+    var wire: H2Wire = .{};
+    wire.preface(&.{.{ 0x4, 0 }}); // SETTINGS_INITIAL_WINDOW_SIZE.
+    wire.headers(1, &.{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/nowhere" }, .{ ":authority", "a" } }, false);
+    wire.data(1, "abc", false);
+    wire.windowUpdate(1, 64);
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    const answer = answers[0];
+    try std.testing.expectEqual(@as(u16, 404), answer.status);
+    try std.testing.expectEqual(@as(usize, test_page_body.len), answer.body);
+    try std.testing.expect(answer.ended);
+    // Answered while the client was still sending: told to stop (§8.1).
+    try std.testing.expectEqual(@as(?u32, 0x0), answer.reset);
+    try bed.expectDrained();
+}
+
+test "h2: with the shared stream pool empty, a request is refused and the connection serves on" {
+    var options = h2BedOptions(25);
+    options.route_prefix = "/api";
+    options.error_pages = &.{&TestNotFound.page};
+    options.stream_slots = 1;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    // The first connection's answer waits on a window that never opens, so
+    // its stream holds the one shared slot; the second connection's request
+    // finds none.
+    var first: H2Wire = .{};
+    first.preface(&.{.{ 0x4, 0 }});
+    first.get(1, "GET", "/nowhere");
+    var second: H2Wire = .{};
+    second.preface(&.{});
+    second.get(1, "GET", "/nowhere");
+    bed.client.drain_on_finish = false;
+    bed.client.next = null;
+    bed.client2.request = second.written();
+    bed.client2.send_delay_ms = 20;
+    bed.client2.startAt(&bed.sim_io, &bed.server, bed.listeners[0].bind_address);
+    try bed.exchange(first.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client2.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(?u32, 0x7), answers[0].reset); // REFUSED_STREAM.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_shed_streams"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("h2_connections"));
+    try bed.expectDrained();
+}
+
+// ---------------------------------------------------------------------------
 // HTTP/2 over TLS (#275): `h2` selected in ALPN, the same driver behind the
 // engine. The listener offers `h2` straight from the bed — no config can
 // name it while every stream is refused.
@@ -1213,6 +1486,37 @@ fn expectH2OverTls(seed: u64, partial_io: bool) !void {
 test "h2: `h2` in ALPN is answered in HTTP/2 over TLS — SETTINGS, its ACK, a refused stream, a drain's GOAWAY" {
     try expectH2OverTls(58, false);
     try expectH2OverTls(59, true);
+}
+
+test "h2: over TLS, §7's answer comes back sealed on the stream that asked" {
+    var options = h2TlsBedOptions(65);
+    options.route_prefix = "/api";
+    options.error_pages = &.{&TestNotFound.page};
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = h2_preface ++ h2_settings ++ h2_get,
+        .alpn = h2_offer,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    bed.armDrainTimer(50);
+    try bed.sim_io.run();
+
+    // The request's head lives in a stream head, not the engine's buffer:
+    // the engine decrypts frames, and the downgrade writes the head.
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(client.app_received[0..client.app_received_len], &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 404), answers[0].status);
+    try std.testing.expectEqual(@as(usize, test_page_body.len), answers[0].body);
+    try std.testing.expect(answers[0].ended);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_no_route"));
+    try bed.expectDrained();
 }
 
 test "h2: a client choosing HTTP/1.1, or naming nothing, on an h2 listener is served HTTP/1.1" {

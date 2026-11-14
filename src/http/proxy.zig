@@ -52,6 +52,8 @@ const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
 const render = @import("render.zig");
 const h2_connection = @import("h2/Connection.zig");
+const h2_exchange = @import("h2/exchange.zig");
+const downgrade = @import("h2/downgrade.zig");
 const router = @import("router.zig");
 const filter = @import("filter.zig");
 const shed = @import("../shed.zig");
@@ -153,6 +155,7 @@ pub const RenderScratch = struct {
 pub fn Proxy(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
     const H2Driver = h2_connection.Driver(IoType);
+    const H2Exchange = h2_exchange.Exchange(IoType);
     const ConnType = conn_module.Conn(IoType);
     const StreamType = ConnType.StreamType;
     const UpstreamType = @import("../net/upstream.zig").UpstreamPool(IoType).Upstream;
@@ -410,6 +413,10 @@ pub fn Proxy(comptime IoType: type) type {
         /// here means every read of head content states its precondition.
         fn headBytes(server: *ServerType, stream: *StreamType) []u8 {
             const conn = stream.conn;
+            // A multiplexed exchange's head is the stream head its request
+            // was written out into (#275), whatever its connection's socket
+            // carries — TLS included: the engine decrypts frames, not heads.
+            if (stream.h2_id != 0) return stream.h2_head.?.data;
             // A terminated connection accumulates its head in the engine's
             // own plaintext buffer, not the ring (§4). It has to: a ring
             // buffer binds only on a `recvGroup` delivery, and a request
@@ -964,6 +971,12 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.phase == .reading_head);
             assert(stream.l7.request_deadline_ns == 0);
             if (server.config.request_timeout_ms == 0) return;
+            // The connection's one timer serves its own exchange's cap. A
+            // multiplexed exchange is answered by §7 in the frame that asked
+            // (#275) — what can outlast that is an answer the client will
+            // not take, which the connection's idle window bounds — so it
+            // has no cap to arm until its upstream half can wait on one.
+            if (stream.h2_id != 0) return;
             const now_ns = server.io.nowNs();
             stream.l7.request_deadline_ns = now_ns +
                 @as(u64, server.config.request_timeout_ms) * std.time.ns_per_ms;
@@ -1135,6 +1148,10 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, stream, 404, "l7_no_route");
             };
 
+            // A multiplexed exchange has no upstream half yet (#275): one
+            // that would need an origin is refused before anything is
+            // acquired for it, which the client may retry (RFC 9113 §8.7).
+            if (stream.h2_id != 0) return H2Exchange.abandon(server, stream, .refused_stream);
             stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, stream, 503, "l7_shed_relay_buffers");
             };
@@ -2391,6 +2408,14 @@ pub fn Proxy(comptime IoType: type) type {
             stream: *const StreamType,
             may_keep: bool,
         ) StaticPersistence {
+            // A multiplexed exchange's answer ends its stream, never its
+            // connection (#275): HTTP/2 has no persistence to announce, and
+            // the mapping drops the `Connection` line either variant would
+            // carry — so this picks only which rendering is mapped, and
+            // keeps the rule that a kept answer is one whose head parsed.
+            if (stream.h2_id != 0) {
+                return .{ .keep = stream.l7.request_head_len >= 1, .capped = false };
+            }
             const would_keep = may_keep and
                 staticResponseResyncable(stream) and
                 stream.l7.client_keep_alive and
@@ -3044,6 +3069,12 @@ pub fn Proxy(comptime IoType: type) type {
             // and a previous write either drained or ended in teardown.
             assert(stream.client_write.pending.len == 0);
             stream.client_write = .{ .pending = bytes, .then = then };
+            // A multiplexed exchange's client is its session (#275): the
+            // answer is handed over as frames rather than sent — and may be
+            // taken whole, in which case the stream is finished and back in
+            // its pool before this returns. A caller reads nothing of
+            // `stream` after arming a write, on either path.
+            if (stream.h2_id != 0) return H2Exchange.answer(server, stream);
             resumeClientWrite(server, stream);
         }
 
@@ -3115,7 +3146,9 @@ pub fn Proxy(comptime IoType: type) type {
                 // invariant itself.
                 .redirect_next_request, .redirect_lingering_close => {
                     assert(stream.phase == .responding);
-                    if (conn.tls == null) {
+                    // A multiplexed exchange's is its stream head (#275).
+                    if (stream.h2_id != 0) assert(stream.h2_head != null);
+                    if (conn.tls == null and stream.h2_id == 0) {
                         assert(stream.head_buffer_id != StreamType.head_buffer_none);
                     }
                 },
@@ -4025,7 +4058,7 @@ pub fn Proxy(comptime IoType: type) type {
             // `head_len` deliberately survives the return: it is a count,
             // not buffer content, and the §7 resync rule still reads it to
             // decide keep-or-close; `beginNextRequest` zeroes it.
-            if (stream.head_buffer_id != StreamType.head_buffer_none) {
+            if (ServerType.holdsHeadBuffer(stream)) {
                 server.returnHeadBuffer(stream);
             }
             if (stream.relay_buffer) |buffer| {
@@ -4067,6 +4100,72 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.relay_buffer != buffer); // Not yet swapped in: no live tunnel here.
             server.releaseTunnelBuffer(buffer);
             conn.tunnel_buffer = null;
+        }
+
+        // -- a multiplexed exchange's entries (#275) --
+        //
+        // An HTTP/2 stream's request arrives whole, as a field section the
+        // downgrade writes out into the stream's head buffer; these are the
+        // points it joins and leaves the §7 path at. Everything between is
+        // the path a head read off a socket takes.
+
+        /// The downgraded head parsed: the request is read, so §7 runs.
+        pub fn serveH2Request(
+            server: *ServerType,
+            stream: *StreamType,
+            request: *const parser.RequestHead,
+        ) void {
+            assert(request.head_len >= 1);
+            assert(request.head_len <= stream.h2_head.?.data.len);
+            beginH2Request(server, stream, request.head_len);
+            routeRequest(server, stream, request);
+        }
+
+        /// The request could not be written out as an HTTP/1.1 head, or
+        /// read back as one: answered as the head that failed the same way
+        /// on a socket would be.
+        /// The answer may finish the stream before this returns, so
+        /// nothing here reads the stream after it is answered.
+        pub fn refuseH2Request(server: *ServerType, stream: *StreamType, err: downgrade.Error) void {
+            assert(stream.h2_id != 0);
+            assert(stream.l7.request_head_len == 0); // Nothing parsed.
+            beginH2Request(server, stream, 0);
+            switch (err) {
+                error.Malformed => respond(server, stream, 400, "l7_bad_request"),
+                error.UriTooLong => respond(server, stream, 414, "l7_uri_too_long"),
+                error.HeadTooLarge => respond(server, stream, 431, "l7_headers_too_large"),
+            }
+        }
+
+        /// What a head's arrival does on a socket, for a head that arrived
+        /// in one frame: the request's clock starts, and it is being read.
+        fn beginH2Request(server: *ServerType, stream: *StreamType, head_len: u32) void {
+            assert(stream.h2_id != 0);
+            assert(stream.phase == .none);
+            stream.moveTo(.reading_head);
+            stream.head_len = head_len;
+            server.beginRequest(stream);
+            assert(stream.log.started_ns != 0);
+        }
+
+        /// The answer is staged whole: the static pair's endings, said for
+        /// a stream — logged, its head buffer back if a redirect rendered
+        /// into it, and the stream finished. There is no connection to
+        /// keep or close: the next request is the client's next stream.
+        pub fn h2AnswerDelivered(server: *ServerType, stream: *StreamType) void {
+            assert(stream.h2_id != 0);
+            assert(stream.client_write.pending.len == 0);
+            const then = stream.client_write.then;
+            assertWriteContinuation(stream, then);
+            switch (then) {
+                .lingering_close, .next_request => {},
+                .redirect_lingering_close, .redirect_next_request => server.returnHeadBuffer(stream),
+                // Only a static answer reaches a multiplexed exchange yet.
+                .response_excess, .response_body, .interim_sent, .tunnel_start => unreachable,
+            }
+            server.releaseStaticSend(stream);
+            server.logExchange(stream);
+            H2Exchange.finish(server, stream);
         }
 
         /// Answer a comptime static error response, then keep the

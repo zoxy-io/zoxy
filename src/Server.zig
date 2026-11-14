@@ -38,6 +38,7 @@ const TlsEngine = @import("tls/Engine.zig");
 const H2Session = @import("http/h2/Session.zig");
 const H2Connection = @import("http/h2/Connection.zig");
 const H2Slot = H2Connection.Slot;
+const H2Exchange = @import("http/h2/exchange.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -109,6 +110,11 @@ pub fn Server(comptime IoType: type) type {
         /// upstream heads are: the acquire is synchronous, at the stream's
         /// first frame, not at a kernel-chosen recv.
         stream_head_buffers: Pool(upstream_module.HeadBuffer),
+        /// Where a multiplexed exchange's rendered response head is mapped
+        /// to the field section HTTP/2 sends (#275): one per process, lent
+        /// for one mapping at a time — the session copies the section out
+        /// before the mapping returns. Empty where no HTTP/2 is spoken.
+        h2_scratch: H2Exchange.Scratch,
         /// Live L4 relayed connections per endpoint (§7), the other half
         /// of `upstream_module.Load`. The pool cannot hold this: an L4
         /// connection leases no upstream slot, so it is the server —
@@ -725,6 +731,82 @@ pub fn Server(comptime IoType: type) type {
             assert(server.h2_sessions.slots.len == options.h2_connections);
         }
 
+        /// A shared stream and a stream head for HTTP/2 stream `id` on
+        /// `conn` (#275), bound to it and linked into the connection's list —
+        /// or null when either pool is empty, the caller's to refuse. The
+        /// pair is all-or-nothing: an exchange cannot begin without the
+        /// buffer its request is written into.
+        pub fn acquireSharedStream(server: *Self, conn: *ConnType, id: u31) ?*StreamType {
+            assert(conn.state == .h2);
+            assert(id != 0);
+            const stream = server.shared_streams.acquire() orelse return null;
+            const head = server.stream_head_buffers.acquire() orelse {
+                server.shared_streams.release(stream);
+                return null;
+            };
+            stream.prepare(conn);
+            stream.h2_id = id;
+            stream.h2_head = head;
+            stream.h2_next = conn.h2_streams;
+            conn.h2_streams = stream;
+            // The listener's starting cluster, as admission gives its own
+            // stream (§7); routing overwrites it once the head parses.
+            stream.cluster_index = conn.stream.cluster_index;
+            server.resetLogHeaders(stream);
+            assert(stream.conn.stream != stream);
+            return stream;
+        }
+
+        /// Give a shared stream back (#275): its line written if it owes
+        /// one — an exchange that ended unanswered says so, as teardown
+        /// does for a connection's own — what it holds released, and its
+        /// place in the connection's list given up. Nothing on it is armed:
+        /// its client half is the session's, and no upstream runs on one.
+        pub fn releaseSharedStream(server: *Self, stream: *StreamType) void {
+            const conn = stream.conn;
+            const streams_max = conn.h2.?.session.config.concurrent_streams_max;
+            assert(stream.h2_id != 0);
+            assert(stream.armedCount() == 0);
+            assert(stream.relay_buffer == null);
+            assert(stream.upstream == null);
+            // No tunnel is ever claimed for one: HTTP/2 refuses `upgrade` as
+            // connection-specific (RFC 9113 §8.2.2) before §7 could read it.
+            assert(conn.tunnel_buffer == null);
+            server.logExchange(stream);
+            server.releaseStaticSend(stream);
+            if (stream.h2_head != null) server.returnHeadBuffer(stream);
+            var link: *?*StreamType = &conn.h2_streams;
+            var visited: u32 = 0;
+            while (link.*) |current| : (link = &current.h2_next) {
+                assert(visited < streams_max);
+                visited += 1;
+                if (current != stream) continue;
+                link.* = stream.h2_next;
+                stream.h2_next = null;
+                stream.h2_id = 0;
+                server.shared_streams.release(stream);
+                return;
+            }
+            unreachable; // A shared stream is on its connection's list.
+        }
+
+        /// Every exchange an HTTP/2 connection is multiplexing, ended with
+        /// it: the connection is torn down, so none of them can answer.
+        fn releaseSharedStreams(server: *Self, conn: *ConnType) void {
+            // Only a connection that spoke HTTP/2 multiplexed anything.
+            const slot = conn.h2 orelse {
+                assert(conn.h2_streams == null);
+                return;
+            };
+            const streams_max = slot.session.config.concurrent_streams_max;
+            var released: u32 = 0;
+            while (conn.h2_streams) |stream| : (released += 1) {
+                assert(released < streams_max);
+                server.releaseSharedStream(stream);
+            }
+            assert(conn.h2_streams == null);
+        }
+
         /// A session for a connection about to speak HTTP/2, or null when
         /// the pool is empty — the caller's to shed or to fall back from.
         pub fn acquireH2Session(server: *Self) ?*H2Slot {
@@ -782,8 +864,13 @@ pub fn Server(comptime IoType: type) type {
             const health_probes = server.config.healthProbes();
             const probe_scratch_bytes: u64 =
                 @as(u64, health_probes) * options.head_buffer_bytes;
+            server.h2_scratch = if (options.h2_connections >= 1)
+                try H2Exchange.Scratch.init(arena, options.head_buffer_bytes)
+            else
+                .empty;
             assert(server.target_scratch.len + server.rewrite_scratch.len +
-                probe_scratch_bytes == headScratchBytes(options.*, health_probes));
+                probe_scratch_bytes + h2ScratchBytes(options) ==
+                headScratchBytes(options.*, health_probes));
             try server.initLogHeaders(arena, options);
         }
 
@@ -2462,6 +2549,13 @@ pub fn Server(comptime IoType: type) type {
         }
 
         pub fn returnHeadBuffer(server: *Self, stream: *StreamType) void {
+            // A multiplexed exchange's head is a stream head (#275), from a
+            // pool of its own: neither the ring nor an engine.
+            if (stream.h2_id != 0) {
+                server.stream_head_buffers.release(stream.h2_head.?);
+                stream.h2_head = null;
+                return;
+            }
             // A terminated connection's head lives in its engine, not the
             // ring (§4): it never bound a buffer, so there is none to give
             // back and no in-use count to decrement. Every site that
@@ -2477,6 +2571,13 @@ pub fn Server(comptime IoType: type) type {
             stream.head_buffer_id = StreamType.head_buffer_none;
             server.head_buffers_in_use -= 1;
             server.updateHeadPressure();
+        }
+
+        /// Whether the exchange holds a head buffer of any kind — the ring's
+        /// or, on a multiplexed exchange, a stream head (#275).
+        pub fn holdsHeadBuffer(stream: *const StreamType) bool {
+            if (stream.h2_id != 0) return stream.h2_head != null;
+            return stream.head_buffer_id != StreamType.head_buffer_none;
         }
 
         /// The shared lingering-close discard target (§7) — see the field.
@@ -2495,7 +2596,16 @@ pub fn Server(comptime IoType: type) type {
             assert(health_probes >= 1);
             assert(health_probes <= constants.health_probe_concurrency_max);
             const serving: u64 = if (options.head_buffers >= 1) 2 else 0;
-            return (serving + health_probes) * options.head_buffer_bytes;
+            return (serving + health_probes) * options.head_buffer_bytes + h2ScratchBytes(&options);
+        }
+
+        /// The HTTP/2 mapping scratch's share of the head-sized side
+        /// buffers (#275): nothing where no HTTP/2 is spoken.
+        fn h2ScratchBytes(options: *const InitOptions) u64 {
+            if (options.h2_connections == 0) return 0;
+            const bytes = H2Exchange.Scratch.bytesFor(options.head_buffer_bytes);
+            assert(bytes > options.head_buffer_bytes);
+            return bytes;
         }
 
         /// Named headers one connection can be holding values for (#140):
@@ -3709,6 +3819,9 @@ pub fn Server(comptime IoType: type) type {
                 conn.tls = null;
                 conn.tls_pending_len = 0;
             }
+            // The exchanges it multiplexed end with it (#275), before the
+            // session whose streams they were.
+            server.releaseSharedStreams(conn);
             if (conn.h2) |slot| {
                 server.releaseH2Session(slot);
                 conn.h2 = null;
