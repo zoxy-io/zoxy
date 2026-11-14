@@ -19,6 +19,9 @@ const render = @import("http/render.zig");
 const shed = @import("shed.zig");
 const io_module = @import("io/io.zig");
 const json_schema = @import("json_schema.zig");
+/// The ALPN vocabulary (#271). Public so the schema emitter states the
+/// same closed set the loader enforces.
+pub const alpn = @import("tls/alpn.zig");
 
 const assert = std.debug.assert;
 const repeat = @import("testing/bytes.zig").repeat;
@@ -520,6 +523,14 @@ pub const Config = struct {
             /// PEM private key for the leaf. ECDSA P-256 or P-384; any
             /// other key type is refused at load (`tls/Credentials.zig`).
             key_path: []const u8,
+            /// What this listener offers in ALPN (#271), most preferred
+            /// first: canonical `tls/alpn.zig` tokens, never the config's
+            /// own spellings. `["http/1.1"]` on an `http` listener whose
+            /// block named none, and empty on an `l4` one, which speaks no
+            /// protocol it could name. No default: a listener built in
+            /// code has to say which, rather than inherit a silence the
+            /// loader never produces.
+            alpn: []const []const u8,
         };
     };
 
@@ -802,6 +813,10 @@ pub const ValidationError = error{
     LimitRelayBufferOverTlsRecord,
     ListenerTlsCertPathEmpty,
     ListenerTlsKeyPathEmpty,
+    ListenerTlsAlpnEmpty,
+    ListenerTlsAlpnUnknown,
+    ListenerTlsAlpnDuplicate,
+    ListenerTlsAlpnOnL4,
     ClusterProxyProtocolSendUnknown,
     ClusterProxyProtocolOnHttpListener,
     ClusterProxyProtocolOnTlsListener,
@@ -2310,6 +2325,7 @@ pub const L4RouteJson = struct {
 pub const TlsJson = struct {
     cert: []const u8,
     key: []const u8,
+    alpn: ?[]const []const u8 = null,
 
     pub const schema_doc =
         "TLS termination for this listener: where its certificate chain and " ++
@@ -2326,6 +2342,16 @@ pub const TlsJson = struct {
         .key = .{
             .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384).",
             .min_length = 1,
+        },
+        .alpn = .{
+            .desc = "Application protocols to offer in ALPN (RFC 7301), most " ++
+                "preferred first. Absent offers `http/1.1` on an `http` listener; " ++
+                "refused on an `l4` listener, which names no protocol. A client " ++
+                "that offers ALPN and names none of these is refused with " ++
+                "`no_application_protocol`.",
+            .min_items = 1,
+            .max_items = alpn.protocols_max,
+            .items = SchemaItems.alpn_protocol,
         },
     };
 };
@@ -3405,8 +3431,9 @@ pub const ClustersJson = struct {
 /// HTTP method tokens", which `config_schema.zig` emits as a token
 /// enum. #180's upgrade set used to be the second member; it is a flag
 /// object now (#305), so the schema states its vocabulary as fields and
-/// needs no item marker.
-pub const SchemaItems = enum { http_method };
+/// needs no item marker. `alpn_protocol` is #271's closed ALPN vocabulary,
+/// emitted as its wire tokens rather than its Zig names.
+pub const SchemaItems = enum { http_method, alpn_protocol };
 
 /// The attribute keys a `schema_fields` entry may carry beyond `.desc`.
 /// `assert_meta_matches` rejects any other key at comptime, so a typo'd
@@ -4059,12 +4086,13 @@ fn resolveListener(
     assert(clusters.len >= 1);
     assert(head_buffer_bytes >= 1);
     const bind_address = try resolveBindAddress(arena, listener_json.bind);
-    const tls = try resolveTls(listener_json.tls);
+    const protocol = try protocolOf(listener_json);
+    const tls = try resolveTls(arena, listener_json.tls, protocol);
     // The tag dispatches, and every field it does not carry is one this
     // arm cannot be handed (#305): the seven "this key is meaningless on
     // that protocol" errors this replaced were the loader restating a
     // shape it now simply has.
-    var listener: Config.Listener = switch (try protocolOf(listener_json)) {
+    var listener: Config.Listener = switch (protocol) {
         .http => try resolveHttpListener(
             arena,
             bind_address,
@@ -5366,12 +5394,60 @@ fn resolveProxyProtocol(
 /// all: an empty string would otherwise reach `openat` as a request to
 /// open the current directory, which fails somewhere far less obvious.
 /// Shared by both protocols rather than living in either body: both
-/// speak over a terminated session (§4, §7).
-fn resolveTls(tls_json: ?TlsJson) ValidationError!?Config.Listener.Tls {
+/// speak over a terminated session (§4, §7). The one key that differs
+/// between them is `alpn`, so the protocol rides along for it.
+fn resolveTls(
+    arena: std.mem.Allocator,
+    tls_json: ?TlsJson,
+    protocol: Config.Listener.Protocol,
+) ParseError!?Config.Listener.Tls {
     const tls = tls_json orelse return null;
     if (tls.cert.len == 0) return error.ListenerTlsCertPathEmpty;
     if (tls.key.len == 0) return error.ListenerTlsKeyPathEmpty;
-    return .{ .cert_path = tls.cert, .key_path = tls.key };
+    return .{
+        .cert_path = tls.cert,
+        .key_path = tls.key,
+        .alpn = try resolveAlpn(arena, tls.alpn, protocol),
+    };
+}
+
+/// A terminating listener's ALPN offer (#271), as canonical tokens.
+///
+/// Closed, on #180's upgrade-allowlist precedent: a token is a promise the
+/// serving path keeps, so a name this proxy does not speak — `h2` until
+/// #275, or a spelling RFC 7301 §3.1's octet comparison would not match —
+/// is refused rather than offered to a client that would then speak it at
+/// a parser that cannot. An empty list is refused too: a listener that
+/// speaks HTTP/1.1 offering nothing is the gap this closes, and an `l4`
+/// listener, which speaks no protocol it could name, is refused the key
+/// outright and offers nothing whatever it says.
+fn resolveAlpn(
+    arena: std.mem.Allocator,
+    alpn_json: ?[]const []const u8,
+    protocol: Config.Listener.Protocol,
+) ParseError![]const []const u8 {
+    const asked = alpn_json orelse return switch (protocol) {
+        .http => alpn.http_default,
+        .l4 => &.{},
+    };
+    if (protocol == .l4) return error.ListenerTlsAlpnOnL4;
+    if (asked.len == 0) return error.ListenerTlsAlpnEmpty;
+    // Bounded by the input, and every pass either rejects or marks one
+    // vocabulary entry seen — so past `protocols_max` passes the next one
+    // must be a duplicate or an unknown, and the list is refused there.
+    var seen: [alpn.protocols_max]bool = @splat(false);
+    for (asked) |token| {
+        const named = alpn.Protocol.fromToken(token) orelse return error.ListenerTlsAlpnUnknown;
+        if (seen[@backingInt(named)]) return error.ListenerTlsAlpnDuplicate;
+        seen[@backingInt(named)] = true;
+    }
+    assert(asked.len >= 1);
+    assert(asked.len <= alpn.protocols_max);
+    const tokens = try arena.alloc([]const u8, asked.len);
+    for (asked, tokens) |token, *canonical| {
+        canonical.* = alpn.Protocol.fromToken(token).?.token();
+    }
+    return tokens;
 }
 
 /// A cluster's resolved pick: the policy, and — for `hash` — the key it
@@ -7581,6 +7657,8 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerL4RequestKeyedHash", .gap = .cross_block },
     .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerModeWithoutUnixBind", .gap = .cross_block },
+    .{ .name = "ListenerTlsAlpnDuplicate", .gap = .duplicate },
+    .{ .name = "ListenerTlsAlpnOnL4", .gap = .cross_block },
     .{ .name = "ListenerTlsWithSniRoutes", .gap = .cross_block },
     .{ .name = "ListenerUnixBindClientMatch", .gap = .cross_block },
     .{ .name = "ListenerUnixBindClusterSend", .gap = .cross_block },
@@ -9503,6 +9581,64 @@ test "config: a terminating listener cannot reach a PROXY-sending cluster" {
         );
         try std.testing.expect(parsed.clusters[0].proxy_protocol_send != null);
     }
+}
+
+test "config: tls.alpn offers what the listener speaks, and only that (#271)" {
+    const tail = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}";
+    const http = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}";
+    const l4 = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}";
+    const tls_head = ",\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"";
+
+    // Absent on an `http` listener: HTTP/1.1, said rather than left for a
+    // client to infer from silence — the gap #271 closes by default.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, http ++ tls_head ++ "}" ++ tail);
+        const offer = parsed.listeners[0].tls.?.alpn;
+        try std.testing.expectEqual(@as(usize, 1), offer.len);
+        try std.testing.expectEqualStrings("http/1.1", offer[0]);
+    }
+    // Absent on an `l4` listener: nothing, because a relay names no
+    // protocol it could promise.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, l4 ++ tls_head ++ "}" ++ tail);
+        try std.testing.expectEqual(@as(usize, 0), parsed.listeners[0].tls.?.alpn.len);
+    }
+    // Spelled out, it resolves to the canonical token — the static one,
+    // not the config's own copy.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(
+            &arena_state,
+            http ++ tls_head ++ ",\"alpn\":[\"http/1.1\"]}" ++ tail,
+        );
+        const offer = parsed.listeners[0].tls.?.alpn;
+        try std.testing.expectEqual(@as(usize, 1), offer.len);
+        try std.testing.expectEqual(alpn.Protocol.http_1_1.token().ptr, offer[0].ptr);
+    }
+    // A name this proxy does not speak. `h2` is the one that matters: it
+    // joins with #275, and until then a client handed it would speak h2 at
+    // an HTTP/1.1 parser. RFC 7301 §3.1 compares octets, so case counts.
+    try expectParseError(error.ListenerTlsAlpnUnknown, http ++ tls_head ++ ",\"alpn\":[\"h2\"]}" ++ tail);
+    try expectParseError(error.ListenerTlsAlpnUnknown, http ++ tls_head ++ ",\"alpn\":[\"HTTP/1.1\"]}" ++ tail);
+    // Offering nothing is the silence this closes, not a spelling of it.
+    try expectParseError(error.ListenerTlsAlpnEmpty, http ++ tls_head ++ ",\"alpn\":[]}" ++ tail);
+    // A name twice is a preference order that says nothing.
+    try expectParseError(
+        error.ListenerTlsAlpnDuplicate,
+        http ++ tls_head ++ ",\"alpn\":[\"http/1.1\",\"http/1.1\"]}" ++ tail,
+    );
+    // And on an `l4` listener the key is refused outright, whatever it
+    // names: the relay would be promising a protocol it never parses.
+    try expectParseError(
+        error.ListenerTlsAlpnOnL4,
+        l4 ++ tls_head ++ ",\"alpn\":[\"http/1.1\"]}" ++ tail,
+    );
 }
 
 test "config: tls_engines follows the tls listeners, and refuses a mismatch" {

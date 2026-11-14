@@ -220,6 +220,12 @@ pub fn TestClient(comptime IoType: type) type {
             /// that issued it instead of running a full handshake. The
             /// storage is the caller's and must outlive the client.
             resume_with: ?*const SessionTicket = null,
+            /// ALPN protocols to offer, most preferred first (#271), or
+            /// empty to offer none. Raw strings rather than zoxy's own
+            /// vocabulary on purpose: a client may name anything, and the
+            /// interesting cases are the names the server does not speak.
+            /// The storage is the caller's and must outlive the client.
+            alpn: []const []const u8 = &.{},
             /// Seeds for the two keyshares and the client random.
             x25519_seed: [32]u8 = @splat(0x61),
             p256_seed: [32]u8 = @splat(0x62),
@@ -251,6 +257,7 @@ pub fn TestClient(comptime IoType: type) type {
                     ticket.resumption()
                 else
                     null,
+                .alpn_protocols = options.alpn,
                 .reassembly = &client.reassembly,
             });
             client.records = .init(&client.storage);
@@ -698,6 +705,23 @@ pub fn TestClient(comptime IoType: type) type {
         /// there — what a scenario asks before deciding it may wind down.
         pub fn isEnded(client: *const Self) bool {
             return client.ended;
+        }
+
+        /// The protocol the server selected from `Options.alpn`, or null if
+        /// it selected none — which is also the answer for a server that
+        /// offers no ALPN at all, the `l4` listener's case.
+        pub fn alpnSelected(client: *const Self) ?[]const u8 {
+            return client.hs.alpnSelected();
+        }
+
+        /// Whether the server turned this handshake away with RFC 7301's
+        /// `no_application_protocol` — read off the alert itself, since a
+        /// refusal and a reset end the socket the same way and only the
+        /// alert byte says which one this was.
+        pub fn refusedForAlpn(client: *const Self) bool {
+            const description = client.hs.peer_alert_description orelse return false;
+            assert(!client.handshake_done);
+            return description == @backingInt(zssl.alert.Description.no_application_protocol);
         }
 
         /// The ticket this session was issued, for a later client to offer

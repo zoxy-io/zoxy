@@ -367,6 +367,7 @@ fn writeItems(out: *Stringify, comptime Child: type, comptime meta: anytype) Wri
             if (comptime @hasField(@TypeOf(meta), "items")) {
                 switch (meta.items) {
                     .http_method => try writeMethodEnum(out),
+                    .alpn_protocol => try writeAlpnEnum(out),
                 }
             } else {
                 try out.objectField("type");
@@ -500,6 +501,18 @@ fn writeMethodEnum(out: *Stringify) Writer.Error!void {
     }
     try out.endArray();
     comptime assert(emitted); // at least one real method token exists
+}
+
+/// The #271 ALPN vocabulary as an `"enum"` array of its wire tokens — the
+/// same closed set the loader accepts, read off `tls/alpn.zig` so the
+/// document and the loader cannot disagree about which names are legal.
+fn writeAlpnEnum(out: *Stringify) Writer.Error!void {
+    const protocols = std.enums.values(config.alpn.Protocol);
+    comptime assert(protocols.len >= 1);
+    try out.objectField("enum");
+    try out.beginArray();
+    for (protocols) |protocol| try out.write(protocol.token());
+    try out.endArray();
 }
 
 /// The clusters map: a name-keyed object whose values are cluster schemas.

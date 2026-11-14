@@ -73,6 +73,28 @@ const tls_token_bytes: u8 = 24;
 /// state re-entered on a terminated connection, which is where the head
 /// source's first defect lived (#204).
 const tls_http_followup = l7.scripts.get_request_close;
+
+/// What one terminating client offers in ALPN (#271). The server's side
+/// is fixed by the listener — HTTP/1.1 on an `http` terminator, nothing on
+/// an `l4` one — so the draw is on the client's, which is where every
+/// verdict RFC 7301 §3.2 can reach comes from: a match, no offer at all,
+/// a match that is not the client's first choice, and an offer the
+/// listener cannot meet.
+const TlsAlpnOffer = enum {
+    none,
+    http_1_1,
+    h2_then_http_1_1,
+    h2_only,
+
+    fn protocols(offer: TlsAlpnOffer) []const []const u8 {
+        return switch (offer) {
+            .none => &.{},
+            .http_1_1 => &.{"http/1.1"},
+            .h2_then_http_1_1 => &.{ "h2", "http/1.1" },
+            .h2_only => &.{"h2"},
+        };
+    }
+};
 /// "203.0.113.255:65535" is 19 bytes; the slack is headroom, not hope.
 const announced_bytes_max: u8 = 32;
 /// Virtual time from scenario start after which stuck work is force-ended.
@@ -181,6 +203,10 @@ tls_tokens: [tls_client_slots][tls_token_bytes]u8,
 /// POST-then-GET pair, which exercised the response render's happy path
 /// and nothing else.
 tls_scripts: [tls_client_slots]l7.Script,
+/// Each slot's ALPN offer (#271), drawn beside its script and read by the
+/// same two places: `startTlsClient` to make the offer, and
+/// `verifyTlsSessions` to hold the outcome to what the listener implies.
+tls_alpn_offers: [tls_client_slots]TlsAlpnOffer,
 tls_credentials: [3]?zoxy.tls.Credentials,
 /// The #142 gate drawn for the l4 listener; `populateClients` reads it
 /// to decide whether its clients open with headers.
@@ -818,6 +844,10 @@ fn deriveTerminatingDraws(harness: *Harness, random: std.Random) void {
     }
     harness.clock_jump_wanted = deriveClockJump(harness.tls_clients, random);
     harness.drop_mode = deriveDropMode(harness.clean, random);
+    // Last, so the draws above keep the values each seed always gave them.
+    for (&harness.tls_alpn_offers) |*offer| {
+        offer.* = random.enumValue(TlsAlpnOffer);
+    }
     assert(harness.listeners_count <= harness.listener_configs.len);
     assert(harness.tls_clients >= 1 or !harness.clock_jump_wanted);
 }
@@ -1496,7 +1526,14 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
             // this states is only that the listener terminates — which is
             // what `Server.start` checks its credentials table against.
             .tls = if (harness.tls_clients >= 1)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+                .{
+                    .cert_path = "cert.pem",
+                    .key_path = "key.pem",
+                    .alpn = switch (harness.tls_protocol) {
+                        .http => zoxy.config.alpn.http_default,
+                        .l4 => &.{},
+                    },
+                }
             else
                 null,
         },
@@ -1884,6 +1921,7 @@ fn startTlsClient(
     client.start(&harness.io, Harness.tlsBindAddress(), .{
         .host_name = zoxy.tls.testdata.host_name,
         .resume_with = resume_with,
+        .alpn = harness.tls_alpn_offers[index].protocols(),
         // An echo token for a relayed session, a real request for a
         // proxied one — the terminated stream has to be what the
         // listener behind it expects, or the head parser answers 400
@@ -2544,8 +2582,10 @@ fn verifyTlsSessions(harness: *Harness) !void {
     if (harness.tls_clients == 0) return;
     assert(harness.tls_clients_live <= harness.tls_clients_storage.len);
     var closed_count: u8 = 0;
+    var refusals: TlsAlpnRefusals = .{};
     for (harness.tls_clients_storage[0..harness.tls_clients_live], 0..) |*client, index| {
         const back = client.app_received[0..client.app_received_len];
+        if (try harness.verifyTlsAlpn(client, index, back, &refusals)) continue;
         if (harness.tls_protocol == .http) {
             // What this slot drew, and the same pairing rule
             // `startTlsClient` sent it under: a `routed_canonical` script
@@ -2604,6 +2644,64 @@ fn verifyTlsSessions(harness: *Harness) !void {
     if (harness.server.counters.get("tls_handshakes_completed") < closed_count) {
         return error.TlsHandshakesDiverged;
     }
+    // The counter between what clients heard and what could have been
+    // said. Not an equality, because the adversary can end a refused
+    // client's socket before the alert lands, and it can end one before
+    // its hello reached the server at all.
+    const refused = harness.server.counters.get("tls_alpn_refused");
+    if (refused < refusals.heard) return error.TlsAlpnRefusalsDiverged;
+    if (refused > refusals.possible) return error.TlsAlpnRefusalsDiverged;
+}
+
+const TlsAlpnRefusals = struct {
+    /// Clients whose offer this listener could not meet.
+    possible: u8 = 0,
+    /// Those whose `no_application_protocol` alert actually arrived.
+    heard: u8 = 0,
+};
+
+/// #271's verdict for one terminating client, answering whether that
+/// client was one the listener refuses — in which case it is fully judged
+/// here and the caller skips it, since a refused session has no exchange
+/// for the walk below to read.
+fn verifyTlsAlpn(
+    harness: *const Harness,
+    client: *const TlsClient,
+    index: usize,
+    back: []const u8,
+    refusals: *TlsAlpnRefusals,
+) !bool {
+    assert(index < harness.tls_alpn_offers.len);
+    const offer = harness.tls_alpn_offers[index];
+    const refusable = harness.tls_protocol == .http and offer == .h2_only;
+    if (refusable) {
+        refusals.possible += 1;
+        if (client.refusedForAlpn()) refusals.heard += 1;
+        // Refused in the handshake, so nothing may have been served: a
+        // byte back, or a session up, would mean the client was handed
+        // the HTTP/1.1 it never asked for — the gap #271 closes.
+        if (back.len != 0) return error.TlsAlpnRefusalServed;
+        if (client.handshake_done) return error.TlsAlpnRefusalServed;
+        return true;
+    }
+    // Every other offer is one the listener can meet, so a refusal here
+    // would be the server turning away a client it speaks for.
+    if (client.refusedForAlpn()) return error.TlsAlpnRefusedWrongly;
+    if (client.handshake_done) {
+        // And what it met it with is the listener's to decide: HTTP/1.1
+        // on an `http` terminator to any client that offered it, and
+        // nothing from an `l4` one, which names no protocol.
+        const expected: ?[]const u8 = switch (harness.tls_protocol) {
+            .http => if (offer == .none) null else "http/1.1",
+            .l4 => null,
+        };
+        const selected = client.alpnSelected();
+        if ((expected == null) != (selected == null)) return error.TlsAlpnSelectionDiverged;
+        if (expected) |name| {
+            if (!std.mem.eql(u8, name, selected.?)) return error.TlsAlpnSelectionDiverged;
+        }
+    }
+    return false;
 }
 
 /// #178, every seed: the sticky verdicts move only when the cookie

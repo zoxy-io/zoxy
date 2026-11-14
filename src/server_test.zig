@@ -429,7 +429,7 @@ pub const TestBed = struct {
             // states is only that the listener terminates — which is what
             // `Server.start` checks its credentials against.
             .tls = if (options.tls)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+                .{ .cert_path = "cert.pem", .key_path = "key.pem", .alpn = &.{} }
             else
                 null,
         }};
@@ -1966,14 +1966,14 @@ test "tls: the engine pool hands out what the config provisioned, and no more" {
     defer bed.tearDown();
 
     const credentials = &bed.tls_credentials[0].?;
-    const first = try bed.server.acquireTlsEngine(credentials);
-    const second = try bed.server.acquireTlsEngine(credentials);
+    const first = try bed.server.acquireTlsEngine(credentials, &.{});
+    const second = try bed.server.acquireTlsEngine(credentials, &.{});
     try std.testing.expect(first != second);
     // Exhausted at exactly the provisioned count: the wall a shed rung
     // will report is this null, not a larger pool than the banner priced.
     try std.testing.expectError(
         error.EnginesExhausted,
-        bed.server.acquireTlsEngine(credentials),
+        bed.server.acquireTlsEngine(credentials, &.{}),
     );
 
     // Each slot's plaintext destination is bound and sized by the engine's
@@ -1988,7 +1988,7 @@ test "tls: the engine pool hands out what the config provisioned, and no more" {
     try std.testing.expect(first.plaintext.ptr != second.plaintext.ptr);
 
     bed.server.releaseTlsEngine(first);
-    const reused = try bed.server.acquireTlsEngine(credentials);
+    const reused = try bed.server.acquireTlsEngine(credentials, &.{});
     try std.testing.expectEqual(first, reused);
     bed.server.releaseTlsEngine(reused);
     bed.server.releaseTlsEngine(second);
@@ -2011,7 +2011,7 @@ test "tls: two engines from one seed produce one handshake, replayed" {
         });
         defer bed.tearDown();
 
-        const engine = try bed.server.acquireTlsEngine(&bed.tls_credentials[0].?);
+        const engine = try bed.server.acquireTlsEngine(&bed.tls_credentials[0].?, &.{});
         // The ServerHello random is the engine's seeded input made
         // visible: it goes on the wire verbatim, so comparing it compares
         // what the peer would see.
@@ -2108,6 +2108,40 @@ test "tls: an operator's head size widens the plaintext buffer, and is priced" {
         wide_head + TlsEngine.plaintext_bytes_min,
         TlsEngine.plaintextBytesFor(wide_head),
     );
+}
+
+test "tls: an L4 listener offers no ALPN, so an h2-only client is relayed, not refused (#271)" {
+    // The other half of #271's rule. An `l4` listener names no protocol —
+    // it relays bytes it never parses — so it offers nothing, and RFC 7301
+    // §3.2 then has nothing to refuse: a client whose offer names only
+    // `h2` gets an ordinary session and no selection. Refusing it here
+    // would be the relay claiming to know what flows through it.
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 43 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+        .tls = true,
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = echo_token,
+        .close_after_echo = true,
+        .alpn = &.{"h2"},
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed, .expected = 1 };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(?[]const u8, null), client.alpnSelected());
+    try std.testing.expect(!client.refusedForAlpn());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_alpn_refused"));
+    try std.testing.expectEqualStrings(echo_token, client.app_received[0..client.app_received_len]);
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
 }
 
 test "tls: an L4 listener terminates, and relays the plaintext both ways" {

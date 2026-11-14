@@ -538,8 +538,25 @@ pub const Counters = struct {
     /// One counter for every cause on purpose. The distinctions matter to
     /// whoever is debugging a client, and to nobody operating the proxy;
     /// worse, publishing which step a handshake died at is a probing
-    /// oracle, so the peer learns nothing and neither does this.
+    /// oracle, so the peer learns nothing and neither does this. The one
+    /// handshake that ends without a session and is *not* counted here is
+    /// an ALPN refusal, which is not a failure — see `tls_alpn_refused`.
     tls_handshake_failed: Value = Value.init(0),
+    /// Handshakes refused because the client offered ALPN and named no
+    /// protocol this listener speaks (#271), each answered with RFC 7301's
+    /// `no_application_protocol` before the teardown.
+    ///
+    /// Apart from `tls_handshake_failed`, and disjoint from it, because the
+    /// reason to count these is the opposite of the reason to lump those:
+    /// nothing went wrong, the client asked for something the listener
+    /// does not offer, and only an operator can change that. A rising count
+    /// is clients wanting a protocol — `h2`, most likely — that the
+    /// listener's `tls.alpn` does not name. The peer was already told
+    /// exactly this by the alert, so the split publishes nothing the wire
+    /// did not. And the three never overlap: no handshake is counted as
+    /// more than one of completed, failed and refused — including one whose
+    /// client resets while the refusal is still going out.
+    tls_alpn_refused: Value = Value.init(0),
     /// Established sessions torn down by a TLS-layer failure while
     /// relaying: a record that would not decrypt, or an engine outbox
     /// with no room for what the next step would stage. Distinct from

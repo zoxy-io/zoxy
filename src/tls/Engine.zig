@@ -34,6 +34,7 @@ const zssl = @import("zssl");
 
 const Credentials = @import("Credentials.zig");
 const Tickets = @import("Tickets.zig");
+const alpn = @import("alpn.zig");
 
 const assert = std.debug.assert;
 
@@ -121,6 +122,12 @@ close_staged: bool,
 /// to ask afterwards whether that was a fragment or the end of the
 /// stream, and those two answers could not differ more (§6 half-close).
 peer_closed: bool,
+/// Whether this handshake was refused with an answer owed — RFC 7301's
+/// `no_application_protocol`, the one alert this proxy sends a peer it
+/// turns away (#271). The transport flushes the outbox and then tears
+/// down rather than reading again, so it asks this after the drain, the
+/// same way it asks `close_staged`.
+refused: bool,
 
 /// What a drive step hands back *synchronously*: plaintext the caller
 /// consumes before returning, and the peer's orderly close. Ciphertext
@@ -275,6 +282,10 @@ pub const Config = struct {
     /// it is the stamp a sealed ticket carries and the clock an offered
     /// one is aged against.
     now_unix: u64 = 0,
+    /// The listener's ALPN offer (#271), most preferred first: canonical
+    /// `tls/alpn.zig` tokens, or empty to negotiate none. Borrowed like
+    /// `credentials` — the listener's for the process.
+    alpn_protocols: []const []const u8 = &.{},
 };
 
 /// What one slot's plaintext buffer must be, given the head size the
@@ -325,6 +336,8 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     assert(engine.body_plaintext.len >= plaintext_bytes_min);
     engine.tickets = config.tickets;
     engine.now_unix = config.now_unix;
+    assert(config.alpn_protocols.len <= alpn.protocols_max);
+    for (config.alpn_protocols) |token| assert(alpn.Protocol.fromToken(token) != null);
     // The seed *is* the private scalar: x25519 clamps internally, so
     // there is no keypair to generate and no failure to shed. That
     // retires #222's livelock at the source — the fallible P-256 keygen
@@ -347,6 +360,7 @@ pub fn init(engine: *Engine, config: *const Config) !void {
         // taking them is an entropy-draw change and a decision of its
         // own, not a consequence of a dependency bump (§4).
         .groups = &groups_offered,
+        .alpn_protocols = config.alpn_protocols,
         .reassembly = &engine.reassembly,
         .flight = &engine.flight,
         // Offered only when this deployment can actually open one. A
@@ -363,6 +377,7 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     engine.outbox_sent = 0;
     engine.close_staged = false;
     engine.peer_closed = false;
+    engine.refused = false;
     assert(!engine.isConnected());
 }
 
@@ -612,6 +627,54 @@ pub fn sendClose(engine: *Engine) !void {
     assert(wire.len > 0);
     engine.stage(wire);
     engine.close_staged = true;
+}
+
+/// The application protocol this session negotiated, or null when none
+/// was: the client offered no ALPN, or the listener advertises none (an
+/// `l4` one). Valid from the moment the ClientHello is answered.
+pub fn alpnSelected(engine: *const Engine) ?alpn.Protocol {
+    const token = engine.hs.alpnSelected() orelse return null;
+    assert(token.len >= 1);
+    // Only canonical tokens are ever configured, so a selection — which
+    // zssl takes from that list and nowhere else — is always one of them.
+    const protocol = alpn.Protocol.fromToken(token);
+    assert(protocol != null);
+    return protocol;
+}
+
+/// Stage RFC 7301 §3.2's `no_application_protocol`: the client offered
+/// ALPN and named nothing this listener speaks, and §3.2 makes the alert
+/// a MUST. The transport flushes it and tears down.
+///
+/// Takes no description, deliberately. Every other handshake failure is a
+/// bare teardown — telling a peer which step it failed is telling an
+/// attacker — and this one is different only because the RFC requires an
+/// answer whose content the client already knows: it asked for a protocol
+/// and did not get it. One alert is the whole vocabulary.
+pub fn refuseApplicationProtocol(engine: *Engine) void {
+    assert(!engine.refused);
+    assert(!engine.isConnected());
+    assert(engine.outboundRoom() >= control_record_bytes_max);
+    const wire = engine.hs.sendAlert(.no_application_protocol, &engine.out);
+    assert(wire.len >= 1);
+    engine.stage(wire);
+    engine.refused = true;
+}
+
+/// True once `refuseApplicationProtocol` has staged the refusal.
+pub fn isRefused(engine: *const Engine) bool {
+    return engine.refused;
+}
+
+comptime {
+    // The refusal is one alert record: it has to fit both the buffer zssl
+    // renders it into and the staging room the caller is promised.
+    assert(zssl.ServerHandshake.alert_bytes_min <= zssl.ServerHandshake.out_bytes_min);
+    assert(zssl.ServerHandshake.alert_bytes_min <= control_record_bytes_max);
+    // And the vocabulary has to fit what zssl's server will accept as an
+    // offer, or a valid config would trip `ServerHandshake.init`'s assert.
+    assert(alpn.protocols_max <= zssl.client_messages.alpn_protocols_max);
+    assert(alpn.protocol_bytes_max <= zssl.client_messages.alpn_protocol_bytes_max);
 }
 
 /// True once `sendClose` has staged this session's close_notify: the

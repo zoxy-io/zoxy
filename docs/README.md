@@ -295,6 +295,22 @@ where an RSA signature's millisecond would stall every other connection
 sharing it; an ECDSA signature costs about 260 µs. An RSA key is refused at
 startup.
 
+`alpn` lists the application protocols the listener offers in ALPN
+(RFC 7301), most preferred first. Today the only one is `http/1.1`, and an
+`http` listener offers it whether or not the block says so:
+
+```json
+"tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key", "alpn": ["http/1.1"] }
+```
+
+A client that offers ALPN without naming anything the listener speaks, such
+as a gRPC client offering only `h2`, is refused in the handshake with the
+`no_application_protocol` alert and counted in `zoxy_tls_alpn_refused`. It
+is not handed an HTTP/1.1 session it would then speak HTTP/2 into. A
+client that offers no ALPN is unaffected. Names outside the list, an empty
+list and a repeated name are all refused at load. An `l4` listener relays
+bytes it never parses, so it offers nothing and refuses the key.
+
 A cluster with `proxy_protocol.send` cannot be reached from a terminating
 listener. That header is staged in the relay buffer, which a terminated
 connection's wire bytes do not pass through, so the combination is
