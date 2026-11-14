@@ -1259,7 +1259,7 @@ const H2Session = @import("http/h2/Session.zig");
 
 /// A client's octets, frame by frame.
 const H2Wire = struct {
-    bytes: [4096]u8 = undefined,
+    bytes: [16 * 1024]u8 = undefined,
     len: usize = 0,
 
     /// The client preface (RFC 9113 §3.4): the magic, then its SETTINGS.
@@ -1299,6 +1299,12 @@ const H2Wire = struct {
         const start = wire.frameHeader(4, 0x3, 0, id);
         std.mem.writeInt(u32, wire.bytes[start..][0..4], code, .big);
         wire.len = start + 4;
+    }
+
+    /// The client's acknowledgement of this side's SETTINGS (§6.5.3):
+    /// from here on, its streams have the window the server advertised.
+    fn settingsAck(wire: *H2Wire) void {
+        wire.len = wire.frameHeader(0, 0x4, 0x1, 0);
     }
 
     fn ping(wire: *H2Wire, opaque_data: u64) void {
@@ -1830,6 +1836,51 @@ test "h2: a body past the buffer before the client heard the window is held, and
     // declared length as sent, and an undeclared one chunked, whose framing
     // is what must never run past the buffer.
     for ([_]bool{ true, false }, 0..) |declared, index| try expectHeldBody(42 + index, declared);
+}
+
+test "h2: past the client's ACK, a frame many times a small buffer's room is held, and arrives whole (#277)" {
+    // The window is never below one frame (`requestWindow`), so a client
+    // that heard it may send, into the smallest relay buffer, a frame
+    // fifteen times its room: held, and drained in pieces — each its own
+    // chunk when the length was not declared.
+    for ([_]bool{ true, false }, 0..) |declared, index| try expectHeldFrame(44 + index, declared);
+}
+
+fn expectHeldFrame(seed: u64, declared: bool) !void {
+    var options = h2BedOptions(seed);
+    options.relay_buffer_bytes = constants.relay_buffer_bytes_min;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    // Inside the origin's request buffer, head and framing included.
+    var payload: [15_000]u8 = undefined;
+    for (&payload, 0..) |*octet, index| octet.* = 'a' + @as(u8, @intCast(index % 26));
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.settingsAck();
+    const pseudo = .{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/upload" }, .{ ":authority", "a" } };
+    if (declared) {
+        wire.headers(1, &(pseudo ++ .{.{ "content-length", "15000" }}), false);
+    } else {
+        wire.headers(1, &pseudo, false);
+    }
+    wire.data(1, &payload, true);
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqual(@as(?u32, null), answers[0].reset);
+    var body = originBody(&bed);
+    if (!declared) {
+        var scanner: parser.ChunkedScanner = .{};
+        const dechunked = try scanner.dechunk(body);
+        try std.testing.expect(dechunked.done);
+        body = body[0..dechunked.payload_len];
+    }
+    try std.testing.expectEqualStrings(&payload, body);
+    try bed.expectDrained();
 }
 
 fn expectHeldBody(seed: u64, declared: bool) !void {

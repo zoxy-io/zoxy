@@ -115,10 +115,18 @@ pub const body_framing_bytes: u32 = 2 * render.chunk_prefix_bytes_max +
 /// a stream more than its buffer can take — capped at the protocol's
 /// default, which a client may spend before it hears ours (RFC 9113
 /// §6.9.2), and is held to then (`Driver.offerHeld`).
+///
+/// Never less than one frame of the size every endpoint must take (§4.2,
+/// #277): a window under it leaves a client no way to send one, and a
+/// client that sends one anyway — h2spec's 4.2/1 — overruns it. Past the
+/// buffer's room the frame is held, which waits this connection's other
+/// streams behind it until it drains: 58 octets at the default buffer,
+/// and the price of configuring one smaller than a frame.
 pub fn requestWindow(relay_buffer_bytes: u32) u31 {
     assert(relay_buffer_bytes > body_framing_bytes);
-    const window = @min(relay_buffer_bytes - body_framing_bytes, Session.window_default);
-    assert(window >= 1);
+    const room = relay_buffer_bytes - body_framing_bytes;
+    const window = @min(@max(room, Session.frame_payload_bytes_max), Session.window_default);
+    assert(window >= Session.frame_payload_bytes_max);
     return @intCast(window);
 }
 
@@ -127,6 +135,8 @@ comptime {
     assert(chunk_tail_bytes >= render.chunk_suffix.len + render.last_chunk.len);
     // Any legal relay buffer leaves a window.
     assert(constants.relay_buffer_bytes_min > body_framing_bytes);
+    // One frame fits under the protocol's default window, which caps it.
+    assert(Session.frame_payload_bytes_max <= Session.window_default);
 }
 
 pub fn Exchange(comptime IoType: type) type {
