@@ -2075,21 +2075,52 @@ newest work, keeps serving admitted work, and never allocates, blocks, or
 dies.** Every ladder rung is a static decision at a single choke point on
 the loop thread.
 
-| resource exhausted | detected at | shed action |
-|---|---|---|
-| connection slots | accept completion | close immediately (SO_LINGER 0 → RST); accept stays armed |
-| relay buffers (L4) | accept admission | close immediately |
-| head buffers | a client's first byte, before the parse | static `503`, then **always close** — the refused bytes are still unread in the socket, and a kept connection would shed them forever |
-| relay buffers (L7) | request admission on a kept-alive conn | static `503` from static memory, then keep or close per pressure |
-| upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) |
-| upstream head buffers | beside the slot, as it is obtained | static `503`, then keep or close per pressure |
-| **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) |
-| tunnels | the upgrade request, **before** it is forwarded | static `503`, then keep or close per pressure |
-| request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
-| head-read budget | timer completion | `408` for a client that began a head and stopped; **silence earns none** — a connection that said nothing was never under the budget |
-| kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
-| HTTP/2 shared streams / stream heads | a stream's request, before §7 | `REFUSED_STREAM` on that stream, which the client may retry; the connection serves on |
-| **an HTTP/2 client's budgets** — Rapid Reset, PING, SETTINGS, WINDOW_UPDATE, ignored frames (PRIORITY, unknown types), empty DATA, CONTINUATION, field block | the frame that overruns one | `GOAWAY(ENHANCE_YOUR_CALM)`, then close; a counter per budget |
+| resource exhausted | detected at | shed action | on HTTP/2 |
+|---|---|---|---|
+| connection slots | accept completion | close immediately (SO_LINGER 0 → RST); accept stays armed | **connection** — before any protocol is spoken |
+| relay buffers (L4) | accept admission | close immediately | — |
+| head buffers | a client's first byte, before the parse | static `503`, then **always close** — the refused bytes are still unread in the socket, and a kept connection would shed them forever | **connection**, and only h2c's: its preface is a first byte like any other |
+| relay buffers (L7) | request admission on a kept-alive conn | static `503` from static memory, then keep or close per pressure | **stream** — `503` on it |
+| upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) | **stream** — `503` on it |
+| upstream head buffers | beside the slot, as it is obtained | static `503`, then keep or close per pressure | **stream** — `503` on it |
+| **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) | **stream** — `503` on it |
+| tunnels | the upgrade request, **before** it is forwarded | static `503`, then keep or close per pressure | — no upgrade reaches HTTP/2 |
+| request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body | **stream** — `504`, or its reset |
+| head-read budget | timer completion | `408` for a client that began a head and stopped; **silence earns none** — a connection that said nothing was never under the budget | **connection**, while h2c's preface is read; after it, the idle window |
+| kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter | the op's owner: an origin leg's is its **stream**'s, the client socket's the **connection**'s |
+| HTTP/2 sessions | the h2c preface, or TLS admission | h2c: close; TLS: offer `http/1.1` alone, or shed at accept when `h2` is all the listener offers | **connection** |
+| HTTP/2 shared streams / stream heads | a stream's request, before §7 | `REFUSED_STREAM` on that stream, which the client may retry | **stream** |
+| **an HTTP/2 client's budgets** — Rapid Reset, PING, SETTINGS, WINDOW_UPDATE, ignored frames (PRIORITY, unknown types), empty DATA, CONTINUATION, field block | the frame that overruns one | `GOAWAY(ENHANCE_YOUR_CALM)`, then close; a counter per budget | **connection** |
+
+The last column is the multiplexed connection's question (#276): does
+the rung answer the *stream*, or the *connection*? Closing a connection
+on HTTP/2 takes its sibling streams with it — work already admitted —
+so a rung that can answer the stream does, and the rule that decides
+which can is #162's: *the shed's keep-or-close is decided by where the
+acquire sits*. Every pool an exchange draws on after its stream opened
+— a relay buffer, an upstream slot and its head, an endpoint's
+in-flight count, a shared stream — is acquired on the stream, so its
+rung answers the stream, and `src/http_proxy_test.zig` sheds each with
+a sibling holding the pool and answered after it. What sits on the
+connection answers it: the slot it was accepted into, the session it
+speaks in, the budgets it spends from, and the client socket's own
+failures. A static answer on HTTP/2 never chooses between keeping and
+closing, because it has no persistence to announce: it ends its
+stream, and the connection's end is its idle window's, a drain's, or
+the client's.
+
+The head-buffer rung's **always close** is HTTP/1.1's reasoning, and
+it does not carry over — it does not need to. Its justification is the
+refused bytes still unread in the socket; on HTTP/2 a stream's head is
+a frame the session has already read, and the buffer it is written
+into is the stream head paired with its shared stream, so running out
+of either is the one `REFUSED_STREAM` and nothing is stranded. The rung
+itself reaches HTTP/2 only as h2c's preface, read into a head buffer
+like any first byte, before the connection is known to speak it — so
+what it gets is HTTP/1.1's `503`, which an HTTP/2 client cannot read,
+and then the close that is the answer it can. Over TLS the
+handshake chose `h2` before any request byte, and the session reads
+from the engine, so no head buffer is ever asked for.
 
 Most rungs shed on a *resource of this proxy's* running out. That was
 once every rung, and it was a real gap — measured, not theorised: at

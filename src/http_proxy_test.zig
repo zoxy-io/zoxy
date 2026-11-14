@@ -1519,6 +1519,83 @@ test "h2: with the shared stream pool empty, a request is refused and the connec
     try bed.expectDrained();
 }
 
+test "h2: a pool's rung answers its stream — and the sibling holding the pool is answered after it (#276)" {
+    // On HTTP/1.1 these rungs answer 503 and keep or close per pressure;
+    // on a multiplexed connection closing would take the siblings with
+    // it — work already admitted — so the answer is the stream's alone.
+    // Stream 1 takes the one unit of each pool and dials; stream 3, in the
+    // same read, finds none. Stream 1's 200 coming back after stream 3's
+    // 503, on the same connection, is the connection serving on.
+    const Rung = struct {
+        counter: []const u8,
+        relay_buffers: u32 = 2,
+        upstream_slots: u32 = 2,
+        upstream_head_buffers: ?u32 = null,
+        max_inflight: ?u32 = null,
+    };
+    const rungs = [_]Rung{
+        .{ .counter = "l7_shed_relay_buffers", .relay_buffers = 1 },
+        .{ .counter = "l7_shed_upstream_slots", .upstream_slots = 1 },
+        .{ .counter = "l7_shed_upstream_head_buffers", .upstream_head_buffers = 1 },
+        .{ .counter = "l7_shed_endpoint_inflight", .max_inflight = 1 },
+    };
+    inline for (rungs, 0..) |rung, index| {
+        var options = h2BedOptions(60 + index);
+        options.relay_buffers = rung.relay_buffers;
+        options.upstream_slots = rung.upstream_slots;
+        options.upstream_head_buffers = rung.upstream_head_buffers;
+        options.max_inflight = rung.max_inflight;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+
+        var wire: H2Wire = .{};
+        wire.preface(&.{});
+        wire.get(1, "GET", "/a");
+        wire.get(3, "GET", "/b");
+        try bed.exchange(wire.written());
+
+        var storage: [4]H2Answer = undefined;
+        const answers = try h2Answers(bed.client.response(), &storage);
+        try std.testing.expectEqual(@as(usize, 2), answers.len);
+        const held = try h2AnswerFor(answers, 1);
+        try std.testing.expectEqual(@as(u16, 200), held.status);
+        try std.testing.expectEqualStrings("ok", held.dataSlice());
+        const refused = try h2AnswerFor(answers, 3);
+        try std.testing.expectEqual(@as(u16, 503), refused.status);
+        // Answered and ended, not reset: a client reads why.
+        for (answers) |*answer| {
+            try std.testing.expect(answer.ended);
+            try std.testing.expectEqual(@as(?u32, null), answer.reset);
+        }
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get(rung.counter));
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+        try expectAnsweredAfterShed(bed.client.response(), 3, 1);
+        // What ended the connection is its idle window, after both.
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("deadline_expired"));
+        try bed.expectDrained();
+    }
+}
+
+/// The shed stream's head went out before the held one's, and the
+/// connection heard no GOAWAY: the shed ended nothing but its stream.
+fn expectAnsweredAfterShed(response: []const u8, shed_stream: u31, held_stream: u31) !void {
+    var frames: [32]H2Frame = undefined;
+    const count = try h2Frames(response, &frames);
+    var shed_head: ?usize = null;
+    var held_head: ?usize = null;
+    var goaways: u32 = 0;
+    for (frames[0..count], 0..) |frame, index| {
+        if (frame.frame_type == 0x1 and frame.stream == shed_stream) shed_head = shed_head orelse index;
+        if (frame.frame_type == 0x1 and frame.stream == held_stream) held_head = held_head orelse index;
+        if (frame.frame_type == 0x7) goaways += 1;
+    }
+    try std.testing.expect(shed_head != null);
+    try std.testing.expect(held_head != null);
+    try std.testing.expect(shed_head.? < held_head.?);
+    try std.testing.expectEqual(@as(u32, 0), goaways);
+}
+
 test "h2: an origin's body comes back as DATA — chunking undone, a close-delimited one ended at its FIN" {
     const Case = struct { response: []const u8, closes: bool, body: []const u8 };
     const cases = [_]Case{
