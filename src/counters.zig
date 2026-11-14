@@ -274,6 +274,32 @@ pub const Counters = struct {
     /// stream is refused before any work, which the client may retry, and
     /// the connection goes on serving the others.
     h2_shed_streams: Value = Value.init(0),
+    /// HTTP/2 connections ended GOAWAY(ENHANCE_YOUR_CALM) for overrunning
+    /// a per-connection budget (#276), one counter per budget: each is a
+    /// client inside the protocol's rules and expensive anyway, and what
+    /// it spent is the operator's question. Rapid Reset (CVE-2023-44487):
+    /// more streams reset before their answers ended than answers ended,
+    /// past `Session.resets_unpaid_max`.
+    h2_calm_rapid_reset: Value = Value.init(0),
+    /// Floods of frames that ask for no work of their own — PING and
+    /// SETTINGS (and ACKs this side never asked for), WINDOW_UPDATE,
+    /// frames read and ignored (PRIORITY, unknown types), and DATA with no
+    /// octets and no END_STREAM — each past its bound in
+    /// `Session.Unpaid.max` since the connection last did work for the
+    /// client.
+    h2_calm_ping: Value = Value.init(0),
+    h2_calm_settings: Value = Value.init(0),
+    h2_calm_window_update: Value = Value.init(0),
+    h2_calm_ignored: Value = Value.init(0),
+    h2_calm_empty_data: Value = Value.init(0),
+    /// The CONTINUATION flood: a field block across more frames than the
+    /// assembler allows, which empty fragments make cost no octets.
+    h2_calm_continuation: Value = Value.init(0),
+    /// A field block, or the list it decodes to, past its octet bound —
+    /// an HPACK bomb, or a head past what this side advertised. A head
+    /// too large is 431 in HTTP/1.1; in HTTP/2 the decoder has stopped
+    /// mid-table, so the connection cannot go on.
+    h2_calm_field_block: Value = Value.init(0),
     /// Requests refused for a body over the listener's cap (#236).
     /// Distinct from `l7_body_too_large` beside it, which answers the
     /// same `413` for a different question — that one is a *buffer*

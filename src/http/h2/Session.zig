@@ -199,6 +199,86 @@ comptime {
     assert(reset_ring_len >= 1); // `reset_ring_next` wraps modulo it.
 }
 
+/// Why a session ended with ENHANCE_YOUR_CALM (RFC 9113 §7: "a behavior
+/// that might be generating excessive load"): which of a client's per-connection
+/// budgets it overran (#276). Every one is a client inside the protocol's
+/// rules and expensive anyway — a malformed one gets PROTOCOL_ERROR — and
+/// each has its own counter, so an operator can tell a flood from a bomb.
+pub const Calm = enum {
+    /// More streams reset by the client before their answers ended than
+    /// answers this side finished: CVE-2023-44487's Rapid Reset.
+    rapid_reset,
+    /// The frames `Unpaid` counts, each past its own bound.
+    ping,
+    settings,
+    window_update,
+    ignored,
+    empty_data,
+    /// A field block across more frames than the assembler allows — the
+    /// CONTINUATION flood, which empty fragments make cost no octets.
+    continuation,
+    /// A field block, or the list it decodes to, past its octet bound: an
+    /// HPACK bomb, or a head too large for what this side advertised.
+    field_block,
+};
+
+/// The frames a client can send that cost this side work and ask for none
+/// of its own (#276), counted since the connection last did work for it —
+/// a request handed to the caller, or a response frame staged. Each count
+/// starts over then; past its bound, the connection ends calm. The bounds
+/// are what a client using the connection could spend between two such
+/// moments, with room: a PING or a SETTINGS now and then, a WINDOW_UPDATE
+/// per stream and the connection's beside each, a PRIORITY per stream.
+/// An acknowledgement counts with what it acknowledges: this side sends
+/// one SETTINGS and no PING, so every ACK past the first asks nothing.
+/// A connection a client only keeps alive — PINGs and nothing else — ends
+/// after `max.ping` of them, as gRPC's servers end one for "too many pings".
+pub const Unpaid = struct {
+    ping: u32 = 0,
+    settings: u32 = 0,
+    window_update: u32 = 0,
+    /// Frames read and set aside: PRIORITY, whose scheme §5.3.2
+    /// deprecates and this server does not schedule by, and the types
+    /// §5.5 says to ignore. Each costs a parse and nothing more, which is
+    /// still a cost a client can repeat.
+    ignored: u32 = 0,
+    /// DATA with no octets and no END_STREAM: it spends no window, so
+    /// nothing else bounds it.
+    empty_data: u32 = 0,
+
+    pub const max: Unpaid = .{
+        .ping = 32,
+        .settings = 16,
+        // A burst of credit after a burst of DATA: one per stream, and the
+        // connection's between them, twice over.
+        .window_update = 4 * concurrent_streams_advertised_max,
+        .ignored = 2 * concurrent_streams_advertised_max,
+        .empty_data = 32,
+    };
+
+    comptime {
+        for (@typeInfo(Unpaid).@"struct".field_names) |name| assert(@field(max, name) >= 1);
+        // A WINDOW_UPDATE per stream and one for the connection, at once.
+        assert(max.window_update >= 2 * concurrent_streams_advertised_max);
+        // A PRIORITY per stream a client may open.
+        assert(max.ignored >= concurrent_streams_advertised_max);
+    }
+};
+
+/// The Rapid Reset budget (#276): how far the streams a client reset
+/// before their answers ended may outnumber the answers that did. A
+/// browser abandoning a page cancels what it had open — at most this
+/// many — and pays it back as later answers complete; a client that opens
+/// and resets in a loop, each reset sparing it a stream while the work it
+/// asked for goes on, never does.
+pub const resets_unpaid_max: u32 = concurrent_streams_advertised_max;
+
+comptime {
+    // Every stream a client may have open, abandoned at once, is in budget.
+    assert(resets_unpaid_max >= concurrent_streams_advertised_max);
+    assert(resets_unpaid_max >= 1);
+}
+
 /// What one session's buffers are, for a connection advertising
 /// `header_list_size_max` and `concurrent_streams_max` — the unit
 /// `limits.h2_connections` reserves (§5) — and how they are laid out in
@@ -464,6 +544,14 @@ reset_ring_next: u32,
 /// The highest stream that reached the caller as `.request` — what a
 /// GOAWAY of ours names as the last one this side may have acted on.
 last_accepted_stream: u31,
+/// Which budget the client overran, when this side's GOAWAY said
+/// ENHANCE_YOUR_CALM; null otherwise.
+calm: ?Calm,
+/// The frames that asked nothing, since the connection last did work.
+unpaid: Unpaid,
+/// Streams the client reset before their answers ended, less the answers
+/// that ended since — never below zero.
+resets_unpaid: u32,
 /// Streams answered with REFUSED_STREAM because the table was full.
 streams_refused: u32,
 /// The response blocks' encoder, and the table-size change owed at the
@@ -521,6 +609,9 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
         .reset_ring = @splat(0),
         .reset_ring_next = 0,
         .last_accepted_stream = 0,
+        .calm = null,
+        .unpaid = .{},
+        .resets_unpaid = 0,
         .streams_refused = 0,
         .encoder = buffers.encoder.encoder(.dynamic),
         .encoder_resize_low = null,
@@ -826,6 +917,7 @@ fn sendFields(session: *Session, slot: *StreamTable.Slot, fields: []const hpack.
     }
     session.unwait(slot);
     session.stageBlock(slot.id, fields, @intCast(block_max), end_stream);
+    session.paid();
     return .staged;
 }
 
@@ -949,6 +1041,7 @@ fn stageData(session: *Session, slot: *StreamTable.Slot, bytes: []const u8, end_
         session.send_window -= @intCast(bytes.len);
         assert(slot.send_window >= 0);
         assert(session.send_window >= 0);
+        session.paid();
     }
     if (end_stream) session.endLocal(slot);
 }
@@ -958,6 +1051,8 @@ fn stageData(session: *Session, slot: *StreamTable.Slot, bytes: []const u8, end_
 fn endLocal(session: *Session, slot: *StreamTable.Slot) void {
     assert(slot.id != 0);
     assert(session.state == .open);
+    // An answer ended: one reset before its answer is paid for.
+    session.resets_unpaid -|= 1;
     session.unwait(slot);
     switch (slot.state) {
         .open => slot.state = .half_closed_local,
@@ -1166,8 +1261,13 @@ fn handleFrame(session: *Session, header: frame.Header, bytes: []const u8) void 
     if (payload == .push_promise) return session.fail(.protocol_error);
     // Every frame goes through the assembler, not only fragments: an open
     // field block forbids all of them (§4.3), which is the rule enforced.
-    const accepted = session.assembler.accept(header, &payload) catch |err| {
-        return session.fail(frame.BlockAssembler.errorCode(err));
+    const accepted = session.assembler.accept(header, &payload) catch |err| switch (err) {
+        // Its bounds: a client inside §4.3's rules and expensive anyway.
+        error.TooManyFrames => return session.failCalm(.continuation),
+        error.BlockTooLarge => return session.failCalm(.field_block),
+        error.UnexpectedContinuation,
+        error.InterleavedFrame,
+        => return session.fail(frame.BlockAssembler.errorCode(err)),
     };
     switch (accepted) {
         .fragment => {},
@@ -1182,18 +1282,30 @@ fn handleControl(session: *Session, header: frame.Header, payload: *const frame.
     switch (payload.*) {
         .settings => |settings| session.handleSettings(header, settings),
         .ping => |ping| {
+            if (!session.spend(.ping)) return;
             if (header.has(.ack)) return; // An answer to a PING we never sent.
             session.stage(&.{ .ping = .{ .opaque_data = ping.opaque_data } }, 0, frame.Flag.ack.bit());
         },
         .goaway => session.handleGoaway(),
-        .window_update => |update| session.handleWindowUpdate(header.stream_identifier, update.increment),
-        .data => |data| session.handleData(header, data),
+        .window_update => |update| {
+            if (!session.spend(.window_update)) return;
+            session.handleWindowUpdate(header.stream_identifier, update.increment);
+        },
+        .data => |data| {
+            // No octets, so no window spent, and no END_STREAM, so no
+            // end: a frame that says nothing, and only its budget stops
+            // it. One that pads is spending window, which bounds it.
+            if (header.length == 0 and !header.has(.end_stream)) {
+                if (!session.spend(.empty_data)) return;
+            }
+            session.handleData(header, data);
+        },
         .rst_stream => |reset| session.handlePeerReset(header.stream_identifier, reset.error_code),
         // §5.3.2's priority scheme is deprecated and this server does
-        // not schedule by it, so PRIORITY is legal anywhere and read never.
-        .priority => {},
-        // §4.1 and §5.5: an unknown type is ignored.
-        .unknown => {},
+        // not schedule by it, so PRIORITY is legal anywhere and read
+        // never; and §4.1 and §5.5 say an unknown type is ignored. Each
+        // is still a frame parsed, and budgeted.
+        .priority, .unknown => _ = session.spend(.ignored),
         // The assembler takes every field-block frame, and PUSH_PROMISE
         // failed the connection before it got here.
         .headers, .continuation, .push_promise => unreachable,
@@ -1204,7 +1316,16 @@ fn handleControl(session: *Session, header: frame.Header, payload: *const frame.
 /// acknowledgement of ours.
 fn handleSettings(session: *Session, header: frame.Header, settings: frame.payload.Settings) void {
     assert(header.stream_identifier == 0);
+    if (!session.spend(.settings)) return;
     if (header.has(.ack)) return session.takeSettingsAck();
+    // INITIAL_WINDOW_SIZE moves every stream's window, so it is applied
+    // once, after the frame — a frame of nothing else would otherwise cost
+    // its entries times the streams (#276). Applying the last value is
+    // what applying each in turn comes to, and since every window moves by
+    // the same difference, one would have passed 2^31-1 at some entry
+    // exactly when one passes it at the frame's highest.
+    var window_last: ?u31 = null;
+    var window_highest: u31 = 0;
     var entries = settings.iterate();
     while (entries.next()) |entry| {
         switch (entry.identifier) {
@@ -1214,9 +1335,9 @@ fn handleSettings(session: *Session, header: frame.Header, settings: frame.paylo
             .enable_push => if (entry.value > 1) return session.fail(.protocol_error),
             .initial_window_size => {
                 if (entry.value > window_max) return session.fail(.flow_control_error);
-                if (!session.retunePeerWindows(@intCast(entry.value))) {
-                    return session.fail(.flow_control_error);
-                }
+                const size: u31 = @intCast(entry.value);
+                window_last = size;
+                window_highest = @max(window_highest, size);
             },
             .max_frame_size => {
                 if (entry.value < frame.Header.max_frame_size_min) return session.fail(.protocol_error);
@@ -1232,6 +1353,9 @@ fn handleSettings(session: *Session, header: frame.Header, settings: frame.paylo
             _ => {},
         }
     }
+    if (window_last) |size| {
+        if (!session.retunePeerWindows(size, window_highest)) return session.fail(.flow_control_error);
+    }
     if (session.state == .awaiting_settings) session.state = .open;
     assert(session.state == .open);
     session.stage(&.{ .settings = .{ .entries = &.{} } }, 0, frame.Flag.ack.bit());
@@ -1239,15 +1363,18 @@ fn handleSettings(session: *Session, header: frame.Header, settings: frame.paylo
 
 /// §6.9.2: a new SETTINGS_INITIAL_WINDOW_SIZE from the client moves every
 /// stream's send window by the difference. Answers false when one would
-/// pass 2^31-1, which is the connection's flow-control error.
-fn retunePeerWindows(session: *Session, size: u31) bool {
-    assert(size <= window_max);
+/// pass 2^31-1 — at `size`, or at `highest`, the largest value its frame
+/// set on the way — which is the connection's flow-control error.
+fn retunePeerWindows(session: *Session, size: u31, highest: u31) bool {
+    assert(size <= highest);
+    assert(highest <= window_max);
     const delta: i64 = @as(i64, size) - @as(i64, session.peer_initial_window_size);
+    const delta_highest: i64 = @as(i64, highest) - @as(i64, session.peer_initial_window_size);
     session.peer_initial_window_size = size;
     for (session.streams.slots) |*slot| {
         if (slot.id == 0) continue;
+        if (slot.send_window + delta_highest > window_max) return false;
         slot.send_window += delta;
-        if (slot.send_window > window_max) return false;
     }
     return true;
 }
@@ -1316,6 +1443,15 @@ fn handlePeerReset(session: *Session, stream: u31, code: frame.ErrorCode) void {
     if (isIdle(session, stream)) return session.fail(.protocol_error);
     const slot = session.streams.find(stream) orelse return;
     const caller_reset = slot.state == .reset_pending;
+    // Reset before this side's answer ended: the work it asked for may
+    // still be going on, and the stream it held is the client's again.
+    // Charged before the release, which may close a connection that is
+    // going away — the overrun is the verdict, not that close.
+    if (!caller_reset and slot.state != .half_closed_local) {
+        assert(session.resets_unpaid <= resets_unpaid_max);
+        session.resets_unpaid += 1;
+        if (session.resets_unpaid > resets_unpaid_max) return session.failCalm(.rapid_reset);
+    }
     session.releaseStream(slot);
     if (caller_reset) return;
     session.event = .{ .reset = .{ .stream = stream, .code = code } };
@@ -1402,7 +1538,7 @@ fn handleBlock(session: *Session, block: *const frame.BlockAssembler.Block) void
     // connection's, so a block skipped is every later block misread.
     const decoded = session.decodeBlock(block.fragment, if (opening) .request else .trailer);
     switch (decoded) {
-        .connection => |code| return session.fail(code),
+        .connection => |err| return session.failDecode(err),
         .malformed, .ok => {},
     }
     // At or below the high-water mark and not open. A stream this side
@@ -1447,6 +1583,7 @@ fn openStream(session: *Session, block: *const frame.BlockAssembler.Block, count
     slot.send_window = session.peer_initial_window_size;
     slot.content_length = content_length;
     session.last_accepted_stream = block.stream_identifier;
+    session.paid();
     session.event = .{ .request = .{
         .stream = block.stream_identifier,
         .fields = session.fields[0..count],
@@ -1468,7 +1605,7 @@ fn handleTrailers(session: *Session, slot: *StreamTable.Slot, block: *const fram
     assert(slot.id == block.stream_identifier);
     const decoded = session.decodeBlock(block.fragment, .trailer);
     const count = switch (decoded) {
-        .connection => |code| return session.fail(code),
+        .connection => |err| return session.failDecode(err),
         .malformed => null,
         .ok => |ok| ok.count,
     };
@@ -1489,8 +1626,8 @@ fn handleTrailers(session: *Session, slot: *StreamTable.Slot, block: *const fram
 
 const Decoded = union(enum) {
     /// HPACK itself failed: the table is mid-block, and the connection
-    /// ends with this code.
-    connection: frame.ErrorCode,
+    /// ends (`failDecode`).
+    connection: hpack.Decoder.Error,
     /// Decoded to the end, but malformed (§8.1.1): the stream's error.
     malformed,
     /// Decoded and well-formed: `fields[0..count]`.
@@ -1508,7 +1645,7 @@ fn decodeBlock(session: *Session, fragment: []const u8, kind: MessageValidator.K
     var iterator = session.decoder.iterate(session.decoded, fragment);
     var count: u32 = 0;
     var malformed = false;
-    while (iterator.next() catch |err| return .{ .connection = decodeFailure(err) }) |field| : (count += 1) {
+    while (iterator.next() catch |err| return .{ .connection = err }) |field| : (count += 1) {
         assert(count < session.fields.len);
         if (malformed) continue;
         validator.field(&field) catch {
@@ -1523,14 +1660,16 @@ fn decodeBlock(session: *Session, fragment: []const u8, kind: MessageValidator.K
     return .{ .ok = .{ .count = count, .content_length = validator.contentLength() } };
 }
 
-/// Every HPACK failure ends the connection, because the decoder stops where
-/// it failed and the table is left mid-block. Not every one is the client's
-/// malformation: a list past the size this side advertised, or one past
-/// the buffer that size bought, is a client being expensive, and RFC 9113
-/// §7 names that ENHANCE_YOUR_CALM rather than COMPRESSION_ERROR.
-fn decodeFailure(err: hpack.Decoder.Error) frame.ErrorCode {
+/// Fail the connection for an HPACK failure: every one ends it, because
+/// the decoder stops where it failed and the table is left mid-block. Not
+/// every one is the client's malformation: a list past the size this side
+/// advertised, or one past the buffer that size bought, is a client being
+/// expensive — RFC 9113 §7's ENHANCE_YOUR_CALM rather than
+/// COMPRESSION_ERROR, recorded as the field block's budget.
+fn failDecode(session: *Session, err: hpack.Decoder.Error) void {
+    assert(session.state != .closed);
     return switch (err) {
-        error.HeaderListTooLarge, error.OutputTooLong => .enhance_your_calm,
+        error.HeaderListTooLarge, error.OutputTooLong => session.failCalm(.field_block),
         error.Incomplete,
         error.InvalidIndex,
         error.InvalidHuffman,
@@ -1538,7 +1677,7 @@ fn decodeFailure(err: hpack.Decoder.Error) frame.ErrorCode {
         error.CapacityTooLarge,
         error.UnexpectedSizeUpdate,
         error.TooManySizeUpdates,
-        => .compression_error,
+        => session.fail(.compression_error),
     };
 }
 
@@ -1723,10 +1862,40 @@ fn resetByUs(session: *const Session, stream: u31) bool {
 fn fail(session: *Session, code: frame.ErrorCode) void {
     assert(session.state != .closed);
     assert(code != .no_error);
+    // A calm close names its cause, which only `failCalm` records.
+    if (code == .enhance_your_calm) assert(session.calm != null);
     session.stageGoaway(code);
     session.state = .closed;
     session.closed_with = code;
     session.event = null;
+}
+
+/// A connection error for a client that overran `cause`'s budget.
+fn failCalm(session: *Session, cause: Calm) void {
+    assert(session.state != .closed);
+    assert(session.calm == null);
+    session.calm = cause;
+    session.fail(.enhance_your_calm);
+}
+
+/// Count one frame against `kind`'s budget. False once the client has
+/// overrun it: the connection is failing, and the frame goes unanswered.
+fn spend(session: *Session, comptime kind: Calm) bool {
+    assert(session.state != .closed);
+    const count = &@field(session.unpaid, @tagName(kind));
+    const bound = @field(Unpaid.max, @tagName(kind));
+    assert(count.* <= bound);
+    count.* += 1;
+    if (count.* <= bound) return true;
+    session.failCalm(kind);
+    return false;
+}
+
+/// The connection did work for the client: every count `Unpaid` keeps
+/// starts over.
+fn paid(session: *Session) void {
+    assert(session.state != .closed);
+    session.unpaid = .{};
 }
 
 /// §6.8: GOAWAY naming the last stream this side may have acted on — the

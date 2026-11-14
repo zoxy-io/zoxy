@@ -381,7 +381,13 @@ sheds the connection at accept, before its handshake, in
 HTTP/2.
 
 What fails on a stream ends that stream — reset, or answered `502`/`504`
-— never the connection. Response trailers are not carried, nor are a
+— never the connection. What a client spends is bounded per connection:
+resetting streams before their answers end faster than answers end
+(Rapid Reset), and floods of frames that ask for nothing — PING,
+SETTINGS, WINDOW_UPDATE, PRIORITY or unknown types, empty DATA, a field
+block in empty CONTINUATIONs — end the connection with
+`GOAWAY(ENHANCE_YOUR_CALM)`, each counted in its own
+`zoxy_h2_calm_*`. Response trailers are not carried, nor are a
 request's.
 
 #### Tunnelled upgrades (WebSocket)
