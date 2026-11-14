@@ -423,6 +423,12 @@ pub const Config = struct {
         /// listener applies to another byte of it, so which sockets may
         /// hand out that exemption is a property of the socket.
         upgrades: Upgrades = .{},
+        /// Whether this plaintext listener takes h2c by prior knowledge
+        /// (#275, RFC 9113 §3.3): a connection opening with HTTP/2's
+        /// preface speaks HTTP/2. No key yet — the session layer answers
+        /// every stream with REFUSED_STREAM until the exchange runs on
+        /// one, and the key (`http.h2c`) arrives with that.
+        h2c: bool = false,
         /// Whether refusals name their RFC 9209 cause on the wire
         /// (#300). Per listener and off by default, on `forwarded`'s
         /// reasoning: the header states which of *this proxy's* limits a

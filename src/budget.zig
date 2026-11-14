@@ -565,10 +565,21 @@ test "h2 pools: `Server.init` reserves exactly what the budget prices (#275)" {
     }
     // The session slab, at the shape the budget prices it: the advertised
     // concurrency is the shared pool here, under the advertisement's cap.
-    try testing.expectEqual(@as(u64, server.h2_session_slab.len), sizes.h2_connections * sizes.h2_session_bytes);
-    // Every unit of it starts where a session can live: the stride is
-    // the layout's, padded to its alignment, not a byte sum.
-    try testing.expectEqual(@as(u64, 0), sizes.h2_session_bytes % @import("http/h2/Session.zig").Layout.unit_align);
+    // Priced as a pair of terms, as the head pools are: the pool's own
+    // element, and the slab unit carved for it.
+    const H2Slot = @import("http/h2/Connection.zig").Slot;
+    const unit = sizes.h2_session_bytes - @sizeOf(H2Slot);
+    try testing.expectEqual(@as(usize, sizes.h2_connections), server.h2_sessions.slots.len);
+    try testing.expectEqual(@as(u64, server.h2_session_slab.len), sizes.h2_connections * unit);
+    // Every unit starts where a session can live: the stride is the
+    // layout's, padded to its alignment, not a byte sum — and each slot's
+    // session was carved inside the slab, once, at init.
+    try testing.expectEqual(@as(u64, 0), unit % @import("http/h2/Session.zig").Layout.unit_align);
+    const slab_start = @intFromPtr(server.h2_session_slab.ptr);
+    for (server.h2_sessions.slots) |slot| {
+        try testing.expect(@intFromPtr(slot.session) >= slab_start);
+        try testing.expect(@intFromPtr(slot.session) < slab_start + server.h2_session_slab.len);
+    }
     try testing.expect(sizes.h2_session_bytes > 0);
     // And the closed form takes all of it without tripping its own
     // all-or-nothing assertions.

@@ -16,6 +16,7 @@ const filter = @import("../http/filter.zig");
 const relay = @import("relay.zig");
 const stream_module = @import("Stream.zig");
 const TlsEngine = @import("../tls/Engine.zig");
+const H2Slot = @import("../http/h2/Connection.zig").Slot;
 
 const assert = std.debug.assert;
 
@@ -123,6 +124,15 @@ pub fn Conn(comptime IoType: type) type {
         /// turnaround — the whole point is a total that survives them.
         requests_served: u32,
         request_filters: []const filter.Rule,
+        /// Whether this listener takes h2c by prior knowledge (#275): a
+        /// plaintext connection whose first octets are HTTP/2's preface
+        /// speaks HTTP/2. Handed over at admission like the tables beside
+        /// it, so the sniff asks its own socket.
+        h2c: bool,
+        /// This connection's HTTP/2 session slot (#275), from the §5 pool,
+        /// or null on any connection that does not speak HTTP/2. Held for
+        /// the connection's life once taken, and returned at teardown.
+        h2: ?*H2Slot,
         /// The listener's #175 response filter rules, same lifetime:
         /// matched against the origin's parsed response head at the
         /// re-render (empty on L4 and when none are configured).
@@ -223,6 +233,10 @@ pub fn Conn(comptime IoType: type) type {
             /// multiplexed connection is in one state while its streams are
             /// each in their own phase.
             l7,
+            /// Speaking HTTP/2 (#275): the session in `h2` decides what is
+            /// said, the admission stream carries its socket I/O, and the
+            /// multiplexed exchanges run on streams of their own.
+            h2,
             /// Teardown begun: sockets shut down, pending ops draining.
             /// The delivery that empties the armed set closes both fds
             /// synchronously and releases the slot (§5) — there is no
@@ -263,6 +277,7 @@ pub fn Conn(comptime IoType: type) type {
                 .connecting,
                 .relaying,
                 .l7,
+                .h2,
                 => true,
                 .tearing_down => false,
             };
@@ -325,6 +340,8 @@ pub fn Conn(comptime IoType: type) type {
             conn.routes = &.{};
             conn.sni_routes = &.{};
             conn.request_filters = &.{};
+            conn.h2c = false;
+            conn.h2 = null;
             conn.response_filters = &.{};
             conn.upgrades = .{};
             conn.max_body_bytes = 0;

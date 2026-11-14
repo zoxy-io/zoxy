@@ -36,6 +36,8 @@ const Credentials = @import("tls/Credentials.zig");
 const Tickets = @import("tls/Tickets.zig");
 const TlsEngine = @import("tls/Engine.zig");
 const H2Session = @import("http/h2/Session.zig");
+const H2Connection = @import("http/h2/Connection.zig");
+const H2Slot = H2Connection.Slot;
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -90,6 +92,11 @@ pub fn Server(comptime IoType: type) type {
         /// `Session.Layout.carve`, so aligned to the layout's unit. Empty
         /// on a deployment that speaks no HTTP/2.
         h2_session_slab: []align(H2Session.Layout.unit_align) u8,
+        /// The pool that hands the slab's units out, one per connection that
+        /// speaks HTTP/2, each already carved (`initH2Sessions`).
+        h2_sessions: Pool(H2Slot),
+        /// The layout every slot was carved to, or null with no sessions.
+        h2_layout: ?H2Session.Layout,
         /// The shared stream pool (#275): the exchanges HTTP/2 multiplexes,
         /// `limits.stream_slots` of them. A pool of its own beside
         /// `streams`, not a tail on it, so admission's one stream per
@@ -374,6 +381,7 @@ pub fn Server(comptime IoType: type) type {
         pub const StreamType = ConnType.StreamType;
         pub const AccessLogType = access_log_module.AccessLog(IoType);
         const Proxy = proxy.Proxy(IoType);
+        const H2Driver = H2Connection.Driver(IoType);
 
         /// Pool sizes are injectable so tests and the simulator can force
         /// every exhaustion rung; production passes the config's resolved
@@ -407,6 +415,9 @@ pub fn Server(comptime IoType: type) type {
             /// reason as the tables above: an admitted connection asks its
             /// own socket what it may carry.
             upgrades: config_module.Config.Listener.Upgrades,
+            /// The listener's h2c-by-prior-knowledge switch (#275),
+            /// carried like the upgrade allowlist beside it.
+            h2c: bool,
             max_body_bytes: u64,
             /// The listener's #237 keep-alive request cap (#305), carried
             /// for the same reason as the caps beside it.
@@ -613,27 +624,45 @@ pub fn Server(comptime IoType: type) type {
             try server.health.init(arena, server, keys, options.head_buffer_bytes);
         }
 
-        /// One HTTP/2 session at this config's shape (#275): fields of up
+        /// One HTTP/2 session's shape at this config (#275): fields of up
         /// to a head buffer — what the downgrade writes a request into —
         /// and the concurrency `Session` advertises, capped by the shared
-        /// stream pool. `Session.Layout` is the one statement of what that
-        /// costs; this names the shape, for both the reservation below and
-        /// the §5 banner, so the two read one closed form.
-        pub fn h2SessionBytes(limits: *const config_module.Config.Limits) u64 {
-            if (limits.h2_connections == 0) return 0;
+        /// stream pool. `Session.Layout` states what that shape costs and
+        /// how it is laid out; this only names it, once, for the slab, the
+        /// carve, `Session.init` and the §5 banner alike.
+        pub fn h2Layout(limits: *const config_module.Config.Limits) H2Session.Layout {
+            assert(limits.h2_connections >= 1);
             assert(limits.stream_slots >= 1);
-            const layout: H2Session.Layout = .{
+            return .{
                 .header_list_size_max = limits.head_buffer_bytes,
                 .concurrent_streams_max = @min(H2Session.concurrent_streams_advertised_max, limits.stream_slots),
             };
-            return layout.bytes();
         }
 
-        /// The HTTP/2 pools (#275): the session slab, and a head per shared
-        /// stream slot. Reserved exactly as §5 prices them, and — like the
-        /// head slabs — not faulted in: a page is resident once a session
-        /// or an exchange first writes it. All-or-nothing together, which
-        /// the budget asserts of its own terms too.
+        /// What one session costs (§5): its pool element and its unit of
+        /// the slab — the same pair-of-terms shape the head pools price.
+        pub fn h2SessionBytes(limits: *const config_module.Config.Limits) u64 {
+            if (limits.h2_connections == 0) return 0;
+            return @sizeOf(H2Slot) + h2Layout(limits).bytes();
+        }
+
+        /// What `Session.init` is given: the layout every slot was carved
+        /// to, kept from the carve itself rather than re-derived, so the
+        /// two cannot be given different limits.
+        pub fn h2SessionConfig(server: *const Self) H2Session.Config {
+            const layout = server.h2_layout.?;
+            return .{
+                .concurrent_streams_max = layout.concurrent_streams_max,
+                .header_list_size_max = layout.header_list_size_max,
+            };
+        }
+
+        /// The HTTP/2 pools (#275): the session slab and the pool that hands
+        /// its units out, the shared streams, and a head per shared stream.
+        /// Reserved exactly as §5 prices them, and — like the head slabs —
+        /// not faulted in: a page is resident once a session or an exchange
+        /// first writes it. All-or-nothing together, which the budget
+        /// asserts of its own terms too.
         fn initH2Pools(
             server: *Self,
             arena: std.mem.Allocator,
@@ -641,11 +670,7 @@ pub fn Server(comptime IoType: type) type {
         ) error{OutOfMemory}!void {
             assert(options.h2_connections <= options.conn_slots);
             if (options.h2_connections == 0) assert(options.stream_slots == 0);
-            server.h2_session_slab = try arena.alignedAlloc(
-                u8,
-                .fromByteUnits(H2Session.Layout.unit_align),
-                @intCast(@as(u64, options.h2_connections) * h2SessionBytes(options)),
-            );
+            try server.initH2Sessions(arena, options);
             try server.shared_streams.init(arena, options.stream_slots);
             assert(server.streams.capacity() + server.shared_streams.capacity() ==
                 constants.streamSlotsFor(options.conn_slots, options.stream_slots));
@@ -655,6 +680,55 @@ pub fn Server(comptime IoType: type) type {
                 head_buffer.data = slab[index * options.head_buffer_bytes ..][0..options.head_buffer_bytes];
             }
             assert(server.stream_head_buffers.slots.len == options.stream_slots);
+        }
+
+        /// The session slab, carved once: every slot's session and buffers
+        /// are laid out here and never moved, so a connection that takes a
+        /// slot only has to `Session.init` what it found.
+        fn initH2Sessions(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+        ) error{OutOfMemory}!void {
+            try server.h2_sessions.init(arena, options.h2_connections);
+            server.h2_layout = null;
+            if (options.h2_connections == 0) {
+                server.h2_session_slab = &.{};
+                return;
+            }
+            const layout = h2Layout(options);
+            server.h2_layout = layout;
+            const unit: usize = @intCast(layout.bytes());
+            server.h2_session_slab = try arena.alignedAlloc(
+                u8,
+                .fromByteUnits(H2Session.Layout.unit_align),
+                @as(usize, options.h2_connections) * unit,
+            );
+            for (server.h2_sessions.slots, 0..) |*slot, index| {
+                const piece: []align(H2Session.Layout.unit_align) u8 =
+                    @alignCast(server.h2_session_slab[index * unit ..][0..unit]);
+                const carved = layout.carve(piece);
+                slot.session = carved.session;
+                slot.buffers = carved.buffers;
+                slot.reset();
+            }
+            assert(server.h2_sessions.slots.len == options.h2_connections);
+        }
+
+        /// A session for a connection about to speak HTTP/2, or null when
+        /// the pool is empty — the caller's to shed or to fall back from.
+        pub fn acquireH2Session(server: *Self) ?*H2Slot {
+            const slot = server.h2_sessions.acquire() orelse return null;
+            assert(slot.sending == 0);
+            assert(!slot.receiving);
+            return slot;
+        }
+
+        fn releaseH2Session(server: *Self, slot: *H2Slot) void {
+            assert(slot.sending == 0);
+            assert(!slot.receiving);
+            slot.reset();
+            server.h2_sessions.release(slot);
         }
 
         /// The §5 upstream head slab wiring and the serving path's two
@@ -1158,6 +1232,7 @@ pub fn Server(comptime IoType: type) type {
                     .routes = listener_config.routes,
                     .sni_routes = listener_config.sni_routes,
                     .upgrades = listener_config.upgrades,
+                    .h2c = listener_config.h2c,
                     .max_body_bytes = listener_config.max_body_bytes,
                     .keepalive_requests = listener_config.keepalive_requests,
                     .request_filters = listener_config.request_filters,
@@ -1303,6 +1378,7 @@ pub fn Server(comptime IoType: type) type {
             // Parked upstreams are idle capacity; the drain sheds them
             // first (§8). Synchronous closes: no armed op to wait for.
             server.reapParked(true);
+            server.drainH2Connections();
             // A zero deadline is "no cap" (§5): the drain waits for the
             // last connection however long that takes, which is what
             // nginx, HAProxy and Caddy all do by default. Whoever sent
@@ -1359,6 +1435,19 @@ pub fn Server(comptime IoType: type) type {
                 }
             }
             server.maybeStopAfterDrain();
+        }
+
+        /// HTTP/2 connections are told of a drain rather than waited on
+        /// (#275): an idle one has nothing that would make it notice, and
+        /// its client is owed a GOAWAY saying which streams were taken — so
+        /// it can retry the rest elsewhere instead of finding them cut.
+        fn drainH2Connections(server: *Self) void {
+            assert(server.draining);
+            for (server.conns.slots) |*conn| {
+                if (!server.conns.isAcquired(conn)) continue;
+                if (conn.state != .h2) continue;
+                H2Driver.beginDrain(server, conn);
+            }
         }
 
         /// The #180 tunnel-only drain bound fired: cut the tunnels and
@@ -1673,6 +1762,7 @@ pub fn Server(comptime IoType: type) type {
             assert(server.upstream_head_buffers.isFullyReleased());
             // Trivially true until anything serves HTTP/2 (#275), and
             // stated now for the tunnel pool's reason above.
+            assert(server.h2_sessions.isFullyReleased());
             assert(server.shared_streams.isFullyReleased());
             assert(server.stream_head_buffers.isFullyReleased());
             // The drain finished, so the watchdog has nothing left to
@@ -1766,6 +1856,7 @@ pub fn Server(comptime IoType: type) type {
                 server.tunnel_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
                 server.upstream_head_buffers.isFullyReleased() and
+                server.h2_sessions.isFullyReleased() and
                 server.shared_streams.isFullyReleased() and
                 server.stream_head_buffers.isFullyReleased() and
                 server.head_buffers_in_use == 0 and
@@ -2105,6 +2196,7 @@ pub fn Server(comptime IoType: type) type {
             conn.request_filters = listener.request_filters;
             conn.response_filters = listener.response_filters;
             conn.upgrades = listener.upgrades;
+            conn.h2c = listener.h2c;
             conn.max_body_bytes = listener.max_body_bytes;
             conn.keepalive_requests = listener.keepalive_requests;
             conn.forwarded = listener.forwarded;
@@ -3547,7 +3639,12 @@ pub fn Server(comptime IoType: type) type {
                 conn.tls = null;
                 conn.tls_pending_len = 0;
             }
+            if (conn.h2) |slot| {
+                server.releaseH2Session(slot);
+                conn.h2 = null;
+            }
             assert(conn.tls == null);
+            assert(conn.h2 == null);
             assert(conn.stream.relay_buffer == null);
             assert(conn.tunnel_buffer == null);
             assert(conn.stream.upstream == null);

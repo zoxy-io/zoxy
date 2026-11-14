@@ -253,6 +253,16 @@ pub const Counters = struct {
     /// says an operator's deadline expired, this one says a deadline
     /// they never named was supplied for them (§8).
     tunnels_drained: Value = Value.init(0),
+    /// Connections that started speaking HTTP/2 (#275): an h2c preface on
+    /// a listener that allows it. Established ones, not live ones — the
+    /// live count is the session pool's occupancy, a gauge.
+    h2_connections: Value = Value.init(0),
+    /// h2c prefaces turned away because the session pool was empty
+    /// (#275), and the connection with them: a client that sent HTTP/2's
+    /// preface cannot be answered in HTTP/1.1. Outside the admission
+    /// identity's shed sum on purpose — the connection was admitted, and
+    /// it counts as completed when it goes.
+    h2_shed_sessions: Value = Value.init(0),
     /// Requests refused for a body over the listener's cap (#236).
     /// Distinct from `l7_body_too_large` beside it, which answers the
     /// same `413` for a different question — that one is a *buffer*
