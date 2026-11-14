@@ -619,6 +619,12 @@ const Http1Bed = struct {
         /// default, which is the shape every pre-#180 config has.
         upgrades: config_module.Config.Listener.Upgrades = .{},
         tunnels: u32 = 0,
+        /// h2c by prior knowledge on the one listener (#275), and the
+        /// session and shared-stream pools it draws on. All off by
+        /// default — the shape of every config until the knobs land.
+        h2c: bool = false,
+        h2_connections: u32 = 0,
+        stream_slots: u32 = 0,
         /// The §8 drain deadline. The bed's default is a real one; a
         /// tunnel scenario needs the zero case, which is production's
         /// default and the one #180 had to answer for.
@@ -779,6 +785,7 @@ const Http1Bed = struct {
             .response_filters = options.response_filters,
             .protocol = .http,
             .upgrades = options.upgrades,
+            .h2c = options.h2c,
             .max_body_bytes = options.max_body_bytes,
             .keepalive_requests = options.keepalive_requests,
             .forwarded = options.forwarded,
@@ -854,6 +861,8 @@ const Http1Bed = struct {
                 0,
             .tls_engines = if (options.tls) options.conn_slots else 0,
             .tunnels = options.tunnels,
+            .h2_connections = options.h2_connections,
+            .stream_slots = options.stream_slots,
         });
         try bed.loadTlsCredentials(arena, options.tls);
         try bed.server.start();
@@ -956,6 +965,184 @@ const Http1Bed = struct {
         try std.testing.expect(bed.sim_io.sockets.isFullyReleased());
     }
 };
+
+// ---------------------------------------------------------------------------
+// h2c by prior knowledge (#275): the HTTP/2 connection driver, through a
+// real server. This file may not import `h2` (it is confined to
+// src/http/h2/), so the few frames these scenarios send are written out as
+// bytes and the replies are read by their nine-octet headers alone.
+// ---------------------------------------------------------------------------
+
+const h2_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+/// An empty SETTINGS frame: the rest of the client's connection preface.
+const h2_settings = "\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+/// HEADERS on stream 1, END_STREAM | END_HEADERS: `GET http://a/` from the
+/// static table (`:method GET`, `:scheme http`, `:path /`) and `:authority a`
+/// as a literal on its static name.
+const h2_get = "\x00\x00\x06\x01\x05\x00\x00\x00\x01\x82\x86\x84\x01\x01a";
+
+const H2Frame = struct { length: u32, frame_type: u8, flags: u8, stream: u31, payload: []const u8 };
+
+/// The frames in `bytes`, by header alone, into `out`; answers how many.
+/// Every byte must belong to a whole frame — a server that sent half of one
+/// is a defect these scenarios are here to catch.
+fn h2Frames(bytes: []const u8, out: []H2Frame) !usize {
+    var offset: usize = 0;
+    var count: usize = 0;
+    while (offset < bytes.len) : (count += 1) {
+        try std.testing.expect(count < out.len);
+        try std.testing.expect(bytes.len - offset >= 9);
+        const header = bytes[offset..][0..9];
+        const length = (@as(u32, header[0]) << 16) | (@as(u32, header[1]) << 8) | header[2];
+        try std.testing.expect(bytes.len - offset - 9 >= length);
+        out[count] = .{
+            .length = length,
+            .frame_type = header[3],
+            .flags = header[4],
+            .stream = @intCast(std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff),
+            .payload = bytes[offset + 9 ..][0..length],
+        };
+        offset += 9 + length;
+    }
+    return count;
+}
+
+fn h2BedOptions(seed: u64) Http1Bed.Options {
+    return .{ .seed = seed, .h2c = true, .h2_connections = 2, .stream_slots = 4 };
+}
+
+test "h2c: a preface is answered in HTTP/2 — SETTINGS, its ACK, and a refused stream" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2BedOptions(1));
+    defer bed.tearDown();
+
+    try bed.exchange(h2_preface ++ h2_settings ++ h2_get);
+
+    var frames: [8]H2Frame = undefined;
+    const count = try h2Frames(bed.client.response(), &frames);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    // The server's preface: its SETTINGS, which leads whatever else it says.
+    try std.testing.expectEqual(@as(u8, 0x4), frames[0].frame_type);
+    try std.testing.expectEqual(@as(u8, 0), frames[0].flags);
+    // The client's SETTINGS, acknowledged.
+    try std.testing.expectEqual(@as(u8, 0x4), frames[1].frame_type);
+    try std.testing.expectEqual(@as(u8, 0x1), frames[1].flags);
+    // The request, refused before any work: REFUSED_STREAM (0x7) on 1.
+    try std.testing.expectEqual(@as(u8, 0x3), frames[2].frame_type);
+    try std.testing.expectEqual(@as(u31, 1), frames[2].stream);
+    try std.testing.expectEqual(@as(u32, 0x7), std.mem.readInt(u32, frames[2].payload[0..4], .big));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    // Nothing of HTTP/1.1 happened: no request began, no line, no verdict.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_request"));
+    try bed.expectDrained();
+}
+
+test "h2c: a preface split across reads is still recognized" {
+    var options = h2BedOptions(7);
+    options.partial_io = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    try bed.exchange(h2_preface ++ h2_settings ++ h2_get);
+
+    var frames: [8]H2Frame = undefined;
+    const count = try h2Frames(bed.client.response(), &frames);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(u8, 0x3), frames[2].frame_type);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    try bed.expectDrained();
+}
+
+test "h2c: a drain sends GOAWAY(NO_ERROR) naming no stream, and ends the connection" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2BedOptions(3));
+    defer bed.tearDown();
+
+    // Inside the idle window, so it is the drain that ends the connection.
+    bed.armDrainTimer(50);
+    try bed.exchange(h2_preface ++ h2_settings);
+
+    var frames: [8]H2Frame = undefined;
+    const count = try h2Frames(bed.client.response(), &frames);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    const goaway = frames[2];
+    try std.testing.expectEqual(@as(u8, 0x7), goaway.frame_type);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, goaway.payload[0..4], .big)); // Last stream.
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, goaway.payload[4..8], .big)); // NO_ERROR.
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try bed.expectDrained();
+}
+
+test "h2c: a connection admitted before a drain and speaking after it is owed its GOAWAY at once" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2BedOptions(13));
+    defer bed.tearDown();
+
+    // Connected before the drain, preface after it: `beginDrain` found no
+    // HTTP/2 connection to tell, so the driver must tell this one itself.
+    bed.armDrainTimer(10);
+    bed.client.send_delay_ms = 40;
+    try bed.exchange(h2_preface ++ h2_settings);
+
+    var frames: [8]H2Frame = undefined;
+    const count = try h2Frames(bed.client.response(), &frames);
+    try std.testing.expect(count >= 2);
+    try std.testing.expectEqual(@as(u8, 0x4), frames[0].frame_type); // SETTINGS.
+    const goaway = frames[count - 1];
+    try std.testing.expectEqual(@as(u8, 0x7), goaway.frame_type);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, goaway.payload[4..8], .big)); // NO_ERROR.
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try bed.expectDrained();
+}
+
+test "h2c: with the session pool empty, a preface is turned away and counted" {
+    var options = h2BedOptions(5);
+    options.h2_connections = 1;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    // The first holds the one session for its idle window; the second,
+    // started once the first is in, finds none.
+    bed.client.drain_on_finish = false;
+    bed.client.next = null;
+    bed.client2.request = h2_preface ++ h2_settings;
+    bed.client2.send_delay_ms = 20;
+    bed.client2.startAt(&bed.sim_io, &bed.server, bed.listeners[0].bind_address);
+    try bed.exchange(h2_preface ++ h2_settings);
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_shed_sessions"));
+    // Told nothing — HTTP/1.1 has no answer it would read — and closed.
+    try std.testing.expectEqual(@as(usize, 0), bed.client2.response().len);
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client2.outcome);
+    try bed.expectDrained();
+}
+
+test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a preface elsewhere is a 400" {
+    {
+        var bed: Http1Bed = undefined;
+        var options = h2BedOptions(9);
+        options.origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        try bed.exchange("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_connections"));
+        try bed.expectDrained();
+    }
+    {
+        // Without `h2c`, the preface is what RFC 9113 §3.4 built it to be
+        // to an HTTP/1.1 server: a request line it refuses.
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, .{ .seed = 11 });
+        defer bed.tearDown();
+        try bed.exchange(h2_preface ++ h2_settings);
+        try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 400 Bad Request\r\n"));
+        try bed.expectDrained();
+    }
+}
 
 test "l7: a malformed request head is answered 400 and closed with FIN" {
     var bed: Http1Bed = undefined;

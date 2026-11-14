@@ -412,6 +412,12 @@ settings_acked: bool,
 /// The client sent GOAWAY: it opens nothing more, and once its open
 /// streams are done, so is the connection.
 peer_going_away: bool,
+/// This side called `goAway` (§6.8): it accepts nothing more, and once
+/// the streams it already accepted are done, so is the connection.
+self_going_away: bool,
+/// That GOAWAY is owed and not yet staged; `flushPending` stages it, as
+/// room allows, ahead of anything else it owes.
+goaway_owed: bool,
 /// Whether a credit or a reset is waiting for outbox room.
 pending: bool,
 /// The client's settings that bound what this side may send.
@@ -476,6 +482,8 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
         .closed_with = null,
         .settings_acked = false,
         .peer_going_away = false,
+        .self_going_away = false,
+        .goaway_owed = false,
         .pending = false,
         .peer_frame_size_max = frame.Header.max_frame_size_min,
         .peer_initial_window_size = window_default,
@@ -617,6 +625,20 @@ pub fn resetStream(session: *Session, stream: u31, code: frame.ErrorCode) void {
     slot.state = .reset_pending;
     slot.reset_code = code;
     session.pending = true;
+}
+
+/// End the connection gracefully (§6.8): GOAWAY(NO_ERROR) naming the last
+/// stream the caller was handed, every stream after it refused, and the
+/// connection over once the ones before it finish — a drain, not an error,
+/// so `closed_with` stays null. Staged at the next `step`, which is where
+/// room is found; idempotent, since a drain can be asked for twice.
+pub fn goAway(session: *Session) void {
+    assert(session.state != .closed);
+    if (session.self_going_away) return;
+    session.self_going_away = true;
+    session.goaway_owed = true;
+    session.pending = true;
+    assert(session.goingAway());
 }
 
 /// Stage a response head on `stream`: interim ones (1xx) first, as many as
@@ -1208,7 +1230,7 @@ fn takeSettingsAck(session: *Session) void {
 fn handleGoaway(session: *Session) void {
     assert(session.state == .open);
     session.peer_going_away = true;
-    if (session.streams.used == 0) session.state = .closed;
+    if (session.streams.used == 0) session.closeIfGoneAway();
 }
 
 fn handleWindowUpdate(session: *Session, stream: u31, increment: u31) void {
@@ -1332,9 +1354,10 @@ fn handleBlock(session: *Session, block: *const frame.BlockAssembler.Block) void
     // PROTOCOL_ERROR, looks the same without per-identifier state.)
     if (!opening) return;
     session.last_peer_stream = block.stream_identifier;
-    // The client's GOAWAY said it would open nothing more; this one is
-    // refused rather than believed.
-    if (session.peer_going_away) return session.refuse(block.stream_identifier, .refused_stream);
+    // Either side's GOAWAY: the client said it would open nothing more,
+    // or this side said it would accept nothing more. Refused either way —
+    // REFUSED_STREAM, which tells the client nothing happened (§8.7).
+    if (session.goingAway()) return session.refuse(block.stream_identifier, .refused_stream);
     switch (decoded) {
         .connection => unreachable, // Failed above.
         .malformed => session.refuse(block.stream_identifier, .protocol_error),
@@ -1528,7 +1551,21 @@ fn releaseStream(session: *Session, slot: *StreamTable.Slot) void {
     session.recv_unacked += slot.recv_delivered;
     if (session.recv_unacked >= 1) session.pending = true;
     session.streams.release(slot);
-    if (session.peer_going_away and session.streams.used == 0) session.state = .closed;
+    if (session.streams.used == 0) session.closeIfGoneAway();
+}
+
+/// Whether either side has said this connection takes no new streams.
+fn goingAway(session: *const Session) bool {
+    return session.peer_going_away or session.self_going_away;
+}
+
+/// With no stream left, a connection either side is ending is over —
+/// once this side's own GOAWAY, if it owes one, is staged to say so.
+fn closeIfGoneAway(session: *Session) void {
+    assert(session.streams.used == 0);
+    assert(session.state != .closed);
+    if (session.goaway_owed) return;
+    if (session.goingAway()) session.state = .closed;
 }
 
 /// Credits and caller resets, staged as room allows while `reply_bytes_max`
@@ -1536,6 +1573,17 @@ fn releaseStream(session: *Session, slot: *StreamTable.Slot) void {
 fn flushPending(session: *Session) void {
     assert(session.state != .closed);
     session.pending = false;
+    if (session.goaway_owed) {
+        // A reply's reserve stays behind it, as behind everything here;
+        // an empty outbox always has room (`outbox_bytes_min`).
+        if (session.outboxRoom() < 2 * reply_bytes_max) {
+            session.pending = true;
+            return;
+        }
+        session.stageGoaway(.no_error);
+        session.goaway_owed = false;
+        if (session.streams.used == 0) return session.closeIfGoneAway();
+    }
     for (session.streams.slots) |*slot| {
         if (slot.id == 0) continue;
         // A half-closed stream's client sends nothing more on it, so its
@@ -1601,17 +1649,25 @@ fn stageReset(session: *Session, stream: u31, code: frame.ErrorCode) void {
 fn fail(session: *Session, code: frame.ErrorCode) void {
     assert(session.state != .closed);
     assert(code != .no_error);
-    // §6.8: the last stream this side may have acted on — the highest one
-    // the caller was handed. A refused stream is one nothing happened on
-    // (§8.7), so it does not count.
+    session.stageGoaway(code);
+    session.state = .closed;
+    session.closed_with = code;
+    session.event = null;
+}
+
+/// §6.8: GOAWAY naming the last stream this side may have acted on — the
+/// highest one the caller was handed. A stream this session refused itself
+/// never reached the caller (§8.7), so it does not count; one the caller
+/// reset after being handed it does — the bound is conservative there, and
+/// the stream's own RST_STREAM already told the client what happened.
+fn stageGoaway(session: *Session, code: frame.ErrorCode) void {
+    assert(session.state != .closed);
+    assert(session.outboxRoom() >= reply_bytes_max);
     session.stage(&.{ .goaway = .{
         .last_stream_identifier = session.last_accepted_stream,
         .error_code = code,
         .debug_data = &.{},
     } }, 0, 0);
-    session.state = .closed;
-    session.closed_with = code;
-    session.event = null;
 }
 
 /// The server preface. Only what differs from RFC 9113's defaults goes

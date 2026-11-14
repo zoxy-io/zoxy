@@ -1028,6 +1028,58 @@ test "h2 session: after the client's GOAWAY, the connection ends with its last s
     try testing.expect(fixture.session.closed_with == null);
 }
 
+test "h2 session: going away with nothing open is a GOAWAY(NO_ERROR) and the end" {
+    var fixture: Fixture = .{};
+    fixture.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    fixture.session.goAway();
+    fixture.session.goAway(); // A drain asked for twice is one drain.
+    try testing.expectEqual(Session.Step.closed, fixture.settle());
+    try testing.expect(fixture.session.closed_with == null); // A drain, not an error.
+    var reader = fixture.replies();
+    const goaway = reader.nextSkippingAcks().?;
+    try testing.expectEqual(frame.Type.goaway, goaway.header.frame_type);
+    try testing.expectEqual(frame.ErrorCode.no_error, goaway.payload.goaway.error_code);
+    try testing.expectEqual(@as(u31, 0), goaway.payload.goaway.last_stream_identifier);
+    try testing.expect(reader.next() == null);
+}
+
+test "h2 session: going away finishes what was accepted and refuses what comes after" {
+    var fixture: Fixture = .{};
+    fixture.init();
+    fixture.caller = .hold;
+    var blocks: Blocks = .{};
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    putHeaders(&input, 1, blocks.encode(&post_fields), false);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    fixture.session.goAway();
+    try testing.expectEqual(Session.Step.need_input, fixture.settle());
+    // A newer stream is refused; the accepted one is still served.
+    var more: Wire = .empty;
+    defer more.deinit(testing.allocator);
+    putHeaders(&more, 3, blocks.encode(&request_fields), true);
+    putData(&more, 1, "body", true);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(more.items));
+    var reader = fixture.replies();
+    const goaway = reader.nextSkippingAcks().?;
+    try testing.expectEqual(frame.Type.goaway, goaway.header.frame_type);
+    try testing.expectEqual(frame.ErrorCode.no_error, goaway.payload.goaway.error_code);
+    try testing.expectEqual(@as(u31, 1), goaway.payload.goaway.last_stream_identifier);
+    try expectReset(reader.nextSkippingAcks(), 3, .refused_stream);
+    const events = fixture.eventsOf();
+    try testing.expectEqual(.data, events[events.len - 1].kind);
+    // Answering the last accepted stream ends the connection.
+    try testing.expectEqual(Session.Sent.staged, fixture.session.sendHead(1, &response_head, true));
+    try testing.expectEqual(Session.Step.closed, fixture.settle());
+    try testing.expect(fixture.session.closed_with == null);
+}
+
 test "h2 session: our GOAWAY names the last stream the caller was handed" {
     var fixture: Fixture = .{};
     fixture.init();

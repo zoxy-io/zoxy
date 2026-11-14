@@ -51,6 +51,7 @@ const relay = @import("../net/relay.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
 const render = @import("render.zig");
+const h2_connection = @import("h2/Connection.zig");
 const router = @import("router.zig");
 const filter = @import("filter.zig");
 const shed = @import("../shed.zig");
@@ -151,6 +152,7 @@ pub const RenderScratch = struct {
 
 pub fn Proxy(comptime IoType: type) type {
     const ServerType = @import("../Server.zig").Server(IoType);
+    const H2Driver = h2_connection.Driver(IoType);
     const ConnType = conn_module.Conn(IoType);
     const StreamType = ConnType.StreamType;
     const UpstreamType = @import("../net/upstream.zig").UpstreamPool(IoType).Upstream;
@@ -605,6 +607,26 @@ pub fn Proxy(comptime IoType: type) type {
             const bytes = headBytes(server, stream);
             const head = bytes[0..stream.head_len];
             const head_is_full = stream.head_len == bytes.len;
+            // h2c by prior knowledge (#275): a listener that allows it hands
+            // a connection whose very first octets are HTTP/2's preface to
+            // the HTTP/2 driver. Before the parse, because the preface is
+            // built to fail one (RFC 9113 §3.4) — a complete head that
+            // hparse would answer 400 — and only on the connection's first
+            // head, because prior knowledge is a claim about byte zero.
+            // Plaintext only: h2c is HTTP/2 *without* TLS, and a terminated
+            // connection negotiates HTTP/2 by ALPN instead (RFC 9113 §3.2–
+            // 3.3) — so a TLS connection is never sniffed, whatever its
+            // listener says.
+            if (conn.h2c and conn.tls == null and conn.requests_served == 0) {
+                switch (prefaceOf(head)) {
+                    .absent => {},
+                    .partial => {
+                        assert(!head_is_full);
+                        return readMoreHead(server, stream);
+                    },
+                    .whole => return H2Driver.startH2c(server, stream, head),
+                }
+            }
 
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
@@ -621,19 +643,37 @@ pub fn Proxy(comptime IoType: type) type {
                     // converts it to the oversize verdicts below — so here
                     // there is room to read more.
                     assert(!head_is_full);
-                    installHeadBudget(server, stream);
-                    if (conn.tls != null) {
-                        armTlsHeadRecv(server, stream);
-                    } else {
-                        armHeadRecv(server, stream);
-                    }
-                    return;
+                    return readMoreHead(server, stream);
                 },
                 error.Malformed => return respond(server, stream, 400, "l7_bad_request"),
                 error.UriTooLong => return respond(server, stream, 414, "l7_uri_too_long"),
                 error.HeadTooLarge => return respond(server, stream, 431, "l7_headers_too_large"),
             };
             routeRequest(server, stream, &request);
+        }
+
+        /// The head is not all here: start its slowloris clock, and read on.
+        fn readMoreHead(server: *ServerType, stream: *StreamType) void {
+            assert(stream.phase == .reading_head);
+            assert(stream.head_len < headBytes(server, stream).len);
+            installHeadBudget(server, stream);
+            if (stream.conn.tls != null) {
+                armTlsHeadRecv(server, stream);
+            } else {
+                armHeadRecv(server, stream);
+            }
+        }
+
+        /// How much of HTTP/2's client preface (RFC 9113 §3.4) `head` is:
+        /// all of it, a prefix of it with more to come, or not it at all.
+        const Preface = enum { absent, partial, whole };
+
+        fn prefaceOf(head: []const u8) Preface {
+            const preface = h2_connection.preface;
+            const seen = @min(head.len, preface.len);
+            if (!std.mem.eql(u8, head[0..seen], preface[0..seen])) return .absent;
+            if (seen == preface.len) return .whole;
+            return .partial;
         }
 
         /// Start this head's #235 slowloris clock: the idle window ends
