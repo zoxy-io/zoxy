@@ -19,6 +19,10 @@ const repeat = zoxy.testing.repeat;
 /// under every schedule the adversary produces.
 pub const log_request_header = "x-sim-trace";
 pub const log_request_value = "sim-trace-1";
+/// The one other value it may carry: an HTTP/2 flood's (#276), whose
+/// streams the server ends on purpose — so a clean seed's aborted lines
+/// can be told apart, every one of them a flood's or a bug.
+pub const log_request_flood_value = "sim-flood-1";
 pub const log_response_header = "x-sim-origin";
 pub const log_response_value = "sized";
 

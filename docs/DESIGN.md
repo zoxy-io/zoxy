@@ -2749,7 +2749,11 @@ equalities a shared runner's noise cannot move.
    streams on one connection, each held to the same allowed statuses and
    canonical bodies — whole frames only, every stream answered at most
    once — with the session and stream pools starved on some seeds so
-   their sheds fire too. A quarter of seeds run
+   their sheds fire too. A third of those clients flood instead (#276),
+   one per-connection budget each — Rapid Reset paced by PING, so the
+   budget and not the pool is what it meets — and are held to the
+   connection's end: `GOAWAY(ENHANCE_YOUR_CALM)` on a clean seed, whose
+   aborted lines must then all be a flood's. A quarter of seeds run
    clean — adversary off, origin well-behaved — hardening the L7 oracle
    from prefix-legality to each script's exact golden outcome, so a
    silently torn-down exchange that should have been answered fails the
