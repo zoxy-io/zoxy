@@ -325,7 +325,11 @@ pub fn Exchange(comptime IoType: type) type {
             if (session.awaitingClient(stream.h2_id)) {
                 session.resetStream(stream.h2_id, .no_error);
             }
-            server.releaseSharedStream(stream);
+            if (stream.armedCount() == 0) return server.releaseSharedStream(stream);
+            // An op the answer did not wait for is still out — a timed-out
+            // dial's cancel, when the 504 came from the connect's own
+            // completion — and the slot waits for it, as an ending one does.
+            server.endSharedStream(stream);
         }
 
         /// The exchange cannot finish: reset the stream with `code` — if

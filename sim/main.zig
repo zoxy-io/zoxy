@@ -325,32 +325,11 @@ const uncovered = [_]Uncovered{
             "src/http_proxy_test.zig exhausts the upstream pool directly",
     },
     .{
-        .name = "h2_connections",
-        .why = .unreached,
-        .reason = "the simulator does not speak HTTP/2 yet — its client is " ++
-            "#275's last slice; src/http_proxy_test.zig drives h2c " ++
-            "connections through a real server directly",
-    },
-    .{
-        .name = "h2_shed_sessions",
-        .why = .unreached,
-        .reason = "the simulator does not speak HTTP/2 yet — its client is " ++
-            "#275's last slice; src/http_proxy_test.zig exhausts the " ++
-            "session pool directly",
-    },
-    .{
         .name = "shed_h2_sessions",
         .why = .unreached,
-        .reason = "the simulator does not speak HTTP/2 yet — its client is " ++
-            "#275's last slice; src/http_proxy_test.zig sheds an h2-only " ++
-            "listener's accept directly",
-    },
-    .{
-        .name = "h2_shed_streams",
-        .why = .unreached,
-        .reason = "the simulator does not speak HTTP/2 yet — its client is " ++
-            "#275's last slice; src/http_proxy_test.zig exhausts the " ++
-            "shared stream pool directly",
+        .reason = "the simulator's terminating listener offers http/1.1 alone, and only " ++
+            "a listener offering h2 alone sheds at accept; " ++
+            "src/http_proxy_test.zig drives one directly",
     },
     .{
         .name = "tunnels_drained",

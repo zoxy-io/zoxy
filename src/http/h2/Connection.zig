@@ -212,6 +212,14 @@ pub fn Driver(comptime IoType: type) type {
             const slot = conn.h2.?;
             if (slot.driving) return;
             if (slot.closing) return; // `close` is already sending its last.
+            // Under a borrow of the serving path's scratches — an origin's
+            // completion mid-parse — a step could hand some exchange an
+            // event that borrows again. So stage only what is owed, read
+            // nothing, and send: that send's completion steps the rest.
+            if (server.headerScratchLent() or server.renderScratchLent()) {
+                slot.session.stagePending();
+                return flush(server, conn, slot);
+            }
             drive(server, conn);
         }
 

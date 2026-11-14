@@ -2246,6 +2246,29 @@ pub fn Proxy(comptime IoType: type) type {
         /// framing strictness applies to it all the same).
         fn parseResponseAndDispatch(server: *ServerType, stream: *StreamType) void {
             assert(stream.phase == .exchanging);
+            parseResponseUnderBorrow(server, stream);
+            resumeOwedInterim(server);
+        }
+
+        /// A multiplexed exchange's interim head is handed to its session at
+        /// once, so the step after it — parsing what follows — would run
+        /// under the parse that forwarded it, whose borrow of the header
+        /// scratch is still held (#275). It is owed instead, and run here,
+        /// once that borrow is over. The stream is the one the parse was
+        /// for, alive: an exchange owing a step has not ended.
+        fn resumeOwedInterim(server: *ServerType) void {
+            assert(!server.headerScratchLent());
+            const owed = server.h2_interim_owed orelse return;
+            server.h2_interim_owed = null;
+            assert(owed.h2_id != 0);
+            // Nothing between the deferral and here could end it: under the
+            // borrow its driver stepped nothing (`Driver.kick`).
+            assert(!ServerType.exchangeEnding(owed));
+            resumeAfterInterim(server, owed);
+        }
+
+        fn parseResponseUnderBorrow(server: *ServerType, stream: *StreamType) void {
+            assert(stream.phase == .exchanging);
             const upstream = stream.upstream.?;
             const head = upstreamHeadBytes(upstream)[0..upstream.head_len];
             const head_is_full = upstream.head_len == upstreamHeadBytes(upstream).len;
@@ -2292,6 +2315,11 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.phase == .exchanging);
             assert(stream.l7.response_leg == .awaiting_head);
             assert(stream.l7.request_head_vacated);
+            forwardUnderBorrow(server, stream);
+            resumeOwedInterim(server);
+        }
+
+        fn forwardUnderBorrow(server: *ServerType, stream: *StreamType) void {
             const upstream = stream.upstream.?;
             const storage = server.borrowHeaderScratch();
             defer server.returnHeaderScratch();
@@ -4200,7 +4228,14 @@ pub fn Proxy(comptime IoType: type) type {
                 // The proxied continuations, as `onClientWritten` runs them —
                 // a body chunk's included, which the HTTP/1.1 pump sends on
                 // its own and a multiplexed exchange's hands over here.
-                .interim_sent => return resumeAfterInterim(server, stream),
+                // Under a parse's borrow, the next parse is owed to it
+                // (`resumeOwedInterim`); from `.writable`, it runs now.
+                .interim_sent => {
+                    if (!server.headerScratchLent()) return resumeAfterInterim(server, stream);
+                    assert(server.h2_interim_owed == null);
+                    server.h2_interim_owed = stream;
+                    return;
+                },
                 .response_excess => return sendResponseExcess(server, stream),
                 .response_body => return afterResponseExcess(server, stream),
                 // No upgrade reaches HTTP/2 (RFC 9113 §8.6).
