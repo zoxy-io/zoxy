@@ -73,6 +73,15 @@ pub const Slot = struct {
     /// A `drive` pass is running: what an exchange stages now is flushed
     /// when the pass ends, and `kick` must not start a second one inside it.
     driving: bool,
+    /// A DATA frame's octets its exchange had no room for yet (#275): the
+    /// session's, borrowed until its next step — so the session is neither
+    /// stepped nor read into until the exchange has taken them all, which
+    /// is a stream's backpressure on its whole connection. Only before the
+    /// client applies this side's window can a stream be sent more than its
+    /// buffer holds (RFC 9113 §6.9.2), so in steady state this stays null.
+    /// While it is not, nothing else on the connection is read — the
+    /// exchange's next send, bounded by its deadline, is what frees it.
+    held: ?Session.Step.Data,
 
     /// Back to the state a fresh connection finds it in. The carve stays:
     /// it is the slab's layout, not the connection's.
@@ -83,6 +92,7 @@ pub const Slot = struct {
         slot.closing = false;
         slot.idle_deadline_ns = 0;
         slot.driving = false;
+        slot.held = null;
         assert(slot.buffers.inbound.len >= Session.frame_bytes_max);
     }
 };
@@ -246,6 +256,9 @@ pub fn Driver(comptime IoType: type) type {
             assert(!slot.driving);
             slot.driving = true;
             defer slot.driving = false;
+            // A frame held for room goes first: the session cannot step past
+            // it, and while it waits, what is staged still goes out.
+            if (!offerHeld(server, conn, slot)) return flush(server, conn, slot);
             var passes: u32 = 0;
             while (true) : (passes += 1) {
                 assert(passes < drive_passes_max);
@@ -269,11 +282,11 @@ pub fn Driver(comptime IoType: type) type {
                     .flush_first => return flush(server, conn, slot),
                     .closed => return close(server, conn, slot),
                     .request => |request| ExchangeType.open(server, conn, &request),
-                    // No exchange forwards a body yet: it is answered by §7
-                    // or refused, so what the client sends after its head
-                    // is read and dropped, and its trailers with it.
-                    .data => |data| ExchangeType.discardData(conn, &data),
-                    .trailers => |trailers| assert(ExchangeType.find(conn, trailers.stream) != null),
+                    .data => |data| {
+                        slot.held = data;
+                        if (!offerHeld(server, conn, slot)) return flush(server, conn, slot);
+                    },
+                    .trailers => |trailers| ExchangeType.onTrailers(server, conn, &trailers),
                     .reset => |reset| ExchangeType.onReset(server, conn, &reset),
                     .writable => |writable| ExchangeType.onWritable(server, conn, writable.stream),
                 }
@@ -281,6 +294,25 @@ pub fn Driver(comptime IoType: type) type {
                 // connection: an exchange resets, and the session goes on.
                 assert(!conn.isTearingDown());
             }
+        }
+
+        /// Hand the held frame's octets to their exchange, as many as it has
+        /// room for. True once none are held — the session may step on.
+        fn offerHeld(server: *ServerType, conn: *ConnType, slot: *Slot) bool {
+            const held = slot.held orelse return true;
+            assert(slot.session.state != .closed);
+            const taken = ExchangeType.onData(server, conn, &held);
+            assert(taken <= held.bytes.len);
+            if (taken == held.bytes.len) {
+                slot.held = null;
+                return true;
+            }
+            slot.held = .{
+                .stream = held.stream,
+                .bytes = held.bytes[taken..],
+                .end_stream = held.end_stream,
+            };
+            return false;
         }
 
         /// As much of the backlog as the session has room for, now; the

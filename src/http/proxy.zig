@@ -1139,12 +1139,6 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, stream, 404, "l7_no_route");
             };
 
-            // A multiplexed exchange forwards no request body yet (#275):
-            // one that has a body to forward is refused before anything is
-            // acquired for it, which the client may retry (RFC 9113 §8.7).
-            if (stream.h2_id != 0 and request.framing != .none) {
-                return H2Exchange.abandon(server, stream, .refused_stream);
-            }
             stream.relay_buffer = server.acquireRelayBuffer() orelse {
                 return respond(server, stream, 503, "l7_shed_relay_buffers");
             };
@@ -2001,13 +1995,16 @@ pub fn Proxy(comptime IoType: type) type {
             }
             if (framingDoneOf(&stream.l7.request_framing)) {
                 stream.l7.request_leg = .done;
-            } else {
-                stream.l7.request_leg = .pumping_body;
-                // Relay chunks will flow and be overwritten: from here the
-                // try is no longer reconstructible — no replay (§7).
-                stream.l7.request_body_pumped = true;
-                armRequestBodyRecv(server, stream);
+                return;
             }
+            stream.l7.request_leg = .pumping_body;
+            // Relay chunks will flow and be overwritten: from here the try
+            // is no longer reconstructible — no replay (§7).
+            stream.l7.request_body_pumped = true;
+            // A multiplexed exchange's body arrives as DATA (#275), and its
+            // exchange forwards it rather than reading a socket.
+            if (stream.h2_id != 0) return H2Exchange.forwardBody(server, stream);
+            armRequestBodyRecv(server, stream);
         }
 
         /// The request leg's body pump (client → origin, §7). Framed by the
@@ -3524,6 +3521,7 @@ pub fn Proxy(comptime IoType: type) type {
             // no connection of its own to keep or close, so what it holds
             // goes back and the stream is finished.
             if (stream.h2_id != 0) {
+                if (!request_complete) return H2Exchange.finishAhead(server, stream);
                 detachUpstream(server, stream);
                 server.releaseRelayBuffer(stream.relay_buffer.?);
                 stream.relay_buffer = null;
@@ -3975,6 +3973,19 @@ pub fn Proxy(comptime IoType: type) type {
             };
             const pick = pickEndpointOrShed(server, stream, request_key) orelse return;
             dialUpstream(server, stream, pick, .fresh);
+        }
+
+        /// For the HTTP/2 body pump (#275): a forced completion settles the
+        /// exchange's pending verdict, and a failed send fails its upstream,
+        /// as on the HTTP/1.1 path.
+        pub fn settleVerdict(server: *ServerType, stream: *StreamType) void {
+            assert(stream.h2_id != 0);
+            settlePendingVerdict(server, stream);
+        }
+
+        pub fn failUpstream(server: *ServerType, stream: *StreamType) void {
+            assert(stream.h2_id != 0);
+            upstreamFailed(server, stream);
         }
 
         /// The upstream leg failed. A stale checkout takes its one free

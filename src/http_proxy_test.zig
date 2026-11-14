@@ -331,6 +331,10 @@ const HttpOrigin = struct {
         /// The request in flight is chunked, so its total is unknown and
         /// this connection only drains (#236).
         chunked_request: bool = false,
+        /// A chunked request body's end, found as it arrives: an origin
+        /// answers once the last chunk is in, as a real one does (#275).
+        chunk_scanner: parser.ChunkedScanner = .{},
+        chunk_scanned: u32 = 0,
         response_sent: u32 = 0,
 
         fn armRecv(oconn: *OConn) void {
@@ -385,16 +389,20 @@ const HttpOrigin = struct {
                     .chunked => {
                         oconn.chunked_request = true;
                         oconn.request_expected = request.head_len;
-                        oconn.armRecv();
-                        return;
+                        // The body may have come with the head: look at it
+                        // before reading on.
+                        return oconn.tryAdvance();
                     },
                     else => 0,
                 };
                 oconn.request_expected = request.head_len + body_length;
             }
             if (oconn.chunked_request) {
-                oconn.armRecv();
-                return;
+                if (!oconn.chunkedBodyDone()) {
+                    oconn.armRecv();
+                    return;
+                }
+                oconn.request_expected = oconn.request_len - oconn.request_offset;
             }
             const current_len = oconn.request_len - oconn.request_offset;
             assert(current_len <= oconn.request_expected);
@@ -417,6 +425,20 @@ const HttpOrigin = struct {
                 oconn.interim_then_close = true;
             }
             oconn.armSend();
+        }
+
+        /// Scan what arrived of a chunked body since the last look; true
+        /// once its last chunk is in. A body the scanner refuses never ends,
+        /// and the proxy's own verdict is what closes on it.
+        fn chunkedBodyDone(oconn: *OConn) bool {
+            const body_start = oconn.request_offset + oconn.request_expected;
+            if (oconn.chunk_scanned < body_start) oconn.chunk_scanned = body_start;
+            if (oconn.chunk_scanned == oconn.request_len) return false;
+            const progress = oconn.chunk_scanner.feed(
+                oconn.request_buffer[oconn.chunk_scanned..oconn.request_len],
+            ) catch return false;
+            oconn.chunk_scanned += progress.consumed;
+            return progress.done;
         }
 
         fn responseBytes(oconn: *const OConn) []const u8 {
@@ -637,6 +659,9 @@ const Http1Bed = struct {
         head_timeout_ms: ?u32 = null,
         /// The #236 request-body cap; 0 accepts any size.
         max_body_bytes: u64 = constants.request_body_bytes_default,
+        /// The §5 relay buffer half: what an HTTP/2 stream's request body
+        /// window is sized from (#275), so a scenario can make it small.
+        relay_buffer_bytes: u32 = constants.relay_buffer_bytes_default,
         /// The #237 keep-alive request cap; 0 is unlimited.
         keepalive_requests: u32 = constants.keepalive_requests_default,
         /// Put an endpoint nothing listens on *ahead* of the origin, so
@@ -855,6 +880,7 @@ const Http1Bed = struct {
         try bed.server.init(arena, &bed.sim_io, &bed.config, .{
             .conn_slots = options.conn_slots,
             .relay_buffers = options.relay_buffers,
+            .relay_buffer_bytes = options.relay_buffer_bytes,
             .upstream_slots = options.upstream_slots,
             .head_buffers = head_buffers,
             .upstream_head_buffers = options.upstream_head_buffers orelse options.upstream_slots,
@@ -1564,6 +1590,125 @@ test "h2: an origin's failure is its stream's alone — a refused dial's 502, a 
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
         try bed.expectDrained();
     }
+}
+
+/// The body the origin read on its one connection, after the head.
+fn originBody(bed: *Http1Bed) []u8 {
+    const oconn = &bed.origin.conns[0];
+    const raw = oconn.request_buffer[0..oconn.request_len];
+    const head_end = std.mem.indexOf(u8, raw, "\r\n\r\n").? + 4;
+    return raw[head_end..];
+}
+
+test "h2: a request body goes to the origin — a declared length as sent, an undeclared one chunked" {
+    for ([_]bool{ true, false }, 0..) |declared, index| {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, h2BedOptions(40 + index));
+        defer bed.tearDown();
+
+        var wire: H2Wire = .{};
+        wire.preface(&.{});
+        const method = .{ ":method", "POST" };
+        const rest = .{ .{ ":scheme", "http" }, .{ ":path", "/upload" }, .{ ":authority", "a" } };
+        if (declared) {
+            wire.headers(1, &(.{method} ++ rest ++ .{.{ "content-length", "10" }}), false);
+        } else {
+            wire.headers(1, &(.{method} ++ rest), false);
+        }
+        wire.data(1, "hello", false);
+        wire.data(1, "world", true);
+        try bed.exchange(wire.written());
+
+        var storage: [2]H2Answer = undefined;
+        const answers = try h2Answers(bed.client.response(), &storage);
+        try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+        try std.testing.expect(answers[0].ended);
+        const oconn = &bed.origin.conns[0];
+        const head = oconn.request_buffer[0..oconn.request_len];
+        const body = originBody(&bed);
+        if (declared) {
+            try std.testing.expect(std.ascii.findIgnoreCase(head, "content-length: 10\r\n") != null);
+            try std.testing.expectEqualStrings("helloworld", body);
+        } else {
+            // HTTP/2 framed it; HTTP/1.1 has to be told how it ends.
+            try std.testing.expect(std.ascii.findIgnoreCase(head, "transfer-encoding: chunked\r\n") != null);
+            var scanner: parser.ChunkedScanner = .{};
+            const dechunked = try scanner.dechunk(body);
+            try std.testing.expect(dechunked.done);
+            try std.testing.expectEqualStrings("helloworld", body[0..dechunked.payload_len]);
+        }
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+        try bed.expectDrained();
+    }
+}
+
+test "h2: a body past the buffer before the client heard the window is held, and arrives whole" {
+    // A small relay buffer, and a client that never acknowledges this
+    // side's SETTINGS: its streams keep the protocol's 65535-octet window,
+    // and it sends more than the buffer holds. The connection's input waits
+    // on the body's sends instead, and every octet reaches the origin — a
+    // declared length as sent, and an undeclared one chunked, whose framing
+    // is what must never run past the buffer.
+    for ([_]bool{ true, false }, 0..) |declared, index| try expectHeldBody(42 + index, declared);
+}
+
+fn expectHeldBody(seed: u64, declared: bool) !void {
+    var options = h2BedOptions(seed);
+    options.relay_buffer_bytes = 1024;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var payload: [1400]u8 = undefined;
+    for (&payload, 0..) |*octet, index| octet.* = 'a' + @as(u8, @intCast(index % 26));
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    const pseudo = .{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/upload" }, .{ ":authority", "a" } };
+    if (declared) {
+        wire.headers(1, &(pseudo ++ .{.{ "content-length", "2800" }}), false);
+    } else {
+        wire.headers(1, &pseudo, false);
+    }
+    wire.data(1, &payload, false);
+    wire.data(1, &payload, true);
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    var body = originBody(&bed);
+    if (!declared) {
+        var scanner: parser.ChunkedScanner = .{};
+        const dechunked = try scanner.dechunk(body);
+        try std.testing.expect(dechunked.done);
+        body = body[0..dechunked.payload_len];
+    }
+    try std.testing.expectEqual(@as(usize, 2800), body.len);
+    try std.testing.expectEqualStrings(&payload, body[0..1400]);
+    try std.testing.expectEqualStrings(&payload, body[1400..]);
+    try bed.expectDrained();
+}
+
+test "h2: a body over the listener's cap resets its stream, and the connection serves on" {
+    var options = h2BedOptions(43);
+    options.max_body_bytes = 8;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.headers(1, &.{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/upload" }, .{ ":authority", "a" } }, false);
+    wire.data(1, "0123456789", true);
+    wire.get(3, "GET", "/after");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(?u32, 0x2), (try h2AnswerFor(answers, 1)).reset); // INTERNAL_ERROR.
+    try std.testing.expectEqual(@as(u16, 200), (try h2AnswerFor(answers, 3)).status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_body_cut_mid_stream"));
+    try bed.expectDrained();
 }
 
 test "h2: a stream its client resets mid-dial ends alone, and gives back what it held" {

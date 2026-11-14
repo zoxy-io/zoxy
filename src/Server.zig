@@ -98,6 +98,11 @@ pub fn Server(comptime IoType: type) type {
         h2_sessions: Pool(H2Slot),
         /// The layout every slot was carved to, or null with no sessions.
         h2_layout: ?H2Session.Layout,
+        /// SETTINGS_INITIAL_WINDOW_SIZE as every session advertises it
+        /// (#275): what one stream's request body can have outstanding,
+        /// sized so it always fits the relay buffer it is forwarded through
+        /// (`h2RequestWindow`).
+        h2_request_window: u31,
         /// The shared stream pool (#275): the exchanges HTTP/2 multiplexes,
         /// `limits.stream_slots` of them. A pool of its own beside
         /// `streams`, not a tail on it, so admission's one stream per
@@ -671,6 +676,7 @@ pub fn Server(comptime IoType: type) type {
             return .{
                 .concurrent_streams_max = layout.concurrent_streams_max,
                 .header_list_size_max = layout.header_list_size_max,
+                .initial_window_size = server.h2_request_window,
             };
         }
 
@@ -709,12 +715,14 @@ pub fn Server(comptime IoType: type) type {
         ) error{OutOfMemory}!void {
             try server.h2_sessions.init(arena, options.h2_connections);
             server.h2_layout = null;
+            server.h2_request_window = H2Session.window_default;
             if (options.h2_connections == 0) {
                 server.h2_session_slab = &.{};
                 return;
             }
             const layout = h2Layout(options);
             server.h2_layout = layout;
+            server.h2_request_window = H2Exchange.requestWindow(options.relay_buffer_bytes);
             const unit: usize = @intCast(layout.bytes());
             server.h2_session_slab = try arena.alignedAlloc(
                 u8,

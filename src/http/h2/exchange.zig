@@ -21,10 +21,15 @@
 //!
 //! What fails on a stream ends the stream, never its connection: it is
 //! reset, and whatever it has in flight is forced and waited for before
-//! the slot goes back (`Server.endSharedStream`). A request with a body is
-//! refused with REFUSED_STREAM before anything is acquired for it (RFC
-//! 9113 §8.7: no processing has occurred, so the client may retry) until
-//! request bodies are forwarded.
+//! the slot goes back (`Server.endSharedStream`).
+//!
+//! A request body arrives as DATA and goes to the origin through the relay
+//! buffer's client half, framed for HTTP/1.1 as it leaves — chunked when it
+//! declared no length — one send at a time. Its octets are credited back to
+//! the client only once they are sent, and the window a stream advertises
+//! is what the buffer holds, so a client cannot outrun it; one that sends
+//! before it has heard that window is held, connection and all, until the
+//! body's next send makes room (`Driver.offerHeld`).
 
 const std = @import("std");
 const h2 = @import("h2");
@@ -34,6 +39,7 @@ const parser = @import("../parser.zig");
 const Session = @import("Session.zig");
 const downgrade = @import("downgrade.zig");
 const response = @import("response.zig");
+const render = @import("../render.zig");
 const Io = @import("../../io/io.zig");
 
 const hpack = h2.hpack;
@@ -90,6 +96,38 @@ pub const Scratch = struct {
         scratch.lent = false;
     }
 };
+
+/// What a chunked request body's gathered payload must leave behind it:
+/// its chunk's CRLF, and then either the last chunk or the next frame's
+/// headroom — whichever is wider — so the frame it becomes never ends past
+/// the buffer, nor leaves the next payload's start there (#275).
+pub const chunk_tail_bytes: u32 = @intCast(render.chunk_suffix.len +
+    @max(render.chunk_prefix_bytes_max, render.last_chunk.len));
+
+/// What framing costs a request body in its buffer at worst: a frame in
+/// flight (its size line and CRLF), and behind it the next payload's
+/// headroom and `chunk_tail_bytes`. A window of the rest always fits.
+pub const body_framing_bytes: u32 = 2 * render.chunk_prefix_bytes_max +
+    @as(u32, render.chunk_suffix.len) + chunk_tail_bytes;
+
+/// The request-body window a stream advertises (#275): what a relay buffer
+/// holds beside `body_framing_bytes`, so a client honouring it never sends
+/// a stream more than its buffer can take — capped at the protocol's
+/// default, which a client may spend before it hears ours (RFC 9113
+/// §6.9.2), and is held to then (`Driver.offerHeld`).
+pub fn requestWindow(relay_buffer_bytes: u32) u31 {
+    assert(relay_buffer_bytes > body_framing_bytes);
+    const window = @min(relay_buffer_bytes - body_framing_bytes, Session.window_default);
+    assert(window >= 1);
+    return @intCast(window);
+}
+
+comptime {
+    // The last chunk fits where the next frame's headroom would.
+    assert(chunk_tail_bytes >= render.chunk_suffix.len + render.last_chunk.len);
+    // Any legal relay buffer leaves a window.
+    assert(constants.relay_buffer_bytes_min > body_framing_bytes);
+}
 
 pub fn Exchange(comptime IoType: type) type {
     const ServerType = @import("../../Server.zig").Server(IoType);
@@ -313,15 +351,233 @@ pub fn Exchange(comptime IoType: type) type {
             abandon(server, stream, .internal_error);
         }
 
-        /// Request body octets, for an exchange that has none to forward
-        /// them to yet: every exchange here is answered by §7 itself or
-        /// refused, so the octets are read and dropped — consumed, so the
-        /// client's window opens again while the answer goes out.
-        pub fn discardData(conn: *ConnType, data: *const Session.Step.Data) void {
+        // -- the request body --
+
+        /// Request body octets for `data.stream`, taken into its buffer as
+        /// far as there is room. Answers how many were taken: the driver
+        /// holds the rest of the frame — and the connection's input with it
+        /// — until the body's next send makes room, which in steady state
+        /// the window each stream advertises means it never has to. An
+        /// exchange not forwarding a body — answered by §7, or ending — has
+        /// its octets consumed and dropped, so the client's window opens.
+        pub fn onData(server: *ServerType, conn: *ConnType, data: *const Session.Step.Data) u32 {
             assert(conn.state == .h2);
-            assert(find(conn, data.stream) != null);
-            if (data.bytes.len == 0) return;
-            conn.h2.?.session.consume(data.stream, @intCast(data.bytes.len));
+            const length: u32 = @intCast(data.bytes.len);
+            const stream = find(conn, data.stream) orelse return drop(conn, data);
+            if (!forwarding(stream)) return drop(conn, data);
+            const body = &stream.h2_body;
+            // The first payload sits where a frame's starts: past room for
+            // its chunk size line, which goes in front of it when it is sent.
+            // Zero is that place for a declared length, so setting it again
+            // there changes nothing.
+            if (body.payload_start == 0) body.payload_start = headroom(stream);
+            const take = @min(bodyRoom(stream), length);
+            assert(take <= length);
+            const buffer = stream.relay_buffer.?.client_to_upstream;
+            @memcpy(buffer[body.payload_start + body.payload_len ..][0..take], data.bytes[0..take]);
+            body.payload_len += take;
+            assert(body.payload_start + body.payload_len <= buffer.len);
+            body.total += take;
+            stream.log.bytes_in += take;
+            if (conn.max_body_bytes != 0 and body.total > conn.max_body_bytes) {
+                // The listener's cap (#236), on a body that declared no
+                // length: the stream is reset, the connection serves on.
+                server.counters.increment("l7_body_cut_mid_stream");
+                fail(server, stream);
+                return length;
+            }
+            if (take == length and data.end_stream) body.client_ended = true;
+            if (stream.l7.request_leg == .pumping_body) frameAndSend(server, stream);
+            return take;
+        }
+
+        /// The request's trailer section ends the client's half. It is not
+        /// carried: the chunked body's last chunk goes out with none, as
+        /// an origin's trailers do not come back either (#275).
+        pub fn onTrailers(server: *ServerType, conn: *ConnType, trailers: *const Session.Step.Trailers) void {
+            assert(conn.state == .h2);
+            const stream = find(conn, trailers.stream) orelse return;
+            if (!forwarding(stream)) return;
+            stream.h2_body.client_ended = true;
+            if (stream.l7.request_leg == .pumping_body) frameAndSend(server, stream);
+        }
+
+        /// Octets for an exchange that will not forward them, consumed.
+        fn drop(conn: *ConnType, data: *const Session.Step.Data) u32 {
+            const length: u32 = @intCast(data.bytes.len);
+            assert(length == data.bytes.len);
+            if (length >= 1) conn.h2.?.session.consume(data.stream, length);
+            return length;
+        }
+
+        /// The exchange forwards a request body: its upstream half runs,
+        /// and the client's half is still arriving.
+        fn forwarding(stream: *const StreamType) bool {
+            assert(stream.h2_id != 0);
+            if (stream.ending) return false;
+            if (stream.phase != .dialing and stream.phase != .exchanging) return false;
+            if (stream.l7.request_framing == .none) return false;
+            return !stream.h2_body.client_ended;
+        }
+
+        /// A chunked body's headroom: room before the payload for its size
+        /// line, written there when the payload goes.
+        fn headroom(stream: *const StreamType) u32 {
+            return if (stream.l7.request_framing == .chunked) render.chunk_prefix_bytes_max else 0;
+        }
+
+        /// What the buffer can take behind the payload already gathered,
+        /// leaving the chunk suffix and the last chunk their room.
+        fn bodyRoom(stream: *const StreamType) u32 {
+            const body = &stream.h2_body;
+            const capacity: u32 = @intCast(stream.relay_buffer.?.client_to_upstream.len);
+            const tail: u32 = if (stream.l7.request_framing == .chunked) chunk_tail_bytes else 0;
+            const used = body.payload_start + body.payload_len + tail;
+            assert(body.payload_start >= headroom(stream));
+            assert(body.payload_start + body.payload_len <= capacity);
+            return capacity -| used;
+        }
+
+        /// The request head is out (§7's request leg): what the body has
+        /// gathered goes, and the rest follows as it arrives.
+        pub fn forwardBody(server: *ServerType, stream: *StreamType) void {
+            assert(stream.l7.request_leg == .pumping_body);
+            assert(stream.l7.request_framing != .none);
+            const body = &stream.h2_body;
+            if (body.payload_start == 0) body.payload_start = headroom(stream);
+            assert(!body.inFlight());
+            frameAndSend(server, stream);
+        }
+
+        /// Send what the body has gathered, if nothing is in flight: one
+        /// chunk — its size line before it, CRLF after, the last chunk too
+        /// once the client's half has ended — or a declared-length body's
+        /// bare octets. The next payload gathers past it.
+        fn frameAndSend(server: *ServerType, stream: *StreamType) void {
+            const body = &stream.h2_body;
+            assert(stream.l7.request_leg == .pumping_body);
+            if (body.inFlight()) return;
+            if (body.payload_len == 0 and !body.client_ended) return;
+            const chunked = stream.l7.request_framing == .chunked;
+            const buffer = stream.relay_buffer.?.client_to_upstream;
+            var start = body.payload_start;
+            var end = body.payload_start + body.payload_len;
+            if (chunked and body.payload_len >= 1) {
+                var prefix_storage: [render.chunk_prefix_bytes_max]u8 = undefined;
+                const prefix = render.chunkPrefix(body.payload_len, &prefix_storage);
+                assert(prefix.len <= start);
+                start -= @intCast(prefix.len);
+                @memcpy(buffer[start..][0..prefix.len], prefix);
+                @memcpy(buffer[end..][0..render.chunk_suffix.len], render.chunk_suffix);
+                end += @intCast(render.chunk_suffix.len);
+            }
+            if (chunked and body.client_ended) {
+                @memcpy(buffer[end..][0..render.last_chunk.len], render.last_chunk);
+                end += @intCast(render.last_chunk.len);
+            }
+            assert(start <= end);
+            assert(end <= buffer.len);
+            // A declared length, met: nothing is left to frame or send.
+            if (start == end) return bodyForwarded(stream);
+            body.frame_start = start;
+            body.frame_end = end;
+            body.frame_sent = 0;
+            body.frame_payload = body.payload_len;
+            body.frame_last = body.client_ended;
+            body.payload_start = end + headroom(stream);
+            body.payload_len = 0;
+            // `bodyRoom` kept the next frame's headroom behind this one.
+            assert(body.payload_start <= buffer.len);
+            stream.l7.request_body_pumped = true;
+            armBodySend(server, stream);
+        }
+
+        fn armBodySend(server: *ServerType, stream: *StreamType) void {
+            const body = &stream.h2_body;
+            assert(body.inFlight());
+            assert(body.frame_start + body.frame_sent < body.frame_end);
+            // A send on the upstream socket, never a read of the client's.
+            stream.l7.request_op_on_client = false;
+            stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
+            server.io.send(
+                stream.upstream_socket.?,
+                stream.relay_buffer.?.client_to_upstream[body.frame_start + body.frame_sent .. body.frame_end],
+                &stream.op_data_client_to_upstream.completion,
+                StreamType,
+                stream,
+                onBodySent,
+            );
+        }
+
+        fn onBodySent(stream: *StreamType, result: Io.SendError!u32) void {
+            const conn = stream.conn;
+            const server = conn.server;
+            stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
+            if (server.exchangeOver(stream)) return;
+            assert(stream.phase == .exchanging);
+            assert(stream.l7.request_leg == .pumping_body);
+            // A verdict forced this send's completion: it is settled here,
+            // as the HTTP/1.1 body pump settles it (§8).
+            if (stream.l7.pending_verdict != .none) return Proxy.settleVerdict(server, stream);
+            const sent = result catch |err| {
+                server.witnessKernelPressure(.send, err);
+                return Proxy.failUpstream(server, stream);
+            };
+            const body = &stream.h2_body;
+            body.frame_sent += sent;
+            assert(body.frame_start + body.frame_sent <= body.frame_end);
+            if (body.frame_start + body.frame_sent < body.frame_end) return armBodySend(server, stream);
+            // The frame is out: its payload is the client's to send again.
+            if (body.frame_payload >= 1) conn.h2.?.session.consume(stream.h2_id, body.frame_payload);
+            const last = body.frame_last;
+            compactBody(stream);
+            if (last) {
+                bodyForwarded(stream);
+            } else {
+                frameAndSend(server, stream);
+            }
+            // The window update goes out, and a frame held for room is
+            // offered again.
+            Driver.kick(server, conn);
+        }
+
+        /// The frame in flight is gone: what gathered behind it moves to
+        /// the front, where the next frame's payload starts.
+        fn compactBody(stream: *StreamType) void {
+            const body = &stream.h2_body;
+            const buffer = stream.relay_buffer.?.client_to_upstream;
+            const front = headroom(stream);
+            assert(body.payload_start >= front);
+            assert(body.payload_start + body.payload_len <= buffer.len);
+            std.mem.copyForwards(u8, buffer[front..][0..body.payload_len], buffer[body.payload_start..][0..body.payload_len]);
+            body.payload_start = front;
+            body.frame_start = 0;
+            body.frame_end = 0;
+            body.frame_sent = 0;
+            body.frame_payload = 0;
+            body.frame_last = false;
+        }
+
+        /// The whole body reached the origin: the request leg is done.
+        fn bodyForwarded(stream: *StreamType) void {
+            assert(stream.h2_body.client_ended);
+            assert(!stream.h2_body.inFlight());
+            assert(stream.h2_body.payload_len == 0);
+            stream.l7.request_leg = .done;
+        }
+
+        /// The response is whole while the request is still on its way: the
+        /// client is told to stop sending (RST_STREAM(NO_ERROR), RFC 9113
+        /// §8.1), and the exchange ends — a body send in flight forced, its
+        /// upstream not one to park.
+        pub fn finishAhead(server: *ServerType, stream: *StreamType) void {
+            const conn = stream.conn;
+            const session = conn.h2.?.session;
+            assert(stream.h2_ended);
+            assert(stream.l7.request_leg != .done);
+            if (session.awaitingClient(stream.h2_id)) session.resetStream(stream.h2_id, .no_error);
+            server.endSharedStream(stream);
+            Driver.kick(server, conn);
         }
 
         /// The client reset a stream, or the session did for a stream error:
