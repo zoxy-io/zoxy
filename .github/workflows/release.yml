@@ -86,8 +86,8 @@ jobs:
             # Darwin has no static libc, so a macOS binary cannot be fully
             # static and must not ask to be. libcrypto still comes from the
             # archive pkg-config names — what stays dynamic is libSystem,
-            # which every macOS machine has. The nix-store check below is
-            # what holds that distinction to its promise.
+            # which every macOS machine has. The OS-libraries-only check
+            # below is what holds that distinction to its promise.
             static: false
     runs-on: ${{ matrix.os }}
     steps:
@@ -107,20 +107,17 @@ jobs:
         with:
           ref: ${{ github.event.inputs.dry_run == 'true' && github.ref || (github.event.inputs.tag || github.ref) }}
 
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v35
+      # The pinned Zig without Nix — see ci.yml. The version comes from the
+      # checked-out tree's build.zig.zon, so a tag builds with its own Zig.
+      #
+      # No build cache, on purpose. A release artifact is compiled from
+      # nothing but the tag and the hash-pinned packages, never from objects
+      # an earlier run left behind: a cache is a second input nobody audits,
+      # and the few minutes it would save are paid once per release.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
         with:
-          nix_conf: |
-            experimental-features = nix-command flakes
-
-      - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v17
-        with:
-          name: devenv
-          skipPush: true
-
-      - name: Install devenv
-        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+          use-cache: false
 
       - name: Resolve version
         id: ver
@@ -148,7 +145,7 @@ jobs:
           # naming its own dynamic openssl, so the value had to be set
           # *inside* the shell or it was silently discarded and the release
           # linked a shared library it could not find at runtime.
-          devenv shell -- zig build \
+          zig build \
             -Dtarget="${{ matrix.zig_target }}" \
             ${{ matrix.cpu && format('-Dcpu={0}', matrix.cpu) || '' }} \
             ${{ matrix.static && '-Dstatic' || '' }} \
@@ -164,9 +161,14 @@ jobs:
           # runtime — unrunnable on a stock box, and indistinguishable
           # from a good build until someone tried to start it.
           #
-          # A nix store path baked into a release is the same failure
-          # wearing macOS clothes, so both are refused here rather than
-          # discovered by whoever downloads it.
+          # On macOS the same failure is any dylib that is not part of the
+          # OS. This used to look only for a nix store path, which was the
+          # one way it could happen while the build ran in a devenv shell;
+          # without Nix it would be a Homebrew or /usr/local openssl
+          # instead, so the check is now an allowlist — /usr/lib and
+          # /System — rather than a guess at where the stray came from.
+          # Both are refused here rather than discovered by whoever
+          # downloads the release.
           case "${{ runner.os }}" in
             Linux)
               if readelf -d ./out/bin/zoxy 2>/dev/null | grep -q NEEDED; then
@@ -175,9 +177,12 @@ jobs:
               fi
               ;;
             macOS)
-              if otool -L ./out/bin/zoxy | grep -q /nix/store; then
-                echo "::error::links the build machine's nix store:"
-                otool -L ./out/bin/zoxy | grep /nix/store
+              # The first line of `otool -L` names the binary itself.
+              foreign=$(otool -L ./out/bin/zoxy | tail -n +2 | awk '{print $1}' \
+                | grep -vE '^(/usr/lib/|/System/Library/)' || true)
+              if [ -n "$foreign" ]; then
+                echo "::error::links libraries from outside the OS:"
+                echo "$foreign"
                 exit 1
               fi
               ;;
@@ -239,20 +244,12 @@ jobs:
         with:
           ref: ${{ github.event.inputs.dry_run == 'true' && github.ref || (github.event.inputs.tag || github.ref) }}
 
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v35
+      # Only for `zig build schema` below; uncached for the build job's
+      # reason, since the schema ships as a release asset.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
         with:
-          nix_conf: |
-            experimental-features = nix-command flakes
-
-      - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v17
-        with:
-          name: devenv
-          skipPush: true
-
-      - name: Install devenv
-        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+          use-cache: false
 
       - name: Resolve version
         id: ver
@@ -299,7 +296,7 @@ jobs:
           # (§5). It is generated from the Zig config definitions, never
           # committed; shipping it here as an asset keeps a single source of
           # truth.
-          devenv shell -- zig build schema
+          zig build schema
           cp zig-out/config.schema.json "dist/zoxy-$version-config.schema.json"
 
           ( cd dist && sha256sum * > SHA256SUMS.txt )

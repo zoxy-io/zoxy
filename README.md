@@ -82,7 +82,10 @@ topology; read the nightly report rather than any number quoted here.
 
 ### Requirements
 
-- **Zig 0.17** (pinned by [devenv](devenv.nix): `zig_0_17` + `zls`).
+- **Zig 0.17.1** (pinned by [devenv](devenv.nix): `zig_0_17` + `zls`). CI
+  installs the same release without Nix, from `minimum_zig_version` in
+  [build.zig.zon](build.zig.zon); any other way of getting exactly that
+  version works too.
 
 With [devenv](https://devenv.sh), `.envrc` activates the same shell
 automatically on `cd`:

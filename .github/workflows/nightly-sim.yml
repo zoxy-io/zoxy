@@ -160,20 +160,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
-
-      - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v17
-        with:
-          name: devenv
-          skipPush: true
-
-      - name: Install devenv
-        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+      # The pinned Zig without Nix — see ci.yml for why and how. The shards
+      # deliberately share one cache key (no `cache-key: shard`): they build
+      # the identical Debug binary, so the first shard to finish saves the
+      # next night's warm build and packages, and the rest find the key
+      # taken and skip — one entry instead of four copies of the same one.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
 
       # Debug, deliberately, and do not "optimize" this. Measured
       # 2026-07-28 on the dev box, 20k seeds: Debug 25 s, ReleaseSafe
@@ -186,14 +179,14 @@ jobs:
       # both counts and there is no trade left to make.
       #
       # Retried, because this step is where the night meets the network —
-      # the first `devenv shell` realizes the Nix shell, and the first
-      # `zig build` fetches packages — and a shard whose Build fails sweeps
-      # nothing. Twice in October that cost a whole shard to a transient:
-      # a DNS failure cloning zrk (run #80) and an invalid Nix store path
-      # (run #88). Neither range is ever revisited, since ranges are keyed
-      # to the run number, so a few minutes of retry is cheap against a
-      # million unswept seeds. A real compile error fails all three
-      # attempts identically and still fails the shard.
+      # on a cold cache the first `zig build` fetches packages — and a
+      # shard whose Build fails sweeps nothing. Twice in October that cost
+      # a whole shard to a transient: a DNS failure cloning zrk (run #80)
+      # and an invalid Nix store path (run #88, from the devenv shell this
+      # job no longer uses). Neither range is ever revisited, since ranges
+      # are keyed to the run number, so a few minutes of retry is cheap
+      # against a million unswept seeds. A real compile error fails all
+      # three attempts identically and still fails the shard.
       #
       # `-Dbench=false` on both steps keeps zrk and zio, the bench's load
       # generator, out of the build: lazy dependencies are fetched only
@@ -202,7 +195,7 @@ jobs:
       - name: Build
         run: |
           for attempt in 1 2 3; do
-            if devenv shell -- zig build -Dbench=false; then
+            if zig build -Dbench=false; then
               exit 0
             fi
             if [ "$attempt" -lt 3 ]; then
@@ -224,7 +217,7 @@ jobs:
           shard_last=$(( shard_start + SEEDS - 1 ))
           began=$(date +%s)
           set +e
-          devenv shell -- zig build -Dbench=false sim -- "$shard_start" "$SEEDS" keep-going 2>&1 \
+          zig build -Dbench=false sim -- "$shard_start" "$SEEDS" keep-going 2>&1 \
             | tee "sweep-${SHARD}.log"
           status=${PIPESTATUS[0]}
           set -e
@@ -233,7 +226,7 @@ jobs:
           # states the range it actually reached, so a shard that stopped
           # at the failure cap cannot read as having cleared the rest.
           # Anchored to the simulator's own lines so a `seed=`-shaped
-          # string anywhere in the nix or build output cannot be mistaken
+          # string anywhere in the build output cannot be mistaken
           # for the verdict.
           seeds_failed=$(grep -oE '^sim: [0-9]+ seed\(s\) failed: .*' "sweep-${SHARD}.log" \
             | sed 's/^.*failed: //' | head -1 || true)
