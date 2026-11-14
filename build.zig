@@ -444,6 +444,37 @@ pub fn build(b: *std.Build) void {
     );
     smoke_release_step.dependOn(&smoke_release_run.step);
 
+    // The HTTP/2 conformance gate (#277, DESIGN.md §9, §12): h2spec
+    // against the shipped build, over h2c and TLS, its failures held equal
+    // to the deviations §12 records. Merge tier, beside `bench`, and not
+    // in `ci`: h2spec is a Go binary the dev shell provides, and a
+    // per-change gate adds no dependency. Same TLS fixture as smoke, and
+    // smoke's own origin; nothing here links the proxy.
+    const h2spec_exe = b.addExecutable(.{
+        .name = "zoxy-h2spec",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("smoke/h2spec.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    h2spec_exe.root_module.addAnonymousImport("tls_cert_pem", .{
+        .root_source_file = b.path("src/tls/testdata/cert.pem"),
+    });
+    h2spec_exe.root_module.addAnonymousImport("tls_key_pem", .{
+        .root_source_file = b.path("src/tls/testdata/key.pem"),
+    });
+    const h2spec_run = b.addRunArtifact(h2spec_exe);
+    h2spec_run.addArg("--zoxy");
+    h2spec_run.addArtifactArg(release_zoxy);
+    h2spec_run.addPassthruArgs();
+    h2spec_run.has_side_effects = true;
+    const h2spec_step = b.step(
+        "h2spec",
+        "HTTP/2 conformance at merge: h2spec against the ReleaseSafe twin, failures equal to §12's deviations",
+    );
+    h2spec_step.dependOn(&h2spec_run.step);
+
     // §9 Tier 1 and the Tier-0 profile: the two harnesses that drive zrk.
     // Registered whatever `-Dbench` says, so `zig build -l` lists them
     // either way; see `addLoadGenerator` for what the option gates.
@@ -526,6 +557,8 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(micro_step);
     ci_step.dependOn(load_generator.bench_exe);
     ci_step.dependOn(load_generator.profile_harness);
+    // The h2spec harness, on the same terms: run at merge, compiled here.
+    ci_step.dependOn(&h2spec_exe.step);
 
     // Line coverage via kcov (Linux-only, in the dev shell): the unit-test
     // binary plus a simulator sweep, merged — the simulator reaches error

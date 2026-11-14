@@ -8,7 +8,8 @@
 # resolves to in devenv.lock — a lock bump that moves zig moves it too.
 #
 # Beyond zig: zls (editor LSP), kcov (`zig build coverage`, Linux), nginx +
-# haproxy (Tier-1 bench origins, §9), poop (Tier-0 hardware-counter A/B) and
+# haproxy (Tier-1 bench origins, §9), h2spec (`zig build h2spec`, the HTTP/2
+# conformance gate at merge, §12), poop (Tier-0 hardware-counter A/B) and
 # perf + flamegraph (the pinned `zig build profile`).
 { pkgs, lib, ... }:
 {
@@ -22,6 +23,7 @@
       pkgs.zls
       pkgs.nginx
       pkgs.haproxy
+      pkgs.h2spec
     ]
     ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
       pkgs.kcov
