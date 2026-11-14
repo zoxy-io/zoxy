@@ -238,9 +238,10 @@ pub const Unpaid = struct {
     settings: u32 = 0,
     window_update: u32 = 0,
     /// Frames read and set aside: PRIORITY, whose scheme §5.3.2
-    /// deprecates and this server does not schedule by, and the types
-    /// §5.5 says to ignore. Each costs a parse and nothing more, which is
-    /// still a cost a client can repeat.
+    /// deprecates and this server does not schedule by, the types §5.5
+    /// says to ignore, and DATA on a closed stream (`dropClosedData`).
+    /// Each costs a parse and at most a reset, which is still a cost a
+    /// client can repeat.
     ignored: u32 = 0,
     /// DATA with no octets and no END_STREAM: it spends no window, so
     /// nothing else bounds it.
@@ -1307,9 +1308,17 @@ fn handleControl(session: *Session, header: frame.Header, payload: *const frame.
         .rst_stream => |reset| session.handlePeerReset(header.stream_identifier, reset.error_code),
         // §5.3.2's priority scheme is deprecated and this server does
         // not schedule by it, so PRIORITY is legal anywhere and read
-        // never; and §4.1 and §5.5 say an unknown type is ignored. Each
-        // is still a frame parsed, and budgeted.
-        .priority, .unknown => _ = session.spend(.ignored),
+        // never — but for the one rule its parse alone can break: a
+        // stream cannot depend on itself (§5.3.1). Still a frame parsed,
+        // and budgeted.
+        .priority => |priority| {
+            if (!session.spend(.ignored)) return;
+            if (priority.stream_dependency == header.stream_identifier) {
+                session.streamError(header, .protocol_error);
+            }
+        },
+        // §4.1 and §5.5: an unknown type is ignored, and budgeted.
+        .unknown => _ = session.spend(.ignored),
         // The assembler takes every field-block frame, and PUSH_PROMISE
         // failed the connection before it got here.
         .headers, .continuation, .push_promise => unreachable,
@@ -1471,11 +1480,7 @@ fn handleData(session: *Session, header: frame.Header, data: frame.payload.Data)
     session.recv_window -= header.length;
     if (session.recv_window < 0) return session.fail(.flow_control_error);
     const slot = session.streams.find(header.stream_identifier) orelse {
-        // A closed stream's octets: read, dropped, and the connection's
-        // window given back so the siblings are not stalled by them.
-        session.recv_unacked += header.length;
-        session.pending = true;
-        return;
+        return session.dropClosedData(header);
     };
     switch (slot.state) {
         .open, .half_closed_local => {},
@@ -1500,6 +1505,25 @@ fn handleData(session: *Session, header: frame.Header, data: frame.payload.Data)
     slot.recv_unacked += padding;
     if (padding >= 1) session.pending = true;
     session.deliverData(slot, data.data, header.has(.end_stream));
+}
+
+/// DATA on a closed stream: read, dropped, and the connection's window
+/// given back so the siblings are not stalled by it. In flight when this
+/// side reset the stream, which §5.1 says to ignore; on one the client
+/// closed — its reset, or both halves' END_STREAM — a frame it had no
+/// business sending, and STREAM_CLOSED (§5.1). The reset is then this
+/// side's, so the next is ignored. Each costs a parse, and some a reset,
+/// and asks nothing — so each is budgeted, as a frame set aside: a client
+/// cycling through more closed streams than the ring remembers would
+/// otherwise earn a reset per frame, forever.
+fn dropClosedData(session: *Session, header: frame.Header) void {
+    assert(header.frame_type == .data);
+    assert(!isIdle(session, header.stream_identifier));
+    session.recv_unacked += header.length;
+    session.pending = true;
+    if (!session.spend(.ignored)) return;
+    if (session.resetByUs(header.stream_identifier)) return;
+    session.stageReset(header.stream_identifier, .stream_closed);
 }
 
 /// The request body's octets, past every window: §8.1.1's content-length
@@ -1559,11 +1583,23 @@ fn handleBlock(session: *Session, block: *const frame.BlockAssembler.Block) void
     // or this side said it would accept nothing more. Refused either way —
     // REFUSED_STREAM, which tells the client nothing happened (§8.7).
     if (session.goingAway()) return session.refuse(block.stream_identifier, .refused_stream);
+    // §5.3.1: a stream cannot depend on itself — its stream's error, the
+    // block decoded first like every refused one's (trailers: see
+    // `handleTrailers`).
+    if (selfDependent(block)) return session.refuse(block.stream_identifier, .protocol_error);
     switch (decoded) {
         .connection => unreachable, // Failed above.
         .malformed => session.refuse(block.stream_identifier, .protocol_error),
         .ok => |ok| session.openStream(block, ok.count, ok.content_length),
     }
+}
+
+/// Whether the opening HEADERS named its own stream as the one it
+/// depends on — the PRIORITY flag's one rule HTTP/2 still states.
+fn selfDependent(block: *const frame.BlockAssembler.Block) bool {
+    assert(block.stream_identifier != 0);
+    const priority = block.priority orelse return false;
+    return priority.stream_dependency == block.stream_identifier;
 }
 
 /// A well-formed request head: claim a slot, or refuse the stream when the
@@ -1620,6 +1656,8 @@ fn handleTrailers(session: *Session, slot: *StreamTable.Slot, block: *const fram
     }
     if (!block.end_stream) return session.resetAccepted(slot, .protocol_error);
     if (count == null) return session.resetAccepted(slot, .protocol_error);
+    // §5.3.1 holds of any HEADERS carrying a priority, trailers included.
+    if (selfDependent(block)) return session.resetAccepted(slot, .protocol_error);
     if (slot.content_length) |declared| {
         if (slot.data_received != declared) return session.resetAccepted(slot, .protocol_error);
     }

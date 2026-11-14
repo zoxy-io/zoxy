@@ -1008,7 +1008,11 @@ test "h2 session: frames after the client's half closed, and trailers that do no
     try expectReset(reader.nextSkippingAcks(), 1, .protocol_error);
 }
 
-test "h2 session: the client's reset ends its stream, and later frames on it are ignored" {
+test "h2 session: the client's reset ends its stream, and its DATA after that is STREAM_CLOSED, said once" {
+    // §5.1: "An endpoint that receives any frame other than PRIORITY after
+    // receiving a RST_STREAM MUST treat that as a stream error ... of type
+    // STREAM_CLOSED." Once said, the reset is this side's, and the next
+    // frame on the stream is one §5.1 says to ignore.
     var fixture: Fixture = .{};
     fixture.init();
     var blocks: Blocks = .{};
@@ -1018,14 +1022,113 @@ test "h2 session: the client's reset ends its stream, and later frames on it are
     putOpening(&input);
     putHeaders(&input, 1, blocks.encode(&post_fields), false);
     put(&input, .{ .rst_stream = .{ .error_code = .cancel } }, 1, 0);
-    putData(&input, 1, "in flight before the reset", false);
+    putData(&input, 1, "after the client's own reset", false);
+    putData(&input, 1, "and after ours", false);
     try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
     const events = fixture.eventsOf();
     try testing.expectEqual(@as(usize, 2), events.len);
     try testing.expectEqual(.reset, events[1].kind);
     try testing.expectEqual(@as(?frame.ErrorCode, .cancel), events[1].code);
     try testing.expectEqual(@as(u32, 0), fixture.session.streams.used);
+    var reader = fixture.replies();
+    try expectReset(reader.nextSkippingAcks(), 1, .stream_closed);
+    // One reset for both frames: the second met this side's, and was
+    // ignored.
+    try testing.expect(reader.next() == null);
     try testing.expect(fixture.session.closed_with == null);
+}
+
+test "h2 session: DATA on a stream both halves closed is STREAM_CLOSED" {
+    var fixture: Fixture = .{};
+    fixture.init();
+    fixture.caller = .respond;
+    fixture.body = "";
+    var blocks: Blocks = .{};
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    putHeaders(&input, 1, blocks.encode(&request_fields), true);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    try testing.expectEqual(@as(u32, 0), fixture.session.streams.used); // Answered, and gone.
+    var late: Wire = .empty;
+    defer late.deinit(testing.allocator);
+    putData(&late, 1, "after both ends", false);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(late.items));
+    var reader = fixture.replies();
+    const head = reader.nextSkippingAcks().?;
+    try testing.expectEqual(frame.Type.headers, head.header.frame_type);
+    try expectReset(reader.nextSkippingAcks(), 1, .stream_closed);
+    try testing.expect(fixture.session.closed_with == null);
+}
+
+test "h2 session: DATA on closed streams is budgeted as frames set aside, the resets with it" {
+    // Streams the client opened and closed itself, one past the ring's
+    // memory, each answered — then DATA on each, every one a reset: the
+    // budget for frames set aside is what ends it, not the ring.
+    var fixture: Fixture = .{};
+    fixture.init();
+    fixture.caller = .respond;
+    fixture.body = "";
+    var blocks: Blocks = .{};
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    const closed = Session.Unpaid.max.ignored + 1;
+    var stream: u31 = 1;
+    for (0..closed) |_| {
+        putHeaders(&input, stream, blocks.encode(&request_fields), true);
+        stream += 2;
+    }
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    var late: Wire = .empty;
+    defer late.deinit(testing.allocator);
+    stream = 1;
+    for (0..closed) |_| {
+        putData(&late, stream, "", true);
+        stream += 2;
+    }
+    try testing.expectEqual(Session.Step.closed, fixture.feed(late.items));
+    try expectGoaway(&fixture, .enhance_your_calm);
+    try testing.expectEqual(@as(?Session.Calm, .ignored), fixture.session.calm);
+}
+
+test "h2 session: a stream cannot depend on itself — its HEADERS or its PRIORITY is its error" {
+    const self = frame.payload.Priority{ .exclusive = false, .stream_dependency = 1, .weight_octet = 15 };
+    // On the opening HEADERS: refused, its block still decoded for the next.
+    {
+        var fixture: Fixture = .{};
+        fixture.init();
+        var blocks: Blocks = .{};
+        blocks.init();
+        var input: Wire = .empty;
+        defer input.deinit(testing.allocator);
+        putOpening(&input);
+        const block = blocks.encode(&request_fields);
+        put(&input, .{ .headers = .{ .priority = self, .fragment = block, .padding = null } }, 1, frame.Flag.end_headers.bit() | frame.Flag.end_stream.bit());
+        putHeaders(&input, 3, blocks.encode(&request_fields), true);
+        try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+        var reader = fixture.replies();
+        try expectReset(reader.nextSkippingAcks(), 1, .protocol_error);
+        const events = fixture.eventsOf();
+        try testing.expectEqual(@as(usize, 1), events.len);
+        try testing.expectEqual(@as(u31, 3), events[0].stream);
+    }
+    // In a PRIORITY on the open stream: that stream's error, and the
+    // connection serves on.
+    {
+        var fixture: Fixture = .{};
+        var blocks: Blocks = .{};
+        try openHeld(&fixture, &blocks);
+        var input: Wire = .empty;
+        defer input.deinit(testing.allocator);
+        put(&input, .{ .priority = self }, 1, 0);
+        try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+        var reader = fixture.replies();
+        try expectReset(reader.nextSkippingAcks(), 1, .protocol_error);
+        try testing.expect(fixture.session.closed_with == null);
+    }
 }
 
 test "h2 session: a stream's window is ours once acknowledged, and overrunning it is its error" {
