@@ -26,9 +26,18 @@ pub const http = struct {
     pub const filter = @import("http/filter.zig");
     pub const proxy = @import("http/proxy.zig");
     /// What a client outside `src/http/h2/` needs to read a server's
-    /// HTTP/2 field sections (#275): the simulator's h2c client.
+    /// HTTP/2 field sections (#275), and the per-connection budgets a
+    /// client can overrun (#276): the simulator's h2c client, which sends
+    /// one past each.
     pub const h2 = struct {
         pub const ResponseReader = @import("http/h2/ResponseReader.zig");
+        pub const budgets = struct {
+            const Session = @import("http/h2/Session.zig");
+            pub const Calm = Session.Calm;
+            pub const Unpaid = Session.Unpaid;
+            pub const resets_unpaid_max = Session.resets_unpaid_max;
+            pub const field_block_frames_max = Session.field_block_frames_max;
+        };
     };
 };
 pub const Io = @import("io/io.zig");

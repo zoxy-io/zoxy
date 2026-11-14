@@ -270,6 +270,12 @@ tunnels: u32,
 h2c_http: bool,
 h2_connections: u32,
 stream_slots: u32,
+/// Rapid Reset may be among the seed's floods (#276). Drawn with the pools
+/// rather than with the client, because each stream it resets is an
+/// access-log line, a hundred of them as fast as PONGs come back — past
+/// what an adversary's slow sink drains through any staging but the
+/// largest. Such a seed stages at the ceiling, which holds every line.
+h2_rapid_reset: bool,
 /// Decided before `io.init` (the ring the sim registers must equal the
 /// limit the server accounts against — Server.init asserts the match),
 /// consumed by `startServerAndOrigins` for the rest of the pool shape.
@@ -708,9 +714,11 @@ fn deriveHttp2(harness: *Harness, random: std.Random) void {
         harness.h2c_http = false;
         harness.h2_connections = 0;
         harness.stream_slots = 0;
+        harness.h2_rapid_reset = false;
         return;
     }
     harness.h2c_http = true;
+    harness.h2_rapid_reset = random.boolean();
     // A clean seed has room for every client's every stream, so its golden
     // oracle never meets a shed; an adversarial one is sometimes starved to
     // one session and a stream or two.
@@ -1587,6 +1595,12 @@ fn wireListeners(harness: *Harness, forwarded: ?zoxy.config.Config.Listener.Forw
 /// it is pinned by a directed test (`access_log_test.zig`) rather than
 /// left to a seed that cannot generate the volume.
 ///
+/// The one scenario that does generate it is Rapid Reset (#276): a
+/// hundred lines, as fast as PONGs return, outrun any smaller staging
+/// behind the adversary's slow sink. A seed that may draw it stages at
+/// the ceiling, which holds them all, so the drop rung stays the
+/// directed test's.
+///
 /// The floor is one line of *this* config, not the static minimum:
 /// #140's named headers widen a line, and the loader holds a real
 /// config to the wider bound — a hand-built one owes itself the same,
@@ -1596,6 +1610,7 @@ fn deriveAccessLogBuffer(harness: *const Harness) u32 {
     if (harness.config.access_log_sink == null) {
         return 0;
     }
+    if (harness.h2_rapid_reset) return zoxy.constants.access_log_buffer_bytes_max;
     if (harness.clean) {
         return zoxy.constants.access_log_buffer_bytes_default;
     }
@@ -1765,14 +1780,23 @@ fn populateTlsClients(harness: *Harness, random: std.Random) void {
 }
 
 /// One of the HTTP/2 population (#275): its streams drawn, and its end
-/// counted with every other client's.
+/// counted with every other client's. A third of it floods instead, one
+/// budget each (#276), so every one of the server's verdicts is reached
+/// beside the exchanges it must not disturb.
 fn prepareH2Client(harness: *Harness, random: std.Random) void {
     assert(harness.h2c_http);
     assert(harness.h2_count < clients_max);
     const client = &harness.h2_clients[harness.h2_count];
     harness.h2_count += 1;
     const streams = 1 + random.uintLessThan(u8, H2Client.streams_max);
-    client.prepare(&harness.io, httpBindAddress(), streams, harness.clean);
+    const floods = l7.H2Mode.floods;
+    var mode: l7.H2Mode = if (random.uintLessThan(u8, 3) == 0)
+        floods[random.uintLessThan(usize, floods.len)]
+    else
+        .exchange;
+    // Its lines need the staging `h2_rapid_reset` sized for them.
+    if (mode == .rapid_reset and !harness.h2_rapid_reset) mode = .exchange;
+    client.prepare(&harness.io, httpBindAddress(), streams, harness.clean, mode);
     client.on_ended = clientEndedHook;
     client.context = harness;
 }
@@ -2920,8 +2944,13 @@ fn verifyAccessLog(harness: *Harness) !void {
     // This is the half with teeth. The equality above counts a phantom
     // abort on both sides and passes; this one refuses it outright, and
     // is what fails on seed 10 when #129's bug is put back.
+    //
+    // The one abort a clean seed owes is an HTTP/2 flood's (#276): the
+    // server ends that client's connection on purpose, and the streams it
+    // had open with it. Each is traced as a flood's, so the rule stays
+    // exact — every abort a flood's, and any other still a bug.
     if (harness.clean) {
-        if (tally.http_aborted != 0) return error.AccessLogAbortedOnCleanSeed;
+        if (tally.http_aborted != tally.http_aborted_flood) return error.AccessLogAbortedOnCleanSeed;
         // And each L4 connection is one line: the clients connect once
         // apiece, clean-seed pools are sized well past the population so
         // none is shed at admission, and an L4 connection stamps its
@@ -2977,6 +3006,8 @@ const LineTally = struct {
     http: u64 = 0,
     l4: u64 = 0,
     http_aborted: u64 = 0,
+    /// Those of them an HTTP/2 flood's request asked for.
+    http_aborted_flood: u64 = 0,
 };
 
 fn tallyAccessLog(sink: []const u8) !LineTally {
@@ -3006,10 +3037,12 @@ fn tallyAccessLog(sink: []const u8) !LineTally {
         }
         if (std.mem.indexOf(u8, line, "\"outcome\":\"aborted\"") != null) {
             tally.http_aborted += 1;
+            if (std.mem.indexOf(u8, line, l7.canon.log_request_flood_value) != null) tally.http_aborted_flood += 1;
         }
     }
     assert(tally.http + tally.l4 == tally.total);
     assert(tally.http_aborted <= tally.http);
+    assert(tally.http_aborted_flood <= tally.http_aborted);
     return tally;
 }
 
@@ -3118,7 +3151,11 @@ fn verifyLoggedHeaders(line: []const u8, is_http: bool) !void {
     if (has_request != is_http) return error.AccessLogHeadersWrongShape;
     if (has_response != is_http) return error.AccessLogHeadersWrongShape;
     if (!is_http) return;
-    try verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_value);
+    // A flood's requests carry their own trace (#276); any other value is
+    // a capture gone wrong.
+    verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_value) catch {
+        try verifyLoggedValue(line, l7.canon.log_request_header, l7.canon.log_request_flood_value);
+    };
     try verifyLoggedValue(line, l7.canon.log_response_header, l7.canon.log_response_value);
 }
 

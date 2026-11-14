@@ -273,6 +273,10 @@ pub const Unpaid = struct {
 /// asked for goes on, never does.
 pub const resets_unpaid_max: u32 = concurrent_streams_advertised_max;
 
+/// The frames one field block may span — the assembler's bound, which the
+/// CONTINUATION flood (`Calm.continuation`) runs into.
+pub const field_block_frames_max: u32 = frame.BlockAssembler.frames_max_default;
+
 comptime {
     // Every stream a client may have open, abandoned at once, is in budget.
     assert(resets_unpaid_max >= concurrent_streams_advertised_max);
@@ -587,7 +591,7 @@ pub fn init(session: *Session, config: Config, buffers: *const Buffers) void {
         .outbox_sent = 0,
         .decoded = buffers.decoded,
         .fields = buffers.fields,
-        .assembler = frame.BlockAssembler.init(buffers.block, frame.BlockAssembler.frames_max_default),
+        .assembler = frame.BlockAssembler.init(buffers.block, field_block_frames_max),
         .decoder = hpack.Decoder.init(buffers.table.table(), config.header_list_size_max),
         .streams = StreamTable.init(buffers.streams),
         .event = null,

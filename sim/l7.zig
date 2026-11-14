@@ -15,3 +15,4 @@ pub const Client = @import("l7/client.zig").Client;
 pub const ClientError = @import("l7/client.zig").ClientError;
 pub const H2Client = @import("l7/h2_client.zig").Client;
 pub const H2ClientError = @import("l7/h2_client.zig").ClientError;
+pub const H2Mode = @import("l7/h2_client.zig").Mode;
