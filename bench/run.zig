@@ -37,10 +37,29 @@ const assert = std.debug.assert;
 const zoxy_port: u16 = 18180;
 const zoxy_http_port: u16 = 18181;
 const zoxy_https_port: u16 = 18182;
+/// zoxy's h2c listener (#277): its own port, so the HTTP/1.1 L7 bands'
+/// listener stays the one they always measured — no preface to look for.
+const zoxy_h2c_port: u16 = 18183;
 const origin_port: u16 = 19180;
 const haproxy_port: u16 = 17180;
 const haproxy_http_port: u16 = 17181;
 const haproxy_https_port: u16 = 17182;
+/// The most streams zoxy lets one connection open (its advertised
+/// SETTINGS_MAX_CONCURRENT_STREAMS): past it, `--streams` stops measuring
+/// a depth the proxy allows.
+const h2_streams_max: u32 = 100;
+/// Bounds `--connections` so the stream-slot product (`h2Pools`) stays a
+/// sum a u32 holds. zoxy has a tighter ceiling of its own, and a pool
+/// past it is refused at startup, in the banner this harness reads.
+const connections_max: u32 = 1_000;
+
+comptime {
+    assert(@as(u64, connections_max) * (h2_streams_max + 1) <= std.math.maxInt(u32));
+}
+
+/// haproxy's h2c reference: a bind that speaks HTTP/2 by prior knowledge
+/// (`proto h2`) and nothing else, so it is a port of its own.
+const haproxy_h2c_port: u16 = 17183;
 const overload_http_port: u16 = 18291;
 const work_directory = ".zig-cache/zoxy-bench";
 
@@ -131,6 +150,12 @@ const Flags = struct {
     /// rather than the generator.
     large_rate: u64 = 400,
     connections: u32 = 32,
+    /// HTTP/2 streams each connection keeps in flight in the h2 band
+    /// (#277) — zrk's `--streams`, a depth knob rather than more load: the
+    /// offer is still `rate`, so the band compares with keep-alive's, and
+    /// what it adds is the multiplexing a single-stream band never puts
+    /// on the session.
+    streams: u32 = 8,
     duration_s: u64 = 10,
     origin: ?[]const u8 = null,
     zoxy_path: []const u8 = "zig-out/bin/zoxy",
@@ -173,7 +198,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Before either proxy: both configs name these paths.
     try writeCertificates(arena, io);
-    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, origin_address);
+    var zoxy_child = try spawnZoxy(arena, io, flags.zoxy_path, origin_address, h2Pools(&flags));
     var zoxy_running = true;
     defer if (zoxy_running) zoxy_child.kill(io);
     // The banner is the first thing zoxy prints, so a failed bind or a
@@ -211,6 +236,7 @@ const MeasuredModes = struct {
     keep_alive: Runs,
     close_mode: Runs,
     large_body: Runs,
+    h2: H2Runs,
     rss_after_kb: u64,
 };
 
@@ -241,11 +267,13 @@ fn runMeasuredWindow(
     const keep_alive = try runMode(arena, io, direct_port, flags, .keep_alive);
     const close_mode = try runMode(arena, io, direct_port, flags, .close);
     const large_body = try runMode(arena, io, direct_port, flags, .large_body);
+    const h2 = try runH2Mode(arena, io, flags);
     const rss_after_kb = try readRssKb(arena, io, zoxy_pid);
 
     printMode("keep-alive", &keep_alive, .keep_alive);
     printMode("Connection: close", &close_mode, .close);
     printMode("large body", &large_body, .large_body);
+    printH2Mode(&h2, flags);
     std.debug.print("zoxy RSS: {d} KiB -> {d} KiB (budget {d} KiB)\n", .{
         rss_before_kb,
         rss_after_kb,
@@ -255,6 +283,7 @@ fn runMeasuredWindow(
         .keep_alive = keep_alive,
         .close_mode = close_mode,
         .large_body = large_body,
+        .h2 = h2,
         .rss_after_kb = rss_after_kb,
     };
 }
@@ -583,8 +612,8 @@ fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers:
     const ring_seconds: u64 = (3 * head_buffers) / flags.rate + 1;
     warm_flags.duration_s = @max(saturate_duration_s, ring_seconds);
     std.debug.print(
-        "bench: saturating warmup — {d}s keep-alive + {d}s close + {d}s large-body, every zoxy port\n",
-        .{ warm_flags.duration_s, saturate_duration_s, saturate_duration_s },
+        "bench: saturating warmup — {d}s keep-alive + {d}s close + {d}s large-body + {d}s h2, every zoxy port\n",
+        .{ warm_flags.duration_s, saturate_duration_s, saturate_duration_s, saturate_duration_s },
     );
     // The terminating port is here for the ceiling gate's sake, not for
     // symmetry: engine slots and the libcrypto heap are the largest
@@ -604,6 +633,10 @@ fn saturate(arena: std.mem.Allocator, io: Io, flags: *const Flags, head_buffers:
         _ = try loadTest(arena, io, target.port, &warm_flags, .close, target.tls);
         _ = try loadTest(arena, io, target.port, &warm_flags, .large_body, target.tls);
     }
+    // And HTTP/2 on both transports (#277), so the sessions and shared
+    // streams the h2 band uses are resident before the window opens.
+    _ = try loadTestH2(arena, io, zoxy_h2c_port, &warm_flags, false);
+    _ = try loadTestH2(arena, io, zoxy_https_port, &warm_flags, true);
 }
 
 /// Prove every path answers before measuring; the short probes double as
@@ -618,6 +651,27 @@ fn warmUp(arena: std.mem.Allocator, io: Io, direct_port: u16) !void {
     _ = try awaitResponsive(arena, io, haproxy_http_port, "haproxy http", false);
     _ = try awaitResponsive(arena, io, zoxy_https_port, "zoxy L7 TLS", true);
     _ = try awaitResponsive(arena, io, haproxy_https_port, "haproxy https", true);
+    // Every HTTP/2 path (#277): a broken one fails here, as a setup
+    // error, rather than inside the measured window.
+    try awaitResponsiveH2(arena, io, zoxy_h2c_port, "zoxy h2c", false);
+    try awaitResponsiveH2(arena, io, zoxy_https_port, "zoxy h2 TLS", true);
+    try awaitResponsiveH2(arena, io, haproxy_h2c_port, "haproxy h2c", false);
+    try awaitResponsiveH2(arena, io, haproxy_https_port, "haproxy h2", true);
+}
+
+/// `awaitResponsive`'s probe, spoken in HTTP/2: one short paced run that
+/// must complete a request. Not retried — every listener is already up,
+/// since the HTTP/1.1 probes above answered on the same processes.
+fn awaitResponsiveH2(arena: std.mem.Allocator, io: Io, port: u16, label: []const u8, tls: bool) !void {
+    assert(port != 0);
+    assert(label.len > 0);
+    var config = benchConfig(port, 4, 100, "/", tls);
+    config.duration_ns = std.time.ns_per_s / 2;
+    config.http2 = true;
+    const report = try zrk.runner.run(arena, io, &config, 0, null, null, null);
+    if (report.snapshot.counters.completed > 0) return;
+    std.debug.print("bench: {s} on port {d} never answered in HTTP/2\n", .{ label, port });
+    return error.TargetUnresponsive;
 }
 
 /// One scenario's bands plus what they were asked to do, so the gates can
@@ -699,7 +753,24 @@ fn benchPassed(
             }
         }
     }
-    return rss_bounded and bands_ok and drained_cleanly;
+    const h2_ok = h2Passed(&modes.h2, flags);
+    return rss_bounded and bands_ok and h2_ok and drained_cleanly;
+}
+
+/// The h2 band's §9 invariants, as the HTTP/1.1 bands': zoxy's paths
+/// complete their requests under the socket-error ceiling, and every
+/// path — the haproxy references included, by reflection over `H2Runs`
+/// — holds the offered rate.
+fn h2Passed(runs: *const H2Runs, flags: *const Flags) bool {
+    assert(flags.rate >= 1);
+    var passed = proxyHealthy("h2", "h2c", &runs.zoxy_h2c) and
+        proxyHealthy("h2", "h2 TLS", &runs.zoxy_h2);
+    const runs_info = @typeInfo(H2Runs).@"struct";
+    inline for (runs_info.field_names, runs_info.field_types) |name, FieldType| {
+        comptime assert(FieldType == zrk.runner.Report);
+        if (!rateHeld("h2", name, flags.rate, &@field(runs, name))) passed = false;
+    }
+    return passed;
 }
 
 fn parseFlags(args: []const [:0]const u8) !Flags {
@@ -719,6 +790,9 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--connections")) {
             index += 1;
             flags.connections = try std.fmt.parseUnsigned(u32, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--streams")) {
+            index += 1;
+            flags.streams = try std.fmt.parseUnsigned(u32, args[index], 10);
         } else if (std.mem.eql(u8, arg, "--seconds")) {
             index += 1;
             flags.duration_s = try std.fmt.parseUnsigned(u64, args[index], 10);
@@ -743,7 +817,7 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
         } else {
             std.debug.print(
                 "usage: bench [--rate N] [--close-rate N] [--connections N] " ++
-                    "[--seconds N] [--origin host:port] [--zoxy path]\n",
+                    "[--streams N] [--seconds N] [--origin host:port] [--zoxy path]\n",
                 .{},
             );
             return error.InvalidArguments;
@@ -751,7 +825,15 @@ fn parseFlags(args: []const [:0]const u8) !Flags {
     }
     assert(flags.rate >= 1);
     assert(flags.close_rate >= 1);
+    if (flags.streams < 1 or flags.streams > h2_streams_max or flags.connections > connections_max) {
+        std.debug.print(
+            "bench: --streams must be 1..{d} (zoxy's per-connection limit), --connections at most {d}\n",
+            .{ h2_streams_max, connections_max },
+        );
+        return error.InvalidArguments;
+    }
     assert(flags.connections >= 1);
+    assert(flags.streams >= 1);
     assert(flags.duration_s >= 1);
     return flags;
 }
@@ -815,12 +897,20 @@ fn spawnZoxy(
     io: Io,
     zoxy_path: []const u8,
     origin_address: []const u8,
+    h2: H2Pools,
 ) !std.process.Child {
+    assert(h2.stream_slots >= 1);
+    assert(h2.connections >= 1);
     const config_path = work_directory ++ "/zoxy.json";
     // Both protocols on one process (§6, §7): the L4 relay and the L7
     // reverse proxy serve the same origin, so one run bands both paths.
-    // idle_ms stays below nginx's default 75 s keepalive_timeout so
-    // parked upstream connections are reaped before the origin closes
+    // HTTP/2 rides the same process (#277) — `h2` first in the TLS
+    // listener's ALPN, which a client offering only http/1.1 never
+    // negotiates, and h2c on a listener of its own — so the §5 banner
+    // the RSS gate holds prices its pools, sized to what the band opens
+    // rather than to the defaults, which would leave the ceiling loose
+    // by the sessions nobody uses. idle_ms stays below nginx's default 75 s keepalive_timeout
+    // so parked upstream connections are reaped before the origin closes
     // them (§5).
     const config_json = try std.fmt.allocPrint(arena,
         \\{{
@@ -828,11 +918,13 @@ fn spawnZoxy(
         \\        {{ "bind": "127.0.0.1:{d}", "l4": {{ "cluster": "origin" }} }},
         \\        {{ "bind": "127.0.0.1:{d}", "http": {{ "cluster": "origin" }} }},
         \\        {{ "bind": "127.0.0.1:{d}", "http": {{ "cluster": "origin" }},
-        \\          "tls": {{ "cert": "{s}", "key": "{s}" }} }}
+        \\          "tls": {{ "cert": "{s}", "key": "{s}", "alpn": ["h2", "http/1.1"] }} }},
+        \\        {{ "bind": "127.0.0.1:{d}", "http": {{ "cluster": "origin", "h2c": true }} }}
         \\    ],
         \\    "clusters": {{
         \\        "origin": {{ "endpoints": ["{s}"] }}
         \\    }},
+        \\    "limits": {{ "stream_slots": {d}, "h2_connections": {d} }},
         \\    "timeouts": {{
         \\        "connect_ms": 5000,
         \\        "idle_ms": 60000,
@@ -846,7 +938,10 @@ fn spawnZoxy(
         zoxy_https_port,
         work_directory ++ "/cert.pem",
         work_directory ++ "/key.pem",
+        zoxy_h2c_port,
         origin_address,
+        h2.stream_slots,
+        h2.connections,
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 
@@ -956,7 +1051,12 @@ fn spawnHaproxy(
         \\
         \\listen bench_https
         \\    mode http
-        \\    bind 127.0.0.1:{d} ssl crt {s}
+        \\    bind 127.0.0.1:{d} ssl crt {s} alpn h2,http/1.1
+        \\    server origin {s}
+        \\
+        \\listen bench_h2c
+        \\    mode http
+        \\    bind 127.0.0.1:{d} proto h2
         \\    server origin {s}
         \\
     , .{
@@ -966,6 +1066,8 @@ fn spawnHaproxy(
         origin_address,
         haproxy_https_port,
         work_directory ++ "/haproxy.pem",
+        origin_address,
+        haproxy_h2c_port,
         origin_address,
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = conf });
@@ -1113,6 +1215,77 @@ fn runMode(
         .http = try loadTest(arena, io, haproxy_http_port, flags, scenario, false),
         .https = try loadTest(arena, io, haproxy_https_port, flags, scenario, true),
     };
+}
+
+/// The h2 band (#277): HTTP/2 through each proxy's two transports — no
+/// direct baseline, since the origin speaks HTTP/1.1 and a baseline over
+/// another protocol would compare nothing. zoxy against haproxy at the
+/// same offer, depth and core is the comparison, and keep-alive's band
+/// beside it says what multiplexing costs or saves over one stream.
+const H2Runs = struct {
+    zoxy_h2c: zrk.runner.Report,
+    zoxy_h2: zrk.runner.Report,
+    haproxy_h2c: zrk.runner.Report,
+    haproxy_h2: zrk.runner.Report,
+};
+
+fn runH2Mode(arena: std.mem.Allocator, io: Io, flags: *const Flags) !H2Runs {
+    assert(flags.streams >= 1);
+    return .{
+        .zoxy_h2c = try loadTestH2(arena, io, zoxy_h2c_port, flags, false),
+        .zoxy_h2 = try loadTestH2(arena, io, zoxy_https_port, flags, true),
+        .haproxy_h2c = try loadTestH2(arena, io, haproxy_h2c_port, flags, false),
+        .haproxy_h2 = try loadTestH2(arena, io, haproxy_https_port, flags, true),
+    };
+}
+
+/// keep-alive's load, spoken in HTTP/2: h2c by prior knowledge over
+/// cleartext, ALPN `h2` over TLS, `streams` in flight per connection.
+fn loadTestH2(
+    arena: std.mem.Allocator,
+    io: Io,
+    port: u16,
+    flags: *const Flags,
+    tls: bool,
+) !zrk.runner.Report {
+    assert(port != 0);
+    assert(flags.duration_s >= 1);
+    var config = benchConfig(port, flags.connections, flags.rate, "/", tls);
+    config.duration_ns = flags.duration_s * std.time.ns_per_s;
+    config.http2 = true;
+    config.streams = flags.streams;
+    // A path that launched nothing is `h2Passed`'s finding to name, not
+    // an assertion's to crash on.
+    return zrk.runner.run(arena, io, &config, 0, null, null, null);
+}
+
+fn printH2Mode(runs: *const H2Runs, flags: *const Flags) void {
+    assert(flags.streams >= 1);
+    std.debug.print("-- HTTP/2 ({d} streams per connection) --\n", .{flags.streams});
+    printReport("zoxy h2c     ", &runs.zoxy_h2c, .keep_alive);
+    printReport("zoxy h2 TLS  ", &runs.zoxy_h2, .keep_alive);
+    printReport("haproxy h2c  ", &runs.haproxy_h2c, .keep_alive);
+    printReport("haproxy h2   ", &runs.haproxy_h2, .keep_alive);
+}
+
+/// The HTTP/2 pools the band needs, and no more: a session per
+/// connection with a couple over for the warmup's probes, and every
+/// connection's streams in flight at once with one each of headroom —
+/// so the band measures the proxy, never `h2_shed_streams`, and the
+/// banner prices what the window can actually fault in.
+const H2Pools = struct { connections: u32, stream_slots: u32 };
+
+fn h2Pools(flags: *const Flags) H2Pools {
+    assert(flags.connections >= 1);
+    assert(flags.streams >= 1);
+    assert(flags.streams <= h2_streams_max);
+    // `parseFlags` bounded both, so neither product overflows.
+    const pools: H2Pools = .{
+        .connections = flags.connections + 2,
+        .stream_slots = flags.connections * (flags.streams + 1),
+    };
+    assert(pools.stream_slots >= flags.connections);
+    return pools;
 }
 
 fn benchConfig(
