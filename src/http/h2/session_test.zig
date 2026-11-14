@@ -281,7 +281,13 @@ const Fixture = struct {
             switch (fixture.session.sendHead(job.stream, &response_head, fixture.body.len == 0)) {
                 .staged => job.head_sent = true,
                 .blocked => return,
-                .refused => unreachable, // `response_head` is well formed.
+                // Well formed, so the outbox is what cannot hold it: the
+                // stream is the caller's to reset, as a server's would be.
+                .refused => {
+                    fixture.session.resetStream(job.stream, .internal_error);
+                    job.* = .{};
+                    return;
+                },
             }
             if (fixture.body.len == 0) {
                 job.* = .{};
@@ -1801,24 +1807,49 @@ test "h2 session: a send leaves the reserve free, so the next reply never waits 
 
 const empty_settings = "\x00\x00\x00\x04\x00\x00\x00\x00\x00";
 
+/// GET https://a/ on streams 1 and 3, ending the stream: `:method GET`,
+/// `:scheme https` and `:path /` from the static table, and `:authority a`
+/// as a literal on its static name.
+const headers_get_1 = "\x00\x00\x06\x01\x05\x00\x00\x00\x01\x82\x87\x84\x01\x01a";
+const headers_get_3 = "\x00\x00\x06\x01\x05\x00\x00\x00\x03\x82\x87\x84\x01\x01a";
+
+/// A corpus entry as `Smith.slice` reads one: a little-endian `u32` length,
+/// then the octets. Written bare, an entry's first four octets are read as
+/// that length, and the target never sees the seed it was written as.
+fn seed(comptime bytes: []const u8) []const u8 {
+    const encoded = comptime encoded: {
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, bytes.len, .little);
+        break :encoded length ++ bytes[0..bytes.len].*;
+    };
+    return &encoded;
+}
+
 test "fuzz: h2 session — any octets, any split: answered or closed, never a third outcome" {
     // Corpus entries lead with the harness's control octet (see
     // `fuzzSession`): `0x07` supplies the opening, reads 8 at a time and
     // answers each request, `0x80` makes the entry carry its own opening,
-    // `0x27` resets every stream on open, `0x17` answers at the head.
+    // `0x27` resets every stream on open, `0x17` answers at the head, and
+    // `0x4c` answers through a 128-octet outbox and a short socket. Each is
+    // `seed`-encoded, so it reaches the target as written.
     try testing.fuzz({}, fuzzSession, .{
         .corpus = &.{
-            "\x80" ++ Session.preface ++ empty_settings,
-            "\x07" ++ "\x00\x00\x08\x06\x00\x00\x00\x00\x00" ++ "pingping",
-            "\x07" ++ "\x00\x00\x04\x01\x04\x00\x00\x00\x01\x82\x87\x84\x41" ++
-                "\x00\x00\x03\x00\x01\x00\x00\x00\x01abc",
-            "\x27" ++ "\x00\x00\x04\x01\x05\x00\x00\x00\x01\x82\x87\x84\x41",
-            "\x07" ++ "\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+            seed("\x80" ++ Session.preface ++ empty_settings),
+            seed("\x07" ++ "\x00\x00\x08\x06\x00\x00\x00\x00\x00" ++ "pingping"),
+            seed("\x07" ++ headers_get_1 ++ "\x00\x00\x03\x00\x01\x00\x00\x00\x01abc"),
+            seed("\x27" ++ headers_get_1),
+            seed("\x07" ++ "\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x00\x01"),
             // Two requests, then credit on the connection and on stream 1.
-            "\x17" ++ "\x00\x00\x04\x01\x05\x00\x00\x00\x01\x82\x87\x84\x41" ++
-                "\x00\x00\x04\x01\x05\x00\x00\x00\x03\x82\x87\x84\x41" ++
+            seed("\x17" ++ headers_get_1 ++ headers_get_3 ++
                 "\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x01\x00\x00" ++
-                "\x00\x00\x04\x08\x00\x00\x00\x00\x01\x00\x01\x00\x00",
+                "\x00\x00\x04\x08\x00\x00\x00\x00\x01\x00\x01\x00\x00"),
+            seed("\x4c" ++ headers_get_1 ++ headers_get_3),
+            // What found the harness assuming a head can never be refused:
+            // a request answered through an outbox no head fits. Already in
+            // `Smith`'s encoding, as the fuzzer saved it.
+            "\x26\x00\x00\x00\x5d\x00\x00\x03\x01\x04\x00\x00\x00\x01\x82\x87" ++
+                "\x84\x00\x00\x00\x98\x01\x82\x87\x84\x41\x00\x15\x5f\x07\xc6\xc0" ++
+                "\x8d\x8a\x5e\x4d\x53\x94\xc4\x7f\x7c\x9c",
         },
     });
 }
@@ -1856,7 +1887,11 @@ fn fuzzSession(context: void, smith: *std.testing.Smith) !void {
     fixture.drain_max = std.math.maxInt(u32);
     fixture.body = &fuzz_body;
     if (control & 0x40 != 0) {
-        fixture.initWith(.{ .outbox_len = Session.outbox_bytes_min });
+        // The smallest outbox the session takes, which no response head
+        // fits — so heads are refused and the streams reset — or one a head
+        // just fits, so the small frames are bodies.
+        const outbox_len: u32 = if (control & 0x01 != 0) Session.outbox_bytes_min else 128;
+        fixture.initWith(.{ .outbox_len = outbox_len });
         fixture.drain_max = 1 + @as(u32, (control >> 2) % 8);
         // Frames of a few octets each: a short body keeps a run short.
         fixture.body = fuzz_body[0..64];
