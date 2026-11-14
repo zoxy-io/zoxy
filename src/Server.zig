@@ -3735,7 +3735,7 @@ pub fn Server(comptime IoType: type) type {
             // A dial-timeout verdict (§8) may already have a cancel in
             // flight; submitting a second would double-arm the op.
             if (conn.stream.armed.connect and !conn.stream.armed.connect_cancel) {
-                server.armConnectCancel(conn);
+                server.armConnectCancel(conn.stream);
             }
             // A dial rebase (§8) may already have this timer's cancel in
             // flight (onDeadlineRebase); submitting a second would double-arm
@@ -4305,6 +4305,52 @@ pub fn Server(comptime IoType: type) type {
             return @max(base / constants.pressure_idle_divisor, 1);
         }
 
+        /// An exchange's next deadline, `timeout_ms` from now. On its
+        /// connection's one timer — a multiplexed exchange's (#275) too, for
+        /// now, where it only refreshes the connection's window — the seam
+        /// a shared stream's own deadline will be kept behind.
+        pub fn storeExchangeDeadline(server: *Self, stream: *StreamType, timeout_ms: u32) void {
+            assert(stream.conn.stream == stream or stream.h2_id != 0);
+            assert(timeout_ms >= 1);
+            server.storeDeadline(stream.conn, timeout_ms);
+        }
+
+        /// Re-base the timer under an exchange's narrowed deadline: its
+        /// connection's, for the reason `storeExchangeDeadline` gives.
+        pub fn rebaseExchangeDeadline(server: *Self, stream: *StreamType) void {
+            assert(stream.conn.stream == stream);
+            assert(!stream.conn.isTearingDown());
+            server.rebaseDeadline(stream.conn);
+        }
+
+        /// Whether the exchange on `stream` is ending under a completion
+        /// just delivered on it — today exactly when its connection is
+        /// being torn down, the one way an exchange ends with ops still in
+        /// flight. Every completion on an exchange's op asks this first, so
+        /// an exchange that can end apart from its connection (#275)
+        /// changes the answer here rather than at every op.
+        pub fn exchangeEnding(stream: *const StreamType) bool {
+            assert(stream.conn.stream == stream or stream.h2_id != 0);
+            return stream.conn.isTearingDown();
+        }
+
+        /// Go on with whatever is ending the exchange — its connection's
+        /// teardown — now that one more of its ops has delivered.
+        pub fn continueExchangeEnd(server: *Self, stream: *StreamType) void {
+            assert(exchangeEnding(stream));
+            assert(stream.conn.state == .tearing_down);
+            server.continueTeardown(stream.conn);
+        }
+
+        /// `exchangeEnding`, and if so `continueExchangeEnd`: the shape every
+        /// completion on an exchange's op opens with. True when the exchange
+        /// is over and the completion has nothing left to do.
+        pub fn exchangeOver(server: *Self, stream: *StreamType) bool {
+            if (!exchangeEnding(stream)) return false;
+            server.continueExchangeEnd(stream);
+            return true;
+        }
+
         /// Public for the relay: activity pushes the idle deadline out;
         /// only the stored value moves, never the armed timer op (§4).
         pub fn storeDeadline(server: *Self, conn: *ConnType, timeout_ms: u32) void {
@@ -4552,7 +4598,7 @@ pub fn Server(comptime IoType: type) type {
                 // Same fixed grace as the exchange verdict above.
                 server.storeDeadline(conn, server.config.idle_timeout_ms);
                 server.armDeadline(conn);
-                server.armConnectCancel(conn);
+                server.armConnectCancel(conn.stream);
                 return;
             }
             // The #235 head budget's own reap, witnessed (#258). Every
@@ -4595,36 +4641,34 @@ pub fn Server(comptime IoType: type) type {
         /// dial (§4: the one cancel outside data-op drain). Callers guard
         /// the double-arm themselves: a verdict cancel may already be in
         /// flight when teardown starts.
-        fn armConnectCancel(server: *Self, conn: *ConnType) void {
-            assert(conn.stream.armed.connect);
-            assert(!conn.stream.armed.connect_cancel);
-            conn.stream.arm(&conn.stream.op_connect_cancel, "connect_cancel");
+        fn armConnectCancel(server: *Self, stream: *StreamType) void {
+            assert(stream.armed.connect);
+            assert(!stream.armed.connect_cancel);
+            stream.arm(&stream.op_connect_cancel, "connect_cancel");
             server.io.connectCancel(
-                &conn.stream.op_connect.completion,
-                &conn.stream.op_connect_cancel.completion,
-                ConnType,
-                conn,
+                &stream.op_connect.completion,
+                &stream.op_connect_cancel.completion,
+                StreamType,
+                stream,
                 onConnectCancel,
             );
         }
 
-        fn onConnectCancel(conn: *ConnType) void {
-            conn.stream.delivered(&conn.stream.op_connect_cancel, "connect_cancel");
-            if (conn.isTearingDown()) {
-                conn.server.continueTeardown(conn);
-                return;
-            }
+        fn onConnectCancel(stream: *StreamType) void {
+            const server = stream.conn.server;
+            stream.delivered(&stream.op_connect_cancel, "connect_cancel");
+            if (server.exchangeOver(stream)) return;
             // A §8 dial-timeout cancel: the connect completion itself
             // carries the verdict (it may deliver before or after this
             // one), so there is nothing to do here. The verdict is still
             // pending, or the 504 answer is already under way.
-            assert(conn.stream.phase == .dialing or conn.stream.phase == .responding or
-                conn.stream.phase == .draining_request);
+            assert(stream.phase == .dialing or stream.phase == .responding or
+                stream.phase == .draining_request);
             // Still dialing implies the verdict is still pending: only the
             // connect completion's divert clears it, and that divert
             // leaves .dialing in the same callback.
-            if (conn.stream.phase == .dialing) {
-                assert(conn.stream.l7.pending_verdict == .gateway_timeout);
+            if (stream.phase == .dialing) {
+                assert(stream.l7.pending_verdict == .gateway_timeout);
             }
         }
 

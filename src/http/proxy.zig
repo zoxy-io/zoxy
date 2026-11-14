@@ -232,10 +232,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             assert(stream.phase == .reading_head);
             // The head budget's verdict forced this op (#247) — the same
             // divert `onHeadRecv` makes, and it must be here too because
@@ -511,7 +508,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
+            if (ServerType.exchangeEnding(stream)) {
                 // The teardown raced the client's first byte (§5): the
                 // kernel may already have bound a ring buffer for the
                 // delivery, and dropping it here would leak that buffer
@@ -524,7 +521,7 @@ pub fn Proxy(comptime IoType: type) type {
                 if (result) |bound| {
                     server.io.bufferGroupReturn(bound.buffer_id);
                 } else |_| {}
-                server.continueTeardown(conn);
+                server.continueExchangeEnd(stream);
                 return;
             }
             assert(stream.phase == .reading_head);
@@ -570,10 +567,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             assert(stream.phase == .reading_head);
             // The head budget's verdict forced this op (#247): the read
             // half was shut down precisely to end it, so its result is
@@ -719,6 +713,10 @@ pub fn Proxy(comptime IoType: type) type {
             stream.l7.head_budget_installed = true;
             const budget_ms = @min(server.config.head_timeout_ms, server.idleTimeoutMs());
             assert(budget_ms >= 1);
+            // The connection's: a head read in pieces off a socket is an
+            // admission stream's alone — a multiplexed exchange's head
+            // arrives whole, in the frame that opened it (#275).
+            assert(stream.h2_id == 0);
             server.narrowDeadline(conn, budget_ms);
         }
 
@@ -967,7 +965,6 @@ pub fn Proxy(comptime IoType: type) type {
         /// Re-base once, here, and every later `storeDeadline` on this
         /// exchange clamps under a timer already due on time.
         fn armRequestDeadline(server: *ServerType, stream: *StreamType) void {
-            const conn = stream.conn;
             assert(stream.phase == .reading_head);
             assert(stream.l7.request_deadline_ns == 0);
             if (server.config.request_timeout_ms == 0) return;
@@ -981,8 +978,8 @@ pub fn Proxy(comptime IoType: type) type {
             stream.l7.request_deadline_ns = now_ns +
                 @as(u64, server.config.request_timeout_ms) * std.time.ns_per_ms;
             assert(stream.l7.request_deadline_ns > now_ns);
-            server.storeDeadline(conn, server.idleTimeoutMs());
-            server.rebaseDeadline(conn);
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
+            server.rebaseExchangeDeadline(stream);
         }
 
         /// Record what this request asked for, before any rung can reject
@@ -1453,8 +1450,8 @@ pub fn Proxy(comptime IoType: type) type {
             // expiry still fires on time and still finds this connection
             // dialing — whichever endpoint it is dialing by then.
             if (budget == .fresh) {
-                server.storeDeadline(conn, server.config.connect_timeout_ms);
-                server.rebaseDeadline(conn);
+                server.storeExchangeDeadline(stream, server.config.connect_timeout_ms);
+                server.rebaseExchangeDeadline(stream);
             } else {
                 // Stated rather than assumed: the budget being carried is
                 // only a budget if it is still running, and what makes it
@@ -1502,14 +1499,14 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_connect, "connect");
-            if (conn.isTearingDown()) {
+            if (ServerType.exchangeEnding(stream)) {
                 // The teardown raced the dial (§5): a socket that arrived
                 // anyway must still be shut down and closed.
                 if (result) |socket| {
                     stream.upstream_socket = socket;
                     server.io.shutdown(socket, .both);
                 } else |_| {}
-                server.continueTeardown(conn);
+                server.continueExchangeEnd(stream);
                 return;
             }
             assert(stream.phase == .dialing);
@@ -1706,7 +1703,6 @@ pub fn Proxy(comptime IoType: type) type {
             /// `route_host` across this call (see `RenderScratch`).
             scratch: *RenderScratch,
         ) void {
-            const conn = stream.conn;
             assert(stream.phase == .dialing);
             assert(request.head_len == stream.l7.request_head_len);
             assert(views.forward.path.len >= 1);
@@ -1763,7 +1759,7 @@ pub fn Proxy(comptime IoType: type) type {
             stream.l7.request_head_sent = 0;
             stream.moveTo(.exchanging);
             stream.l7.request_leg = .sending_head;
-            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             armRequestHeadSend(server, stream);
         }
 
@@ -1874,10 +1870,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             assert(stream.phase == .exchanging);
             assert(stream.l7.request_leg == .sending_head);
             if (stream.l7.pending_verdict != .none) {
@@ -1971,10 +1964,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             assert(stream.phase == .exchanging);
             assert(stream.l7.request_leg == .sending_body_excess);
             if (stream.l7.pending_verdict != .none) {
@@ -2238,10 +2228,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_upstream_to_client, "data_upstream_to_client");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             assert(stream.phase == .exchanging);
             assert(stream.l7.response_leg == .awaiting_head);
             if (stream.l7.pending_verdict != .none) {
@@ -3224,10 +3211,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_upstream_to_client, "data_upstream_to_client");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             assert(stream.phase == .exchanging or stream.phase == .responding);
             const write = &stream.client_write;
             const sent = result catch |err| {
@@ -4216,7 +4200,6 @@ pub fn Proxy(comptime IoType: type) type {
             comptime counter: []const u8,
             may_keep: bool,
         ) bool {
-            const conn = stream.conn;
             assert(!stream.l7.response_started);
             releaseForStaticResponse(server, stream);
             // Retiring the *cap* is only half of it — `conn.deadline_ns`
@@ -4227,7 +4210,7 @@ pub fn Proxy(comptime IoType: type) type {
             // remainder once it sees the later target (§4's lazy
             // tick-and-compare).
             ServerType.clearRequestDeadline(stream);
-            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             server.counters.increment(counter);
             // What the line will say, recorded here where the verdict is
             // made; it is written once the response is on the wire, so
@@ -4377,7 +4360,6 @@ pub fn Proxy(comptime IoType: type) type {
             stream: *StreamType,
             page: *const config_module.Config.StaticPage,
         ) void {
-            const conn = stream.conn;
             assert(stream.phase == .reading_head);
             // `respond`'s own contract: both data ops free, so the send
             // and any lingering drain have their completions.
@@ -4397,7 +4379,7 @@ pub fn Proxy(comptime IoType: type) type {
             // same reason, and they assert the buffer is already gone.
             releaseForStaticResponse(server, stream);
             ServerType.clearRequestDeadline(stream);
-            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             server.counters.increment("l7_responded");
             stream.log.status = page.status;
             stream.log.outcome = .responded;
@@ -4500,7 +4482,6 @@ pub fn Proxy(comptime IoType: type) type {
             request_host: ?[]const u8,
             forward: parser.CanonicalTarget,
         ) void {
-            const conn = stream.conn;
             assert(stream.phase == .reading_head);
             // The same contract `respond` states: both data ops free, so
             // the send and any lingering drain have their completions.
@@ -4553,7 +4534,7 @@ pub fn Proxy(comptime IoType: type) type {
                 server.counters.increment("l7_keepalive_requests_capped");
             }
             ServerType.clearRequestDeadline(stream);
-            server.storeDeadline(conn, server.idleTimeoutMs());
+            server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             server.counters.increment("l7_redirected");
             stream.log.status = redirect.status;
             stream.log.outcome = .redirected;
@@ -4697,10 +4678,7 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            if (conn.isTearingDown()) {
-                server.continueTeardown(conn);
-                return;
-            }
+            if (server.exchangeOver(stream)) return;
             assert(stream.phase == .draining_request);
             _ = result catch |err| {
                 // EOF or error: the client's inbound is drained, so the
