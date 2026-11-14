@@ -2950,7 +2950,18 @@ equalities a shared runner's noise cannot move.
      multi-host cloud fleet (disjoint hosts, saturation self-checks,
      HAProxy/Envoy/Traefik/Caddy). Run per release, never per PR.
 
-5. **Zero-alloc gate.** The full serving path — including a drain — runs
+5. **HTTP/2 conformance — [h2spec](https://github.com/summerwind/h2spec),
+   at merge** (#277). An implementation of RFC 9113 sharing no code with
+   this proxy — which zrk, pinning the same `zoxy-io/h2`, cannot be —
+   run by `zig build h2spec` against the ReleaseSafe twin, over h2c and
+   over TLS, beside smoke's own origin (`smoke/h2spec.zig`). Its verdict
+   is an equality like Tier 0.5's: the cases that fail are exactly the
+   deviations §12 records, out of every case h2spec has, so a deviation
+   fixed fails it as loudly as a regression. Merge tier rather than
+   per change only because h2spec is a Go binary the dev shell provides,
+   and a per-change gate adds no dependency; `ci` compiles the harness.
+
+6. **Zero-alloc gate.** The full serving path — including a drain — runs
    in tests under a failing/counting allocator; baseline allocation count
    must equal the final count. Steady state also asserts zero allocating
    syscalls (no mmap/brk after init) via counters.
@@ -3050,10 +3061,12 @@ is a trap rather than a synonym.
 | **8297** early hints | defines `103` | §7's interim relay (#232) |
 | **9209** `Proxy-Status` | defines the field and the error-token registry a proxy may name a cause from | §8's opt-in, with one deviation below |
 | **3986** URI syntax | §2.3 unreserved, §5.2.4 dot-segments | §7 canonical path |
+| **9113** HTTP/2 | §3.4 preface; §4.2 frame size; §5.1 stream states and §5.1.1 identifiers; §6 every frame's rules; §6.5 SETTINGS; §6.8 GOAWAY; §6.9 flow control; §8.2–§8.3 field validity, connection-specific fields, pseudo-headers | the h2 session and its downgrade (#275, #277), with two deviations below |
+| **7541** HPACK | the codec, and §4.1's list-size accounting | the `h2` package's decoder and encoder |
 
 RFC 9111 (caching) binds only an implementation that caches, which §1
-rules out — a non-caching gateway inherits nothing from it. RFC 9113,
-9114 and 9204 arrive with #173 and #197 and not before.
+rules out — a non-caching gateway inherits nothing from it. RFC 9114
+and 9204 arrive with #197 and not before.
 
 **TLS, because this proxy terminates it** (§4). RFC 8446 is the protocol
 and §4.6.1 its resumption tickets; **6066** §3 is SNI, which is what a
@@ -3107,6 +3120,29 @@ closed the other half of it.
   alone would add a field no downstream reads. It returns as a decision
   if a deployment ever needs loop detection this proxy can see.
 
+Two more are HTTP/2's (#277), and `zig build h2spec` holds the first to
+its case (§9):
+
+- **An h2c listener answers an invalid preface in HTTP/1.1** (h2spec
+  `http2/3.5` "Sends invalid connection preface"; 9113 §3.4 says to
+  close). Prior knowledge on a listener that serves HTTP/1.1 too means
+  octets that are not the preface are an HTTP/1.1 request, and one this
+  malformed is answered `400` as any other would be — the listener
+  cannot refuse HTTP/1.1 for being not-HTTP/2. Over TLS, where ALPN
+  chose `h2` before a byte of either, an invalid preface closes the
+  connection, and h2spec passes every case.
+
+- **A header list past the advertised `SETTINGS_MAX_HEADER_LIST_SIZE`
+  ends the connection, with ENHANCE_YOUR_CALM** (§8's field-block
+  budget), where 9113 §10.5.1 would allow a `431` on the stream. The
+  limit is advisory, so a client may send past it — but the decoder
+  stops at the bound, which is what makes it the HPACK-bomb defence,
+  and a block decoded part-way leaves the connection's table out of
+  step with the client's. The gate runs h2spec with field values that
+  fit the advertised list (`--max-header-length 3000`; its default
+  makes two of them 8 240 octets against 8 192), so the case that sends
+  two keeps testing CONTINUATION rather than this bound.
+
 **There is no conformance suite**, official or otherwise, and §9's gates
 are internal by construction — the fuzzer asserts *this* parser never
 panics and never admits a third outcome, which is a different claim from
@@ -3118,7 +3154,11 @@ request-smuggling class was found, and it tests exactly the property
 §7's strictness claims — the first differential run against it produced
 #244, the one payload in twenty-one where this proxy was the permissive
 side, and §7's trailer rule above is that run's verdict. h2spec answers
-the same question for #173 and arrives with it.
+the same question for HTTP/2 (§9, #277). Its first run against the
+shipped binary failed seven of 145 cases: five were this proxy's to
+fix — a frame after the client's own reset, and on a stream both halves
+closed, is STREAM_CLOSED; no stream may depend on itself; a stream's
+window takes one full frame — and two are the deviations above.
 
 ## 13. Embedding — the library seam
 

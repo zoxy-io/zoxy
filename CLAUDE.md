@@ -26,6 +26,9 @@ direnv activates the shell). Read before writing code:
   ships has failure modes a Debug build cannot reproduce (#283).
 - `zig fmt --check src scripts smoke build.zig build.zig.zon` — the format
   gate (a PostToolUse hook auto-formats files as they are edited).
+- `zig build h2spec` (h2spec against the shipped build, over h2c and TLS;
+  its failures must equal DESIGN.md §12's recorded deviations) runs at
+  merge, beside the bench.
 - `zig build bench` (Tier 1: zrk against an nginx origin) runs at merge,
   not per change — compare bands across runs, never single numbers.
 
