@@ -625,6 +625,10 @@ const Http1Bed = struct {
         h2c: bool = false,
         h2_connections: u32 = 0,
         stream_slots: u32 = 0,
+        /// What a `tls` listener offers in ALPN (#271) — set straight on
+        /// the listener, as `h2c` is, so it may name `h2`, which no config
+        /// can yet (#275).
+        alpn: []const []const u8 = config_module.alpn.http_default,
         /// The §8 drain deadline. The bed's default is a real one; a
         /// tunnel scenario needs the zero case, which is production's
         /// default and the one #180 had to answer for.
@@ -796,7 +800,7 @@ const Http1Bed = struct {
                 .{
                     .cert_path = "cert.pem",
                     .key_path = "key.pem",
-                    .alpn = config_module.alpn.http_default,
+                    .alpn = options.alpn,
                 }
             else
                 null,
@@ -1142,6 +1146,205 @@ test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a prefa
         try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 400 Bad Request\r\n"));
         try bed.expectDrained();
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 over TLS (#275): `h2` selected in ALPN, the same driver behind the
+// engine. The listener offers `h2` straight from the bed — no config can
+// name it while every stream is refused.
+// ---------------------------------------------------------------------------
+
+const h2_offer: []const []const u8 = &.{ "h2", "http/1.1" };
+
+fn h2TlsBedOptions(seed: u64) Http1Bed.Options {
+    return .{
+        .seed = seed,
+        .tls = true,
+        .alpn = h2_offer,
+        .h2_connections = 2,
+        .stream_slots = 4,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    };
+}
+
+/// One client selecting `h2`, a refused request, and a drain to end it: the
+/// frames come back whole through the engine, read or written in whatever
+/// pieces `partial_io` makes of them.
+fn expectH2OverTls(seed: u64, partial_io: bool) !void {
+    var options = h2TlsBedOptions(seed);
+    options.partial_io = partial_io;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = h2_preface ++ h2_settings ++ h2_get,
+        .alpn = h2_offer,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    // Inside the idle window, so it is the drain that ends the connection.
+    bed.armDrainTimer(50);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqualStrings("h2", client.alpnSelected().?);
+    var frames: [8]H2Frame = undefined;
+    const count = try h2Frames(client.app_received[0..client.app_received_len], &frames);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(u8, 0x4), frames[0].frame_type); // SETTINGS.
+    try std.testing.expectEqual(@as(u8, 0), frames[0].flags);
+    try std.testing.expectEqual(@as(u8, 0x4), frames[1].frame_type); // Its ACK.
+    try std.testing.expectEqual(@as(u8, 0x1), frames[1].flags);
+    try std.testing.expectEqual(@as(u8, 0x3), frames[2].frame_type); // RST_STREAM,
+    try std.testing.expectEqual(@as(u31, 1), frames[2].stream);
+    try std.testing.expectEqual(@as(u32, 0x7), std.mem.readInt(u32, frames[2].payload[0..4], .big)); // REFUSED.
+    try std.testing.expectEqual(@as(u8, 0x7), frames[3].frame_type); // GOAWAY,
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, frames[3].payload[4..8], .big)); // NO_ERROR.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_relay_failed"));
+    // Nothing of HTTP/1.1 happened.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_request"));
+    try bed.expectDrained();
+}
+
+test "h2: `h2` in ALPN is answered in HTTP/2 over TLS — SETTINGS, its ACK, a refused stream, a drain's GOAWAY" {
+    try expectH2OverTls(58, false);
+    try expectH2OverTls(59, true);
+}
+
+test "h2: a client choosing HTTP/1.1, or naming nothing, on an h2 listener is served HTTP/1.1" {
+    const offers = [_][]const []const u8{ config_module.alpn.http_default, &.{} };
+    for (offers, 0..) |offer, index| {
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, h2TlsBedOptions(60 + index));
+        defer bed.tearDown();
+
+        var client: TlsClient = undefined;
+        try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+            .host_name = fixture_host_name,
+            .app_data = "GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+            .alpn = offer,
+            .exchange_end = .http_response,
+        });
+        var wind_down: TlsWindDown = .{ .bed = &bed };
+        wind_down.attach(&client);
+        try bed.sim_io.run();
+
+        if (offer.len >= 1) try std.testing.expectEqualStrings("http/1.1", client.alpnSelected().?);
+        if (offer.len == 0) try std.testing.expectEqual(@as(?[]const u8, null), client.alpnSelected());
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            client.app_received[0..client.app_received_len],
+        );
+        // The session reserved for the offer went back unused — at the
+        // handshake's end, which `Proxy.start` asserts — and the pools
+        // are whole again.
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_connections"));
+        try bed.expectDrained();
+    }
+}
+
+test "h2: a client refused in ALPN on an h2 listener leaves no session held" {
+    // The reservation is made at admission, before the client has named
+    // anything; a client naming only what the listener does not speak is
+    // refused in the handshake, and the teardown gives the session back.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2TlsBedOptions(63));
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = h2_preface ++ h2_settings,
+        .alpn = &.{"spdy/3.1"},
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expect(client.refusedForAlpn());
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_alpn_refused"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_connections"));
+    try bed.expectDrained();
+}
+
+/// Winds the scenario down once every one of `clients` clients has ended,
+/// where `TlsWindDown` does at the first: a client that ends early must
+/// not stop the origin under another's request.
+const TlsWindDownAll = struct {
+    bed: *Http1Bed,
+    clients: u32,
+    ended: u32 = 0,
+
+    fn onEnd(context: ?*anyopaque) void {
+        const self: *TlsWindDownAll = @ptrCast(@alignCast(context.?));
+        self.ended += 1;
+        assert(self.ended <= self.clients);
+        if (self.ended < self.clients) return;
+        self.bed.server.beginDrain();
+        self.bed.origin.stopListening();
+    }
+
+    fn attach(self: *TlsWindDownAll, client: *TlsClient) void {
+        client.on_end = onEnd;
+        client.on_end_context = self;
+    }
+};
+
+test "h2: with no session free, a client offering h2 is offered HTTP/1.1 in the handshake instead" {
+    // One session, two clients offering both. Whichever is admitted first
+    // reserves the session and selects `h2`; the other is offered what is
+    // left, and is served HTTP/1.1 rather than turned away. Both send an
+    // HTTP/1.1 request, not knowing which they will be — so the HTTP/2 one
+    // sends a bad preface, and is ended for it.
+    var options = h2TlsBedOptions(62);
+    options.h2_connections = 1;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var clients: [2]TlsClient = undefined;
+    var wind_down: TlsWindDownAll = .{ .bed = &bed, .clients = clients.len };
+    for (&clients, 0..) |*client, index| {
+        const seed: u8 = @intCast(0x70 + 3 * index);
+        try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+            .host_name = fixture_host_name,
+            .app_data = "GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+            .alpn = h2_offer,
+            .exchange_end = .http_response,
+            .x25519_seed = @splat(seed),
+            .p256_seed = @splat(seed + 1),
+            .random = @splat(seed + 2),
+        });
+        wind_down.attach(client);
+    }
+    try bed.sim_io.run();
+
+    const h2_index: usize = if (std.mem.eql(u8, clients[0].alpnSelected().?, "h2")) 0 else 1;
+    const h2 = &clients[h2_index];
+    const h1 = &clients[1 - h2_index];
+    try std.testing.expectEqualStrings("h2", h2.alpnSelected().?);
+    try std.testing.expectEqualStrings("http/1.1", h1.alpnSelected().?);
+    // The HTTP/2 one: the server's preface, then the connection error its
+    // request line earned — GOAWAY(PROTOCOL_ERROR), sealed and sent before
+    // the close.
+    var frames: [4]H2Frame = undefined;
+    const count = try h2Frames(h2.app_received[0..h2.app_received_len], &frames);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(u8, 0x4), frames[0].frame_type);
+    try std.testing.expectEqual(@as(u8, 0x7), frames[1].frame_type);
+    try std.testing.expectEqual(@as(u32, 0x1), std.mem.readInt(u32, frames[1].payload[4..8], .big));
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        h1.app_received[0..h1.app_received_len],
+    );
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_shed_sessions"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("tls_handshakes_completed"));
+    try bed.expectDrained();
 }
 
 test "l7: a malformed request head is answered 400 and closed with FIN" {

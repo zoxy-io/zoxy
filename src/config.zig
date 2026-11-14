@@ -5455,6 +5455,9 @@ fn resolveAlpn(
     var seen: [alpn.protocols_max]bool = @splat(false);
     for (asked) |token| {
         const named = alpn.Protocol.fromToken(token) orelse return error.ListenerTlsAlpnUnknown;
+        // A protocol the serving path speaks only in part is not one an
+        // operator can name yet: `h2` refuses every stream (#275).
+        if (!named.configurable()) return error.ListenerTlsAlpnUnknown;
         if (seen[@backingInt(named)]) return error.ListenerTlsAlpnDuplicate;
         seen[@backingInt(named)] = true;
     }

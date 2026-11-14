@@ -455,6 +455,14 @@ pub fn Server(comptime IoType: type) type {
             /// config, which lives for the process. Empty on a plaintext
             /// socket and on an `l4` listener, which names no protocol.
             alpn_protocols: []const []const u8,
+            /// What it offers instead when HTTP/2 is in that list and no
+            /// session is free to speak it with (#275): the list less `h2`
+            /// (`alpn.withoutH2`). The same slice as `alpn_protocols` when
+            /// that names no `h2`.
+            alpn_fallback: []const []const u8,
+            /// `alpn_protocols` names `h2`, so admission reserves a session
+            /// before it offers it (`acquireTlsAdmission`).
+            alpn_h2: bool,
             accepting: bool,
         };
 
@@ -1217,6 +1225,7 @@ pub fn Server(comptime IoType: type) type {
             server.installTicketKey();
             for (server.config.listeners, 0..) |listener_config, index| {
                 const state = &server.listeners[index];
+                const offer: []const []const u8 = if (listener_config.tls) |tls| tls.alpn else &.{};
                 state.* = .{
                     .server = server,
                     .listener = try server.io.listen(
@@ -1243,9 +1252,16 @@ pub fn Server(comptime IoType: type) type {
                     .unix_bind = listener_config.bind_address == .unix,
                     .protocol = listener_config.protocol,
                     .credentials = server.credentialsFor(index),
-                    .alpn_protocols = if (listener_config.tls) |tls| tls.alpn else &.{},
+                    .alpn_protocols = offer,
+                    .alpn_fallback = config_module.alpn.withoutH2(offer),
+                    .alpn_h2 = config_module.alpn.namesH2(offer),
                     .accepting = false,
                 };
+                // An offer naming HTTP/2 alone has nothing to fall back to
+                // when the session pool is empty. No config can name `h2`
+                // yet; the one that can decides what such a listener says
+                // then, and until it does there is no such listener.
+                assert(state.alpn_fallback.len >= 1 or offer.len == 0);
                 // A listener the config says terminates TLS must have
                 // credentials by now: `main` loads them before `start`, and
                 // starting without them would bind a socket that answers
@@ -1970,43 +1986,15 @@ pub fn Server(comptime IoType: type) type {
             // the handshake's first byte because that is where a shed can
             // still be one — past `finishAdmission` the connection is in
             // the gate identity and the answer would have to be a teardown.
-            const engine: ?*TlsEngine = if (state.credentials) |credentials|
-                server.acquireTlsEngine(credentials, state.alpn_protocols) catch |err| {
-                    // The two causes want opposite answers from an
-                    // operator — provision more engines, or size the
-                    // libcrypto heap — so they keep separate rungs (§8).
-                    // This is the first rung that fires with a relay
-                    // buffer already in hand — every earlier one aborts
-                    // because it could not get what it needed, so
-                    // `abortAdmission` has never had one to give back.
-                    // Returning it here rather than teaching that function
-                    // about buffers keeps the ordering visible: acquire,
-                    // then acquire, then release what the failed step's
-                    // predecessor took.
-                    if (buffer) |acquired| {
-                        server.releaseRelayBuffer(acquired);
-                    }
-                    // Two calls rather than a switch on the rung name:
-                    // `abortAdmission` takes it comptime, which is what
-                    // makes `witnessShed` check the `shed_` prefix that
-                    // puts a rung in the reconcile identity (§9).
-                    switch (err) {
-                        error.EnginesExhausted => server.abortAdmission(
-                            conn,
-                            client_socket,
-                            "shed_tls_engines",
-                        ),
-                        error.CryptoUnavailable => server.abortAdmission(
-                            conn,
-                            client_socket,
-                            "shed_tls_crypto",
-                        ),
-                    }
-                    return;
-                }
+            const tls: ?TlsAdmission = if (state.credentials != null)
+                server.acquireTlsAdmission(state, conn, client_socket, buffer) orelse return
             else
                 null;
+            const engine: ?*TlsEngine = if (tls) |held| held.engine else null;
             server.finishAdmission(conn, client_socket, buffer, engine, state);
+            // After `prepare`, which clears it: the session the offer the
+            // engine makes is a promise of, if it makes one.
+            if (tls) |held| conn.h2 = held.h2;
             if (state.proxy_protocol != null) {
                 // The loader rejects the block on an http listener, so a
                 // non-null here can only be an l4 one (#142).
@@ -2022,6 +2010,64 @@ pub fn Server(comptime IoType: type) type {
             } else {
                 server.startProtocol(conn, state.protocol);
             }
+        }
+
+        /// What a terminating listener holds a connection to before the
+        /// handshake: its engine, and the HTTP/2 session the engine's offer
+        /// promises, when it offers `h2` (#275).
+        const TlsAdmission = struct { engine: *TlsEngine, h2: ?*H2Slot };
+
+        /// The engine, offering `h2` only with a session reserved to speak
+        /// it — so a handshake that selects it can never find the pool
+        /// empty, and a client that could not have been served HTTP/2 is
+        /// offered HTTP/1.1 instead, in the handshake, rather than turned
+        /// away after it (#275). The reservation goes back at the handshake's
+        /// end if the client chose otherwise. Null when the engine could
+        /// not be had: the admission is shed, and what it held released.
+        fn acquireTlsAdmission(
+            server: *Self,
+            state: *const ListenerState,
+            conn: *ConnType,
+            client_socket: IoType.Socket,
+            buffer: ?*relay.RelayBuffer,
+        ) ?TlsAdmission {
+            const credentials = state.credentials.?;
+            const h2: ?*H2Slot = if (state.alpn_h2) server.acquireH2Session() else null;
+            assert(h2 == null or state.alpn_h2);
+            const offer = if (h2 != null) state.alpn_protocols else state.alpn_fallback;
+            assert(offer.len <= config_module.alpn.protocols_max);
+            const engine = server.acquireTlsEngine(credentials, offer) catch |err| {
+                // The two causes want opposite answers from an operator —
+                // provision more engines, or size the libcrypto heap — so
+                // they keep separate rungs (§8). These are the first rungs
+                // that fire with something already in hand — every earlier
+                // one aborts because it could not get what it needed, so
+                // `abortAdmission` has never had anything to give back.
+                // Returning it here rather than teaching that function
+                // about buffers and sessions keeps the ordering visible:
+                // acquire, then acquire, then release what the failed
+                // step's predecessors took.
+                if (h2) |slot| server.releaseH2Session(slot);
+                if (buffer) |acquired| server.releaseRelayBuffer(acquired);
+                // Two calls rather than a switch on the rung name:
+                // `abortAdmission` takes it comptime, which is what makes
+                // `witnessShed` check the `shed_` prefix that puts a rung
+                // in the reconcile identity (§9).
+                switch (err) {
+                    error.EnginesExhausted => server.abortAdmission(
+                        conn,
+                        client_socket,
+                        "shed_tls_engines",
+                    ),
+                    error.CryptoUnavailable => server.abortAdmission(
+                        conn,
+                        client_socket,
+                        "shed_tls_crypto",
+                    ),
+                }
+                return null;
+            };
+            return .{ .engine = engine, .h2 = h2 };
         }
 
         /// The state a protocol's connection starts serving in, in one
@@ -3280,16 +3326,22 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls.?.isConnected());
             assert(conn.tls.?.outbound().len == 0);
             assert(conn.tls_session_up); // The pump counted it on the way here.
-            // What the session negotiated (#271). An `http` listener speaks
-            // one protocol today, so there is nothing to branch on yet;
-            // this read is the seam #275 turns into the branch between
-            // HTTP/1.1 and h2. Until then it states what must already be
-            // true: an `http` session negotiated HTTP/1.1, or nothing (the
-            // client offered no ALPN), and an `l4` one — which offers none
-            // — negotiated nothing.
-            switch (conn.protocol) {
-                .http => if (conn.tls.?.alpnSelected()) |selected| assert(selected == .http_1_1),
-                .l4 => assert(conn.tls.?.alpnSelected() == null),
+            // What the session negotiated (#271): HTTP/2 (#275), or
+            // HTTP/1.1 — chosen, or assumed by a client that offered no
+            // ALPN. An `l4` listener offers none, so negotiates nothing.
+            const selected = conn.tls.?.alpnSelected();
+            if (conn.protocol == .l4) assert(selected == null);
+            if (selected == .h2) {
+                assert(conn.protocol == .http);
+                H2Driver.startTls(server, conn);
+                return;
+            }
+            // Offered and not chosen. Back now rather than at teardown,
+            // which a keep-alive connection may put a long way off: the
+            // session is the next handshake's to offer.
+            if (conn.h2) |slot| {
+                server.releaseH2Session(slot);
+                conn.h2 = null;
             }
             // An L4 connection relays for its whole life and must hold a
             // buffer before the dial (§6); an L7 one takes its per-leg.

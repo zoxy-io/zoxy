@@ -14,7 +14,15 @@
 //! input, for a flush, or is done. Plaintext reaches the session from a
 //! backlog before the socket is read again — an h2c connection's opening
 //! octets, which the HTTP/1.1 head read already pulled into a head buffer
-//! when the preface was recognized there.
+//! when the preface was recognized there, or a terminated connection's
+//! decrypted records.
+//!
+//! Over TLS (RFC 9113 §3.2, `h2` selected in ALPN) the same two ops carry
+//! ciphertext. A read lands in the engine's record buffer and decrypts into
+//! the engine's plaintext buffer, which becomes the backlog; a send seals
+//! the session's staged octets a record's worth at a time and carries the
+//! engine's outbox. Nothing about the session changes: it never learns its
+//! octets were encrypted.
 //!
 //! What a stream becomes is the next slice's: until the exchange runs on a
 //! shared stream, every request is refused with REFUSED_STREAM (RFC 9113
@@ -26,6 +34,8 @@ const std = @import("std");
 
 const Session = @import("Session.zig");
 const Io = @import("../../io/io.zig");
+const TlsEngine = @import("../../tls/Engine.zig");
+const constants = @import("../../constants.zig");
 
 const assert = std.debug.assert;
 
@@ -43,12 +53,15 @@ pub const Slot = struct {
     /// Wired once, never moved; `Session.init` resets it per connection.
     session: *Session,
     buffers: Session.Buffers,
-    /// Plaintext not yet handed to the session — an h2c connection's
-    /// opening octets, borrowed from the head buffer that read them, which
-    /// goes back once this is empty.
+    /// Plaintext not yet handed to the session, borrowed from where it
+    /// landed: an h2c connection's opening octets from the head buffer that
+    /// read them, which goes back once this is empty, or a terminated
+    /// connection's decrypted records from the engine's plaintext buffer,
+    /// which the next read decrypts into — so it is read only once this
+    /// is empty.
     backlog: []const u8,
-    /// Octets of `session.outbound()` the send in flight carries; zero
-    /// when none is.
+    /// Octets the send in flight carries — of `session.outbound()`, or of
+    /// the engine's outbox over TLS; zero when none is.
     sending: u32,
     receiving: bool,
     /// The session is done: once what it staged is sent — its GOAWAY, if
@@ -92,11 +105,34 @@ pub fn Driver(comptime IoType: type) type {
                 server.beginTeardown(conn);
                 return;
             };
-            begin(server, conn, slot);
+            assert(conn.h2 == null);
+            conn.h2 = slot;
+            begin(server, conn);
             slot.backlog = opening;
             // Admitted before a drain, speaking after it: `beginDrain` only
             // reached the connections already speaking HTTP/2, so this one
             // is owed its GOAWAY now, before it can open anything.
+            if (server.draining) slot.session.goAway();
+            drive(server, conn);
+        }
+
+        /// HTTP/2 over TLS (RFC 9113 §3.2): the handshake selected `h2`.
+        /// The listener offers it only with a session reserved at admission
+        /// (`Server.acquireTlsAdmission`), so this one has a session, and
+        /// whatever plaintext the client sent behind its Finished — its
+        /// preface, often — is the session's opening.
+        pub fn startTls(server: *ServerType, conn: *ConnType) void {
+            assert(conn.state == .tls_handshaking);
+            const engine = conn.tls.?;
+            assert(engine.alpnSelected().? == .h2);
+            assert(engine.outbound().len == 0); // The handshake's flight is out.
+            const slot = conn.h2.?;
+            begin(server, conn);
+            assert(conn.tls_pending_len <= engine.plaintext.len);
+            slot.backlog = engine.plaintext[0..conn.tls_pending_len];
+            conn.tls_pending_len = 0;
+            // As for h2c: a drain that began during the handshake found no
+            // HTTP/2 connection here to tell.
             if (server.draining) slot.session.goAway();
             drive(server, conn);
         }
@@ -111,14 +147,14 @@ pub fn Driver(comptime IoType: type) type {
             drive(server, conn);
         }
 
-        /// The connection becomes an HTTP/2 one: its session reset, its
-        /// admission stream's HTTP/1.1 bookkeeping cleared — the head read
-        /// that recognized the preface began a request that never was, and
-        /// left a log line and a head budget behind it.
-        fn begin(server: *ServerType, conn: *ConnType, slot: *Slot) void {
-            assert(conn.h2 == null);
+        /// The connection becomes an HTTP/2 one, on the session the caller
+        /// put in `conn.h2`: the session reset, the admission stream's
+        /// HTTP/1.1 bookkeeping cleared — an h2c head read that recognized
+        /// the preface began a request that never was, and left a log line
+        /// and a head budget behind it.
+        fn begin(server: *ServerType, conn: *ConnType) void {
+            const slot = conn.h2.?;
             slot.reset();
-            conn.h2 = slot;
             conn.enter(.h2);
             const stream = conn.stream;
             stream.log = .{};
@@ -149,7 +185,13 @@ pub fn Driver(comptime IoType: type) type {
                             continue;
                         }
                         flush(server, conn, slot);
-                        if (!slot.receiving) armRecv(server, conn, slot);
+                        if (conn.isTearingDown()) return; // A seal failed.
+                        if (slot.receiving) return;
+                        if (recvRoom(conn)) return armRecv(server, conn, slot);
+                        // The outbox is short of what a read may stage, so
+                        // it holds ciphertext — which `flush` just sent —
+                        // and the send's completion comes back here.
+                        assert(slot.sending >= 1);
                         return;
                     },
                     // The outbox is full: the send completion steps again.
@@ -181,15 +223,27 @@ pub fn Driver(comptime IoType: type) type {
             }
         }
 
+        /// Whether a read may be armed: over TLS, decrypting may stage a
+        /// KeyUpdate's answer behind a record still going out, and the
+        /// engine demands room for that up front — the gate the L7 and L4
+        /// paths put on their reads too.
+        fn recvRoom(conn: *const ConnType) bool {
+            assert(conn.state == .h2);
+            assert(conn.h2 != null);
+            const engine = conn.tls orelse return true;
+            return engine.outboundRoom() >= TlsEngine.emitted_record_bytes_max;
+        }
+
         fn armRecv(server: *ServerType, conn: *ConnType, slot: *Slot) void {
             assert(!slot.receiving);
             assert(slot.backlog.len == 0);
+            assert(recvRoom(conn));
             const stream = conn.stream;
             slot.receiving = true;
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
             server.io.recv(
                 conn.client_socket,
-                slot.session.recvBuffer(),
+                if (conn.tls) |engine| engine.recvBuffer() else slot.session.recvBuffer(),
                 &stream.op_data_client_to_upstream.completion,
                 StreamType,
                 stream,
@@ -219,9 +273,43 @@ pub fn Driver(comptime IoType: type) type {
                 return;
             };
             assert(received >= 1);
-            slot.session.received(received);
+            if (conn.tls) |engine| {
+                if (!decrypt(server, conn, slot, engine, received)) return;
+            } else {
+                slot.session.received(received);
+            }
             server.storeDeadline(conn, server.idleTimeoutMs());
             drive(server, conn);
+        }
+
+        /// A terminated connection's read landed in the engine's record
+        /// buffer: what it decrypts to becomes the backlog. False when it
+        /// ended the connection instead.
+        fn decrypt(
+            server: *ServerType,
+            conn: *ConnType,
+            slot: *Slot,
+            engine: *TlsEngine,
+            received: u32,
+        ) bool {
+            assert(slot.backlog.len == 0); // The buffer below is free.
+            var plaintext: Plaintext = .{ .engine = engine };
+            const sink = plaintext.sink();
+            engine.received(received, &sink) catch {
+                server.counters.increment("tls_relay_failed");
+                server.beginTeardown(conn);
+                return false;
+            };
+            // The client's close_notify: it will write no more. Nothing it
+            // opened is being served — every stream is refused — so there
+            // is nothing left to answer, and the connection ends as a
+            // socket EOF would end it.
+            if (engine.peerClosed()) {
+                server.beginTeardown(conn);
+                return false;
+            }
+            slot.backlog = engine.plaintext[0..plaintext.len];
+            return true;
         }
 
         /// One send in flight at a time, carrying whatever is staged: the
@@ -229,7 +317,10 @@ pub fn Driver(comptime IoType: type) type {
         /// while it appends more behind them.
         fn flush(server: *ServerType, conn: *ConnType, slot: *Slot) void {
             if (slot.sending >= 1) return;
-            const staged = slot.session.outbound();
+            const staged = if (conn.tls) |engine|
+                seal(server, conn, slot, engine)
+            else
+                slot.session.outbound();
             if (staged.len == 0) return;
             const stream = conn.stream;
             slot.sending = @intCast(staged.len);
@@ -263,7 +354,11 @@ pub fn Driver(comptime IoType: type) type {
             };
             assert(sent >= 1);
             assert(sent <= carried);
-            slot.session.outboundSent(sent);
+            if (conn.tls) |engine| {
+                engine.outboundSent(sent);
+            } else {
+                slot.session.outboundSent(sent);
+            }
             if (slot.closing) return close(server, conn, slot);
             // Room came back, which is what a session waiting to flush, or
             // a stream waiting to send, was waiting for.
@@ -275,9 +370,66 @@ pub fn Driver(comptime IoType: type) type {
         fn close(server: *ServerType, conn: *ConnType, slot: *Slot) void {
             slot.closing = true;
             flush(server, conn, slot);
+            if (conn.isTearingDown()) return; // A seal failed.
             if (slot.sending >= 1) return; // `onSend` comes back here.
             assert(slot.session.outbound().len == 0);
+            if (conn.tls) |engine| assert(engine.outbound().len == 0);
             server.beginTeardown(conn);
         }
+
+        /// What a terminated connection sends next: ciphertext already
+        /// staged — a short send's remainder, or a KeyUpdate's answer — or
+        /// else the session's next record's worth, sealed now. Sealed
+        /// octets are spent as far as the session is concerned: the record
+        /// carries them from here, so its outbox can take more while the
+        /// record is in flight. Empty when there is nothing to send, and
+        /// when sealing failed, which tears the connection down.
+        fn seal(server: *ServerType, conn: *ConnType, slot: *Slot, engine: *TlsEngine) []const u8 {
+            assert(slot.sending == 0);
+            if (engine.outbound().len >= 1) return engine.outbound();
+            const plaintext = slot.session.outbound();
+            if (plaintext.len == 0) return &.{};
+            const chunk: u32 = @intCast(@min(plaintext.len, constants.tls_app_chunk_bytes));
+            engine.sendApp(plaintext[0..chunk]) catch {
+                server.counters.increment("tls_relay_failed");
+                server.beginTeardown(conn);
+                return &.{};
+            };
+            slot.session.outboundSent(chunk);
+            assert(engine.outbound().len > chunk); // A record's header and tag.
+            return engine.outbound();
+        }
+
+        /// Where a read's decrypted records land: the engine's plaintext
+        /// buffer, from its front, which the backlog then borrows. One read
+        /// decrypts at most what it completes plus the record it carried
+        /// over — `TlsEngine.plaintext_bytes_min`, which the buffer is at
+        /// least — so it always fits.
+        const Plaintext = struct {
+            engine: *TlsEngine,
+            len: u32 = 0,
+
+            fn sink(self: *Plaintext) TlsEngine.Sink {
+                return .{ .ctx = self, .appData = append, .closed = closed };
+            }
+
+            fn append(ctx: *anyopaque, bytes: []const u8) void {
+                const self: *Plaintext = @ptrCast(@alignCast(ctx));
+                // RFC 8446 §6.1: anything after a close_notify is ignored,
+                // and `decrypt` ends the connection on one anyway.
+                if (self.engine.peerClosed()) return;
+                const buffer = self.engine.plaintext;
+                assert(self.len + bytes.len <= buffer.len);
+                std.mem.copyForwards(u8, buffer[self.len..][0..bytes.len], bytes);
+                self.len += @intCast(bytes.len);
+            }
+
+            fn closed(ctx: *anyopaque) void {
+                // Recorded on the engine, which `decrypt` asks once the
+                // records are walked; ending the connection here would do
+                // it underneath the engine still walking them.
+                _ = ctx;
+            }
+        };
     };
 }
