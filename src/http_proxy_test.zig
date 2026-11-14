@@ -647,9 +647,8 @@ const Http1Bed = struct {
         h2c: bool = false,
         h2_connections: u32 = 0,
         stream_slots: u32 = 0,
-        /// What a `tls` listener offers in ALPN (#271) — set straight on
-        /// the listener, as `h2c` is, so it may name `h2`, which no config
-        /// can yet (#275).
+        /// What a `tls` listener offers in ALPN (#271), `h2` included
+        /// (#275) — set straight on the listener, as `h2c` is.
         alpn: []const []const u8 = config_module.alpn.http_default,
         /// The §8 drain deadline. The bed's default is a real one; a
         /// tunnel scenario needs the zero case, which is production's
@@ -1770,8 +1769,7 @@ fn expectTeardownTakesStreams(seed: u64) !void {
 
 // ---------------------------------------------------------------------------
 // HTTP/2 over TLS (#275): `h2` selected in ALPN, the same driver behind the
-// engine. The listener offers `h2` straight from the bed — no config can
-// name it while every stream is refused.
+// engine. The listener offers `h2` straight from the bed.
 // ---------------------------------------------------------------------------
 
 const h2_offer: []const []const u8 = &.{ "h2", "http/1.1" };
@@ -1896,6 +1894,50 @@ test "h2: a client choosing HTTP/1.1, or naming nothing, on an h2 listener is se
         try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_connections"));
         try bed.expectDrained();
     }
+}
+
+test "h2: a listener offering h2 alone sheds at accept when no session is free" {
+    // One session, two clients. Whichever is admitted first reserves it
+    // and is served; the other finds the pool empty, and a listener with no
+    // HTTP/1.1 to offer instead closes it before a handshake is spent —
+    // an admission rung, inside the accepted = admitted + shed identity.
+    var options = h2TlsBedOptions(66);
+    options.alpn = &.{"h2"};
+    options.h2_connections = 1;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var clients: [2]TlsClient = undefined;
+    var wind_down: TlsWindDownAll = .{ .bed = &bed, .clients = clients.len };
+    for (&clients, 0..) |*client, index| {
+        const seed: u8 = @intCast(0x40 + 3 * index);
+        try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+            .host_name = fixture_host_name,
+            .app_data = h2_preface ++ h2_settings ++ h2_get,
+            .alpn = &.{"h2"},
+            .x25519_seed = @splat(seed),
+            .p256_seed = @splat(seed + 1),
+            .random = @splat(seed + 2),
+        });
+        wind_down.attach(client);
+    }
+    // The served connection holds its session until the drain ends it.
+    bed.armDrainTimer(50);
+    try bed.sim_io.run();
+
+    const served_index: usize = if (clients[0].alpnSelected() != null) 0 else 1;
+    const served = &clients[served_index];
+    const turned_away = &clients[1 - served_index];
+    try std.testing.expectEqualStrings("h2", served.alpnSelected().?);
+    try std.testing.expect(!turned_away.handshake_done);
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(served.app_received[0..served.app_received_len], &storage);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("shed_h2_sessions"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("admitted"));
+    try bed.expectDrained();
 }
 
 test "h2: a client refused in ALPN on an h2 listener leaves no session held" {

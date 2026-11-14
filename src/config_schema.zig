@@ -505,18 +505,13 @@ fn writeMethodEnum(out: *Stringify) Writer.Error!void {
 
 /// The #271 ALPN vocabulary as an `"enum"` array of its wire tokens — the
 /// same closed set the loader accepts, read off `tls/alpn.zig` so the
-/// document and the loader cannot disagree about which names are legal:
-/// a protocol the vocabulary knows but no config may name yet
-/// (`Protocol.configurable`) is left out of both.
+/// document and the loader cannot disagree about which names are legal.
 fn writeAlpnEnum(out: *Stringify) Writer.Error!void {
     const protocols = std.enums.values(config.alpn.Protocol);
     comptime assert(protocols.len >= 1);
-    comptime assert(config.alpn.Protocol.http_1_1.configurable());
     try out.objectField("enum");
     try out.beginArray();
-    for (protocols) |protocol| {
-        if (protocol.configurable()) try out.write(protocol.token());
-    }
+    for (protocols) |protocol| try out.write(protocol.token());
     try out.endArray();
 }
 

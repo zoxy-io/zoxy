@@ -13,10 +13,9 @@ const assert = std.debug.assert;
 
 pub const Protocol = enum(u8) {
     http_1_1,
-    /// HTTP/2 over TLS (RFC 9113 §3.2, #275). Spoken by the driver in
-    /// `http/h2/Connection.zig` — so it is in the vocabulary, and the engine
-    /// may negotiate it, but no config may name it until the keys that size
-    /// its pools arrive beside it (`configurable`).
+    /// HTTP/2 over TLS (RFC 9113 §3.2, #275), spoken by the driver in
+    /// `http/h2/Connection.zig`. A listener naming it needs the session and
+    /// stream pools sized (`limits.h2_connections`, `limits.stream_slots`).
     h2,
 
     /// The token on the wire: the IANA "TLS Application-Layer Protocol
@@ -39,16 +38,6 @@ pub const Protocol = enum(u8) {
             if (std.mem.eql(u8, bytes, protocol.token())) return protocol;
         }
         return null;
-    }
-
-    /// Whether `tls.alpn` may name it. The loader and the schema both ask,
-    /// so a protocol is unknown to an operator until a config can say
-    /// everything serving it takes: HTTP/2's pools have no keys yet (#275).
-    pub fn configurable(protocol: Protocol) bool {
-        return switch (protocol) {
-            .http_1_1 => true,
-            .h2 => false,
-        };
     }
 };
 
@@ -81,9 +70,9 @@ pub fn namesH2(offer: []const []const u8) bool {
 ///
 /// Static, like `http_default`: the vocabulary is closed at two, so an
 /// offer less `h2` is HTTP/1.1 alone or nothing. Nothing is a listener
-/// that offers HTTP/2 alone, which has no fallback to give; whether such
-/// a listener may exist is the config's to decide when `h2` becomes
-/// configurable, and until then `Server` refuses to start one.
+/// that offers HTTP/2 alone, which has no fallback to give: with no
+/// session free, it sheds the connection at accept instead
+/// (`Server.acquireTlsAdmission`).
 pub fn withoutH2(offer: []const []const u8) []const []const u8 {
     if (!namesH2(offer)) return offer;
     comptime assert(protocols_max == 2);
@@ -99,9 +88,8 @@ comptime {
     for (std.enums.values(Protocol)) |protocol| {
         assert(Protocol.fromToken(protocol.token()) == protocol);
     }
-    // The default is a list of canonical tokens, not a spelling of its own,
-    // and one the loader would accept were it written out.
-    for (http_default) |bytes| assert(Protocol.fromToken(bytes).?.configurable());
+    // The default is a list of canonical tokens, not a spelling of its own.
+    for (http_default) |bytes| assert(Protocol.fromToken(bytes) != null);
 }
 
 test "alpn: every token names its protocol and nothing else" {
@@ -111,7 +99,6 @@ test "alpn: every token names its protocol and nothing else" {
     try std.testing.expectEqual(@as(?Protocol, null), Protocol.fromToken("h2c"));
     try std.testing.expectEqual(@as(?Protocol, null), Protocol.fromToken(""));
     try std.testing.expectEqualStrings("http/1.1", http_default[0]);
-    try std.testing.expect(!Protocol.h2.configurable());
 }
 
 test "alpn: an offer less h2 is HTTP/1.1 alone, or nothing" {

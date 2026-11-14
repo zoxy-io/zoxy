@@ -39,6 +39,12 @@ pub const Counters = struct {
     /// zero forever; any value at all means `libcrypto_heap_bytes` is
     /// undersized for the concurrency this deployment reaches.
     shed_tls_crypto: Value = Value.init(0),
+    /// §8 rung: a listener offering HTTP/2 alone had no session free at
+    /// accept (#275) → close. It has no HTTP/1.1 to offer instead, so the
+    /// connection goes before a handshake is spent on it. An admission
+    /// rung, in the accepted = admitted + shed identity — unlike
+    /// `h2_shed_sessions`, whose h2c connection was admitted first.
+    shed_h2_sessions: Value = Value.init(0),
     /// §8 "watermarks before walls": pool pressure engaged (false→true
     /// crossings of a pool's high watermark), one counter per pool. Not
     /// sheds — biases that precede the walls — so they stay out of
@@ -1975,6 +1981,9 @@ test "counters: the gate identity sums exactly today's admission rungs" {
         // the gate identity because neither ever counted `admitted`.
         "shed_tls_engines",
         "shed_tls_crypto",
+        // A listener offering HTTP/2 alone with no session free (#275):
+        // shed before its handshake, so it never counted `admitted`.
+        "shed_h2_sessions",
         "shed_draining",
     };
     comptime var actual_count: usize = 0;

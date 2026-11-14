@@ -552,9 +552,10 @@ turned away after it; a reservation the client did not take goes back
 when the handshake ends. The shared stream slots are what HTTP/2
 multiplexes, each charged a stream's two ring ops beside the
 per-connection divisor, which is why `limits.stream_slots` is required
-rather than guessed. Both are
-priced and reserved ahead of the serving path, and read zero until a
-listener can speak HTTP/2. A deployment that does configure tunnels at the
+rather than guessed. Both read zero, and are refused, unless a listener
+speaks HTTP/2 — `h2` in `tls.alpn`, or `http.h2c`; a listener offering
+`h2` alone has no HTTP/1.1 to fall back to, and sheds at accept instead
+(`shed_h2_sessions`). A deployment that does configure tunnels at the
 ceiling pays the same `relay_buffer_bytes` term twice. Both figures track
 that knob: measured at the ceiling with tunnels and TLS off, the banner
 prints 290 MiB at 4 KiB against 559 MiB at the 16 KiB default, the
@@ -839,9 +840,9 @@ Rules:
 - **`tls.alpn` is a closed list of protocols this proxy speaks** (#271),
   in the listener's preference order, which RFC 7301 §3.2 makes the order
   that counts. Closed on #180's upgrade-allowlist precedent: a token is a
-  promise the serving path keeps, so `h2` is refused at load until #275
-  can keep it, and an `l4` listener — which parses nothing it could name
-  — refuses the key and offers nothing. Absent on an `http` listener it
+  promise the serving path keeps — `h2` was refused at load until #275
+  could keep it — and an `l4` listener, which parses nothing it could
+  name, refuses the key and offers nothing. Absent on an `http` listener it
   means `["http/1.1"]`, so the default closes the gap rather than
   preserving it: before this a client offering only `h2` was handed an
   HTTP/1.1 session in silence. Now it gets `no_application_protocol`, the

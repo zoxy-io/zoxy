@@ -325,13 +325,13 @@ pub const Config = struct {
         /// Zero exactly when no listener allows any upgrade.
         tunnels: u32 = 0,
         /// The §5 HTTP/2 session pool and the shared stream pool its
-        /// multiplexed exchanges draw from (#275). Zero, and no key yet:
-        /// they are priced and reserved (`budget`, `Server.init`) before
-        /// anything serves HTTP/2, and a listener that speaks it —
-        /// `h2` in `tls.alpn`, or `http.h2c` — arrives with the serving
-        /// path, the knobs with it (`limits.h2_connections`, defaulting to
-        /// `constants.h2_connections_default`, and `limits.stream_slots`,
-        /// required where a listener speaks HTTP/2).
+        /// multiplexed exchanges draw from (#275). Zero exactly when no
+        /// listener speaks HTTP/2 — `h2` in `tls.alpn`, or `http.h2c`.
+        /// Where one does, `limits.h2_connections` defaults to
+        /// `constants.h2_connections_default` (capped at conn slots) and
+        /// `limits.stream_slots` is required: a count of concurrent
+        /// exchanges is a capacity decision, not something a connection
+        /// count implies.
         h2_connections: u32 = 0,
         stream_slots: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
@@ -425,8 +425,8 @@ pub const Config = struct {
         upgrades: Upgrades = .{},
         /// Whether this plaintext listener takes h2c by prior knowledge
         /// (#275, RFC 9113 §3.3): a connection opening with HTTP/2's
-        /// preface speaks HTTP/2. No key yet: it arrives (`http.h2c`) with
-        /// the keys that size HTTP/2's pools.
+        /// preface speaks HTTP/2 (`http.h2c`). A TLS listener negotiates
+        /// HTTP/2 by ALPN instead, and is refused the key.
         h2c: bool = false,
         /// Whether refusals name their RFC 9209 cause on the wire
         /// (#300). Per listener and off by default, on `forwarded`'s
@@ -900,6 +900,13 @@ pub const ValidationError = error{
     LimitTunnelsOutOfRange,
     LimitTunnelsOverConnSlots,
     LimitTunnelsWithoutUpgrades,
+    LimitStreamSlotsRequired,
+    LimitStreamSlotsOutOfRange,
+    LimitStreamSlotsWithoutHttp2,
+    LimitH2ConnectionsOutOfRange,
+    LimitH2ConnectionsOverConnSlots,
+    LimitH2ConnectionsWithoutHttp2,
+    ListenerH2cOnTls,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -1410,39 +1417,88 @@ fn resolveAdminBind(admin_json: ?AdminJson) ValidationError!?std.Io.net.IpAddres
     return std.Io.net.IpAddress.parseLiteral(admin.bind) catch error.AdminBindInvalid;
 }
 
-/// Resolve the effective pool sizes (§5, §8): the comptime constants are
-/// the hard, budget-asserted ceilings — config may only shrink below
-/// them, never grow past them, and never to zero. An unspecified
-/// relay-buffer count derives from the effective conn slots (a buffer
-/// beyond the slot count could never be acquired); a *specified* count
-/// above them is a contradiction and fails loudly.
-/// The §5 relation every per-connection pool shares: none of them may
-/// out-size the connections that draw on it. Stated once, after the
-/// resolvers have each enforced their own half, because a pool past this
-/// is not merely wasteful — the fd and ring budgets are derived from
-/// `conn_slots` on the strength of it (`fdsRequired`, `inFlightOps`), so
-/// The two pools a *feature* switches on: TLS engines, reserved exactly
-/// when some listener terminates, and #180's tunnels, reserved exactly
-/// when some listener allows an upgrade. Their own group because both are
-/// zero for a deployment that asked for neither — which is what makes
-/// each feature free — and both are bounded by the conn slots above.
+/// The pools a *feature* switches on, as `resolveFeaturePools` sizes them.
+const FeaturePools = struct {
+    tls_engines: u32,
+    tunnels: u32,
+    h2_connections: u32,
+    stream_slots: u32,
+};
+
+/// The pools a *feature* switches on: TLS engines, reserved exactly when
+/// some listener terminates; #180's tunnels, exactly when some listener
+/// allows an upgrade; and #275's HTTP/2 sessions and shared streams,
+/// exactly when some listener speaks HTTP/2. Their own group because each
+/// is zero for a deployment that asked for none of it — which is what
+/// makes each feature free — and each is bounded by the conn slots above
+/// or a ceiling of its own.
 fn resolveFeaturePools(
     limits_json: *const LimitsJson,
     conn_slots: u32,
-    tls_listeners_count: u32,
-    upgrade_listeners_count: u32,
-) ValidationError!struct { tls_engines: u32, tunnels: u32 } {
+    features: ListenerFeatures,
+) ValidationError!FeaturePools {
     const tls_engines = try resolveTlsEngines(
         limits_json.tls_engines,
         conn_slots,
-        tls_listeners_count,
+        features.tls,
     );
     const tunnels = try resolveTunnels(
         limits_json.tunnels,
         conn_slots,
-        upgrade_listeners_count,
+        features.upgrades,
     );
-    return .{ .tls_engines = tls_engines, .tunnels = tunnels };
+    const stream_slots = try resolveStreamSlots(limits_json.stream_slots, features.http2);
+    const h2_connections = try resolveH2Connections(
+        limits_json.h2_connections,
+        conn_slots,
+        features.http2,
+    );
+    assert((stream_slots == 0) == (h2_connections == 0));
+    return .{
+        .tls_engines = tls_engines,
+        .tunnels = tunnels,
+        .h2_connections = h2_connections,
+        .stream_slots = stream_slots,
+    };
+}
+
+/// The shared stream pool HTTP/2 multiplexes (#275): required — and only
+/// legal — where a listener speaks HTTP/2, on `tunnels`' reasoning: how
+/// many exchanges run at once is a capacity decision, not something a
+/// connection count implies, and every one is charged its ring ops (§8).
+fn resolveStreamSlots(requested: ?u32, http2_listeners_count: u32) ValidationError!u32 {
+    const stream_slots = requested orelse {
+        if (http2_listeners_count >= 1) return error.LimitStreamSlotsRequired;
+        return 0;
+    };
+    if (http2_listeners_count == 0) return error.LimitStreamSlotsWithoutHttp2;
+    if (stream_slots < 1 or stream_slots > constants.stream_slots_max) {
+        return error.LimitStreamSlotsOutOfRange;
+    }
+    assert(stream_slots >= 1);
+    return stream_slots;
+}
+
+/// The HTTP/2 session pool (#275): a session per connection speaking it,
+/// defaulting to `h2_connections_default` capped at conn slots — each
+/// session is a connection's — where a listener speaks HTTP/2, and zero
+/// otherwise. Running short is graceful: an `h2` offer falls back to
+/// HTTP/1.1, an h2c preface is turned away, an `h2`-only listener sheds.
+fn resolveH2Connections(
+    requested: ?u32,
+    conn_slots: u32,
+    http2_listeners_count: u32,
+) ValidationError!u32 {
+    assert(conn_slots >= 1);
+    if (http2_listeners_count == 0) {
+        if (requested != null) return error.LimitH2ConnectionsWithoutHttp2;
+        return 0;
+    }
+    const h2_connections = requested orelse @min(constants.h2_connections_default, conn_slots);
+    if (h2_connections < 1) return error.LimitH2ConnectionsOutOfRange;
+    if (h2_connections > conn_slots) return error.LimitH2ConnectionsOverConnSlots;
+    assert(h2_connections <= conn_slots);
+    return h2_connections;
 }
 
 /// The two head pools (§5), which exist only for an HTTP listener: the
@@ -1471,6 +1527,11 @@ fn resolveHeadPools(
     };
 }
 
+/// The §5 relation every per-connection pool shares: none of them may
+/// out-size the connections that draw on it. Stated once, after the
+/// resolvers have each enforced their own half, because a pool past this
+/// is not merely wasteful — the fd and ring budgets are derived from
+/// `conn_slots` on the strength of it (`fdsRequired`, `inFlightOps`), so
 /// a breach here is an under-provisioned ring rather than spare memory.
 fn assertPoolsFitConnSlots(
     conn_slots: u32,
@@ -1485,6 +1546,12 @@ fn assertPoolsFitConnSlots(
     assert(tunnels <= conn_slots);
 }
 
+/// Resolve the effective pool sizes (§5, §8): the comptime constants are
+/// the hard, budget-asserted ceilings — config may only shrink below
+/// them, never grow past them, and never to zero. An unspecified
+/// relay-buffer count derives from the effective conn slots (a buffer
+/// beyond the slot count could never be acquired); a *specified* count
+/// above them is a contradiction and fails loudly.
 fn resolveLimits(
     limits_json: *const LimitsJson,
     listeners_count: u32,
@@ -1532,15 +1599,11 @@ fn resolveLimits(
     if (features.tls >= 1 and relay_buffer_bytes > constants.tls_app_chunk_bytes) {
         return error.LimitRelayBufferOverTlsRecord;
     }
-    const feature_pools = try resolveFeaturePools(
-        limits_json,
-        conn_slots,
-        features.tls,
-        features.upgrades,
-    );
+    const feature_pools = try resolveFeaturePools(limits_json, conn_slots, features);
     const cq_fill_eighths = try resolveCqFill(
         limits_json.cq_fill_eighths,
         conn_slots,
+        feature_pools.stream_slots,
         upstream_slots,
         listeners_count,
         health_probes,
@@ -1572,6 +1635,8 @@ fn resolveLimits(
         .relay_buffer_bytes = relay_buffer_bytes,
         .tls_engines = feature_pools.tls_engines,
         .tunnels = feature_pools.tunnels,
+        .h2_connections = feature_pools.h2_connections,
+        .stream_slots = feature_pools.stream_slots,
         .keepalive_requests = limits_json.keepalive_requests orelse
             constants.keepalive_requests_default,
         .cq_fill_eighths = cq_fill_eighths,
@@ -1627,6 +1692,7 @@ fn resolveSlotCounts(limits_json: *const LimitsJson) ValidationError!SlotCounts 
 fn resolveCqFill(
     requested: ?u32,
     conn_slots: u32,
+    stream_slots: u32,
     upstream_slots: u32,
     listeners_count: u32,
     health_probes: u32,
@@ -1642,7 +1708,7 @@ fn resolveCqFill(
     }
     if (!constants.cqFillFits(
         conn_slots,
-        0, // `stream_slots`: zero until a listener can speak HTTP/2 (#275).
+        stream_slots,
         upstream_slots,
         listeners_count,
         health_probes,
@@ -1999,6 +2065,10 @@ pub const LimitsJson = struct {
     relay_buffer_bytes: ?u32 = null,
     tls_engines: ?u32 = null,
     tunnels: ?u32 = null,
+    /// The #275 HTTP/2 pools: sessions (defaulted where HTTP/2 is spoken)
+    /// and the shared streams they multiplex (required there).
+    h2_connections: ?u32 = null,
+    stream_slots: ?u32 = null,
     /// Optional #237 keep-alive request cap; absent means nginx's 1000,
     /// `0` is unlimited.
     keepalive_requests: ?u32 = null,
@@ -2083,6 +2153,25 @@ pub const LimitsJson = struct {
                 "decision rather than something a connection count implies.",
             .minimum = 1,
             .maximum = constants.tunnels_max,
+        },
+        .h2_connections = .{
+            .desc = "Concurrent HTTP/2 connections (#275), each holding a session of " ++
+                "its own (~100 KiB). Legal only when some listener speaks HTTP/2 " ++
+                "— h2 in tls.alpn, or http.h2c — and defaults to 1024, at most " ++
+                "conn_slots. With none free, an h2 offer falls back to HTTP/1.1, " ++
+                "an h2c preface is turned away, and an h2-only listener sheds " ++
+                "at accept.",
+            .minimum = 1,
+            .maximum = constants.conn_slots_max,
+        },
+        .stream_slots = .{
+            .desc = "Concurrent HTTP/2 exchanges across every connection (#275): " ++
+                "the shared streams HTTP/2 multiplexes, each with a head buffer " ++
+                "of its own. Required — and only legal — when some listener " ++
+                "speaks HTTP/2; a stream past the pool is refused REFUSED_STREAM, " ++
+                "which a client retries. One connection advertises at most 100.",
+            .minimum = 1,
+            .maximum = constants.stream_slots_max,
         },
         .cq_fill_eighths = .{
             .desc = "Eighths of the io_uring completion queue the worst-case " ++
@@ -2189,6 +2278,8 @@ pub const HttpListenerJson = struct {
     /// Whether this listener names *why* it refused, in an RFC 9209
     /// `Proxy-Status` field (#300). Absent is off.
     proxy_status: bool = false,
+    /// h2c by prior knowledge (#275); plaintext listeners only.
+    h2c: bool = false,
 
     pub const schema_doc =
         "An HTTP/1.1 listener's settings. Exactly one of `cluster` or " ++
@@ -2229,6 +2320,12 @@ pub const HttpListenerJson = struct {
         .upgrades = .{
             .desc = "Protocol upgrades this listener will carry as tunnels; absent " ++
                 "allows none and an Upgrade stays 501. Requires limits.tunnels.",
+        },
+        .h2c = .{
+            .desc = "Also speak HTTP/2 to a client that opens with its preface " ++
+                "(h2c by prior knowledge, RFC 9113 §3.3); HTTP/1.1 is served as " ++
+                "before. Plaintext only — a tls listener offers h2 in tls.alpn " ++
+                "instead. Requires limits.stream_slots.",
         },
     };
 };
@@ -4162,7 +4259,18 @@ fn resolveHttpListener(
         .upgrades = try resolveUpgrades(http_json.upgrades),
         .max_body_bytes = try resolveMaxBodyBytes(http_json.max_body_bytes),
         .proxy_status = http_json.proxy_status,
+        .h2c = try resolveH2c(http_json.h2c, tls),
     };
+}
+
+/// h2c is HTTP/2 *without* TLS (RFC 9113 §3.3): a terminating listener
+/// negotiates HTTP/2 by ALPN instead, and never sniffs a preface.
+fn resolveH2c(h2c: bool, tls: ?Config.Listener.Tls) ValidationError!bool {
+    // `countListenerFeatures` refused the pair before any pool was sized,
+    // so the order of the two checks cannot decide which error is shown.
+    if (h2c and tls != null) return error.ListenerH2cOnTls;
+    assert(!h2c or tls == null);
+    return h2c;
 }
 
 /// An `l4` listener: which cluster (or which table of them) it relays to,
@@ -5454,9 +5562,6 @@ fn resolveAlpn(
     var seen: [alpn.protocols_max]bool = @splat(false);
     for (asked) |token| {
         const named = alpn.Protocol.fromToken(token) orelse return error.ListenerTlsAlpnUnknown;
-        // A protocol the serving path speaks only in part is not one an
-        // operator can name yet: `h2`'s pools have no keys (#275).
-        if (!named.configurable()) return error.ListenerTlsAlpnUnknown;
         if (seen[@backingInt(named)]) return error.ListenerTlsAlpnDuplicate;
         seen[@backingInt(named)] = true;
     }
@@ -5609,6 +5714,9 @@ const ListenerFeatures = struct {
     /// Listeners routing by SNI (#298) — what decides whether the relay
     /// buffer has to be wide enough to stage a ClientHello.
     sni: u32 = 0,
+    /// Listeners speaking HTTP/2 (#275) — h2c, or `h2` in `tls.alpn` —
+    /// what decides whether the HTTP/2 pools exist.
+    http2: u32 = 0,
 };
 
 fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFeatures {
@@ -5632,6 +5740,11 @@ fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFea
                 const allowed = try resolveUpgrades(upgrades);
                 if (allowed.any()) features.upgrades += 1;
             }
+            // h2c is HTTP/2 *without* TLS: refused here, before any pool
+            // is sized from it, so a terminating listener asking for it is
+            // told the specific thing it got wrong first.
+            if (http_json.h2c and listener_json.tls != null) return error.ListenerH2cOnTls;
+            if (speaksHttp2(&listener_json, &http_json)) features.http2 += 1;
         }
         if (listener_json.l4) |l4_json| {
             if (l4_json.routes != null) features.sni += 1;
@@ -5645,7 +5758,22 @@ fn countListenerFeatures(listeners: []const ListenerJson) ParseError!ListenerFea
     assert(features.tls <= listeners.len);
     assert(features.upgrades <= listeners.len);
     assert(features.sni <= listeners.len);
+    assert(features.http2 <= features.http);
     return features;
+}
+
+/// An http listener speaks HTTP/2 when it takes h2c, or offers `h2` in
+/// ALPN. The offer is read as written: the token is validated where the
+/// listener resolves, and an unknown one is refused there.
+fn speaksHttp2(listener_json: *const ListenerJson, http_json: *const HttpListenerJson) bool {
+    assert(listener_json.http != null);
+    if (http_json.h2c) return true;
+    const tls_json = listener_json.tls orelse return false;
+    const offer = tls_json.alpn orelse return false;
+    for (offer) |token| {
+        if (std.mem.eql(u8, token, alpn.Protocol.h2.token())) return true;
+    }
+    return false;
 }
 
 /// Which protocol a listener's tag names (#305). The vocabulary used to
@@ -7657,10 +7785,14 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "LimitConnSlotsOverCqFill", .gap = .budget },
     .{ .name = "LimitHeadBuffersOutOfRange", .gap = .budget },
     .{ .name = "LimitHeadBuffersOverConnSlots", .gap = .budget },
+    .{ .name = "LimitH2ConnectionsOverConnSlots", .gap = .budget },
+    .{ .name = "LimitH2ConnectionsWithoutHttp2", .gap = .budget },
     .{ .name = "LimitHeadBuffersWithoutHttpListener", .gap = .budget },
     .{ .name = "LimitRelayBufferOverTlsRecord", .gap = .budget },
     .{ .name = "LimitRelayBufferUnderSniRouting", .gap = .budget },
     .{ .name = "LimitRelayBuffersOverConnSlots", .gap = .budget },
+    .{ .name = "LimitStreamSlotsRequired", .gap = .budget },
+    .{ .name = "LimitStreamSlotsWithoutHttp2", .gap = .budget },
     .{ .name = "LimitTlsEnginesOverConnSlots", .gap = .budget },
     .{ .name = "LimitTlsEnginesWithoutTlsListener", .gap = .budget },
     .{ .name = "LimitTunnelsOverConnSlots", .gap = .budget },
@@ -7673,6 +7805,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ListenerBindInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerBindUnixPathInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerBindUnixPathRelative", .gap = .literal_syntax },
+    .{ .name = "ListenerH2cOnTls", .gap = .cross_block },
     .{ .name = "ListenerL4RequestKeyedHash", .gap = .cross_block },
     .{ .name = "ListenerModeInvalid", .gap = .literal_syntax },
     .{ .name = "ListenerModeWithoutUnixBind", .gap = .cross_block },
@@ -9640,11 +9773,10 @@ test "config: tls.alpn offers what the listener speaks, and only that (#271)" {
         try std.testing.expectEqual(@as(usize, 1), offer.len);
         try std.testing.expectEqual(alpn.Protocol.http_1_1.token().ptr, offer[0].ptr);
     }
-    // A name this proxy does not speak. `h2` is the one that matters: it
-    // joins with #275, and until then a client handed it would speak h2 at
-    // an HTTP/1.1 parser. RFC 7301 §3.1 compares octets, so case counts.
-    try expectParseError(error.ListenerTlsAlpnUnknown, http ++ tls_head ++ ",\"alpn\":[\"h2\"]}" ++ tail);
+    // A name this proxy does not speak. RFC 7301 §3.1 compares octets, so
+    // case counts: `HTTP/1.1` is not `http/1.1`.
     try expectParseError(error.ListenerTlsAlpnUnknown, http ++ tls_head ++ ",\"alpn\":[\"HTTP/1.1\"]}" ++ tail);
+    try expectParseError(error.ListenerTlsAlpnUnknown, http ++ tls_head ++ ",\"alpn\":[\"h2c\"]}" ++ tail);
     // Offering nothing is the silence this closes, not a spelling of it.
     try expectParseError(error.ListenerTlsAlpnEmpty, http ++ tls_head ++ ",\"alpn\":[]}" ++ tail);
     // A name twice is a preference order that says nothing.
@@ -9658,6 +9790,69 @@ test "config: tls.alpn offers what the listener speaks, and only that (#271)" {
         error.ListenerTlsAlpnOnL4,
         l4 ++ tls_head ++ ",\"alpn\":[\"http/1.1\"]}" ++ tail,
     );
+}
+
+test "config: a listener speaking HTTP/2 sizes its pools, and only one does (#275)" {
+    const tail_head = "}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}";
+    const plain = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    const tls_h2 = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}," ++
+        "\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\",\"alpn\":[\"h2\",\"http/1.1\"]}";
+    const tls_h2_only = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}," ++
+        "\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\",\"alpn\":[\"h2\"]}";
+    const streams = ",\"limits\":{\"stream_slots\":64}}";
+
+    // h2c on a plaintext listener: the stream pool is required, and the
+    // session pool defaults, capped at conn slots.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, plain ++ ",\"h2c\":true}" ++ tail_head ++ streams);
+        try std.testing.expect(parsed.listeners[0].h2c);
+        try std.testing.expectEqual(@as(u32, 64), parsed.limits.stream_slots);
+        try std.testing.expectEqual(
+            @min(constants.h2_connections_default, parsed.limits.conn_slots),
+            parsed.limits.h2_connections,
+        );
+    }
+    // `h2` in ALPN — beside HTTP/1.1, or alone, which sheds at accept when
+    // no session is free rather than being refused here.
+    inline for (.{ tls_h2, tls_h2_only }) |listener| {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, listener ++ tail_head ++ streams);
+        try std.testing.expectEqual(alpn.Protocol.h2.token().ptr, parsed.listeners[0].tls.?.alpn[0].ptr);
+        try std.testing.expect(parsed.limits.h2_connections >= 1);
+    }
+    // A stream count is a capacity decision, never guessed.
+    try expectParseError(error.LimitStreamSlotsRequired, plain ++ ",\"h2c\":true}" ++ tail_head ++ "}");
+    try expectParseError(error.LimitStreamSlotsRequired, tls_h2 ++ tail_head ++ "}");
+    try expectParseError(
+        error.LimitStreamSlotsOutOfRange,
+        plain ++ ",\"h2c\":true}" ++ tail_head ++ ",\"limits\":{\"stream_slots\":0}}",
+    );
+    // Both pools are refused where nothing speaks HTTP/2.
+    try expectParseError(error.LimitStreamSlotsWithoutHttp2, plain ++ "}" ++ tail_head ++ streams);
+    try expectParseError(
+        error.LimitH2ConnectionsWithoutHttp2,
+        plain ++ "}" ++ tail_head ++ ",\"limits\":{\"h2_connections\":4}}",
+    );
+    // A session per connection, at most.
+    try expectParseError(
+        error.LimitH2ConnectionsOverConnSlots,
+        plain ++ ",\"h2c\":true}" ++ tail_head ++
+            ",\"limits\":{\"conn_slots\":4,\"h2_connections\":5,\"stream_slots\":8}}",
+    );
+    try expectParseError(
+        error.LimitH2ConnectionsOutOfRange,
+        plain ++ ",\"h2c\":true}" ++ tail_head ++ ",\"limits\":{\"h2_connections\":0,\"stream_slots\":8}}",
+    );
+    // h2c is HTTP/2 without TLS: a terminating listener offers h2 instead —
+    // and is told so first, with the stream pool sized or not.
+    const h2c_on_tls = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\",\"h2c\":true}," ++
+        "\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}" ++ tail_head;
+    try expectParseError(error.ListenerH2cOnTls, h2c_on_tls ++ streams);
+    try expectParseError(error.ListenerH2cOnTls, h2c_on_tls ++ "}");
 }
 
 test "config: tls_engines follows the tls listeners, and refuses a mismatch" {
