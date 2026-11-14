@@ -1869,7 +1869,7 @@ pub fn Server(comptime IoType: type) type {
         fn entryState(protocol: config_module.Config.Listener.Protocol) ConnType.State {
             return switch (protocol) {
                 .l4 => .connecting,
-                .http => .l7_reading_head,
+                .http => .l7,
             };
         }
 
@@ -1935,7 +1935,7 @@ pub fn Server(comptime IoType: type) type {
             // The one timer this connection ever arms is already armed
             // (§4: a state transition only ever *stores* a new deadline).
             assert(conn.armed.deadline);
-            conn.state = entryState(protocol);
+            conn.enter(entryState(protocol));
             server.storeDeadline(conn, server.entryTimeoutMs(protocol));
             switch (protocol) {
                 .l4 => {
@@ -2543,7 +2543,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.stream.relay_buffer != null);
             assert(conn.armed.deadline);
             assert(conn.stream.head_len == 0);
-            conn.state = .l4_reading_proxy_header;
+            conn.enter(.l4_reading_proxy_header);
             server.armProxyHeaderRecv(conn);
         }
 
@@ -2694,7 +2694,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.stream.relay_buffer != null);
             assert(conn.armed.deadline);
             assert(conn.stream.head_len < constants.client_hello_bytes_max);
-            conn.state = .l4_peeking_client_hello;
+            conn.enter(.l4_peeking_client_hello);
             // Judged before any recv is armed, because this phase can be
             // entered *holding* bytes: the PROXY-header phase reads past
             // its own header routinely, and what it read past is the
@@ -2863,7 +2863,7 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.armed.deadline);
             assert(!conn.tls.?.isConnected());
             assert(conn.tls_pending_len == 0);
-            conn.state = .tls_handshaking;
+            conn.enter(.tls_handshaking);
             if (opening.len == 0) {
                 server.armTlsRecv(conn);
                 return;
@@ -3371,7 +3371,7 @@ pub fn Server(comptime IoType: type) type {
             server.io.setNodelay(socket) catch |err| {
                 server.witnessKernelPressure(.set_option, err);
             };
-            conn.state = .relaying;
+            conn.enter(.relaying);
             server.storeDeadline(conn, server.idleTimeoutMs());
             relay.Relay(IoType).start(server, conn.stream);
         }
@@ -3383,7 +3383,7 @@ pub fn Server(comptime IoType: type) type {
         pub fn beginTeardown(server: *Self, conn: *ConnType) void {
             if (conn.isTearingDown()) return;
             assert(conn.isLive());
-            conn.state = .tearing_down;
+            conn.enter(.tearing_down);
             server.io.shutdown(conn.client_socket, .both);
             if (conn.stream.upstream_socket) |socket| {
                 server.io.shutdown(socket, .both);
@@ -3860,7 +3860,7 @@ pub fn Server(comptime IoType: type) type {
         /// are work the origin is carrying (§7), so a tunnel keeps being
         /// counted for its whole life without pinning a shared slot.
         pub fn chargeEndpoint(server: *Self, conn: *ConnType, cluster_index: u16, endpoint_index: u16) void {
-            assert(conn.protocol == .l4 or conn.state == .l7_exchanging);
+            assert(conn.protocol == .l4 or conn.stream.phase == .exchanging);
             assert(conn.charged_endpoint == stream_module.LogState.endpoint_none);
             const key = server.upstreams.keys.key(cluster_index, endpoint_index);
             server.l4_inflight[key] += 1;
@@ -4037,7 +4037,7 @@ pub fn Server(comptime IoType: type) type {
             // Compared against the previously *stored* target, not the
             // armed timer's — which is never recorded. That is sound for
             // this caller because nothing stores a deadline between the
-            // entry window and the head budget: in `.l7_reading_head` the
+            // entry window and the head budget: in `.reading_head` the
             // only prior store is the idle window, and the armed timer is
             // aimed at it. Said that narrowly on purpose — "the armed
             // target is always at or before the stored one" is *not* a
@@ -4060,17 +4060,17 @@ pub fn Server(comptime IoType: type) type {
         /// delivered the timer has no armed op to re-base, so it arms fresh.
         pub fn rebaseDeadline(server: *Self, conn: *ConnType) void {
             // Three callers, all storing a target earlier than the armed
-            // timer. The dial's per-try connect budget (`.l7_dialing`); the
-            // request deadline installed at routing (`.l7_reading_head`,
+            // timer. The dial's per-try connect budget (`.dialing`); the
+            // request deadline installed at routing (`.reading_head`,
             // §8), which must re-base here because the reuse path never
             // reaches the dial; and the #235 head budget, installed on the
             // first parse that comes back Incomplete — also from
-            // `.l7_reading_head`, but a different narrowing: routing
+            // `.reading_head`, but a different narrowing: routing
             // tightens to the *exchange* cap, this one tightens the idle
             // window to the head read. That third one reaches here through
             // `narrowDeadline`, which is what establishes "earlier" for it
             // rather than assuming it.
-            assert(conn.state == .l7_dialing or conn.state == .l7_reading_head);
+            assert(conn.stream.phase == .dialing or conn.stream.phase == .reading_head);
             // A prior dial's rebase cancel can still be draining if the
             // exchange outran it across a keep-alive turnaround. It re-arms
             // the timer at the target this dial just stored (deadline_ns is
@@ -4176,7 +4176,7 @@ pub fn Server(comptime IoType: type) type {
             // grace deadlines run through `storeDeadline`, which would
             // clamp them straight back to this already-expired cap.
             clearRequestDeadline(conn);
-            if (conn.state == .l7_exchanging and
+            if (conn.stream.phase == .exchanging and
                 conn.stream.l7.pending_verdict == .none and
                 Proxy.expiryAnswerable(conn.stream))
             {
@@ -4189,7 +4189,7 @@ pub fn Server(comptime IoType: type) type {
                 Proxy.beginExpiry(server, conn.stream);
                 return;
             }
-            if (conn.state == .l7_dialing and conn.stream.l7.pending_verdict == .none) {
+            if (conn.stream.phase == .dialing and conn.stream.l7.pending_verdict == .none) {
                 // At loop-rest a dialing L7 connection always has its
                 // connect in flight, no data ops, and no response byte.
                 assert(conn.stream.armed.connect);
@@ -4210,10 +4210,10 @@ pub fn Server(comptime IoType: type) type {
             // budget reached 0.4.0.
             //
             // `head_budget_installed` is the discriminator rather than
-            // the state: a connection in `.l7_reading_head` may still be
+            // the state: a connection in `.reading_head` may still be
             // on the idle window, because the budget is installed at the
             // first `Incomplete` and not at the first byte.
-            if (conn.state == .l7_reading_head and conn.stream.l7.head_budget_installed and
+            if (conn.stream.phase == .reading_head and conn.stream.l7.head_budget_installed and
                 conn.stream.l7.pending_verdict == .none)
             {
                 // Gated on the verdict, not merely on the state: the
@@ -4265,12 +4265,12 @@ pub fn Server(comptime IoType: type) type {
             // carries the verdict (it may deliver before or after this
             // one), so there is nothing to do here. The verdict is still
             // pending, or the 504 answer is already under way.
-            assert(conn.state == .l7_dialing or conn.state == .l7_responding or
-                conn.state == .l7_draining_request);
+            assert(conn.stream.phase == .dialing or conn.stream.phase == .responding or
+                conn.stream.phase == .draining_request);
             // Still dialing implies the verdict is still pending: only the
             // connect completion's divert clears it, and that divert
-            // leaves .l7_dialing in the same callback.
-            if (conn.state == .l7_dialing) {
+            // leaves .dialing in the same callback.
+            if (conn.stream.phase == .dialing) {
                 assert(conn.stream.l7.pending_verdict == .gateway_timeout);
             }
         }
