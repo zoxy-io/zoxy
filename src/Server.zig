@@ -1946,7 +1946,7 @@ pub fn Server(comptime IoType: type) type {
                 .http => {
                     // An idle L7 connection holds no relay buffer (§5).
                     assert(conn.stream.relay_buffer == null);
-                    Proxy.start(server, conn);
+                    Proxy.start(server, conn.stream);
                 },
             }
         }
@@ -3373,7 +3373,7 @@ pub fn Server(comptime IoType: type) type {
             };
             conn.state = .relaying;
             server.storeDeadline(conn, server.idleTimeoutMs());
-            relay.Relay(IoType).start(server, conn);
+            relay.Relay(IoType).start(server, conn.stream);
         }
 
         /// Teardown is a state, not an event (§5): shutdown both fds,
@@ -4178,7 +4178,7 @@ pub fn Server(comptime IoType: type) type {
             clearRequestDeadline(conn);
             if (conn.state == .l7_exchanging and
                 conn.stream.l7.pending_verdict == .none and
-                Proxy.expiryAnswerable(conn))
+                Proxy.expiryAnswerable(conn.stream))
             {
                 // The verdict grace bounds the escape hatch, not idle
                 // shedding: use the fixed configured idle timeout, never the
@@ -4186,7 +4186,7 @@ pub fn Server(comptime IoType: type) type {
                 // tear the verdict down before its forced completions land).
                 server.storeDeadline(conn, server.config.idle_timeout_ms);
                 server.armDeadline(conn);
-                Proxy.beginExpiry(server, conn);
+                Proxy.beginExpiry(server, conn.stream);
                 return;
             }
             if (conn.state == .l7_dialing and conn.stream.l7.pending_verdict == .none) {
@@ -4223,14 +4223,14 @@ pub fn Server(comptime IoType: type) type {
                 // re-entrancy the exchange and dial branches above guard,
                 // guarded the same way.
                 server.counters.increment("l7_head_budget_expired");
-                if (Proxy.headExpiryAnswerable(conn)) {
+                if (Proxy.headExpiryAnswerable(conn.stream)) {
                     // The same fixed grace the other two verdicts take:
                     // the pressure-biased window can collapse toward 1 ms
                     // and tear the verdict down before its forced
                     // completion lands.
                     server.storeDeadline(conn, server.config.idle_timeout_ms);
                     server.armDeadline(conn);
-                    Proxy.beginHeadExpiry(server, conn);
+                    Proxy.beginHeadExpiry(server, conn.stream);
                     return;
                 }
             }

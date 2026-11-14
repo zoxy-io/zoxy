@@ -18,24 +18,24 @@
 //! relay buffer for both halves.
 //!
 //! Required Policy decls:
-//!   feed(conn, chunk) FeedResult      how many bytes belong to the message
-//!   framingDone(conn) bool            is the message fully forwarded
-//!   onRecvError(server, conn, err)    terminal: EOF/reset handling
-//!   onSendError(server, conn, err)    terminal: send failure
-//!   onDrained(server, conn)           a recv yielded 0 forwardable bytes, done
-//!   onComplete(server, conn)          the whole body reached the far side
+//!   feed(stream, chunk) FeedResult    how many bytes belong to the message
+//!   framingDone(stream) bool          is the message fully forwarded
+//!   onRecvError(server, stream, err)  terminal: EOF/reset handling
+//!   onSendError(server, stream, err)  terminal: send failure
+//!   onDrained(server, stream)         a recv yielded 0 forwardable bytes, done
+//!   onComplete(server, stream)        the whole body reached the far side
 //! Optional Policy decls (skipped when absent):
-//!   beforeRecv(conn) / beforeSend(conn)   pre-arm bookkeeping (flags, phase)
-//!   onRecvEntry(conn)                     post-await recv invariant re-checks
-//!   afterFeed(conn, received, fr)         e.g. pipelined-tail detection
-//!   afterSend(conn, sent)                 e.g. access-log byte accounting
-//!   onSendEntry(server, conn) bool        divert a settled verdict; true = handled
-//!   recvBuffer(conn) []u8                 where a read lands
-//!   transformIn(conn, chunk) ?[]const u8  read bytes → framed bytes
-//!   transformEnded(conn) bool             an empty transform: ended, not partial
-//!   transformOut(conn, consumed) bool     framed bytes → wire bytes
-//!   sendSlice(conn) []const u8            what a send writes; empty = drained
-//!   creditSend(conn, sent)                credit whichever cursor tracks the wire
+//!   beforeRecv(stream) / beforeSend(stream)  pre-arm bookkeeping (flags, phase)
+//!   onRecvEntry(stream)                      post-await recv invariant re-checks
+//!   afterFeed(stream, received, fr)          e.g. pipelined-tail detection
+//!   afterSend(stream, sent)                  e.g. access-log byte accounting
+//!   onSendEntry(server, stream) bool         divert a settled verdict; true = handled
+//!   recvBuffer(stream) []u8                  where a read lands
+//!   transformIn(stream, chunk) ?[]const u8   read bytes → framed bytes
+//!   transformEnded(stream) bool              an empty transform: ended, not partial
+//!   transformOut(stream, consumed) bool      framed bytes → wire bytes
+//!   sendSlice(stream) []const u8             what a send writes; empty = drained
+//!   creditSend(stream, sent)                 credit whichever cursor tracks the wire
 //!
 //! **The transform seam** (the last six). A plain relay recvs and sends the
 //! same bytes, so one buffer per direction serves both halves and the framed
@@ -120,25 +120,28 @@ pub fn Pump(
     comptime Policy: type,
 ) type {
     const ConnType = conn_module.Conn(IoType);
+    const StreamType = ConnType.StreamType;
     const ServerType = @import("../Server.zig").Server(IoType);
     const direction_tag = @tagName(direction);
 
     return struct {
         const bit = "data_" ++ direction_tag;
 
-        /// The exchange's op, on the stream slot since #274 — the pump
-        /// itself is unchanged by that move, because it reached the op
-        /// through this one accessor and nothing else.
-        fn op(conn: *ConnType) *ConnType.StreamType.Op {
-            return &@field(conn.stream, "op_data_" ++ direction_tag);
+        /// The exchange's op, on the stream slot since #274 — and the
+        /// pump is keyed on that stream, not on the connection under it,
+        /// because a multiplexed connection (#173) carries several: the
+        /// stream names whose direction this is, and `stream.conn` is the
+        /// socket and the teardown it shares with its siblings.
+        fn op(stream: *StreamType) *StreamType.Op {
+            return &@field(stream, "op_data_" ++ direction_tag);
         }
 
-        fn directionState(conn: *ConnType) *stream_module.DirectionState {
-            return &conn.stream.directions[@backingInt(direction)];
+        fn directionState(stream: *StreamType) *stream_module.DirectionState {
+            return &stream.directions[@backingInt(direction)];
         }
 
-        fn buffer(conn: *ConnType) []u8 {
-            return @field(conn.stream.relay_buffer.?, direction_tag);
+        fn buffer(stream: *StreamType) []u8 {
+            return @field(stream.relay_buffer.?, direction_tag);
         }
 
         // -- the transform seam (§4, §6; see the module header) --
@@ -147,25 +150,25 @@ pub fn Pump(
         /// Transforming: wherever the *untransformed* bytes belong, since
         /// the relay buffer is then the transform's destination and cannot
         /// also be the read target.
-        fn recvBuffer(conn: *ConnType) []u8 {
-            if (@hasDecl(Policy, "recvBuffer")) return Policy.recvBuffer(conn);
-            return buffer(conn);
+        fn recvBuffer(stream: *StreamType) []u8 {
+            if (@hasDecl(Policy, "recvBuffer")) return Policy.recvBuffer(stream);
+            return buffer(stream);
         }
 
         /// Turn what was read into the bytes framing should see, so framing
         /// never learns a transform happened. Null is a failed transform,
         /// which is this connection's alone — a peer chooses what it sends
         /// (§8) — so the caller tears it down instead of asserting.
-        fn transformIn(conn: *ConnType, chunk: []u8) ?[]const u8 {
-            if (@hasDecl(Policy, "transformIn")) return Policy.transformIn(conn, chunk);
+        fn transformIn(stream: *StreamType, chunk: []u8) ?[]const u8 {
+            if (@hasDecl(Policy, "transformIn")) return Policy.transformIn(stream, chunk);
             return chunk;
         }
 
         /// Whether an empty `transformIn` means the transformed stream is
         /// over rather than mid-unit. Only ever asked when the transform
         /// yielded nothing, so identity — which never does — is never asked.
-        fn transformEnded(conn: *ConnType) bool {
-            if (@hasDecl(Policy, "transformEnded")) return Policy.transformEnded(conn);
+        fn transformEnded(stream: *StreamType) bool {
+            if (@hasDecl(Policy, "transformEnded")) return Policy.transformEnded(stream);
             return false;
         }
 
@@ -173,9 +176,9 @@ pub fn Pump(
         /// before the first send, never on a resume, or a short write would
         /// re-transform bytes already gone. False fails the connection for
         /// the same reason `transformIn` may.
-        fn transformOut(conn: *ConnType, consumed: u32) bool {
+        fn transformOut(stream: *StreamType, consumed: u32) bool {
             assert(consumed >= 1);
-            if (@hasDecl(Policy, "transformOut")) return Policy.transformOut(conn, consumed);
+            if (@hasDecl(Policy, "transformOut")) return Policy.transformOut(stream, consumed);
             return true;
         }
 
@@ -184,11 +187,11 @@ pub fn Pump(
         /// which is how `onSend` asks "anything left to write?" without
         /// knowing whether a transform is in play. Transforming: the staged
         /// wire bytes, which carry their own cursor.
-        fn sendSlice(conn: *ConnType) []const u8 {
-            if (@hasDecl(Policy, "sendSlice")) return Policy.sendSlice(conn);
-            const state = directionState(conn);
+        fn sendSlice(stream: *StreamType) []const u8 {
+            if (@hasDecl(Policy, "sendSlice")) return Policy.sendSlice(stream);
+            const state = directionState(stream);
             if (state.owed() == 0) return &.{};
-            return state.pending(buffer(conn));
+            return state.pending(buffer(stream));
         }
 
         /// Credit whichever cursor tracks the wire. Plain: the framed debt
@@ -196,54 +199,57 @@ pub fn Pump(
         /// the transform's own cursor — ciphertext does not count against a
         /// debt framing measured in plaintext — but the framed debt must
         /// still be settled by the time `sendSlice` empties (module header).
-        fn creditSend(conn: *ConnType, sent: u32) void {
-            if (@hasDecl(Policy, "creditSend")) return Policy.creditSend(conn, sent);
-            directionState(conn).credit(sent);
+        fn creditSend(stream: *StreamType, sent: u32) void {
+            if (@hasDecl(Policy, "creditSend")) return Policy.creditSend(stream, sent);
+            directionState(stream).credit(sent);
         }
 
-        fn source(conn: *const ConnType) IoType.Socket {
+        fn source(stream: *const StreamType) IoType.Socket {
+            const conn = stream.conn;
             return switch (direction) {
                 .client_to_upstream => conn.client_socket,
-                .upstream_to_client => conn.stream.upstream_socket.?,
+                .upstream_to_client => stream.upstream_socket.?,
             };
         }
 
-        fn target(conn: *const ConnType) IoType.Socket {
+        fn target(stream: *const StreamType) IoType.Socket {
+            const conn = stream.conn;
             return switch (direction) {
-                .client_to_upstream => conn.stream.upstream_socket.?,
+                .client_to_upstream => stream.upstream_socket.?,
                 .upstream_to_client => conn.client_socket,
             };
         }
 
-        pub fn armRecv(server: *ServerType, conn: *ConnType) void {
+        pub fn armRecv(server: *ServerType, stream: *StreamType) void {
             // A direction-agnostic precondition the pump enforces itself, so
             // the shared mechanism never relies solely on the optional
             // `beforeRecv` hook: every pump reads and writes the relay buffer.
-            assert(conn.stream.relay_buffer != null);
-            if (@hasDecl(Policy, "beforeRecv")) Policy.beforeRecv(conn);
-            conn.stream.arm(op(conn), bit);
+            assert(stream.relay_buffer != null);
+            if (@hasDecl(Policy, "beforeRecv")) Policy.beforeRecv(stream);
+            stream.arm(op(stream), bit);
             server.io.recv(
-                source(conn),
-                recvBuffer(conn),
-                &op(conn).completion,
-                ConnType,
-                conn,
+                source(stream),
+                recvBuffer(stream),
+                &op(stream).completion,
+                StreamType,
+                stream,
                 onRecv,
             );
         }
 
-        fn onRecv(conn: *ConnType, result: Io.RecvError!u32) void {
+        fn onRecv(stream: *StreamType, result: Io.RecvError!u32) void {
+            const conn = stream.conn;
             const server = conn.server;
-            conn.stream.delivered(op(conn), bit);
+            stream.delivered(op(stream), bit);
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
             }
-            if (@hasDecl(Policy, "onRecvEntry")) Policy.onRecvEntry(conn);
-            const received = result catch |err| return Policy.onRecvError(server, conn, err);
+            if (@hasDecl(Policy, "onRecvEntry")) Policy.onRecvEntry(stream);
+            const received = result catch |err| return Policy.onRecvError(server, stream, err);
             assert(received >= 1);
-            assert(received <= recvBuffer(conn).len);
-            const chunk = transformIn(conn, recvBuffer(conn)[0..received]) orelse {
+            assert(received <= recvBuffer(stream).len);
+            const chunk = transformIn(stream, recvBuffer(stream)[0..received]) orelse {
                 server.beginTeardown(conn);
                 return;
             };
@@ -259,18 +265,18 @@ pub fn Pump(
             if (chunk.len == 0) {
                 // Nothing was framed, so nothing is owed: a fragment must
                 // never leave a debt deferred across the next read.
-                assert(directionState(conn).owed() == 0);
+                assert(directionState(stream).owed() == 0);
                 // …but an empty transform is also how an in-band EOF
                 // arrives, and reading on for a stream that ended waits
                 // for bytes that will never come.
-                if (transformEnded(conn)) {
-                    Policy.onDrained(server, conn);
+                if (transformEnded(stream)) {
+                    Policy.onDrained(server, stream);
                     return;
                 }
-                armRecv(server, conn);
+                armRecv(server, stream);
                 return;
             }
-            const fr = Policy.feed(conn, chunk);
+            const fr = Policy.feed(stream, chunk);
             if (fr.malformed or fr.over_limit) {
                 // Both end the exchange here and for the same reason: the
                 // response leg is already armed by now, so no status can
@@ -279,80 +285,81 @@ pub fn Pump(
                 server.beginTeardown(conn);
                 return;
             }
-            if (@hasDecl(Policy, "afterFeed")) Policy.afterFeed(conn, received, fr);
-            const state = directionState(conn);
+            if (@hasDecl(Policy, "afterFeed")) Policy.afterFeed(stream, received, fr);
+            const state = directionState(stream);
             state.owe(fr.consumed);
             if (state.owed() >= 1) {
                 // Stage the wire bytes once, here: a short write resumes
                 // through `sendSlice`, never back through the transform.
-                if (!transformOut(conn, fr.consumed)) {
+                if (!transformOut(stream, fr.consumed)) {
                     server.beginTeardown(conn);
                     return;
                 }
-                armSend(server, conn);
+                armSend(server, stream);
             } else {
                 assert(fr.done);
-                Policy.onDrained(server, conn);
+                Policy.onDrained(server, stream);
             }
         }
 
-        pub fn armSend(server: *ServerType, conn: *ConnType) void {
-            assert(conn.stream.relay_buffer != null);
-            if (@hasDecl(Policy, "beforeSend")) Policy.beforeSend(conn);
-            const wire = sendSlice(conn);
+        pub fn armSend(server: *ServerType, stream: *StreamType) void {
+            assert(stream.relay_buffer != null);
+            if (@hasDecl(Policy, "beforeSend")) Policy.beforeSend(stream);
+            const wire = sendSlice(stream);
             // Nothing arms an empty send: the seam's contract is
             // `bytes.len >= 1` (§4), and an empty slice here would mean a
             // caller asked to write with nothing staged.
             assert(wire.len >= 1);
-            conn.stream.arm(op(conn), bit);
+            stream.arm(op(stream), bit);
             server.io.send(
-                target(conn),
+                target(stream),
                 wire,
-                &op(conn).completion,
-                ConnType,
-                conn,
+                &op(stream).completion,
+                StreamType,
+                stream,
                 onSend,
             );
         }
 
-        fn onSend(conn: *ConnType, result: Io.SendError!u32) void {
+        fn onSend(stream: *StreamType, result: Io.SendError!u32) void {
+            const conn = stream.conn;
             const server = conn.server;
-            conn.stream.delivered(op(conn), bit);
+            stream.delivered(op(stream), bit);
             if (conn.isTearingDown()) {
                 server.continueTeardown(conn);
                 return;
             }
             if (@hasDecl(Policy, "onSendEntry")) {
-                if (Policy.onSendEntry(server, conn)) return;
+                if (Policy.onSendEntry(server, stream)) return;
             }
-            const sent = result catch |err| return Policy.onSendError(server, conn, err);
+            const sent = result catch |err| return Policy.onSendError(server, stream, err);
             assert(sent >= 1);
-            creditSend(conn, sent);
+            creditSend(stream, sent);
             // What actually left on the wire, whether or not framing
             // counts in the same units (the transform seam above): the
             // access log reports bytes moved, not bytes framed.
-            if (@hasDecl(Policy, "afterSend")) Policy.afterSend(conn, sent);
+            if (@hasDecl(Policy, "afterSend")) Policy.afterSend(stream, sent);
             // "Anything left to write?" rather than "is the framed debt
             // settled?" — the same question for a plain policy, whose
             // `sendSlice` empties exactly when the debt does, and the only
             // form that still holds when the wire carries a different number
             // of bytes than framing counted.
-            if (sendSlice(conn).len > 0) {
-                armSend(server, conn);
+            if (sendSlice(stream).len > 0) {
+                armSend(server, stream);
                 return;
             }
             // The wire is drained, so the chunk framing chose is delivered:
             // the seam's contract (module header) is that a transform has
             // settled the framed debt by now, which is what lets the next
             // chunk's `owe` demand a clean slate.
-            assert(directionState(conn).owed() == 0);
+            assert(directionState(stream).owed() == 0);
             // A full chunk moved: this is activity — push the idle deadline
             // out (§6); the armed timer op is not touched.
             server.storeDeadline(conn, server.idleTimeoutMs());
-            if (Policy.framingDone(conn)) {
-                Policy.onComplete(server, conn);
+            if (Policy.framingDone(stream)) {
+                Policy.onComplete(server, stream);
             } else {
-                armRecv(server, conn);
+                armRecv(server, stream);
             }
         }
     };

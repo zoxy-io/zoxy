@@ -1339,6 +1339,26 @@ protected was available more cheaply. Reversed deliberately, no knob:
 - SimIo keeps zeroing its slab — that was never residency, it is seed
   determinism (a replayed schedule must see identical bytes).
 
+### Idle RSS moves in 2 MiB steps under THP (2026-11-14)
+
+The smoke banner's resting RSS for the ReleaseSafe twin went from 10756
+to 12804 KiB across a refactor that changed no state (#275's keying of
+the exchange on its stream). Exactly +2048 KiB, stable across runs, and
+not memory: `/proc/<pid>/smaps` put the whole difference in the bss
+mapping — one transparent huge page before, two after — because the
+build shifted bss by 896 bytes and the bytes touched at startup now
+straddle a 2 MiB boundary. With THP disabled for the process
+(`prctl(PR_SET_THP_DISABLE)`) the two builds measured 9096 and 9104 KiB,
+bss 400 and 404 KiB: one page. Text was 848 bytes smaller and data
+identical.
+
+So on a host with `transparent_hugepage=always` the idle figure is
+quantized: any change that moves bss across a 2 MiB line — code size,
+a constant, a field — can move it by a whole huge page either way. The
+smoke gates on growth across its run (`rss A -> B`), not on the resting
+value, so this trips nothing; read a 2 MiB jump in the resting value as
+layout until smaps says otherwise.
+
 ## The simulator runs fastest in Debug — why, not just that (2026-08-03)
 
 That Debug beats ReleaseSafe here was measured on 2026-07-28 and
