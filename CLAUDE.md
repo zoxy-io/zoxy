@@ -38,7 +38,7 @@ direnv activates the shell). Read before writing code:
   the C binding lives inside it, so `@cImport` stays lint-forbidden here.
 - Boundaries (lint-enforced): raw syscalls and the `xev` import live only
   under `src/io/`; `hparse` is imported only by `src/http/parser.zig`;
-  `zssl` only under `src/tls/`.
+  `h2` only under `src/http/h2/`; `zssl` only under `src/tls/`.
 - Zero allocation after startup. The memory, fd, and ring budgets are
   closed-form functions of `src/constants.zig` and the loaded config.
   Where a budget is a property of one constant it is comptime-asserted;

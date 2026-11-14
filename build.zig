@@ -111,6 +111,18 @@ pub fn build(b: *std.Build) void {
     });
     const hparse_module = hparse_dependency.module("hparse");
 
+    // h2 — HTTP/2's frame codec and HPACK (#275) — is pinned by content
+    // hash like hparse, and confined like it: only `src/http/h2/` may
+    // import it (lint-enforced), because the session there owns every
+    // framing decision the codec leaves to its consumer. Assertions are
+    // stated rather than defaulted: on, as everywhere in this tree.
+    const h2_dependency = b.dependency("h2", .{
+        .target = target,
+        .optimize = optimize,
+        .assertions = true,
+    });
+    const h2_module = h2_dependency.module("h2");
+
     // zssl — the TLS 1.3 engine (DESIGN.md §4) — is pinned by content
     // hash; see build.zig.zon for why it replaced the ztls fork. Only
     // src/tls/ may import it (lint-enforced). It is a Zig protocol layer
@@ -182,6 +194,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_module },
+            .{ .name = "h2", .module = h2_module },
             .{ .name = "zssl", .module = zssl_module },
         },
     });
@@ -361,6 +374,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = std.lang.Optimize.safe,
     });
+    const h2_fast_dependency = b.dependency("h2", .{
+        .target = target,
+        .optimize = std.lang.Optimize.safe,
+        .assertions = true,
+    });
     const zssl_fast_dependency = b.dependency("zssl", .{
         .target = target,
         .optimize = std.lang.Optimize.safe,
@@ -373,6 +391,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "xev", .module = xev_module },
             .{ .name = "hparse", .module = hparse_fast_dependency.module("hparse") },
+            .{ .name = "h2", .module = h2_fast_dependency.module("h2") },
             .{ .name = "zssl", .module = zssl_fast_dependency.module("zssl") },
         },
     });
