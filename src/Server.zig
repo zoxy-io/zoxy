@@ -292,9 +292,11 @@ pub fn Server(comptime IoType: type) type {
         /// round: under a sustained shed storm the date goes *stale*,
         /// never malformed.
         ///
-        /// A claim, not a tally: `Conn.static_send` records who holds one,
-        /// so the release is a no-op wherever nothing was taken and the
-        /// conn's own release path is the backstop. A leak would freeze
+        /// A claim, not a tally: `Stream.static_send` records which
+        /// exchange holds one — an admission stream's or a shared one's,
+        /// so the bound is both pools — and the release is a no-op
+        /// wherever nothing was taken, with the stream's own release path
+        /// as the backstop. A leak would freeze
         /// the date silently, which is why `isIdle` asserts a drained
         /// server holds none.
         static_sends_inflight: u32,
@@ -1194,27 +1196,28 @@ pub fn Server(comptime IoType: type) type {
             }
         }
 
-        /// Take the claim that says this connection's pending write is
+        /// Take the claim that says this exchange's pending write is
         /// reading shared static bytes (#234). Paired with
         /// `releaseStaticSend`, which every path out of that write runs.
-        pub fn claimStaticSend(server: *Self, conn: *ConnType) void {
-            // One write at a time per connection (`armClientWrite`), so a
-            // conn already holding one would mean two are in flight.
-            assert(!conn.stream.static_send);
-            conn.stream.static_send = true;
+        pub fn claimStaticSend(server: *Self, stream: *StreamType) void {
+            // One write at a time per exchange (`armClientWrite`), so a
+            // stream already holding one would mean two are in flight.
+            assert(!stream.static_send);
+            stream.static_send = true;
             server.static_sends_inflight += 1;
-            assert(server.static_sends_inflight <= server.conns.capacity());
+            assert(server.static_sends_inflight <=
+                server.streams.capacity() + server.shared_streams.capacity());
         }
 
-        /// Hand back the claim, if this connection holds one. A no-op
+        /// Hand back the claim, if this exchange holds one. A no-op
         /// otherwise, so the paths that end a write do not each re-test
-        /// what they were writing — and so the connection's own release
-        /// can be the backstop for the ones that end it abruptly.
-        pub fn releaseStaticSend(server: *Self, conn: *ConnType) void {
-            if (!conn.stream.static_send) {
+        /// what they were writing — and so the stream's own release can be
+        /// the backstop for the ones that end it abruptly.
+        pub fn releaseStaticSend(server: *Self, stream: *StreamType) void {
+            if (!stream.static_send) {
                 return;
             }
-            conn.stream.static_send = false;
+            stream.static_send = false;
             assert(server.static_sends_inflight >= 1);
             server.static_sends_inflight -= 1;
         }
@@ -1853,13 +1856,13 @@ pub fn Server(comptime IoType: type) type {
         /// all the same, so its quiescence is part of "idle" — and so is
         /// an endpoint left carrying a charge for a connection that ended.
         pub fn isIdle(server: *const Self) bool {
-            // Every #234 claim is a connection's, so a released conn pool
-            // and an outstanding claim contradict each other — and a
-            // leaked one would silently freeze the `Date`. Asserted here
+            // Every #234 claim is a stream's, so released stream pools and
+            // an outstanding claim contradict each other — and a leaked
+            // one would silently freeze the `Date`. Asserted here
             // rather than merely reported, because an idle server with a
             // claim standing is a bug in the release path, not a state a
             // caller should be asked to handle.
-            if (server.conns.isFullyReleased()) {
+            if (server.streams.isFullyReleased() and server.shared_streams.isFullyReleased()) {
                 assert(server.static_sends_inflight == 0);
             }
             return server.l4Released() and
@@ -2270,7 +2273,7 @@ pub fn Server(comptime IoType: type) type {
             // read as this client's: a head that never parses reaches no
             // capture at all, and its line would otherwise report
             // whatever the slot's *previous* occupant sent.
-            server.resetLogHeaders(conn);
+            server.resetLogHeaders(conn.stream);
             // An L4 connection is its own log unit and starts its clocks
             // here — the first point at which a listener has said it is
             // one. An L7 exchange starts only when its first head byte
@@ -2279,7 +2282,7 @@ pub fn Server(comptime IoType: type) type {
             // `beginRequest`'s, called rather than repeated: two copies of
             // "which clock is conditional on what" is exactly the shape
             // that drifted once already (#237).
-            if (listener.protocol == .l4) server.beginRequest(conn);
+            if (listener.protocol == .l4) server.beginRequest(conn.stream);
             assert(conn.routes.len >= 1);
             assert(conn.stream.conn == conn);
         }
@@ -2458,20 +2461,20 @@ pub fn Server(comptime IoType: type) type {
             server.updateHeadPressure();
         }
 
-        pub fn returnHeadBuffer(server: *Self, conn: *ConnType) void {
+        pub fn returnHeadBuffer(server: *Self, stream: *StreamType) void {
             // A terminated connection's head lives in its engine, not the
             // ring (§4): it never bound a buffer, so there is none to give
             // back and no in-use count to decrement. Every site that
             // returns a buffer on the L7 path reaches here, so the fork
             // lives once rather than at each of them.
-            if (conn.tls != null) {
-                assert(conn.stream.head_buffer_id == StreamType.head_buffer_none);
+            if (stream.conn.tls != null) {
+                assert(stream.head_buffer_id == StreamType.head_buffer_none);
                 return;
             }
-            assert(conn.stream.head_buffer_id != StreamType.head_buffer_none);
+            assert(stream.head_buffer_id != StreamType.head_buffer_none);
             assert(server.head_buffers_in_use >= 1);
-            server.io.bufferGroupReturn(conn.stream.head_buffer_id);
-            conn.stream.head_buffer_id = StreamType.head_buffer_none;
+            server.io.bufferGroupReturn(stream.head_buffer_id);
+            stream.head_buffer_id = StreamType.head_buffer_none;
             server.head_buffers_in_use -= 1;
             server.updateHeadPressure();
         }
@@ -2516,11 +2519,27 @@ pub fn Server(comptime IoType: type) type {
             return slots * constants.access_log_header_bytes_max + slots * @sizeOf(u16);
         }
 
+        /// A stream's place across both stream pools (#275): the admission
+        /// streams first, then the shared ones — the order every side table
+        /// sized by `constants.streamSlotsFor` lays them out in. An
+        /// admission stream is the one its connection names; a shared one
+        /// belongs to a connection whose own stream is another.
+        fn streamIndex(server: *const Self, stream: *const StreamType) u32 {
+            if (stream.conn.stream == stream) {
+                const index = server.streams.indexOf(stream);
+                assert(index < server.streams.capacity());
+                return index;
+            }
+            const index = server.streams.capacity() + server.shared_streams.indexOf(stream);
+            assert(index < server.streams.capacity() + server.shared_streams.capacity());
+            return index;
+        }
+
         /// One exchange's slice of the capture table: `per_conn` value
-        /// slots, addressed by the *stream* pool index — stable across
-        /// reuse, and the same index for the whole life of the slot
-        /// holding it. Split from the capture and the read so both speak
-        /// one piece of arithmetic.
+        /// slots, addressed by the stream's place across both stream pools
+        /// (`streamIndex`) — stable across reuse, and the same index for
+        /// the whole life of the slot holding it. Split from the capture
+        /// and the read so both speak one piece of arithmetic.
         ///
         /// Keyed by the stream since #274, because these are the fields
         /// `LogState` could not hold inline and they share its unit
@@ -2529,21 +2548,19 @@ pub fn Server(comptime IoType: type) type {
         /// they belong to lives on the stream would be two units for one
         /// log entry. The table is sized for every stream slot, the
         /// shared HTTP/2 pool's included (#275), since a multiplexed
-        /// exchange writes a line of its own; the admission pool's slots
-        /// come first, which is the only pool this addresses until a
-        /// shared stream can capture.
-        fn logHeaderSlot(server: *Self, conn: *const ConnType, index: u32) []u8 {
+        /// exchange writes a line of its own.
+        fn logHeaderSlot(server: *Self, stream: *const StreamType, index: u32) []u8 {
             assert(index < server.log_headers_per_conn);
-            const stream_index = server.streams.indexOf(conn.stream);
+            const stream_index = server.streamIndex(stream);
             const slot = stream_index * server.log_headers_per_conn + index;
             assert(slot < server.log_header_lens.len);
             const bytes = constants.access_log_header_bytes_max;
             return server.log_header_values[slot * bytes ..][0..bytes];
         }
 
-        fn logHeaderLen(server: *Self, conn: *const ConnType, index: u32) *u16 {
+        fn logHeaderLen(server: *Self, stream: *const StreamType, index: u32) *u16 {
             assert(index < server.log_headers_per_conn);
-            const stream_index = server.streams.indexOf(conn.stream);
+            const stream_index = server.streamIndex(stream);
             const slot = stream_index * server.log_headers_per_conn + index;
             assert(slot < server.log_header_lens.len);
             return &server.log_header_lens[slot];
@@ -2562,7 +2579,7 @@ pub fn Server(comptime IoType: type) type {
         /// anything when the two disagree.
         fn captureLogHeaders(
             server: *Self,
-            conn: *ConnType,
+            stream: *StreamType,
             headers: []const parser.Header,
             names: []const []const u8,
             first_index: u32,
@@ -2570,13 +2587,13 @@ pub fn Server(comptime IoType: type) type {
             assert(first_index + names.len <= server.log_headers_per_conn);
             for (names, 0..) |name, offset| {
                 const index = first_index + @as(u32, @intCast(offset));
-                const slot = server.logHeaderSlot(conn, index);
+                const slot = server.logHeaderSlot(stream, index);
                 const value = parser.headerValue(headers, name) orelse {
-                    server.logHeaderLen(conn, index).* = 0;
+                    server.logHeaderLen(stream, index).* = 0;
                     continue;
                 };
                 const captured = access_log_module.captureTruncated(slot, value);
-                server.logHeaderLen(conn, index).* = @intCast(captured.len);
+                server.logHeaderLen(stream, index).* = @intCast(captured.len);
             }
         }
 
@@ -2586,7 +2603,7 @@ pub fn Server(comptime IoType: type) type {
         /// request touches it (the `Record` contract).
         fn loggedHeaders(
             server: *Self,
-            conn: *const ConnType,
+            stream: *const StreamType,
             names: []const []const u8,
             first_index: u32,
             out: *[constants.access_log_headers_max][]const u8,
@@ -2594,9 +2611,9 @@ pub fn Server(comptime IoType: type) type {
             assert(first_index + names.len <= server.log_headers_per_conn);
             for (names, 0..) |_, offset| {
                 const index = first_index + @as(u32, @intCast(offset));
-                const len = server.logHeaderLen(conn, index).*;
+                const len = server.logHeaderLen(stream, index).*;
                 assert(len <= constants.access_log_header_bytes_max);
-                out[offset] = server.logHeaderSlot(conn, index)[0..len];
+                out[offset] = server.logHeaderSlot(stream, index)[0..len];
             }
             return .{ .names = names, .values = out[0..names.len] };
         }
@@ -2606,14 +2623,14 @@ pub fn Server(comptime IoType: type) type {
         /// that names none, which is every config that did not ask.
         pub fn captureRequestLogHeaders(
             server: *Self,
-            conn: *ConnType,
+            stream: *StreamType,
             headers: []const parser.Header,
         ) void {
-            assert(conn.protocol == .http); // Only a parsed head has headers.
+            assert(stream.conn.protocol == .http); // Only a parsed head has headers.
             assert(headers.len <= constants.headers_max);
             if (server.config.access_log_request_headers.len == 0) return;
             server.captureLogHeaders(
-                conn,
+                stream,
                 headers,
                 server.config.access_log_request_headers,
                 0,
@@ -2624,14 +2641,14 @@ pub fn Server(comptime IoType: type) type {
         /// liveness rule, one direction over.
         pub fn captureResponseLogHeaders(
             server: *Self,
-            conn: *ConnType,
+            stream: *StreamType,
             headers: []const parser.Header,
         ) void {
-            assert(conn.protocol == .http); // An l4 relay parses no response.
+            assert(stream.conn.protocol == .http); // An l4 relay parses no response.
             assert(headers.len <= constants.headers_max);
             if (server.config.access_log_response_headers.len == 0) return;
             server.captureLogHeaders(
-                conn,
+                stream,
                 headers,
                 server.config.access_log_response_headers,
                 @intCast(server.config.access_log_request_headers.len),
@@ -2651,20 +2668,20 @@ pub fn Server(comptime IoType: type) type {
         /// config's lists say nothing about relayed bytes.
         fn loggedHeaderPair(
             server: *Self,
-            conn: *const ConnType,
+            stream: *const StreamType,
             values: *LoggedHeaderValues,
         ) struct {
             request: access_log_module.NamedHeaders,
             response: access_log_module.NamedHeaders,
         } {
-            if (conn.protocol != .http) {
+            if (stream.conn.protocol != .http) {
                 return .{ .request = .{}, .response = .{} };
             }
             const request_names = server.config.access_log_request_headers;
             return .{
-                .request = server.loggedHeaders(conn, request_names, 0, &values.request),
+                .request = server.loggedHeaders(stream, request_names, 0, &values.request),
                 .response = server.loggedHeaders(
-                    conn,
+                    stream,
                     server.config.access_log_response_headers,
                     @intCast(request_names.len),
                     &values.response,
@@ -2676,12 +2693,13 @@ pub fn Server(comptime IoType: type) type {
         /// turnaround cannot report the previous request's headers on
         /// the next one's line — `LogState.reset`'s rule for the fields
         /// that live in the side table instead of on the slot.
-        pub fn resetLogHeaders(server: *Self, conn: *const ConnType) void {
+        pub fn resetLogHeaders(server: *Self, stream: *const StreamType) void {
             assert(server.log_header_lens.len ==
-                @as(usize, server.streams.capacity()) * server.log_headers_per_conn);
+                (@as(usize, server.streams.capacity()) + server.shared_streams.capacity()) *
+                    server.log_headers_per_conn);
             var index: u32 = 0;
             while (index < server.log_headers_per_conn) : (index += 1) {
-                server.logHeaderLen(conn, index).* = 0;
+                server.logHeaderLen(stream, index).* = 0;
             }
         }
 
@@ -2714,7 +2732,7 @@ pub fn Server(comptime IoType: type) type {
             // mid-write ends here like every other, and a claim that
             // outlived its connection would freeze the `Date` for the
             // life of the process.
-            server.releaseStaticSend(conn);
+            server.releaseStaticSend(conn.stream);
             // §5's release rule, one level deeper (#274): the stream goes
             // back before the connection that owns it, never after — a
             // pool that outlived its owner is how a release order becomes
@@ -3669,7 +3687,7 @@ pub fn Server(comptime IoType: type) type {
             // Same rule for the ring buffer: nothing armed references it
             // (asserted above), so the return cannot race a landing recv.
             if (conn.stream.head_buffer_id != StreamType.head_buffer_none) {
-                server.returnHeadBuffer(conn);
+                server.returnHeadBuffer(conn.stream);
             }
             // The leased upstream slot rides the same release rule: its
             // socket (if any) was closed by the caller, so the slot is
@@ -3742,7 +3760,7 @@ pub fn Server(comptime IoType: type) type {
             // ended without one — a client that left mid-request, a
             // truncated body, a drain straggler — and every L4 connection,
             // whose whole life is the unit being logged.
-            server.logExchange(conn);
+            server.logExchange(conn.stream);
             // Which returns the stream with it (§5).
             server.releaseConn(conn);
             server.counters.increment("completed");
@@ -3778,79 +3796,80 @@ pub fn Server(comptime IoType: type) type {
         /// had none, log or no log. §9 priced them at ~100 cycles per
         /// request. The duration never needed a wall clock; it needed a
         /// stopwatch, and §4's tick clock had been one all along.
-        pub fn beginRequest(server: *Self, conn: *ConnType) void {
-            if (conn.stream.log.started_ns != 0) return;
-            conn.stream.log.started_ns = server.io.nowNs();
-            assert(conn.stream.log.started_ns != 0);
+        pub fn beginRequest(server: *Self, stream: *StreamType) void {
+            if (stream.log.started_ns != 0) return;
+            stream.log.started_ns = server.io.nowNs();
+            assert(stream.log.started_ns != 0);
             if (server.access_log.sink == null) return;
-            conn.stream.log.started_wall_ns = server.io.nowWallNs();
-            assert(conn.stream.log.started_wall_ns != 0);
+            stream.log.started_wall_ns = server.io.nowWallNs();
+            assert(stream.log.started_wall_ns != 0);
         }
 
-        /// Write the access-log line this connection owes, if any (§8).
+        /// Write the access-log line this exchange owes, if any (§8): an L7
+        /// exchange's, or an L4 connection's, whose whole life is its one.
         ///
-        /// The caller sets `conn.stream.log.status` and `conn.stream.log.outcome` when it
+        /// The caller sets `stream.log.status` and `stream.log.outcome` when it
         /// knows them; the defaults — status 0, outcome `aborted` — are
         /// deliberately the answer for the caller that does not, which is
         /// teardown. That is what lets one function serve both the path
         /// that decided an outcome and the path that never got one, with
         /// `emitted` deciding which of the two speaks for an exchange that
         /// took both.
-        pub fn logExchange(server: *Self, conn: *ConnType) void {
+        pub fn logExchange(server: *Self, stream: *StreamType) void {
             if (server.access_log.sink == null) return;
-            if (conn.stream.log.emitted) return;
-            // Nothing was asked of this connection: an L7 slot that idled
+            if (stream.log.emitted) return;
+            // Nothing was asked of this exchange: an L7 slot that idled
             // out between requests, or one reaped before its first byte.
             // The monotonic stamp is the one that answers this, because it
             // is the one taken unconditionally; the wall stamp beside it
             // says only whether a date was wanted.
-            if (conn.stream.log.started_ns == 0) return;
-            conn.stream.log.emitted = true;
+            if (stream.log.started_ns == 0) return;
+            stream.log.emitted = true;
             // Reached only past the `sink == null` return above, and the
             // sink is fixed at startup — `init` is its one writer, and
             // SIGHUP reopens the file behind it without ever clearing it.
             // So a stamp taken under "the log is on" cannot be missing by
             // the time the line is written.
-            assert(conn.stream.log.started_wall_ns != 0);
+            assert(stream.log.started_wall_ns != 0);
             // One clock for the interval, and it is not this line's date
             // clock. `nowNs` is monotonic and cannot step backwards, so
             // the subtraction below needs no saturation — where the wall
             // clock this used to read needed it against NTP.
             const now_ns = server.io.nowNs();
-            assert(now_ns >= conn.stream.log.started_ns);
+            assert(now_ns >= stream.log.started_ns);
             // Both indices are pool/config positions this connection has
             // carried since routing; a stale one would name another
             // operator's backend in the line, so they are checked here
             // rather than left to Zig's bounds check to turn into a panic.
-            assert(conn.stream.cluster_index < server.config.clusters.len);
-            const cluster = server.config.clusters[conn.stream.cluster_index];
-            if (conn.stream.log.endpoint_index != stream_module.LogState.endpoint_none) {
-                assert(conn.stream.log.endpoint_index < cluster.endpoints.len);
+            assert(stream.cluster_index < server.config.clusters.len);
+            const cluster = server.config.clusters[stream.cluster_index];
+            if (stream.log.endpoint_index != stream_module.LogState.endpoint_none) {
+                assert(stream.log.endpoint_index < cluster.endpoints.len);
             }
             var values: LoggedHeaderValues = undefined;
-            const logged = server.loggedHeaderPair(conn, &values);
+            const logged = server.loggedHeaderPair(stream, &values);
             const entry: access_log_module.Record = .{
-                .kind = switch (conn.protocol) {
+                .kind = switch (stream.conn.protocol) {
                     .l4 => .l4,
                     .http => .http,
                 },
-                .outcome = conn.stream.log.outcome,
-                .started_wall_ns = conn.stream.log.started_wall_ns,
-                .duration_ns = now_ns - conn.stream.log.started_ns,
-                .client = conn.client_address,
-                .upstream = if (conn.stream.log.endpoint_index == stream_module.LogState.endpoint_none)
+                .outcome = stream.log.outcome,
+                .started_wall_ns = stream.log.started_wall_ns,
+                .duration_ns = now_ns - stream.log.started_ns,
+                .client = stream.conn.client_address,
+                .upstream = if (stream.log.endpoint_index == stream_module.LogState.endpoint_none)
                     null
                 else
-                    cluster.endpoints[conn.stream.log.endpoint_index],
+                    cluster.endpoints[stream.log.endpoint_index],
                 .cluster = cluster.name,
-                .bytes_in = conn.stream.log.bytes_in,
-                .bytes_out = conn.stream.log.bytes_out,
-                .method = conn.stream.log.methodSlice(),
-                .host = conn.stream.log.hostSlice(),
-                .path = conn.stream.log.pathSlice(),
-                .status = conn.stream.log.status,
-                .upstream_reused = conn.stream.l7.upstream_was_reused,
-                .upstream_replayed = conn.stream.l7.replay_used,
+                .bytes_in = stream.log.bytes_in,
+                .bytes_out = stream.log.bytes_out,
+                .method = stream.log.methodSlice(),
+                .host = stream.log.hostSlice(),
+                .path = stream.log.pathSlice(),
+                .status = stream.log.status,
+                .upstream_reused = stream.l7.upstream_was_reused,
+                .upstream_replayed = stream.l7.replay_used,
                 .request_headers = logged.request,
                 .response_headers = logged.response,
             };
@@ -4219,8 +4238,8 @@ pub fn Server(comptime IoType: type) type {
         /// retirement changes nothing that is already armed. `respond`
         /// widens to the idle budget; `expireDeadline`'s two verdict
         /// branches store their fixed grace window.
-        pub fn clearRequestDeadline(conn: *ConnType) void {
-            conn.stream.l7.request_deadline_ns = 0;
+        pub fn clearRequestDeadline(stream: *StreamType) void {
+            stream.l7.request_deadline_ns = 0;
         }
 
         fn armDeadline(server: *Self, conn: *ConnType) void {
@@ -4396,7 +4415,7 @@ pub fn Server(comptime IoType: type) type {
             // Before either verdict branch stores its grace window: both
             // grace deadlines run through `storeDeadline`, which would
             // clamp them straight back to this already-expired cap.
-            clearRequestDeadline(conn);
+            clearRequestDeadline(conn.stream);
             if (conn.stream.phase == .exchanging and
                 conn.stream.l7.pending_verdict == .none and
                 Proxy.expiryAnswerable(conn.stream))

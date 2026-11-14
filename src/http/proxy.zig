@@ -182,7 +182,7 @@ pub fn Proxy(comptime IoType: type) type {
                     const capacity = headBytes(server, stream).len;
                     const pending = conn.tls_pending_len;
                     conn.tls_pending_len = 0;
-                    server.beginRequest(conn);
+                    server.beginRequest(stream);
                     // The handshake phase collects whatever the last
                     // flight carried without knowing what the protocol
                     // will make of it, so it can hold more than an L7
@@ -272,7 +272,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // clock on the delivery opens a log entry for a request
                 // nobody made, which teardown then writes out as an
                 // aborted exchange with no method and no bytes.
-                server.beginRequest(conn);
+                server.beginRequest(stream);
                 stream.log.bytes_in += head.appended;
             }
             if (conn.tls.?.peerClosed()) {
@@ -553,7 +553,7 @@ pub fn Proxy(comptime IoType: type) type {
             // would owe the log a line for a request nobody made. Nor at
             // the parse: a slowloris that dribbles for the whole head-read
             // deadline must report the time it spent doing it (§8).
-            server.beginRequest(conn);
+            server.beginRequest(stream);
             stream.log.bytes_in += bound.len;
             fillHead(stream, bound.len, headBytes(server, stream).len);
             parseAndDispatch(server, stream);
@@ -931,7 +931,6 @@ pub fn Proxy(comptime IoType: type) type {
         /// sets these: `request_head_len` staying 0 is exactly what marks a
         /// stream whose message boundary the parser could not find.
         fn recordRequestFacts(server: *ServerType, stream: *StreamType, request: *const parser.RequestHead) void {
-            const conn = stream.conn;
             assert(stream.phase == .reading_head);
             assert(request.head_len >= 1);
             // Once per request: `resetForNextRequest` and
@@ -949,7 +948,7 @@ pub fn Proxy(comptime IoType: type) type {
             // The #140 named headers, on the same terms and for the same
             // reason — and here rather than deeper, so every line that
             // reports a parsed request carries them, rejects included.
-            server.captureRequestLogHeaders(conn, request.headers);
+            server.captureRequestLogHeaders(stream, request.headers);
         }
 
         /// Start this exchange's §8 deadline, if the deployment set one.
@@ -2658,7 +2657,7 @@ pub fn Proxy(comptime IoType: type) type {
             // in the log means a tunnel the client actually got, so a
             // handshake whose write never landed reports the teardown it
             // really was rather than a session that never existed.
-            server.captureResponseLogHeaders(conn, response.headers);
+            server.captureResponseLogHeaders(stream, response.headers);
             armClientWrite(server, stream, headBytes(server, stream)[0..head_write_len], .tunnel_start);
         }
 
@@ -2718,7 +2717,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.relay_buffer != null);
             assert(stream.head_buffer_id != StreamType.head_buffer_none);
             server.releaseRelayBuffer(stream.relay_buffer.?);
-            server.returnHeadBuffer(conn);
+            server.returnHeadBuffer(stream);
             stream.head_len = 0;
             stream.head_cursor.reset();
             stream.relay_buffer = buffer;
@@ -3011,7 +3010,6 @@ pub fn Proxy(comptime IoType: type) type {
             verdict: StickyVerdict,
             head_write_len: u32,
         ) void {
-            const conn = stream.conn;
             assert(stream.phase == .exchanging);
             assert(!stream.l7.response_started);
             assert(head_write_len >= 1);
@@ -3019,7 +3017,7 @@ pub fn Proxy(comptime IoType: type) type {
             stream.l7.response_started = true;
             creditSticky(server, verdict);
             stream.log.status = response.status;
-            server.captureResponseLogHeaders(conn, response.headers);
+            server.captureResponseLogHeaders(stream, response.headers);
             armClientWrite(server, stream, headBytes(server, stream)[0..head_write_len], .response_excess);
         }
 
@@ -3215,7 +3213,7 @@ pub fn Proxy(comptime IoType: type) type {
             // because a kept connection holds its slot for as long as the
             // client stays — and a claim standing that long would freeze
             // the `Date` every later response is stamped from.
-            server.releaseStaticSend(conn);
+            server.releaseStaticSend(stream);
             assertWriteContinuation(stream, write.then);
             switch (write.then) {
                 // The origin's `101` has reached the client, so the HTTP
@@ -3234,11 +3232,11 @@ pub fn Proxy(comptime IoType: type) type {
                 // — the keep path resets what the line reports, and the
                 // close path hands the connection to a drain (§8).
                 .lingering_close => {
-                    server.logExchange(conn);
+                    server.logExchange(stream);
                     beginLingeringClose(server, stream);
                 },
                 .next_request => {
-                    server.logExchange(conn);
+                    server.logExchange(stream);
                     resumeAfterStaticResponse(server, stream);
                 },
                 // A #176 redirect is fully delivered: return the head
@@ -3246,13 +3244,13 @@ pub fn Proxy(comptime IoType: type) type {
                 // a static answer's — then the static pair's own endings,
                 // whose continuations assert the buffer is gone.
                 .redirect_lingering_close => {
-                    server.returnHeadBuffer(conn);
-                    server.logExchange(conn);
+                    server.returnHeadBuffer(stream);
+                    server.logExchange(stream);
                     beginLingeringClose(server, stream);
                 },
                 .redirect_next_request => {
-                    server.returnHeadBuffer(conn);
-                    server.logExchange(conn);
+                    server.returnHeadBuffer(stream);
+                    server.logExchange(stream);
                     resumeAfterStaticResponse(server, stream);
                 },
             }
@@ -3499,7 +3497,7 @@ pub fn Proxy(comptime IoType: type) type {
             // which is what keeps one `ok` line per `l7_responses`.
             assert(stream.log.outcome == .aborted);
             stream.log.outcome = .ok;
-            server.logExchange(conn);
+            server.logExchange(stream);
 
             const request_complete = stream.l7.request_leg == .done;
             if (stream.l7.upstream_reusable and request_complete and !server.draining) {
@@ -3619,7 +3617,7 @@ pub fn Proxy(comptime IoType: type) type {
             // returned it (`releaseForStaticResponse`); the completed-
             // exchange path still holds it here.
             if (stream.head_buffer_id != StreamType.head_buffer_none) {
-                server.returnHeadBuffer(conn);
+                server.returnHeadBuffer(stream);
             }
             stream.head_len = 0;
             stream.head_cursor.reset();
@@ -3628,7 +3626,7 @@ pub fn Proxy(comptime IoType: type) type {
             // The #140 captures live in the server's side table, not on
             // `log`, so they need clearing beside it — or the next
             // request's line would report this one's headers.
-            server.resetLogHeaders(conn);
+            server.resetLogHeaders(stream);
             stream.directions = .{ .{}, .{} };
             stream.moveTo(.reading_head);
             server.storeDeadline(conn, server.idleTimeoutMs());
@@ -4028,7 +4026,7 @@ pub fn Proxy(comptime IoType: type) type {
             // not buffer content, and the §7 resync rule still reads it to
             // decide keep-or-close; `beginNextRequest` zeroes it.
             if (stream.head_buffer_id != StreamType.head_buffer_none) {
-                server.returnHeadBuffer(conn);
+                server.returnHeadBuffer(stream);
             }
             if (stream.relay_buffer) |buffer| {
                 server.releaseRelayBuffer(buffer);
@@ -4129,7 +4127,7 @@ pub fn Proxy(comptime IoType: type) type {
             // whatever timer is already out re-arms itself for the
             // remainder once it sees the later target (§4's lazy
             // tick-and-compare).
-            ServerType.clearRequestDeadline(conn);
+            ServerType.clearRequestDeadline(stream);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment(counter);
             // What the line will say, recorded here where the verdict is
@@ -4160,7 +4158,6 @@ pub fn Proxy(comptime IoType: type) type {
         /// head ring — the origin is deliberately never dialed, which is
         /// the whole meaning of a budget that ran out here.
         fn respondMaxForwardsExhausted(server: *ServerType, stream: *StreamType) void {
-            const conn = stream.conn;
             assert(stream.phase == .reading_head);
             assert(!stream.armed.data_client_to_upstream);
             assert(!stream.armed.data_upstream_to_client);
@@ -4170,7 +4167,7 @@ pub fn Proxy(comptime IoType: type) type {
             const persistence: shed.Persistence = if (keep) .keep else .close;
             const answer = server.static_responses.getOptions(persistence);
             server.stampStaticDate(answer.date);
-            server.claimStaticSend(conn);
+            server.claimStaticSend(stream);
             stream.moveTo(.responding);
             // The answer is bodiless, so a HEAD would take the same bytes
             // — and a HEAD never reaches here anyway: this is the OPTIONS
@@ -4233,7 +4230,7 @@ pub fn Proxy(comptime IoType: type) type {
             // reading these bytes — the claim taken below is what makes
             // that true for the next one to ask.
             server.stampStaticDate(answer.date);
-            server.claimStaticSend(conn);
+            server.claimStaticSend(stream);
             const then: stream_module.ClientWrite.Then =
                 if (keep) .next_request else .lingering_close;
             armClientWrite(server, stream, answer.bytes, then);
@@ -4252,7 +4249,6 @@ pub fn Proxy(comptime IoType: type) type {
             page: *const config_module.Config.StaticPage,
             keep: bool,
         ) void {
-            const conn = stream.conn;
             assert(stream.phase == .responding);
             assert(page.keep_head_len <= page.keep.len);
             assert(page.close_head_len <= page.close.len);
@@ -4267,7 +4263,7 @@ pub fn Proxy(comptime IoType: type) type {
             // slot is stamped under the same claim (#234). The slot sits
             // in the head, so the HEAD prefix carries it too.
             server.stampStaticDate(if (keep) page.keep_date else page.close_date);
-            server.claimStaticSend(conn);
+            server.claimStaticSend(stream);
             const then: stream_module.ClientWrite.Then =
                 if (keep) .next_request else .lingering_close;
             armClientWrite(server, stream, bytes, then);
@@ -4301,7 +4297,7 @@ pub fn Proxy(comptime IoType: type) type {
             // The continuations below are the plain static pair for the
             // same reason, and they assert the buffer is already gone.
             releaseForStaticResponse(server, stream);
-            ServerType.clearRequestDeadline(conn);
+            ServerType.clearRequestDeadline(stream);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment("l7_responded");
             stream.log.status = page.status;
@@ -4457,7 +4453,7 @@ pub fn Proxy(comptime IoType: type) type {
                 assert(!keep);
                 server.counters.increment("l7_keepalive_requests_capped");
             }
-            ServerType.clearRequestDeadline(conn);
+            ServerType.clearRequestDeadline(stream);
             server.storeDeadline(conn, server.idleTimeoutMs());
             server.counters.increment("l7_redirected");
             stream.log.status = redirect.status;
