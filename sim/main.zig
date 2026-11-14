@@ -324,6 +324,56 @@ const uncovered = [_]Uncovered{
             "of 4097..20480, before `deriveRetries` accounted for it); " ++
             "src/http_proxy_test.zig exhausts the upstream pool directly",
     },
+    // #276's per-connection budgets. The sim's h2 clients are well
+    // behaved — every PING, SETTINGS and WINDOW_UPDATE they send is one a
+    // real client would — so none overruns one; a flooding mode of the h2
+    // client is the scenario that will. Until then, each verdict is
+    // driven past its bound directly.
+    .{
+        .name = "h2_calm_rapid_reset",
+        .why = .unreached,
+        .reason = "no sim h2 client resets a stream before its answer; " ++
+            "src/http/h2/session_test.zig drives the debt past its bound and pays it back",
+    },
+    .{
+        .name = "h2_calm_ping",
+        .why = .unreached,
+        .reason = "no sim h2 client floods; src/http/h2/session_test.zig overruns the " ++
+            "bound, and src/http_proxy_test.zig counts it end to end",
+    },
+    .{
+        .name = "h2_calm_settings",
+        .why = .unreached,
+        .reason = "no sim h2 client floods; src/http/h2/session_test.zig overruns the bound",
+    },
+    .{
+        .name = "h2_calm_window_update",
+        .why = .unreached,
+        .reason = "no sim h2 client floods; src/http/h2/session_test.zig overruns the bound",
+    },
+    .{
+        .name = "h2_calm_ignored",
+        .why = .unreached,
+        .reason = "no sim h2 client sends PRIORITY or an unknown type; " ++
+            "src/http/h2/session_test.zig overruns the bound",
+    },
+    .{
+        .name = "h2_calm_empty_data",
+        .why = .unreached,
+        .reason = "no sim h2 client sends empty DATA; src/http/h2/session_test.zig overruns the bound",
+    },
+    .{
+        .name = "h2_calm_continuation",
+        .why = .unreached,
+        .reason = "the sim h2 client's heads fit one frame; src/http/h2/session_test.zig " ++
+            "sends one past the frame bound in empty CONTINUATIONs",
+    },
+    .{
+        .name = "h2_calm_field_block",
+        .why = .unreached,
+        .reason = "the sim h2 client's heads are well inside the list size; " ++
+            "src/http/h2/session_test.zig sends one past it",
+    },
     .{
         .name = "shed_h2_sessions",
         .why = .unreached,

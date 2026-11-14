@@ -1979,6 +1979,242 @@ test "h2 session: a send leaves the reserve free, so the next reply never waits 
 }
 
 // ---------------------------------------------------------------------------
+// The budgets (#276)
+// ---------------------------------------------------------------------------
+
+/// The `index`th frame of a kind `Unpaid` counts, on stream 1 where it
+/// needs one. Every other one is the kind's other shape: the ACK this side
+/// never asked for, or a type it never heard of.
+fn putUnpaid(out: *Wire, comptime kind: Session.Calm, index: usize) void {
+    const ack: u8 = if (index % 2 == 1) frame.Flag.ack.bit() else 0;
+    switch (kind) {
+        .ping => put(out, .{ .ping = .{ .opaque_data = &@splat(7) } }, 0, ack),
+        .settings => put(out, .{ .settings = .{ .entries = &.{} } }, 0, ack),
+        .window_update => put(out, .{ .window_update = .{ .increment = 1 } }, 0, 0),
+        .ignored => if (ack != 0) {
+            putRaw(out, 0xfa, 0, 1, "an extension");
+        } else {
+            put(out, .{ .priority = .{ .exclusive = false, .stream_dependency = 0, .weight_octet = 15 } }, 1, 0);
+        },
+        .empty_data => putData(out, 1, "", false),
+        else => comptime unreachable,
+    }
+}
+
+/// A connection with stream 1 open at both ends — a POST the caller holds
+/// — and the request that opened it the last work done.
+fn openHeld(fixture: *Fixture, blocks: *Blocks) !void {
+    fixture.init();
+    fixture.caller = .hold;
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    putHeaders(&input, 1, blocks.encode(&post_fields), false);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    try testing.expectEqual(@as(usize, 1), fixture.eventsOf().len);
+}
+
+test "h2 session: each frame that asks nothing has a budget — at it the connection serves, past it it ends calm" {
+    inline for (.{ .ping, .settings, .window_update, .ignored, .empty_data }) |kind| {
+        var fixture: Fixture = .{};
+        var blocks: Blocks = .{};
+        try openHeld(&fixture, &blocks);
+        const bound = @field(Session.Unpaid.max, @tagName(kind));
+        var input: Wire = .empty;
+        defer input.deinit(testing.allocator);
+        for (0..bound) |index| putUnpaid(&input, kind, index);
+        try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+        try testing.expectEqual(@as(?frame.ErrorCode, null), fixture.session.closed_with);
+        var over: Wire = .empty;
+        defer over.deinit(testing.allocator);
+        putUnpaid(&over, kind, bound);
+        try testing.expectEqual(Session.Step.closed, fixture.feed(over.items));
+        try expectGoaway(&fixture, .enhance_your_calm);
+        try testing.expectEqual(@as(?Session.Calm, kind), fixture.session.calm);
+    }
+}
+
+test "h2 session: work done for the client starts every budget over — a request, or a response frame" {
+    var fixture: Fixture = .{};
+    var blocks: Blocks = .{};
+    try openHeld(&fixture, &blocks);
+    const bound = Session.Unpaid.max.ping;
+    var pings: Wire = .empty;
+    defer pings.deinit(testing.allocator);
+    for (0..bound) |index| putUnpaid(&pings, .ping, index);
+    // A response head staged, then a DATA frame, then a new request: each
+    // is work, and after each the client may PING its whole budget again.
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(pings.items));
+    try testing.expectEqual(Session.Sent.staged, fixture.session.sendHead(1, &response_head, false));
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(pings.items));
+    try testing.expect(fixture.session.sendData(1, "partial", false).taken == 7);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(pings.items));
+    var request: Wire = .empty;
+    defer request.deinit(testing.allocator);
+    putHeaders(&request, 3, blocks.encode(&request_fields), true);
+    request.appendSlice(testing.allocator, pings.items) catch unreachable;
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(request.items));
+    try testing.expectEqual(@as(?frame.ErrorCode, null), fixture.session.closed_with);
+    // A frame with END_STREAM and no octets ends the client's half: not
+    // the empty flood, which is one that ends nothing.
+    var ended: Wire = .empty;
+    defer ended.deinit(testing.allocator);
+    putData(&ended, 1, "", true);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(ended.items));
+    try testing.expectEqual(@as(u32, 0), fixture.session.unpaid.empty_data);
+}
+
+test "h2 session: Rapid Reset — resets before the answer outrunning answers ended is the connection's end" {
+    // Each GET is reset before the caller answers it; the bound's worth is
+    // a browser abandoning everything it had open, one more is a loop.
+    var fixture: Fixture = .{};
+    fixture.init();
+    var blocks: Blocks = .{};
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    var stream: u31 = 1;
+    for (0..Session.resets_unpaid_max) |_| {
+        putHeaders(&input, stream, blocks.encode(&request_fields), true);
+        put(&input, .{ .rst_stream = .{ .error_code = .cancel } }, stream, 0);
+        stream += 2;
+    }
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    try testing.expectEqual(Session.resets_unpaid_max, fixture.session.resets_unpaid);
+    // An answer that ends pays one back, so one more reset is room again.
+    var answered: Wire = .empty;
+    defer answered.deinit(testing.allocator);
+    putHeaders(&answered, stream, blocks.encode(&request_fields), true);
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(answered.items));
+    try testing.expectEqual(Session.Sent.staged, fixture.session.sendHead(stream, &response_head, true));
+    try testing.expectEqual(Session.resets_unpaid_max - 1, fixture.session.resets_unpaid);
+    stream += 2;
+    var again: Wire = .empty;
+    defer again.deinit(testing.allocator);
+    for (0..2) |_| {
+        putHeaders(&again, stream, blocks.encode(&request_fields), true);
+        put(&again, .{ .rst_stream = .{ .error_code = .cancel } }, stream, 0);
+        stream += 2;
+    }
+    try testing.expectEqual(Session.Step.closed, fixture.feed(again.items));
+    try expectGoaway(&fixture, .enhance_your_calm);
+    try testing.expectEqual(@as(?Session.Calm, .rapid_reset), fixture.session.calm);
+}
+
+test "h2 session: the reset that overruns the debt is still the verdict when it closes the client's last stream after its GOAWAY" {
+    // The client went away; its last stream's reset would end the
+    // connection cleanly — but it is also the reset one past the budget.
+    var fixture: Fixture = .{};
+    fixture.init();
+    var blocks: Blocks = .{};
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    var stream: u31 = 1;
+    for (0..Session.resets_unpaid_max) |_| {
+        putHeaders(&input, stream, blocks.encode(&request_fields), true);
+        put(&input, .{ .rst_stream = .{ .error_code = .cancel } }, stream, 0);
+        stream += 2;
+    }
+    putHeaders(&input, stream, blocks.encode(&request_fields), true);
+    put(&input, .{ .goaway = .{ .last_stream_identifier = 0, .error_code = .no_error, .debug_data = &.{} } }, 0, 0);
+    put(&input, .{ .rst_stream = .{ .error_code = .cancel } }, stream, 0);
+    try testing.expectEqual(Session.Step.closed, fixture.feed(input.items));
+    try expectGoaway(&fixture, .enhance_your_calm);
+    try testing.expectEqual(@as(?Session.Calm, .rapid_reset), fixture.session.calm);
+}
+
+test "h2 session: a reset after the answer ended costs nothing — the client stopping a body it need not send" {
+    var fixture: Fixture = .{};
+    fixture.init();
+    fixture.caller = .respond_early;
+    var blocks: Blocks = .{};
+    blocks.init();
+    var input: Wire = .empty;
+    defer input.deinit(testing.allocator);
+    putOpening(&input);
+    var stream: u31 = 1;
+    for (0..Session.resets_unpaid_max + 1) |_| {
+        putHeaders(&input, stream, blocks.encode(&post_fields), false);
+        put(&input, .{ .rst_stream = .{ .error_code = .no_error } }, stream, 0);
+        stream += 2;
+    }
+    try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+    try testing.expectEqual(@as(u32, 0), fixture.session.resets_unpaid);
+    try testing.expectEqual(@as(?frame.ErrorCode, null), fixture.session.closed_with);
+}
+
+test "h2 session: the field block's bounds end the connection calm, each under its own cause" {
+    // The CONTINUATION flood: empty fragments, one past the frame bound.
+    {
+        var fixture: Fixture = .{};
+        fixture.init();
+        var blocks: Blocks = .{};
+        blocks.init();
+        var input: Wire = .empty;
+        defer input.deinit(testing.allocator);
+        putOpening(&input);
+        put(&input, .{ .headers = .{ .priority = null, .fragment = blocks.encode(&request_fields), .padding = null } }, 1, 0);
+        for (0..frame.BlockAssembler.frames_max_default) |_| {
+            put(&input, .{ .continuation = .{ .fragment = &.{} } }, 1, 0);
+        }
+        try testing.expectEqual(Session.Step.closed, fixture.feed(input.items));
+        try expectGoaway(&fixture, .enhance_your_calm);
+        try testing.expectEqual(@as(?Session.Calm, .continuation), fixture.session.calm);
+    }
+    // A list past what this side advertised: the HPACK bomb's shape.
+    {
+        var fixture: Fixture = .{};
+        fixture.init();
+        var blocks: Blocks = .{};
+        blocks.init();
+        const large: [header_list_size]u8 = @splat('v');
+        const fields = request_fields ++ [_]hpack.Field{.{ .name = "x-large", .value = &large }};
+        var encoded: [header_list_size + 256]u8 = undefined;
+        const block = blocks.encoder.encode(&encoded, &fields);
+        assert(block.fields == fields.len);
+        var input: Wire = .empty;
+        defer input.deinit(testing.allocator);
+        putOpening(&input);
+        put(&input, .{ .headers = .{ .priority = null, .fragment = encoded[0..block.written], .padding = null } }, 1, frame.Flag.end_headers.bit());
+        try testing.expectEqual(Session.Step.closed, fixture.feed(input.items));
+        try expectGoaway(&fixture, .enhance_your_calm);
+        try testing.expectEqual(@as(?Session.Calm, .field_block), fixture.session.calm);
+    }
+}
+
+test "h2 session: a SETTINGS frame moves the windows once, to its last value, and overflows at its highest" {
+    // Stream 1's window is ten past the default, so 2^31-1 anywhere in a
+    // frame takes it over — even with a lower value after it.
+    for ([_]bool{ false, true }) |overflow| {
+        var fixture: Fixture = .{};
+        var blocks: Blocks = .{};
+        try openHeld(&fixture, &blocks);
+        var input: Wire = .empty;
+        defer input.deinit(testing.allocator);
+        put(&input, .{ .window_update = .{ .increment = 10 } }, 1, 0);
+        const highest: u32 = if (overflow) std.math.maxInt(u31) else 100_000;
+        putSettings(&input, &.{
+            .{ .identifier = setting_initial_window_size, .value = 500 },
+            .{ .identifier = setting_initial_window_size, .value = highest },
+            .{ .identifier = setting_initial_window_size, .value = 1000 },
+        });
+        if (overflow) {
+            try testing.expectEqual(Session.Step.closed, fixture.feed(input.items));
+            try expectGoaway(&fixture, .flow_control_error);
+        } else {
+            try testing.expectEqual(Session.Step.need_input, fixture.feed(input.items));
+            // 65,545 moved by 1000 - 65,535: the last value, applied once.
+            try testing.expectEqual(@as(i64, 1010), fixture.session.streams.find(1).?.send_window);
+            try testing.expectEqual(@as(u31, 1000), fixture.session.peer_initial_window_size);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fuzzing
 // ---------------------------------------------------------------------------
 

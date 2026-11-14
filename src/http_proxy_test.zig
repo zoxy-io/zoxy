@@ -1115,6 +1115,34 @@ test "h2c: a drain sends GOAWAY(NO_ERROR) naming no stream, and ends the connect
     try bed.expectDrained();
 }
 
+test "h2c: a client overrunning a budget is told ENHANCE_YOUR_CALM, counted by the budget, and closed (#276)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, h2BedOptions(5));
+    defer bed.tearDown();
+
+    // PINGs and nothing else: every one answered up to the bound, and the
+    // one past it answered with the end of the connection.
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    var index: u64 = 0;
+    while (index <= H2Session.Unpaid.max.ping) : (index += 1) wire.ping(index);
+    try bed.exchange(wire.written());
+
+    var frames: [64]H2Frame = undefined;
+    const count = try h2Frames(bed.client.response(), &frames);
+    var pongs: u32 = 0;
+    for (frames[0..count]) |one| {
+        if (one.frame_type == 0x6) pongs += 1;
+    }
+    try std.testing.expectEqual(H2Session.Unpaid.max.ping, pongs);
+    const goaway = frames[count - 1];
+    try std.testing.expectEqual(@as(u8, 0x7), goaway.frame_type);
+    try std.testing.expectEqual(@as(u32, 0xb), std.mem.readInt(u32, goaway.payload[4..8], .big)); // ENHANCE_YOUR_CALM.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_calm_ping"));
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try bed.expectDrained();
+}
+
 test "h2c: a connection admitted before a drain and speaking after it is owed its GOAWAY at once" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, h2BedOptions(13));
@@ -1194,6 +1222,7 @@ test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a prefa
 // ---------------------------------------------------------------------------
 
 const ResponseReader = @import("http/h2/ResponseReader.zig");
+const H2Session = @import("http/h2/Session.zig");
 
 /// A client's octets, frame by frame.
 const H2Wire = struct {
@@ -1237,6 +1266,12 @@ const H2Wire = struct {
         const start = wire.frameHeader(4, 0x3, 0, id);
         std.mem.writeInt(u32, wire.bytes[start..][0..4], code, .big);
         wire.len = start + 4;
+    }
+
+    fn ping(wire: *H2Wire, opaque_data: u64) void {
+        const start = wire.frameHeader(8, 0x6, 0, 0);
+        std.mem.writeInt(u64, wire.bytes[start..][0..8], opaque_data, .big);
+        wire.len = start + 8;
     }
 
     fn windowUpdate(wire: *H2Wire, id: u31, increment: u31) void {

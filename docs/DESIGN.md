@@ -2088,6 +2088,8 @@ the loop thread.
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body |
 | head-read budget | timer completion | `408` for a client that began a head and stopped; **silence earns none** — a connection that said nothing was never under the budget |
 | kernel memory pressure (ENOBUFS/ENOMEM from ring) | any completion | treat as that op's failure → teardown that connection; counter |
+| HTTP/2 shared streams / stream heads | a stream's request, before §7 | `REFUSED_STREAM` on that stream, which the client may retry; the connection serves on |
+| **an HTTP/2 client's budgets** — Rapid Reset, PING, SETTINGS, WINDOW_UPDATE, ignored frames (PRIORITY, unknown types), empty DATA, CONTINUATION, field block | the frame that overruns one | `GOAWAY(ENHANCE_YOUR_CALM)`, then close; a counter per budget |
 
 Most rungs shed on a *resource of this proxy's* running out. That was
 once every rung, and it was a real gap — measured, not theorised: at
@@ -2104,6 +2106,33 @@ caps the work one endpoint may carry, counted across both protocols
 upstream slots says *widen the pool*, while a capped endpoint says *the
 backend is full*, and the two have their own counters so an operator
 cannot read one as the other.
+
+The HTTP/2 budgets (#276) are a third shape: nothing of this proxy's
+runs out and no origin is full. A client inside the protocol's rules is
+expensive anyway — resetting each stream as it opens it, so the work it
+asked for goes on while the stream it held is free for the next
+(CVE-2023-44487's Rapid Reset); sending frames that ask for no work of
+their own, PING, SETTINGS, WINDOW_UPDATE, PRIORITY or a type it never
+heard of, DATA with no octets;
+spreading one field block across empty CONTINUATIONs, which cost no
+octets and so never meet the octet bound. Each has a budget per
+connection, and its overrun is `GOAWAY(ENHANCE_YOUR_CALM)` and the
+close: the connection is what the client spends from, so it is what
+pays, and a counter per budget says which it spent.
+
+The budgets need no clock. Each count runs from the last time the
+connection did work for the client — a request handed to §7, a response
+frame staged — and starts over then, so a client using its connection
+never nears one, and the bound is frames per unit of work rather than a
+rate a slow network and a fast one would read differently. Rapid
+Reset's is a debt instead: a reset before its answer ended against an
+answer that did, so a browser abandoning a page's streams pays them
+back as it goes on browsing, and a client resetting in a loop never
+does. A reset after the answer ended — a client stopping a body the
+answer made moot — costs nothing. One consequence is deliberate: a
+connection kept alive by PINGs alone, with nothing open, runs into the
+PING bound, as gRPC's servers end one for "too many pings". Every frame
+refreshes the idle window, so nothing else would.
 
 The tunnel rung is the one that refuses **before** doing the work rather
 than after: the check runs on the upgrade request, before the handshake

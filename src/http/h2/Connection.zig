@@ -483,6 +483,7 @@ pub fn Driver(comptime IoType: type) type {
         /// The session is over: send what it staged — its GOAWAY, if it
         /// ended the connection — and then end the connection.
         fn close(server: *ServerType, conn: *ConnType, slot: *Slot) void {
+            if (!slot.closing) countCalm(server, slot.session);
             slot.closing = true;
             flush(server, conn, slot);
             if (conn.isTearingDown()) return; // A seal failed.
@@ -490,6 +491,17 @@ pub fn Driver(comptime IoType: type) type {
             assert(slot.session.outbound().len == 0);
             if (conn.tls) |engine| assert(engine.outbound().len == 0);
             server.beginTeardown(conn);
+        }
+
+        /// A session that ended a client for overrunning a budget (#276):
+        /// the budget's own counter, so a flood reads apart from a bomb.
+        fn countCalm(server: *ServerType, session: *const Session) void {
+            assert(session.state == .closed);
+            const cause = session.calm orelse return;
+            assert(session.closed_with.? == .enhance_your_calm);
+            switch (cause) {
+                inline else => |tag| server.counters.increment("h2_calm_" ++ @tagName(tag)),
+            }
         }
 
         /// What a terminated connection sends next: ciphertext already
