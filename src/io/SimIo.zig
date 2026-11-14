@@ -50,8 +50,14 @@ comptime {
 /// a test double whose bounds describe what the simulator drives, not
 /// what a deployment may configure. At the shared pool ceilings this is
 /// at least what any scenario can arm.
+///
+/// Without the shared HTTP/2 stream pool (#275): no scenario multiplexes
+/// yet, and the bound sizes `flush`'s stack buffer, which Debug fills on
+/// every call — so the term joins when the simulator first speaks HTTP/2,
+/// not before.
 const pending_ops_max: u32 = constants.inFlightOps(
     constants.conn_slots_max,
+    0,
     constants.upstream_slots_max,
     listeners_max,
     constants.health_probe_concurrency_max,

@@ -35,6 +35,7 @@ const shed = @import("shed.zig");
 const Credentials = @import("tls/Credentials.zig");
 const Tickets = @import("tls/Tickets.zig");
 const TlsEngine = @import("tls/Engine.zig");
+const H2Session = @import("http/h2/Session.zig");
 const upstream_module = @import("net/upstream.zig");
 
 const assert = std.debug.assert;
@@ -84,6 +85,23 @@ pub fn Server(comptime IoType: type) type {
         /// acquire is synchronous: a render needs the bytes now.
         upstream_head_buffers: Pool(upstream_module.HeadBuffer),
         upstream_head_pressure: bool,
+        /// The HTTP/2 session slab (#275): `limits.h2_connections` units
+        /// of `h2SessionBytes`, reserved as §5 prices it and carved by
+        /// `Session.Layout.carve`, so aligned to the layout's unit. Empty
+        /// on a deployment that speaks no HTTP/2.
+        h2_session_slab: []align(H2Session.Layout.unit_align) u8,
+        /// The shared stream pool (#275): the exchanges HTTP/2 multiplexes,
+        /// `limits.stream_slots` of them. A pool of its own beside
+        /// `streams`, not a tail on it, so admission's one stream per
+        /// connection stays a reservation nothing else can draw down — and
+        /// `admitStream`'s acquire stays one that cannot fail.
+        shared_streams: Pool(StreamType),
+        /// One head buffer per shared stream slot (#275) — what a
+        /// multiplexed exchange's request is written into by the downgrade
+        /// and its response rendered in. App-side for the reason the
+        /// upstream heads are: the acquire is synchronous, at the stream's
+        /// first frame, not at a kernel-chosen recv.
+        stream_head_buffers: Pool(upstream_module.HeadBuffer),
         /// Live L4 relayed connections per endpoint (§7), the other half
         /// of `upstream_module.Load`. The pool cannot hold this: an L4
         /// connection leases no upstream slot, so it is the server —
@@ -557,10 +575,11 @@ pub fn Server(comptime IoType: type) type {
             server.static_sends_inflight = 0;
             server.initDateSlots();
             try server.conns.init(arena, options.conn_slots);
-            // One stream per connection (#274). Derived rather than
-            // configured, so the pair cannot drift apart in a
-            // hand-written bridge the way two limits could.
-            try server.streams.init(arena, constants.streamSlotsFor(options.conn_slots));
+            // One stream per connection (#274). The shared HTTP/2 streams
+            // are a pool of their own (`initH2Pools`), so this one stays
+            // pinned to the conn count and admission's acquire stays one
+            // that cannot fail.
+            try server.streams.init(arena, options.conn_slots);
             assert(server.streams.capacity() == server.conns.capacity());
             try server.relay_buffers.init(arena, options.relay_buffers);
             try wireRelayHalves(arena, server.relay_buffers.slots, options.relay_buffer_bytes);
@@ -573,6 +592,7 @@ pub fn Server(comptime IoType: type) type {
             try server.upstream_head_buffers.init(arena, options.upstream_head_buffers);
             try server.initHeadBuffers(arena, &options);
             try server.initTlsEngines(arena, &options);
+            try server.initH2Pools(arena, &options);
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
@@ -591,6 +611,50 @@ pub fn Server(comptime IoType: type) type {
             server.access_log.init(server, config.access_log_sink, options.access_log_buffer_bytes);
             try server.access_log.reserve(arena);
             try server.health.init(arena, server, keys, options.head_buffer_bytes);
+        }
+
+        /// One HTTP/2 session at this config's shape (#275): fields of up
+        /// to a head buffer — what the downgrade writes a request into —
+        /// and the concurrency `Session` advertises, capped by the shared
+        /// stream pool. `Session.Layout` is the one statement of what that
+        /// costs; this names the shape, for both the reservation below and
+        /// the §5 banner, so the two read one closed form.
+        pub fn h2SessionBytes(limits: *const config_module.Config.Limits) u64 {
+            if (limits.h2_connections == 0) return 0;
+            assert(limits.stream_slots >= 1);
+            const layout: H2Session.Layout = .{
+                .header_list_size_max = limits.head_buffer_bytes,
+                .concurrent_streams_max = @min(H2Session.concurrent_streams_advertised_max, limits.stream_slots),
+            };
+            return layout.bytes();
+        }
+
+        /// The HTTP/2 pools (#275): the session slab, and a head per shared
+        /// stream slot. Reserved exactly as §5 prices them, and — like the
+        /// head slabs — not faulted in: a page is resident once a session
+        /// or an exchange first writes it. All-or-nothing together, which
+        /// the budget asserts of its own terms too.
+        fn initH2Pools(
+            server: *Self,
+            arena: std.mem.Allocator,
+            options: *const InitOptions,
+        ) error{OutOfMemory}!void {
+            assert(options.h2_connections <= options.conn_slots);
+            if (options.h2_connections == 0) assert(options.stream_slots == 0);
+            server.h2_session_slab = try arena.alignedAlloc(
+                u8,
+                .fromByteUnits(H2Session.Layout.unit_align),
+                @intCast(@as(u64, options.h2_connections) * h2SessionBytes(options)),
+            );
+            try server.shared_streams.init(arena, options.stream_slots);
+            assert(server.streams.capacity() + server.shared_streams.capacity() ==
+                constants.streamSlotsFor(options.conn_slots, options.stream_slots));
+            try server.stream_head_buffers.init(arena, options.stream_slots);
+            const slab = try arena.alloc(u8, @as(usize, options.stream_slots) * options.head_buffer_bytes);
+            for (server.stream_head_buffers.slots, 0..) |*head_buffer, index| {
+                head_buffer.data = slab[index * options.head_buffer_bytes ..][0..options.head_buffer_bytes];
+            }
+            assert(server.stream_head_buffers.slots.len == options.stream_slots);
         }
 
         /// The §5 upstream head slab wiring and the serving path's two
@@ -805,10 +869,9 @@ pub fn Server(comptime IoType: type) type {
             const per_conn = logHeadersPerConn(server.config);
             server.log_headers_per_conn = per_conn;
             // One slice per *stream* slot (#274): the captures share
-            // `LogState`'s unit, and that is the slot the line lives on.
-            // Pinned 1:1 to the conn count, so the reservation is the
-            // number the §5 banner has always printed.
-            const stream_slots = constants.streamSlotsFor(options.conn_slots);
+            // `LogState`'s unit, and that is the slot the line lives on —
+            // a multiplexed exchange writes a line of its own (#275).
+            const stream_slots = constants.streamSlotsFor(options.conn_slots, options.stream_slots);
             const slots: usize = @as(usize, stream_slots) * per_conn;
             server.log_header_values = try arena.alloc(
                 u8,
@@ -1608,6 +1671,10 @@ pub fn Server(comptime IoType: type) type {
             // and every released or parked upstream let go of its head.
             assert(server.head_buffers_in_use == 0);
             assert(server.upstream_head_buffers.isFullyReleased());
+            // Trivially true until anything serves HTTP/2 (#275), and
+            // stated now for the tunnel pool's reason above.
+            assert(server.shared_streams.isFullyReleased());
+            assert(server.stream_head_buffers.isFullyReleased());
             // The drain finished, so the watchdog has nothing left to
             // watch. Unconditional: `alarmCancel` on an unarmed alarm is
             // a no-op on both sides of the seam, and the alternative is
@@ -1699,6 +1766,8 @@ pub fn Server(comptime IoType: type) type {
                 server.tunnel_buffers.isFullyReleased() and
                 server.upstreams.isFullyReleased() and
                 server.upstream_head_buffers.isFullyReleased() and
+                server.shared_streams.isFullyReleased() and
+                server.stream_head_buffers.isFullyReleased() and
                 server.head_buffers_in_use == 0 and
                 server.admin.isQuiescent() and
                 server.access_log.isQuiescent() and
@@ -2320,8 +2389,11 @@ pub fn Server(comptime IoType: type) type {
         /// exactly: one request on the L7 path, cleared at every
         /// turnaround. Addressing them by the conn slot while the line
         /// they belong to lives on the stream would be two units for one
-        /// log entry. The count is unchanged — the pools are pinned 1:1
-        /// (#274) — so the §5 budget term does not move.
+        /// log entry. The table is sized for every stream slot, the
+        /// shared HTTP/2 pool's included (#275), since a multiplexed
+        /// exchange writes a line of its own; the admission pool's slots
+        /// come first, which is the only pool this addresses until a
+        /// shared stream can capture.
         fn logHeaderSlot(server: *Self, conn: *const ConnType, index: u32) []u8 {
             assert(index < server.log_headers_per_conn);
             const stream_index = server.streams.indexOf(conn.stream);

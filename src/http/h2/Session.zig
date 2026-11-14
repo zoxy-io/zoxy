@@ -180,6 +180,127 @@ pub fn fieldsFor(list_size_max: u32) u32 {
     return @divFloor(list_size_max, 32);
 }
 
+/// The most streams one connection advertises (SETTINGS_MAX_CONCURRENT_
+/// STREAMS): RFC 9113 §6.5.2's recommended floor, and the cap on how much
+/// of the shared stream pool one client can hold (#275).
+pub const concurrent_streams_advertised_max: u32 = 100;
+
+/// What one session's buffers are, for a connection advertising
+/// `header_list_size_max` and `concurrent_streams_max` — the unit
+/// `limits.h2_connections` reserves (§5) — and how they are laid out in
+/// it. One statement for both, beside `Buffers`, so the pool that carves
+/// a unit, the budget that prices it, and `init` that asserts what it is
+/// handed cannot drift apart.
+pub const Layout = struct {
+    header_list_size_max: u32,
+    concurrent_streams_max: u32,
+
+    /// Where every piece of a unit starts: the widest alignment any piece
+    /// needs, so one stride serves a whole slab of units and each piece
+    /// in each of them.
+    pub const unit_align: u32 = @max(
+        @alignOf(Session),
+        @alignOf(TableStorage),
+        @alignOf(EncoderStorage),
+        @alignOf(hpack.Field),
+        @alignOf(StreamTable.Slot),
+    );
+
+    /// A whole frame at the size this server accepts.
+    pub fn inboundBytes(layout: Layout) u32 {
+        _ = layout;
+        return frame_bytes_max;
+    }
+
+    /// The compressed block, bounded by the list it decodes to: HPACK
+    /// spends fewer octets on a field than §4.1's 32 of list accounting.
+    pub fn blockBytes(layout: Layout) u32 {
+        assert(layout.header_list_size_max >= 1);
+        return layout.header_list_size_max;
+    }
+
+    pub fn decodedBytes(layout: Layout) u32 {
+        assert(layout.header_list_size_max >= 1);
+        return layout.header_list_size_max;
+    }
+
+    pub fn fieldsCount(layout: Layout) u32 {
+        return fieldsFor(layout.header_list_size_max);
+    }
+
+    /// A response head's block — no more than twice the list it encodes,
+    /// which covers each field's length prefixes and every CONTINUATION
+    /// header — beside a whole DATA frame and the send reserve, so a head
+    /// and the body after it never wait on each other for room.
+    pub fn outboxBytes(layout: Layout) u32 {
+        assert(layout.header_list_size_max >= 1);
+        return 2 * layout.header_list_size_max + frame_bytes_max + send_reserve;
+    }
+
+    /// One unit: every piece `carve` hands out, each padded to
+    /// `unit_align`, so the sum is a stride as well as a size.
+    pub fn bytes(layout: Layout) u64 {
+        assert(layout.concurrent_streams_max >= 1);
+        assert(layout.concurrent_streams_max <= concurrent_streams_advertised_max);
+        const total = padded(@sizeOf(Session)) + padded(@sizeOf(TableStorage)) +
+            padded(@sizeOf(EncoderStorage)) +
+            padded(@as(u64, layout.fieldsCount()) * @sizeOf(hpack.Field)) +
+            padded(@as(u64, layout.concurrent_streams_max) * @sizeOf(StreamTable.Slot)) +
+            padded(layout.inboundBytes()) + padded(layout.blockBytes()) +
+            padded(layout.decodedBytes()) + padded(layout.outboxBytes());
+        assert(total % unit_align == 0);
+        assert(total > frame_bytes_max);
+        return total;
+    }
+
+    pub const Carved = struct {
+        session: *Session,
+        buffers: Buffers,
+    };
+
+    /// One unit's pieces, in the order `bytes` prices them — the widest
+    /// alignments first only by habit, since every piece starts on
+    /// `unit_align` anyway — ready for `Session.init`.
+    pub fn carve(layout: Layout, unit: []align(unit_align) u8) Carved {
+        assert(unit.len == layout.bytes());
+        var cursor: Cursor = .{ .unit = unit };
+        const session = &cursor.take(Session, 1)[0];
+        const table = &cursor.take(TableStorage, 1)[0];
+        const encoder = &cursor.take(EncoderStorage, 1)[0];
+        const buffers: Buffers = .{
+            .fields = cursor.take(hpack.Field, layout.fieldsCount()),
+            .streams = cursor.take(StreamTable.Slot, layout.concurrent_streams_max),
+            .inbound = cursor.take(u8, layout.inboundBytes()),
+            .block = cursor.take(u8, layout.blockBytes()),
+            .decoded = cursor.take(u8, layout.decodedBytes()),
+            .outbox = cursor.take(u8, layout.outboxBytes()),
+            .table = table,
+            .encoder = encoder,
+        };
+        assert(cursor.offset == unit.len);
+        return .{ .session = session, .buffers = buffers };
+    }
+
+    fn padded(size: u64) u64 {
+        return std.mem.alignForward(u64, size, unit_align);
+    }
+
+    const Cursor = struct {
+        unit: []align(unit_align) u8,
+        offset: usize = 0,
+
+        fn take(cursor: *Cursor, comptime T: type, count: u32) []T {
+            assert(cursor.offset % unit_align == 0);
+            const size: usize = @as(usize, count) * @sizeOf(T);
+            assert(cursor.offset + size <= cursor.unit.len);
+            const start: [*]align(unit_align) u8 = @alignCast(cursor.unit[cursor.offset..].ptr);
+            cursor.offset += @intCast(padded(size));
+            const typed: [*]T = @ptrCast(start);
+            return typed[0..count];
+        }
+    };
+};
+
 /// What the caller does next.
 pub const Step = union(enum) {
     /// Everything buffered was handled, nothing staged is owed, and no
