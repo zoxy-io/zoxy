@@ -1383,11 +1383,6 @@ pub fn Server(comptime IoType: type) type {
                     .alpn_h2 = config_module.alpn.namesH2(offer),
                     .accepting = false,
                 };
-                // An offer naming HTTP/2 alone has nothing to fall back to
-                // when the session pool is empty. No config can name `h2`
-                // yet; the one that can decides what such a listener says
-                // then, and until it does there is no such listener.
-                assert(state.alpn_fallback.len >= 1 or offer.len == 0);
                 // A listener the config says terminates TLS must have
                 // credentials by now: `main` loads them before `start`, and
                 // starting without them would bind a socket that answers
@@ -2160,6 +2155,15 @@ pub fn Server(comptime IoType: type) type {
             const credentials = state.credentials.?;
             const h2: ?*H2Slot = if (state.alpn_h2) server.acquireH2Session() else null;
             assert(h2 == null or state.alpn_h2);
+            // A listener offering HTTP/2 alone has no HTTP/1.1 to fall back
+            // to: with no session free it sheds here, before a handshake is
+            // spent on a client it could not serve (#275) — an admission
+            // rung like the engine's below, and counted the same way.
+            if (state.alpn_h2 and h2 == null and state.alpn_fallback.len == 0) {
+                if (buffer) |acquired| server.releaseRelayBuffer(acquired);
+                server.abortAdmission(conn, client_socket, "shed_h2_sessions");
+                return null;
+            }
             const offer = if (h2 != null) state.alpn_protocols else state.alpn_fallback;
             assert(offer.len <= config_module.alpn.protocols_max);
             const engine = server.acquireTlsEngine(credentials, offer) catch |err| {

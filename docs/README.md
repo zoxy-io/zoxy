@@ -296,15 +296,16 @@ sharing it; an ECDSA signature costs about 260 µs. An RSA key is refused at
 startup.
 
 `alpn` lists the application protocols the listener offers in ALPN
-(RFC 7301), most preferred first. Today the only one is `http/1.1`, and an
-`http` listener offers it whether or not the block says so:
+(RFC 7301), most preferred first: `http/1.1`, and `h2` for
+[HTTP/2](#http2). Absent, an `http` listener offers `http/1.1` alone:
 
 ```json
-"tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key", "alpn": ["http/1.1"] }
+"tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key", "alpn": ["h2", "http/1.1"] }
 ```
 
-A client that offers ALPN without naming anything the listener speaks, such
-as a gRPC client offering only `h2`, is refused in the handshake with the
+A client that offers ALPN without naming anything the listener speaks —
+a gRPC client offering only `h2` to a listener that offers only
+`http/1.1` — is refused in the handshake with the
 `no_application_protocol` alert and counted in `zoxy_tls_alpn_refused`. It
 is not handed an HTTP/1.1 session it would then speak HTTP/2 into. A
 client that offers no ALPN is unaffected. Names outside the list, an empty
@@ -344,6 +345,44 @@ On steady keep-alive traffic the two are at parity, about 20k req/s at a
 p50 within a few µs of each other. Bulk transfer is the one band zoxy
 trails on, by a third to two-fifths: 507–542 µs against 383–385 µs at the
 same 100 MiB/s.
+
+#### HTTP/2
+
+An `http` listener speaks HTTP/2 to its clients two ways: over TLS, by
+offering `h2` in `tls.alpn`, and in the clear, by `"h2c": true`, which
+answers a client that opens with HTTP/2's preface (prior knowledge, RFC
+9113 §3.3) and serves HTTP/1.1 as before to one that does not. `h2c` is
+refused beside `tls`. Each stream is one request, run through the same
+routing, filters, redirects and access log as an HTTP/1.1 one; the origin
+leg stays HTTP/1.1, and a body with no length goes to it chunked.
+
+```json
+"listeners": [
+    { "bind": "0.0.0.0:443", "http": { "cluster": "web" },
+      "tls": { "cert": "/etc/zoxy/site.crt", "key": "/etc/zoxy/site.key",
+               "alpn": ["h2", "http/1.1"] } },
+    { "bind": "10.0.0.1:8080", "http": { "cluster": "web", "h2c": true } }
+],
+"limits": { "stream_slots": 4096 }
+```
+
+`limits.stream_slots` is required and has no default: it bounds the
+requests in flight across every HTTP/2 connection, each holding a head
+buffer of its own, and how many to carry is a capacity decision. A stream
+past the pool is refused `REFUSED_STREAM`, which a client retries, and
+counted in `zoxy_h2_shed_streams`; one connection advertises at most 100.
+`limits.h2_connections` bounds the connections speaking HTTP/2 at once,
+each holding a session of about 100 KiB, and defaults to 1024, at most
+`conn_slots`. With none free, a listener offering `h2` beside `http/1.1`
+offers `http/1.1` alone in the handshake; an h2c preface is closed and
+counted in `zoxy_h2_shed_sessions`; and a listener offering `h2` alone
+sheds the connection at accept, before its handshake, in
+`zoxy_shed_h2_sessions`. Both keys are refused unless a listener speaks
+HTTP/2.
+
+What fails on a stream ends that stream — reset, or answered `502`/`504`
+— never the connection. Response trailers are not carried, nor are a
+request's.
 
 #### Tunnelled upgrades (WebSocket)
 
@@ -1279,9 +1318,10 @@ before your platform does.
 
 Optional. The compiled constants are hard ceilings; this block sizes the
 actual pools anywhere from 1 up to them, so a small deployment neither
-reserves nor demands the ceiling's resources. The two conditional keys,
-`tls_engines` and `tunnels`, are absent below: each is refused unless the
-feature it sizes is configured. Both are described further down.
+reserves nor demands the ceiling's resources. The conditional keys,
+`tls_engines`, `tunnels`, `h2_connections` and `stream_slots`, are absent
+below: each is refused unless the feature it sizes is configured. They are
+described further down.
 
 ```json
 "limits": {
@@ -1323,6 +1363,11 @@ some listener names an `upgrades` allowlist, in which case it is
 **required**, since no default can be derived for it. Each costs one
 relay-buffer pair (8200 bytes), held for the tunnel's whole life, which
 is why they are reserved apart from `relay_buffers`.
+
+`h2_connections` and `stream_slots` size [HTTP/2](#http2) and are zero
+unless some listener speaks it, in which case `stream_slots` is
+**required**. Each HTTP/2 connection holds a session of about 100 KiB and
+each stream slot a head buffer; the banner prints both.
 
 `keepalive_requests` lives on an `http` listener beside `max_body_bytes`,
 not in `limits`, because it reserves nothing and states policy. It bounds

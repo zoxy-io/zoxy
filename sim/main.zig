@@ -339,6 +339,13 @@ const uncovered = [_]Uncovered{
             "session pool directly",
     },
     .{
+        .name = "shed_h2_sessions",
+        .why = .unreached,
+        .reason = "the simulator does not speak HTTP/2 yet — its client is " ++
+            "#275's last slice; src/http_proxy_test.zig sheds an h2-only " ++
+            "listener's accept directly",
+    },
+    .{
         .name = "h2_shed_streams",
         .why = .unreached,
         .reason = "the simulator does not speak HTTP/2 yet — its client is " ++
