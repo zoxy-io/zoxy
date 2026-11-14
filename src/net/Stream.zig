@@ -111,6 +111,37 @@ pub const DirectionState = struct {
     }
 };
 
+/// A multiplexed exchange's request body on its way to the origin (#275),
+/// in `relay_buffer.client_to_upstream`: the payload of the client's DATA
+/// frames accumulating behind the frame in flight, and framed for HTTP/1.1
+/// — chunked, when the downgrade said so — only as it goes. One send at a
+/// time, as every leg (§6): `frame_*` is the send, `payload_*` the next.
+pub const H2Body = struct {
+    /// The framed octets in flight, `frame_sent` of them gone; an empty
+    /// range when none are.
+    frame_start: u32 = 0,
+    frame_end: u32 = 0,
+    frame_sent: u32 = 0,
+    /// The payload they carry, credited to the client's window once sent.
+    frame_payload: u32 = 0,
+    /// They end the body: the request leg is done once they are out.
+    frame_last: bool = false,
+    /// Payload taken from DATA and not yet framed. It starts past the
+    /// frame in flight and room for its own chunk prefix.
+    payload_start: u32 = 0,
+    payload_len: u32 = 0,
+    /// The client's half ended: END_STREAM, or its trailers.
+    client_ended: bool = false,
+    /// Payload taken in all, for the listener's body cap (#236).
+    total: u64 = 0,
+
+    pub fn inFlight(body: *const H2Body) bool {
+        assert(body.frame_start <= body.frame_end);
+        assert(body.frame_sent <= body.frame_end - body.frame_start);
+        return body.frame_end > body.frame_start;
+    }
+};
+
 /// One client-directed write in flight (§7, §8): the plaintext still to
 /// deliver, and where control goes once it is all out.
 ///
@@ -431,6 +462,8 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         h2_head_staged: bool,
         /// Its END_STREAM is staged: the answer is whole on the session.
         h2_ended: bool,
+        /// Its request body's way to the origin, on a shared stream.
+        h2_body: H2Body,
         /// A multiplexed exchange is ending on its own, its connection
         /// serving on (#275): what it has in flight is being forced, and the
         /// slot goes back once the last of it delivers. An admission
@@ -748,6 +781,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             stream.h2_next = null;
             stream.h2_head_staged = false;
             stream.h2_ended = false;
+            stream.h2_body = .{};
             stream.ending = false;
             stream.deadline_ns = 0;
             assert(stream.armedCount() == 0);

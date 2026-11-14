@@ -14,9 +14,9 @@ const assert = std.debug.assert;
 pub const Protocol = enum(u8) {
     http_1_1,
     /// HTTP/2 over TLS (RFC 9113 §3.2, #275). Spoken by the driver in
-    /// `http/h2/Connection.zig`, which serves a request only once it has
-    /// no body to forward — so it is in the vocabulary, and the engine may
-    /// negotiate it, but no config may name it yet (`configurable`).
+    /// `http/h2/Connection.zig` — so it is in the vocabulary, and the engine
+    /// may negotiate it, but no config may name it until the keys that size
+    /// its pools arrive beside it (`configurable`).
     h2,
 
     /// The token on the wire: the IANA "TLS Application-Layer Protocol
@@ -42,9 +42,8 @@ pub const Protocol = enum(u8) {
     }
 
     /// Whether `tls.alpn` may name it. The loader and the schema both ask,
-    /// so a protocol the serving path speaks only in part is unknown to an
-    /// operator until it is whole: HTTP/2 forwards no request body yet
-    /// (#275).
+    /// so a protocol is unknown to an operator until a config can say
+    /// everything serving it takes: HTTP/2's pools have no keys yet (#275).
     pub fn configurable(protocol: Protocol) bool {
         return switch (protocol) {
             .http_1_1 => true,
