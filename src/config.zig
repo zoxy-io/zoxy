@@ -324,6 +324,16 @@ pub const Config = struct {
         /// listener that allows upgrades without one is rejected at load.
         /// Zero exactly when no listener allows any upgrade.
         tunnels: u32 = 0,
+        /// The §5 HTTP/2 session pool and the shared stream pool its
+        /// multiplexed exchanges draw from (#275). Zero, and no key yet:
+        /// they are priced and reserved (`budget`, `Server.init`) before
+        /// anything serves HTTP/2, and a listener that speaks it —
+        /// `h2` in `tls.alpn`, or `http.h2c` — arrives with the serving
+        /// path, the knobs with it (`limits.h2_connections`, defaulting to
+        /// `constants.h2_connections_default`, and `limits.stream_slots`,
+        /// required where a listener speaks HTTP/2).
+        h2_connections: u32 = 0,
+        stream_slots: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -1627,6 +1637,7 @@ fn resolveCqFill(
     }
     if (!constants.cqFillFits(
         conn_slots,
+        0, // `stream_slots`: zero until a listener can speak HTTP/2 (#275).
         upstream_slots,
         listeners_count,
         health_probes,

@@ -86,6 +86,7 @@ pub fn Budget(comptime IoType: type) type {
                 ),
                 .cq_entries = constants.completionQueueDepthFor(
                     config.limits.conn_slots,
+                    config.limits.stream_slots,
                     config.limits.upstream_slots,
                     listeners_count,
                     health_probes,
@@ -115,10 +116,11 @@ pub fn Budget(comptime IoType: type) type {
             return .{
                 .conn_slots = limits.conn_slots,
                 .conn_bytes = @sizeOf(ServerType.ConnType),
-                // One stream per connection (#274), derived from the
-                // same limit `Server.init` sizes the pool from, so the
-                // printed number and the reserved one cannot disagree.
-                .stream_slots = constants.streamSlotsFor(limits.conn_slots),
+                // One stream per connection (#274) plus the shared HTTP/2
+                // pool (#275), derived from the same limits `Server.init`
+                // sizes the pool from, so the printed number and the
+                // reserved one cannot disagree.
+                .stream_slots = constants.streamSlotsFor(limits.conn_slots, limits.stream_slots),
                 .stream_bytes = @sizeOf(ServerType.StreamType),
                 .relay_buffers = limits.relay_buffers,
                 // The pool element (free-list header and the two slab
@@ -129,7 +131,7 @@ pub fn Budget(comptime IoType: type) type {
                 .upstream_slots = limits.upstream_slots,
                 .upstream_bytes = @sizeOf(UpstreamType),
                 .access_log_bytes = constants.accessLogBytes(limits.access_log_buffer_bytes),
-                .log_header_bytes = ServerType.logHeaderBytes(config, constants.streamSlotsFor(limits.conn_slots)),
+                .log_header_bytes = ServerType.logHeaderBytes(config, constants.streamSlotsFor(limits.conn_slots, limits.stream_slots)),
                 .endpoint_table_bytes = ServerType.endpointTableBytes(config),
                 .metrics_bytes = ServerType.metricsBytes(config),
                 .head_buffers = limits.head_buffers,
@@ -171,6 +173,15 @@ pub fn Budget(comptime IoType: type) type {
                     0
                 else
                     constants.libcrypto_heap_bytes,
+                // Zero unless a listener speaks HTTP/2 (#275), the four
+                // together: a session pool, and a head per shared stream.
+                .h2_connections = limits.h2_connections,
+                .h2_session_bytes = ServerType.h2SessionBytes(&limits),
+                .stream_head_buffers = limits.stream_slots,
+                .stream_head_buffer_bytes = if (limits.stream_slots == 0)
+                    0
+                else
+                    @sizeOf(upstream_module.HeadBuffer) + limits.head_buffer_bytes,
             };
         }
 
@@ -292,6 +303,7 @@ pub fn Budget(comptime IoType: type) type {
             const limits = config.limits;
             const in_flight = constants.inFlightOps(
                 limits.conn_slots,
+                limits.stream_slots,
                 limits.upstream_slots,
                 @intCast(config.listeners.len),
                 config.healthProbes(),
@@ -404,7 +416,6 @@ pub fn Budget(comptime IoType: type) type {
                 \\          + labeled metrics {d} B (tables, labels and render buffers)
                 \\          + tunnels {d} x {d} B (their own relay buffers, never HTTP's)
                 \\          + tls engines {d} x {d} B (+ plaintext {d} B each, libcrypto heap {d} KiB)
-                \\          + config arena {d} KiB (measured, not closed-form)
                 \\
             , .{
                 build.version,
@@ -444,6 +455,21 @@ pub fn Budget(comptime IoType: type) type {
                 sizes.tls_engine_bytes,
                 sizes.tls_plaintext_bytes,
                 sizes.libcrypto_heap_bytes / 1024,
+            });
+            // Apart from the block above only because one format call takes
+            // at most 32 arguments. The HTTP/2 terms read zero unless a
+            // listener speaks HTTP/2 (#275) — printed rather than omitted,
+            // like the tunnel and TLS lines — and the arena stays last, the
+            // one term measured rather than derived.
+            try emit(sink,
+                \\          + h2 sessions {d} x {d} B + stream heads {d} x {d} B
+                \\          + config arena {d} KiB (measured, not closed-form)
+                \\
+            , .{
+                sizes.h2_connections,
+                sizes.h2_session_bytes,
+                sizes.stream_head_buffers,
+                sizes.stream_head_buffer_bytes,
                 config_arena_bytes / 1024,
             });
         }
@@ -486,4 +512,65 @@ test "totalBytes: the measured arena joins the closed form" {
     // not a rounding.
     try testing.expectEqual(pools_only + 4096, with_arena);
     try testing.expect(pools_only > 0);
+}
+
+test "h2 pools: `Server.init` reserves exactly what the budget prices (#275)" {
+    const SimIo = @import("io/SimIo.zig");
+    const BudgetSim = Budget(SimIo);
+
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    // An L4 shape is enough: the pools are sized from the limits alone,
+    // whatever the listeners speak, and nothing here serves a byte.
+    var io: SimIo = undefined;
+    try io.init(arena, .{ .seed = 1, .buffer_group_count = 0 });
+    const endpoints = [_]Io.Address{.{ .ip = std.Io.net.IpAddress.parseLiteral("127.0.0.1:19401") catch unreachable }};
+    const clusters = [_]config_module.Config.Cluster{.{ .name = "origin", .endpoints = &endpoints }};
+    const routes = [_]@import("http/router.zig").Route{.{ .prefix = "/", .cluster_index = 0 }};
+    const listeners = [_]config_module.Config.Listener{.{
+        .bind_address = .{ .ip = std.Io.net.IpAddress.parseLiteral("127.0.0.1:19402") catch unreachable },
+        .bind_mode = null,
+        .routes = &routes,
+        .protocol = .l4,
+    }};
+    var config: config_module.Config = .{
+        .listeners = &listeners,
+        .clusters = &clusters,
+        .connect_timeout_ms = 1000,
+        .idle_timeout_ms = 5000,
+        .head_timeout_ms = 5000,
+        .drain_deadline_ms = 1000,
+        .loop_watchdog_ms = 0,
+        .max_lifetime_ms = 0,
+        .request_timeout_ms = 0,
+        .tunnel_timeout_ms = constants.tunnel_ms_default,
+    };
+    config.limits = .{ .conn_slots = 4, .relay_buffers = 1, .h2_connections = 2, .stream_slots = 8 };
+
+    const sizes = BudgetSim.poolSizesFor(&config);
+    var server: Server(SimIo) = undefined;
+    try server.init(arena, &io, &config, config.limits);
+
+    // The stream slots: one per connection in admission's own pool, and
+    // the shared eight in theirs — priced as one count, reserved as two.
+    try testing.expectEqual(@as(u32, 4 + 8), sizes.stream_slots);
+    try testing.expectEqual(@as(usize, 4), server.streams.slots.len);
+    try testing.expectEqual(@as(usize, 8), server.shared_streams.slots.len);
+    try testing.expectEqual(@as(usize, sizes.stream_slots), server.streams.slots.len + server.shared_streams.slots.len);
+    // A head per shared stream, each a whole head buffer.
+    try testing.expectEqual(@as(usize, sizes.stream_head_buffers), server.stream_head_buffers.slots.len);
+    for (server.stream_head_buffers.slots) |head_buffer| {
+        try testing.expectEqual(@as(usize, config.limits.head_buffer_bytes), head_buffer.data.len);
+    }
+    // The session slab, at the shape the budget prices it: the advertised
+    // concurrency is the shared pool here, under the advertisement's cap.
+    try testing.expectEqual(@as(u64, server.h2_session_slab.len), sizes.h2_connections * sizes.h2_session_bytes);
+    // Every unit of it starts where a session can live: the stride is
+    // the layout's, padded to its alignment, not a byte sum.
+    try testing.expectEqual(@as(u64, 0), sizes.h2_session_bytes % @import("http/h2/Session.zig").Layout.unit_align);
+    try testing.expect(sizes.h2_session_bytes > 0);
+    // And the closed form takes all of it without tripping its own
+    // all-or-nothing assertions.
+    try testing.expect(constants.memoryBytesTotal(&sizes) > 0);
 }

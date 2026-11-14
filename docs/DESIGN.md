@@ -535,12 +535,22 @@ a raised `RLIMIT_NOFILE`:
 | upstream head buffers | = upstream slots | 11457 | `head_buffer_bytes` + 24 B |
 | tls engines | 0, or min(conn slots, 1024) | 1024 | ~92 KiB + plaintext |
 | tunnels | 0 (off) | 11457 | 2 × `relay_buffer_bytes` |
+| h2 sessions | 0 (off), or min(conn slots, 1024) | conn slots | ~100 KiB at the default head |
+| shared stream slots | 0 (off), required with HTTP/2 | 11457 | a stream slot + `head_buffer_bytes` + 24 B |
 | **pool memory** | **~66 MiB** | **~653 MiB** | |
 
 The **pool memory** row excludes tunnels, which are off unless a listener
 allows an upgrade — a feature nobody asked for costing nothing is the
 point of the separate pool, and including a ceiling nobody reaches would
-misprice the common case. A deployment that does configure tunnels at the
+misprice the common case. The two HTTP/2 pools (#275) are off on the same
+terms, unless a listener speaks HTTP/2: the sessions are a pool because
+the unit is ~100 KiB, which on every conn slot would cost a GiB at c10k,
+and running short of one is graceful — ALPN offers `http/1.1` while the
+pool is empty. The shared stream slots are what HTTP/2 multiplexes, each
+charged a stream's two ring ops beside the per-connection divisor, which
+is why `limits.stream_slots` is required rather than guessed. Both are
+priced and reserved ahead of the serving path, and read zero until a
+listener can speak HTTP/2. A deployment that does configure tunnels at the
 ceiling pays the same `relay_buffer_bytes` term twice. Both figures track
 that knob: measured at the ceiling with tunnels and TLS off, the banner
 prints 290 MiB at 4 KiB against 559 MiB at the 16 KiB default, the

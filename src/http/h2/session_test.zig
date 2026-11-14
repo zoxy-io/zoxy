@@ -2026,3 +2026,42 @@ fn seenOf(seen: *[64]Seen, seen_len: *u32, id: u31) ?*Seen {
     seen_len.* += 1;
     return &seen[seen_len.* - 1];
 }
+
+test "h2 session: a layout prices what `Buffers` asks for, at the default head size" {
+    const layout: Session.Layout = .{ .header_list_size_max = 8192, .concurrent_streams_max = Session.concurrent_streams_advertised_max };
+    // Every buffer a session needs is at least what `init` asserts of it.
+    try testing.expect(layout.inboundBytes() >= Session.frame_bytes_max);
+    try testing.expect(layout.outboxBytes() >= Session.outbox_bytes_min);
+    try testing.expect(layout.decodedBytes() >= layout.header_list_size_max);
+    try testing.expectEqual(Session.fieldsFor(8192), layout.fieldsCount());
+    // And a block a head of that size encodes to fits beside a DATA frame.
+    try testing.expect(layout.outboxBytes() >= 8192 + Session.frame_bytes_max + Session.send_reserve);
+    // The figure the banner prints, held to its order of magnitude: about
+    // a hundred KiB a connection at defaults, which is why it is a pool.
+    const bytes = layout.bytes();
+    try testing.expect(bytes >= 64 * 1024);
+    try testing.expect(bytes <= 160 * 1024);
+}
+
+test "h2 session: a slab of units carves into sessions that each init and serve" {
+    const layout: Session.Layout = .{ .header_list_size_max = 4096, .concurrent_streams_max = 4 };
+    const unit_bytes: usize = @intCast(layout.bytes());
+    const units = 3;
+    const slab = try testing.allocator.alignedAlloc(u8, .fromByteUnits(Session.Layout.unit_align), units * unit_bytes);
+    defer testing.allocator.free(slab);
+    for (0..units) |index| {
+        const unit: []align(Session.Layout.unit_align) u8 = @alignCast(slab[index * unit_bytes ..][0..unit_bytes]);
+        const carved = layout.carve(unit);
+        // Every piece where its type can live, in every unit, not only
+        // the first — the stride is what a byte-aligned slab got wrong.
+        try testing.expect(std.mem.isAligned(@intFromPtr(carved.session), @alignOf(Session)));
+        try testing.expect(std.mem.isAligned(@intFromPtr(carved.buffers.table), @alignOf(Session.TableStorage)));
+        try testing.expect(std.mem.isAligned(@intFromPtr(carved.buffers.fields.ptr), @alignOf(hpack.Field)));
+        carved.session.init(.{
+            .concurrent_streams_max = layout.concurrent_streams_max,
+            .header_list_size_max = layout.header_list_size_max,
+        }, &carved.buffers);
+        // A carved session is a working one: its SETTINGS are staged.
+        try testing.expect(carved.session.outbound().len >= frame.Header.octets);
+    }
+}
