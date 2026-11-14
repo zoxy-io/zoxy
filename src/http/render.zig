@@ -55,6 +55,37 @@ pub const forwarded_for_name = "X-Forwarded-For";
 /// number this proxy computes per hop.
 pub const max_forwards_name = "Max-Forwards";
 
+/// The most one chunk-size line takes (RFC 9112 §7.1): a `u64`'s sixteen
+/// hex digits, then CRLF.
+pub const chunk_prefix_bytes_max: u32 = 16 + 2;
+
+comptime {
+    // A line this proxy writes is one its own scanner would read: a size
+    // line past the scanner's bound would be refused by the very framing
+    // rules this proxy holds origins and clients to.
+    assert(chunk_prefix_bytes_max <= constants.chunked_line_bytes_max);
+}
+
+/// What closes a chunk's data (RFC 9112 §7.1). The octets a body this
+/// proxy chunks itself is framed by — an HTTP/2 request body with no
+/// `content-length` (#275), going to an HTTP/1.1 origin that must be told
+/// where it ends — are `chunkPrefix`, the data, this, and `last_chunk`.
+pub const chunk_suffix = "\r\n";
+
+/// A chunked body's end with no trailer section: the zero-size chunk and
+/// the empty line after it.
+pub const last_chunk = "0\r\n\r\n";
+
+/// The size line in front of `length` octets of chunk data. Never zero:
+/// a zero-size chunk is `last_chunk`, which ends the body, and a caller
+/// with nothing to send has no chunk to frame.
+pub fn chunkPrefix(length: u64, out: *[chunk_prefix_bytes_max]u8) []const u8 {
+    assert(length >= 1);
+    const line = std.fmt.bufPrint(out, "{x}\r\n", .{length}) catch unreachable; // 18 octets hold any u64.
+    assert(line.len >= 3);
+    return line;
+}
+
 /// True when `list` names `name` exactly. Comptime-only, for the check
 /// below; the runtime path compares tags, not strings.
 fn nameListHas(list: []const []const u8, name: []const u8) bool {
@@ -1163,4 +1194,126 @@ fn checkRequestRenderForwarded(input: []const u8) void {
         }
     }
     assert(seen == 1);
+}
+
+/// Chunk `payload` into `out` with `chunkPrefix` — chunk sizes drawn from
+/// `sizes`, cycled — and end it with `last_chunk`. Answers the wire length.
+fn chunkInto(out: []u8, payload: []const u8, sizes: []const u8) usize {
+    var length: usize = 0;
+    var offset: usize = 0;
+    var pick: usize = 0;
+    while (offset < payload.len) : (pick += 1) {
+        const want: usize = if (sizes.len == 0) payload.len else @as(usize, sizes[pick % sizes.len]) + 1;
+        const take = @min(want, payload.len - offset);
+        var prefix: [chunk_prefix_bytes_max]u8 = undefined;
+        const line = chunkPrefix(take, &prefix);
+        @memcpy(out[length..][0..line.len], line);
+        length += line.len;
+        @memcpy(out[length..][0..take], payload[offset..][0..take]);
+        length += take;
+        @memcpy(out[length..][0..chunk_suffix.len], chunk_suffix);
+        length += chunk_suffix.len;
+        offset += take;
+    }
+    @memcpy(out[length..][0..last_chunk.len], last_chunk);
+    return length + last_chunk.len;
+}
+
+/// Dechunk `wire` fed in pieces of the sizes in `splits` (cycled), into
+/// `payload`. Answers the payload length; the whole wire must be one body.
+fn dechunkPieces(wire: []u8, splits: []const u8, payload: []u8) !usize {
+    var scanner: parser.ChunkedScanner = .{};
+    var offset: usize = 0;
+    var length: usize = 0;
+    var pick: usize = 0;
+    while (offset < wire.len) : (pick += 1) {
+        const want: usize = if (splits.len == 0) wire.len else @as(usize, splits[pick % splits.len]) + 1;
+        const piece = wire[offset..][0..@min(want, wire.len - offset)];
+        const result = try scanner.dechunk(piece);
+        @memcpy(payload[length..][0..result.payload_len], piece[0..result.payload_len]);
+        length += result.payload_len;
+        offset += result.consumed;
+        if (result.done) break;
+    }
+    try testing.expectEqual(wire.len, offset);
+    try testing.expectEqual(parser.ChunkedScanner.State.done, scanner.state);
+    return length;
+}
+
+test "render: a body chunked here dechunks back to itself, however it is split" {
+    const payload = "an HTTP/2 request body, arriving as DATA, going upstream chunked";
+    var wire: [512]u8 = undefined;
+    var back: [512]u8 = undefined;
+    for ([_][]const u8{ "", "\x00", "\x03\x10", "\xff" }) |sizes| {
+        for ([_][]const u8{ "", "\x00", "\x06", "\x01\x0a" }) |splits| {
+            const length = chunkInto(&wire, payload, sizes);
+            const got = try dechunkPieces(wire[0..length], splits, &back);
+            try testing.expectEqualStrings(payload, back[0..got]);
+        }
+    }
+    var prefix: [chunk_prefix_bytes_max]u8 = undefined;
+    try testing.expectEqualStrings("ffffffffffffffff\r\n", chunkPrefix(std.math.maxInt(u64), &prefix));
+}
+
+test "fuzz: chunk framing — what is chunked here dechunks to itself, and dechunk agrees with feed" {
+    // Four octets of chunk sizes, four of feed splits, then a payload —
+    // which `agree` also reads as raw wire, so these carry extensions,
+    // trailers and a malformed size line for it to meet.
+    const seed = @import("../testing/bytes.zig").fuzzSeed;
+    try testing.fuzz({}, fuzzChunkFraming, .{ .corpus = &.{
+        seed("\x00\x03\x10\xff" ++ "\x00\x06\x01\x0a" ++ "5;e=1\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n"),
+        seed("\x07\x07\x07\x07" ++ "\x02\x02\x02\x02" ++ "a\r\n0123456789\r\n0\r\n\r\n"),
+        seed("\x00\x00\x00\x00" ++ "\x00\x00\x00\x00" ++ "zz\r\n"),
+    } });
+}
+
+fn fuzzChunkFraming(context: void, smith: *std.testing.Smith) !void {
+    _ = context;
+    var input: [1024]u8 = undefined;
+    const input_len = smith.slice(&input);
+    if (input_len < 3) return;
+    const sizes = input[0..@min(input_len, 4)];
+    const splits = input[@min(input_len, 4)..@min(input_len, 8)];
+    const payload = input[@min(input_len, 8)..input_len];
+    // The round trip: any payload, any chunk sizes, any feed splits.
+    var wire: [8192]u8 = undefined;
+    var back: [1024]u8 = undefined;
+    const length = chunkInto(&wire, payload, sizes);
+    const got = try dechunkPieces(wire[0..length], splits, &back);
+    assert(std.mem.eql(u8, payload, back[0..got]));
+    // Agreement: the raw input as wire — it is not read again after this,
+    // so `dechunk` may compact it in place — fed both ways in the same
+    // pieces, the same verdicts.
+    agree(payload, splits);
+}
+
+/// Feed `bytes` to one scanner with `feed` and to another with `dechunk`,
+/// piece by piece in the sizes `splits` cycles through, and hold them to
+/// the same answers at every piece: consumed, done, the state they land
+/// in, the payload counted, and the error that ends either.
+fn agree(bytes: []u8, splits: []const u8) void {
+    var counting: parser.ChunkedScanner = .{};
+    var dechunking: parser.ChunkedScanner = .{};
+    var offset: usize = 0;
+    var pick: usize = 0;
+    while (offset < bytes.len) : (pick += 1) {
+        const want: usize = if (splits.len == 0) bytes.len else @as(usize, splits[pick % splits.len]) + 1;
+        const piece = bytes[offset..][0..@min(want, bytes.len - offset)];
+        // `feed` first: `dechunk` compacts the piece in place, and the
+        // counting scanner must read the octets as they arrived.
+        const fed = counting.feed(piece);
+        const kept = dechunking.dechunk(piece);
+        const progress = fed catch |err| {
+            assert(kept == err);
+            return;
+        };
+        const result = kept catch unreachable;
+        assert(result.consumed == progress.consumed);
+        assert(result.done == progress.done);
+        assert(result.payload_len <= result.consumed);
+        assert(dechunking.state == counting.state);
+        assert(dechunking.body_bytes == counting.body_bytes);
+        offset += progress.consumed;
+        if (progress.done) return;
+    }
 }

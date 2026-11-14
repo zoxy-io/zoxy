@@ -722,6 +722,49 @@ pub const ChunkedScanner = struct {
         return .{ .consumed = index, .done = done };
     }
 
+    /// What `dechunk` made of one feed: `feed`'s answer, and the payload.
+    pub const Dechunked = struct {
+        /// Wire octets consumed, exactly as `feed` would count them.
+        consumed: u32,
+        /// The chunk data among them, moved to the front of the buffer.
+        payload_len: u32,
+        done: bool,
+    };
+
+    /// `feed`, keeping only the payload: of the octets consumed, the chunk
+    /// data moves to the front of `bytes`, in order, and the framing —
+    /// sizes, extensions, terminators, trailers — is dropped. For a
+    /// recipient that frames a body itself (HTTP/2's DATA, #275) and wants
+    /// a chunked origin's octets without the chunking. The same scanner,
+    /// so the same verdicts: a stream `feed` refuses, this refuses too.
+    ///
+    /// In place, because payload is never longer than the wire that
+    /// carried it, and each run moves only toward the front.
+    pub fn dechunk(scanner: *ChunkedScanner, bytes: []u8) Error!Dechunked {
+        assert(bytes.len >= 1);
+        assert(bytes.len <= std.math.maxInt(u32));
+        assert(scanner.state != .done);
+
+        var index: u32 = 0;
+        var payload: u32 = 0;
+        while (index < bytes.len) {
+            const in_data = scanner.state == .data;
+            const consumed = try scanner.step(bytes[index..]);
+            assert(consumed >= 1);
+            if (in_data) {
+                std.mem.copyForwards(u8, bytes[payload..][0..consumed], bytes[index..][0..consumed]);
+                payload += consumed;
+            }
+            index += consumed;
+            assert(index <= bytes.len);
+            if (scanner.state == .done) break;
+        }
+        assert(payload <= index);
+        const done = scanner.state == .done;
+        if (!done) assert(index == bytes.len);
+        return .{ .consumed = index, .payload_len = payload, .done = done };
+    }
+
     /// Consumes at least one byte: a whole run of chunk data, or exactly
     /// one framing byte.
     fn step(scanner: *ChunkedScanner, bytes: []const u8) Error!u32 {
@@ -2293,6 +2336,26 @@ fn chunkedOutcome(input: []const u8, feed_bytes_max: usize) ChunkedOutcome {
         assert(offset == end);
     }
     return outcome;
+}
+
+test "chunked: dechunk keeps the payload and drops sizes, extensions and trailers" {
+    var scanner: ChunkedScanner = .{};
+    var wire = "5;ext=1\r\nhello\r\n7\r\n, world\r\n0\r\nX-Sum: 1\r\n\r\nNEXT".*;
+    const result = try scanner.dechunk(&wire);
+    try std.testing.expect(result.done);
+    try std.testing.expectEqualStrings("hello, world", wire[0..result.payload_len]);
+    // The tail past the terminator is the next message's, never consumed.
+    try std.testing.expectEqual(@as(u32, wire.len - 4), result.consumed);
+}
+
+test "chunked: dechunk refuses what feed refuses" {
+    const malformed = [_][]const u8{ "x\r\n", "5\r\nhello\n", "\r\n" };
+    for (malformed) |bytes| {
+        var scanner: ChunkedScanner = .{};
+        var copy: [32]u8 = undefined;
+        @memcpy(copy[0..bytes.len], bytes);
+        try std.testing.expectError(error.Malformed, scanner.dechunk(copy[0..bytes.len]));
+    }
 }
 
 test "chunked: a simple body scans to done at every split size" {

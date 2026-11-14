@@ -273,6 +273,7 @@ const Writer = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const seed = @import("../../testing/bytes.zig").fuzzSeed;
 const MessageValidator = h2.fields.MessageValidator;
 
 /// A head buffer and header storage, and the session's own reading of a
@@ -549,18 +550,6 @@ test "fuzz: downgrade — whatever the session accepts maps to exactly its field
             "\x15\x00\x00\x00\x00\x04x-at\x02/[\x86\x01?<\x02/[\x86\x00\x04\x000",
         },
     });
-}
-
-/// A corpus entry as `Smith.slice` reads one: a little-endian `u32` length,
-/// then the octets. Written bare, an entry's first four octets are read as
-/// that length, and the target never sees the seed it was written as.
-fn seed(comptime bytes: []const u8) []const u8 {
-    const encoded = comptime encoded: {
-        var length: [4]u8 = undefined;
-        std.mem.writeInt(u32, &length, bytes.len, .little);
-        break :encoded length ++ bytes[0..bytes.len].*;
-    };
-    return &encoded;
 }
 
 /// Field lists built from the input — pseudo-headers from short tables

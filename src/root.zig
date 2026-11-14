@@ -83,6 +83,7 @@ test {
     _ = @import("http/h2/Session.zig");
     _ = @import("http/h2/StreamTable.zig");
     _ = @import("http/h2/downgrade.zig");
+    _ = @import("http/h2/response.zig");
     _ = @import("http/h2/session_test.zig");
     _ = Io;
     _ = Server;

@@ -41,3 +41,17 @@ test "repeat writes the pattern out count times, sentinel included" {
     try std.testing.expectEqualStrings("ab\r\nab\r\n", several);
     try std.testing.expectEqual(*const [8:0]u8, @TypeOf(several));
 }
+
+/// A fuzz corpus entry as `std.testing.Smith.slice` reads one: a
+/// little-endian `u32` length, then the octets. `slice` reads that length
+/// before anything else, from corpus entries and saved crash inputs alike,
+/// so an entry written bare loses its first four octets to it and never
+/// reaches the target as written.
+pub fn fuzzSeed(comptime bytes: []const u8) []const u8 {
+    const encoded = comptime encoded: {
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, bytes.len, .little);
+        break :encoded length ++ bytes[0..bytes.len].*;
+    };
+    return &encoded;
+}
