@@ -86,6 +86,7 @@ test {
     _ = tls.Credentials;
     _ = tls.Engine;
     _ = tls.Tickets;
+    _ = @import("tls/alpn.zig");
     _ = @import("tls/engine_test.zig");
     _ = tls.TestClient;
     _ = @import("mem/Pool.zig");

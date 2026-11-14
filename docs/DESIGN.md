@@ -822,6 +822,20 @@ Rules:
   its object — sugar for the common case, one general form underneath.
   Breaking it instead would be the freeze meaning nothing the first time
   it was tested.
+- **`tls.alpn` is a closed list of protocols this proxy speaks** (#271),
+  in the listener's preference order, which RFC 7301 §3.2 makes the order
+  that counts. Closed on #180's upgrade-allowlist precedent: a token is a
+  promise the serving path keeps, so `h2` is refused at load until #275
+  can keep it, and an `l4` listener — which parses nothing it could name
+  — refuses the key and offers nothing. Absent on an `http` listener it
+  means `["http/1.1"]`, so the default closes the gap rather than
+  preserving it: before this a client offering only `h2` was handed an
+  HTTP/1.1 session in silence. Now it gets `no_application_protocol`, the
+  one alert this proxy sends a peer it refuses. Every other handshake
+  failure stays a bare teardown, and this one differs only because the
+  RFC requires an answer whose content the client already knows. Counted
+  as `tls_alpn_refused`, disjoint from `tls_handshake_failed`: nothing
+  failed, and only an operator can change the outcome.
 - **An address is a string, and `unix:` extends its grammar** (#303,
   #305). `bind` and `endpoints` stay single scalars rather than becoming
   tagged objects or gaining a second key — they are the two most-written

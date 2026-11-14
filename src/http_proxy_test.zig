@@ -786,7 +786,11 @@ const Http1Bed = struct {
             // Paths nothing reads: the bed embeds the PEMs, so what this
             // states is only that the listener terminates.
             .tls = if (options.tls)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem" }
+                .{
+                    .cert_path = "cert.pem",
+                    .key_path = "key.pem",
+                    .alpn = config_module.alpn.http_default,
+                }
             else
                 null,
         }};
@@ -5284,6 +5288,77 @@ test "l7: a completed handshake issues its session tickets" {
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         client.app_received[0..client.app_received_len],
     );
+    try bed.expectDrained();
+}
+
+test "l7: ALPN — a client offering h2 and http/1.1 is answered http/1.1 (#271)" {
+    // `h2` first, as browsers and curl order it. The listener speaks
+    // HTTP/1.1 alone, so the server's preference has exactly one name to
+    // offer and the client's order cannot change the answer.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 56,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+        .alpn = &.{ "h2", "http/1.1" },
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqualStrings("http/1.1", client.alpnSelected().?);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_handshakes_completed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_alpn_refused"));
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        client.app_received[0..client.app_received_len],
+    );
+    try bed.expectDrained();
+}
+
+test "l7: ALPN — a client offering only h2 is refused with the alert, not served HTTP/1.1 (#271)" {
+    // The gap #271 closes. Before it, this client was handed an HTTP/1.1
+    // session it never asked for and would have spoken h2 into a parser
+    // that cannot read it; now it is told no in the handshake, which is
+    // RFC 7301 §3.2's MUST and the only answer it can act on.
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 57,
+        .tls = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    });
+    defer bed.tearDown();
+
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, Http1Bed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = "GET /x HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n",
+        .alpn = &.{"h2"},
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    // The alert itself reached the client — the refusal was said, not
+    // merely acted on by a teardown the client would read as a reset.
+    try std.testing.expect(client.refusedForAlpn());
+    try std.testing.expect(!client.handshake_done);
+    try std.testing.expectEqual(@as(u32, 0), client.app_received_len);
+    // Counted as what it is. Not a failure: the handshake was refused on
+    // the listener's terms, and `tls_handshake_failed` stays the counter
+    // an operator reads for clients that could not get through.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_alpn_refused"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshakes_completed"));
+    // And nothing reached the origin: a refused session has no exchange.
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_responses"));
     try bed.expectDrained();
 }
 

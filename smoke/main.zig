@@ -110,6 +110,13 @@ const tls_requests: u32 = 3;
 /// equality: a leg that opened a second connection without saying so here
 /// would be caught as an off-by-one rather than pass quietly.
 const tls_connections: u32 = 1;
+/// The #271 refusal: one raw connection whose hello offers only `h2`,
+/// which the HTTP/1.1 terminator answers with `no_application_protocol`.
+const tls_alpn_refusal_connections: u32 = 1;
+/// Everything the last leg opens, as one term: the scrapes before it
+/// subtract the leg whole, so a connection added to it cannot be counted
+/// in the run's total and forgotten in theirs.
+const https_leg_connections: u32 = tls_connections + tls_alpn_refusal_connections;
 /// Tickets a completed handshake is expected to issue — `constants
 /// .tls_tickets_per_handshake`, spelled here rather than imported like
 /// the counter names: the gate reads what the binary *wrote*, so a drift
@@ -248,7 +255,7 @@ const allowlist_connections: u32 = 1;
 const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
-    body_connections + allowlist_connections + tls_connections + readiness_probes;
+    body_connections + allowlist_connections + https_leg_connections + readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -447,6 +454,7 @@ const Stage = enum {
     sticky_leg,
     bodies_leg,
     allowlist_leg,
+    https_alpn_refusal,
     https_handshake,
     https_request,
     https_close_notify,
@@ -465,6 +473,7 @@ const Stage = enum {
             .sticky_leg => "the sticky leg (#178)",
             .bodies_leg => "the bodies leg (#159)",
             .allowlist_leg => "the allowlist leg (#331)",
+            .https_alpn_refusal => "the ALPN refusal (#271)",
             .https_handshake => "the https handshake",
             .watchdog_leg => "the loop-watchdog leg (#311)",
             .https_request => "an https request",
@@ -1017,7 +1026,7 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
     // `tls_requests`); the whole-run equality is asserted on the last of
     // their scrapes.
     const opened_so_far = connections_expected - sticky_connections -
-        body_connections - allowlist_connections - tls_connections;
+        body_connections - allowlist_connections - https_leg_connections;
     if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
@@ -1287,7 +1296,7 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // the #159 and TLS legs open after it — the whole-run equality lands
     // on the last scrape of the run.
     const opened_by_here = connections_expected - body_connections -
-        allowlist_connections - tls_connections;
+        allowlist_connections - https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1338,7 +1347,7 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     }
     // Short the #331 and TLS legs' connections, which open after this
     // scrape; the last of them carries the whole-run equality.
-    const opened_by_here = connections_expected - allowlist_connections - tls_connections;
+    const opened_by_here = connections_expected - allowlist_connections - https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1562,11 +1571,11 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     assert(ports.admin != 0);
     var host_buffer: [32]u8 = undefined;
     const host = try std.fmt.bufPrint(&host_buffer, "127.0.0.1:{d}", .{ports.tls});
+    var passed = try alpnRefusalPassed(io, ports.tls);
     enterStage(.https_handshake);
     try single_client.connectTls(io, ports.tls);
     defer single_client.close();
 
-    var passed = true;
     var request: u32 = 0;
     enterStage(.https_request);
     while (request < tls_requests) : (request += 1) {
@@ -1591,6 +1600,10 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // rung a working run must never reach — a session that failed and
         // silently retried would otherwise pass on the count above.
         .{ .name = "tls_handshake_failed", .expected = 0 },
+        // The #271 leg's one refusal — counted as a refusal, and so
+        // *not* above: nothing failed, the client asked for `h2` and was
+        // told no.
+        .{ .name = "tls_alpn_refused", .expected = tls_alpn_refusal_connections },
         // The post-handshake flight, witnessed on the shipped binary
         // rather than only in a simulator: it is what carries the ACK
         // that keeps a client's first request out of its own Nagle queue,
@@ -1629,6 +1642,86 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         passed = false;
     }
     return passed;
+}
+
+/// The #271 leg: a ClientHello offering only `h2`, written by hand onto a
+/// raw socket, must be answered with RFC 7301's `no_application_protocol`
+/// and nothing else — then the connection ends.
+///
+/// No TLS library, deliberately, and not only because `std.crypto.tls`
+/// cannot offer ALPN. The refusal goes out before any key exists, as one
+/// plaintext alert record, so its bytes are fixed by RFC 8446 §5.1 and
+/// §6 alone and can be compared exactly. A library would only add a
+/// second reading of them; these bytes are the wire. And the hello shares
+/// no code with zoxy's parser, which is the property every outside peer
+/// in this tier exists for.
+fn alpnRefusalPassed(io: Io, port: u16) !bool {
+    assert(port != 0);
+    enterStage(.https_alpn_refusal);
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.writeAll(&h2_only_hello);
+    try writer.interface.flush();
+    // Read to the end: the alert, then the close. A proxy that kept the
+    // socket open would hang here, which the stage watchdog names.
+    var read_buffer: [64]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var answer: [64]u8 = undefined;
+    const answer_len = try reader.interface.readSliceShort(&answer);
+    assert(answer_len <= answer.len);
+    // Record header (alert, TLS 1.2 legacy version, two bytes), then the
+    // alert: fatal, no_application_protocol (120).
+    const expected = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 120 };
+    if (!std.mem.eql(u8, answer[0..answer_len], &expected)) {
+        std.debug.print(
+            "FAIL: an h2-only hello was answered {x}, not the alert {x}\n",
+            .{ answer[0..answer_len], &expected },
+        );
+        return false;
+    }
+    return true;
+}
+
+/// A TLS 1.3 ClientHello whose one ALPN offer is `h2`. Everything else is
+/// the least zssl's server needs to reach its ALPN choice: one suite, one
+/// group with a share, one signature scheme the fixture's P-256 key can
+/// produce. The share is RFC 7748 §6.1's published X25519 public key —
+/// a real point, so nothing ahead of the ALPN check can refuse it.
+const h2_only_hello: [h2_only_hello_bytes.len]u8 = h2_only_hello_bytes.*;
+const h2_only_hello_bytes = hello: {
+    const share = [_]u8{
+        0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54, 0x74, 0x8b, 0x7d, 0xdc, 0xb4, 0x3e, 0xf7, 0x5a,
+        0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4, 0xeb, 0xa4, 0xa9, 0x8e, 0xaa, 0x9b, 0x4e, 0x6a,
+    };
+    const extensions =
+        // supported_versions: TLS 1.3.
+        [_]u8{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 } ++
+        // supported_groups: x25519.
+        [_]u8{ 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d } ++
+        // signature_algorithms: ecdsa_secp256r1_sha256.
+        [_]u8{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03 } ++
+        // key_share: one x25519 entry.
+        [_]u8{ 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 } ++ share ++
+        // application_layer_protocol_negotiation: "h2", and nothing else.
+        [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '2' };
+    const body =
+        // legacy_version, then a fixed random: nothing here is secret.
+        [_]u8{ 0x03, 0x03 } ++ @as([32]u8, @splat(0x5a)) ++
+        // Empty legacy_session_id; one suite, TLS_AES_128_GCM_SHA256;
+        // the null compression method TLS 1.3 requires.
+        [_]u8{ 0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00 } ++
+        bigEndian2(extensions.len) ++ extensions;
+    const handshake = [_]u8{ 0x01, 0x00 } ++ bigEndian2(body.len) ++ body;
+    break :hello &([_]u8{ 0x16, 0x03, 0x01 } ++ bigEndian2(handshake.len) ++ handshake);
+};
+
+fn bigEndian2(comptime value: usize) [2]u8 {
+    comptime assert(value >= 1);
+    comptime assert(value <= std.math.maxInt(u16));
+    return .{ @intCast(value >> 8), @intCast(value & 0xff) };
 }
 
 /// One response off the terminated listener. The same framing the

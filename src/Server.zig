@@ -421,6 +421,11 @@ pub fn Server(comptime IoType: type) type {
             /// engine this listener drives — a chain and a libcrypto key
             /// are parsed once per listener, never per connection.
             credentials: ?*const Credentials,
+            /// What this listener offers in ALPN (#271), most preferred
+            /// first — canonical `tls/alpn.zig` tokens borrowed from the
+            /// config, which lives for the process. Empty on a plaintext
+            /// socket and on an `l4` listener, which names no protocol.
+            alpn_protocols: []const []const u8,
             accepting: bool,
         };
 
@@ -1100,6 +1105,7 @@ pub fn Server(comptime IoType: type) type {
                     .unix_bind = listener_config.bind_address == .unix,
                     .protocol = listener_config.protocol,
                     .credentials = server.credentialsFor(index),
+                    .alpn_protocols = if (listener_config.tls) |tls| tls.alpn else &.{},
                     .accepting = false,
                 };
                 // A listener the config says terminates TLS must have
@@ -1805,7 +1811,7 @@ pub fn Server(comptime IoType: type) type {
             // still be one — past `finishAdmission` the connection is in
             // the gate identity and the answer would have to be a teardown.
             const engine: ?*TlsEngine = if (state.credentials) |credentials|
-                server.acquireTlsEngine(credentials) catch |err| {
+                server.acquireTlsEngine(credentials, state.alpn_protocols) catch |err| {
                     // The two causes want opposite answers from an
                     // operator — provision more engines, or size the
                     // libcrypto heap — so they keep separate rungs (§8).
@@ -2193,6 +2199,7 @@ pub fn Server(comptime IoType: type) type {
         pub fn acquireTlsEngine(
             server: *Self,
             credentials: *const Credentials,
+            alpn_protocols: []const []const u8,
         ) AcquireEngineError!*TlsEngine {
             assert(credentials.chain.len >= 1);
             const engine = server.tls_engines.acquire() orelse
@@ -2208,6 +2215,7 @@ pub fn Server(comptime IoType: type) type {
                 // ticket it opened would be one it never sealed.
                 .tickets = if (server.tls_tickets.ready()) &server.tls_tickets else null,
                 .now_unix = server.nowUnix(),
+                .alpn_protocols = alpn_protocols,
             }) catch {
                 // Deriving the ephemeral keypair is the one fallible step,
                 // and under the OpenSSL backend it *allocates*
@@ -2861,9 +2869,8 @@ pub fn Server(comptime IoType: type) type {
                 return;
             }
             var sink: TlsHandshakeSink = .{ .conn = conn };
-            conn.tls.?.feed(opening, &sink.sink()) catch {
-                server.counters.increment("tls_handshake_failed");
-                server.beginTeardown(conn);
+            conn.tls.?.feed(opening, &sink.sink()) catch |err| {
+                server.failTlsHandshake(conn, err);
                 return;
             };
             server.pumpTlsOutbound(conn);
@@ -2922,13 +2929,8 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.state == .tls_handshaking);
             const engine = conn.tls.?;
             var sink: TlsHandshakeSink = .{ .conn = conn };
-            engine.received(received, &sink.sink()) catch {
-                // Any protocol error is this connection's: a malformed
-                // record, a bad MAC, an unacceptable parameter. The peer
-                // gets a teardown rather than a diagnosis — telling it
-                // which of those it was is telling an attacker.
-                server.counters.increment("tls_handshake_failed");
-                server.beginTeardown(conn);
+            engine.received(received, &sink.sink()) catch |err| {
+                server.failTlsHandshake(conn, err);
                 return;
             };
             // A client that closed the session mid-handshake said goodbye
@@ -2939,6 +2941,32 @@ pub fn Server(comptime IoType: type) type {
                 return;
             }
             server.pumpTlsOutbound(conn);
+        }
+
+        /// A handshake step returned an error. Any protocol error is this
+        /// connection's — a malformed record, a bad MAC, an unacceptable
+        /// parameter — and the peer gets a teardown rather than a
+        /// diagnosis: telling it which of those it was is telling an
+        /// attacker.
+        ///
+        /// One exception, and the RFC's rather than ours. A client that
+        /// offered ALPN and named nothing this listener speaks is owed
+        /// `no_application_protocol` (RFC 7301 §3.2), so that alert is
+        /// staged and flushed before the teardown, and the outcome is
+        /// counted apart (#271): nothing failed, the client was told no.
+        /// The alert says only what the client already knows — it asked
+        /// for a protocol and did not get it — so it is no oracle.
+        fn failTlsHandshake(server: *Self, conn: *ConnType, err: anyerror) void {
+            assert(conn.state == .tls_handshaking);
+            assert(!conn.tls_session_up);
+            if (err == error.NoApplicationProtocol) {
+                server.counters.increment("tls_alpn_refused");
+                conn.tls.?.refuseApplicationProtocol();
+                server.pumpTlsOutbound(conn);
+                return;
+            }
+            server.counters.increment("tls_handshake_failed");
+            server.beginTeardown(conn);
         }
 
         /// Write whatever the engine staged, then take the next step. The
@@ -2982,6 +3010,13 @@ pub fn Server(comptime IoType: type) type {
                     conn,
                     onTlsSent,
                 );
+                return;
+            }
+            // A refusal's alert has drained: there is nothing left to say
+            // and nothing to read, so the connection ends here.
+            if (engine.isRefused()) {
+                assert(!engine.isConnected());
+                server.beginTeardown(conn);
                 return;
             }
             assert(conn.tls_session_up or !engine.isConnected());
@@ -3053,7 +3088,11 @@ pub fn Server(comptime IoType: type) type {
                 // it completed one and then went away, which teardown
                 // already accounts for.
                 if (err == error.Reset) {
-                    if (!conn.tls_session_up) {
+                    // A reset under a refusal's alert is a refusal the
+                    // client did not stay to hear; it was counted when it
+                    // was decided, and counting it again would make one
+                    // handshake both refused and failed.
+                    if (!conn.tls_session_up and !conn.tls.?.isRefused()) {
                         server.counters.increment("tls_handshake_failed");
                     }
                 } else {
@@ -3077,6 +3116,17 @@ pub fn Server(comptime IoType: type) type {
             assert(conn.tls.?.isConnected());
             assert(conn.tls.?.outbound().len == 0);
             assert(conn.tls_session_up); // The pump counted it on the way here.
+            // What the session negotiated (#271). An `http` listener speaks
+            // one protocol today, so there is nothing to branch on yet;
+            // this read is the seam #275 turns into the branch between
+            // HTTP/1.1 and h2. Until then it states what must already be
+            // true: an `http` session negotiated HTTP/1.1, or nothing (the
+            // client offered no ALPN), and an `l4` one — which offers none
+            // — negotiated nothing.
+            switch (conn.protocol) {
+                .http => if (conn.tls.?.alpnSelected()) |selected| assert(selected == .http_1_1),
+                .l4 => assert(conn.tls.?.alpnSelected() == null),
+            }
             // An L4 connection relays for its whole life and must hold a
             // buffer before the dial (§6); an L7 one takes its per-leg.
             // Admission already settled that, so nothing is acquired here.
