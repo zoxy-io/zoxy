@@ -25,42 +25,39 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Single-user install (the runner owns /nix), which cache-nix-action
-      # requires: the daemon install cachix/install-nix-action does leaves
-      # /nix root-owned, so restoring the store as the runner fails with
-      # "Cannot mkdir: Permission denied" and silently degrades to a miss.
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
-
-      # Serve prebuilt devenv from the public binary cache instead of
-      # building it from source — the macOS `nix profile install` was the
-      # single slowest step (3m37s → ~30s). Pull-only: no auth token.
+      # The pinned Zig, without Nix. CI used to run every command inside a
+      # devenv shell, which made Nix the first thing each job depended on
+      # and the one that failed most often: binary caches down, store
+      # paths that came back invalid (the coverage job carried a whole
+      # /nix/store cache just to dodge `ldexpl.c is not valid`) — all
+      # failing runs before a line of zoxy compiled. All to deliver one
+      # compiler: libcrypto has been built by Zig since #279, so the
+      # shell's openssl was already dead weight.
       #
-      # A /nix/store cache (cache-nix-action) was measured and dropped: on
-      # macOS restoring the ~950 MB store took longer than the install it
-      # replaced (net slower), and on Linux it was a wash — the fast
-      # single-user install plus this cache already do the work.
-      - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v17
-        with:
-          name: devenv
-          skipPush: true
-
-      # Pin devenv to a fixed release (matches local dev, 2.1.2) instead of the
-      # drifting `nixpkgs#devenv`, so every run resolves the same devenv binary;
-      # --accept-flake-config lets it pull prebuilt from devenv.cachix.org.
-      - name: Install devenv
-        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+      # setup-zig fetches the official tarball from the community mirrors
+      # in random order, ziglang.org last, and checks its minisign
+      # signature before use, so one mirror down costs a retry rather than
+      # the run; the tarball itself is then cached. The version is
+      # build.zig.zon's `minimum_zig_version` (the action's default), so
+      # it travels with the tree and matches devenv's zig_0_17.
+      #
+      # It also caches the Zig cache — fetched packages and compiled
+      # artifacts, the vendored OpenSSL above all — per job and platform,
+      # restoring the newest entry and saving a fresh one each run.
+      # Measured 2026-11-14 on the dev box: a cold `zig build ci` takes
+      # 3m53s and leaves ~1 GB of cache, and the same run warm takes 28 s.
+      # The action empties the cache once it passes 2 GiB (its default
+      # limit), so a cold run is the price of every few incremental ones —
+      # raise `cache-size-limit` only if that cadence turns out too tight.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
 
       # zig-pkg (vendored, hash-pinned deps) is deliberately not checked.
       - name: Check formatting
-        run: devenv shell -- zig fmt --check build.zig src bench sim smoke scripts
+        run: zig fmt --check build.zig src bench sim smoke scripts
 
       - name: Build
-        run: devenv shell -- zig build
+        run: zig build
 
       # The per-change gates (DESIGN.md §9): unit tests, the fd-boundary
       # lint, and the deterministic simulator (failures replay locally with
@@ -68,49 +65,35 @@ jobs:
       # excluded — its verdict is a band comparison against a real origin
       # at merge, not a blind shared-runner pass.
       - name: Run gates (test + lint + sim)
-        run: devenv shell -- zig build ci --summary all
+        run: zig build ci --summary all
 
   coverage:
     name: coverage
-    # kcov is Linux-only (devenv.nix); the merged report is the unit tests
-    # plus a simulator sweep, which reaches error paths unit tests cannot.
-    runs-on: ubuntu-latest
+    # kcov is Linux-only; the merged report is the unit tests plus a
+    # simulator sweep, which reaches error paths unit tests cannot.
+    #
+    # Pinned to 26.04 rather than ubuntu-latest because that is where kcov
+    # comes from: Ubuntu's archive carries kcov 43 from 26.04 on (24.04 has
+    # none at all), the same release nixpkgs gives the dev shell, so
+    # build.zig's workaround for kcov 43's DWARF gotcha holds for both. A
+    # moving label would make the kcov version move under it.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Nix
-        uses: nixbuild/nix-quick-install-action@v35
-        with:
-          nix_conf: |
-            experimental-features = nix-command flakes
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
 
-      # Persist /nix/store across runs so the realised nixpkgs bootstrap paths
-      # — including the `ldexpl.c` source that devenv 2.x's shell-eval IFD
-      # flakily re-substitutes from cache.nixos.org — survive between runs.
-      # That kills the intermittent `path '...ldexpl.c' is not valid` coverage
-      # failure at its root (a restored path is already valid) and skips the
-      # re-fetch, so the job gets faster, not slower. Coverage-only: Linux +
-      # single-user Nix (nix-quick-install-action), where restore works — the
-      # daemon install's permission problem that broke it is gone. Keyed on
-      # devenv.lock (the nixpkgs pin that fixes the bootstrap paths); the prefix
-      # restores the newest store on a miss so the bootstrap survives a bump.
-      - name: Cache Nix store
-        uses: nix-community/cache-nix-action@v7
-        with:
-          primary-key: nix-coverage-v1-${{ hashFiles('devenv.lock') }}
-          restore-prefixes-first-match: nix-coverage-v1-
-
-      - name: Set up devenv binary cache
-        uses: cachix/cachix-action@v17
-        with:
-          name: devenv
-          skipPush: true
-
-      - name: Install devenv
-        run: nix profile install --accept-flake-config github:cachix/devenv/v2.1.2
+      # From the runner's own Ubuntu mirror rather than a third-party
+      # download, with apt's retries on for a transient mirror failure.
+      - name: Install kcov
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y kcov
+          kcov --version
 
       - name: Measure coverage (kcov)
-        run: devenv shell -- zig build coverage
+        run: zig build coverage
 
       - name: Upload to Coveralls
         uses: coverallsapp/github-action@v2

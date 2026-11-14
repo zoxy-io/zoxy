@@ -25,7 +25,15 @@
     .fingerprint = 0xa872299f36b5e445, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.17.0",
+    //
+    // Also the CI toolchain pin: mlugg/setup-zig installs exactly this
+    // version in every workflow, so it is the one Zig every gate and every
+    // release artifact is built with. It lives here rather than in the
+    // workflows so it travels with the tree — a release dispatched for an
+    // older tag builds with that tag's Zig. Keep it equal to the release
+    // nixpkgs' `zig_0_17` resolves to in devenv.lock (the local shell), or
+    // CI and local builds run different compilers.
+    .minimum_zig_version = "0.17.1",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.

@@ -1,47 +1,32 @@
-# Dev environment (https://devenv.sh): the pinned toolchain. Only three
-# packages are used by CI — zig (every job), openssl (every build links
-# libcrypto for ztls, §4) and kcov (the Linux `zig build coverage`
-# job) — so everything else is developer/bench/profile tooling gated out of the
-# CI closure: zls (editor LSP), nginx + haproxy (Tier-1 bench origins, §9), poop
-# (Tier-0 hardware-counter A/B) and perf + flamegraph (the pinned
-# `zig build profile`). CI runs none of them (`zig fmt`, `zig build`,
-# `zig build ci`, `zig build coverage` only), and keeping its closure cache-only
-# both trims fetch time and dodges the uncached-source-bootstrap flake that
-# pkgs.linuxPackages_latest.perf triggered (the `ldexpl.c is not valid`
-# coverage failure). Activated automatically by `.envrc` via direnv, or manually
-# with `devenv shell`.
+# Dev environment (https://devenv.sh): the pinned local toolchain. Activated
+# automatically by `.envrc` via direnv, or manually with `devenv shell`.
+#
+# CI does not use it. GitHub Actions installs Zig with mlugg/setup-zig and
+# kcov from Ubuntu's archive (.github/workflows/ci.yml says why). The one
+# thing the two must agree on is the compiler: build.zig.zon's
+# `minimum_zig_version` is CI's pin, and it must name the release `zig_0_17`
+# resolves to in devenv.lock — a lock bump that moves zig moves it too.
+#
+# Beyond zig: zls (editor LSP), kcov (`zig build coverage`, Linux), nginx +
+# haproxy (Tier-1 bench origins, §9), poop (Tier-0 hardware-counter A/B) and
+# perf + flamegraph (the pinned `zig build profile`).
 { pkgs, lib, ... }:
-let
-  # GitHub Actions sets CI=true; a CI checkout is always fresh, so this
-  # re-evaluates every run and never serves a stale (dev-tool-included) shell.
-  in_ci = (builtins.getEnv "CI") == "true";
-in
 {
   packages =
     [
       pkgs.zig_0_17
-      # ztls's crypto primitives (§4). Every zoxy build links libcrypto, so
-      # this belongs to the CI closure rather than the dev-only set below —
-      # without it `zig build` cannot find `-lcrypto` at all. The `.dev`
-      # output carries the headers ztls's C bindings need; the runtime
-      # library rides along in its closure.
+      # OpenSSL headers and libcrypto. No `zig build` step reads them any
+      # more: every build links the libcrypto Zig compiles from the vendored
+      # openssl package (build.zig's `linkLibcrypto`, #279).
       pkgs.openssl.dev
+      pkgs.zls
+      pkgs.nginx
+      pkgs.haproxy
     ]
-    # kcov drives the Linux `zig build coverage` job.
     ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
       pkgs.kcov
-    ]
-    # Developer/bench/profile tooling — no CI command runs it.
-    ++ lib.optionals (!in_ci) (
-      [
-        pkgs.zls
-        pkgs.nginx
-        pkgs.haproxy
-      ]
-      ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-        pkgs.poop
-        pkgs.linuxPackages_latest.perf
-        pkgs.flamegraph
-      ]
-    );
+      pkgs.poop
+      pkgs.linuxPackages_latest.perf
+      pkgs.flamegraph
+    ];
 }
