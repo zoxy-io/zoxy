@@ -1524,9 +1524,11 @@ fn splitAbsoluteForm(target: []const u8) error{Malformed}!TargetSplit {
     };
 }
 
-/// Whether an absolute-form authority is one this proxy will both route
-/// on and write back out as a `Host` line: a positive charset — RFC 3986
-/// reg-name, IP-literal brackets, percent-escapes and the port colon.
+/// Whether an absolute-form authority — or an HTTP/2 `:authority`, which
+/// `http/h2/downgrade.zig` holds to the same rule — is one this proxy will
+/// both route on and write back out as a `Host` line: a positive charset
+/// — RFC 3986 reg-name, IP-literal brackets, percent-escapes and the port
+/// colon.
 ///
 /// Positive rather than a list of rejects because these bytes are
 /// *emitted*, not just matched: hparse's target charset already excludes
@@ -1542,7 +1544,7 @@ fn splitAbsoluteForm(target: []const u8) error{Malformed}!TargetSplit {
 /// host, so it reaches the any-host routes and no further. What the
 /// charset is for is the byte-level guarantee the grammar would not add:
 /// these bytes are written into a header line.
-fn authorityIsWellFormed(authority: []const u8) bool {
+pub fn authorityIsWellFormed(authority: []const u8) bool {
     assert(authority.len >= 1);
     for (authority) |byte| {
         if (std.ascii.isAlphanumeric(byte)) {
