@@ -380,6 +380,16 @@ sheds the connection at accept, before its handshake, in
 `zoxy_shed_h2_sessions`. Both keys are refused unless a listener speaks
 HTTP/2.
 
+A request body reaches its upstream through the stream's relay buffer
+(`limits.relay_buffer_bytes`). A DATA frame the buffer has no room for is
+held until the stream's own send makes room, and its connection reads
+nothing else meanwhile, so the connection's other streams wait. Each held
+frame is counted once in `zoxy_h2_frames_held`. A client that sends before
+it applies the server's window can cause it, and so can a full 16 KiB
+frame of a body without a `content-length`, which overruns the default
+buffer by the octets its chunk framing takes: 38 for the first frame,
+up to 58 behind one still in flight.
+
 What fails on a stream ends that stream — reset, or answered `502`/`504`
 — never the connection. What a client spends is bounded per connection:
 resetting streams before their answers end faster than answers end

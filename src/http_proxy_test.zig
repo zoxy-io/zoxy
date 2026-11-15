@@ -2032,6 +2032,8 @@ test "h2: a request body goes to the origin — a declared length as sent, an un
             try std.testing.expectEqualStrings("helloworld", body[0..dechunked.payload_len]);
         }
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+        // The default buffer has room for a small body: nothing is held.
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_frames_held"));
         try bed.expectDrained();
     }
 }
@@ -2115,6 +2117,8 @@ fn expectHeldFrame(seed: u64, declared: bool) !void {
         body = body[0..dechunked.payload_len];
     }
     try std.testing.expectEqualStrings(&payload, body);
+    // One frame, held once: the offers that drained it are not counted.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_frames_held"));
     try bed.expectDrained();
 }
 
@@ -2152,6 +2156,8 @@ fn expectHeldBody(seed: u64, declared: bool) !void {
     try std.testing.expectEqual(@as(usize, 2800), body.len);
     try std.testing.expectEqualStrings(&payload, body[0..1400]);
     try std.testing.expectEqualStrings(&payload, body[1400..]);
+    // Sent before the client heard the window: held at least once.
+    try std.testing.expect(bed.server.counters.get("h2_frames_held") >= 1);
     try bed.expectDrained();
 }
 
