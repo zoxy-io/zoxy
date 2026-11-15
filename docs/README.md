@@ -194,8 +194,8 @@ edits and canned bodies applied at the edge, and last the process-wide
 
 A listener binds an address and speaks one protocol, named by the key its
 settings live under: `l4` relays bytes without inspecting them, `http` runs
-the HTTP/1.1 reverse proxy. Exactly one of the two is required. There is no
-default.
+the HTTP reverse proxy, over HTTP/1.1 and, where the listener allows it,
+[HTTP/2](#http2). Exactly one of the two is required. There is no default.
 
 `bind` and `tls` sit outside the protocol body because they apply to both.
 Everything else lives inside the body, so a setting that only makes sense

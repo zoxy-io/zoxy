@@ -1,23 +1,28 @@
 //! The stream slot (DESIGN.md §5): one *exchange*, drawn from a pool of
 //! its own rather than inlined into the connection slot that carries it.
 //!
-//! Today a connection **is** an exchange — one request at a time, its
-//! state inlined into `Conn` — and this slice (#274) draws the seam
-//! without yet moving anything through it. Every admitted connection
-//! acquires exactly one stream and holds it for the connection's life, so
-//! the two pools have equal capacity and equal occupancy and nothing
-//! observable changes. What it buys is §5's release rule and its
-//! generation discipline replicated one layer down, proven under the
-//! existing sweep before #173 puts N streams on a connection and makes
-//! them load-bearing: a straggling completion into a recycled *stream* is
-//! the same bug as one into a recycled slot, and it has to fail the same
-//! way.
+//! Two pools draw this type.
 //!
-//! The 1:1 cap is also what holds the ring budget still. `conn_ops_max`
-//! becomes a conn share plus a stream share whose sum at one stream per
-//! connection is exactly what it was, so the CQ ceiling and the printed
-//! fd form do not move — an equality sharp enough that a changed banner
-//! means the split took something with it that it should not have.
+//! - **Admission streams** (#274): every admitted connection acquires one
+//!   and holds it for the connection's life, so this pool has the conn
+//!   slots' capacity and occupancy. An HTTP/1.1 connection runs its
+//!   exchanges on it one at a time. An HTTP/2 connection's carries the
+//!   socket's one recv and one send, and runs no exchange of its own.
+//! - **Shared streams** (#275), `limits.stream_slots`: each multiplexed
+//!   HTTP/2 exchange takes one for the life of one request.
+//!
+//! §5's release rule and its generation discipline hold one layer down,
+//! for both. A straggling completion into a recycled *stream* is the same
+//! bug as one into a recycled slot, and it has to fail the same way.
+//!
+//! The 1:1 admission cap is what holds the per-connection ring budget
+//! still. `conn_ops_max` is a conn share plus a stream share, and their
+//! sum at one admission stream per connection is exactly what it was
+//! before the split. So the CQ ceiling and the printed fd form did not
+//! move, an equality sharp enough that a changed banner means the split
+//! took something with it that it should not have. A shared stream is
+//! charged its own ops beside that divisor (§5), which is why
+//! `stream_slots` is required rather than guessed.
 
 const std = @import("std");
 

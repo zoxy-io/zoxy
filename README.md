@@ -16,6 +16,9 @@ processes behind `SO_REUSEPORT`, never threads sharing memory.
 - **L4** — blind TCP relay, half-close honored
 - **L7** — HTTP/1.1 reverse proxy: host and longest-prefix routing, filter
   rules, keep-alive, pooled upstream connections
+- **HTTP/2** — to clients, over TLS by ALPN or in the clear by prior
+  knowledge, multiplexed onto the same L7 exchange; checked against h2spec
+  at merge
 - **Balancing** — power-of-two-choices, round-robin, or rendezvous hashing
   for client stickiness
 - **Health checks** — active TCP or HTTP probes, per cluster
