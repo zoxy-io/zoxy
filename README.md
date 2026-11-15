@@ -14,11 +14,11 @@ One thread owns one `io_uring` and every pool. Scale-out is N independent
 processes behind `SO_REUSEPORT`, never threads sharing memory.
 
 - **L4** — blind TCP relay, half-close honored
-- **L7** — HTTP/1.1 reverse proxy: host and longest-prefix routing, filter
-  rules, keep-alive, pooled upstream connections
+- **L7** — HTTP reverse proxy: host and longest-prefix routing, filter
+  rules, keep-alive, pooled HTTP/1.1 upstream connections
 - **HTTP/2** — to clients, over TLS by ALPN or in the clear by prior
-  knowledge, multiplexed onto the same L7 exchange; checked against h2spec
-  at merge
+  knowledge; each stream is routed, filtered and balanced like an HTTP/1.1
+  request, to the same pooled upstreams; checked against h2spec at merge
 - **Balancing** — power-of-two-choices, round-robin, or rendezvous hashing
   for client stickiness
 - **Health checks** — active TCP or HTTP probes, per cluster
