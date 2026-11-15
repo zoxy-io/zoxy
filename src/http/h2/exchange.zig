@@ -219,8 +219,19 @@ pub fn Exchange(comptime IoType: type) type {
         /// (`Proxy.armClientWrite`), and again from `.writable` for an
         /// answer the session could not take whole. An interim head goes
         /// alone, and the final one is still to come after it.
+        ///
+        /// The session may have ended the connection while the origin was
+        /// answering: a flood's verdict, or a protocol error. Its GOAWAY is
+        /// going out, and the teardown behind it takes every stream, but
+        /// until then the connection is not tearing down, so this stream's
+        /// ops still deliver. Nothing more can be said on it, so the
+        /// exchange ends here, unanswered, as the client's reset would end
+        /// it.
         pub fn answer(server: *ServerType, stream: *StreamType) void {
             const conn = stream.conn;
+            assert(stream.h2_id != 0);
+            if (conn.h2.?.session.state == .closed) return server.endSharedStream(stream);
+            assert(!stream.ending);
             // The answer can finish the stream and give its slot back, so
             // only the connection is read after it.
             stage(server, stream);

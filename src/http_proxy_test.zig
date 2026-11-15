@@ -1860,6 +1860,83 @@ test "h2: a drain reaching a session its last stream just closed leaves it to cl
     try std.testing.expect(hits >= 1);
 }
 
+/// Holds a mute origin until the session's own verdict has ended its
+/// connection, then lets it answer: the answer lands while the verdict's
+/// GOAWAY is still going out and the teardown waits behind it, the window
+/// a nightly soak found (seed 448270645, and three more like it). Polled
+/// once a batch by a timer due at once; nothing before the release waits
+/// on time.
+const AnswerAfterVerdict = struct {
+    bed: *Http1Bed,
+    completion: SimIo.Completion = .{},
+    polls: u32 = 0,
+    released: bool = false,
+
+    const polls_max: u32 = 1_000_000;
+
+    fn arm(watch: *AnswerAfterVerdict) void {
+        assert(watch.polls < polls_max);
+        watch.bed.sim_io.timerStart(&watch.completion, 0, AnswerAfterVerdict, watch, onPoll);
+    }
+
+    fn onPoll(watch: *AnswerAfterVerdict, result: Io.TimerError!void) void {
+        result catch unreachable; // Nothing cancels it.
+        watch.polls += 1;
+        const server = &watch.bed.server;
+        const origin = &watch.bed.origin;
+        if (origin.accepted_count == 1 and origin.conns[0].request_complete) {
+            for (server.conns.slots) |*conn| {
+                if (!server.conns.isAcquired(conn)) continue;
+                if (conn.state != .h2) continue;
+                const slot = conn.h2.?;
+                if (!slot.closing) continue;
+                assert(slot.session.state == .closed);
+                assert(slot.sending >= 1); // The GOAWAY, held by a full socket.
+                origin.conns[0].armSend();
+                watch.released = true;
+                return;
+            }
+        }
+        if (watch.polls < polls_max) watch.arm();
+    }
+};
+
+test "h2: an origin's answer for a connection its session already ended ends the exchange, unsaid (#276)" {
+    // A one-octet socket its client never reads, so the verdict's GOAWAY
+    // stays in flight, and a mute origin released only once that verdict
+    // is in: the stream's answer arrives for a session that can say
+    // nothing more, on a connection not yet tearing down.
+    var options = h2BedOptions(120);
+    options.inbox_bytes = 1;
+    options.origin_mute = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    bed.client.reads = false;
+    bed.client.drain_on_finish = false;
+    // Past the idle window that ends a connection whose GOAWAY never got
+    // out (`goingAway`), so the run winds down.
+    bed.armDrainTimer(3 * Http1Bed.idle_timeout_ms);
+    var watch: AnswerAfterVerdict = .{ .bed = &bed };
+    watch.arm();
+
+    // A request, then PINGs past their budget: the stream is open at the
+    // origin when the session's verdict ends the connection.
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    var index: u64 = 0;
+    while (index <= H2Session.Unpaid.max.ping) : (index += 1) wire.ping(index);
+    try bed.exchange(wire.written());
+
+    try std.testing.expect(watch.released);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_calm_ping"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.accepted_count);
+    bed.sim_io.closeNow(bed.client.socket);
+    try bed.expectDrained();
+}
+
 test "h2: an origin's failure is its stream's alone — a refused dial's 502, a stalled origin's 504" {
     {
         var options = h2BedOptions(33);
