@@ -475,9 +475,18 @@ pub fn Exchange(comptime IoType: type) type {
 
         /// The exchange forwards a request body: its upstream half runs,
         /// and the client's half is still arriving.
+        ///
+        /// Not once the §8 deadline has condemned it. `beginExpiry` shut
+        /// its upstream down to force its ops, and it answers 504 once
+        /// they settle, so a frame held for its room until then must not
+        /// be sent on that socket. Another stream's answer can drive the
+        /// session in that window, which is how a soak seed met it
+        /// (456163385). A pending replay is not condemned: its try is
+        /// rebuilt, so what gathers still goes.
         fn forwarding(stream: *const StreamType) bool {
             assert(stream.h2_id != 0);
             if (stream.ending) return false;
+            if (stream.l7.pending_verdict == .gateway_timeout) return false;
             if (stream.phase != .dialing and stream.phase != .exchanging) return false;
             if (stream.l7.request_framing == .none) return false;
             return !stream.h2_body.client_ended;
@@ -506,6 +515,9 @@ pub fn Exchange(comptime IoType: type) type {
         pub fn forwardBody(server: *ServerType, stream: *StreamType) void {
             assert(stream.l7.request_leg == .pumping_body);
             assert(stream.l7.request_framing != .none);
+            // The head's completions settle a pending verdict before they
+            // come here, so a condemned exchange never begins its body.
+            assert(stream.l7.pending_verdict == .none);
             const body = &stream.h2_body;
             if (body.payload_start == 0) body.payload_start = headroom(stream);
             assert(!body.inFlight());
