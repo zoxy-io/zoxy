@@ -1256,6 +1256,7 @@ test "h2c: an HTTP/1.1 request on an h2c listener is still HTTP/1.1, and a prefa
 
 const ResponseReader = @import("http/h2/ResponseReader.zig");
 const H2Session = @import("http/h2/Session.zig");
+const H2Slot = @import("http/h2/Connection.zig").Slot;
 
 /// A client's octets, frame by frame.
 const H2Wire = struct {
@@ -2151,6 +2152,137 @@ fn expectHeldBody(seed: u64, declared: bool) !void {
     try std.testing.expectEqual(@as(usize, 2800), body.len);
     try std.testing.expectEqualStrings(&payload, body[0..1400]);
     try std.testing.expectEqualStrings(&payload, body[1400..]);
+    try bed.expectDrained();
+}
+
+/// Answers for a mute origin once it has the request's head and the
+/// stream's last DATA frame is held for room, with the request cap's
+/// GOAWAY already staged (#373). The answer is whole, so it ends the
+/// session's last stream, and the session closes with the rest of that
+/// frame still held. Polled once a batch by a timer due at once.
+const AnswerOverHeld = struct {
+    bed: *Http1Bed,
+    /// Whether the held frame ends the client's half.
+    end_stream: bool,
+    completion: SimIo.Completion = .{},
+    send_completion: SimIo.Completion = .{},
+    polls: u32 = 0,
+    sent: u32 = 0,
+    answered: bool = false,
+
+    const polls_max: u32 = 1_000_000;
+
+    fn arm(watch: *AnswerOverHeld) void {
+        assert(watch.polls < polls_max);
+        watch.bed.sim_io.timerStart(&watch.completion, 0, AnswerOverHeld, watch, onPoll);
+    }
+
+    fn onPoll(watch: *AnswerOverHeld, result: Io.TimerError!void) void {
+        result catch unreachable; // Nothing cancels it.
+        watch.polls += 1;
+        if (watch.heldSlot()) |slot| {
+            // The cap's GOAWAY is out: only the stream keeps the session
+            // open.
+            assert(slot.held.?.end_stream == watch.end_stream);
+            assert(slot.session.self_going_away);
+            assert(!slot.session.goaway_owed);
+            watch.answered = true;
+            watch.armSend();
+            return;
+        }
+        if (watch.polls < polls_max) watch.arm();
+    }
+
+    /// The connection holding a frame, once the origin has the request's
+    /// head to answer.
+    fn heldSlot(watch: *AnswerOverHeld) ?*H2Slot {
+        const server = &watch.bed.server;
+        const origin = &watch.bed.origin;
+        if (origin.accepted_count != 1) return null;
+        if (origin.conns[0].request_expected == 0) return null;
+        for (server.conns.slots) |*conn| {
+            if (!server.conns.isAcquired(conn)) continue;
+            if (conn.state != .h2) continue;
+            const slot = conn.h2.?;
+            if (slot.held != null) return slot;
+        }
+        return null;
+    }
+
+    fn armSend(watch: *AnswerOverHeld) void {
+        const response = watch.bed.origin.response;
+        assert(watch.sent < response.len);
+        watch.bed.sim_io.send(
+            watch.bed.origin.conns[0].socket,
+            response[watch.sent..],
+            &watch.send_completion,
+            AnswerOverHeld,
+            watch,
+            onSend,
+        );
+    }
+
+    fn onSend(watch: *AnswerOverHeld, result: Io.SendError!u32) void {
+        const sent = result catch unreachable; // The proxy reads its answer.
+        watch.sent += sent;
+        if (watch.sent < watch.bed.origin.response.len) watch.armSend();
+    }
+};
+
+test "h2: a frame held for room goes with its session, when its stream's answer ends both (#373)" {
+    // The smallest relay buffer, and a POST in one DATA frame fifteen times
+    // its room: held from the first offer. The request cap's GOAWAY went
+    // out as the stream opened, so the answer that ends the stream also
+    // closes the session. With END_STREAM on the frame, the answer's own
+    // END_STREAM releases the stream. Without it, the RST_STREAM(NO_ERROR)
+    // that stops the body does.
+    for ([_]bool{ true, false }) |end_stream| {
+        for (0..8) |index| try expectHeldAtClose(140 + index, end_stream);
+    }
+}
+
+fn expectHeldAtClose(seed: u64, end_stream: bool) !void {
+    var options = h2BedOptions(seed);
+    options.relay_buffer_bytes = constants.relay_buffer_bytes_min;
+    options.keepalive_requests = 1;
+    options.origin_mute = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    var watch: AnswerOverHeld = .{ .bed = &bed, .end_stream = end_stream };
+    watch.arm();
+
+    var payload: [15_000]u8 = undefined;
+    for (&payload, 0..) |*octet, offset| octet.* = 'a' + @as(u8, @intCast(offset % 26));
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.settingsAck();
+    wire.headers(1, &.{
+        .{ ":method", "POST" },
+        .{ ":scheme", "http" },
+        .{ ":path", "/upload" },
+        .{ ":authority", "a" },
+        .{ "content-length", "15000" },
+    }, false);
+    wire.data(1, &payload, end_stream);
+    try bed.exchange(wire.written());
+
+    try std.testing.expect(watch.answered);
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqualStrings("ok", answers[0].dataSlice());
+    try std.testing.expect(answers[0].ended);
+    // A client that ended its half is owed no reset. One still sending is
+    // told to stop: NO_ERROR (§8.1).
+    const reset: ?u32 = if (end_stream) null else 0x0;
+    try std.testing.expectEqual(reset, answers[0].reset);
+    // Its body unread, the origin's upstream is not one to park.
+    try std.testing.expect(originBody(&bed).len < payload.len);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_keepalive_requests_capped"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("h2_connections"));
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
     try bed.expectDrained();
 }
 
