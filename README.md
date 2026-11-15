@@ -3,7 +3,7 @@
 [![CI](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zoxy/actions/workflows/ci.yml)
 [![Coverage Status](https://coveralls.io/repos/github/zoxy-io/zoxy/badge.svg?branch=main)](https://coveralls.io/github/zoxy-io/zoxy?branch=main)
 [![Discord](https://img.shields.io/discord/1530882611159760956)](https://discord.gg/BGbb7VtYA)
-[![Project stage: Experimental][project-stage-badge: Experimental]][project-stage-page]
+[![Project stage: Development][project-stage-badge: Development]][project-stage-page]
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 zoxy is built on the [TigerBeetle](https://tigerbeetle.com) I/O model — completion-based
@@ -128,5 +128,5 @@ catch a bug whose only symptom is a wrong *rate*.
 
 [MIT](LICENSE) © 2026 Vsevolod Strukchinsky
 
-[project-stage-badge: Experimental]: https://img.shields.io/badge/Project%20Stage-Experimental-yellow.svg
+[project-stage-badge: Development]: https://img.shields.io/badge/Project%20Stage-Development-yellowgreen.svg
 [project-stage-page]: https://blog.pother.ca/project-stages/
