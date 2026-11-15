@@ -100,7 +100,9 @@ pub const Scratch = struct {
 /// What a chunked request body's gathered payload must leave behind it:
 /// its chunk's CRLF, and then either the last chunk or the next frame's
 /// headroom — whichever is wider — so the frame it becomes never ends past
-/// the buffer, nor leaves the next payload's start there (#275).
+/// the buffer, nor leaves the next payload's start there (#275). Either,
+/// not both: a frame carrying the last chunk has no next payload, and
+/// `frameAndSend` keeps no headroom after it.
 pub const chunk_tail_bytes: u32 = @intCast(render.chunk_suffix.len +
     @max(render.chunk_prefix_bytes_max, render.last_chunk.len));
 
@@ -559,9 +561,15 @@ pub fn Exchange(comptime IoType: type) type {
             body.frame_sent = 0;
             body.frame_payload = body.payload_len;
             body.frame_last = body.client_ended;
-            body.payload_start = end + headroom(stream);
+            // `bodyRoom` kept room behind the payload for the next frame's
+            // size line or for the last chunk, not for both. A last frame
+            // has no next one, so its headroom is not kept. The last chunk
+            // may have taken that room, and a payload that filled the
+            // buffer and ended the body would have put the next frame's
+            // start past the buffer's end.
+            body.payload_start = if (body.frame_last) end else end + headroom(stream);
             body.payload_len = 0;
-            // `bodyRoom` kept the next frame's headroom behind this one.
+            if (body.frame_last) assert(body.payload_start == end);
             assert(body.payload_start <= buffer.len);
             stream.l7.request_body_pumped = true;
             armBodySend(server, stream);
