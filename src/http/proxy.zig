@@ -2379,6 +2379,11 @@ pub fn Proxy(comptime IoType: type) type {
         /// already closing for one of those never reaches the check.
         fn applyRequestCap(server: *ServerType, stream: *const StreamType, would_keep: bool) bool {
             if (!would_keep) return false;
+            // A multiplexed connection's cap was weighed when the stream was
+            // opened (`H2Exchange.capRequests`): the stream that reached
+            // it ended the connection with GOAWAY. An answer here ends only
+            // its own stream, so it carries no verdict and takes no count.
+            if (stream.h2_id != 0) return true;
             if (!requestsCapReached(stream)) return true;
             server.counters.increment("l7_keepalive_requests_capped");
             return false;

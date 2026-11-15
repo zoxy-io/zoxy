@@ -173,6 +173,44 @@ pub fn Exchange(comptime IoType: type) type {
                 return Proxy.refuseH2Request(server, stream, err);
             };
             Proxy.serveH2Request(server, stream, &head);
+            // The stream may be answered and gone by now; the connection is
+            // what the cap reads.
+            capRequests(server, conn);
+        }
+
+        /// The #237 request cap on a multiplexed connection, settled as
+        /// #173's answer 4. It counts the connection's streams, and the
+        /// stream that reaches it ends the connection with GOAWAY(NO_ERROR)
+        /// naming that stream, which is HTTP/2's way of saying
+        /// `Connection: close`. The streams before it finish. Any the client
+        /// opens after it are refused with REFUSED_STREAM, and since they
+        /// were never processed, the client may retry them on a new
+        /// connection (RFC 9113 §8.7).
+        ///
+        /// HTTP/1.1 weighs the cap at the answer. Here it is weighed as each
+        /// stream is opened, once §7 has it, because a stream's answer ends
+        /// only that stream. Siblings admitted earlier can answer after the cap is
+        /// reached, so weighing it at the answer would count it once per
+        /// sibling and still close nothing.
+        ///
+        /// It is counted only where the cap is the binding reason, as on
+        /// HTTP/1.1. A connection that is already ending did not need this
+        /// rung: one draining, one whose client sent its own GOAWAY, one
+        /// closing, or one this side already told.
+        fn capRequests(server: *ServerType, conn: *ConnType) void {
+            if (conn.state != .h2) return; // Torn down while it served.
+            assert(conn.h2 != null);
+            const cap = conn.keepalive_requests;
+            if (cap == 0) return; // Unlimited.
+            if (conn.requests_served < cap) return;
+            const slot = conn.h2.?;
+            const session = slot.session;
+            if (slot.closing or server.draining) return;
+            if (session.state == .closed) return;
+            if (session.goingAway()) return;
+            session.goAway();
+            assert(session.self_going_away);
+            server.counters.increment("l7_keepalive_requests_capped");
         }
 
         /// Hand the session what the exchange's answer has left to say: its

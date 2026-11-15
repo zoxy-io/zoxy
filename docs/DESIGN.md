@@ -1443,6 +1443,15 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   *upstream* connection is deliberately uncapped: it is shared across
   clients and carries the reuse win §3 cites, so churning it has a cost
   churning a client's does not.
+  On HTTP/2 the cap binds the connection and counts its streams (#173).
+  The multiplexed connection is the shape this argument was reaching
+  for. Because a stream's answer ends only that stream, the cap is
+  weighed as each stream is opened rather than at its answer. The
+  stream that reaches the cap ends the connection with
+  `GOAWAY(NO_ERROR)` naming it, which is HTTP/2's announced close. The
+  streams before it finish. Any the client opens after it are refused
+  with `REFUSED_STREAM`, which a client may safely retry on a new
+  connection, because the server never acted on them.
 - **A request body is bounded, and the bound is the origin's** (#236).
   Nothing here needs it: §6's strict recv → send → recv relay keeps
   per-connection memory constant whatever the stream size, so an
@@ -2134,9 +2143,10 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   a chunked body's payload and not its trailer section. That is one
   reason gRPC stays a §1 non-goal.
 
-- **An HTTP/2 connection is told before it is closed.** Draining, and
-  an idle connection with no stream open, are both answered with
-  `GOAWAY(NO_ERROR)` before the close. A client that overspends one of
+- **An HTTP/2 connection is told before it is closed.** It gets
+  `GOAWAY(NO_ERROR)` before the close when it is drained, when it sits
+  idle with no stream open, and when its stream count reaches
+  `keepalive_requests` (above). A client that overspends one of
   its per-connection budgets gets `GOAWAY(ENHANCE_YOUR_CALM)` (§8).
 
 - **Still deferred**: circuit breakers, Envoy-style *outlier detection*
