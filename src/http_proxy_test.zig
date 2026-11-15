@@ -1703,6 +1703,81 @@ test "h2: two streams on one connection reach the origin side by side, each with
     try bed.expectDrained();
 }
 
+test "h2: the request cap counts streams, and the one reaching it ends the connection with GOAWAY naming it (#237)" {
+    var options = h2BedOptions(44);
+    options.keepalive_requests = 2;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    // Three streams in one write, against a cap of two. The second
+    // reaches the cap, so the third, already on the wire, is refused.
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    wire.get(3, "GET", "/b");
+    wire.get(5, "GET", "/c");
+    try bed.exchange(wire.written());
+
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 3), answers.len);
+    for (answers) |*answer| {
+        if (answer.stream == 5) {
+            try std.testing.expectEqual(@as(?u32, 0x7), answer.reset); // REFUSED_STREAM.
+            try std.testing.expectEqual(@as(u16, 0), answer.status);
+            continue;
+        }
+        try std.testing.expectEqual(@as(u16, 200), answer.status);
+        try std.testing.expectEqualStrings("ok", answer.dataSlice());
+        try std.testing.expect(answer.ended);
+    }
+
+    var frames: [16]H2Frame = undefined;
+    const count = try h2Frames(bed.client.response(), &frames);
+    var goaways: u32 = 0;
+    for (frames[0..count]) |frame| {
+        if (frame.frame_type != 0x7) continue;
+        goaways += 1;
+        try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, frame.payload[0..4], .big)); // Last stream.
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, frame.payload[4..8], .big)); // NO_ERROR.
+    }
+    try std.testing.expectEqual(@as(u32, 1), goaways);
+    // Once for the connection the cap ended. The stream answered after
+    // the cap was reached does not count again.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_keepalive_requests_capped"));
+    try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_responses"));
+    try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+    try bed.expectDrained();
+}
+
+test "h2: one stream short of the request cap, every stream is served and nothing is counted (#237)" {
+    var options = h2BedOptions(45);
+    options.keepalive_requests = 3;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/a");
+    wire.get(3, "GET", "/b");
+    try bed.exchange(wire.written());
+
+    // The connection still ends, but by its idle window, not the cap. That
+    // window's GOAWAY is #367's, so a GOAWAY here proves nothing either
+    // way. A refused stream, or a count, would mean the cap fired early.
+    var storage: [4]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    for (answers) |*answer| {
+        try std.testing.expectEqual(@as(u16, 200), answer.status);
+        try std.testing.expectEqual(@as(?u32, null), answer.reset);
+    }
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_keepalive_requests_capped"));
+    try bed.expectDrained();
+}
+
 test "h2: an origin's failure is its stream's alone — a refused dial's 502, a stalled origin's 504" {
     {
         var options = h2BedOptions(33);

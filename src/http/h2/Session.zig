@@ -1797,7 +1797,7 @@ fn releaseStream(session: *Session, slot: *StreamTable.Slot) void {
 }
 
 /// Whether either side has said this connection takes no new streams.
-fn goingAway(session: *const Session) bool {
+pub fn goingAway(session: *const Session) bool {
     return session.peer_going_away or session.self_going_away;
 }
 

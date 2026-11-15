@@ -65,6 +65,11 @@ pub const ClientError = error{
     /// A PONG for a PING this client never sent: more than it sent, or
     /// any for a flood that sent none.
     PongUnexpected,
+    /// A stream answered past the last stream a GOAWAY named. RFC 9113
+    /// §6.8: the server did not act on streams past that one, so none of
+    /// them may carry a status. Every seed holds this. A drain, the idle
+    /// window and the #237 request cap each send such a GOAWAY.
+    StreamPastGoaway,
 };
 
 /// What a client does with its connection: the exchange the population
@@ -361,11 +366,14 @@ pub fn Client(comptime IoType: type) type {
             if (client.overrun) return error.ResponseOverrun;
             if (client.mode != .exchange) return client.verifyFlood();
             var answers: [streams_max]Answer = @splat(.{});
-            try readAnswers(client.receive_buffer[0..client.received_len], client.streams, &answers);
+            const goaway_last = try readAnswers(client.receive_buffer[0..client.received_len], client.streams, &answers);
             const allowed = scripts.spec(.get).allowed_statuses;
-            for (answers[0..client.streams]) |*answer| {
+            for (answers[0..client.streams], 0..) |*answer, index| {
                 if (answer.status != 0 and std.mem.indexOfScalar(u16, allowed, answer.status) == null) {
                     return error.StatusUnexpected;
+                }
+                if (goaway_last) |last| {
+                    if (answer.status != 0 and streamId(@intCast(index)) > last) return error.StreamPastGoaway;
                 }
                 if (answer.status == 200) try checkBody(answer);
                 if (!client.clean) continue;
@@ -541,10 +549,13 @@ pub fn Client(comptime IoType: type) type {
         }
 
         /// Walk the frames, decoding each field section in the order it
-        /// went out, and fold them into one answer per stream.
-        fn readAnswers(bytes: []const u8, streams: u8, answers: *[streams_max]Answer) ClientError!void {
+        /// went out, and fold them into one answer per stream. The result
+        /// is the lowest last-stream identifier any GOAWAY named, or null
+        /// if none came.
+        fn readAnswers(bytes: []const u8, streams: u8, answers: *[streams_max]Answer) ClientError!?u31 {
             var reader: ResponseReader = undefined;
             reader.init();
+            var goaway_last: ?u31 = null;
             var offset: usize = 0;
             var frames: u32 = 0;
             while (bytes.len - offset >= 9) : (frames += 1) {
@@ -553,19 +564,24 @@ pub fn Client(comptime IoType: type) type {
                 const length = std.mem.readInt(u24, header[0..3], .big);
                 const id: u31 = @intCast(std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff);
                 // A partial last frame: what a cut connection leaves.
-                if (bytes.len - offset - 9 < length) return;
+                if (bytes.len - offset - 9 < length) return goaway_last;
                 const payload = bytes[offset + 9 ..][0..length];
                 offset += 9 + length;
                 if (id == 0) {
-                    // The connection's own frames; a GOAWAY a drain's.
-                    if (header[3] == frame_goaway and try goawayCode(payload) != code_no_error) {
-                        return error.GoawayUnexpected;
-                    }
+                    // The connection's own frames. A GOAWAY here comes from
+                    // a drain, the idle window or the request cap: all
+                    // NO_ERROR.
+                    if (header[3] != frame_goaway) continue;
+                    if (try goawayCode(payload) != code_no_error) return error.GoawayUnexpected;
+                    const last: u31 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
+                    goaway_last = @min(goaway_last orelse last, last);
                     continue;
                 }
                 const answer = answerFor(answers, streams, id) orelse return error.StreamUnexpected;
                 try foldFrame(&reader, answer, header[3], header[4], payload);
             }
+            assert(offset <= bytes.len);
+            return goaway_last;
         }
 
         fn answerFor(answers: *[streams_max]Answer, streams: u8, id: u31) ?*Answer {

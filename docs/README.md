@@ -1384,9 +1384,13 @@ nginx's figure, and `0` is unlimited. It is the one bound that reaches a
 connection that keeps asking, which is the one holding a conn slot and,
 on every request, a head buffer and an upstream lease. Past the cap the
 next response announces `Connection: close`, never a silent reset, and the
-client reconnects. `zoxy_l7_keepalive_requests_capped` counts it, and only
-where the cap is the *binding* reason, so a rising count is the cap
-working rather than churn it coincided with.
+client reconnects. On HTTP/2 the cap counts a connection's streams. The
+stream that reaches it ends the connection with `GOAWAY(NO_ERROR)`: the
+streams before it finish, and any the client opened after it are refused
+with `REFUSED_STREAM`, for it to retry on a new connection.
+`zoxy_l7_keepalive_requests_capped` counts each capped connection once,
+and only where the cap is the *binding* reason, so a rising count is the
+cap working rather than churn it coincided with.
 
 A parked *upstream* connection is not capped, where nginx caps both. It
 is shared across clients and carries the reuse the design rests on, and
