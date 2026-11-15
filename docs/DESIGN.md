@@ -40,16 +40,23 @@ Goals, in priority order:
    every pool — no worker threads, no cross-thread queues (§3). Fewer
    moving parts than the previous iteration, not more.
 5. **L4 (TCP relay) and L7 (HTTP/1.1 reverse proxy)** serving, with
-   keep-alive and shared upstream connection reuse.
+   keep-alive and shared upstream connection reuse. HTTP/2 reaches the
+   same L7 exchange from the client side (§7, #173).
 
 Non-goals (deliberate, recorded so they are decisions rather than drift):
 
-- HTTP/2, HTTP/3, gRPC — deferred until the L4/L7 core is proven. WebSocket
-  was deferred on the same line and is not any more (#180, §7): the
-  condition was met, and carrying it needs no new I/O machinery — a
-  tunnel is the L4 relay this proxy already runs, entered from an L7
-  exchange. What it does need is its own resource model, which is why it
-  is a §5 pool rather than a §7 detail.
+- HTTP/3, HTTP/2 to the origin, gRPC — deferred. HTTP/2 to the client
+  was deferred on this line until the L4/L7 core was proven, and it is
+  not any more (#173, §7). It was let in only in front of the HTTP/1.1
+  exchange, and that is why its two neighbours here stay out. An h2
+  connection to an origin is shared by concurrent requests rather than
+  leased to one, so it would need a pool with a different lease model.
+  gRPC needs that upstream leg, and also trailers carried end to end,
+  which the HTTP/1.1 relay does not do. HTTP/3 is #197. WebSocket was
+  deferred too and is not any more (#180, §7): carrying it needs no new
+  I/O machinery, because a tunnel is the L4 relay this proxy already
+  runs, entered from an L7 exchange. What it does need is its own
+  resource model, which is why it is a §5 pool rather than a §7 detail.
 - Feature parity with Envoy/NGINX. Pingora's lesson is that a small, sharp
   proxy core beats a configurable monolith.
 - Caching, compression, request transformation.
@@ -1095,7 +1102,7 @@ accept → admit (slots? buffers?) → route by listener
   probes do not send the header — the dial-only tcp check is unaffected,
   an http check against a sending cluster probes bare.
 
-## 7. L7 data path — HTTP/1.1 reverse proxy
+## 7. L7 data path — HTTP/1.1 reverse proxy, and HTTP/2 to the client
 
 Same skeleton as the previous iteration (it was measured sound), simplified
 where Pingora's phase model lets us:
@@ -2058,6 +2065,80 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   the banner is what a bug report pastes, so "why did traffic keep going
   to a dead backend?" becomes answerable without a round trip.
 
+- **HTTP/2 is a front end on this exchange, not a second one** (#173,
+  #275). A client reaches it two ways:
+  - over TLS, when ALPN selects `h2`;
+  - in the clear, by prior knowledge, when an `http` listener sets
+    `h2c` (RFC 9113 §3.3). A connection that opens with the preface
+    speaks HTTP/2 and anything else speaks HTTP/1.1. The preface is
+    reserved, so no HTTP/1.1 request is misread as one.
+
+  `Upgrade: h2c` stays refused, as above. Everything past the socket is
+  the HTTP/1.1 exchange of this section: same phases, same router and
+  filters, and an HTTP/1.1 upstream leg drawn from the same pool.
+
+  The work is split three ways:
+  - **zoxy-io/h2** owns the syntax: frames, HPACK and RFC 9113 §8's field
+    rules. It is pinned like hparse and imported only under
+    `src/http/h2/`, and it holds no allocator.
+  - **`Session.zig`** owns what one connection does with that syntax, and
+    is sans-I/O: bytes in, events and frames out. That covers the
+    preface, SETTINGS, PING, GOAWAY, both levels of flow control, stream
+    states, and every frame-level rule, each answered with GOAWAY or
+    RST_STREAM as the codec classifies it.
+  - **`Connection.zig`** moves the octets, with one recv and one send in
+    flight, strict like the pump. Over TLS the same two ops carry
+    ciphertext, and the session never learns it.
+
+- **An HTTP/2 request crosses into §7 by being written out as the
+  HTTP/1.1 head it stands for, then parsed back by
+  `parser.parseRequestHead`** (`downgrade.zig`). Re-parsing is the point: every rule above is stated
+  once, against the bytes an origin will read. A second statement over
+  HTTP/2's fields would be a second trust boundary to keep in step with
+  the first, which is the gap request smuggling lives in. Only what
+  HTTP/2 alone can say is settled before the write:
+  - `:path` is origin-form or `*`;
+  - `:authority` replaces every `host`;
+  - `:scheme` is `http` or `https`;
+  - cookie crumbs are rejoined;
+  - a body with no `content-length` goes upstream chunked.
+
+  Extended CONNECT is never offered (RFC 8441), so WebSocket over HTTP/2
+  is refused at the stream. Plain CONNECT gets the `501` above.
+
+- **Its answer comes back the same way, mirrored** (`response.zig`). The
+  rendered HTTP/1.1 response head, with every decision of this section
+  already applied, is parsed back and said again as a field section:
+  `:status` first, names lowercased, every connection-specific field
+  dropped, and the body's framing undone so DATA carries the payload
+  alone.
+
+- **Each HTTP/2 request runs on a shared stream slot** (§5), with its own
+  upstream socket. A failure scoped to the stream (its origin, its
+  head, its body) ends that stream with RST_STREAM and never touches its
+  siblings. Whether each §8 rung
+  answers the stream or the connection is that table's last column.
+
+- **An HTTP/2 stream's flow-control window is the room its relay
+  buffer has**, capped at the protocol's default window and never less
+  than one maximum-size frame. A request body's octets are
+  credited back to the client only once they have been sent upstream,
+  so a client cannot outrun the buffer. One that sends before it has
+  heard the window is held, connection and all, until the next send
+  makes room. Streams waiting on the connection's window or the outbox
+  take turns, one frame per turn, so none starves.
+
+- **HTTP/2 trailers are not carried, in either direction.** A request's
+  trailers end the client's half; the chunked body goes upstream with
+  none. An origin's trailers are not relayed, because the relay carries
+  a chunked body's payload and not its trailer section. That is one
+  reason gRPC stays a §1 non-goal.
+
+- **An HTTP/2 connection is told before it is closed.** Draining, and
+  an idle connection with no stream open, are both answered with
+  `GOAWAY(NO_ERROR)` before the close. A client that overspends one of
+  its per-connection budgets gets `GOAWAY(ENHANCE_YOUR_CALM)` (§8).
+
 - **Still deferred**: circuit breakers, Envoy-style *outlier detection*
   (success-rate and stddev maths, panic thresholds) and *aggregate*
   retry budgets. The previous iteration proved them buildable here;
@@ -2999,6 +3080,7 @@ src/
     Pool.zig          // Pool(T): startup alloc, intrusive free list
   net/
     Conn.zig          // connection slot: state, completions, head-ring claim
+    Stream.zig        // stream slot: one exchange — HTTP/1.1's, or an h2 stream's
     proxy_protocol.zig // PROXY v1/v2 parse + write: pure, round-trip-pinned (§6)
     relay.zig         // strict recv→send→recv relay (L4 + L7 bodies)
     upstream.zig      // shared upstream pool + endpoint idle lists + head pool
@@ -3007,6 +3089,13 @@ src/
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
+    h2/               // HTTP/2 to the client (§7); the only `h2` importer
+      Session.zig     // one connection, sans-I/O: frames in, events out
+      Connection.zig  // the driver: one recv + one send, plain or TLS
+      exchange.zig    // a stream's §7 exchange on a shared stream slot
+      downgrade.zig   // h2 → h1: write the head, parse it back (§7)
+      response.zig    // h1 → h2: the rendered head, read back as fields
+      StreamTable.zig // one connection's open streams, a bounded scan
   tls/
     Engine.zig        // zssl wrapper: sans-I/O TLS 1.3 seam, pooled (§4, §5)
     Credentials.zig   // per-listener PEM chain + signing key, parsed once (§4)
@@ -3079,7 +3168,8 @@ and 9204 arrive with #197 and not before.
 **TLS, because this proxy terminates it** (§4). RFC 8446 is the protocol
 and §4.6.1 its resumption tickets; **6066** §3 is SNI, which is what a
 terminating proxy selects credentials on; **7301** is ALPN, which is how
-`http/1.1` is advertised and the gate #173 opens behind. Two BCPs are
+a listener offers `http/1.1` and `h2` and how a client gets HTTP/2 over
+TLS (§7). Two BCPs are
 prescriptive rather than definitional and are treated as binding anyway:
 **9325** (secure use) and **8996** (TLS 1.0/1.1 deprecated). **9525** —
 service identity in certificates, which obsoleted 6125 in 2023 — binds
@@ -3214,9 +3304,10 @@ the opposite trade and is right to: it has years of production
 consumers, and it does not promise what §1 promises.
 
 So the seam is **published, not frozen**. There is no external consumer
-yet, and #173 will change the exchange model from one request per
-connection to multiplexed streams — the exact internal shape a stability
-promise would pin. Naming it here is what stops it being rediscovered,
-not a commitment that it cannot move. The related idea — specializing a
+yet. HTTP/2 (#173) has already changed the exchange model once, from one
+request per connection to an exchange keyed on its stream, and HTTP/3
+(#197) will move it again. That internal shape is exactly what a
+stability promise would pin. Naming the seam here is what stops it being
+rediscovered, not a commitment that it cannot move. The related idea — specializing a
 `Config` at comptime to buy performance — is a **settled no**, measured
 three ways in `IMPLEMENTATION_NOTES.md`.
