@@ -258,7 +258,16 @@ pub fn Driver(comptime IoType: type) type {
             // nothing, and send: that send's completion steps the rest.
             if (server.headerScratchLent() or server.renderScratchLent()) {
                 slot.session.stagePending();
-                return flush(server, conn, slot);
+                flush(server, conn, slot);
+                if (conn.isTearingDown()) return; // A seal failed.
+                // A closed session's connection is closed by a send's
+                // completion, so a send must be out (#374): this flush's,
+                // or one already in flight. It is: outside a pass, a
+                // session closes only as it stages a frame, either the one
+                // ending a stream that `answer` staged and kicked for, or
+                // the RST_STREAM or GOAWAY `stagePending` just staged.
+                if (slot.session.state == .closed) assert(slot.sending >= 1);
+                return;
             }
             drive(server, conn);
         }
