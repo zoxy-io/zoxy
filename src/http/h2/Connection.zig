@@ -265,11 +265,22 @@ pub fn Driver(comptime IoType: type) type {
 
         /// The server is draining (§8): end gracefully — GOAWAY(NO_ERROR),
         /// the streams already accepted finished, nothing new taken.
+        ///
+        /// The session may be over already while the connection does not
+        /// know it. A GOAWAY was out (the request cap's, or the client's
+        /// own), and the last stream ended from an origin's completion
+        /// under a scratch borrow, so `kick` only sent that stream's last
+        /// frame and left the close to the send's completion. Such a
+        /// session owes no GOAWAY (`closeIfGoneAway` closes only once its
+        /// own is staged), and the drive closes it.
         pub fn beginDrain(server: *ServerType, conn: *ConnType) void {
             assert(conn.state == .h2);
             const slot = conn.h2.?;
             if (slot.closing) return;
-            slot.session.goAway();
+            if (slot.session.state != .closed) {
+                slot.session.goAway();
+                assert(slot.session.goingAway());
+            }
             drive(server, conn);
         }
 

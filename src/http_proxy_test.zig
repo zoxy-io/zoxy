@@ -1778,6 +1778,88 @@ test "h2: one stream short of the request cap, every stream is served and nothin
     try bed.expectDrained();
 }
 
+/// Begins the drain at the instant a nightly soak found (seed 444046625): an
+/// HTTP/2 session over while its connection does not know yet, the close
+/// owed to the send carrying the last stream's last frame. Polled once a
+/// batch by a timer that is due at once, which the bed's clock allows: no
+/// op of its waits on time.
+const DrainWhileClosing = struct {
+    bed: *Http1Bed,
+    completion: SimIo.Completion = .{},
+    polls: u32 = 0,
+    hit: bool = false,
+
+    const polls_max: u32 = 100_000;
+
+    fn arm(watch: *DrainWhileClosing) void {
+        assert(watch.polls < polls_max);
+        watch.bed.sim_io.timerStart(&watch.completion, 0, DrainWhileClosing, watch, onPoll);
+    }
+
+    fn onPoll(watch: *DrainWhileClosing, result: Io.TimerError!void) void {
+        result catch unreachable; // Nothing cancels it.
+        watch.polls += 1;
+        const server = &watch.bed.server;
+        if (server.draining) return; // The client's own drain came first.
+        for (server.conns.slots) |*conn| {
+            if (!server.conns.isAcquired(conn)) continue;
+            if (conn.state != .h2) continue;
+            const slot = conn.h2.?;
+            if (slot.closing) continue;
+            if (slot.session.state != .closed) continue;
+            assert(slot.sending >= 1); // What the close waits on.
+            watch.hit = true;
+            server.beginDrain();
+            return;
+        }
+        if (watch.polls < polls_max) watch.arm();
+    }
+};
+
+test "h2: a drain reaching a session its last stream just closed leaves it to close, unasked (#237)" {
+    // The request cap's GOAWAY is staged as the stream that reaches it
+    // opens, so the origin's answer, staged under the parse's scratch
+    // borrow, is what ends the session. The batch order decides whether the poll lands in the gap
+    // before that frame's send completes, so a few seeds are swept and at
+    // least one must.
+    var hits: u32 = 0;
+    for (0..16) |index| {
+        var options = h2BedOptions(100 + index);
+        options.keepalive_requests = 1;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        var watch: DrainWhileClosing = .{ .bed = &bed };
+        watch.arm();
+
+        var wire: H2Wire = .{};
+        wire.preface(&.{});
+        wire.get(1, "GET", "/a");
+        try bed.exchange(wire.written());
+        if (watch.hit) hits += 1;
+
+        var storage: [2]H2Answer = undefined;
+        const answers = try h2Answers(bed.client.response(), &storage);
+        try std.testing.expectEqual(@as(usize, 1), answers.len);
+        try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+        try std.testing.expectEqualStrings("ok", answers[0].dataSlice());
+        try std.testing.expect(answers[0].ended);
+        // The cap's GOAWAY alone. A session already over owes the drain
+        // none of its own.
+        var frames: [8]H2Frame = undefined;
+        const count = try h2Frames(bed.client.response(), &frames);
+        var goaways: u32 = 0;
+        for (frames[0..count]) |frame| {
+            if (frame.frame_type == 0x7) goaways += 1;
+        }
+        try std.testing.expectEqual(@as(u32, 1), goaways);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_keepalive_requests_capped"));
+        try std.testing.expectEqual(HttpClient.Outcome.fin, bed.client.outcome);
+        try bed.expectDrained();
+    }
+    try std.testing.expect(hits >= 1);
+}
+
 test "h2: an origin's failure is its stream's alone — a refused dial's 502, a stalled origin's 504" {
     {
         var options = h2BedOptions(33);
