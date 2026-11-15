@@ -2286,6 +2286,119 @@ fn expectHeldAtClose(seed: u64, end_stream: bool) !void {
     try bed.expectDrained();
 }
 
+/// One deadline pass over two exchanges, as the soak's seed 456163385
+/// met it (#373). Stream 1 is still dialing an endpoint that never
+/// answers, its relay buffer full, and its DATA frame held for room.
+/// Stream 3 is pumping its body, nothing in flight, and its last frame
+/// waits behind stream 1's. The pass condemns both: stream 1's dial is
+/// canceled, and stream 3's upstream is shut down to force its response
+/// recv. Then the two completions race. If stream 1's cancel lands first,
+/// its 504 drives the session, the held frame goes with it, and stream
+/// 3's last frame reaches an exchange whose upstream is shut. Run through
+/// `expireExchange`, as the connection's own pass runs it, once the
+/// setup holds. The deadlines that would set it off are seconds apart.
+/// The pass's closing `kick` is left out: it would find stream 1 still
+/// forwarding, and the completions drive the session after it anyway.
+const ExpireBehindHeld = struct {
+    bed: *Http1Bed,
+    completion: SimIo.Completion = .{},
+    polls: u32 = 0,
+    expired: bool = false,
+
+    const polls_max: u32 = 10_000;
+    const poll_ns: u64 = 100 * std.time.ns_per_us;
+    const Proxy = @TypeOf(@as(Http1Bed, undefined).server).Proxy;
+
+    fn arm(watch: *ExpireBehindHeld) void {
+        assert(watch.polls < polls_max);
+        watch.bed.sim_io.timerStart(&watch.completion, poll_ns, ExpireBehindHeld, watch, onPoll);
+    }
+
+    fn onPoll(watch: *ExpireBehindHeld, result: Io.TimerError!void) void {
+        result catch unreachable; // Nothing cancels it.
+        watch.polls += 1;
+        const server = &watch.bed.server;
+        for (server.conns.slots) |*conn| {
+            if (!server.conns.isAcquired(conn)) continue;
+            if (conn.state != .h2) continue;
+            const slot = conn.h2.?;
+            const held = slot.held orelse continue;
+            if (held.stream != 1) continue;
+            const dialing = H2Exchange.find(conn, 1) orelse continue;
+            const pumping = H2Exchange.find(conn, 3) orelse continue;
+            if (!dialing.armed.connect) continue;
+            if (!idlePumping(pumping)) continue;
+            // As `Driver.expire` scans, counted as it counts: a pass, so
+            // what the expiries stage waits for its end.
+            slot.driving = true;
+            server.counters.increment("deadline_expired");
+            Proxy.expireExchange(server, pumping);
+            server.counters.increment("deadline_expired");
+            Proxy.expireExchange(server, dialing);
+            slot.driving = false;
+            assert(pumping.l7.pending_verdict == .gateway_timeout);
+            assert(dialing.l7.pending_verdict == .gateway_timeout);
+            watch.expired = true;
+            return;
+        }
+        if (watch.polls < polls_max) watch.arm();
+    }
+
+    /// Its body pumping, nothing of it in flight, and its response awaited:
+    /// the one op its expiry forces.
+    fn idlePumping(stream: anytype) bool {
+        if (stream.l7.request_leg != .pumping_body) return false;
+        if (stream.h2_body.inFlight()) return false;
+        if (stream.armed.data_client_to_upstream) return false;
+        return stream.armed.data_upstream_to_client;
+    }
+
+    const H2Exchange = @import("http/h2/exchange.zig").Exchange(SimIo);
+};
+
+test "h2: a frame for an exchange its deadline condemned is dropped, not sent (#373)" {
+    // Stream 1 dials an endpoint that never answers, and its one DATA frame
+    // is fifteen times the smallest relay buffer's room: held. Stream 3
+    // reaches the origin with half its body, and its other half waits
+    // behind stream 1's frame. Which completion of the pass lands first is
+    // the batch order's, so seeds are swept. Each must end both exchanges
+    // with a 504. Some meet the order the soak met: without the fix, they
+    // send on the shut socket, which the simulator refuses.
+    for (0..16) |index| {
+        var options = h2BedOptions(160 + index);
+        options.relay_buffer_bytes = constants.relay_buffer_bytes_min;
+        options.refusing_endpoint_first = true;
+        options.pick = .rr;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        bed.sim_io.blackholeAddress(Http1Bed.refusingEndpointAddress());
+        var watch: ExpireBehindHeld = .{ .bed = &bed };
+        watch.arm();
+
+        var payload: [15_000]u8 = undefined;
+        for (&payload, 0..) |*octet, offset| octet.* = 'a' + @as(u8, @intCast(offset % 26));
+        const post = .{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/upload" }, .{ ":authority", "a" } };
+        var wire: H2Wire = .{};
+        wire.preface(&.{});
+        wire.settingsAck();
+        wire.headers(1, &(post ++ .{.{ "content-length", "15000" }}), false);
+        wire.headers(3, &(post ++ .{.{ "content-length", "20" }}), false);
+        wire.data(3, payload[0..10], false);
+        wire.data(1, &payload, true);
+        wire.data(3, payload[10..20], true);
+        try bed.exchange(wire.written());
+
+        try std.testing.expect(watch.expired);
+        var storage: [4]H2Answer = undefined;
+        const answers = try h2Answers(bed.client.response(), &storage);
+        try std.testing.expectEqual(@as(u16, 504), (try h2AnswerFor(answers, 1)).status);
+        try std.testing.expectEqual(@as(u16, 504), (try h2AnswerFor(answers, 3)).status);
+        try std.testing.expectEqual(@as(u64, 2), bed.server.counters.get("l7_gateway_timeout"));
+        try bed.expectDrained();
+    }
+}
+
 test "h2: a body over the listener's cap resets its stream, and the connection serves on" {
     var options = h2BedOptions(43);
     options.max_body_bytes = 8;
