@@ -357,9 +357,25 @@ pub fn Driver(comptime IoType: type) type {
 
         /// Hand the held frame's octets to their exchange, as many as it has
         /// room for. True once none are held — the session may step on.
+        ///
+        /// The session may have closed under the frame (#373). It is not
+        /// stepped while a frame is held, so only a stream's release can
+        /// close it, and that release comes from outside. An origin that
+        /// answers in full before reading the body ends the stream from
+        /// its completion. If the held frame carries END_STREAM, the
+        /// session already half-closed the stream before handing it over,
+        /// so the answer's END_STREAM releases it. Otherwise the
+        /// RST_STREAM(NO_ERROR) that stops the body does. With a GOAWAY
+        /// staged, that release closes the session. Nothing takes the
+        /// octets now and no window is left to credit them to, so they go
+        /// with the session, and the drive finds it closed.
         fn offerHeld(server: *ServerType, conn: *ConnType, slot: *Slot) bool {
             const held = slot.held orelse return true;
-            assert(slot.session.state != .closed);
+            if (slot.session.state == .closed) {
+                assert(slot.session.streams.used == 0);
+                slot.held = null;
+                return true;
+            }
             const taken = ExchangeType.onData(server, conn, &held);
             assert(taken <= held.bytes.len);
             if (taken == held.bytes.len) {
