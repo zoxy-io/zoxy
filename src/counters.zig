@@ -274,6 +274,16 @@ pub const Counters = struct {
     /// stream is refused before any work, which the client may retry, and
     /// the connection goes on serving the others.
     h2_shed_streams: Value = Value.init(0),
+    /// Request-body DATA frames held because their stream's relay buffer
+    /// had no room for them (#373), each counted once, when it is first
+    /// held. Not a shed: the frame waits, and is forwarded once the
+    /// stream's send makes room, or dropped if the stream ends first. But
+    /// while it waits its connection reads nothing else, so every other
+    /// stream on it waits too. A client that sends before it
+    /// applies this side's window can cause it, and so can a full 16 KiB
+    /// frame of a body without a declared length, which overruns the
+    /// default buffer by the octets its chunk framing takes.
+    h2_frames_held: Value = Value.init(0),
     /// HTTP/2 connections ended GOAWAY(ENHANCE_YOUR_CALM) for overrunning
     /// a per-connection budget (#276), one counter per budget: each is a
     /// client inside the protocol's rules and expensive anyway, and what

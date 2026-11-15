@@ -352,7 +352,12 @@ pub fn Driver(comptime IoType: type) type {
                     .request => |request| ExchangeType.open(server, conn, &request),
                     .data => |data| {
                         slot.held = data;
-                        if (!offerHeld(server, conn, slot)) return flush(server, conn, slot);
+                        if (!offerHeld(server, conn, slot)) {
+                            // Counted as it is first held: the offers
+                            // that drain it later are the same frame.
+                            server.counters.increment("h2_frames_held");
+                            return flush(server, conn, slot);
+                        }
                     },
                     .trailers => |trailers| ExchangeType.onTrailers(server, conn, &trailers),
                     .reset => |reset| ExchangeType.onReset(server, conn, &reset),
