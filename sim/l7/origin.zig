@@ -81,10 +81,16 @@ pub fn HttpOrigin(comptime IoType: type) type {
         violations: u32 = 0,
 
         const Self = @This();
-        /// Sized for the worst case: client-driven dials (fresh, replay,
-        /// post-ejection) plus a `check` scenario's passing probes, each
-        /// of which accepts and vanishes (§7) but still consumes a slot —
-        /// conns are tracked monotonically, never recycled.
+        /// Sized for the HTTP/1.1 worst case: client-driven dials (fresh,
+        /// replay, post-ejection) plus a `check` scenario's passing
+        /// probes, each of which accepts and vanishes (§7) but still
+        /// consumes a slot. Fresh slots are handed out first, so such a
+        /// seed reuses none while it stays inside that sizing. Past them,
+        /// `acquireConn` reuses a slot the origin is done with: a Rapid
+        /// Reset client (#276) opens and resets a stream per round for
+        /// `resets_unpaid_max + 1` rounds (101), and each round can cost
+        /// one dial — more than this whole slab from one client, while
+        /// few of them are live at once.
         pub const conns_max: u8 = 64;
         const request_buffer_bytes: u32 = 16384;
 
@@ -573,9 +579,7 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 assert(err == error.Canceled);
                 return;
             };
-            assert(origin.conns_count < origin.conns.len);
-            const conn = &origin.conns[origin.conns_count];
-            origin.conns_count += 1;
+            const conn = origin.acquireConn();
             conn.origin = origin;
             conn.socket = socket;
             conn.mode = if (origin.mode_selector) |select|
@@ -584,6 +588,30 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 .sized;
             conn.beginMode();
             origin.armAccept();
+        }
+
+        /// The slot an accepted connection takes: a fresh one while any
+        /// remain, then one the origin closed with neither of its ops
+        /// still pending, so nothing the loop delivers can reach it again.
+        /// An op dropped by a stranding seed (#206) never completes, and
+        /// its slot is never reused. `closeRemaining` reads only what is
+        /// still open, so a reused slot loses no record.
+        fn acquireConn(origin: *Self) *Conn {
+            assert(origin.conns_count <= origin.conns.len);
+            if (origin.conns_count < origin.conns.len) {
+                const conn = &origin.conns[origin.conns_count];
+                origin.conns_count += 1;
+                assert(!conn.done);
+                return conn;
+            }
+            for (&origin.conns) |*conn| {
+                if (!conn.done) continue;
+                if (conn.recv_completion.state == .pending) continue;
+                if (conn.send_completion.state == .pending) continue;
+                conn.* = .{};
+                return conn;
+            }
+            @panic("sim origin: more connections live at once than conns_max");
         }
 
         pub fn stopListening(origin: *Self) void {

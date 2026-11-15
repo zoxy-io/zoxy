@@ -131,10 +131,12 @@ const DropMode = enum { wind_down, teardown };
 const teardown_strand_kinds = [_]SimIo.OpKind{ .timer_cancel, .connect_cancel };
 
 comptime {
-    // Passing probes consume origin conn slots (accept-and-vanish, never
-    // recycled), on top of each origin's client-driven worst case: one
-    // conn per L4 client, and the pre-probe capacity of 32 the 4096-seed
-    // sweeps validated for the HTTP origin's dial churn.
+    // Passing probes consume origin conn slots (accept-and-vanish), on
+    // top of each origin's client-driven worst case: one conn per L4
+    // client, and the pre-probe capacity of 32 the 4096-seed sweeps
+    // validated for the HTTP origin's HTTP/1.1 dial churn. The HTTP
+    // origin reuses a closed slot only once these are spent, which a
+    // Rapid Reset flood's dial per round does (#276).
     assert(Origin.conns_max >= @as(u64, clients_max) + probe_sweeps_max);
     assert(HttpOrigin.conns_max >= 32 + probe_sweeps_max);
     // The clean-seed margin, as a proof rather than a comment: the whole
