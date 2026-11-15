@@ -147,11 +147,17 @@ comptime {
     // Rapid Reset flood's dial per round does (#276).
     assert(Origin.conns_max >= @as(u64, clients_max) + probe_sweeps_max);
     assert(HttpOrigin.conns_max >= 32 + probe_sweeps_max);
+    // `deriveRelayBufferBytes` draws up to the default, which a
+    // terminating listener allows (`LimitRelayBufferOverTlsRecord`).
+    assert(zoxy.constants.relay_buffer_bytes_default <= zoxy.constants.tls_app_chunk_bytes);
     // An HTTP/2 client's largest body (#373) reaches the origin whole in
     // its request buffer: beside the forwarded head, and the chunk framing
     // the proxy adds when the length was not declared, a size line and
-    // CRLF per forwarded chunk, under ten octets, for the few dozen
-    // chunks a small relay buffer cuts a held frame into.
+    // CRLF per forwarded chunk, under ten octets. The allowance covers
+    // some two hundred chunks. A small relay buffer cuts a held frame into
+    // about a dozen, and deliveries cut it further, which no bound here
+    // proves. A body past the allowance would read as forwarded excess,
+    // `OriginSawMalformedBytes`, which would name this comment.
     const forwarded_head_bytes_max: u32 = 1024;
     const chunk_framing_bytes_max: u32 = 2048;
     assert(l7.h2_body_bytes_max + forwarded_head_bytes_max + chunk_framing_bytes_max <=
@@ -282,6 +288,9 @@ max_body_bytes: u64,
 /// On the listener since the freeze (#305), so the harness derives it
 /// beside the body cap rather than into `limits`.
 keepalive_requests: u32,
+/// The size each relay buffer's halves are cut to (§5), the default but
+/// on a third of adversarial seeds (`deriveRelayBufferBytes`).
+relay_buffer_bytes: u32,
 /// The seed's http origin prefixes an interim `100 Continue` to every
 /// answer (#232). Drawn once per seed rather than per accept, so a clean
 /// seed's transcript stays exact — which is the point: the golden oracle
@@ -772,6 +781,7 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     deriveHttp2(harness, random);
     harness.max_body_bytes = deriveMaxBodyBytes(harness.clean, random);
     harness.keepalive_requests = deriveKeepaliveRequests(harness.clean, random);
+    harness.relay_buffer_bytes = deriveRelayBufferBytes(harness.clean, random);
     // A quarter of seeds. Clean ones included, deliberately: an
     // adversarial seed only holds the transcript to a legal *prefix*, so
     // a proxy that settled on the interim and dropped the real answer
@@ -1109,6 +1119,27 @@ fn deriveKeepaliveRequests(clean: bool, random: std.Random) u32 {
     if (clean) return 0;
     if (random.uintLessThan(u8, 3) != 0) return 0;
     return 1 + random.uintLessThan(u32, 2);
+}
+
+/// The relay buffer's size (§5). The default on clean seeds, whose pools
+/// are proved against it, and on two thirds of adversarial ones. The rest
+/// draw it from the smallest the loader accepts up to the default, so
+/// bodies and answers are pumped in more chunks than one. An HTTP/2
+/// stream's DATA frame can then outrun its room and be held, and with it
+/// its connection's input (#373). The default is the ceiling: a
+/// terminating listener's relay buffer may be no larger than one TLS
+/// record's plaintext. No seed routes by SNI, whose floor is that same
+/// record (`LimitRelayBufferUnderSniRouting`). One that did would have to
+/// keep the default.
+fn deriveRelayBufferBytes(clean: bool, random: std.Random) u32 {
+    const default = zoxy.constants.relay_buffer_bytes_default;
+    const smallest = zoxy.constants.relay_buffer_bytes_min;
+    if (clean) return default;
+    if (random.uintLessThan(u8, 3) != 0) return default;
+    const bytes = smallest + random.uintLessThan(u32, default - smallest + 1);
+    assert(bytes >= smallest);
+    assert(bytes <= default);
+    return bytes;
 }
 
 /// The #235 head budget, drawn *apart* from the idle window on a third
@@ -1686,11 +1717,13 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             // the engage counter stays reachable even though the shed
             // rung itself is relay-shadowed (see sim/main.zig uncovered).
             .upstream_head_buffers = 1,
+            .relay_buffer_bytes = harness.relay_buffer_bytes,
             .access_log_buffer_bytes = access_log_buffer_bytes,
             .tls_engines = deriveTlsEngines(harness.tls_clients, force_exhaustion),
         }
     else
         .{
+            .relay_buffer_bytes = harness.relay_buffer_bytes,
             .tunnels = harness.tunnels,
             .h2_connections = harness.h2_connections,
             .stream_slots = harness.stream_slots,
