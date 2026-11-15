@@ -848,6 +848,12 @@ fn originPortOf(origin_address: []const u8) u16 {
 fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !std.process.Child {
     const prefix = work_directory ++ "/nginx";
     try Io.Dir.cwd().createDirPath(io, prefix ++ "/logs");
+    // Every temp path is named under the prefix: nginx creates them at
+    // startup whether or not a request ever spills, and the compiled-in
+    // defaults differ by build (Arch's /var/lib/nginx does not exist
+    // unless the package was installed), so leaving them implicit made the
+    // origin's start depend on how nginx was packaged.
+    try Io.Dir.cwd().createDirPath(io, prefix ++ "/temp");
     // The bulk body the large-body bands request, written once. `alias`
     // resolves relative to nginx's own prefix (`-p`), so the config needs no
     // absolute path and the file lives beside the logs it never fills.
@@ -867,6 +873,11 @@ fn spawnNginx(arena: std.mem.Allocator, io: Io, environ: std.process.Environ) !s
         \\events {{ worker_connections 1024; }}
         \\http {{
         \\    access_log off;
+        \\    client_body_temp_path temp/client-body;
+        \\    proxy_temp_path temp/proxy;
+        \\    fastcgi_temp_path temp/fastcgi;
+        \\    uwsgi_temp_path temp/uwsgi;
+        \\    scgi_temp_path temp/scgi;
         \\    server {{
         \\        listen 127.0.0.1:{d};
         \\        location / {{ return 200 "zoxy-bench-origin\n"; }}
