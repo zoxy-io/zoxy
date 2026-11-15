@@ -2399,6 +2399,42 @@ test "h2: a frame for an exchange its deadline condemned is dropped, not sent (#
     }
 }
 
+test "h2: an undeclared body that ends exactly at its buffer's room goes whole, last chunk and all" {
+    // The room `bodyRoom` gathers into while the dial is out: the buffer
+    // less the size line's headroom before it and the tail after it. One
+    // DATA frame of exactly that, END_STREAM on it, so the frame that
+    // carries it also carries the last chunk, and fills the tail the next
+    // frame's size line would have used. Soak seeds 460156680, 462868281
+    // and 463170863 met it.
+    const exchange_module = @import("http/h2/exchange.zig");
+    const headroom = @import("http/render.zig").chunk_prefix_bytes_max;
+    const room = constants.relay_buffer_bytes_min - headroom - exchange_module.chunk_tail_bytes;
+    var options = h2BedOptions(48);
+    options.relay_buffer_bytes = constants.relay_buffer_bytes_min;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var payload: [room]u8 = undefined;
+    for (&payload, 0..) |*octet, offset| octet.* = 'a' + @as(u8, @intCast(offset % 26));
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.headers(1, &.{ .{ ":method", "POST" }, .{ ":scheme", "http" }, .{ ":path", "/upload" }, .{ ":authority", "a" } }, false);
+    wire.data(1, &payload, true);
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqual(@as(?u32, null), answers[0].reset);
+    var scanner: parser.ChunkedScanner = .{};
+    const body = originBody(&bed);
+    const dechunked = try scanner.dechunk(body);
+    try std.testing.expect(dechunked.done);
+    try std.testing.expectEqualStrings(&payload, body[0..dechunked.payload_len]);
+    try bed.expectDrained();
+}
+
 test "h2: a body over the listener's cap resets its stream, and the connection serves on" {
     var options = h2BedOptions(43);
     options.max_body_bytes = 8;
