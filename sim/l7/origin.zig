@@ -79,6 +79,13 @@ pub fn HttpOrigin(comptime IoType: type) type {
         /// Count of §7 violations observed: a malformed forwarded head,
         /// a body that broke its framing. Checked by the harness verify.
         violations: u32 = 0,
+        /// Marked bodies (#373) that did not arrive as their client sent
+        /// them: a framing at odds with the mark, or an octet out of
+        /// place. Checked by the harness verify.
+        body_mismatches: u32 = 0,
+        /// Marked bodies that arrived whole: the census's proof that the
+        /// check above ever ran.
+        bodies_verified: u32 = 0,
 
         const Self = @This();
         /// Sized for the HTTP/1.1 worst case: client-driven dials (fresh,
@@ -92,10 +99,13 @@ pub fn HttpOrigin(comptime IoType: type) type {
         /// one dial — more than this whole slab from one client, while
         /// few of them are live at once.
         pub const conns_max: u8 = 64;
-        const request_buffer_bytes: u32 = 16384;
+        pub const request_buffer_bytes: u32 = 16384;
 
         const Phase = enum(u8) { head, body, respond };
         const FramingTag = enum(u8) { none, content_length, chunked };
+        /// A request body's mark (#373): what its client sent, and where
+        /// in the buffer the forwarded body starts.
+        const MarkedBody = struct { length: u32, salt: u32, start: u32 };
 
         comptime {
             // What `compact` makes true, checked rather than trusted:
@@ -134,6 +144,8 @@ pub fn HttpOrigin(comptime IoType: type) type {
             framing_tag: FramingTag = .none,
             content_remaining: u64 = 0,
             chunk_scanner: parser.ChunkedScanner = .{},
+            /// The request in flight's body mark, if it carries one.
+            marked: ?MarkedBody = null,
             mode: OriginMode = .sized,
             /// What this connection answers with, per its mode.
             response_bytes: []const u8 = canon.sized_response,
@@ -362,7 +374,58 @@ pub fn HttpOrigin(comptime IoType: type) type {
                 }
                 conn.request_offset += request.head_len;
                 assert(conn.request_offset <= conn.request_len);
+                conn.marked = null;
+                if (parser.headerValue(request.headers, canon.request_body_header)) |value| {
+                    conn.marked = markedBody(value, &request, conn.request_offset) orelse {
+                        conn.origin.body_mismatches += 1;
+                        conn.close();
+                        return false;
+                    };
+                }
                 conn.phase = .body;
+                return true;
+            }
+
+            /// The mark's `<length>.<salt>`, if the request's framing can
+            /// carry that body: chunked, or the very length declared. One
+            /// with no body framing at all lost its body on the way.
+            fn markedBody(value: []const u8, request: *const parser.RequestHead, body_start: u32) ?MarkedBody {
+                const dot = std.mem.indexOfScalar(u8, value, '.') orelse return null;
+                const length = std.fmt.parseUnsigned(u32, value[0..dot], 10) catch return null;
+                const salt = std.fmt.parseUnsigned(u32, value[dot + 1 ..], 10) catch return null;
+                switch (request.framing) {
+                    .none => return null,
+                    .content_length => |declared| if (declared != length) return null,
+                    .chunked => {},
+                    .until_close => unreachable, // Requests are length-delimited.
+                }
+                assert(body_start >= request.head_len);
+                return .{ .length = length, .salt = salt, .start = body_start };
+            }
+
+            /// Whether a marked body arrived as its client sent it: every
+            /// octet, in order, and no more, dechunked first when the
+            /// proxy chunked it. Dechunked in place: the body is consumed,
+            /// and nothing reads its wire again.
+            fn bodyMatches(conn: *Conn, marked: MarkedBody) bool {
+                assert(conn.phase == .body);
+                assert(marked.start <= conn.request_offset);
+                const wire = conn.request_buffer[marked.start..conn.request_offset];
+                const body = switch (conn.framing_tag) {
+                    .none => unreachable, // `markedBody` refused it.
+                    .content_length => wire,
+                    .chunked => body: {
+                        var scanner: parser.ChunkedScanner = .{};
+                        const dechunked = scanner.dechunk(wire) catch return false;
+                        if (!dechunked.done) return false;
+                        if (dechunked.consumed != wire.len) return false;
+                        break :body wire[0..dechunked.payload_len];
+                    },
+                };
+                if (body.len != marked.length) return false;
+                for (body, 0..) |octet, index| {
+                    if (octet != canon.requestBodyOctet(marked.salt, @intCast(index))) return false;
+                }
                 return true;
             }
 
@@ -402,6 +465,14 @@ pub fn HttpOrigin(comptime IoType: type) type {
                     },
                 }
                 assert(conn.request_offset <= conn.request_len);
+                if (conn.marked) |marked| {
+                    if (!conn.bodyMatches(marked)) {
+                        conn.origin.body_mismatches += 1;
+                        conn.close();
+                        return false;
+                    }
+                    conn.origin.bodies_verified += 1;
+                }
                 conn.phase = .respond;
                 return true;
             }

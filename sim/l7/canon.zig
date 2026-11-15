@@ -26,6 +26,31 @@ pub const log_request_flood_value = "sim-flood-1";
 pub const log_response_header = "x-sim-origin";
 pub const log_response_value = "sized";
 
+/// The mark on a request body the origin checks octet by octet (#373):
+/// an HTTP/2 client's POST names its body's length and salt in it, as
+/// `<length>.<salt>`, and the origin demands exactly those octets. A
+/// stream's body goes to its origin reframed — its DATA frames' octets as
+/// sent, or chunked when its length was not declared — so a proxy that
+/// dropped, repeated, reordered or crossed octets between streams would
+/// otherwise pass, its framing whole.
+pub const request_body_header = "x-sim-body";
+
+/// Octet `index` of a marked body salted with `salt`: murmur3's 32-bit
+/// finalizer over the two, so each octet is all but independent of its
+/// neighbours. A body shifted, repeated or crossed with another salt's
+/// reads wrong at nearly every octet, and over any body longer than a few
+/// octets, wrong somewhere.
+pub fn requestBodyOctet(salt: u32, index: u32) u8 {
+    assert(index < 1 << 16);
+    var mixed: u32 = salt *% 0x0001_0000 +% index;
+    mixed ^= mixed >> 16;
+    mixed *%= 0x85eb_ca6b;
+    mixed ^= mixed >> 13;
+    mixed *%= 0xc2b2_ae35;
+    mixed ^= mixed >> 16;
+    return @truncate(mixed);
+}
+
 /// The hop-by-hop headers the sized origin answers with, and the one it
 /// nominates through `Connection` (RFC 9110 §7.6.1, §7). All three must
 /// die at this hop: two because they are hop-by-hop by name, the third

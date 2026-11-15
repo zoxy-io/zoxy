@@ -147,6 +147,15 @@ comptime {
     // Rapid Reset flood's dial per round does (#276).
     assert(Origin.conns_max >= @as(u64, clients_max) + probe_sweeps_max);
     assert(HttpOrigin.conns_max >= 32 + probe_sweeps_max);
+    // An HTTP/2 client's largest body (#373) reaches the origin whole in
+    // its request buffer: beside the forwarded head, and the chunk framing
+    // the proxy adds when the length was not declared, a size line and
+    // CRLF per forwarded chunk, under ten octets, for the few dozen
+    // chunks a small relay buffer cuts a held frame into.
+    const forwarded_head_bytes_max: u32 = 1024;
+    const chunk_framing_bytes_max: u32 = 2048;
+    assert(l7.h2_body_bytes_max + forwarded_head_bytes_max + chunk_framing_bytes_max <=
+        HttpOrigin.request_buffer_bytes);
     // The clean-seed margin, as a proof rather than a comment: every
     // exchange the population can hold at once still stops short of the
     // watermark, and an exchange per connection is the least of it.
@@ -1803,6 +1812,7 @@ fn populateTlsClients(harness: *Harness, random: std.Random) void {
 fn prepareH2Client(harness: *Harness, random: std.Random) void {
     assert(harness.h2c_http);
     assert(harness.h2_count < clients_max);
+    const salt = harness.h2_count;
     const client = &harness.h2_clients[harness.h2_count];
     harness.h2_count += 1;
     const streams = 1 + random.uintLessThan(u8, H2Client.streams_max);
@@ -1813,9 +1823,33 @@ fn prepareH2Client(harness: *Harness, random: std.Random) void {
         .exchange;
     // Its lines need the staging `h2_rapid_reset` sized for them.
     if (mode == .rapid_reset and !harness.h2_rapid_reset) mode = .exchange;
-    client.prepare(&harness.io, httpBindAddress(), streams, harness.clean, mode);
+    var plans: [H2Client.streams_max]l7.H2Plan = @splat(.{});
+    for (plans[0..streams]) |*plan| plan.* = drawH2Plan(random);
+    client.prepare(&harness.io, httpBindAddress(), plans[0..streams], salt, harness.clean, mode);
     client.on_ended = clientEndedHook;
     client.context = harness;
+}
+
+/// One stream's request (#373): half are `get`'s GET, and half POST a
+/// marked body, its length declared or not. A body is short or up to the
+/// largest, evenly, so seeds meet both one small frame and frames past a
+/// small relay buffer's room. It is cut into up to `h2_body_frames_max`
+/// DATA frames.
+fn drawH2Plan(random: std.Random) l7.H2Plan {
+    if (random.boolean()) return .{};
+    const ask: l7.H2Ask = if (random.boolean()) .post_declared else .post_undeclared;
+    const short_bytes_max: u32 = 64;
+    const span = if (random.boolean()) short_bytes_max else l7.h2_body_bytes_max;
+    const body_len = 1 + random.uintLessThan(u32, span);
+    const frames_max: u8 = @intCast(@min(l7.h2_body_frames_max, body_len));
+    const plan: l7.H2Plan = .{
+        .ask = ask,
+        .body_len = body_len,
+        .frames = 1 + random.uintLessThan(u8, frames_max),
+    };
+    assert(plan.frames <= plan.body_len);
+    assert(plan.body_len <= l7.h2_body_bytes_max);
+    return plan;
 }
 
 fn populateClients(harness: *Harness, random: std.Random) void {
@@ -2633,6 +2667,8 @@ pub fn verify(harness: *Harness) !void {
     if (!harness.io.sockets.isFullyReleased()) return error.SocketLeak;
     // §7: no malformed byte may ever reach an origin.
     if (harness.origin_http.violations != 0) return error.OriginSawMalformedBytes;
+    // #373: a marked body reaches its origin exactly as its client sent it.
+    if (harness.origin_http.body_mismatches != 0) return error.OriginSawWrongBody;
     // #142 send: on any seed, garbage where a header belongs is zoxy's
     // bug — the writers are pure and the adversary splits deliveries but
     // never corrupts bytes, so a cut lands as EOF, not as a violation.

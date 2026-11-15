@@ -16,3 +16,7 @@ pub const ClientError = @import("l7/client.zig").ClientError;
 pub const H2Client = @import("l7/h2_client.zig").Client;
 pub const H2ClientError = @import("l7/h2_client.zig").ClientError;
 pub const H2Mode = @import("l7/h2_client.zig").Mode;
+pub const H2Plan = @import("l7/h2_client.zig").Plan;
+pub const H2Ask = @import("l7/h2_client.zig").Ask;
+pub const h2_body_bytes_max = @import("l7/h2_client.zig").body_bytes_max;
+pub const h2_body_frames_max = @import("l7/h2_client.zig").body_frames_max;

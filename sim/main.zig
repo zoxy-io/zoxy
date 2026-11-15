@@ -515,6 +515,11 @@ const Census = struct {
     /// independently — `close` is delivered by exactly one call site in
     /// the tree, so no counter's silence would have named it.
     ops: [std.enums.values(SimIo.OpKind).len]u64 = @splat(0),
+    /// Marked request bodies (#373) the origin checked and found whole:
+    /// the one oracle that reads HTTP/2 request bodies, asked whether it
+    /// ever ran. No counter says so, since a body that arrives whole is
+    /// the proxy doing nothing a rung would count.
+    bodies_verified: u64 = 0,
 
     fn add(census: *Census, harness: *const Harness) void {
         inline for (Counters.names, 0..) |name, index| {
@@ -532,6 +537,9 @@ const Census = struct {
             // quiet, which is the one thing this table exists to notice.
             assert(census.ops[@backingInt(kind)] >= before);
         }
+        const bodies_before = census.bodies_verified;
+        census.bodies_verified += harness.origin_http.bodies_verified;
+        assert(census.bodies_verified >= bodies_before);
     }
 
     /// True when every counter agrees with its side of `uncovered`. Each
@@ -582,7 +590,22 @@ const Census = struct {
         if (held) {
             assert(fired == Counters.names.len - uncovered.len + allowed_fired);
         }
-        return census.verifyOps() and held;
+        const ops_held = census.verifyOps();
+        return census.verifyBodies() and ops_held and held;
+    }
+
+    /// Some marked body must reach its origin whole in the range: an
+    /// origin that never checks one leaves HTTP/2's request bodies
+    /// unread by any oracle, whatever else passes.
+    fn verifyBodies(census: *const Census) bool {
+        if (census.bodies_verified >= 1) return true;
+        std.debug.print(
+            "sim census: no marked request body reached its origin whole — " ++
+                "the HTTP/2 clients' POSTs went unchecked; widen `drawH2Plan`\n",
+            .{},
+        );
+        assert(census.bodies_verified == 0);
+        return false;
     }
 
     /// Every op of the §4 seam must be delivered somewhere in the range.
@@ -758,11 +781,12 @@ fn checkCensus(options: *const Sweep, census: *const Census) bool {
         return true;
     }
     if (!census.verify(options.iterations)) return false;
-    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} seam op(s), {d} exempt\n", .{
+    std.debug.print("sim: census ok, {d} counter(s) fired, {d} exempt; {d} seam op(s), {d} exempt; {d} body(ies) verified\n", .{
         Counters.names.len - uncovered.len,
         uncovered.len,
         std.enums.values(SimIo.OpKind).len - 1 - uncovered_ops.len,
         uncovered_ops.len,
+        census.bodies_verified,
     });
     return true;
 }
