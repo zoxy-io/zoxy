@@ -54,11 +54,19 @@ const tls_client_slots: u8 = tls_clients_max + 1;
 /// 9 of 12 that engages the §8 watermark, and seed 284647213's
 /// `keepalive_pair` met a pressure-announced close on a clean seed.
 const connections_max: u8 = clients_max + tls_client_slots;
+/// Every exchange one seed's population can hold at once: `connections_max`
+/// with each plaintext client counted as an HTTP/2 one at its most streams
+/// (#275), since each stream holds a relay buffer, an upstream slot and an
+/// upstream head buffer of its own. Counting connections alone let three
+/// nightly seeds (448156674, 449268806, 450273021) engage relay pressure
+/// on a clean seed, so their `keepalive_pair` met a pressure-announced
+/// close beside four HTTP/2 clients.
+const exchanges_max: u32 = @as(u32, clients_max) * H2Client.streams_max + tls_client_slots;
 /// Every pool's capacity on a clean seed, sized so its §8 pressure
-/// watermark sits above `connections_max`: a golden outcome must never
-/// meet a pressure-announced close or a shortened deadline — correct
-/// behavior, but not the script's exact transcript.
-const clean_pool_capacity: u32 = 2 * connections_max;
+/// watermark sits above `exchanges_max`: a golden outcome must never meet
+/// a pressure-announced close or a shortened deadline — correct behavior,
+/// but not the script's exact transcript.
+const clean_pool_capacity: u32 = 2 * exchanges_max;
 /// Bytes each terminating client echoes. Small: what this population is
 /// for is the handshake and the transform, not throughput.
 const tls_token_bytes: u8 = 24;
@@ -139,9 +147,16 @@ comptime {
     // Rapid Reset flood's dial per round does (#276).
     assert(Origin.conns_max >= @as(u64, clients_max) + probe_sweeps_max);
     assert(HttpOrigin.conns_max >= 32 + probe_sweeps_max);
-    // The clean-seed margin, as a proof rather than a comment: the whole
-    // population held at once still stops short of the watermark.
-    assert(zoxy.constants.poolPressureOn(clean_pool_capacity) > connections_max);
+    // The clean-seed margin, as a proof rather than a comment: every
+    // exchange the population can hold at once still stops short of the
+    // watermark, and an exchange per connection is the least of it.
+    assert(exchanges_max >= connections_max);
+    assert(zoxy.constants.poolPressureOn(clean_pool_capacity) > exchanges_max);
+    // And within what a deployment may configure, so a population bump
+    // fails here rather than at `Server.init`.
+    assert(clean_pool_capacity <= zoxy.constants.conn_slots_max);
+    assert(clean_pool_capacity <= zoxy.constants.relay_buffers_max);
+    assert(clean_pool_capacity <= zoxy.constants.upstream_slots_max);
 }
 
 io: SimIo,
@@ -1672,7 +1687,7 @@ fn deriveInitOptions(harness: *const Harness, random: std.Random) ServerSim.Init
             .stream_slots = harness.stream_slots,
             .access_log_buffer_bytes = access_log_buffer_bytes,
             // Clean seeds size every pool at `clean_pool_capacity`
-            // (watermark 14 of 18, over a population of 9); the
+            // (watermark 41 of 54, over at most 27 exchanges); the
             // comptime block at the top proves the margin, so a
             // population bump fails there. The upstream margin also
             // rides the single-endpoint topology (checkout-before-
