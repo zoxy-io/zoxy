@@ -375,7 +375,7 @@ pub fn Client(comptime IoType: type) type {
                 if (goaway_last) |last| {
                     if (answer.status != 0 and streamId(@intCast(index)) > last) return error.StreamPastGoaway;
                 }
-                if (answer.status == 200) try checkBody(answer);
+                if (answer.status == 200) try checkBody(answer, client.clean);
                 if (!client.clean) continue;
                 // A clean seed meets no adversary: every stream is answered,
                 // whole, by its origin.
@@ -536,7 +536,22 @@ pub fn Client(comptime IoType: type) type {
         /// A whole body is one canonical body, length and octets; one cut
         /// short is a prefix of one. Longer than every canonical body is
         /// neither, whatever its first octets.
-        fn checkBody(answer: *const Answer) ClientError!void {
+        ///
+        /// One cut short may also end the stream, on an adversarial seed,
+        /// when it is the until-close body. That body is delimited by the
+        /// origin's FIN and nothing else, so an origin whose send failed
+        /// mid-body (kernel pressure on its socket) closes with the same
+        /// FIN as one that finished. The proxy cannot tell them apart and
+        /// must say END_STREAM, as the HTTP/1.1 client counts a cut
+        /// one complete. Five nightly seeds met it (450198017 among them).
+        /// Sized and chunked bodies carry their own end, so a cut one is
+        /// still a reset, never END_STREAM. Their canonical bodies share no
+        /// first octet with the until-close one, so only the empty prefix
+        /// is ambiguous. A sized body wrongly ended at no octets reads the
+        /// same as an until-close one cut at the head's last, and passes
+        /// here. A clean seed meets no adversary, so its stricter rule
+        /// still catches it.
+        fn checkBody(answer: *const Answer, clean: bool) ClientError!void {
             assert(answer.status == 200);
             if (answer.body_len > answer.body.len) return error.BodyCorrupted;
             const body = answer.body[0..answer.body_len];
@@ -545,6 +560,8 @@ pub fn Client(comptime IoType: type) type {
                 if (answer.ended and std.mem.eql(u8, body, canonical)) return;
                 if (!answer.ended and std.mem.startsWith(u8, canonical, body)) return;
             }
+            if (clean) return error.BodyCorrupted;
+            if (answer.ended and std.mem.startsWith(u8, canon.until_close_body, body)) return;
             return error.BodyCorrupted;
         }
 
