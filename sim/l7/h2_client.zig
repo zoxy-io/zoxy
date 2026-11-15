@@ -1,14 +1,23 @@
 //! The simulation gate's HTTP/2 client (#275): h2c by prior knowledge to
-//! the http listener, a few GET streams opened in its first write, and an
+//! the http listener, a few streams opened in its first write, and an
 //! oracle over every frame that came back.
 //!
-//! The streams ask what the HTTP/1.1 population's `get` script asks, so
-//! the same origin answers them and the same canonical bodies judge them.
+//! A stream asks what the HTTP/1.1 population's `get` script asks, or
+//! POSTs a body to the same path (#373), so the same origin answers them
+//! and the same canonical bodies judge them. A POST's body is marked, and
+//! the origin checks every octet of it. Its length is declared or not,
+//! which the proxy then forwards chunked. It goes in up to
+//! `body_frames_max` DATA frames, one per stream per turn after every
+//! head, so a frame held for its stream's room holds its siblings behind
+//! it.
+//!
 //! The oracle is per stream, and holds on every seed: whatever came back
 //! is whole frames, each stream is answered at most once, with a status
-//! the `get` script allows and — for a 200 — a canonical body, or a prefix
-//! of one on a stream that was cut short. On clean seeds it hardens: every
-//! stream ends with a 200 and a whole canonical body.
+//! its script allows and — for a 200 — a canonical body, or a prefix of
+//! one on a stream that was cut short. A POST's stream may hear one frame
+//! past its answer's end: the RST_STREAM(NO_ERROR) that stops a body no
+//! longer wanted (RFC 9113 §8.1). On clean seeds it hardens: every stream
+//! ends with a 200 and a whole canonical body, and nothing after it.
 //!
 //! The client never acknowledges the server's SETTINGS, so its streams run
 //! on the protocol's default window, as a client that has not yet heard
@@ -91,6 +100,29 @@ pub const Mode = enum {
     };
 };
 
+/// What an exchange's stream asks (#373): `get`'s GET, or a POST whose
+/// body the origin checks octet by octet, its length declared or not.
+pub const Ask = enum(u8) { get, post_declared, post_undeclared };
+
+/// One stream's request: what it asks and, for a POST, its body's length
+/// and the DATA frames it is cut into, each at least one octet.
+pub const Plan = struct {
+    ask: Ask = .get,
+    body_len: u32 = 0,
+    frames: u8 = 0,
+
+    pub fn carriesBody(plan: Plan) bool {
+        return plan.ask != .get;
+    }
+};
+
+/// A POST's largest body. The client never reads the server's
+/// WINDOW_UPDATEs, so every stream's body together stays inside the
+/// protocol's default connection window, and each inside the smallest
+/// stream window the server advertises (`exchange.requestWindow`).
+pub const body_bytes_max: u32 = 12 * 1024;
+pub const body_frames_max: u8 = 4;
+
 /// The bodies an origin answers `get` with, as DATA carries them: the
 /// chunked one dechunked.
 const canonical_bodies = [_][]const u8{
@@ -141,6 +173,8 @@ comptime {
     for (canonical_bodies) |body| assert(body.len <= 32);
     assert(rounds_max * resets_per_round > budgets.resets_unpaid_max);
     assert(bomb_fields * 60 > zoxy.constants.head_buffer_bytes_default);
+    assert(body_bytes_max <= 1 << 14); // The smallest frame size, and stream window.
+    assert(body_frames_max >= 1);
 }
 
 pub fn Client(comptime IoType: type) type {
@@ -152,6 +186,10 @@ pub fn Client(comptime IoType: type) type {
         clean: bool = false,
         mode: Mode = .exchange,
         streams: u8 = 0,
+        plans: [streams_max]Plan = @splat(.{}),
+        /// This client's part of each body's salt, so equal bodies on two
+        /// connections still differ (`bodySalt`).
+        salt: u8 = 0,
         connect_completion: IoType.Completion = .{},
         connect_cancel_completion: IoType.Completion = .{},
         recv_completion: IoType.Completion = .{},
@@ -179,7 +217,9 @@ pub fn Client(comptime IoType: type) type {
 
         const Self = @This();
         pub const streams_max: u8 = 4;
-        const request_bytes_max: u32 = 16 * 1024;
+        const request_bytes_max: u32 = 64 * 1024;
+        /// A POST's head: five short literals, a length and the mark.
+        const head_bytes_max: u32 = 160;
         /// Room for Rapid Reset's worst transcript: every round's stream
         /// answered whole before its reset arrived — which an adversary
         /// splitting a round's send can arrange — beside its PONG.
@@ -188,6 +228,12 @@ pub fn Client(comptime IoType: type) type {
         comptime {
             // The preface, its SETTINGS, and every round.
             assert(64 + rounds_max * round_bytes_max <= request_bytes_max);
+            // Or every stream's head and body, each frame's header too.
+            const stream_bytes_max = head_bytes_max + body_bytes_max + body_frames_max * 9;
+            assert(64 + @as(u32, streams_max) * stream_bytes_max <= request_bytes_max);
+            // Every body inside the default connection window (RFC 9113
+            // §6.9.2), which this client never sees grow.
+            assert(@as(u32, streams_max) * body_bytes_max <= (1 << 16) - 1);
         }
 
         /// One stream's answer, as the frames told it.
@@ -197,33 +243,36 @@ pub fn Client(comptime IoType: type) type {
             body_len: u32 = 0,
             ended: bool = false,
             reset: bool = false,
+            /// A POST's RST_STREAM(NO_ERROR) after its answer ended.
+            stopped: bool = false,
         };
 
+        /// One stream per plan. A flood counts them and asks nothing of
+        /// them: its frames are its mode's. `salt` tells this client's
+        /// bodies apart from every other client's: its index, say.
         pub fn prepare(
             client: *Self,
             io: *IoType,
             address: std.Io.net.IpAddress,
-            streams: u8,
+            plans: []const Plan,
+            salt: u8,
             clean: bool,
             mode: Mode,
         ) void {
-            assert(streams >= 1);
-            assert(streams <= streams_max);
+            assert(plans.len >= 1);
+            assert(plans.len <= streams_max);
             client.io = io;
             client.address = address;
-            client.streams = streams;
+            client.streams = @intCast(plans.len);
+            @memcpy(client.plans[0..plans.len], plans);
+            client.salt = salt;
             client.clean = clean;
             client.mode = mode;
             var len: u32 = 0;
             append(&client.request, &len, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
             writeFrame(&client.request, &len, frame_settings, 0, 0, "");
             switch (mode) {
-                .exchange => {
-                    var index: u8 = 0;
-                    while (index < streams) : (index += 1) {
-                        writeHead(&client.request, &len, streamId(index), "GET", flag_end_stream | flag_end_headers);
-                    }
-                },
+                .exchange => client.writeExchange(&len),
                 .rapid_reset => client.writeRounds(&len),
                 else => writeFlood(&client.request, &len, mode),
             }
@@ -366,9 +415,13 @@ pub fn Client(comptime IoType: type) type {
             if (client.overrun) return error.ResponseOverrun;
             if (client.mode != .exchange) return client.verifyFlood();
             var answers: [streams_max]Answer = @splat(.{});
-            const goaway_last = try readAnswers(client.receive_buffer[0..client.received_len], client.streams, &answers);
-            const allowed = scripts.spec(.get).allowed_statuses;
-            for (answers[0..client.streams], 0..) |*answer, index| {
+            const plans = client.plans[0..client.streams];
+            const goaway_last = try readAnswers(client.receive_buffer[0..client.received_len], plans, &answers);
+            for (answers[0..client.streams], plans, 0..) |*answer, plan, index| {
+                // A POST's statuses are the sized POST script's: `get`'s,
+                // and the #236 body cap's 413.
+                const script: scripts.Script = if (plan.carriesBody()) .post_sized else .get;
+                const allowed = scripts.spec(script).allowed_statuses;
                 if (answer.status != 0 and std.mem.indexOfScalar(u16, allowed, answer.status) == null) {
                     return error.StatusUnexpected;
                 }
@@ -378,8 +431,10 @@ pub fn Client(comptime IoType: type) type {
                 if (answer.status == 200) try checkBody(answer, client.clean);
                 if (!client.clean) continue;
                 // A clean seed meets no adversary: every stream is answered,
-                // whole, by its origin.
-                if (answer.status != 200 or !answer.ended or answer.reset) return error.GoldenOutcomeMissed;
+                // whole, by its origin, which answers a POST only once its
+                // body is in, so none is stopped.
+                if (answer.status != 200 or !answer.ended) return error.GoldenOutcomeMissed;
+                if (answer.reset or answer.stopped) return error.GoldenOutcomeMissed;
             }
         }
 
@@ -569,7 +624,7 @@ pub fn Client(comptime IoType: type) type {
         /// went out, and fold them into one answer per stream. The result
         /// is the lowest last-stream identifier any GOAWAY named, or null
         /// if none came.
-        fn readAnswers(bytes: []const u8, streams: u8, answers: *[streams_max]Answer) ClientError!?u31 {
+        fn readAnswers(bytes: []const u8, plans: []const Plan, answers: *[streams_max]Answer) ClientError!?u31 {
             var reader: ResponseReader = undefined;
             reader.init();
             var goaway_last: ?u31 = null;
@@ -594,8 +649,9 @@ pub fn Client(comptime IoType: type) type {
                     goaway_last = @min(goaway_last orelse last, last);
                     continue;
                 }
-                const answer = answerFor(answers, streams, id) orelse return error.StreamUnexpected;
-                try foldFrame(&reader, answer, header[3], header[4], payload);
+                const answer = answerFor(answers, @intCast(plans.len), id) orelse return error.StreamUnexpected;
+                const plan = plans[@divExact(id - 1, 2)];
+                try foldFrame(&reader, answer, plan.carriesBody(), header[3], header[4], payload);
             }
             assert(offset <= bytes.len);
             return goaway_last;
@@ -614,11 +670,13 @@ pub fn Client(comptime IoType: type) type {
         fn foldFrame(
             reader: *ResponseReader,
             answer: *Answer,
+            carries_body: bool,
             frame_type: u8,
             flags: u8,
             payload: []const u8,
         ) ClientError!void {
-            if (answer.ended or answer.reset) return error.StreamUnexpected;
+            if (answer.reset or answer.stopped) return error.StreamUnexpected;
+            if (answer.ended) return stopAfterAnswer(answer, carries_body, frame_type, payload);
             assert(answer.body_len == 0 or answer.status != 0);
             switch (frame_type) {
                 frame_headers => {
@@ -644,6 +702,21 @@ pub fn Client(comptime IoType: type) type {
                 else => {},
             }
             if (endsStream(frame_type, flags)) answer.ended = true;
+        }
+
+        /// Past its answer's end, a POST's stream may hear one frame more:
+        /// RST_STREAM(NO_ERROR), the server done with a body it no longer
+        /// wants (RFC 9113 §8.1). Anything else, and anything on a GET's
+        /// stream, whose client had ended its half, is past the stream.
+        fn stopAfterAnswer(answer: *Answer, carries_body: bool, frame_type: u8, payload: []const u8) ClientError!void {
+            assert(answer.ended);
+            assert(!answer.reset);
+            assert(!answer.stopped);
+            if (!carries_body) return error.StreamUnexpected;
+            if (frame_type != frame_rst_stream) return error.StreamUnexpected;
+            if (payload.len != 4) return error.FramesCorrupted;
+            if (std.mem.readInt(u32, payload[0..4], .big) != code_no_error) return error.StreamUnexpected;
+            answer.stopped = true;
         }
 
         /// END_STREAM on a frame that carries it: DATA or HEADERS.
@@ -696,21 +769,95 @@ pub fn Client(comptime IoType: type) type {
             return 2 * @as(u31, index) + 1;
         }
 
+        /// Every stream's head, then the POSTs' DATA frames in turns, one
+        /// of each body per turn: multiplexed, as a client sends them.
+        fn writeExchange(client: *Self, len: *u32) void {
+            assert(client.mode == .exchange);
+            const plans = client.plans[0..client.streams];
+            for (plans, 0..) |plan, index| {
+                const id = streamId(@intCast(index));
+                writeRequestHead(&client.request, len, id, client.bodySalt(id), plan);
+            }
+            var written: [streams_max]u32 = @splat(0);
+            var turn: u8 = 0;
+            while (turn < body_frames_max) : (turn += 1) {
+                for (plans, 0..) |plan, index| {
+                    if (turn >= plan.frames) continue;
+                    const last = turn + 1 == plan.frames;
+                    const size = if (last) plan.body_len - written[index] else plan.body_len / plan.frames;
+                    assert(size >= 1);
+                    const id = streamId(@intCast(index));
+                    writeBody(&client.request, len, id, client.bodySalt(id), written[index], size, last);
+                    written[index] += size;
+                }
+            }
+            for (plans, written[0..plans.len]) |plan, sent| assert(sent == plan.body_len);
+        }
+
+        /// Stream `id`'s body salt: this client's, then the stream's own.
+        fn bodySalt(client: *const Self, id: u31) u32 {
+            assert(id % 2 == 1);
+            assert(id < 1 << 8);
+            return @as(u32, client.salt) << 8 | id;
+        }
+
+        /// A stream's head: `get`'s, which ends the stream, or a POST's,
+        /// whose body follows, with its length declared if the plan says
+        /// so and its mark (#373) whichever way.
+        fn writeRequestHead(out: *[request_bytes_max]u8, len: *u32, id: u31, salt: u32, plan: Plan) void {
+            assert(plan.carriesBody() == (plan.frames >= 1));
+            const start = len.*;
+            if (!plan.carriesBody()) {
+                writeHead(out, len, id, "GET", flag_end_stream | flag_end_headers);
+                return;
+            }
+            assert(plan.frames <= body_frames_max);
+            assert(plan.body_len >= plan.frames);
+            assert(plan.body_len <= body_bytes_max);
+            var length_bytes: [10]u8 = undefined;
+            const length = std.fmt.bufPrint(&length_bytes, "{d}", .{plan.body_len}) catch unreachable;
+            var mark_bytes: [24]u8 = undefined;
+            const mark = std.fmt.bufPrint(&mark_bytes, "{d}.{d}", .{ plan.body_len, salt }) catch unreachable;
+            const marked = [_][2][]const u8{.{ canon.request_body_header, mark }};
+            const declared = [_][2][]const u8{ .{ "content-length", length }, marked[0] };
+            const extra: []const [2][]const u8 = if (plan.ask == .post_declared) &declared else &marked;
+            writeHeadTraced(out, len, id, "POST", flag_end_headers, canon.log_request_value, extra);
+            assert(len.* - start <= head_bytes_max);
+        }
+
+        /// `size` octets of stream `id`'s marked body, from `offset`, in
+        /// one DATA frame: the octets `canon.requestBodyOctet` names.
+        fn writeBody(out: *[request_bytes_max]u8, len: *u32, id: u31, salt: u32, offset: u32, size: u32, last: bool) void {
+            assert(size >= 1);
+            assert(offset + size <= body_bytes_max);
+            var header: [9]u8 = undefined;
+            std.mem.writeInt(u24, header[0..3], @intCast(size), .big);
+            header[3] = frame_data;
+            header[4] = if (last) flag_end_stream else 0;
+            std.mem.writeInt(u32, header[5..9], id, .big);
+            append(out, len, &header);
+            assert(len.* + size <= out.len);
+            for (out[len.*..][0..size], offset..) |*octet, index| {
+                octet.* = canon.requestBodyOctet(salt, @intCast(index));
+            }
+            len.* += size;
+        }
+
         /// A request head for `get`'s path, with `method`, every field a
         /// literal without indexing on a new name (RFC 7541 §6.2.2): no
         /// table on this side either.
         fn writeHead(out: *[request_bytes_max]u8, len: *u32, id: u31, method: []const u8, flags: u8) void {
-            writeHeadTraced(out, len, id, method, flags, canon.log_request_value);
+            writeHeadTraced(out, len, id, method, flags, canon.log_request_value, &.{});
         }
 
         /// A flood's request head: traced as one, so the access log can
         /// tell the exchanges the server ended on purpose.
         fn writeFloodHead(out: *[request_bytes_max]u8, len: *u32, id: u31, method: []const u8, flags: u8) void {
-            writeHeadTraced(out, len, id, method, flags, canon.log_request_flood_value);
+            writeHeadTraced(out, len, id, method, flags, canon.log_request_flood_value, &.{});
         }
 
         /// `writeHead`'s frame, carrying `trace` as the access log's
-        /// correlation value.
+        /// correlation value, and `extra` fields after it.
         fn writeHeadTraced(
             out: *[request_bytes_max]u8,
             len: *u32,
@@ -718,6 +865,7 @@ pub fn Client(comptime IoType: type) type {
             method: []const u8,
             flags: u8,
             trace: []const u8,
+            extra: []const [2][]const u8,
         ) void {
             const start = len.*;
             len.* += 9;
@@ -729,6 +877,11 @@ pub fn Client(comptime IoType: type) type {
                 .{ canon.log_request_header, trace },
             };
             for (fields) |field| {
+                append(out, len, "\x00");
+                literal(out, len, field[0]);
+                literal(out, len, field[1]);
+            }
+            for (extra) |field| {
                 append(out, len, "\x00");
                 literal(out, len, field[0]);
                 literal(out, len, field[1]);
