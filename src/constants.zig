@@ -899,6 +899,20 @@ comptime {
     assert((@as(u64, 1) << passive_backoff_level_max) >= timeout_ms_max);
 }
 
+/// The ceiling on a cluster's #392 `max_total_inflight`. Arbitrary but
+/// generous: the in-flight total it is compared against is a sum of
+/// per-endpoint counts, each at most 2^17, and no deployment holds a
+/// cluster's worth of work past sixteen million.
+pub const cluster_inflight_max: u32 = 1 << 24;
+comptime {
+    // A cluster's cap can be set at least as high as one endpoint's can,
+    // or a one-endpoint cluster could not express the cap it already has.
+    assert(cluster_inflight_max >= endpoint_inflight_max);
+    // And the per-endpoint load it sums — two u16 tables — stays the
+    // 2^17 the comment above prices it at.
+    assert(2 * @as(u32, std.math.maxInt(u16)) < (1 << 17));
+}
+
 /// The legal range of a cluster's #390 `panic_threshold_percent`. Zero
 /// is the absent rule — fail open only at zero healthy — so it has its
 /// spelling already; 100 would panic at the first ejection, which is

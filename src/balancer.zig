@@ -436,6 +436,11 @@ pub const Balancer = struct {
         /// filter alone can never empty the routable set (`init` proves
         /// at least one endpoint holds weight).
         exhausted,
+        /// #392: the cluster's total in-flight work is at its
+        /// `max_total_inflight`. Apart from `capped` because the two are
+        /// different questions — one origin full, or this cluster's share
+        /// of the process spent — and an operator widens different things.
+        cluster_capped,
     };
 
     /// Choose the endpoint to dial for `cluster_index` under the
@@ -470,7 +475,9 @@ pub const Balancer = struct {
         // left to go, which is the quiet direction to be wrong in.
         for (tried) |index| assert(index < cluster.endpoints.len);
         const steers = healthSteers(balancer.keys, cluster_index, cluster, healthy);
-        if (tried.len == 0 and cluster.endpoints.len == 1 and cluster.max_inflight == null) {
+        if (tried.len == 0 and cluster.endpoints.len == 1 and cluster.max_inflight == null and
+            cluster.max_total_inflight == null)
+        {
             // Neither a rotation nor a draw: uncapped single-endpoint
             // clusters stay branch-cheap and policy state is untouched.
             // The mask is moot too — one endpoint ejected is the
@@ -484,6 +491,16 @@ pub const Balancer = struct {
                 .ejected = !healthy[balancer.keys.key(cluster_index, 0)],
                 .panicked = !steers,
             } };
+        }
+        // A first try only. Today this is insurance rather than a live
+        // exemption: a retry and a stale replay both give their lease back
+        // before they re-pick, so the total never counts them twice. The
+        // rule it states — a request the cap admitted is not refused by it
+        // — is what has to survive if that ordering ever changes.
+        if (tried.len == 0) {
+            if (cluster.max_total_inflight) |cap| {
+                if (clusterInFlight(balancer.keys, cluster_index, cluster, load) >= cap) return .cluster_capped;
+            }
         }
         const eligible = balancer.eligible_scratch;
         const candidates = candidateEndpoints(balancer.keys, cluster_index, cluster, healthy, steers, tried, eligible);
@@ -593,6 +610,24 @@ pub const Balancer = struct {
         assert(count >= 1 or tried.len >= 1);
         assert(count <= cluster.endpoints.len);
         return count;
+    }
+
+    /// The cluster's total in-flight work (#392): every endpoint's leases
+    /// and live L4 connections, the same units `max_inflight` caps one at.
+    fn clusterInFlight(
+        keys: upstream.EndpointKeys,
+        cluster_index: u16,
+        cluster: *const config_module.Config.Cluster,
+        load: *const upstream.Load,
+    ) u64 {
+        assert(cluster.endpoints.len >= 1);
+        var total: u64 = 0;
+        for (0..cluster.endpoints.len) |endpoint_index| {
+            total += load.inFlight(keys.key(cluster_index, @intCast(endpoint_index)));
+        }
+        // `Load.inFlight` is two u16 tables summed per endpoint.
+        assert(total <= @as(u64, cluster.endpoints.len) * 2 * std.math.maxInt(u16));
+        return total;
     }
 
     /// Whether the health mask filters this cluster's picks (#390): while
@@ -1561,6 +1596,40 @@ test "balancer: a retry cannot tip its cluster into panic (#390)" {
         const picked = balancer.pick(0, &testLoad(&counts), &healthy, &test_client, .none, &tried).dial;
         try std.testing.expectEqual(@as(u16, 1), picked.endpoint_index);
     }
+}
+
+test "balancer: a cluster at its total cap refuses a first try, never a retry (#392)" {
+    const pair = [_]io_module.Address{ ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2") };
+    const one = [_]io_module.Address{ipEndpoint("127.0.0.1:3")};
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "pair", .endpoints = &pair, .pick = .rr, .max_total_inflight = 3 },
+        // One endpoint, no per-endpoint cap: the branch-cheap fast path,
+        // which a total cap has to opt out of to be read at all.
+        .{ .name = "one", .endpoints = &one, .max_total_inflight = 1 },
+    };
+    const config = testConfig(&clusters);
+    const keys = testKeysFor(&config);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, keys);
+
+    // Two in flight on one endpoint, none on the other: under the cap of
+    // three, so a first try dials.
+    var l7: [test_counts_len]u16 = @splat(0);
+    l7[keys.key(0, 0)] = 2;
+    try std.testing.expect(balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none, test_untried) == .dial);
+    // Three across the cluster is the cap, whichever endpoints carry it.
+    l7[keys.key(0, 1)] = 1;
+    try std.testing.expect(balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none, test_untried) == .cluster_capped);
+    // A retry belongs to a request the cap admitted: it is never refused
+    // by it, and goes to the endpoint it has not tried.
+    const tried = [_]u16{0};
+    try std.testing.expectEqual(@as(u16, 1), balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none, &tried).dial.endpoint_index);
+    // The single-endpoint fast path does not skip the cap.
+    l7[keys.key(1, 0)] = 1;
+    try std.testing.expect(balancer.pick(1, &testLoad(&l7), &test_healthy_all, &test_client, .none, test_untried) == .cluster_capped);
 }
 
 test "balancer: policies keep independent state across clusters" {

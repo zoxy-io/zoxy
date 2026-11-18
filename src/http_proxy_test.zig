@@ -1006,6 +1006,8 @@ const Http1Bed = struct {
         /// §8 per-endpoint concurrency cap; null leaves the cluster
         /// uncapped, which is what every pre-existing scenario wants.
         max_inflight: ?u32 = null,
+        /// #392's cluster-wide cap; null leaves the cluster uncapped.
+        max_total_inflight: ?u32 = null,
         /// The #159 pre-rendered error pages; empty for every
         /// pre-existing scenario, so the comptime statics keep serving.
         error_pages: []const *const config_module.Config.StaticPage = &.{},
@@ -1063,6 +1065,7 @@ const Http1Bed = struct {
             .check = options.check,
             .passive_ejection = options.passive_ejection,
             .max_inflight = options.max_inflight,
+            .max_total_inflight = options.max_total_inflight,
             .pick = options.pick,
             .hash_key = options.hash_key,
             .retries = options.retries,
@@ -1913,12 +1916,15 @@ test "h2: a pool's rung answers its stream — and the sibling holding the pool 
         upstream_slots: u32 = 2,
         upstream_head_buffers: ?u32 = null,
         max_inflight: ?u32 = null,
+        max_total_inflight: ?u32 = null,
     };
     const rungs = [_]Rung{
         .{ .counter = "l7_shed_relay_buffers", .relay_buffers = 1 },
         .{ .counter = "l7_shed_upstream_slots", .upstream_slots = 1 },
         .{ .counter = "l7_shed_upstream_head_buffers", .upstream_head_buffers = 1 },
         .{ .counter = "l7_shed_endpoint_inflight", .max_inflight = 1 },
+        // #392: the cluster's whole share, one unit, held by stream 1.
+        .{ .counter = "l7_shed_total_inflight", .max_total_inflight = 1 },
     };
     inline for (rungs, 0..) |rung, index| {
         var options = h2BedOptions(60 + index);
@@ -1926,6 +1932,7 @@ test "h2: a pool's rung answers its stream — and the sibling holding the pool 
         options.upstream_slots = rung.upstream_slots;
         options.upstream_head_buffers = rung.upstream_head_buffers;
         options.max_inflight = rung.max_inflight;
+        options.max_total_inflight = rung.max_total_inflight;
         var bed: Http1Bed = undefined;
         try bed.setUp(std.testing.allocator, options);
         defer bed.tearDown();

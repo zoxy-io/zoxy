@@ -870,6 +870,7 @@ fn wireClusters(
             .passive_ejection = health.passive_l4,
             .panic_threshold_percent = derivePanicThreshold(random, health.check_l4 != null or health.passive_l4 != null),
             .max_inflight = deriveMaxInflight(harness.clean, random),
+            .max_total_inflight = deriveMaxInflight(harness.clean, random),
             .proxy_protocol_send = harness.proxy_protocol_send_l4,
         },
         .{
@@ -885,6 +886,7 @@ fn wireClusters(
             .passive_ejection = health.passive_http,
             .panic_threshold_percent = derivePanicThreshold(random, health.check_http != null or health.passive_http != null),
             .max_inflight = deriveMaxInflight(harness.clean, random),
+            .max_total_inflight = deriveMaxInflight(harness.clean, random),
             .retries = harness.retries_http,
         },
     };
@@ -3199,6 +3201,9 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         "l7_shed_h2_origin_streams",
         "l7_shed_upstream_tls",
         "l7_shed_endpoint_inflight",
+        // #392's cluster-wide cap: a shed answered through `respond`,
+        // owing a line like the endpoint cap beside it.
+        "l7_shed_total_inflight",
         "l7_bad_gateway",
         "l7_gateway_timeout",
         // A gRPC call's own deadline: the same verdict, answered as gRPC

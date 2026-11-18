@@ -3995,6 +3995,15 @@ pub fn Server(comptime IoType: type) type {
                 // Unreachable with nothing tried: only a retry can run
                 // the routable set empty.
                 .exhausted => unreachable,
+                .cluster_capped => {
+                    // #392's cap, answered the way L4 answers every cap:
+                    // a close, before anything was armed for a dial.
+                    server.counters.increment("l4_shed_total_inflight");
+                    server.labeled.incrementCluster(.l4_shed_total_inflight, cluster_index);
+                    assert(!conn.stream.armed.connect);
+                    server.beginTeardown(conn);
+                    return;
+                },
                 .capped => {
                     // Every endpoint is at its §8 cap. An L4 listener has no
                     // way to say so — it relays bytes, and there is no

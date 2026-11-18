@@ -2444,8 +2444,16 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   `keepalive_requests` (above). A client that overspends one of
   its per-connection budgets gets `GOAWAY(ENHANCE_YOUR_CALM)` (§8).
 
-- **Still deferred**: circuit breakers, Envoy-style *outlier detection*
-  (success-rate and stddev maths) and *aggregate* retry budgets. The
+- **Still deferred**: Envoy-style *outlier detection* (success-rate and
+  stddev maths) and *aggregate* retry budgets. A cluster-wide in-flight
+  cap — the part of Envoy's circuit breakers this proxy lacked — landed
+  as `max_total_inflight` (#392): one slow cluster could otherwise hold
+  the upstream pool every other cluster shares, which `max_inflight`
+  cannot stop when no per-endpoint cap is set. It is judged at the pick
+  over the same per-endpoint load the per-endpoint cap reads (HTTP/1.1
+  leases from before the dial, HTTP/2 exchanges, live L4 connections),
+  on a request's first try only: a retry continues work the cap already
+  admitted. The
   previous iteration proved them buildable here; simplicity says they
   wait for a demonstrated need, and fail-open plus a consecutive count
   is why the simple thing sufficed. Panic thresholds left this list
@@ -2474,6 +2482,7 @@ the loop thread.
 | upstream slots / dial concurrency | upstream checkout | static `503` (L7), then keep or close per pressure / close (L4) | **stream** — `503` on it |
 | upstream head buffers | beside the slot, as it is obtained | static `503`, then keep or close per pressure | **stream** — `503` on it |
 | **origin capacity** — every endpoint at its `max_inflight` | endpoint pick | static `503` (L7) / close (L4) | **stream** — `503` on it |
+| **cluster share** — the cluster's total at its `max_total_inflight` (#392) | endpoint pick, first try only | static `503` (L7) / close (L4) | **stream** — `503` on it |
 | tunnels | the upgrade request, **before** it is forwarded | static `503`, then keep or close per pressure | — no upgrade reaches HTTP/2 |
 | request deadline | timer completion | `504` if no response byte was sent — a timed-out dial included; teardown once a response byte is on the wire or the stall is the client's own body | **stream** — `504`, or its reset |
 | head-read budget | timer completion | `408` for a client that began a head and stopped; **silence earns none** — a connection that said nothing was never under the budget | **connection**, while h2c's preface is read; after it, the idle window |
