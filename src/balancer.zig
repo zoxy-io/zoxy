@@ -402,6 +402,12 @@ pub const Balancer = struct {
             if (cluster.weights) |weights| {
                 assert(weights.len == cluster.endpoints.len);
             }
+            // #396's tiers are the loader's to bound; a table built any
+            // other way (a test, the simulator) is held to the same range.
+            if (cluster.priorities) |priorities| {
+                assert(priorities.len == cluster.endpoints.len);
+                for (priorities) |priority| assert(priority <= constants.endpoint_priority_max);
+            }
         }
         assert(balancer.rr_current.len == keys.count);
         assert(balancer.endpoint_hashes.len == keys.count);
@@ -419,6 +425,9 @@ pub const Balancer = struct {
         /// The cluster was below its panic threshold when this pick ran,
         /// so health did not steer it (#390). Always false without one.
         panicked: bool,
+        /// The chosen endpoint is in a #396 standby tier (priority > 0):
+        /// every tier below it had nothing usable.
+        standby: bool,
     };
 
     /// What a pick concluded. The two empty answers are different rungs
@@ -490,6 +499,7 @@ pub const Balancer = struct {
                 .endpoint_index = 0,
                 .ejected = !healthy[balancer.keys.key(cluster_index, 0)],
                 .panicked = !steers,
+                .standby = tierOf(cluster, 0) > 0,
             } };
         }
         // A first try only. Today this is insurance rather than a live
@@ -502,25 +512,15 @@ pub const Balancer = struct {
                 if (clusterInFlight(balancer.keys, cluster_index, cluster, load) >= cap) return .cluster_capped;
             }
         }
+        const narrowed = balancer.narrow(cluster_index, cluster, load, healthy, steers, tried);
+        const set = switch (narrowed) {
+            .exhausted => return .exhausted,
+            .capped => return .capped,
+            .choose => |set| set,
+        };
         const eligible = balancer.eligible_scratch;
-        const candidates = candidateEndpoints(balancer.keys, cluster_index, cluster, healthy, steers, tried, eligible);
-        if (candidates == 0) {
-            // A single-endpoint cluster cannot retry, and neither can one
-            // whose every routable endpoint this request has already
-            // dialed. Health does not fail open past this: the endpoints
-            // it would resurrect are the ones that just failed.
-            assert(tried.len >= 1);
-            return .exhausted;
-        }
-        const count = underCapacity(balancer.keys, cluster_index, cluster, load, eligible[0..candidates]);
-        if (count == 0) {
-            // Every candidate is at its §8 cap. Unlike the health mask
-            // this does *not* fail open: an ejected cluster means "we do
-            // not know, try anyway", while a capped one means "we know
-            // they are full", and dialing anyway is the exact thing the
-            // cap exists to stop.
-            return .capped;
-        }
+        const count = set.count;
+        assert(count >= 1);
         const chosen = switch (cluster.pick) {
             .rr => balancer.pickRoundRobin(cluster_index, eligible[0..count]),
             .p2c => balancer.placeByLoad(cluster_index, eligible[0..count], load),
@@ -539,8 +539,116 @@ pub const Balancer = struct {
             .address = cluster.endpoints[chosen],
             .endpoint_index = chosen,
             .ejected = ejected,
-            .panicked = !steers,
+            .panicked = set.panicked,
+            .standby = tierOf(cluster, chosen) > 0,
         } };
+    }
+
+    /// What a pick chooses between, left in `eligible_scratch`, or why it
+    /// cannot choose at all.
+    const Narrowed = union(enum) {
+        choose: struct { count: u16, panicked: bool },
+        exhausted,
+        capped,
+    };
+
+    /// The candidates a pick's policy runs over: health (§7, #390), then
+    /// §8 capacity (with #391's ramp), then — in a tiered cluster — the
+    /// lowest #396 tier left.
+    ///
+    /// A tiered cluster first tries the *healthy* endpoints of every tier,
+    /// whatever its panic threshold says: a usable standby is preferred to
+    /// reopening an ejected primary, which is the failover's whole point.
+    /// Only when no tier has a healthy endpoint with room does the
+    /// ordinary path run — panic or fail-open over every tier — and its
+    /// result is narrowed to the lowest tier too.
+    fn narrow(
+        balancer: *const Balancer,
+        cluster_index: u16,
+        cluster: *const config_module.Config.Cluster,
+        load: *const upstream.Load,
+        healthy: []const bool,
+        steers: bool,
+        tried: []const u16,
+    ) Narrowed {
+        const keys = balancer.keys;
+        const eligible = balancer.eligible_scratch;
+        assert(eligible.len >= cluster.endpoints.len);
+        assert(tried.len <= cluster.endpoints.len);
+        if (cluster.priorities) |priorities| {
+            const healthy_count = healthyCandidates(keys, cluster_index, cluster, healthy, tried, eligible);
+            if (healthy_count >= 1) {
+                const count = underCapacity(keys, cluster_index, cluster, load, eligible[0..healthy_count]);
+                if (count >= 1) return .{ .choose = .{ .count = lowestTier(priorities, eligible[0..count]), .panicked = false } };
+            }
+        }
+        const candidates = candidateEndpoints(keys, cluster_index, cluster, healthy, steers, tried, eligible);
+        if (candidates == 0) {
+            // A single-endpoint cluster cannot retry, and neither can one
+            // whose every routable endpoint this request has already
+            // dialed. Health does not fail open past this: the endpoints
+            // it would resurrect are the ones that just failed.
+            assert(tried.len >= 1);
+            return .exhausted;
+        }
+        const count = underCapacity(keys, cluster_index, cluster, load, eligible[0..candidates]);
+        // Every candidate is at its §8 cap. Unlike the health mask this
+        // does *not* fail open: an ejected cluster means "we do not know,
+        // try anyway", while a capped one means "we know they are full",
+        // and dialing anyway is the exact thing the cap exists to stop.
+        if (count == 0) return .capped;
+        assert(count <= candidates);
+        const narrowed = if (cluster.priorities) |priorities| lowestTier(priorities, eligible[0..count]) else count;
+        return .{ .choose = .{ .count = narrowed, .panicked = !steers } };
+    }
+
+    /// The routable, untried endpoints the health mask holds healthy,
+    /// with no fallback — the first pass of a tiered pick (#396).
+    fn healthyCandidates(
+        keys: upstream.EndpointKeys,
+        cluster_index: u16,
+        cluster: *const config_module.Config.Cluster,
+        healthy: []const bool,
+        tried: []const u16,
+        eligible: []u16,
+    ) u16 {
+        assert(cluster.endpoints.len <= eligible.len);
+        var count: u16 = 0;
+        for (0..cluster.endpoints.len) |endpoint_index| {
+            const index: u16 = @intCast(endpoint_index);
+            if (weightOf(cluster, index) == 0) continue;
+            if (alreadyTried(tried, index)) continue;
+            if (!healthy[keys.key(cluster_index, index)]) continue;
+            eligible[count] = index;
+            count += 1;
+        }
+        assert(count <= cluster.endpoints.len);
+        return count;
+    }
+
+    /// Keep only the lowest #396 tier present in `eligible`, in place and
+    /// in order, and return how many that is. Never empties the set.
+    fn lowestTier(priorities: []const u8, eligible: []u16) u16 {
+        assert(eligible.len >= 1);
+        var lowest: u8 = std.math.maxInt(u8);
+        for (eligible) |index| lowest = @min(lowest, priorities[index]);
+        var kept: u16 = 0;
+        for (eligible) |index| {
+            if (priorities[index] != lowest) continue;
+            eligible[kept] = index;
+            kept += 1;
+        }
+        assert(kept >= 1);
+        assert(kept <= eligible.len);
+        return kept;
+    }
+
+    /// An endpoint's #396 tier: 0 in an untiered cluster.
+    fn tierOf(cluster: *const config_module.Config.Cluster, endpoint_index: u16) u8 {
+        assert(endpoint_index < cluster.endpoints.len);
+        const priorities = cluster.priorities orelse return 0;
+        assert(priorities.len == cluster.endpoints.len);
+        return priorities[endpoint_index];
     }
 
     /// The endpoints a pick may choose between before capacity is read,
@@ -1710,6 +1818,95 @@ test "balancer: a just-restored endpoint is capped below max_inflight until its 
         if (balancer.pick(0, &settled, &test_healthy_all, &test_client, .none, test_untried).dial.endpoint_index == 0) reached_zero = true;
     }
     try std.testing.expect(reached_zero);
+}
+
+test "balancer: a standby tier takes traffic only when the primary tier has nothing usable (#396)" {
+    const trio = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2"), ipEndpoint("127.0.0.1:3"),
+    };
+    const priorities = [_]u8{ 0, 0, 1 };
+    const clusters = [_]config_module.Config.Cluster{.{
+        .name = "tiered",
+        .endpoints = &trio,
+        .pick = .rr,
+        .priorities = &priorities,
+        .max_inflight = 1,
+    }};
+    const config = testConfig(&clusters);
+    const keys = testKeysFor(&config);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, keys);
+
+    // Both primaries usable: the standby is never picked.
+    var l7: [test_counts_len]u16 = @splat(0);
+    for (0..6) |_| {
+        const picked = balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none, test_untried).dial;
+        try std.testing.expect(picked.endpoint_index != 2);
+        try std.testing.expect(!picked.standby);
+    }
+    // Primaries full: the load spills to the standby, and says so.
+    l7[keys.key(0, 0)] = 1;
+    l7[keys.key(0, 1)] = 1;
+    const spilled = balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none, test_untried).dial;
+    try std.testing.expectEqual(@as(u16, 2), spilled.endpoint_index);
+    try std.testing.expect(spilled.standby);
+    // Every tier full: shed, never past a cap.
+    l7[keys.key(0, 2)] = 1;
+    try std.testing.expect(balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none, test_untried) == .capped);
+
+    // Primaries ejected, standby healthy and free: the standby.
+    l7 = @splat(0);
+    var healthy = test_healthy_all;
+    healthy[keys.key(0, 0)] = false;
+    healthy[keys.key(0, 1)] = false;
+    try std.testing.expectEqual(@as(u16, 2), balancer.pick(0, &testLoad(&l7), &healthy, &test_client, .none, test_untried).dial.endpoint_index);
+    // Nothing healthy anywhere: fail-open, to the primary tier first.
+    healthy[keys.key(0, 2)] = false;
+    const opened = balancer.pick(0, &testLoad(&l7), &healthy, &test_client, .none, test_untried).dial;
+    try std.testing.expect(opened.endpoint_index != 2);
+    try std.testing.expect(opened.ejected);
+    // A retry that tried both primaries goes to the standby.
+    const tried = [_]u16{ 0, 1 };
+    try std.testing.expectEqual(@as(u16, 2), balancer.pick(0, &testLoad(&l7), &test_healthy_all, &test_client, .none, &tried).dial.endpoint_index);
+}
+
+test "balancer: a usable standby comes before panic reopens an ejected primary (#396, #390)" {
+    const quad = [_]io_module.Address{
+        ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2"),
+        ipEndpoint("127.0.0.1:3"), ipEndpoint("127.0.0.1:4"),
+    };
+    const priorities = [_]u8{ 0, 0, 0, 1 };
+    const clusters = [_]config_module.Config.Cluster{.{
+        .name = "tiered",
+        .endpoints = &quad,
+        .pick = .rr,
+        .priorities = &priorities,
+        .panic_threshold_percent = 90,
+    }};
+    const config = testConfig(&clusters);
+    const keys = testKeysFor(&config);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, keys);
+
+    // Two of three primaries ejected: half the cluster's weight healthy,
+    // under the 90 percent threshold, so an untiered cluster would panic.
+    // Here a healthy primary and a healthy standby remain, and health
+    // still steers: the lowest healthy tier, never an ejected endpoint.
+    var healthy = test_healthy_all;
+    healthy[keys.key(0, 0)] = false;
+    healthy[keys.key(0, 1)] = false;
+    const l7: [test_counts_len]u16 = @splat(0);
+    for (0..4) |_| {
+        const picked = balancer.pick(0, &testLoad(&l7), &healthy, &test_client, .none, test_untried).dial;
+        try std.testing.expectEqual(@as(u16, 2), picked.endpoint_index);
+        try std.testing.expect(!picked.panicked and !picked.ejected);
+    }
 }
 
 test "balancer: policies keep independent state across clusters" {

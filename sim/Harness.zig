@@ -186,6 +186,11 @@ endpoints_http_count: u16,
 /// the endpoint list it parallels.
 weights_l4: [1]u16,
 weights_http: [2]u16,
+/// #396's tiers for a two-endpoint http cluster: the origin in standby
+/// behind the refusing endpoint, so every request that reaches the origin
+/// does so by failing over to it — a retry off the refused primary, or the
+/// healthy pass once the primary is ejected.
+priorities_http: [2]u8,
 clusters: [2]zoxy.config.Config.Cluster,
 routes_l4: [1]zoxy.http.router.Route,
 routes_http: [1]zoxy.http.router.Route,
@@ -820,6 +825,9 @@ fn deriveTopology(harness: *Harness, random: std.Random) void {
     // properties are pinned by balancer.zig's own tests, exactly like
     // `hash`'s stickiness above.
     harness.weights_l4 = .{1 + random.uintAtMost(u16, 255)};
+    // #396's tiers, assigned rather than defaulted: the harness is built
+    // `undefined`, so a field default would never apply.
+    harness.priorities_http = .{ 1, 0 };
     harness.weights_http = .{
         1 + random.uintAtMost(u16, 255),
         1 + random.uintAtMost(u16, 255),
@@ -884,6 +892,10 @@ fn wireClusters(
             else
                 null,
             .pick = picks.http,
+            .priorities = if (harness.endpoints_http_count == 2 and random.boolean())
+                &harness.priorities_http
+            else
+                null,
             .hash_key = picks.http_hash_key,
             .check = health.check_http,
             .passive_ejection = health.passive_http,

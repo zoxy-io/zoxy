@@ -880,6 +880,36 @@ A listener can take the same grammar; see
 The abstract namespace (a leading NUL) is out of scope: it has no
 filesystem permissions.
 
+#### Standby endpoints
+
+An endpoint can be held in reserve with `priority`:
+
+```json
+"api": {
+    "endpoints": [
+        "10.0.0.1:8080",
+        "10.0.0.2:8080",
+        { "address": "10.9.0.1:8080", "priority": 1 }
+    ],
+    "check": { "type": "http", "path": "/healthz" },
+    "max_inflight": 200
+}
+```
+
+Priority 0, the default and what a bare string means, is the primary
+tier. A request goes to the lowest tier that has an endpoint that is
+healthy, not drained and under its `max_inflight`, and the cluster's
+`pick` policy chooses within that tier. So the standby takes traffic
+when every primary is ejected, or when the primaries are full and the
+excess spills over, and its own `max_inflight` caps what it takes. A
+usable standby is preferred to [panic](#health-checks) reopening ejected
+primaries, so a tiered cluster spills to its standby tier before its panic
+threshold ever applies; the threshold acts only when no tier has a healthy
+endpoint with room. If no tier has a healthy endpoint, zoxy fails open to
+the lowest tier. Tiers are relative: the lowest one a cluster names is its
+primary. `zoxy_upstream_standby_picks`, broken down per cluster,
+counts the requests a standby tier served. Tiers run from 0 to 7.
+
 #### Accepting on a socket file
 
 `bind` takes the same `unix:` grammar, so a local process can reach zoxy
