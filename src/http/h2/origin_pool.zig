@@ -1071,7 +1071,8 @@ pub fn Mux(comptime IoType: type) type {
             assert(leg.send.delivering);
             const pending = leg.send;
             leg.send = .{};
-            const callback: *const SendCallback = @ptrCast(pending.callback.?);
+            // Function pointers are 4-aligned on aarch64: the erased pointer says 1.
+            const callback: *const SendCallback = @ptrCast(@alignCast(pending.callback.?));
             if (pending.failed) return callback(stream, error.Reset);
             assert(pending.count >= 1);
             callback(stream, pending.count);
@@ -1083,7 +1084,7 @@ pub fn Mux(comptime IoType: type) type {
             assert(leg.recv.delivering);
             const pending = leg.recv;
             leg.recv = .{};
-            const callback: *const RecvCallback = @ptrCast(pending.callback.?);
+            const callback: *const RecvCallback = @ptrCast(@alignCast(pending.callback.?));
             if (pending.failed) return callback(stream, error.Reset);
             assert(pending.count >= 1);
             callback(stream, pending.count);
