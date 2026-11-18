@@ -1340,6 +1340,14 @@ pub fn Proxy(comptime IoType: type) type {
                 else => null,
             };
             const pick = pickEndpointOrShed(server, stream, request_key) orelse return;
+            // An h2c cluster's exchanges share connections as streams (§7):
+            // there is no socket to check out or dial, only a connection to
+            // join — so the render follows at once, as on the reuse path.
+            if (clusterSpeaksH2c(server, stream)) {
+                if (!attachOrigin(server, stream, pick)) return;
+                renderRequestAndStartLegs(server, stream, request, views, scratch);
+                return;
+            }
             if (server.upstreams.checkout(stream.cluster_index, pick.endpoint_index)) |parked| {
                 server.counters.increment("upstream_reused");
                 // Recorded once the slot is actually held, never at the
@@ -1367,6 +1375,45 @@ pub fn Proxy(comptime IoType: type) type {
                 return;
             }
             dialUpstream(server, stream, pick, .fresh);
+        }
+
+        fn clusterSpeaksH2c(server: *const ServerType, stream: *const StreamType) bool {
+            assert(stream.cluster_index < server.config.clusters.len);
+            return server.config.clusters[stream.cluster_index].protocol == .h2c;
+        }
+
+        /// An h2c cluster's try (§7): an upstream slot and its head, as a
+        /// dial takes, and a leg on a connection to the picked endpoint in
+        /// place of a socket. The leg says whether that connection was
+        /// already open, which makes this a reused connection's try for
+        /// §7's free replay — the GOAWAY race is HTTP/2's stale socket.
+        /// False when shed, the answer already given.
+        fn attachOrigin(server: *ServerType, stream: *StreamType, pick: Balancer.Pick) bool {
+            assert(stream.upstream == null);
+            assert(!stream.h2_origin.attached());
+            stream.upstream = server.acquireUpstream(stream.cluster_index, pick.endpoint_index) orelse {
+                respond(server, stream, 503, "l7_shed_upstream_slots");
+                return false;
+            };
+            if (!acquireUpstreamHeadOrShed(server, stream)) return false;
+            switch (ServerType.OriginMux.attach(server, stream, stream.cluster_index, pick.endpoint_index)) {
+                .reused => {
+                    server.counters.increment("upstream_reused");
+                    stream.l7.upstream_was_reused = true;
+                },
+                .fresh => stream.l7.upstream_was_reused = false,
+                .shed_connections => {
+                    respond(server, stream, 503, "l7_shed_h2_origin_connections");
+                    return false;
+                },
+                .shed_streams => {
+                    respond(server, stream, 503, "l7_shed_h2_origin_streams");
+                    return false;
+                },
+            }
+            stream.log.endpoint_index = pick.endpoint_index;
+            stream.moveTo(.dialing);
+            return true;
         }
 
         /// Acquire the exchange's upstream head buffer (§5) — the render
@@ -1423,6 +1470,15 @@ pub fn Proxy(comptime IoType: type) type {
             if (stream.phase == .dialing) assert(budget == .carried);
             assert(stream.upstream == null);
             assert(stream.upstream_socket == null);
+            assert(!stream.h2_origin.attached());
+            // A replay's try on an h2c cluster joins a connection again
+            // rather than dialing one (§7); a retry never reaches here for
+            // one, having no dial of its own to have failed.
+            if (clusterSpeaksH2c(server, stream)) {
+                assert(budget == .fresh);
+                if (!attachOrigin(server, stream, pick)) return;
+                return renderAndStartLegs(server, stream);
+            }
             stream.upstream = server.acquireUpstream(stream.cluster_index, pick.endpoint_index) orelse {
                 return respond(server, stream, 503, "l7_shed_upstream_slots");
             };
@@ -1846,12 +1902,10 @@ pub fn Proxy(comptime IoType: type) type {
             assert(l7.request_head_sent < l7.rendered_request_len);
             l7.request_op_on_client = false; // A send on the upstream socket.
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            server.io.send(
-                stream.upstream_socket.?,
+            server.upstreamSend(
+                stream,
                 upstreamHeadBytes(stream.upstream.?)[l7.request_head_sent..l7.rendered_request_len],
                 &stream.op_data_client_to_upstream.completion,
-                StreamType,
-                stream,
                 onRequestHeadSent,
             );
         }
@@ -1940,12 +1994,10 @@ pub fn Proxy(comptime IoType: type) type {
             const base = stream.l7.request_head_len;
             stream.l7.request_op_on_client = false; // A send on the upstream socket.
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            server.io.send(
-                stream.upstream_socket.?,
+            server.upstreamSend(
+                stream,
                 direction.pending(headBytes(server, stream)[base..]),
                 &stream.op_data_client_to_upstream.completion,
-                StreamType,
-                stream,
                 onRequestExcessSent,
             );
         }
@@ -2207,12 +2259,10 @@ pub fn Proxy(comptime IoType: type) type {
             const upstream = stream.upstream.?;
             assert(upstream.head_len < upstreamHeadBytes(upstream).len);
             stream.arm(&stream.op_data_upstream_to_client, "data_upstream_to_client");
-            server.io.recv(
-                stream.upstream_socket.?,
+            server.upstreamRecv(
+                stream,
                 upstreamHeadBytes(upstream)[upstream.head_len..],
                 &stream.op_data_upstream_to_client.completion,
-                StreamType,
-                stream,
                 onResponseHeadRecv,
             );
         }
@@ -3584,6 +3634,15 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.phase == .exchanging);
             const upstream = stream.upstream.?;
             assert(!upstream.parked);
+            // A stream on a shared HTTP/2 connection is not parked: the
+            // connection is, in effect, and its leg simply leaves it (§7).
+            if (stream.h2_origin.attached()) {
+                assert(stream.client_write.pending.len == 0);
+                server.upstreamClose(stream);
+                server.releaseUpstream(upstream);
+                stream.upstream = null;
+                return;
+            }
             // The exchange's head bytes go back before the slot parks
             // (§5): the response leg is settled, so the client-write
             // channel no longer references them — asserted, because the
@@ -3606,12 +3665,13 @@ pub fn Proxy(comptime IoType: type) type {
             assert(!stream.armed.data_client_to_upstream);
             assert(!stream.armed.data_upstream_to_client);
             if (stream.upstream) |leased| {
-                server.io.closeNow(stream.upstream_socket.?);
+                server.upstreamClose(stream);
                 server.releaseUpstream(leased);
                 stream.upstream = null;
                 stream.upstream_socket = null;
             }
             assert(stream.upstream_socket == null);
+            assert(!stream.h2_origin.attached());
         }
 
         /// Keep-alive turnaround (§5): the relay buffer goes back to its
@@ -3841,7 +3901,8 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.armed.data_client_to_upstream or
                 stream.armed.data_upstream_to_client);
             stream.l7.pending_verdict = .gateway_timeout;
-            server.io.shutdown(stream.upstream_socket.?, .both);
+            assert(ServerType.upstreamAttached(stream));
+            server.upstreamShutdown(stream);
         }
 
         /// A completion landed with a verdict pending: once the last data
@@ -3949,7 +4010,7 @@ pub fn Proxy(comptime IoType: type) type {
             assert(stream.relay_buffer != null); // Retained across the replay.
             const stale = stream.upstream.?;
             assert(stale.head_len == 0);
-            server.io.closeNow(stream.upstream_socket.?);
+            server.upstreamClose(stream);
             server.releaseUpstream(stale);
             stream.upstream = null;
             stream.upstream_socket = null;
@@ -4040,7 +4101,7 @@ pub fn Proxy(comptime IoType: type) type {
                 // Force the sibling op, if armed (the response recv during
                 // an excess send); settle acts immediately when both are
                 // already free (the head-send failure case).
-                server.io.shutdown(stream.upstream_socket.?, .both);
+                server.upstreamShutdown(stream);
                 settlePendingVerdict(server, stream);
                 return;
             }
@@ -4145,13 +4206,12 @@ pub fn Proxy(comptime IoType: type) type {
             assert(conn.state != .relaying);
             releaseTunnelClaim(server, stream);
             if (stream.upstream) |leased| {
-                if (stream.upstream_socket) |socket| {
-                    server.io.closeNow(socket);
-                }
+                server.upstreamClose(stream);
                 server.releaseUpstream(leased);
                 stream.upstream = null;
                 stream.upstream_socket = null;
             }
+            assert(!stream.h2_origin.attached());
             assert(stream.relay_buffer == null);
             assert(stream.upstream == null);
             assert(stream.upstream_socket == null);
@@ -4695,6 +4755,8 @@ pub fn Proxy(comptime IoType: type) type {
             if (std.mem.eql(u8, counter, "l7_shed_upstream_slots")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_head_buffers")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_upstream_head_buffers")) return .shed;
+            if (std.mem.eql(u8, counter, "l7_shed_h2_origin_connections")) return .shed;
+            if (std.mem.eql(u8, counter, "l7_shed_h2_origin_streams")) return .shed;
             // A capped endpoint is a shed like any other from the
             // client's side: the request was refused to protect the
             // origin, and the line should read the same as the rungs

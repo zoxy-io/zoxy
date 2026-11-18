@@ -3170,6 +3170,8 @@ fn l7OutcomeTotal(counters: *const zoxy.counters.Counters) u64 {
         // seed to carry one.
         "tunnels_established",
         "l7_shed_upstream_slots",
+        "l7_shed_h2_origin_connections",
+        "l7_shed_h2_origin_streams",
         "l7_shed_endpoint_inflight",
         "l7_bad_gateway",
         "l7_gateway_timeout",

@@ -31,6 +31,7 @@ const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const relay = @import("relay.zig");
 const upstream_module = @import("upstream.zig");
+const Origin = @import("../http/h2/Origin.zig");
 
 const assert = std.debug.assert;
 
@@ -477,6 +478,12 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         h2_trailers: []u8,
         /// Its request body's way to the origin, on a shared stream.
         h2_body: H2Body,
+        /// Its upstream half, when its cluster speaks HTTP/2 (§7): a stream
+        /// on a connection other exchanges share, standing where
+        /// `upstream_socket` stands for one that leases a socket — every
+        /// upstream op goes to one or the other (`Server.upstreamSend` and
+        /// its siblings). Detached on every other exchange.
+        h2_origin: Origin.Leg,
         /// A multiplexed exchange is ending on its own, its connection
         /// serving on (#275): what it has in flight is being forced, and the
         /// slot goes back once the last of it delivers. An admission
@@ -796,6 +803,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             stream.h2_ended = false;
             stream.h2_trailers = &.{};
             stream.h2_body = .{};
+            stream.h2_origin = .{};
             stream.ending = false;
             stream.deadline_ns = 0;
             assert(stream.armedCount() == 0);

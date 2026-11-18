@@ -354,7 +354,8 @@ client that opens with the HTTP/2 preface (prior knowledge, RFC 9113 §3.3)
 and serve HTTP/1.1 as before to one that does not; `h2c` is refused beside
 `tls`. Each stream is one request and goes through the same routing,
 filters, redirects and access log as an HTTP/1.1 request. The origin leg
-stays HTTP/1.1, and a body with no length is sent to it chunked.
+is HTTP/1.1 unless the cluster [speaks HTTP/2](#http2-to-the-origin-and-grpc),
+and a body with no length is sent to an HTTP/1.1 origin chunked.
 
 ```json
 "listeners": [
@@ -404,7 +405,10 @@ connection. Two kinds of abuse end the connection with
   PRIORITY or unknown types, empty DATA, or a field block in empty
   CONTINUATIONs.
 
-Trailers are not carried, on responses or on requests.
+An origin's response trailers reach an HTTP/2 client as the stream's
+trailing HEADERS, whether they came as a chunked body's trailer section or
+as an HTTP/2 origin's trailing HEADERS. A client's request trailers go no
+further.
 
 #### Tunnelled upgrades (WebSocket)
 
@@ -622,6 +626,48 @@ its settings. `hash` takes only the object form, which names its key
 (`source_ip`, `header` or `cookie`).
 
 Upstream connections are pooled process-wide and reusable by any request.
+
+#### HTTP/2 to the origin, and gRPC
+
+A cluster whose origins speak HTTP/2 by prior knowledge says so with
+`"protocol": "h2c"` (the default is `http1`). Its requests then share
+connections, each a stream of its own, rather than leasing one apiece:
+
+```json
+"clusters": {
+    "greeter": {
+        "endpoints": ["10.0.0.5:50051", "10.0.0.6:50051"],
+        "protocol": "h2c"
+    }
+}
+```
+
+Everything before the origin is unchanged — routing, filters, edits,
+`X-Forwarded-For`, the access log — and so is what either kind of client
+gets back. The request is said to the origin as HTTP/2, with
+`te: trailers`. An answer without a declared length comes back to an
+HTTP/1.1 client chunked, so its trailer section has somewhere to go. To
+an HTTP/2 client it comes back as DATA and trailing HEADERS. That is
+what gRPC needs: a gRPC client over HTTP/2 (`h2c` or `h2` in ALPN on the
+listener) reaches a gRPC server in an `h2c` cluster, and `grpc-status`
+arrives in the trailers. Origins reached over TLS are not yet supported.
+
+Two pools carry it, both zero unless some cluster speaks `h2c`.
+`limits.h2_origin_connections` bounds the origin connections, two per
+`h2c` endpoint by default. `limits.h2_origin_streams` bounds the requests
+on them at once, one per upstream slot by default and never more; each
+holds a buffer for its answer. A request that finds neither is answered
+`503` and counted in `zoxy_l7_shed_h2_origin_connections` or
+`zoxy_l7_shed_h2_origin_streams`. An origin connection that carries
+nothing for an idle window is told `GOAWAY` and closed.
+
+What fails on an origin stream fails that request alone, as a socket
+error would: a refused dial is a `502` and a silent origin a `504`. A
+stream the origin resets, or refuses past its `GOAWAY`, earns the same
+free replay a stale pooled connection does. An `h2c` cluster may not be
+reached from an `l4` listener, nor from one carrying upgrades (HTTP/2 has
+no `101`), and its health checks must be `tcp`: the prober speaks
+HTTP/1.1.
 
 #### Weights
 
@@ -1386,6 +1432,9 @@ apart from `relay_buffers`.
 unless a listener speaks it, in which case `stream_slots` is **required**.
 Each HTTP/2 connection holds a session of about 100 KiB and each stream
 slot a head buffer; the banner prints both.
+`h2_origin_connections` and `h2_origin_streams` size
+[HTTP/2 to the origin](#http2-to-the-origin-and-grpc) and are zero unless
+a cluster speaks `h2c`. Both have defaults, and the banner prints them.
 
 `keepalive_requests` lives on an `http` listener beside `max_body_bytes`,
 not in `limits`, because it reserves nothing and states policy. It bounds

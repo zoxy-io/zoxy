@@ -37,6 +37,9 @@ const parser = @import("../parser.zig");
 const hpack = h2.hpack;
 const assert = std.debug.assert;
 
+/// A field as HTTP/2 carries it, for callers outside `src/http/h2/`.
+pub const Field = hpack.Field;
+
 pub const Error = error{
     /// Not a head HTTP/2 can carry, or not one the HTTP/1.1 parser reads
     /// back: the exchange's own rendering, so a bug's signature rather than

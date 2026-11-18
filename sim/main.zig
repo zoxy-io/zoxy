@@ -171,6 +171,53 @@ const Uncovered = struct {
 /// serves both kinds at once, and what stops the table rotting into stale
 /// excuses.
 const uncovered = [_]Uncovered{
+    // §7 HTTP/2 to the origin. The sweep's origins speak HTTP/1.1 — the
+    // byte-exact integrity oracle reads their wire — and no cluster it
+    // builds is h2c, so nothing here dials an HTTP/2 origin. The leg and
+    // the connection run under `SimIo` in `src/http_proxy_test.zig`'s
+    // `h2 origin:` scenarios, against `TestOrigin` (a `Session` on the
+    // server role), partial-io seeds included; `client_session_test.zig`
+    // drives the session's client role frame by frame.
+    .{
+        .name = "h2_origin_connections",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep; http_proxy_test's h2 origin scenarios dial one",
+    },
+    .{
+        .name = "h2_origin_connect_failed",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep; the h2 origin 502 scenario dials one nothing listens on",
+    },
+    .{
+        .name = "h2_origin_idle_closed",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep; an idle origin connection is ended by the drain first",
+    },
+    .{
+        .name = "h2_origin_streams_reset",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep; client_session_test covers the reset and GOAWAY refusals",
+    },
+    .{
+        .name = "h2_origin_refused_heads",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep; origin.zig's tests and fuzz cover the refused mappings",
+    },
+    .{
+        .name = "h2_origin_refused_answers",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep; origin.zig's tests and fuzz cover the refused answers",
+    },
+    .{
+        .name = "l7_shed_h2_origin_connections",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep, so neither origin pool exists to run dry",
+    },
+    .{
+        .name = "l7_shed_h2_origin_streams",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep, so neither origin pool exists to run dry",
+    },
     // §6 SNI routing (#298). The sweep's l4 population opens with a
     // scripted prefix its oracle asserts is *never* relayed — the shape
     // a PROXY header has — and a ClientHello is the opposite: it is the

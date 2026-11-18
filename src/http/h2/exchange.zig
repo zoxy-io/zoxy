@@ -410,14 +410,7 @@ pub fn Exchange(comptime IoType: type) type {
             std.mem.copyForwards(u8, buffer[0..kept.len], kept);
             stream.h2_trailers = buffer[0..kept.len];
             stream.arm(&stream.op_data_upstream_to_client, "data_upstream_to_client");
-            server.io.recv(
-                stream.upstream_socket.?,
-                buffer[kept.len..],
-                &stream.op_data_upstream_to_client.completion,
-                StreamType,
-                stream,
-                onBodyRecv,
-            );
+            server.upstreamRecv(stream, buffer[kept.len..], &stream.op_data_upstream_to_client.completion, onBodyRecv);
         }
 
         fn onBodyRecv(stream: *StreamType, result: Io.RecvError!u32) void {
@@ -663,12 +656,10 @@ pub fn Exchange(comptime IoType: type) type {
             // A send on the upstream socket, never a read of the client's.
             stream.l7.request_op_on_client = false;
             stream.arm(&stream.op_data_client_to_upstream, "data_client_to_upstream");
-            server.io.send(
-                stream.upstream_socket.?,
+            server.upstreamSend(
+                stream,
                 stream.relay_buffer.?.client_to_upstream[body.frame_start + body.frame_sent .. body.frame_end],
                 &stream.op_data_client_to_upstream.completion,
-                StreamType,
-                stream,
                 onBodySent,
             );
         }
