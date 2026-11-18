@@ -1043,7 +1043,10 @@ neither side and is never picked, a retry still skips the endpoints its
 request already tried, and `max_inflight` still caps each endpoint. The
 value is 1 to 99. Leave it out to fail open only at zero healthy, as
 before. It requires `check` or `passive_ejection`, because without one
-nothing is ever ejected.
+nothing is ever ejected. `zoxy_upstream_panic_picks` counts picks made in
+panic, and `zoxy_upstream_ejected_picks` counts every pick that landed on
+an ejected endpoint, at zero healthy or in panic. Both break down
+[per cluster](#metrics).
 
 ### Passive ejection
 
@@ -1139,8 +1142,9 @@ endpoint this request has not tried yet, picked by the cluster's own
 `pick` policy. All tries share one `connect_ms`, so `retries` never
 lengthens how long a client can wait. A dial that times out is not
 retried, because it has already spent that budget, and answers `504`.
-Running out of retries or of untried endpoints answers `502`. `zoxy_upstream_retried` and
-`zoxy_upstream_retries_exhausted` count both outcomes.
+Running out of retries or of untried endpoints answers `502`.
+`zoxy_upstream_retried` and `zoxy_upstream_retries_exhausted` count both
+outcomes.
 
 Retries apply to `http1` clusters. An `h2c` or `h2` cluster refuses a
 non-zero `retries` at load, because its connections are dialed by a pool
@@ -1676,6 +1680,12 @@ zoxy_endpoint_healthy{cluster="api",endpoint="10.0.0.2:8080"} 0
 Dial failures, responses served and health transitions
 (`endpoint_health_down` and `_up`) carry both labels. The "every endpoint
 was full" sheds carry only `cluster`, since no single endpoint was full.
+So do the two pick families. `cluster_upstream_ejected_picks` counts picks
+that landed on an endpoint health checks had ejected, which happens when
+the cluster fails open or panics. `cluster_upstream_panic_picks` counts
+picks made while the cluster was below its
+[`panic_threshold_percent`](#health-checks), so a rising rate means the
+cluster is in panic.
 Two gauges show live state: `zoxy_endpoint_inflight` is the level the
 balancer compares, and `zoxy_endpoint_healthy` is the prober's current
 verdict, rendered for health-checked clusters only. Each labelled family

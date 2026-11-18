@@ -3942,7 +3942,10 @@ pub fn Server(comptime IoType: type) type {
                 &.{},
             );
             const dial = switch (pick) {
-                .dial => |chosen| chosen,
+                .dial => |chosen| blk: {
+                    server.witnessPick(cluster_index, &chosen);
+                    break :blk chosen;
+                },
                 // Unreachable with nothing tried: only a retry can run
                 // the routable set empty.
                 .exhausted => unreachable,
@@ -4309,6 +4312,25 @@ pub fn Server(comptime IoType: type) type {
             // without checking, so they are checked here.
             assert(entry.started_wall_ns != 0);
             server.access_log.record(&entry);
+        }
+
+        /// Count what a pick did beyond dialing (#390): it chose an
+        /// endpoint the health mask had ejected, or its cluster sat below
+        /// its panic threshold. One site for both pick callers — the L7
+        /// exchange (every try, retries included) and the L4 dial — so
+        /// the per-cluster families and their process totals cannot be
+        /// written apart, which `Labeled.reconciles` holds them to.
+        pub fn witnessPick(server: *Self, cluster_index: u16, chosen: *const Balancer.Pick) void {
+            assert(cluster_index < server.config.clusters.len);
+            assert(chosen.endpoint_index < server.config.clusters[cluster_index].endpoints.len);
+            if (chosen.ejected) {
+                server.counters.increment("upstream_ejected_picks");
+                server.labeled.incrementCluster(.ejected_picks, cluster_index);
+            }
+            if (chosen.panicked) {
+                server.counters.increment("upstream_panic_picks");
+                server.labeled.incrementCluster(.panic_picks, cluster_index);
+            }
         }
 
         /// §8 kernel-pressure rung: a non-orderly op failure on a live

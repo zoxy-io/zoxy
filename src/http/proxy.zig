@@ -1296,7 +1296,10 @@ pub fn Proxy(comptime IoType: type) type {
                 stream.l7.tried[0..stream.l7.tried_count],
             );
             switch (outcome) {
-                .dial => |chosen| return chosen,
+                .dial => |chosen| {
+                    server.witnessPick(stream.cluster_index, &chosen);
+                    return chosen;
+                },
                 .exhausted => {
                     // Every routable endpoint refused this request (#181).
                     // 502 rather than 503: the origins were reachable
