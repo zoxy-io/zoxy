@@ -203,6 +203,9 @@ pub const Counters = struct {
     /// (`limits.h2_origin_streams`). Answered 503, as the slot rung is.
     l7_shed_h2_origin_connections: Value = Value.init(0),
     l7_shed_h2_origin_streams: Value = Value.init(0),
+    /// The §8 rung for an HTTPS cluster (#296): a fresh connection found no
+    /// TLS session free (`limits.upstream_tls_sessions`). Answered 503.
+    l7_shed_upstream_tls: Value = Value.init(0),
     /// HTTP/2 origin connections dialed (§7), and the dials refused,
     /// unreachable or past their budget — each of which fails every
     /// exchange that was waiting on it.
@@ -222,6 +225,14 @@ pub const Counters = struct {
     /// not select `h2`, or a record that did not open. The connection, and
     /// every exchange on it, fails.
     h2_origin_tls_failed: Value = Value.init(0),
+    /// Handshakes completed to HTTPS origins (#296): one per fresh
+    /// connection, none for a parked one checked out — what reuse saves.
+    upstream_tls_handshakes: Value = Value.init(0),
+    /// TLS to an HTTPS origin that failed (#296): a chain that did not
+    /// verify, a protocol other than HTTP/1.1, an alert, a record that did
+    /// not open, a hangup mid-handshake. The exchange's own verdict — a
+    /// `502` on a fresh connection — is counted where it always is.
+    upstream_tls_failed: Value = Value.init(0),
     h2_origin_refused_answers: Value = Value.init(0),
     /// §8 requests answered 503 because every endpoint of their cluster
     /// was already carrying its configured `max_inflight`. Distinct from

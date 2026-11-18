@@ -1,7 +1,8 @@
-//! The client end of TLS to an HTTP/2 origin (§7; #296, for the origins an
-//! `h2` cluster names): sans-I/O, like the server's `Engine`, so the origin
-//! connection that drives it (`http/h2/origin_pool.zig`) keeps its one recv and
-//! one send and never learns its octets were encrypted.
+//! The client end of TLS to an origin (§7; #296): sans-I/O, like the
+//! server's `Engine`, so what drives it — an `h2` cluster's pooled
+//! connection (`http/h2/origin_pool.zig`), or an HTTPS cluster's upstream
+//! connection (`net/upstream_tls.zig`) — keeps its one recv and one send
+//! and never learns its octets were encrypted.
 //!
 //! It owns the zssl client handshake and every buffer the connection's TLS
 //! needs — a record's worth of wire in, a record's worth out, the
@@ -10,8 +11,8 @@
 //!
 //! The chain the origin presents is judged by `trust.zig` against the
 //! cluster's anchors and its `server_name`, which is also the SNI it
-//! sends; ALPN offers `h2` alone, and the connection is the caller's to
-//! refuse if the origin does not select it.
+//! sends. ALPN offers the one protocol the connection speaks — `h2`, or
+//! `http/1.1` — and what the origin selects is the caller's to judge.
 //!
 //! One buffer of wire octets is owed to the socket at a time — a handshake
 //! flight or one sealed record — and records are not read while it is,
@@ -48,8 +49,11 @@ const events_per_record_max: u32 = 16;
 /// decrypted behind it.
 pub const plaintext_bytes: u32 = 2 * record_plaintext_bytes_max;
 
-/// What ALPN offers: HTTP/2 alone, since the connection speaks nothing else.
+/// What ALPN offers: the one protocol the connection speaks.
 const alpn_h2 = [_][]const u8{"h2"};
+const alpn_http1 = [_][]const u8{"http/1.1"};
+
+pub const Protocol = enum { h2, http1 };
 
 pub const Error = zssl.ClientHandshake.Error || zssl.record_buffer.RecordBuffer.Error || error{
     /// Two flights owed at once from one record: a peer driving the client
@@ -81,6 +85,7 @@ closed: bool,
 started: bool,
 
 pub const Start = struct {
+    protocol: Protocol = .h2,
     server_name: []const u8,
     anchors: []const []const u8,
     client_random: [32]u8,
@@ -104,7 +109,10 @@ pub fn start(client: *OriginClient, options: *const Start) void {
         .client_random = options.client_random,
         .x25519_private = options.x25519_private,
         .server_name = options.server_name,
-        .alpn_protocols = &alpn_h2,
+        .alpn_protocols = switch (options.protocol) {
+            .h2 => &alpn_h2,
+            .http1 => &alpn_http1,
+        },
         .certificate_policy = .leaf_signature,
         .chain_verifier = .{ .context = client, .verify = verifyChain },
         .reassembly = &client.reassembly,
@@ -129,6 +137,14 @@ pub fn alpnIsH2(client: *const OriginClient) bool {
     assert(client.connected);
     const selected = client.handshake.alpnSelected() orelse return false;
     return std.mem.eql(u8, selected, "h2");
+}
+
+/// The origin selected HTTP/1.1, or nothing — an origin that predates
+/// ALPN speaks HTTP/1.1 over TLS, and was offered nothing else.
+pub fn alpnAllowsHttp1(client: *const OriginClient) bool {
+    assert(client.connected);
+    const selected = client.handshake.alpnSelected() orelse return true;
+    return std.mem.eql(u8, selected, "http/1.1");
 }
 
 /// Whether a read has somewhere to land. Records are read only while

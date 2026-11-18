@@ -128,6 +128,12 @@ pub fn UpstreamPool(comptime IoType: type) type {
             /// timer compares this against the clock and reaps overdue
             /// connections with a synchronous close.
             deadline_ns: u64,
+            /// The TLS session an HTTPS cluster's connection speaks under
+            /// (`net/upstream_tls.zig`, #296): taken at the dial, kept while
+            /// parked, given back by `Server.releaseUpstream`. Null for a
+            /// plaintext origin. Erased because the session's type is the
+            /// server's, which this pool must not name.
+            tls: ?*anyopaque,
         };
 
         /// In-place init via out-pointer for pointer stability. `arena`
@@ -167,6 +173,7 @@ pub fn UpstreamPool(comptime IoType: type) type {
             upstream.head_buffer = null;
             upstream.head_len = 0;
             upstream.deadline_ns = 0;
+            upstream.tls = null;
             const key = pool.keys.key(cluster_index, endpoint_index);
             pool.leased_counts[key] += 1;
             assert(pool.leased_counts[key] <= pool.slot_pool.slots.len);
