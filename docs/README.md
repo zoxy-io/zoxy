@@ -319,8 +319,9 @@ A terminating listener cannot route to a cluster with
 terminated connection's wire bytes do not pass through, so the loader
 rejects the combination instead of sending the origin garbage.
 
-Termination is inbound only. The connection zoxy opens to the backend stays
-plaintext.
+Termination is inbound only. Whether the connection zoxy opens to the
+backend speaks TLS is the cluster's to say: see [HTTPS origins](#https-origins)
+and [HTTP/2 to the origin](#http2-to-the-origin-and-grpc).
 
 `limits.tls_engines` bounds how many TLS sessions may be in flight at once.
 It is the largest single line in the startup banner's memory budget; see
@@ -683,8 +684,9 @@ CAs only. The leaf must carry `server_name` in its subjectAltName (RFC
 sent, and is configured because an endpoint address is not an identity.
 The bundle is read once at load, so a missing or empty file stops the
 config, not the first request. A handshake that fails is a `502` for the
-requests waiting on it, counted in `zoxy_h2_origin_tls_failed`. TLS to an
-HTTP/1.1 origin is not yet supported (#296).
+requests waiting on it, counted in `zoxy_h2_origin_tls_failed`. The same
+`tls` block on a cluster that speaks HTTP/1.1 makes its origins
+[HTTPS origins](#https-origins).
 
 Two pools carry it, both zero unless some cluster speaks `h2c` or `h2`.
 `limits.h2_origin_connections` bounds the origin connections, two per
@@ -703,6 +705,56 @@ reached from an `l4` listener, nor from one carrying upgrades (HTTP/2 has
 no `101`), and its health checks are `tcp` or `grpc`, not `http`: that
 prober speaks HTTP/1.1. A [`grpc` check](#health-checks) asks the gRPC
 health service over the cluster's own connections.
+
+#### HTTPS origins
+
+A cluster that speaks HTTP/1.1 reaches its origins over TLS when it has a
+`tls` block. The block is the same one an `h2` cluster names:
+
+```json
+"billing": {
+    "endpoints": ["10.0.0.7:443", "10.0.0.8:443"],
+    "tls": { "server_name": "billing.internal", "ca": { "path": "/etc/zoxy/internal-ca.pem" } }
+}
+```
+
+Verification works as it does for `h2`, and is never skipped. The chain
+must reach the `ca` bundle, and the leaf must carry `server_name` in its
+subjectAltName. ALPN offers `http/1.1`. An origin may select it or
+nothing. One that insists on something else is refused.
+
+A connection is verified once and then pooled like any other. It is
+parked between requests, and the next request to the same endpoint of the
+same cluster reuses it without a second handshake. A connection carries
+no client identity, so reusing it across clients is safe. A connection
+whose origin closed it, or that holds bytes past the response, is closed
+instead of parked.
+
+- **A failed handshake:** if the chain doesn't verify, the origin speaks
+  another protocol, or it hangs up, the request gets a `502`. The failure
+  is counted in `zoxy_upstream_tls_failed` and is not retried on another
+  endpoint, because the dial itself succeeded.
+- **A slow handshake:** it gets `connect_ms` from its start.
+- **A reused connection the origin had closed:** it costs the request the
+  usual free replay.
+- **Sessions:** each pooled connection holds one session of about 110 KiB.
+  `limits.upstream_tls_sessions` bounds them. The default is 16 per HTTPS
+  endpoint, within `upstream_slots` and within the libcrypto heap that the
+  listeners' `tls_engines` and the `h2` origins' connections also draw
+  on. A new connection with no session free is answered `503`, counted in
+  `zoxy_l7_shed_upstream_tls`.
+- **Handshake counts:** `zoxy_upstream_tls_handshakes` counts completed
+  handshakes. Compare it with the requests served to see how much reuse
+  saves.
+
+Not yet carried over TLS to the origin:
+- an `http` health check (use `tcp`);
+- an upgrade such as WebSocket;
+- an `l4` listener routing to the cluster;
+- `proxy_protocol` (it is `l4`-only anyway).
+
+The loader refuses each of these. Client certificates to the origin are
+not supported.
 
 #### Weights
 
@@ -1493,8 +1545,10 @@ slot a head buffer; the banner prints both.
 [HTTP/2 to the origin](#http2-to-the-origin-and-grpc) and are zero unless
 a cluster speaks `h2c` or `h2`. Both have defaults, and the banner prints
 them. Over TLS, each origin connection also holds a TLS session on the
-libcrypto heap. `tls_engines` and the origin connections together may not
-exceed the heap's 1024 sessions.
+libcrypto heap. `upstream_tls_sessions` sizes the
+[HTTPS origins](#https-origins)' sessions and is zero unless an `http1`
+cluster has `tls`. `tls_engines`, the `h2` origin connections and the
+HTTPS sessions together may not exceed the heap's 1024 sessions.
 
 `keepalive_requests` lives on an `http` listener beside `max_body_bytes`,
 not in `limits`, because it reserves nothing and states policy. It bounds
