@@ -51,8 +51,8 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   exchange, and that is why its two neighbours here stay out. An h2
   connection to an origin is shared by concurrent requests rather than
   leased to one, so it would need a pool with a different lease model.
-  gRPC needs that upstream leg, and also trailers carried end to end,
-  which the HTTP/1.1 relay does not do. HTTP/3 is #197. WebSocket was
+  gRPC needs that upstream leg; the response trailers it ends every
+  call with already reach an HTTP/2 client (§7). HTTP/3 is #197. WebSocket was
   deferred too and is not any more (#180, §7): carrying it needs no new
   I/O machinery, because a tunnel is the L4 relay this proxy already
   runs, entered from an L7 exchange. What it does need is its own
@@ -2137,11 +2137,19 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   makes room. Streams waiting on the connection's window or the outbox
   take turns, one frame per turn, so none starves.
 
-- **HTTP/2 trailers are not carried, in either direction.** A request's
-  trailers end the client's half; the chunked body goes upstream with
-  none. An origin's trailers are not relayed, because the relay carries
-  a chunked body's payload and not its trailer section. That is one
-  reason gRPC stays a §1 non-goal.
+- **An origin's trailers reach an HTTP/2 client as trailing HEADERS; a
+  client's do not reach the origin.** A chunked response's trailer
+  section is the one #244 already holds to RFC 9112 §7.1.2 and refuses
+  any name §7 decides, so what survives the scanner is said again as
+  the stream's last field section, with END_STREAM in DATA's place
+  (RFC 9113 §8.1): names lowercased, values trimmed, and the session's
+  strict check on the way out. It is not copied anywhere: the dechunk
+  leaves it behind the payload it compacts, in the upstream head when
+  the body rode the head, else in the relay buffer — where a section
+  split across reads is moved to the front before the next one, so it
+  stays one run, bounded by `chunked_trailer_bytes_max`. A section with
+  no field is no HEADERS. A request's trailers still end the client's
+  half and go no further: the chunked body goes upstream with none.
 
 - **An HTTP/2 connection is told before it is closed.** It gets
   `GOAWAY(NO_ERROR)` before the close when it is drained, when it sits

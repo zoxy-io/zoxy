@@ -1292,13 +1292,17 @@ fn fuzzChunkFraming(context: void, smith: *std.testing.Smith) !void {
 /// the same answers at every piece: consumed, done, the state they land
 /// in, the payload counted, and the error that ends either.
 fn agree(bytes: []u8, splits: []const u8) void {
+    assert(bytes.len <= 1024);
     var counting: parser.ChunkedScanner = .{};
     var dechunking: parser.ChunkedScanner = .{};
+    var arrived: [1024]u8 = undefined;
     var offset: usize = 0;
     var pick: usize = 0;
+    var trailer: u64 = 0;
     while (offset < bytes.len) : (pick += 1) {
         const want: usize = if (splits.len == 0) bytes.len else @as(usize, splits[pick % splits.len]) + 1;
         const piece = bytes[offset..][0..@min(want, bytes.len - offset)];
+        @memcpy(arrived[0..piece.len], piece);
         // `feed` first: `dechunk` compacts the piece in place, and the
         // counting scanner must read the octets as they arrived.
         const fed = counting.feed(piece);
@@ -1310,9 +1314,15 @@ fn agree(bytes: []u8, splits: []const u8) void {
         const result = kept catch unreachable;
         assert(result.consumed == progress.consumed);
         assert(result.done == progress.done);
-        assert(result.payload_len <= result.consumed);
+        assert(result.payload_len + result.trailer_len <= result.consumed);
         assert(dechunking.state == counting.state);
         assert(dechunking.body_bytes == counting.body_bytes);
+        // The trailer section is the consumed tail, untouched by the
+        // compaction in front of it, and counted as the scanner counts it.
+        const tail_start = result.consumed - result.trailer_len;
+        assert(std.mem.eql(u8, piece[tail_start..result.consumed], arrived[tail_start..result.consumed]));
+        trailer += result.trailer_len;
+        assert(trailer == counting.trailer_bytes);
         offset += progress.consumed;
         if (progress.done) return;
     }

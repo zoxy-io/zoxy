@@ -3020,6 +3020,9 @@ pub fn Proxy(comptime IoType: type) type {
                 upstreamFailed(server, stream);
                 return;
             }
+            // Its trailer section, met here when the body was small, stays
+            // in the upstream head behind the payload until it is said.
+            if (stream.h2_id != 0) H2Exchange.keepTrailers(stream, excess, &fed);
             const head_write_len = coalesceResponseExcess(
                 server,
                 stream,
@@ -4804,10 +4807,16 @@ pub fn Proxy(comptime IoType: type) type {
         /// the octets at the front of `bytes` go to the client. All it
         /// consumed for an HTTP/1.1 client, which reads the same framing;
         /// for an HTTP/2 stream (`payload`), the payload alone — a chunked
-        /// body dechunked in place, sizes and trailers dropped (#275).
+        /// body dechunked in place, sizes dropped (#275) — and, apart, the
+        /// trailer section octets it met, which HTTP/2 says as trailing
+        /// HEADERS rather than as body.
         pub const PayloadFeed = struct {
             feed: FeedResult,
             forward_len: u32,
+            /// The trailer section's octets among those consumed: the last
+            /// `trailer_len` of `bytes[0..feed.consumed]`, as they arrived.
+            /// Zero for an HTTP/1.1 client, whose relay forwards them.
+            trailer_len: u32 = 0,
         };
 
         /// `feedFraming` over a received chunk, and what of it goes on —
@@ -4821,10 +4830,11 @@ pub fn Proxy(comptime IoType: type) type {
             const dechunked = framing.chunked.dechunk(bytes) catch {
                 return .{ .feed = .{ .consumed = 0, .done = false, .malformed = true }, .forward_len = 0 };
             };
-            assert(dechunked.payload_len <= dechunked.consumed);
+            assert(dechunked.payload_len + dechunked.trailer_len <= dechunked.consumed);
             return .{
                 .feed = .{ .consumed = dechunked.consumed, .done = dechunked.done, .malformed = false },
                 .forward_len = dechunked.payload_len,
+                .trailer_len = dechunked.trailer_len,
             };
         }
 

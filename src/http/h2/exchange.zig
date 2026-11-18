@@ -251,8 +251,10 @@ pub fn Exchange(comptime IoType: type) type {
             }
             const write = &stream.client_write;
             const ends = answerEnds(stream);
-            if (write.pending.len >= 1 or (ends and !stream.h2_ended)) {
-                const sent = session.sendData(stream.h2_id, write.pending, ends);
+            // A trailer section ends the stream in DATA's place (§8.1).
+            const trailers_owed = ends and trailersOwed(stream);
+            if (write.pending.len >= 1 or (ends and !trailers_owed and !stream.h2_ended)) {
+                const sent = session.sendData(stream.h2_id, write.pending, ends and !trailers_owed);
                 assert(sent.taken <= write.pending.len);
                 write.pending = write.pending[sent.taken..];
                 stream.log.bytes_out += sent.taken;
@@ -262,9 +264,73 @@ pub fn Exchange(comptime IoType: type) type {
                 if (sent.taken >= 1) server.storeExchangeDeadline(stream, server.idleTimeoutMs());
                 // Cut short by the window or the outbox: `.writable` resumes.
                 if (write.pending.len >= 1) return;
-                if (ends and !sent.ended) return;
+                if (ends and !trailers_owed and !sent.ended) return;
+            }
+            if (trailers_owed and !stream.h2_ended) {
+                if (!stageTrailers(server, stream, session)) return;
             }
             Proxy.h2WriteDelivered(server, stream);
+        }
+
+        /// The answer's trailer section has a field to say: the origin's
+        /// chunked body ended with more than the closing CRLF. Asked only
+        /// once the answer ends — its framing done, the section whole — and
+        /// it asserts as much: a section still arriving is not owed yet.
+        fn trailersOwed(stream: *const StreamType) bool {
+            assert(stream.h2_id != 0);
+            const section = stream.h2_trailers;
+            if (section.len == 0) return false;
+            assert(section.len >= 2);
+            assert(stream.l7.response_framing == .chunked);
+            assert(stream.l7.response_framing.chunked.state == .done);
+            return section.len > 2;
+        }
+
+        /// Stage the origin's trailer section as trailing HEADERS, with
+        /// END_STREAM (RFC 9113 §8.1). False when the answer cannot go on
+        /// now: the session has no room for it yet, or the section is one
+        /// HTTP/2 cannot carry, which ends the exchange as a head would.
+        fn stageTrailers(server: *ServerType, stream: *StreamType, session: *Session) bool {
+            assert(stream.h2_head_staged);
+            assert(stream.client_write.pending.len == 0);
+            const out = server.h2_scratch.lend();
+            defer server.h2_scratch.giveBack();
+            const fields = response.trailerFields(stream.h2_trailers, &out) catch {
+                fail(server, stream);
+                return false;
+            };
+            assert(fields.len >= 1);
+            switch (session.sendTrailers(stream.h2_id, fields)) {
+                .staged => {},
+                .blocked => return false,
+                .refused => {
+                    fail(server, stream);
+                    return false;
+                },
+            }
+            stream.h2_ended = true;
+            stream.log.bytes_out += stream.h2_trailers.len;
+            return true;
+        }
+
+        /// The trailer section octets one feed of the response body met,
+        /// `fed.trailer_len` of them at the tail of what it consumed from
+        /// `bytes`: the section's start, or its continuation — which a read
+        /// into the relay buffer behind the part already moved to its
+        /// front (`pumpBody`) makes contiguous with it.
+        pub fn keepTrailers(stream: *StreamType, bytes: []u8, fed: *const Proxy.PayloadFeed) void {
+            assert(stream.h2_id != 0);
+            assert(fed.trailer_len <= fed.feed.consumed);
+            if (fed.trailer_len == 0) return;
+            const tail = bytes[fed.feed.consumed - fed.trailer_len .. fed.feed.consumed];
+            const kept = stream.h2_trailers;
+            if (kept.len == 0) {
+                stream.h2_trailers = tail;
+                return;
+            }
+            assert(kept.ptr + kept.len == tail.ptr);
+            stream.h2_trailers = kept.ptr[0 .. kept.len + tail.len];
+            assert(stream.h2_trailers.len <= constants.chunked_trailer_bytes_max);
         }
 
         /// Whether what the answer has left ends the stream: a static answer
@@ -301,7 +367,7 @@ pub fn Exchange(comptime IoType: type) type {
             // A HEAD's answer carries the head a GET's would, and no body
             // whatever the head declares (RFC 9110 §9.3.2).
             const body = if (method == .head) write.pending[0..0] else write.pending[mapped.head_len..];
-            const ends = body.len == 0 and answerEnds(stream);
+            const ends = body.len == 0 and answerEnds(stream) and !trailersOwed(stream);
             switch (session.sendHead(stream.h2_id, mapped.fields, ends)) {
                 .staged => {},
                 .blocked => return false,
@@ -326,14 +392,27 @@ pub fn Exchange(comptime IoType: type) type {
         /// origin into the relay buffer, its HTTP/1.1 framing undone, and
         /// handed over as DATA — the next read only once the session has
         /// taken it all, as the HTTP/1.1 pump waits for its send (§6).
+        ///
+        /// A trailer section begun and not yet whole moves to the buffer's
+        /// front first, and the read lands behind it, so the section stays
+        /// one run however the origin split it. The scanner bounds it below
+        /// `chunked_trailer_bytes_max`; a section that fills the buffer
+        /// before it ends is one the scanner refuses at its next octet, and
+        /// that verdict is given here instead of reading for it.
         pub fn pumpBody(server: *ServerType, stream: *StreamType) void {
             assert(stream.phase == .exchanging);
             assert(stream.l7.response_leg == .pumping_body);
             assert(stream.client_write.pending.len == 0);
+            const buffer = stream.relay_buffer.?.upstream_to_client;
+            const kept = stream.h2_trailers;
+            assert(kept.len <= constants.chunked_trailer_bytes_max);
+            if (kept.len == buffer.len) return fail(server, stream);
+            std.mem.copyForwards(u8, buffer[0..kept.len], kept);
+            stream.h2_trailers = buffer[0..kept.len];
             stream.arm(&stream.op_data_upstream_to_client, "data_upstream_to_client");
             server.io.recv(
                 stream.upstream_socket.?,
-                stream.relay_buffer.?.upstream_to_client,
+                buffer[kept.len..],
                 &stream.op_data_upstream_to_client.completion,
                 StreamType,
                 stream,
@@ -365,9 +444,11 @@ pub fn Exchange(comptime IoType: type) type {
             assert(received >= 1);
             // The origin is still sending: activity (§6).
             server.storeExchangeDeadline(stream, server.idleTimeoutMs());
-            const chunk = stream.relay_buffer.?.upstream_to_client[0..received];
+            // The read landed behind a trailer section already begun.
+            const chunk = stream.relay_buffer.?.upstream_to_client[stream.h2_trailers.len..][0..received];
             const fed = Proxy.payloadFraming(&stream.l7.response_framing, chunk, true);
             if (fed.feed.malformed) return fail(server, stream);
+            keepTrailers(stream, chunk, &fed);
             // Octets past the body: the origin said more than its framing
             // allowed, and the connection cannot be trusted with another.
             if (fed.feed.consumed < received) stream.l7.upstream_reusable = false;
@@ -457,8 +538,8 @@ pub fn Exchange(comptime IoType: type) type {
         }
 
         /// The request's trailer section ends the client's half. It is not
-        /// carried: the chunked body's last chunk goes out with none, as
-        /// an origin's trailers do not come back either (#275).
+        /// carried: the chunked body's last chunk goes out with none
+        /// (#275). An origin's, the other way, are (`stageTrailers`).
         pub fn onTrailers(server: *ServerType, conn: *ConnType, trailers: *const Session.Step.Trailers) void {
             assert(conn.state == .h2);
             const stream = find(conn, trailers.stream) orelse return;

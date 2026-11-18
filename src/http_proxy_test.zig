@@ -1361,6 +1361,15 @@ const H2Answer = struct {
     reset: ?u32 = null,
     /// The answer carried a `transfer-encoding` field, which HTTP/2 must not.
     chunked_field: bool = false,
+    /// Its trailing field section, as `name=value;` per field, when a
+    /// HEADERS followed the final head.
+    trailers: [96]u8 = undefined,
+    trailers_len: usize = 0,
+    trailer_blocks: u32 = 0,
+
+    fn trailersSlice(answer: *const H2Answer) []const u8 {
+        return answer.trailers[0..answer.trailers_len];
+    }
 
     fn locationSlice(answer: *const H2Answer) []const u8 {
         return answer.location[0..answer.location_len];
@@ -1392,6 +1401,17 @@ fn h2Answers(bytes: []const u8, out: []H2Answer) ![]H2Answer {
             0x1 => {
                 try std.testing.expect(one.flags & 0x4 != 0); // Whole, one frame.
                 const fields = try reader.decode(one.payload);
+                // A HEADERS after the final head is its trailer section.
+                if (answer.status >= 200) {
+                    try std.testing.expect(ResponseReader.value(fields, ":status") == null);
+                    answer.trailer_blocks += 1;
+                    for (fields) |field| {
+                        const written = try std.fmt.bufPrint(answer.trailers[answer.trailers_len..], "{s}={s};", .{ field.name, field.value });
+                        answer.trailers_len += written.len;
+                    }
+                    if (one.flags & 0x1 != 0) answer.ended = true;
+                    continue;
+                }
                 answer.status = try std.fmt.parseUnsigned(u16, ResponseReader.value(fields, ":status").?, 10);
                 if (ResponseReader.value(fields, "content-length")) |length| {
                     answer.content_length = try std.fmt.parseUnsigned(u64, length, 10);
@@ -1674,6 +1694,77 @@ test "h2: an origin's body comes back as DATA — chunking undone, a close-delim
         try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
         try bed.expectDrained();
     }
+}
+
+test "h2: an origin's trailer section comes back as trailing HEADERS, ending the stream" {
+    const Case = struct { response: []const u8, partial_io: bool, body: []const u8, trailers: []const u8 };
+    const cases = [_]Case{
+        // Small enough to ride the head: the section is met in the excess.
+        .{
+            .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Grpc-Status\r\n\r\n" ++
+                "3\r\nabc\r\n0\r\nGrpc-Status: 0\r\nGrpc-Message: \tok \r\n\r\n",
+            .partial_io = false,
+            .body = "abc",
+            .trailers = "grpc-status=0;grpc-message=ok;",
+        },
+        // Fragmented reads: the section arrives across the body pump's
+        // reads, and is put back together at the relay buffer's front.
+        .{
+            .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "5\r\nhello\r\n0\r\nX-Checksum: 5d41402a\r\nX-Count: 1\r\n\r\n",
+            .partial_io = true,
+            .body = "hello",
+            .trailers = "x-checksum=5d41402a;x-count=1;",
+        },
+        // No payload at all: the head must not end the stream the
+        // section is still to end.
+        .{
+            .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nGrpc-Status: 13\r\n\r\n",
+            .partial_io = false,
+            .body = "",
+            .trailers = "grpc-status=13;",
+        },
+        // A section with no field is no HEADERS: DATA ends the stream.
+        .{
+            .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n",
+            .partial_io = true,
+            .body = "hi",
+            .trailers = "",
+        },
+    };
+    for (cases, 0..) |case, index| {
+        // Fragmenting is the seed's choice, so a split case runs under
+        // enough of them to meet the section cut at every place.
+        const seeds: u64 = if (case.partial_io) 32 else 1;
+        for (0..seeds) |round| {
+            var options = h2BedOptions(40 + index * 64 + round);
+            options.origin_response = case.response;
+            options.partial_io = case.partial_io;
+            try expectTrailers(options, case.body, case.trailers);
+        }
+    }
+}
+
+fn expectTrailers(options: Http1Bed.Options, body: []const u8, trailers: []const u8) !void {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    wire.get(1, "GET", "/");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqualStrings(body, answers[0].dataSlice());
+    try std.testing.expectEqualStrings(trailers, answers[0].trailersSlice());
+    try std.testing.expectEqual(@as(u32, @intFromBool(trailers.len >= 1)), answers[0].trailer_blocks);
+    try std.testing.expect(answers[0].ended);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
 }
 
 test "h2: two streams on one connection reach the origin side by side, each with its own line" {
