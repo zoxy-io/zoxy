@@ -157,6 +157,11 @@ pub fn Server(comptime IoType: type) type {
         /// live conn slot bounds every entry by `conn_slots_max`, which
         /// `constants` asserts fits (`conn_slots_max - 1 <= maxInt(u16)`).
         l4_inflight: []u16,
+        /// #393's retry permits: per cluster, the retry dials in flight —
+        /// taken where a retry arms its connect, given back when that
+        /// connect completes, however it completes. What a cluster's
+        /// `retries.budget` is compared against.
+        retry_dials: []u16,
         listeners: []ListenerState,
         listeners_count: u16,
         /// One slot per listener, null where that listener is plaintext
@@ -576,7 +581,9 @@ pub fn Server(comptime IoType: type) type {
                 @sizeOf(u8) + // Checker.passive_levels (#394)
                 @sizeOf(u64); // Checker.restored_at_ns (#394)
             const scratch = @as(u64, keys.stride) * @sizeOf(u16);
-            const total = count * per_key + scratch;
+            // Server.retry_dials (#393): one count per cluster.
+            const per_cluster = @as(u64, config.clusters.len) * @sizeOf(u16);
+            const total = count * per_key + scratch + per_cluster;
             assert(total > 0);
             return total;
         }
@@ -687,6 +694,8 @@ pub fn Server(comptime IoType: type) type {
             try server.initUpstreamTls(arena, &options);
             server.l4_inflight = try arena.alloc(u16, keys.count);
             @memset(server.l4_inflight, 0);
+            server.retry_dials = try arena.alloc(u16, config.clusters.len);
+            @memset(server.retry_dials, 0);
             server.listeners = try arena.alloc(ListenerState, config.listeners.len);
             server.listeners_count = @intCast(config.listeners.len);
             // Empty until `setTlsCredentials`, which is before `start` when
@@ -2250,6 +2259,11 @@ pub fn Server(comptime IoType: type) type {
         /// only at the idle checks, never on the serving path.
         pub fn l4Released(server: *const Self) bool {
             for (server.l4_inflight) |count| {
+                if (count != 0) return false;
+            }
+            // And no #393 retry permit outlived its dial: a leaked one
+            // would shrink the cluster's budget for the process's life.
+            for (server.retry_dials) |count| {
                 if (count != 0) return false;
             }
             return true;

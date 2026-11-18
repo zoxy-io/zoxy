@@ -226,6 +226,8 @@ fn writeFieldSchema(
         } else {
             if (Base == config.PickJson) {
                 try writePickField(out);
+            } else if (Base == config.RetriesJson) {
+                try writeRetriesField(out);
             } else {
                 if (Base == config.BodiesJson) {
                     try writeNamedMap(out, config.BodyJson);
@@ -430,6 +432,30 @@ fn writeEndpointItems(out: *Stringify) Writer.Error!void {
     try out.endArray();
 }
 
+/// A cluster's retries accept two spellings (#393): the bare count every
+/// config has written, or `{count, budget}`. An `anyOf` for the reason
+/// `writePickField` is one — the number lives in `RetriesJson`'s custom
+/// `jsonParse` — and the object arm's count starts at 1, which is the
+/// line between the two: a bare `0` means no retries, a long form retries.
+fn writeRetriesField(out: *Stringify) Writer.Error!void {
+    try out.objectField("anyOf");
+    try out.beginArray();
+    try out.beginObject();
+    try out.objectField("type");
+    try out.write("integer");
+    try out.objectField("minimum");
+    try out.write(0);
+    try out.objectField("maximum");
+    try out.write(constants.cluster_retries_max);
+    try out.objectField("description");
+    try out.write("How many more endpoints a request may dial; 0 is none.");
+    try out.endObject();
+    try out.beginObject();
+    try writeObjectBody(out, config.RetriesJson, true);
+    try out.endObject();
+    try out.endArray();
+}
+
 /// A cluster's pick accepts two spellings (#178) — the bare policy string
 /// (`p2c`, `rr`; a bare `hash` is rejected because its key must be named)
 /// or the `{policy, key, name}` object — so its schema is an `anyOf`,
@@ -581,7 +607,7 @@ fn upperToken(comptime name: []const u8) [name.len]u8 {
 // ---------------------------------------------------------------------------
 
 /// Render the schema into `buffer` and return the written slice. The document
-/// is a few KiB; callers size their buffers well above that. A too-small
+/// is about 64 KiB; the tests' buffers are 128 KiB. A too-small
 /// buffer fails the render with `error.WriteFailed` (a fixed writer does not
 /// spill), so truncation surfaces as a test failure rather than silent loss.
 fn renderInto(buffer: []u8) Writer.Error![]const u8 {
@@ -591,7 +617,7 @@ fn renderInto(buffer: []u8) Writer.Error![]const u8 {
 }
 
 test "config_schema: the emitted document is valid, documented JSON" {
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -612,7 +638,7 @@ test "config_schema: the `$schema` editor hint is a declared root property" {
     // `additionalProperties: false` is what makes the schema mirror the
     // strict loader, so the key an editor writes to *find* this schema has
     // to be declared here too — otherwise pointing at it flags the pointer.
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer parsed.deinit();
@@ -628,15 +654,15 @@ test "config_schema: the `$schema` editor hint is a declared root property" {
 }
 
 test "config_schema: emission is deterministic" {
-    var buffer_a: [64 * 1024]u8 = undefined;
-    var buffer_b: [64 * 1024]u8 = undefined;
+    var buffer_a: [128 * 1024]u8 = undefined;
+    var buffer_b: [128 * 1024]u8 = undefined;
     // Same inputs, twice: field/enum order is declaration order, so the two
     // renders must be byte-identical (the release asset is reproducible).
     try std.testing.expectEqualStrings(try renderInto(&buffer_a), try renderInto(&buffer_b));
 }
 
 test "config_schema: the shipped example's top-level keys are all declared" {
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var schema = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer schema.deinit();
@@ -652,7 +678,7 @@ test "config_schema: the shipped example's top-level keys are all declared" {
 }
 
 test "config_schema: endpoint items accept both spellings" {
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer parsed.deinit();
@@ -682,7 +708,7 @@ test "config_schema: endpoint items accept both spellings" {
 }
 
 test "config_schema: pick accepts both spellings, and only the object names hash" {
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer parsed.deinit();
@@ -724,7 +750,7 @@ test "config_schema: pick accepts both spellings, and only the object names hash
 }
 
 test "config_schema: response filter status bounds and class vocabulary" {
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer parsed.deinit();
@@ -752,7 +778,7 @@ test "config_schema: response filter status bounds and class vocabulary" {
 }
 
 test "config_schema: every exactly-one-of fork is emitted, and names real properties" {
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer parsed.deinit();
@@ -807,7 +833,7 @@ test "config_schema: the emitted dialect is one the validator implements" {
     // "valid" for a constraint it never read — so the emitter is not
     // free to reach for a new one silently. Teach the emitter a keyword
     // and this fails until the validator learns it too.
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -829,7 +855,7 @@ test "config_schema: no DTO concedes a rule the schema now expresses" {
     // the forks were the expressible third and are gone, so what is left
     // must be genuinely semantic. A new concession has to move this
     // number deliberately rather than accumulate quietly.
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [128 * 1024]u8 = undefined;
     const text = try renderInto(&buffer);
     try std.testing.expectEqual(@as(usize, 0), countOccurrences(text, "enforced by the loader, not this schema"));
     try std.testing.expectEqual(@as(usize, 0), countOccurrences(text, "that fork is enforced by the loader"));

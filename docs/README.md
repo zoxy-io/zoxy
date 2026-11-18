@@ -1254,6 +1254,20 @@ Retries apply to `http1` clusters. An `h2c` or `h2` cluster refuses a
 non-zero `retries` at load, because its connections are dialed by a pool
 rather than by a request. An L4 connection always dials once.
 
+When a whole set of origins starts refusing at once, every request retries
+at once too, and those retries compete with first attempts for the same
+origins and the same upstream slots. The long form of `retries` adds a
+budget on how many retry dials the cluster may have in flight:
+
+```json
+"retries": { "count": 2, "budget": 8 }
+```
+
+A refused dial that finds all eight in use is answered `502`, as it would
+be without retries, and counted in `zoxy_upstream_retry_budget_exhausted`.
+The bare number stays the short spelling of `{"count": N}` with no budget,
+and the long form is for clusters that retry, so its `count` starts at 1.
+
 ### Client address
 
 zoxy uses one client address everywhere it matters: the `source_ip` hash

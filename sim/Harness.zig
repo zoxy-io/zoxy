@@ -892,6 +892,16 @@ fn wireClusters(
             .slow_start_ms = deriveSlowStart(random, http_max_inflight, health.check_http != null or health.passive_http != null),
             .max_total_inflight = deriveMaxInflight(harness.clean, random),
             .retries = harness.retries_http,
+            // #393: a budget of one or two retry dials on half the
+            // adversary seeds that retry, so concurrent clients meet it,
+            // and the leak invariant holds every permit back by the
+            // scenario's end. Never on a clean seed: a budget turns a
+            // retry into a `502`, which its golden transcript forbids —
+            // the reason `max_inflight` stays off them too.
+            .retry_budget = if (!harness.clean and harness.retries_http >= 1 and random.boolean())
+                1 + random.uintAtMost(u16, 1)
+            else
+                null,
         },
     };
     // The retry budget and the endpoint that makes it spendable ride

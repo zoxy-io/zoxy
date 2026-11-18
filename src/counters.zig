@@ -294,6 +294,11 @@ pub const Counters = struct {
     /// single-endpoint cluster it fires on every dial failure, which is
     /// the honest reading — a retry budget there can never be spent.
     upstream_retries_exhausted: Value = Value.init(0),
+    /// Retries refused because their cluster's #393 budget of retry dials
+    /// in flight was spent; each was answered `502` instead. Apart from
+    /// `upstream_retries_exhausted`, which is one request running out of
+    /// endpoints, where this is the cluster running out of permits.
+    upstream_retry_budget_exhausted: Value = Value.init(0),
     /// Picks that chose an endpoint the health mask had ejected: the
     /// fail-open rule at zero healthy, or a cluster below its #390 panic
     /// threshold. Every one of them was invisible before this counter —

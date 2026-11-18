@@ -785,6 +785,15 @@ pub const interim_responses_max: u8 = 8;
 /// the set holds the first try plus this many retries.
 pub const cluster_retries_max: u16 = 3;
 
+/// The ceiling on a cluster's #393 retry budget: retry dials in flight at
+/// once. Each holds an upstream slot while it dials, so more than the
+/// pool could never be in flight — the budget is a cap *below* that.
+pub const retry_budget_max: u16 = @min(upstream_slots_max, std.math.maxInt(u16));
+comptime {
+    assert(retry_budget_max >= 1);
+    assert(retry_budget_max <= upstream_slots_max);
+}
+
 /// Lower bound on configured clusters: a config with no cluster can route
 /// nowhere, so the loader rejects an empty map and the config JSON Schema
 /// emits it as `minProperties`.
