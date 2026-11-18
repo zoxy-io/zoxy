@@ -7822,6 +7822,36 @@ test "health: an http probe passes on the expected status" {
     try bed.expectDrained();
 }
 
+test "health: an http probe to a socket endpoint sends Host: localhost" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 61,
+        .unix_origin = true,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .check = .{
+            .kind = .http,
+            .timeout_ms = Http1Bed.connect_timeout_ms,
+            .http = .{ .path = "/health" },
+        },
+        .health_interval_ms = 30,
+    });
+    defer bed.tearDown();
+
+    bed.armDrainTimer(110);
+    try bed.sim_io.run();
+
+    // With no `host` configured, an IP endpoint's probe names the
+    // endpoint. A socket path is no host at all — `unix:/…` would fail
+    // RFC 9110's grammar at any strict origin — so the probe says
+    // `localhost`, as the gRPC probe already does for the same endpoint.
+    try std.testing.expect(bed.origin.accepted_count >= 1);
+    const request = bed.origin.conns[0].request_buffer[0..bed.origin.conns[0].request_len];
+    try std.testing.expect(std.mem.indexOf(u8, request, "\r\nHost: localhost\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "unix:") == null);
+    try std.testing.expect(bed.server.health.healthy[0]);
+    try bed.expectDrained();
+}
+
 test "health: an http probe fails on a status it was not promised" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{

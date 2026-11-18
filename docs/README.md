@@ -983,6 +983,11 @@ successes restore it.
 expected status). Defaults: `fall` 3, `rise` 2, `expect_status` 200, and a
 probe budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
 `timeouts.health_interval_ms` (default 2000) sets the gap between sweeps.
+An `http` probe sends `host` as its `Host` header. Without it, the probe
+sends the endpoint's `IP:port`, or `localhost` for a `unix:` endpoint,
+whose path is not a host name. `path`, `host` and `expect_status` belong
+to `http` alone, and the loader refuses them beside `tcp` or `grpc`
+rather than ignoring them.
 
 A cluster that [speaks `h2c` or `h2`](#http2-to-the-origin-and-grpc) can
 use `grpc`, the standard gRPC health protocol:
@@ -998,11 +1003,13 @@ use `grpc`, the standard gRPC health protocol:
 The probe calls `grpc.health.v1.Health/Check` on a stream of the
 cluster's own pooled connections, over the cluster's TLS when it has one,
 and passes only on `:status` 200, a `SERVING` answer and `grpc-status: 0`.
-`service` is optional; leave it out to ask about the server as a whole.
-`path` and `host` do not apply. If the connection pool is full and holds no
-connection to the endpoint, the probe is skipped instead of failed, since
-that limit is zoxy's and says nothing about the origin. Skipped probes are
-counted in `zoxy_health_probes_skipped`. If that counter keeps rising,
+`service` is optional; leave it out to ask about the server as a whole
+(an empty string is refused, not read as "the server"). `path`, `host`
+and `expect_status` do not apply. If the connection pool is full and
+holds no connection to the endpoint, the probe is skipped instead of
+failed, since that limit is zoxy's and says nothing about the origin.
+Skipped probes are counted in `zoxy_health_probes_skipped`. If that
+counter keeps rising,
 `limits.h2_origin_connections` is smaller than the cluster's endpoints
 need.
 
