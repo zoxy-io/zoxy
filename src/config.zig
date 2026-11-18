@@ -2843,7 +2843,11 @@ pub const MatchJson = struct {
             .items = SchemaItems.http_method,
         },
         .host = .{ .desc = "Canonical host to match; absent matches any host." },
-        .path_prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
+        .path_prefix = .{
+            .desc = "Canonical origin-form path prefix; must start with a slash. " ++
+                "Matches whole path segments: /api matches /api and /api/v1, " ++
+                "never /apihost.",
+        },
         .headers = .{
             .desc = "Header predicates; all must match.",
         },
@@ -3138,7 +3142,11 @@ pub const RouteJson = struct {
         "first: host, then header, then prefix.";
     pub const schema_fields = .{
         .host = .{ .desc = "Canonical host scope; absent matches any host." },
-        .prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
+        .prefix = .{
+            .desc = "Canonical origin-form path prefix; must start with a slash. " ++
+                "Matches whole path segments: /api matches /api and /api/v1, " ++
+                "never /apihost.",
+        },
         .header = .{
             .desc = "Header the request must carry for this route to match; " ++
                 "absent matches any request. A route with a header is tried " ++
@@ -3809,7 +3817,8 @@ pub const TimeoutsJson = struct {
             .maximum = constants.timeout_ms_max,
         },
         .idle_ms = .{
-            .desc = "Idle and head-read deadline; must exceed connect_ms.",
+            .desc = "How long a connection may stay quiet, between requests or " ++
+                "before its first byte; must exceed connect_ms and be at least head_ms.",
             .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
