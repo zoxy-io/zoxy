@@ -422,7 +422,7 @@ fn writeEndpointItems(out: *Stringify) Writer.Error!void {
     try out.objectField("type");
     try out.write("string");
     try out.objectField("description");
-    try out.write("IP:port endpoint literal (port must be non-zero) — weight 1.");
+    try out.write("IP:port endpoint literal (port must be non-zero), with weight 1.");
     try out.endObject();
     try out.beginObject();
     try writeObjectBody(out, config.EndpointJson, true);
@@ -450,7 +450,7 @@ fn writePickField(out: *Stringify) Writer.Error!void {
     try out.write("rr");
     try out.endArray();
     try out.objectField("description");
-    try out.write("A keyless pick policy; hash takes the object form, which names its key.");
+    try out.write("A pick policy that takes no key. For hash, use the object form, which names its key.");
     try out.endObject();
     try out.beginObject();
     try writeObjectBody(out, config.PickJson, true);

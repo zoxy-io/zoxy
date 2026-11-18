@@ -1951,10 +1951,15 @@ pub const ConfigJson = struct {
     error_pages: ?ErrorPagesJson = null,
 
     pub const schema_doc =
-        "Startup config for the zoxy L4/L7 proxy. Encodes structure, enums, " ++
-        "and numeric bounds; semantic checks (canonical route prefixes/hosts, " ++
-        "IP:port literal parsing, reserved header names, endpoint port != 0) " ++
-        "are enforced by the loader and are not expressible in JSON Schema.";
+        "Startup configuration for zoxy, the L4/L7 proxy. This schema checks " ++
+        "structure, allowed values and numeric ranges. Rules JSON Schema " ++
+        "cannot express are enforced by the loader when zoxy starts: route " ++
+        "hosts and path prefixes must already be canonical (a lowercase host " ++
+        "without a port; a path without dot segments, a query, or " ++
+        "percent-escapes that normalization would change), IP:port addresses " ++
+        "must be valid literals, endpoint ports must be non-zero, and filters " ++
+        "may not edit headers zoxy manages itself, such as Host, Connection, " ++
+        "Content-Length and X-Forwarded-For.";
     pub const schema_fields = .{
         .@"$schema" = .{
             .desc = "URL of the JSON Schema this config follows; an editor hint, ignored by the loader.",
@@ -1965,7 +1970,7 @@ pub const ConfigJson = struct {
         },
         .clusters = .{ .desc = "Named upstream clusters, keyed by cluster name." },
         .timeouts = .{ .desc = "Connection lifecycle deadlines (milliseconds)." },
-        .limits = .{ .desc = "Optional pool sizes and the CQ-fill headroom knob; absent fields take the lean defaults." },
+        .limits = .{ .desc = "Optional pool sizes and completion-queue headroom; omitted fields take lean defaults." },
         .admin = .{ .desc = "Optional admin/metrics listener; absent leaves it off." },
         .access_log = .{ .desc = "Optional per-request/per-connection JSON access log; absent leaves it off." },
         .bodies = .{
@@ -1974,9 +1979,9 @@ pub const ConfigJson = struct {
         },
         .error_pages = .{
             .desc = "Bodies for the statuses zoxy sends itself, keyed by " ++
-                "status literal, each naming a body. Configuring a status " ++
-                "is the opt-in — absent, every static response stays empty, " ++
-                "sheds included.",
+                "status code, each naming a body. Only listed statuses get " ++
+                "a body. Without this block, every such response is empty, " ++
+                "including load-shedding responses.",
         },
     };
 };
@@ -1991,21 +1996,21 @@ pub const AccessLogJson = struct {
     response_headers: ?[]const []const u8 = null,
 
     pub const schema_doc =
-        "Optional access log. When present, zoxy writes one JSON object per " ++
-        "line for every HTTP exchange and every L4 connection; absent leaves " ++
-        "it off and reserves nothing. Lines are dropped, and counted, rather " ++
-        "than allowed to block the event loop when the sink cannot keep up.";
+        "Optional access log: one JSON object per line for every HTTP " ++
+        "exchange and every L4 connection. Absent leaves it off and reserves " ++
+        "nothing. When the sink cannot keep up, lines are dropped and " ++
+        "counted rather than blocking the event loop.";
     pub const schema_fields = .{
         .sink = .{
-            .desc = "Where lines are written. `stdout` is the process's own standard " ++
-                "output; `file` appends to `path`.",
+            .desc = "Where lines are written: `stdout` (the process's standard " ++
+                "output) or `file` (appends to `path`).",
             .enum_type = Config.AccessLogSinkKind,
         },
         .path = .{
-            .desc = "File the `file` sink appends to: created if absent, opened " ++
-                "append-only at startup (one extra fd), never truncated — so a " ++
-                "copy-truncate rotation is safe. Required by `sink:\"file\"`, " ++
-                "rejected beside `stdout`, which cannot use it.",
+            .desc = "File the `file` sink appends to. It is created if missing, " ++
+                "opened append-only at startup (one extra fd) and never " ++
+                "truncated, so copy-truncate rotation is safe. Required with " ++
+                "`sink: \"file\"`, rejected with `stdout`.",
             // An empty path is the same refusal as a missing one and
             // wants the same answer (#305): the loader raises
             // `AccessLogPathMissing` for both, so the schema has to
@@ -2014,18 +2019,18 @@ pub const AccessLogJson = struct {
         },
         .request_headers = .{
             .desc = "Request headers to record under `request_headers` on each " ++
-                "http line — an upstream's X-Request-ID or traceparent is what " ++
-                "joins this log to the origin's. Names are matched " ++
-                "case-insensitively and logged lowercased; absent headers are " ++
-                "omitted from the line.",
+                "http line, such as X-Request-ID or traceparent to join this " ++
+                "log to the origin's. Names match case-insensitively and are " ++
+                "logged in lowercase; a header the request lacks is left out " ++
+                "of its line.",
             .max_items = constants.access_log_headers_max,
             .item_min_length = 1,
             .item_max_length = constants.access_log_header_name_bytes_max,
         },
         .response_headers = .{
             .desc = "Response headers to record under `response_headers`, on the " ++
-                "same terms — the origin's X-Cache, say. Ignored for l4 lines, " ++
-                "which have no response to read.",
+                "same terms (for example the origin's X-Cache). Ignored for l4 " ++
+                "lines, which have no response.",
             .max_items = constants.access_log_headers_max,
             .item_min_length = 1,
             .item_max_length = constants.access_log_header_name_bytes_max,
@@ -2048,8 +2053,8 @@ pub const AdminJson = struct {
     bind: []const u8,
 
     pub const schema_doc =
-        "Optional admin/metrics listener. When present, exposes the process " ++
-        "counters as Prometheus exposition text on `bind`; absent leaves it off.";
+        "Optional admin/metrics listener. When present, it serves the process " ++
+        "counters in Prometheus text format on `bind`; absent leaves it off.";
     pub const schema_fields = .{
         .bind = .{ .desc = "IP:port literal to bind the admin/metrics listener (hostnames are rejected)." },
     };
@@ -2076,9 +2081,10 @@ pub const LimitsJson = struct {
     access_log_buffer_bytes: ?u32 = null,
 
     pub const schema_doc =
-        "Optional pool sizes and the CQ-fill headroom knob; absent fields " ++
-        "take the lean defaults. Pools may only shrink below their ceilings; " ++
-        "cq_fill_eighths trades ceiling for burst headroom, never a pool size.";
+        "Optional pool sizes and completion-queue headroom; omitted fields " ++
+        "take lean defaults. A pool can be set at or below its ceiling, " ++
+        "never above. cq_fill_eighths trades ceiling for burst headroom and " ++
+        "never changes a pool size.";
     pub const schema_fields = .{
         .conn_slots = .{
             .desc = "Concurrent connection slots.",
@@ -2086,7 +2092,7 @@ pub const LimitsJson = struct {
             .maximum = constants.conn_slots_max,
         },
         .relay_buffers = .{
-            .desc = "Relay buffer pairs (bounds concurrent L4 and L7 body relays).",
+            .desc = "Relay buffer pairs; bounds concurrent L4 and L7 body relays.",
             .minimum = 1,
             .maximum = constants.relay_buffers_max,
         },
@@ -2096,44 +2102,43 @@ pub const LimitsJson = struct {
             .maximum = constants.upstream_slots_max,
         },
         .head_buffers = .{
-            .desc = "HTTP head buffers in the shared ring (bounds request heads " ++
-                "in flight; idle keep-alive connections hold none). Defaults " ++
-                "to conn_slots; must be 1..conn_slots with an http listener, " ++
-                "0 without one.",
+            .desc = "HTTP head buffers; bounds request heads in flight (idle " ++
+                "keep-alive connections hold none). Defaults to conn_slots; " ++
+                "must be 1..conn_slots with an http listener, 0 without one.",
             .minimum = 0,
             .maximum = constants.conn_slots_max,
         },
         .upstream_head_buffers = .{
-            .desc = "Upstream head buffers (bounds exchanges in their head " ++
-                "phase; parked origin connections hold none). Defaults to " ++
-                "upstream_slots; must be 1..upstream_slots with an http " ++
+            .desc = "Upstream head buffers; bounds exchanges in their head " ++
+                "phase (idle pooled origin connections hold none). Defaults " ++
+                "to upstream_slots; must be 1..upstream_slots with an http " ++
                 "listener, 0 without one.",
             .minimum = 0,
             .maximum = constants.upstream_slots_max,
         },
         .head_buffer_bytes = .{
-            .desc = "Bytes per head buffer in both head pools — the largest " ++
-                "HTTP head accepted (oversize requests get 414/431). May be " ++
-                "raised for big-cookie/JWT traffic as well as lowered.",
+            .desc = "Bytes per head buffer in both head pools, and so the " ++
+                "largest HTTP head accepted (oversize requests get 414 or " ++
+                "431). Raise it for traffic with large cookies or JWTs.",
             .minimum = constants.head_buffer_bytes_min,
             .maximum = constants.head_buffer_bytes_max,
         },
         .relay_buffer_bytes = .{
-            .desc = "Bytes per relay direction; a pair costs twice this. Sets " ++
-                "how many round trips a body costs and the size of the TLS " ++
-                "records a terminating listener emits. Lower it when " ++
+            .desc = "Bytes per relay direction; a pair costs twice this. It " ++
+                "sets how many round trips a body takes and the size of the " ++
+                "TLS records a terminating listener sends. Lower it when " ++
                 "concurrency matters more than bulk throughput. A listener " ++
-                "that terminates TLS caps this at one record's plaintext " ++
-                "(16 KiB); the range above that is for plaintext deployments, " ++
-                "which pay no record framing.",
+                "that terminates TLS caps it at one record's plaintext " ++
+                "(16 KiB); values above that are for plaintext deployments.",
             .minimum = constants.relay_buffer_bytes_min,
             .maximum = constants.relay_buffer_bytes_max,
         },
         .tls_engines = .{
-            .desc = "Concurrent TLS sessions — handshaking or terminated. The " ++
-                "largest per-connection object zoxy holds (~92 KiB plus a " ++
-                "plaintext buffer), so this is what a TLS deployment's memory " ++
-                "follows. Zero exactly when no listener terminates TLS.",
+            .desc = "Concurrent TLS sessions, handshaking or terminated. Each " ++
+                "is the largest per-connection object zoxy holds (about " ++
+                "92 KiB plus a plaintext buffer), so a TLS deployment's " ++
+                "memory follows this number. Zero exactly when no listener " ++
+                "terminates TLS.",
             .minimum = 1,
             .maximum = constants.tls_engines_max,
         },
@@ -2145,45 +2150,44 @@ pub const LimitsJson = struct {
             .maximum = std.math.maxInt(u32),
         },
         .tunnels = .{
-            .desc = "Concurrent tunnelled upgrades (#180). Each holds its own relay " ++
+            .desc = "Concurrent tunnelled upgrades. Each holds its own relay " ++
                 "buffer and upstream socket for its whole life, so tunnels never " ++
-                "draw on the pools ordinary traffic shares. Required — and only " ++
-                "legal — when some listener allows an upgrade; no default is " ++
-                "derived, because a count of long-lived sessions is a capacity " ++
-                "decision rather than something a connection count implies.",
+                "draw on the pools ordinary traffic shares. Required when some " ++
+                "listener allows an upgrade and rejected otherwise; there is no " ++
+                "default.",
             .minimum = 1,
             .maximum = constants.tunnels_max,
         },
         .h2_connections = .{
-            .desc = "Concurrent HTTP/2 connections (#275), each holding a session of " ++
-                "its own (~100 KiB). Legal only when some listener speaks HTTP/2 " ++
-                "— h2 in tls.alpn, or http.h2c — and defaults to 1024, at most " ++
+            .desc = "Concurrent HTTP/2 connections, each holding its own session " ++
+                "(about 100 KiB). Allowed only when some listener speaks HTTP/2 " ++
+                "(h2 in tls.alpn, or http.h2c); defaults to 1024, at most " ++
                 "conn_slots. With none free, an h2 offer falls back to HTTP/1.1, " ++
-                "an h2c preface is turned away, and an h2-only listener sheds " ++
-                "at accept.",
+                "an h2c preface is turned away, and an h2-only listener refuses " ++
+                "the connection at accept.",
             .minimum = 1,
             .maximum = constants.conn_slots_max,
         },
         .stream_slots = .{
-            .desc = "Concurrent HTTP/2 exchanges across every connection (#275): " ++
-                "the shared streams HTTP/2 multiplexes, each with a head buffer " ++
-                "of its own. Required — and only legal — when some listener " ++
-                "speaks HTTP/2; a stream past the pool is refused REFUSED_STREAM, " ++
-                "which a client retries. One connection advertises at most 100.",
+            .desc = "Concurrent HTTP/2 streams across all connections, each " ++
+                "with its own head buffer. Required when some listener speaks " ++
+                "HTTP/2 and rejected otherwise. A stream beyond the pool is " ++
+                "refused with REFUSED_STREAM, which clients retry. One " ++
+                "connection advertises at most 100.",
             .minimum = 1,
             .maximum = constants.stream_slots_max,
         },
         .cq_fill_eighths = .{
-            .desc = "Eighths of the io_uring completion queue the worst-case " ++
-                "in-flight ops may fill; lower reserves more burst headroom " ++
-                "but lowers the feasible connection-slot ceiling.",
+            .desc = "How many eighths of the io_uring completion queue the " ++
+                "worst-case in-flight operations may fill. Lower values reserve " ++
+                "more burst headroom but lower the highest feasible conn_slots.",
             .minimum = constants.cq_fill_eighths_min,
             .maximum = constants.cq_fill_eighths_max,
         },
         .access_log_buffer_bytes = .{
-            .desc = "Bytes per access-log staging buffer, of which there are two; " ++
-                "larger tolerates a slower sink before lines are dropped. " ++
-                "Only valid alongside an `access_log` block.",
+            .desc = "Bytes per access-log staging buffer (there are two). A " ++
+                "larger buffer tolerates a slower sink before lines are " ++
+                "dropped. Only valid with an `access_log` block.",
             .minimum = constants.access_log_buffer_bytes_min,
             .maximum = constants.access_log_buffer_bytes_max,
         },
@@ -2222,30 +2226,30 @@ pub const ListenerJson = struct {
     l4: ?L4ListenerJson = null,
 
     pub const schema_doc =
-        "One accepting socket. Exactly one of `http` or `l4` names what it " ++
-        "speaks and carries that protocol's settings; `bind` and `tls` are " ++
-        "shared by both.";
+        "One listening socket. Exactly one of `http` or `l4` sets what it " ++
+        "speaks and holds that protocol's settings; `bind` and `tls` apply " ++
+        "to both.";
     pub const schema_one_of = [_][]const u8{ "http", "l4" };
     pub const schema_fields = .{
         .bind = .{
-            .desc = "What to bind: an `IP:port` literal (hostnames are rejected — " ++
-                "DNS is a non-goal), or `unix:` followed by the absolute path of " ++
-                "a socket file to create.",
+            .desc = "Address to bind: an `IP:port` literal (hostnames are " ++
+                "rejected), or `unix:` followed by the absolute path of a " ++
+                "socket file to create.",
         },
         .mode = .{
-            .desc = "Permission bits for a unix: socket file, as an octal string " ++
-                "(\"0660\"). Absent leaves the process umask's default. Rejected " ++
-                "on an IP bind, which creates no file.",
+            .desc = "Permission bits for a `unix:` socket file, as an octal " ++
+                "string (\"0660\"). Absent leaves the process umask's default. " ++
+                "Rejected on an IP bind, which creates no file.",
             .min_length = 1,
         },
         .tls = .{
             .desc = "Terminate TLS on this listener with the given certificate " ++
-                "and key; absent is a plaintext socket. Inbound only — the " ++
+                "and key; absent is a plaintext socket. Inbound only: the " ++
                 "upstream leg stays plaintext.",
         },
         .http = .{
-            .desc = "Speak HTTP/1.1: run the reverse-proxy state machine, with " ++
-                "routing, filters and body limits.",
+            .desc = "Speak HTTP/1.1 as a reverse proxy, with routing, filters " ++
+                "and body limits.",
         },
         .l4 = .{
             .desc = "Speak L4: relay bytes to one cluster without inspecting them.",
@@ -2286,7 +2290,7 @@ pub const HttpListenerJson = struct {
         "`routes` selects the upstream.";
     pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
     pub const schema_fields = .{
-        .cluster = .{ .desc = "Sugar for a single catch-all route to this cluster; mutually exclusive with routes." },
+        .cluster = .{ .desc = "Shorthand for a single catch-all route to this cluster; mutually exclusive with routes." },
         .routes = .{
             .desc = "Explicit longest-prefix route table.",
             .min_items = 1,
@@ -2295,8 +2299,8 @@ pub const HttpListenerJson = struct {
             .desc = "Request filter rules, evaluated top-down.",
         },
         .response_filters = .{
-            .desc = "Response filter rules — header edits on the origin's response, " ++
-                "evaluated top-down.",
+            .desc = "Response filter rules that edit headers on the origin's " ++
+                "response, evaluated top-down.",
         },
         .forwarded = .{
             .desc = "Tell the origin the client's address via X-Forwarded-For; " ++
@@ -2304,28 +2308,29 @@ pub const HttpListenerJson = struct {
         },
         .max_body_bytes = .{
             .desc = "Cap on one request body in bytes; 0 accepts any size, and " ++
-                "absent is 1 MiB. A body over the cap is refused 413 before the " ++
-                "origin is dialed where its length was declared, and the " ++
-                "connection closes.",
+                "absent is 1 MiB. A body over the cap is refused with 413 and " ++
+                "the connection closes; when its length was declared, this " ++
+                "happens before the origin is dialed.",
             .minimum = 0,
             .maximum = constants.request_body_bytes_max,
         },
         .proxy_status = .{
-            .desc = "Name why this proxy refused a request, in an RFC 9209 " ++
-                "Proxy-Status field, so a client can tell a shed 503 from the " ++
-                "origin's own. Off by default: it states internal limits on " ++
-                "the wire, which an internal listener may want and an edge " ++
-                "one may not.",
+            .desc = "Say why zoxy refused a request in an RFC 9209 Proxy-Status " ++
+                "field, so a client can tell a load-shedding 503 from the " ++
+                "origin's own. Off by default because it reveals internal " ++
+                "limits to clients: useful on an internal listener, less so " ++
+                "at the edge.",
         },
         .upgrades = .{
-            .desc = "Protocol upgrades this listener will carry as tunnels; absent " ++
-                "allows none and an Upgrade stays 501. Requires limits.tunnels.",
+            .desc = "Protocol upgrades this listener carries as tunnels. Absent " ++
+                "allows none, and an Upgrade request gets 501. Requires " ++
+                "limits.tunnels.",
         },
         .h2c = .{
-            .desc = "Also speak HTTP/2 to a client that opens with its preface " ++
-                "(h2c by prior knowledge, RFC 9113 §3.3); HTTP/1.1 is served as " ++
-                "before. Plaintext only — a tls listener offers h2 in tls.alpn " ++
-                "instead. Requires limits.stream_slots.",
+            .desc = "Also speak HTTP/2 to a client that opens with the HTTP/2 " ++
+                "preface (h2c with prior knowledge, RFC 9113 §3.3); HTTP/1.1 " ++
+                "clients are still served. Plaintext only: a TLS listener offers " ++
+                "h2 in tls.alpn instead. Requires limits.stream_slots.",
         },
     };
 };
@@ -2350,8 +2355,9 @@ pub const UpgradesJson = struct {
         "every flag false, allows none.";
     pub const schema_fields = .{
         .websocket = .{
-            .desc = "Carry a WebSocket handshake (RFC 6455) as a tunnel once the " ++
-                "origin answers 101. Requires limits.tunnels.",
+            .desc = "Allow WebSocket upgrades (RFC 6455): once the origin " ++
+                "answers 101, the connection is carried as a tunnel. Requires " ++
+                "limits.tunnels.",
         },
     };
 
@@ -2389,24 +2395,24 @@ pub const L4ListenerJson = struct {
 
     pub const schema_doc =
         "An L4 listener's settings: which cluster it relays to, and what it " ++
-        "expects ahead of the payload. Exactly one of `cluster` or `routes` " ++
+        "expects before the payload. Exactly one of `cluster` or `routes` " ++
         "selects the upstream.";
     pub const schema_one_of = [_][]const u8{ "cluster", "routes" };
     pub const schema_fields = .{
         .cluster = .{
-            .desc = "Sugar for a single any-name route to this cluster; " ++
+            .desc = "Shorthand for a single route that matches any server name; " ++
                 "mutually exclusive with routes.",
         },
         .routes = .{
             .desc = "Route by the TLS server name (SNI) the client asked for, " ++
-                "without terminating: the ClientHello is read and relayed " ++
+                "without terminating TLS: the ClientHello is read and relayed " ++
                 "unchanged. Requires the full-size relay buffer, and cannot be " ++
                 "combined with this listener's own tls block.",
             .min_items = 1,
         },
         .proxy_protocol = .{
-            .desc = "Expect a PROXY protocol header (v1 or v2) ahead of every " ++
-                "connection's payload; absent treats first bytes as payload.",
+            .desc = "Expect a PROXY protocol header (v1 or v2) before each " ++
+                "connection's payload; absent treats the first bytes as payload.",
         },
     };
 };
@@ -2421,17 +2427,16 @@ pub const L4RouteJson = struct {
     cluster: []const u8,
 
     pub const schema_doc =
-        "One SNI route. `sni` absent is the catch-all: it answers any " ++
+        "One SNI route. Without `sni` it is the catch-all: it answers any " ++
         "connection, including one whose ClientHello carried no name. A " ++
         "connection matching no route is closed.";
     pub const schema_fields = .{
         .sni = .{
-            .desc = "The TLS server name to match, exactly — the same rule " ++
-                "http routes match a host by, so the two cannot disagree " ++
-                "about what a name is. No wildcards.",
+            .desc = "The TLS server name to match exactly, by the same rule " ++
+                "http routes use to match a host. No wildcards.",
             .min_length = 1,
         },
-        .cluster = .{ .desc = "The cluster connections naming this server are relayed to." },
+        .cluster = .{ .desc = "The cluster that connections naming this server are relayed to." },
     };
 };
 
@@ -2443,10 +2448,9 @@ pub const TlsJson = struct {
     pub const schema_doc =
         "TLS termination for this listener: where its certificate chain and " ++
         "private key live. Both are read once at startup, so a missing or " ++
-        "unusable file stops the proxy while the error can still name it — " ++
-        "never mid-handshake against a real client. The key must be ECDSA " ++
-        "P-256 or P-384: the handshake runs on the event loop, where an RSA " ++
-        "signature's milliseconds would stall every other connection on it.";
+        "unusable file stops startup with an error naming it, rather than " ++
+        "failing a client's handshake later. The key must be ECDSA P-256 or " ++
+        "P-384; RSA signing would stall the event loop.";
     pub const schema_fields = .{
         .cert = .{
             .desc = "Path to the PEM certificate chain, leaf first.",
@@ -2459,8 +2463,8 @@ pub const TlsJson = struct {
         .alpn = .{
             .desc = "Application protocols to offer in ALPN (RFC 7301), most " ++
                 "preferred first. Absent offers `http/1.1` on an `http` listener; " ++
-                "refused on an `l4` listener, which names no protocol. A client " ++
-                "that offers ALPN and names none of these is refused with " ++
+                "rejected on an `l4` listener, which names no protocol. A client " ++
+                "whose ALPN offer names none of these is refused with " ++
                 "`no_application_protocol`.",
             .min_items = 1,
             .max_items = alpn.protocols_max,
@@ -2473,16 +2477,15 @@ pub const ForwardedJson = struct {
     mode: []const u8,
 
     pub const schema_doc =
-        "How this listener sets `X-Forwarded-For`. There is no default, " ++
-        "because `replace` and `append` are each a security bug in the " ++
-        "other's position: an inbound chain is client-controlled at the " ++
-        "edge and authoritative behind a proxy you own, and zoxy cannot " ++
-        "tell from the inside which side of that line it is on.";
+        "How this listener sets `X-Forwarded-For`. There is no default: an " ++
+        "inbound chain is client-controlled at the edge but trustworthy " ++
+        "behind a proxy you own, and zoxy cannot tell which position it is " ++
+        "in, so choosing the wrong mode is a security bug.";
     pub const schema_fields = .{
         .mode = .{
-            .desc = "replace: state the observed peer, discarding any inbound chain " ++
-                "(use at the edge). append: extend the inbound chain with the observed " ++
-                "peer (use only when every hop in front is trusted).",
+            .desc = "replace: set the header to the observed peer, discarding any inbound " ++
+                "chain (use at the edge). append: add the observed peer to the " ++
+                "inbound chain (use only when every hop in front is trusted).",
             .enum_type = Config.Listener.Forwarded,
         },
     };
@@ -2493,16 +2496,14 @@ pub const ProxyProtocolJson = struct {
 
     pub const schema_doc =
         "Whether this listener expects the proxy in front of it to announce " ++
-        "each client with a PROXY protocol header. There is no sniffing mode " ++
-        "— accepting a header only when one shows up would let any client " ++
-        "pick the address that routing and logging then believe — and `mode` " ++
-        "is stated even with one value today, so future modes extend a " ++
-        "vocabulary rather than change what absence means.";
+        "each client with a PROXY protocol header. There is no optional " ++
+        "mode: accepting a header only when one is present would let any " ++
+        "client choose the address that routing and logging trust.";
     pub const schema_fields = .{
         .mode = .{
             .desc = "require: every connection must open with a valid v1 or v2 " ++
                 "header; anything else is closed. Only meaningful when the " ++
-                "listener is reachable exclusively through the fronting proxy.",
+                "listener can be reached solely through the proxy in front of it.",
             .enum_type = Config.Listener.ProxyProtocol,
         },
     };
@@ -2544,11 +2545,12 @@ pub const MatchJson = struct {
             .desc = "Header predicates; all must match.",
         },
         .client = .{
-            .desc = "CIDR prefixes the connection's client address must fall inside " ++
-                "(any-of): \"10.0.0.0/8\", up to /32 for IPv4 and /64 for IPv6 — a " ++
-                "client's IPv6 identity is its /64, like hash source_ip. Matched " ++
-                "against the observed peer (the PROXY-announced client on a " ++
-                "proxy_protocol listener), never an X-Forwarded-For chain.",
+            .desc = "CIDR prefixes such as \"10.0.0.0/8\"; matches when the client " ++
+                "address falls inside any of them. Up to /32 for IPv4 and /64 " ++
+                "for IPv6, since an IPv6 client is identified by its /64, as " ++
+                "with hash source_ip. Matched against the observed peer (the " ++
+                "PROXY-announced client on a proxy_protocol listener), never an " ++
+                "X-Forwarded-For chain.",
             .min_items = 1,
         },
     };
@@ -2562,8 +2564,8 @@ pub const HeaderMatchJson = struct {
     contains: ?[]const u8 = null,
 
     pub const schema_doc =
-        "One header predicate. Exactly one of `present`/`equals`/`contains` " ++
-        "selects the kind.";
+        "One header predicate. Exactly one of `present`, `equals` or " ++
+        "`contains` selects the kind.";
     pub const schema_one_of = [_][]const u8{ "present", "equals", "contains" };
     pub const schema_fields = .{
         .name = .{ .desc = "Header field name (matched case-insensitively)." },
@@ -2600,11 +2602,10 @@ pub const ResponseActionJson = struct {
     header_remove: ?[]const u8 = null,
 
     pub const schema_doc =
-        "One response-filter action. Exactly one field is set — the edit's " ++
-        "kind. Response rules edit headers only: the request-side actions " ++
-        "(reject, redirect, respond, allow, rewrite_prefix) decide whether " ++
-        "to forward at all, and by the time these rules run the origin " ++
-        "already has answered.";
+        "One response-filter action: set exactly one field, which names the " ++
+        "edit. Response rules only edit headers. The request-side actions " ++
+        "(reject, redirect, respond, allow, rewrite_prefix) are not " ++
+        "available, because the origin has already answered.";
     pub const schema_one_of = [_][]const u8{
         "header_set",
         "header_add",
@@ -2651,7 +2652,7 @@ pub const ActionJson = struct {
     rewrite_prefix: ?RewriteJson = null,
 
     pub const schema_doc =
-        "One filter action. Exactly one field is set — the action's kind.";
+        "One filter action: set exactly one field, which names the action.";
     pub const schema_one_of = [_][]const u8{
         "reject",
         "redirect",
@@ -2671,14 +2672,14 @@ pub const ActionJson = struct {
             .desc = "Answer the request with a redirect instead of forwarding it.",
         },
         .respond = .{
-            .desc = "Answer the request from a configured body instead of " ++
-                "forwarding it — this proxy as the origin.",
+            .desc = "Answer the request with a configured body instead of " ++
+                "forwarding it.",
         },
         .allow = .{
-            .desc = "Forward the request and stop reading rules — no answer, no " ++
-                "edit. What an allowlist is written with: an allow rule naming " ++
-                "the admitted traffic, a reject beneath it for everything else " ++
-                "(allow: false is rejected).",
+            .desc = "Forward the request and stop evaluating rules; it neither " ++
+                "answers nor edits. Use it to write an allowlist: an allow rule " ++
+                "matching the admitted traffic, then a reject for everything " ++
+                "else (allow: false is rejected).",
             .const_true = true,
         },
         .header_set = .{ .desc = "Set (replace) a request header." },
@@ -2698,8 +2699,8 @@ pub const RespondJson = struct {
     body: []const u8,
 
     pub const schema_doc =
-        "Answer the matched request from a configured body, with the status " ++
-        "given — the proxy responding as the origin, from memory.";
+        "Answer the matched request with a configured body and the given " ++
+        "status, served from memory without contacting the origin.";
     pub const schema_fields = .{
         .status = .{
             .desc = "Status to answer with: 200, or one of the error statuses " ++
@@ -2725,22 +2726,23 @@ pub const RedirectJson = struct {
 
     pub const schema_doc =
         "Where a redirect sends the client: a fixed `location`, or a " ++
-        "composed target (`scheme` and optionally `host`) that carries the " ++
-        "request's own path and query through.";
+        "composed target (`scheme` and optionally `host`) that keeps the " ++
+        "request's own path and query.";
     pub const schema_fields = .{
         .status = .{
-            .desc = "Redirect status: permanent/temporary x method-preserving.",
+            .desc = "Redirect status: permanent or temporary, each with or " ++
+                "without method preservation.",
             .int_values = &filter.redirect_statuses,
         },
         .location = .{
             .desc = "Fixed Location value, sent verbatim; mutually exclusive " ++
-                "with scheme/host.",
+                "with scheme and host.",
             .min_length = 1,
         },
         .scheme = .{
-            .desc = "Replacement scheme for a composed target. Required there — " ++
-                "never guessed, since behind a TLS terminator every hop this " ++
-                "proxy sees is plaintext.",
+            .desc = "Replacement scheme for a composed target, and required for " ++
+                "one. It is never guessed: behind a TLS terminator, every hop " ++
+                "zoxy sees is plaintext.",
             .enum_type = filter.Redirect.Scheme,
         },
         .host = .{
@@ -2766,10 +2768,9 @@ pub const ResponseFilterJson = struct {
     pub const schema_fields = .{
         .match = .{ .desc = "Response-match predicate; absent fields match anything." },
         .actions = .{
-            .desc = "Header edits (header_set / header_add / header_remove) applied " ++
-                "in order when the rule matches. The request-side actions are not " ++
-                "fields here at all: by the time these rules run the origin has " ++
-                "already answered.",
+            .desc = "Header edits (header_set, header_add, header_remove) applied " ++
+                "in order when the rule matches. Request-side actions are not " ++
+                "available, because the origin has already answered.",
             .min_items = 1,
         },
     };
@@ -2801,7 +2802,7 @@ pub const HeaderEditJson = struct {
     name: []const u8,
     value: []const u8,
 
-    pub const schema_doc = "A header name/value pair for header_set / header_add.";
+    pub const schema_doc = "A header name and value for header_set or header_add.";
     pub const schema_fields = .{
         .name = .{ .desc = "Header field name." },
         .value = .{ .desc = "Header field value." },
@@ -2829,18 +2830,18 @@ pub const RouteJson = struct {
     cluster: []const u8,
 
     pub const schema_doc =
-        "One route entry. Every key it states must hold — host, header and " ++
-        "prefix are a conjunction — and the table is matched most-specific " ++
+        "One route entry. A request must match every key the route sets " ++
+        "(host, header and prefix), and the table is matched most specific " ++
         "first: host, then header, then prefix.";
     pub const schema_fields = .{
         .host = .{ .desc = "Canonical host scope; absent matches any host." },
         .prefix = .{ .desc = "Canonical origin-form path prefix; must start with a slash." },
         .header = .{
             .desc = "Header the request must carry for this route to match; " ++
-                "absent matches any request. A route naming one is the " ++
-                "narrower rule and is tried before the same route without.",
+                "absent matches any request. A route with a header is tried " ++
+                "before the same route without one.",
         },
-        .cluster = .{ .desc = "Name of the cluster matching requests route to." },
+        .cluster = .{ .desc = "Name of the cluster that matching requests are routed to." },
     };
 };
 
@@ -2861,14 +2862,14 @@ pub const RouteHeaderJson = struct {
     equals: ?[]const u8 = null,
 
     pub const schema_doc =
-        "One header predicate on a route. Exactly one of `present`/`equals` " ++
-        "selects the kind. No substring or regex matching: a route's " ++
-        "predicate is a bounded comparison, on a table every request walks.";
+        "One header predicate on a route. Exactly one of `present` or " ++
+        "`equals` selects the kind. Routes do not support substring or " ++
+        "regex matching.";
     pub const schema_one_of = [_][]const u8{ "present", "equals" };
     pub const schema_fields = .{
         .name = .{ .desc = "Header field name (matched case-insensitively)." },
         .present = .{
-            .desc = "Matches when the header is present at all (present: false is rejected).",
+            .desc = "Matches when the header is present (present: false is rejected).",
             .const_true = true,
         },
         .equals = .{ .desc = "Matches when the header's value equals this string exactly." },
@@ -2903,13 +2904,13 @@ pub const ClusterJson = struct {
     pub const schema_fields = .{
         .endpoints = .{
             .desc = "Endpoints: IP:port literals (port must be non-zero), each " ++
-                "optionally an object adding a pick weight (#174).",
+                "optionally written as an object that adds a pick weight.",
             .min_items = 1,
         },
         .pick = .{
-            .desc = "Endpoint-pick policy: p2c (power-of-two-choices) or rr " ++
-                "(strict round-robin) as a bare string, or an object choosing " ++
-                "hash (stickiness) and naming its key.",
+            .desc = "Endpoint-pick policy: p2c (power of two choices) or rr " ++
+                "(strict round-robin) as a bare string, or an object that " ++
+                "selects hash (sticky) and names its key.",
         },
         .check = .{
             .desc = "Active health checks for every endpoint in this cluster; absent leaves them off.",
@@ -2923,16 +2924,16 @@ pub const ClusterJson = struct {
             .maximum = constants.endpoint_inflight_max,
         },
         .retries = .{
-            .desc = "Further endpoints one request may dial after a refused or " ++
-                "unreachable first try; 0 (the default) answers 502 on the first " ++
-                "failure. All tries share the one connect timeout.",
+            .desc = "How many more endpoints a request may dial after a refused " ++
+                "or unreachable first try; 0 (the default) answers 502 on the " ++
+                "first failure. All tries share one connect timeout.",
             .minimum = 0,
             .maximum = constants.cluster_retries_max,
         },
         .proxy_protocol = .{
             .desc = "Announce each client to this cluster's origins with a PROXY " ++
-                "protocol header on the upstream connection (l4-reachable " ++
-                "clusters only); absent sends none.",
+                "protocol header on the upstream connection (only on clusters " ++
+                "no http listener routes to); absent sends none.",
         },
     };
 };
@@ -2958,8 +2959,8 @@ pub const EndpointJson = struct {
         },
         .weight = .{
             .desc = "Relative share of the cluster's traffic under every pick " ++
-                "policy; endpoints default to equal (1). 0 drains the endpoint: " ++
-                "still health-checked, never picked.",
+                "policy; the default is 1, so endpoints share equally. 0 drains " ++
+                "the endpoint: it is still health-checked but never picked.",
             .minimum = 0,
             .maximum = constants.endpoint_weight_max,
         },
@@ -3032,22 +3033,22 @@ pub const PickJson = struct {
 
     pub const schema_doc =
         "Endpoint-pick policy: a bare policy string (p2c, rr), or an object " ++
-        "selecting hash and naming what it keys on. The same key always " ++
-        "selects the same endpoint, and the mapping is a pure function of " ++
-        "the key and the healthy endpoint set — so every zoxy process " ++
-        "behind SO_REUSEPORT agrees without sharing any state.";
+        "selecting hash and naming what it keys on. With hash, the same key " ++
+        "always selects the same endpoint for a given set of healthy " ++
+        "endpoints, so every zoxy process behind SO_REUSEPORT agrees " ++
+        "without sharing any state.";
     pub const schema_fields = .{
         .policy = .{
-            .desc = "Pick policy: p2c (power-of-two-choices), rr (strict " ++
-                "round-robin), or hash (stickiness on an explicit key).",
+            .desc = "Pick policy: p2c (power of two choices), rr (strict " ++
+                "round-robin), or hash (sticky on an explicit key).",
             .enum_type = Config.Cluster.Pick,
         },
         .key = .{
-            .desc = "What a hash cluster is sticky on: source_ip (all four bytes " ++
-                "of an IPv4 address, the /64 prefix of an IPv6 one — RFC 8981 " ++
-                "rotation survives), header (rendezvous on the named header's " ++
-                "value), or cookie (the named cookie carries the endpoint " ++
-                "assignment itself, minted by zoxy — #178).",
+            .desc = "What a hash cluster is sticky on: source_ip (the whole IPv4 " ++
+                "address, or the /64 prefix of an IPv6 one, which survives RFC " ++
+                "8981 address rotation), header (rendezvous hashing on the named " ++
+                "header's value), or cookie (the named cookie, set by zoxy, " ++
+                "carries the endpoint assignment itself).",
             .enum_type = std.meta.Tag(Config.Cluster.HashKey),
         },
         .name = .{
@@ -3149,11 +3150,10 @@ pub const BodyJson = struct {
     content_type: []const u8,
 
     pub const schema_doc =
-        "One named response body: bytes from a file read at startup, or an " ++
-        "inline string — exactly one of the two — plus the Content-Type it " ++
-        "is served with. Referenced by name from error_pages (and any " ++
-        "future body-serving feature), so one body is one buffer however " ++
-        "many places serve it.";
+        "One named response body: exactly one of a `file` read at startup " ++
+        "or an `inline` string, plus the Content-Type it is served with. " ++
+        "Referenced by name from error_pages, so a body served in several " ++
+        "places is still stored once.";
     /// The fork the doc above already describes, said in a way the
     /// schema can act on (#305). It was expressible from the day
     /// `oneOf` was emitted and simply never declared, which is what the
@@ -3161,12 +3161,12 @@ pub const BodyJson = struct {
     pub const schema_one_of = [_][]const u8{ "file", "inline" };
     pub const schema_fields = .{
         .file = .{
-            .desc = "Path to the body's file, read once at startup; a change " ++
-                "needs a restart (parse-once config).",
+            .desc = "Path to the body's file, read once at startup; changing " ++
+                "the file takes a restart.",
         },
         .@"inline" = .{
             .desc = "The body's bytes, verbatim, for content small enough to " ++
-                "live in the config.",
+                "keep in the config.",
         },
         .content_type = .{
             .desc = "The Content-Type header value this body is served with; " ++
@@ -3269,14 +3269,14 @@ pub const ClusterProxyProtocolJson = struct {
     send: []const u8,
 
     pub const schema_doc =
-        "What this cluster's origins expect ahead of the payload. The header " ++
+        "What this cluster's origins expect before the payload. The header " ++
         "names the connection's client, so only l4 listeners may route to a " ++
-        "sending cluster — a pooled HTTP upstream is shared across clients " ++
-        "and cannot carry a per-client header.";
+        "cluster that sends one: a pooled HTTP upstream connection is shared " ++
+        "across clients and cannot carry a per-client header.";
     pub const schema_fields = .{
         .send = .{
-            .desc = "PROXY protocol version to write: v1 (text) or v2 (binary — " ++
-                "what cloud load balancers speak).",
+            .desc = "PROXY protocol version to send: v1 (text) or v2 (binary, " ++
+                "the one cloud load balancers use).",
             .enum_type = Config.Cluster.ProxyProtocolSend,
         },
     };
@@ -3302,7 +3302,7 @@ pub const CheckJson = struct {
     pub const schema_doc = "Active health checks for a cluster's endpoints.";
     pub const schema_fields = .{
         .type = .{
-            .desc = "What a probe proves: tcp (the port accepts) or http (a path answered the expected status).",
+            .desc = "What a probe checks: tcp (the port accepts a connection) or http (a request for `path` gets the expected status).",
             .enum_type = Config.Cluster.Check.Kind,
         },
         .fall = .{
@@ -3329,7 +3329,7 @@ pub const CheckJson = struct {
             .min_length = 1,
         },
         .expect_status = .{
-            .desc = "The one response status an http probe accepts as healthy.",
+            .desc = "The only response status an http probe accepts as healthy.",
             .minimum = 100,
             .maximum = 599,
         },
@@ -3357,10 +3357,10 @@ pub const PassiveEjectionJson = struct {
     recovery_ms: u32 = constants.passive_ejection_recovery_ms_default,
 
     pub const schema_doc =
-        "Eject an endpoint that real traffic reports as dead — a failed dial, " ++
-        "or an exchange that produced no response byte before the deadline. " ++
-        "Absent leaves it off. Origin 5xx responses are never a signal: a bad " ++
-        "deploy is a software bug, not an unhealthy endpoint.";
+        "Eject an endpoint that real traffic shows is dead: a failed dial, " ++
+        "or an exchange with no response byte before its deadline. Absent " ++
+        "leaves it off. Origin 5xx responses never count, since a bad deploy " ++
+        "is not an unhealthy endpoint.";
     pub const schema_fields = .{
         .fall = .{
             .desc = "Consecutive failed requests that eject an endpoint from balancing.",
@@ -3368,7 +3368,7 @@ pub const PassiveEjectionJson = struct {
             .maximum = constants.health_probe_threshold_max,
         },
         .recovery_ms = .{
-            .desc = "How long an ejected endpoint stays out before traffic re-judges it.",
+            .desc = "How long an ejected endpoint stays out before real traffic tests it again.",
             .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
@@ -3439,7 +3439,7 @@ pub const TimeoutsJson = struct {
             .maximum = constants.timeout_ms_max,
         },
         .idle_ms = .{
-            .desc = "Idle / head-read deadline; must exceed connect_ms.",
+            .desc = "Idle and head-read deadline; must exceed connect_ms.",
             .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
@@ -3455,25 +3455,26 @@ pub const TimeoutsJson = struct {
             .maximum = constants.timeout_ms_max,
         },
         .max_lifetime_ms = .{
-            .desc = "Absolute connection-age cap; 0 disables it.",
+            .desc = "Maximum connection age; 0 disables it.",
             .minimum = 0,
             .maximum = constants.timeout_ms_max,
         },
         .head_ms = .{
-            .desc = "Budget for reading one request head — a slowloris's window. " ++
-                "Must exceed connect_ms and not exceed idle_ms.",
+            .desc = "Time allowed to read one request head, which bounds a " ++
+                "slowloris attack. Must exceed connect_ms and not exceed idle_ms.",
             .minimum = 1,
             .maximum = constants.timeout_ms_max,
         },
         .tunnel_ms = .{
-            .desc = "Cap on one tunnelled upgrade's whole life, replacing the idle, " ++
-                "request and lifetime deadlines once a connection becomes one. " ++
-                "Zero is rejected: a tunnel holds a dedicated pool slot.",
+            .desc = "Maximum lifetime of a tunnelled upgrade. Once a connection " ++
+                "becomes a tunnel, this replaces its idle, request and lifetime " ++
+                "deadlines. Zero is rejected because a tunnel holds a dedicated " ++
+                "pool slot.",
             .minimum = constants.tunnel_ms_min,
             .maximum = constants.tunnel_ms_max,
         },
         .request_ms = .{
-            .desc = "Cap on one L7 exchange, not refreshed by activity; 0 disables it.",
+            .desc = "Maximum duration of one L7 exchange, not reset by activity; 0 disables it.",
             .minimum = 0,
             .maximum = constants.timeout_ms_max,
         },
