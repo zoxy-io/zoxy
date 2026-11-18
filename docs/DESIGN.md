@@ -683,7 +683,8 @@ listener carries a `tls` block. Beside the per-engine cost sits one
 process-wide reservation: the fixed heap libcrypto allocates from, which
 is what makes zero-allocation-after-startup provable with a C library
 underneath (§4). It is sized *from the engine pool* — 2 MiB plus 8 KiB
-per engine, so 10 MiB at the 1024-engine default — because its occupancy
+per engine, plus 6 KiB for each of the 256 certificates a process may
+load (#297), so 11.5 MiB at the 1024-engine ceiling — because its occupancy
 is per concurrent session rather than per process. It was a flat 4 MiB
 until #222: that number came from measuring *sequential* handshakes,
 where each one's blocks return to their size class before the next asks
@@ -856,7 +857,9 @@ Rules:
   literal beside its object form and `pick` accepts a bare policy beside
   its object — sugar for the common case, one general form underneath.
   Breaking it instead would be the freeze meaning nothing the first time
-  it was tested.
+  it was tested. (#297 shipped a purely additive variant: `cert`/`key`
+  stays the default and `certificates` lists the further pairs — see its
+  record below.)
 - **`tls.alpn` is a closed list of protocols this proxy speaks** (#271),
   in the listener's preference order, which RFC 7301 §3.2 makes the order
   that counts. Closed on #180's upgrade-allowlist precedent: a token is a
@@ -909,6 +912,55 @@ Rules:
   signature check to that handshake, and `libcrypto_heap_bytes`' per
   session price has not yet been re-measured with it (`zig build
   tls-heap-proof` drives a handshake without client auth).
+- **A listener may hold several certificates, chosen by SNI** (#297).
+  The shape shipped differs from the record above. `cert`/`key` stays
+  the listener's default rather than becoming sugar for a one-entry
+  `certificates`. `certificates` lists the *further* pairs. That is
+  purely additive, and it needs no "exactly one of `cert` or
+  `certificates`" rule, which the schema could not state. It also
+  answers the no-SNI case in the config's own shape: the pair every
+  listener already had is what a client naming nothing is shown.
+
+  Selection:
+
+  - **Names.** They come from each leaf's subjectAltName DNS entries,
+    read at startup (`trust.dnsNames`). That is Envoy's rule, and it
+    removes a class of config/certificate disagreement. Unlike Envoy,
+    there is no CN fallback: RFC 9525 retired it.
+  - **Matching.** An exact name across every certificate first, then a
+    single-label wildcard, then the default
+    (`tls/certificate_set.zig`). §7's `host` still refuses `*`, so a
+    certificate's wildcard is the only one in the tree. A route
+    wildcard, if one lands, adopts this rule rather than a second one.
+  - **Mechanism.** zssl has no selection hook. The engine therefore
+    reads the server name off the first complete record with
+    `net/client_hello.zig`, the L4 SNI parser, before zssl reads a byte.
+    It restarts the handshake with the chosen certificate when that is
+    not the default. A hello not yet whole decides nothing, and zssl
+    cannot consume a partial record either. A hello that will not parse,
+    or that spans records, keeps the default for zssl to judge.
+  - **Cost.** Each key holds ~4.0 KiB of the libcrypto heap for the
+    process's life (measured, and asserted by `zig build
+    tls-heap-proof`). The static reservation therefore prices
+    `tls_certificates_max` (256) of them at 6 KiB, and the loader
+    refuses a config over that count.
+  - **Coverage.** `engine_test.zig` delivers the hello seven bytes at a
+    time and checks the leaf the client was shown. The smoke gate's SNI
+    leg has `std.crypto.tls` verify the chosen certificate against its
+    CA. The simulator's listeners hold one certificate, so the restart
+    path is not swept across its schedules.
+
+  Two points the issue raised were declined:
+
+  - **Cross-checking route hosts against certificate names.** It is not
+    a load error. A route host may be an IP, which a DNS-name rule
+    cannot cover, and refusing would break configs that serve today.
+    The uncovered host gets the default, which a verifying client
+    refuses on its own.
+  - **Choosing among key types.** That is RSA beside ECDSA, keyed on the
+    client's `signature_algorithms`. It is its own decision, because
+    RSA signing on the loop is what §3 excluded, and it is split out
+    rather than smuggled in here.
 - **An address is a string, and `unix:` extends its grammar** (#303,
   #305). `bind` and `endpoints` stay single scalars rather than becoming
   tagged objects or gaining a second key — they are the two most-written

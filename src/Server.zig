@@ -33,6 +33,7 @@ const sni_router = @import("net/sni_router.zig");
 const relay = @import("net/relay.zig");
 const shed = @import("shed.zig");
 const Credentials = @import("tls/Credentials.zig");
+const CertificateChoice = @import("tls/certificate_set.zig").Choice;
 const Tickets = @import("tls/Tickets.zig");
 const TlsEngine = @import("tls/Engine.zig");
 const H2Session = @import("http/h2/Session.zig");
@@ -171,6 +172,10 @@ pub fn Server(comptime IoType: type) type {
         /// empty for the whole process on a deployment with no `tls`
         /// block anywhere.
         tls_credentials: []const ?Credentials,
+        /// #297: per listener, the certificates its ClientHello's server
+        /// name chooses among (the default first), or empty where it holds
+        /// one. Empty for the whole process until `setTlsCertificateSets`.
+        tls_certificate_sets: []const []const CertificateChoice,
         /// The §4 TLS engine pool: one engine per session being
         /// handshaked or terminated, drawn at admission on a listener
         /// that terminates and returned at teardown. Empty — reserving
@@ -519,6 +524,9 @@ pub fn Server(comptime IoType: type) type {
             /// engine this listener drives — a chain and a libcrypto key
             /// are parsed once per listener, never per connection.
             credentials: ?*const Credentials,
+            /// #297: what a ClientHello's server name chooses among, the
+            /// default (`credentials`) first; empty where there is one.
+            certificates: []const CertificateChoice,
             /// What this listener offers in ALPN (#271), most preferred
             /// first — canonical `tls/alpn.zig` tokens borrowed from the
             /// config, which lives for the process. Empty on a plaintext
@@ -701,6 +709,7 @@ pub fn Server(comptime IoType: type) type {
             // Empty until `setTlsCredentials`, which is before `start` when
             // there is anything to hand over and never otherwise.
             server.tls_credentials = &.{};
+            server.tls_certificate_sets = &.{};
             // Dead until `start` draws a key: `init` runs in tests that
             // never start a loop, and a sealing key drawn here would be
             // one the Io seam had not been asked for.
@@ -1461,6 +1470,22 @@ pub fn Server(comptime IoType: type) type {
             return null;
         }
 
+        /// Hand over the #297 certificate sets before `start`, from the
+        /// same caller and for the same reason as `setTlsCredentials`.
+        /// One entry per listener, empty where it holds one certificate;
+        /// a set's first choice is that listener's default credentials.
+        pub fn setTlsCertificateSets(server: *Self, sets: []const []const CertificateChoice) void {
+            assert(sets.len == server.config.listeners.len);
+            for (sets) |set| assert(set.len != 1);
+            server.tls_certificate_sets = sets;
+        }
+
+        /// This listener's certificate set, or empty where it holds one.
+        fn certificatesFor(server: *Self, index: usize) []const CertificateChoice {
+            if (index >= server.tls_certificate_sets.len) return &.{};
+            return server.tls_certificate_sets[index];
+        }
+
         /// Draw a sealing key, which is what turns resumption on (§4).
         ///
         /// At `start` rather than `init` for the same reason the engine
@@ -1664,6 +1689,7 @@ pub fn Server(comptime IoType: type) type {
                     .unix_bind = listener_config.bind_address == .unix,
                     .protocol = listener_config.protocol,
                     .credentials = server.credentialsFor(index),
+                    .certificates = server.certificatesFor(index),
                     .alpn_protocols = offer,
                     .alpn_fallback = config_module.alpn.withoutH2(offer),
                     .alpn_h2 = config_module.alpn.namesH2(offer),
@@ -1678,6 +1704,7 @@ pub fn Server(comptime IoType: type) type {
                 // starting without them would bind a socket that answers
                 // every handshake with a teardown.
                 assert((listener_config.tls != null) == (state.credentials != null));
+                if (state.certificates.len > 0) assert(state.certificates[0].credentials == state.credentials.?);
                 server.armAccept(state);
             }
             try server.admin.start();
@@ -2468,7 +2495,7 @@ pub fn Server(comptime IoType: type) type {
             }
             const offer = if (h2 != null) state.alpn_protocols else state.alpn_fallback;
             assert(offer.len <= config_module.alpn.protocols_max);
-            const engine = server.acquireTlsEngine(credentials, offer, state.client_ca) catch |err| {
+            const engine = server.acquireTlsEngine(credentials, state.certificates, offer, state.client_ca) catch |err| {
                 // The two causes want opposite answers from an operator —
                 // provision more engines, or size the libcrypto heap — so
                 // they keep separate rungs (§8). These are the first rungs
@@ -2849,10 +2876,12 @@ pub fn Server(comptime IoType: type) type {
         pub fn acquireTlsEngine(
             server: *Self,
             credentials: *const Credentials,
+            certificates: []const CertificateChoice,
             alpn_protocols: []const []const u8,
             client_ca: ?*const config_module.Config.Listener.ClientCa,
         ) AcquireEngineError!*TlsEngine {
             assert(credentials.chain.len >= 1);
+            if (certificates.len > 0) assert(certificates[0].credentials == credentials);
             const engine = server.tls_engines.acquire() orelse
                 return error.EnginesExhausted;
             var seeds: [64]u8 = undefined;
@@ -2861,6 +2890,7 @@ pub fn Server(comptime IoType: type) type {
                 .x25519_seed = seeds[0..32].*,
                 .random = seeds[32..64].*,
                 .credentials = credentials,
+                .certificates = certificates,
                 // Only once a key is installed: before that the engine
                 // would offer resumption it could not honour, and every
                 // ticket it opened would be one it never sealed.

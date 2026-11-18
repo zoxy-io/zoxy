@@ -152,6 +152,19 @@ pub const Client = struct {
     /// bundle would have nothing to check it against. The gate's subject
     /// is the proxy's record layer, not this client's trust decisions.
     pub fn connectTls(client: *Client, io: Io, port: u16) !void {
+        return client.connectTlsVerifying(io, port, .no_verification, .self_signed);
+    }
+
+    /// The same, naming a server and verifying what it presents (#297):
+    /// the handshake completes only if the certificate shown is one the
+    /// given `ca` issued for the given `host`.
+    pub fn connectTlsVerifying(
+        client: *Client,
+        io: Io,
+        port: u16,
+        host: @FieldType(std.crypto.tls.Client.Options, "host"),
+        ca: @FieldType(std.crypto.tls.Client.Options, "ca"),
+    ) !void {
         try client.connect(io, port);
         errdefer client.close();
         // The client's own handshake randomness, from the OS: this is the
@@ -161,8 +174,8 @@ pub const Client = struct {
         var entropy: [entropy_len]u8 = undefined;
         io.random(&entropy);
         client.tls = try .init(&client.reader.interface, &client.writer.interface, .{
-            .host = .no_verification,
-            .ca = .self_signed,
+            .host = host,
+            .ca = ca,
             .read_buffer = &client.tls_read_buffer,
             .write_buffer = &client.tls_write_buffer,
             .entropy = &entropy,

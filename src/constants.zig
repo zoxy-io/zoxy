@@ -461,6 +461,24 @@ comptime {
 /// cannot be served out of another's, and the slack absorbs that.
 pub const libcrypto_heap_bytes_per_engine: u32 = 8 * 1024;
 
+/// What one loaded certificate's signing key holds on the libcrypto heap
+/// for the process's life (#297). Measured at ~4.0 KiB per P-256 key —
+/// sixteen loads past the first moved the frontier by 64,032 bytes in
+/// `tls/heap_proof_test.zig`, which now asserts it — and reserved at 6
+/// KiB for the slack segregated fits needs, as the engine term is.
+pub const libcrypto_heap_bytes_per_certificate: u32 = 6 * 1024;
+
+/// The most certificates one process loads across every listener, a
+/// listener's default included (#297). Each costs a key on the libcrypto
+/// heap, which is a static reservation, so the count needs a ceiling for
+/// the reservation to cover any config the loader accepts.
+pub const tls_certificates_max: u32 = 256;
+
+/// The most DNS names zoxy reads off one certificate to select it by
+/// (#297). Past it the load is refused, naming the file, rather than
+/// silently selecting on a prefix of what the certificate covers.
+pub const tls_certificate_names_max: u32 = 128;
+
 /// What the heap costs before any session: libcrypto's one-time tables
 /// plus the first handshake's distinct block footprint, which every later
 /// handshake reuses off the class free lists rather than growing
@@ -478,12 +496,14 @@ pub const libcrypto_heap_base_bytes: u32 = 2 * 1024 * 1024;
 /// a rounding error: the heap ran out at ~675 concurrent sessions, and
 /// because the engine retried that allocation failure forever, the process
 /// livelocked at 100% CPU with every listener dark (#222).
-pub fn libcryptoHeapBytes(tls_engines: u32) u32 {
+pub fn libcryptoHeapBytes(tls_engines: u32, tls_certificates: u32) u32 {
     assert(tls_engines <= tls_engines_max);
+    assert(tls_certificates <= tls_certificates_max);
     // Zero exactly when no listener terminates TLS — the same condition
     // that makes the engine pool itself free (§5).
     if (tls_engines == 0) return 0;
-    return libcrypto_heap_base_bytes + tls_engines * libcrypto_heap_bytes_per_engine;
+    return libcrypto_heap_base_bytes + tls_engines * libcrypto_heap_bytes_per_engine +
+        tls_certificates * libcrypto_heap_bytes_per_certificate;
 }
 
 /// The compiled reservation: what the deepest pool a config may ask for
@@ -495,7 +515,7 @@ pub fn libcryptoHeapBytes(tls_engines: u32) u32 {
 /// `main` has returned and the arena with it (see `main.zig`) — so sizing
 /// for the ceiling is what a static reservation costs, and BSS pages a
 /// smaller deployment never touches never become resident.
-pub const libcrypto_heap_bytes: u32 = libcryptoHeapBytes(tls_engines_max);
+pub const libcrypto_heap_bytes: u32 = libcryptoHeapBytes(tls_engines_max, tls_certificates_max);
 
 /// The most a certificate or key PEM file may be. A bound on a startup
 /// read, so its job is only to turn "the operator pointed at the wrong
@@ -523,6 +543,21 @@ comptime {
     // reservation below what was measured would be a number that had
     // stopped tracking the thing it was derived from.
     assert(libcrypto_heap_bytes_per_engine >= 5 * 1024);
+    // #297's term, on the same two rules: above the ~4.0 KiB measured per
+    // key, and covering every certificate the loader admits at once.
+    assert(libcrypto_heap_bytes_per_certificate >= 4 * 1024);
+    assert(libcrypto_heap_bytes > tls_certificates_max * libcrypto_heap_bytes_per_certificate);
+    // The reservation is a u32 sum of three terms; widened, it must fit.
+    assert(@as(u64, libcrypto_heap_base_bytes) +
+        @as(u64, tls_engines_max) * libcrypto_heap_bytes_per_engine +
+        @as(u64, tls_certificates_max) * libcrypto_heap_bytes_per_certificate <= std.math.maxInt(u32));
+    // A listener's default plus at least one more, or `certificates`
+    // could never be given at all.
+    assert(tls_certificates_max >= 2);
+    // A DNS name in a SAN costs at least its 2-byte TLV header and one
+    // byte, so a chain this proxy can stage cannot carry more names than
+    // this; the cap is a bound on the walk, never one a real chain meets.
+    assert(tls_certificate_names_max * 3 <= tls_cert_chain_bytes_max);
     // A PEM that could not carry the DER it wraps would make the tighter
     // chain bound unreachable — base64 costs a third on top.
     assert(tls_pem_bytes_max > tls_cert_chain_bytes_max * 2);

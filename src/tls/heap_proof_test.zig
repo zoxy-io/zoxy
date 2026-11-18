@@ -10,6 +10,7 @@
 //! cannot promise. `src/tls_heap_proof.zig` is that binary's root.
 
 const std = @import("std");
+const constants = @import("../constants.zig");
 
 const Credentials = @import("Credentials.zig");
 const heap_mod = @import("libcrypto_heap.zig");
@@ -69,6 +70,17 @@ test "a handshake runs entirely on the fixed libcrypto heap" {
         try handshake(&credentials);
     }
     try std.testing.expectEqual(after_first, heap_mod.usedPeak());
+
+    // #297: each further certificate a listener loads holds its key on the
+    // heap for the process's life, and the reservation prices that at
+    // `libcrypto_heap_bytes_per_certificate`. Sixteen more loads must stay
+    // inside sixteen of those.
+    var extra: [16]Credentials = undefined;
+    for (&extra) |*more| more.* = try Credentials.load(arena_state.allocator(), cert_pem, key_pem, .{});
+    defer for (&extra) |*more| more.deinit();
+    const per_certificate = (heap_mod.usedPeak() - after_first) / extra.len;
+    try std.testing.expect(per_certificate > 0);
+    try std.testing.expect(per_certificate <= constants.libcrypto_heap_bytes_per_certificate);
 }
 
 /// One full in-memory handshake, raw zssl both sides. Its own function so

@@ -1722,6 +1722,14 @@ banner prices the whole static array, since that is what is held. At the
 default 1024 engines
 that is 10 MiB against the old 4.
 
+A loaded certificate's key is a separate, per-process term (#297): sixteen
+`Credentials.load` calls past the first moved the frontier by 64,032 bytes,
+~4.0 KiB each, flat. `libcrypto_heap_bytes_per_certificate` reserves 6 KiB
+for `tls_certificates_max` (256) of them, +1.5 MiB of BSS (11.5 MiB in all
+at the 1024-engine ceiling) that a deployment loading one certificate never
+makes resident. `tls-heap-proof` asserts the
+per-key price stays under the reservation.
+
 Verified: the 1200-connection run that used to livelock now leaves
 `shed_tls_crypto` at 0 and sheds on `shed_tls_engines` instead — the pool
 ceiling, which is the correct wall — with the proxy healthy at 0% idle CPU

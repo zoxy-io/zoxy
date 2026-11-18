@@ -36,6 +36,8 @@ const Credentials = @import("Credentials.zig");
 const Tickets = @import("Tickets.zig");
 const alpn = @import("alpn.zig");
 const trust = @import("trust.zig");
+const certificate_set = @import("certificate_set.zig");
+const client_hello = @import("../net/client_hello.zig");
 
 const assert = std.debug.assert;
 
@@ -137,6 +139,17 @@ refused: bool,
 client_anchors: []const []const u8,
 client_fingerprint: ?[trust.fingerprint_bytes]u8,
 client_cert_refused: bool,
+/// #297: the listener's certificates when it holds more than one (the
+/// default first), and the handshake's inputs kept so it can be started
+/// again with another certificate once the ClientHello names one. Empty
+/// `certificates` is a listener with one certificate: nothing to choose.
+certificates: []const certificate_set.Choice,
+certificate_chosen: bool,
+chosen_certificate: usize,
+handshake_seed: [32]u8,
+handshake_random: [32]u8,
+handshake_alpn: []const []const u8,
+handshake_client_auth: ?ClientAuth,
 
 /// What a drive step hands back *synchronously*: plaintext the caller
 /// consumes before returning, and the peer's orderly close. Ciphertext
@@ -299,6 +312,10 @@ pub const Config = struct {
     /// The listener's #304 client-certificate policy, or null to ask no
     /// client for one. Its anchors are borrowed like `credentials`.
     client_auth: ?ClientAuth = null,
+    /// #297: every certificate the listener holds, `credentials` first,
+    /// when it holds more than one; empty otherwise. Borrowed like
+    /// `credentials`.
+    certificates: []const certificate_set.Choice = &.{},
 };
 
 pub const ClientAuth = struct {
@@ -363,6 +380,31 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     assert(config.client_auth == null or engine.client_anchors.len >= 1);
     assert(config.alpn_protocols.len <= alpn.protocols_max);
     for (config.alpn_protocols) |token| assert(alpn.Protocol.fromToken(token) != null);
+    engine.handshake_seed = config.x25519_seed;
+    engine.handshake_random = config.random;
+    engine.handshake_alpn = config.alpn_protocols;
+    engine.handshake_client_auth = config.client_auth;
+    engine.certificates = config.certificates;
+    assert(config.certificates.len != 1);
+    if (config.certificates.len > 0) assert(config.certificates[0].credentials == config.credentials);
+    engine.certificate_chosen = config.certificates.len == 0;
+    engine.chosen_certificate = 0;
+    engine.startHandshake(config.credentials);
+    engine.records = .init(&engine.record_storage);
+    engine.outbox_len = 0;
+    engine.outbox_sent = 0;
+    engine.close_staged = false;
+    engine.peer_closed = false;
+    engine.refused = false;
+    assert(!engine.isConnected());
+}
+
+/// Build zssl's handshake for `credentials` from the inputs `init` kept.
+/// Called once from `init`, and once more if the ClientHello names a
+/// certificate other than the default (#297) — before zssl has read a
+/// byte, so the restart discards nothing.
+fn startHandshake(engine: *Engine, credentials: *const Credentials) void {
+    assert(credentials.chain.len >= 1);
     // The seed *is* the private scalar: x25519 clamps internally, so
     // there is no keypair to generate and no failure to shed. That
     // retires #222's livelock at the source — the fallible P-256 keygen
@@ -373,10 +415,10 @@ pub fn init(engine: *Engine, config: *const Config) !void {
     // is padding that x25519 never reads — `groups` below is what makes
     // that true, and the assert on it is what keeps the two agreeing.
     var key_share_private: [zssl.backend.group_private_bytes_max]u8 = @splat(0);
-    key_share_private[0..config.x25519_seed.len].* = config.x25519_seed;
+    key_share_private[0..engine.handshake_seed.len].* = engine.handshake_seed;
     engine.hs = .init(&.{
-        .credentials = &config.credentials.inner,
-        .server_random = config.random,
+        .credentials = &credentials.inner,
+        .server_random = engine.handshake_random,
         .key_share_private = key_share_private,
         // x25519 alone, which is what this proxy has always negotiated.
         // zssl can complete secp256r1 and secp384r1 on the server side
@@ -385,32 +427,60 @@ pub fn init(engine: *Engine, config: *const Config) !void {
         // taking them is an entropy-draw change and a decision of its
         // own, not a consequence of a dependency bump (§4).
         .groups = &groups_offered,
-        .alpn_protocols = config.alpn_protocols,
+        .alpn_protocols = engine.handshake_alpn,
         .reassembly = &engine.reassembly,
         .flight = &engine.flight,
         // Offered only when this deployment can actually open one. A
         // lookup that always answers null would work too, but saying so
         // in the config keeps "resumption is off" a single readable fact
         // rather than a callback that turns out to never succeed.
-        .psk_lookup = if (config.tickets != null) .{
+        .psk_lookup = if (engine.tickets != null) .{
             .context = engine,
             .lookup = openOfferedTicket,
         } else null,
         // zssl runs the protocol — CertificateRequest, the client's
         // CertificateVerify against its leaf — and hands the chain here,
         // where the anchors and the clock are (#304).
-        .client_auth = if (config.client_auth) |auth| .{
+        .client_auth = if (engine.handshake_client_auth) |auth| .{
             .require = auth.require,
             .chain_verifier = .{ .context = engine, .verify = verifyClientChain },
         } else null,
     });
-    engine.records = .init(&engine.record_storage);
-    engine.outbox_len = 0;
-    engine.outbox_sent = 0;
-    engine.close_staged = false;
-    engine.peer_closed = false;
-    engine.refused = false;
-    assert(!engine.isConnected());
+}
+
+/// Choose the certificate the ClientHello's server name selects (#297),
+/// from the bytes received so far and before zssl reads any of them. A
+/// hello not yet whole decides nothing: zssl cannot read a partial record
+/// either, so the next delivery asks again. One that will not parse, or
+/// spans records, keeps the default — zssl will judge it on its own terms.
+///
+/// That is also why restarting the handshake is safe: an undecided engine
+/// has only ever seen part of one record, which zssl consumed none of, so
+/// a later hello (one after a HelloRetryRequest) can never land here.
+fn chooseCertificate(engine: *Engine) void {
+    assert(!engine.certificate_chosen);
+    assert(engine.certificates.len >= 2);
+    assert(engine.records.start == 0);
+    const pending = engine.records.buffer[engine.records.start..engine.records.used];
+    const server_name: ?[]const u8 = switch (client_hello.parse(pending)) {
+        .need_more => return,
+        .invalid => null,
+        .ok => |hello| hello.server_name,
+    };
+    engine.certificate_chosen = true;
+    const chosen = certificate_set.select(engine.certificates, server_name);
+    assert(chosen < engine.certificates.len);
+    if (chosen == 0) return;
+    engine.chosen_certificate = chosen;
+    engine.hs.deinit();
+    engine.startHandshake(engine.certificates[chosen].credentials);
+}
+
+/// Which of the listener's certificates this handshake presents (#297):
+/// 0, the default, unless the ClientHello's name chose another.
+pub fn chosenCertificate(engine: *const Engine) usize {
+    if (engine.chosen_certificate > 0) assert(engine.chosen_certificate < engine.certificates.len);
+    return engine.chosen_certificate;
 }
 
 pub fn deinit(engine: *Engine) void {
@@ -459,6 +529,7 @@ pub fn received(engine: *Engine, n: usize, sink: *const Sink) !void {
         server_hello_bytes_max + flight_bytes_max;
     assert(engine.outboundRoom() >= room_needed);
     engine.records.advance(n);
+    if (!engine.certificate_chosen) engine.chooseCertificate();
     try engine.pump(sink);
 }
 

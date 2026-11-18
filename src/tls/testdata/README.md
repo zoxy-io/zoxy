@@ -39,6 +39,10 @@ A small PKI for the verifier that checks an origin's chain, valid 2019 to
   serves with.
 - `other-ca.pem`: an unrelated CA, to be the anchor a chain does *not*
   reach.
+- The same leaf and key are also the second certificate a listener
+  chooses by SNI (#297): the engine test and the smoke gate name
+  `origin.zoxy.test` and check it is the one presented, which they can
+  because `cert.pem` above covers another name.
 - `rogue-cert.pem`: a certificate for `DNS:victim.zoxy.test` signed by the
   *leaf's* key. The leaf is not a CA, so a chain through it must be
   refused even though every signature in it verifies.
