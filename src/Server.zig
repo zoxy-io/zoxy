@@ -527,6 +527,9 @@ pub fn Server(comptime IoType: type) type {
             /// `alpn_protocols` names `h2`, so admission reserves a session
             /// before it offers it (`acquireTlsAdmission`).
             alpn_h2: bool,
+            /// The listener's #304 client CA, borrowed from the config, or
+            /// null when it asks no client for a certificate.
+            client_ca: ?*const config_module.Config.Listener.ClientCa,
             accepting: bool,
         };
 
@@ -1651,6 +1654,10 @@ pub fn Server(comptime IoType: type) type {
                     .alpn_protocols = offer,
                     .alpn_fallback = config_module.alpn.withoutH2(offer),
                     .alpn_h2 = config_module.alpn.namesH2(offer),
+                    // Through the config's own element, never the loop's
+                    // copy: the state outlives this iteration, and a
+                    // pointer into `listener_config` would dangle.
+                    .client_ca = clientCaOf(&server.config.listeners[index]),
                     .accepting = false,
                 };
                 // A listener the config says terminates TLS must have
@@ -2443,7 +2450,7 @@ pub fn Server(comptime IoType: type) type {
             }
             const offer = if (h2 != null) state.alpn_protocols else state.alpn_fallback;
             assert(offer.len <= config_module.alpn.protocols_max);
-            const engine = server.acquireTlsEngine(credentials, offer) catch |err| {
+            const engine = server.acquireTlsEngine(credentials, offer, state.client_ca) catch |err| {
                 // The two causes want opposite answers from an operator —
                 // provision more engines, or size the libcrypto heap — so
                 // they keep separate rungs (§8). These are the first rungs
@@ -2802,6 +2809,17 @@ pub fn Server(comptime IoType: type) type {
             CryptoUnavailable,
         };
 
+        /// A listener's #304 client CA as a pointer into the process-lived
+        /// config, or null when it asks no client for a certificate.
+        fn clientCaOf(
+            listener: *const config_module.Config.Listener,
+        ) ?*const config_module.Config.Listener.ClientCa {
+            const tls = if (listener.tls) |*tls| tls else return null;
+            const client_ca = if (tls.client_ca) |*client_ca| client_ca else return null;
+            assert(client_ca.anchors.len >= 1);
+            return client_ca;
+        }
+
         /// A TLS engine for one session (§4), initialized against the
         /// listener's credentials and this run's key material.
         ///
@@ -2814,6 +2832,7 @@ pub fn Server(comptime IoType: type) type {
             server: *Self,
             credentials: *const Credentials,
             alpn_protocols: []const []const u8,
+            client_ca: ?*const config_module.Config.Listener.ClientCa,
         ) AcquireEngineError!*TlsEngine {
             assert(credentials.chain.len >= 1);
             const engine = server.tls_engines.acquire() orelse
@@ -2830,6 +2849,10 @@ pub fn Server(comptime IoType: type) type {
                 .tickets = if (server.tls_tickets.ready()) &server.tls_tickets else null,
                 .now_unix = server.nowUnix(),
                 .alpn_protocols = alpn_protocols,
+                .client_auth = if (client_ca) |ca| .{
+                    .anchors = ca.anchors,
+                    .require = ca.verify == .required,
+                } else null,
             }) catch {
                 // Deriving the ephemeral keypair is the one fallible step,
                 // and under the OpenSSL backend it *allocates*
@@ -3604,13 +3627,16 @@ pub fn Server(comptime IoType: type) type {
         /// diagnosis: telling it which of those it was is telling an
         /// attacker.
         ///
-        /// One exception, and the RFC's rather than ours. A client that
+        /// Two exceptions, both the RFCs' rather than ours, and both
+        /// counted apart from `tls_handshake_failed`. A client that
         /// offered ALPN and named nothing this listener speaks is owed
-        /// `no_application_protocol` (RFC 7301 §3.2), so that alert is
-        /// staged and flushed before the teardown, and the outcome is
-        /// counted apart (#271): nothing failed, the client was told no.
-        /// The alert says only what the client already knows — it asked
-        /// for a protocol and did not get it — so it is no oracle.
+        /// `no_application_protocol` (RFC 7301 §3.2, #271): nothing
+        /// failed, the client was told no. And a client that presented no
+        /// certificate where the listener's `client_ca` requires one is
+        /// owed `certificate_required` (RFC 8446 §4.4.2.4, #304). Each
+        /// alert says only what the client already knows, so neither is
+        /// an oracle. A presented client chain that fails verification is
+        /// counted with the second but gets the bare teardown.
         fn failTlsHandshake(server: *Self, conn: *ConnType, err: anyerror) void {
             assert(conn.state == .tls_handshaking);
             assert(!conn.tls_session_up);
@@ -3618,6 +3644,22 @@ pub fn Server(comptime IoType: type) type {
                 server.counters.increment("tls_alpn_refused");
                 conn.tls.?.refuseApplicationProtocol();
                 server.pumpTlsOutbound(conn);
+                return;
+            }
+            // #304: a client the listener's `client_ca` turned away —
+            // counted apart, because only an operator issuing or trusting
+            // certificates can change the outcome. A missing certificate
+            // is owed `certificate_required`; a refused chain gets the
+            // bare teardown every other failure gets.
+            if (err == error.CertificateRequired) {
+                server.counters.increment("tls_client_cert_refused");
+                conn.tls.?.refuseMissingCertificate();
+                server.pumpTlsOutbound(conn);
+                return;
+            }
+            if (conn.tls.?.clientCertRefused()) {
+                server.counters.increment("tls_client_cert_refused");
+                server.beginTeardown(conn);
                 return;
             }
             server.counters.increment("tls_handshake_failed");

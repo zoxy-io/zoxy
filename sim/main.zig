@@ -371,6 +371,14 @@ const uncovered = [_]Uncovered{
             "either, which is the honest gap",
     },
     .{
+        .name = "tls_client_cert_refused",
+        .why = .unreached,
+        .reason = "no listener in the sweep asks for a client certificate " ++
+            "(#304); engine_test drives every refusal — none presented " ++
+            "where one is required, a chain to another CA — and " ++
+            "server_test counts one end to end through the transport",
+    },
+    .{
         .name = "l7_no_route",
         .why = .unreached,
         .reason = "the sim's route table is a single \"/\" prefix, which no " ++

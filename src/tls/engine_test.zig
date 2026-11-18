@@ -10,12 +10,17 @@ const std = @import("std");
 const constants = @import("../constants.zig");
 const Credentials = @import("Credentials.zig");
 const Engine = @import("Engine.zig");
+const trust = @import("trust.zig");
 const zssl = @import("zssl");
 
 const assert = std.debug.assert;
 
 const cert_pem = @embedFile("testdata/cert.pem");
 const key_pem = @embedFile("testdata/key.pem");
+const client_ca_pem = @embedFile("testdata/client-ca.pem");
+const client_cert_pem = @embedFile("testdata/client-cert.pem");
+const client_key_pem = @embedFile("testdata/client-key.pem");
+const other_ca_pem = @embedFile("testdata/other-ca.pem");
 
 /// Room for the largest record on the wire — a max-size plaintext record
 /// plus its header and AEAD tag — with slack for a second alongside it.
@@ -76,12 +81,21 @@ const Client = struct {
     out: [zssl.ClientHandshake.out_bytes_min]u8,
     storage: [zssl.record.wire_record_bytes_max]u8,
     reassembly: [16 * 1024]u8,
+    /// The client's own Certificate and CertificateVerify, for #304's
+    /// mutual-TLS tests: the chain plus ~1 KiB, as zssl asks.
+    auth_flight: [zssl.Credentials.chain_bytes_max + 1024]u8,
     records: zssl.record_buffer.RecordBuffer,
     app: [app_bytes_max]u8 = undefined,
     app_len: u32 = 0,
     saw_close: bool = false,
 
     fn init(client: *Client) !void {
+        return client.initPresenting(null);
+    }
+
+    /// `credentials` is what the client answers a CertificateRequest
+    /// with (#304); null answers with an empty certificate list.
+    fn initPresenting(client: *Client, credentials: ?*const zssl.Credentials) !void {
         client.hs = .init(&.{
             .client_random = @splat(0x52),
             .x25519_private = @splat(0x51),
@@ -90,6 +104,8 @@ const Client = struct {
             // zoxy's engine, not this client's trust decisions.
             .certificate_policy = .insecure_no_verification,
             .reassembly = &client.reassembly,
+            .client_credentials = credentials,
+            .client_auth_flight = if (credentials != null) &client.auth_flight else &.{},
         });
         client.records = .init(&client.storage);
         client.app_len = 0;
@@ -144,6 +160,7 @@ const Client = struct {
 const Bed = struct {
     arena_state: std.heap.ArenaAllocator,
     credentials: Credentials,
+    client_credentials: ?Credentials = null,
     engine: Engine,
     plaintext: [Engine.plaintext_bytes_min]u8,
     body_plaintext: [Engine.plaintext_bytes_min]u8,
@@ -158,6 +175,7 @@ const Bed = struct {
     /// The deterministic-nonce tests below need the other setting, and
     /// nothing else about the bed changes with it.
     fn initWith(bed: *Bed, options: Credentials.Options) !void {
+        bed.client_credentials = null;
         bed.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         bed.credentials = try Credentials.load(
             bed.arena_state.allocator(),
@@ -180,10 +198,33 @@ const Bed = struct {
         bed.to_client = .{};
     }
 
+    /// A listener asking for a client certificate (#304), against the
+    /// client CA's fixtures at 2030, inside their window. `present` is
+    /// whether the client answers with its certificate; `anchors_pem`
+    /// is what the listener trusts.
+    fn initMutual(bed: *Bed, require: bool, present: bool, anchors_pem: []const u8) !void {
+        bed.arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        const arena = bed.arena_state.allocator();
+        bed.credentials = try Credentials.load(arena, cert_pem, key_pem, .{});
+        bed.client_credentials = try Credentials.load(arena, client_cert_pem, client_key_pem, .{});
+        bed.engine.bindPlaintext(&bed.plaintext, &bed.body_plaintext, constants.head_buffer_bytes_default);
+        try bed.engine.init(&.{
+            .x25519_seed = @splat(0x42),
+            .random = @splat(0x43),
+            .credentials = &bed.credentials,
+            .now_unix = 1_893_456_000,
+            .client_auth = .{ .anchors = try trust.parseAnchors(arena, anchors_pem), .require = require },
+        });
+        try bed.client.initPresenting(if (present) &bed.client_credentials.?.inner else null);
+        bed.to_server = .{};
+        bed.to_client = .{};
+    }
+
     fn deinit(bed: *Bed) void {
         bed.engine.deinit();
         bed.client.hs.deinit();
         bed.credentials.deinit();
+        if (bed.client_credentials) |*credentials| credentials.deinit();
         bed.arena_state.deinit();
     }
 
@@ -493,4 +534,48 @@ test "engine: without the deterministic nonce the same flight diverges" {
         first[0..server_hello_bytes],
         second[0..server_hello_bytes],
     );
+}
+
+test "engine: a client certificate the listener's CA signed completes the handshake, fingerprint kept (#304)" {
+    var bed: Bed = undefined;
+    try bed.initMutual(true, true, client_ca_pem);
+    defer bed.deinit();
+    try bed.handshake();
+    var expected: [trust.fingerprint_bytes]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "F1FD192CFF76490BAF1534F777226E96DBB03D9751A657648E0955116D0D4FCB");
+    try std.testing.expectEqualSlices(u8, &expected, bed.engine.clientFingerprint().?);
+    try std.testing.expect(!bed.engine.clientCertRefused());
+}
+
+test "engine: no client certificate where one is required is refused with certificate_required (#304)" {
+    var bed: Bed = undefined;
+    try bed.initMutual(true, false, client_ca_pem);
+    defer bed.deinit();
+    try std.testing.expectError(error.CertificateRequired, bed.handshake());
+    try std.testing.expect(bed.engine.clientFingerprint() == null);
+    // The transport's answer: the alert, staged for the flush before the
+    // teardown.
+    bed.engine.refuseMissingCertificate();
+    try std.testing.expect(bed.engine.isRefused());
+    try std.testing.expect(bed.engine.outbound().len >= 1);
+}
+
+test "engine: an optional client CA lets a client without a certificate in, unauthenticated (#304)" {
+    var bed: Bed = undefined;
+    try bed.initMutual(false, false, client_ca_pem);
+    defer bed.deinit();
+    try bed.handshake();
+    try std.testing.expect(bed.engine.clientFingerprint() == null);
+    try std.testing.expect(!bed.engine.clientCertRefused());
+}
+
+test "engine: a client certificate from another CA is refused, optional or not (#304)" {
+    inline for (.{ true, false }) |require| {
+        var bed: Bed = undefined;
+        try bed.initMutual(require, true, other_ca_pem);
+        defer bed.deinit();
+        try std.testing.expect(std.meta.isError(bed.handshake()));
+        try std.testing.expect(bed.engine.clientCertRefused());
+        try std.testing.expect(bed.engine.clientFingerprint() == null);
+    }
 }

@@ -659,9 +659,11 @@ pub const Counters = struct {
     /// One counter for every cause on purpose. The distinctions matter to
     /// whoever is debugging a client, and to nobody operating the proxy;
     /// worse, publishing which step a handshake died at is a probing
-    /// oracle, so the peer learns nothing and neither does this. The one
-    /// handshake that ends without a session and is *not* counted here is
-    /// an ALPN refusal, which is not a failure — see `tls_alpn_refused`.
+    /// oracle, so the peer learns nothing and neither does this. Two
+    /// handshake endings without a session are *not* counted here: an
+    /// ALPN refusal, which is not a failure (`tls_alpn_refused`), and a
+    /// client turned away by its listener's `client_ca`
+    /// (`tls_client_cert_refused`, #304), which only an operator fixes.
     tls_handshake_failed: Value = Value.init(0),
     /// Handshakes refused because the client offered ALPN and named no
     /// protocol this listener speaks (#271), each answered with RFC 7301's
@@ -674,10 +676,18 @@ pub const Counters = struct {
     /// is clients wanting a protocol — `h2`, most likely — that the
     /// listener's `tls.alpn` does not name. The peer was already told
     /// exactly this by the alert, so the split publishes nothing the wire
-    /// did not. And the three never overlap: no handshake is counted as
-    /// more than one of completed, failed and refused — including one whose
-    /// client resets while the refusal is still going out.
+    /// did not. And the four never overlap: no handshake is counted as
+    /// more than one of completed, failed, ALPN-refused and
+    /// client-certificate-refused (#304) — including one whose client
+    /// resets while a refusal is still going out.
     tls_alpn_refused: Value = Value.init(0),
+    /// Handshakes a listener's #304 `client_ca` refused: a client that
+    /// presented no certificate where one is required (answered with
+    /// `certificate_required`), or presented a chain that did not verify.
+    /// Disjoint from `tls_handshake_failed` on `tls_alpn_refused`'s
+    /// reasoning: a rising count is clients without a certificate this
+    /// listener trusts, which only issuing or trusting certificates fixes.
+    tls_client_cert_refused: Value = Value.init(0),
     /// Established sessions torn down by a TLS-layer failure while
     /// relaying: a record that would not decrypt, or an engine outbox
     /// with no room for what the next step would stage. Distinct from

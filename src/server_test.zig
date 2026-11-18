@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const config_module = @import("config.zig");
+const zoxy_trust = @import("tls/trust.zig");
 const constants = @import("constants.zig");
 const io_module = @import("io/io.zig");
 const Credentials = @import("tls/Credentials.zig");
@@ -328,6 +329,8 @@ pub const TestBed = struct {
         /// Set `server.tls_engines` alongside; the two are checked against
         /// each other the way a real config's are.
         tls: bool = false,
+        /// #304: the TLS listener's client CA, when `tls` is set.
+        tls_client_ca: ?config_module.Config.Listener.ClientCa = null,
     };
 
     pub fn bindAddress() std.Io.net.IpAddress {
@@ -429,7 +432,7 @@ pub const TestBed = struct {
             // states is only that the listener terminates — which is what
             // `Server.start` checks its credentials against.
             .tls = if (options.tls)
-                .{ .cert_path = "cert.pem", .key_path = "key.pem", .alpn = &.{} }
+                .{ .cert_path = "cert.pem", .key_path = "key.pem", .alpn = &.{}, .client_ca = options.tls_client_ca }
             else
                 null,
         }};
@@ -2028,14 +2031,14 @@ test "tls: the engine pool hands out what the config provisioned, and no more" {
     defer bed.tearDown();
 
     const credentials = &bed.tls_credentials[0].?;
-    const first = try bed.server.acquireTlsEngine(credentials, &.{});
-    const second = try bed.server.acquireTlsEngine(credentials, &.{});
+    const first = try bed.server.acquireTlsEngine(credentials, &.{}, null);
+    const second = try bed.server.acquireTlsEngine(credentials, &.{}, null);
     try std.testing.expect(first != second);
     // Exhausted at exactly the provisioned count: the wall a shed rung
     // will report is this null, not a larger pool than the banner priced.
     try std.testing.expectError(
         error.EnginesExhausted,
-        bed.server.acquireTlsEngine(credentials, &.{}),
+        bed.server.acquireTlsEngine(credentials, &.{}, null),
     );
 
     // Each slot's plaintext destination is bound and sized by the engine's
@@ -2050,7 +2053,7 @@ test "tls: the engine pool hands out what the config provisioned, and no more" {
     try std.testing.expect(first.plaintext.ptr != second.plaintext.ptr);
 
     bed.server.releaseTlsEngine(first);
-    const reused = try bed.server.acquireTlsEngine(credentials, &.{});
+    const reused = try bed.server.acquireTlsEngine(credentials, &.{}, null);
     try std.testing.expectEqual(first, reused);
     bed.server.releaseTlsEngine(reused);
     bed.server.releaseTlsEngine(second);
@@ -2073,7 +2076,7 @@ test "tls: two engines from one seed produce one handshake, replayed" {
         });
         defer bed.tearDown();
 
-        const engine = try bed.server.acquireTlsEngine(&bed.tls_credentials[0].?, &.{});
+        const engine = try bed.server.acquireTlsEngine(&bed.tls_credentials[0].?, &.{}, null);
         // The ServerHello random is the engine's seeded input made
         // visible: it goes on the wire verbatim, so comparing it compares
         // what the peer would see.
@@ -2273,6 +2276,47 @@ test "tls: bytes that are not a handshake are counted, not mistaken for pressure
     // plaintext to relay, so no backend should have heard about it.
     try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("kernel_pressure_recv"));
+    try std.testing.expect(bed.server.reconcile());
+    try bed.expectDrained();
+}
+
+test "tls: a client without a certificate is refused where the listener requires one (#304)" {
+    // End to end through the transport: the bed's TLS client presents no
+    // certificate, the listener's `client_ca` requires one, and the
+    // handshake ends in `certificate_required` — counted apart from every
+    // other handshake failure, because only issuing or trusting
+    // certificates changes the outcome.
+    var anchors_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer anchors_arena.deinit();
+    const anchors = try zoxy_trust.parseAnchors(anchors_arena.allocator(), @embedFile("tls/testdata/client-ca.pem"));
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = 304 },
+        .server = .{ .conn_slots = 4, .relay_buffers = 2, .tls_engines = 2 },
+        .tls = true,
+        .tls_client_ca = .{ .anchors = anchors, .verify = .required },
+    });
+    defer bed.tearDown();
+
+    // A real TLS client that holds no certificate: zssl answers the
+    // CertificateRequest with an empty list, which is how a client says
+    // it has none (RFC 8446 §4.4.2).
+    var client: TlsClient = undefined;
+    try client.start(&bed.sim_io, TestBed.bindAddress(), .{
+        .host_name = fixture_host_name,
+        .app_data = echo_token,
+    });
+    var wind_down: TlsWindDown = .{ .bed = &bed, .expected = 1 };
+    wind_down.attach(&client);
+    try bed.sim_io.run();
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("tls_client_cert_refused"));
+    // The client was turned away before any application data could pass.
+    try std.testing.expectEqual(@as(u32, 0), client.app_received_len);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshake_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("tls_handshakes_completed"));
+    // Nothing reached the origin: the session never came up.
+    try std.testing.expectEqual(@as(u8, 0), bed.scenario.origin.conns_count);
     try std.testing.expect(bed.server.reconcile());
     try bed.expectDrained();
 }
