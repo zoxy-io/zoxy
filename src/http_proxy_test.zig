@@ -1892,6 +1892,45 @@ test "h2 origin: a gRPC call from an HTTP/2 client reaches the origin and its tr
     }
 }
 
+test "h2 origin: a bidirectional call is answered while its request is still arriving, and ends after it" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2BedOptions(84 + @as(u64, @intFromBool(partial_io)));
+        options.origin_h2 = true;
+        options.partial_io = partial_io;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        bed.h2_origin.answer_at_head = true;
+        bed.h2_origin.headers = &.{.{ "content-type", "application/grpc" }};
+        bed.h2_origin.body = "\x00\x00\x00\x00\x04pong";
+        bed.h2_origin.trailers = &.{.{ "grpc-status", "0" }};
+
+        var wire: H2Wire = .{};
+        wire.preface(&.{});
+        wire.headers(1, &.{
+            .{ ":method", "POST" },
+            .{ ":scheme", "http" },
+            .{ ":path", "/echo.Echo/Chat" },
+            .{ ":authority", "a" },
+            .{ "content-type", "application/grpc" },
+            .{ "te", "trailers" },
+        }, false);
+        wire.data(1, "\x00\x00\x00\x00\x05ping1", false);
+        wire.data(1, "\x00\x00\x00\x00\x05ping2", true);
+        try bed.exchange(wire.written());
+
+        var storage: [2]H2Answer = undefined;
+        const answers = try h2Answers(bed.client.response(), &storage);
+        try std.testing.expectEqual(@as(usize, 1), answers.len);
+        try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+        try std.testing.expectEqualStrings("\x00\x00\x00\x00\x04pong", answers[0].dataSlice());
+        try std.testing.expectEqualStrings("grpc-status=0;", answers[0].trailersSlice());
+        try std.testing.expect(answers[0].reset == null);
+        try std.testing.expectEqualStrings("\x00\x00\x00\x00\x05ping1\x00\x00\x00\x00\x05ping2", bed.h2_origin.last_body.slice());
+        try bed.expectDrained();
+    }
+}
+
 test "h2 origin: two client streams share one origin connection, each on a stream of its own" {
     var options = h2BedOptions(76);
     options.origin_h2 = true;
