@@ -199,8 +199,8 @@ pub const Counters = struct {
     l7_shed_upstream_head_buffers: Value = Value.init(0),
     /// §8 rungs for an `h2c` cluster (§7): no connection to the endpoint
     /// had room for another stream and none was free to dial
-    /// (`limits.h2_origin_connections`), or no stream could hold an answer
-    /// (`limits.h2_origin_streams`). Answered 503, as the slot rung is.
+    /// (`limits.upstream_h2_connections`), or no stream could hold an answer
+    /// (`limits.upstream_h2_streams`). Answered 503, as the slot rung is.
     l7_shed_h2_origin_connections: Value = Value.init(0),
     l7_shed_h2_origin_streams: Value = Value.init(0),
     /// The §8 rung for an HTTPS cluster (#296): a fresh connection found no
@@ -427,7 +427,7 @@ pub const Counters = struct {
     health_probes_failed: Value = Value.init(0),
     /// `grpc` probes that reached no verdict (§7): the origin pool had no
     /// connection to the endpoint and no room to dial one — a limit of
-    /// this proxy's (`limits.h2_origin_connections`), which must not
+    /// this proxy's (`limits.upstream_h2_connections`), which must not
     /// eject an endpoint. Neither streak moves. A deployment that sees it
     /// rise has sized the pool below its endpoints.
     health_probes_skipped: Value = Value.init(0),

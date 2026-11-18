@@ -326,7 +326,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         \\          "tls": {{ "cert": "{s}", "key": "{s}", "alpn": ["h2"] }} }}
         \\    ],
         \\    "clusters": {{ "origin": {{ "endpoints": ["127.0.0.1:{d}"] }} }},
-        \\    "limits": {{ "upstream_slots": {d}, "stream_slots": {d} }}
+        \\    "limits": {{ "upstream_slots": {d}, "h2_streams": {d} }}
         \\}}
         \\
     , .{ ports.h2c, ports.tls, tls_cert_path, tls_key_path, origin_port, upstream_slots, stream_slots });

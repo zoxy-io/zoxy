@@ -561,7 +561,7 @@ the pool is empty, so a client is answered in the handshake rather than
 turned away after it; a reservation the client did not take goes back
 when the handshake ends. The shared stream slots are what HTTP/2
 multiplexes, each charged a stream's two ring ops beside the
-per-connection divisor, which is why `limits.stream_slots` is required
+per-connection divisor, which is why `limits.h2_streams` is required
 rather than guessed. Both read zero, and are refused, unless a listener
 speaks HTTP/2 — `h2` in `tls.alpn`, or `http.h2c`; a listener offering
 `h2` alone has no HTTP/1.1 to fall back to, and sheds at accept instead
@@ -891,6 +891,14 @@ Rules:
   So is `cq_fill_eighths`, which is not a pool but sizes the ring this
   process asks the kernel for — the block's rule is about reservation,
   not about being a count of objects.
+  A pool's key names its side and then its protocol: the client side
+  bare (`conn_slots`, `head_buffers`), the origin side `upstream_`
+  (`upstream_slots`, `upstream_tls_sessions`), and an HTTP/2 pool `h2_`
+  after that (`h2_streams`, `upstream_h2_connections`). The HTTP/2 keys
+  were renamed to this before the freeze (#400): `stream_slots` printed
+  back in the banner as a different number under its own name, since
+  the banner's "stream slots" adds one per conn slot, and the origin
+  pair was the only `upstream_` pool spelled `h2_origin_`.
   A cap that reserves nothing states policy and belongs on the thing it
   governs. `max_body_bytes` argued this first, and `keepalive_requests`
   was the standing exception until the freeze moved it beside that cap:
@@ -2263,7 +2271,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
     term (`h2_origin_ops_max` each).
 
   What arrives for a stream is staged in a buffer of the leg's own (§5's
-  `h2_origin_streams`): a head, a window of payload, a trailer section.
+  `upstream_h2_streams`): a head, a window of payload, a trailer section.
   The stream's window is what that buffer holds, so DATA is copied out of
   the session at once and a slow client never holds a connection its
   siblings share; octets are credited back as the exchange reads them.
@@ -2271,7 +2279,7 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   its connection fails the leg as a socket error would, and the exchange
   decides what that means: a leg on a connection that was already open
   is a reused upstream's try, so the GOAWAY race earns §7's free replay.
-  Connections (`h2_origin_connections`) are picked least-loaded per
+  Connections (`upstream_h2_connections`) are picked least-loaded per
   endpoint, dialed when none has room, told GOAWAY after an idle window,
   and closed by the drain once their last leg leaves. An HTTP/2 cluster is
   reachable only from `http` listeners without upgrades, and checked by

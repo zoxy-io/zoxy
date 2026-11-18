@@ -15,7 +15,7 @@ pub const Protocol = enum(u8) {
     http_1_1,
     /// HTTP/2 over TLS (RFC 9113 §3.2, #275), spoken by the driver in
     /// `http/h2/Connection.zig`. A listener naming it needs the session and
-    /// stream pools sized (`limits.h2_connections`, `limits.stream_slots`).
+    /// stream pools sized (`limits.h2_connections`, `limits.h2_streams`).
     h2,
 
     /// The token on the wire: the IANA "TLS Application-Layer Protocol
