@@ -31,7 +31,7 @@ const constants = @import("../constants.zig");
 const parser = @import("../http/parser.zig");
 const relay = @import("relay.zig");
 const upstream_module = @import("upstream.zig");
-const Origin = @import("../http/h2/Origin.zig");
+const Origin = @import("../http/h2/origin_pool.zig");
 
 const assert = std.debug.assert;
 
