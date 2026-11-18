@@ -888,6 +888,17 @@ pub const passive_ejection_fall_default: u8 = 5;
 /// `check`, whose `rise` restores from probe traffic rather than real.
 pub const passive_ejection_recovery_ms_default: u32 = 30_000;
 
+/// Where #394's backoff level stops counting. Past ~40 doublings any
+/// legal base has met any legal ceiling, so a higher level would change
+/// nothing; the cap keeps the counter in a `u8` with room to spare.
+pub const passive_backoff_level_max: u8 = 63;
+comptime {
+    assert(passive_backoff_level_max < std.math.maxInt(u8));
+    // The smallest base, doubled to the cap, meets the largest ceiling: no
+    // legal config reaches a level the cap would cut short.
+    assert((@as(u64, 1) << passive_backoff_level_max) >= timeout_ms_max);
+}
+
 /// The legal range of a cluster's #390 `panic_threshold_percent`. Zero
 /// is the absent rule — fail open only at zero healthy — so it has its
 /// spelling already; 100 would panic at the first ejection, which is

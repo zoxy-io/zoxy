@@ -1129,6 +1129,22 @@ transient failures a probe never sees, and `recovery_ms` 30000. Ejection,
 fail-open and the closing of pooled connections work as they do for active
 checks.
 
+An endpoint that keeps failing as soon as it is let back in costs `fall`
+requests every `recovery_ms`. Set `recovery_ms_max` to make it wait longer
+each time:
+
+```json
+"passive_ejection": { "fall": 5, "recovery_ms": 10000, "recovery_ms_max": 300000 }
+```
+
+Each passive ejection of the same endpoint doubles its cooldown, 10 s,
+20 s, 40 s and so on, up to `recovery_ms_max`. An endpoint that then stays
+in rotation for a whole `recovery_ms_max` starts over at `recovery_ms`. A
+health check's `rise` can still bring an endpoint back early, but that
+does not reset the doubling, since it shows the probe path works, not that
+real traffic will. Without `recovery_ms_max` every cooldown is
+`recovery_ms`, as before.
+
 If no cluster has either kind of detection, the startup banner says so:
 
 ```

@@ -93,6 +93,13 @@ pub fn Checker(comptime IoType: type) type {
         /// re-admission sweep — recovery cannot itself be passive,
         /// because an ejected endpoint receives no traffic to learn from.
         eject_deadline_ns: []u64,
+        /// #394's backoff: how many passive ejections in a row this
+        /// endpoint has taken without a sustained stay in rotation since,
+        /// and when it last came back (0 for never ejected). Allocated for
+        /// every endpoint like the tables above, and priced with them;
+        /// read only where `passive_ejection.recovery_ms_max` is set.
+        passive_levels: []u8,
+        restored_at_ns: []u64,
         /// Endpoints under checks — static after `init` (the sum of
         /// `endpoints.len` over every `check` cluster); zero leaves the
         /// prober `.off` forever unless some cluster opted into passive
@@ -818,11 +825,15 @@ pub fn Checker(comptime IoType: type) type {
             checker.ok_streaks = try arena.alloc(u8, keys.count);
             checker.passive_streaks = try arena.alloc(u8, keys.count);
             checker.eject_deadline_ns = try arena.alloc(u64, keys.count);
+            checker.passive_levels = try arena.alloc(u8, keys.count);
+            checker.restored_at_ns = try arena.alloc(u64, keys.count);
             @memset(checker.healthy, true);
             @memset(checker.fail_streaks, 0);
             @memset(checker.ok_streaks, 0);
             @memset(checker.passive_streaks, 0);
             @memset(checker.eject_deadline_ns, 0);
+            @memset(checker.passive_levels, 0);
+            @memset(checker.restored_at_ns, 0);
             checker.checked_count = 0;
             checker.ejectable_count = 0;
             checker.passive_configured = false;
@@ -1190,6 +1201,11 @@ pub fn Checker(comptime IoType: type) type {
             checker.ok_streaks[key] = 0;
             checker.passive_streaks[key] = 0;
             checker.eject_deadline_ns[key] = 0;
+            // The backoff level survives a restore — a probe's `rise` can
+            // lift an endpoint early, and that says the probe path works,
+            // not that traffic will (#394). Only time in rotation decays
+            // it, judged at the next ejection against this stamp.
+            checker.restored_at_ns[key] = checker.server.io.nowNs();
             assert(checker.unhealthy_count >= 1);
             checker.unhealthy_count -= 1;
             checker.server.counters.increment("health_endpoint_up");
@@ -1251,8 +1267,8 @@ pub fn Checker(comptime IoType: type) type {
                     // and a streak that took a minute to build should not
                     // shorten that.
                     const passive = checker.passiveOf(cluster_index).?;
-                    checker.eject_deadline_ns[key] = checker.server.io.nowNs() +
-                        @as(u64, passive.recovery_ms) * std.time.ns_per_ms;
+                    const now_ns = checker.server.io.nowNs();
+                    checker.eject_deadline_ns[key] = now_ns + checker.passiveCooldownNs(passive, key, now_ns);
                     assert(checker.eject_deadline_ns[key] > 0);
                 },
             }
@@ -1261,6 +1277,29 @@ pub fn Checker(comptime IoType: type) type {
             // out" is asking about the endpoint, not about who said so.
             checker.server.labeled.incrementEndpoint(.health_down, key);
             checker.closeParked(cluster_index, endpoint_index);
+        }
+
+        /// The cooldown this passive ejection earns (#394), advancing the
+        /// endpoint's backoff level. Without `recovery_ms_max` it is
+        /// `recovery_ms` every time, as before the key. With it, an
+        /// endpoint that stayed in rotation for the whole ceiling since it
+        /// last came back starts over; otherwise each ejection doubles the
+        /// last, up to the ceiling.
+        fn passiveCooldownNs(
+            checker: *Self,
+            passive: *const config_module.Config.Cluster.PassiveEjection,
+            key: u32,
+            now_ns: u64,
+        ) u64 {
+            const max_ms = passive.recovery_ms_max orelse return @as(u64, passive.recovery_ms) * std.time.ns_per_ms;
+            const max_ns = @as(u64, max_ms) * std.time.ns_per_ms;
+            const level = decayedLevel(checker.passive_levels[key], checker.restored_at_ns[key], now_ns, max_ns);
+            if (level < constants.passive_backoff_level_max) checker.passive_levels[key] = level + 1;
+            assert(checker.passive_levels[key] <= constants.passive_backoff_level_max);
+            const cooldown_ns = backoffCooldownNs(passive.recovery_ms, max_ms, level);
+            assert(cooldown_ns >= @as(u64, passive.recovery_ms) * std.time.ns_per_ms);
+            assert(cooldown_ns <= max_ns);
+            return cooldown_ns;
         }
 
         /// The cluster's passive-ejection policy, or null where the
@@ -1431,4 +1470,64 @@ pub fn Checker(comptime IoType: type) type {
             checker.server.maybeStopAfterDrain();
         }
     };
+}
+
+/// The backoff level an ejection starts from (#394): reset to zero when
+/// the endpoint has stayed in rotation for the whole ceiling since it
+/// last came back — sustained recovery — and kept otherwise. An endpoint
+/// never ejected (`restored_at_ns == 0`) is at zero already.
+pub fn decayedLevel(level: u8, restored_at_ns: u64, now_ns: u64, max_ns: u64) u8 {
+    assert(max_ns >= 1);
+    assert(level <= constants.passive_backoff_level_max);
+    if (restored_at_ns == 0) return level;
+    assert(now_ns >= restored_at_ns);
+    return if (now_ns - restored_at_ns >= max_ns) 0 else level;
+}
+
+test "health: a backoff level resets only after a whole ceiling in rotation (#394)" {
+    const max_ns: u64 = 30 * std.time.ns_per_s;
+    const back_at: u64 = 100 * std.time.ns_per_s;
+    // Ejected again inside the ceiling: the level stands.
+    try std.testing.expectEqual(@as(u8, 3), decayedLevel(3, back_at, back_at + max_ns - 1, max_ns));
+    // A full ceiling in rotation is sustained recovery: start over.
+    try std.testing.expectEqual(@as(u8, 0), decayedLevel(3, back_at, back_at + max_ns, max_ns));
+    // Never ejected before: nothing to decay.
+    try std.testing.expectEqual(@as(u8, 0), decayedLevel(0, 0, back_at, max_ns));
+}
+
+/// `base_ms` doubled `level` times, never past `max_ms` (#394). Pure, so
+/// the arithmetic — the shift that would overflow, the ceiling — is
+/// tested apart from the prober that drives it.
+pub fn backoffCooldownNs(base_ms: u32, max_ms: u32, level: u8) u64 {
+    assert(base_ms >= 1);
+    assert(max_ms >= base_ms);
+    assert(level <= constants.passive_backoff_level_max);
+    const max_ns = @as(u64, max_ms) * std.time.ns_per_ms;
+    var cooldown_ns = @as(u64, base_ms) * std.time.ns_per_ms;
+    // Bounded by the level cap; stops as soon as the ceiling is met, so
+    // the doubling never reaches a shift that could overflow.
+    var doubled: u8 = 0;
+    while (doubled < level and cooldown_ns < max_ns) : (doubled += 1) cooldown_ns *= 2;
+    const clamped = @min(cooldown_ns, max_ns);
+    assert(clamped >= @as(u64, base_ms) * std.time.ns_per_ms);
+    return clamped;
+}
+
+test "health: a passive cooldown doubles per ejection up to its ceiling (#394)" {
+    try std.testing.expectEqual(@as(u64, 1_000) * std.time.ns_per_ms, backoffCooldownNs(1_000, 30_000, 0));
+    try std.testing.expectEqual(@as(u64, 2_000) * std.time.ns_per_ms, backoffCooldownNs(1_000, 30_000, 1));
+    try std.testing.expectEqual(@as(u64, 16_000) * std.time.ns_per_ms, backoffCooldownNs(1_000, 30_000, 4));
+    // The ceiling holds exactly, not the next doubling past it.
+    try std.testing.expectEqual(@as(u64, 30_000) * std.time.ns_per_ms, backoffCooldownNs(1_000, 30_000, 5));
+    try std.testing.expectEqual(
+        @as(u64, 30_000) * std.time.ns_per_ms,
+        backoffCooldownNs(1_000, 30_000, constants.passive_backoff_level_max),
+    );
+    // A ceiling equal to the base is a fixed cooldown at every level.
+    try std.testing.expectEqual(@as(u64, 5_000) * std.time.ns_per_ms, backoffCooldownNs(5_000, 5_000, 9));
+    // The widest legal values do not overflow on the way to the ceiling.
+    try std.testing.expectEqual(
+        @as(u64, constants.timeout_ms_max) * std.time.ns_per_ms,
+        backoffCooldownNs(1, constants.timeout_ms_max, constants.passive_backoff_level_max),
+    );
 }
