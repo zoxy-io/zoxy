@@ -53,7 +53,8 @@ Non-goals (deliberate, recorded so they are decisions rather than drift):
   connection shared by streams rather than leased to one exchange. gRPC
   rides on both, with the response trailers it ends every call with
   carried end to end. An `h2` cluster reaches its origins over TLS, every
-  chain verified (§7); TLS to an HTTP/1.1 origin is the rest of #296.
+  chain verified (§7), and so does an HTTPS one — `http1` with `tls`
+  (#296).
   WebSocket was
   deferred too and is not any more (#180, §7): carrying it needs no new
   I/O machinery, because a tunnel is the L4 relay this proxy already
@@ -2242,6 +2243,42 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   are read only while their plaintext has room, so a session that cannot
   take more stops the reads rather than growing a buffer.
 
+  An **HTTPS cluster** is one with `protocol` `http1` and a `tls` block
+  (#296). Its connections are verified the same way, with the same client
+  offering `http/1.1`, and the origin may select that protocol or none.
+  Each connection carries a session (`net/upstream_tls.zig`) on its
+  upstream pool slot.
+  - **Lifetime.** The session is taken at the dial and kept while the
+    connection is parked. `Server.releaseUpstream`, the one point every
+    release goes through, gives it back.
+  - **Dispatch.** The exchange does not change. Its ops reach the session
+    through the same `upstream*` dispatch an `h2` cluster's legs use.
+  - **Ring.** The session drives the socket with two completions of its
+    own and delivers to the exchange through zero-delay timers.
+  - **Stream ops.** Each socket op stands for one waiting exchange op,
+    and no waiting op stands behind two. So the stream's ops never
+    outnumber its own two (`stream_ops_max`) and the ring needs no new
+    term.
+  - **Handshake.** It rides the request head's send, under `connect_ms`
+    from its start. A handshake that fails fails that send. On a fresh
+    connection the result is a `502`, counted in `upstream_tls_failed`.
+    #181 does not retry it, because the dial succeeded.
+  - **Parking and reuse.** A parked connection is reused without a new
+    handshake. It parks only when clean: nothing past the response, and
+    no close from the origin.
+  - **Reuse safety.** Reuse across clients is sound because the
+    connection is authenticated by the server only and carries no client
+    identity. The pool is keyed by cluster and endpoint, so a reused
+    connection was verified against the name and anchors its cluster
+    still names. Client certificates to an origin (#9) would end that
+    argument, and would need their own reuse rule.
+  - **Budget.** `limits.upstream_tls_sessions` sizes the sessions. It is
+    sized into the libcrypto heap left over by the listeners' engines and
+    the `h2` origins' connections, and priced in the budget.
+  - **Not yet carried.** An `l4` listener, an upgrade's tunnel, and an
+    `http` check do not cross this TLS, and the loader refuses each. The
+    first two relay the socket itself, and the prober speaks no TLS.
+
 - **An HTTP/2 connection is told before it is closed.** It gets
   `GOAWAY(NO_ERROR)` before the close when it is drained, when it sits
   idle with no stream open, and when its stream count reaches
@@ -3219,6 +3256,7 @@ src/
     proxy_protocol.zig // PROXY v1/v2 parse + write: pure, round-trip-pinned (§6)
     relay.zig         // strict recv→send→recv relay (L4 + L7 bodies)
     upstream.zig      // shared upstream pool + endpoint idle lists + head pool
+    upstream_tls.zig  // an HTTPS cluster's TLS session, riding the pool slot
   http/
     parser.zig        // hparse wrapper: strictness + framing + chunked decoder
     render.zig        // §7 head rendering: hop-by-hop strip + close injection
@@ -3319,10 +3357,10 @@ TLS (§7). Two BCPs are
 prescriptive rather than definitional and are treated as binding anyway:
 **9325** (secure use) and **8996** (TLS 1.0/1.1 deprecated). **9525** —
 service identity in certificates, which obsoleted 6125 in 2023 — binds
-an implementation that *originates* TLS to its upstreams, which this one
-now does for an `h2` cluster (§7): a DNS-ID in the subjectAltName is the
-only identity matched (§6.3's no-CN-fallback), against the configured
-`server_name`.
+an implementation that *originates* TLS to its upstreams. This one now
+does so for an `h2` cluster and for an HTTPS one (§7, #296). A DNS-ID in
+the subjectAltName is the only identity matched (§6.3's no-CN-fallback),
+against the configured `server_name`.
 
 **Per feature.** RFC **6455** §4 is the opening handshake #180
 recognises — tunnelling means never implementing the protocol, but
