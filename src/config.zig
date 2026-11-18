@@ -344,6 +344,12 @@ pub const Config = struct {
         /// exchange holds one of those too, so more could never be used.
         h2_origin_connections: u32 = 0,
         h2_origin_streams: u32 = 0,
+        /// TLS sessions to HTTP/1.1 origins (§7, #296): one per upstream
+        /// connection to a cluster with `tls` and `protocol` `http1`, held
+        /// while it is leased and while it is parked. Zero exactly when no
+        /// such cluster exists; sixteen per such endpoint by default,
+        /// within the upstream slots and the libcrypto heap.
+        upstream_tls_sessions: u32 = 0,
         /// How many eighths of the io_uring completion queue the worst-case
         /// in-flight ops may fill (§8). Unlike the pool sizes this is not a
         /// shrink: ⅞ (the compiled default, the fill the ceiling is derived
@@ -978,10 +984,19 @@ pub const ValidationError = error{
     /// An `http` listener carrying an upgrade to an `h2c` cluster: the
     /// tunnel would need a `101`, which HTTP/2 does not have.
     ClusterH2cWithUpgrades,
-    /// `tls` on a cluster that does not speak `h2`, or `h2` without it:
-    /// TLS to an origin is HTTP/2's here (#296 has the HTTP/1.1 half).
-    ClusterTlsWithoutH2,
+    /// `tls` on an `h2c` cluster, which is HTTP/2 in the clear by name, or
+    /// `h2` without it.
+    ClusterTlsOnH2c,
     ClusterH2WithoutTls,
+    /// An `l4` listener routing to an HTTPS cluster: it relays bytes, and
+    /// what TLS would carry for it is not a request this proxy reads.
+    ClusterTlsOnL4Listener,
+    /// An upgrade to an HTTPS cluster: the tunnel's relay reads and writes
+    /// the socket itself, under the TLS this proxy would have to keep.
+    ClusterTlsWithUpgrades,
+    /// An `http` check on an HTTPS cluster: the prober speaks plaintext,
+    /// so it would probe something the traffic does not reach.
+    ClusterTlsHttpCheck,
     ClusterTlsServerNameInvalid,
     ClusterTlsCaUnreadable,
     /// The bundle holds no certificate, or a block that is not one.
@@ -989,6 +1004,11 @@ pub const ValidationError = error{
     /// The libcrypto heap is reserved for `tls_engines_max` sessions, and
     /// the origin connections a TLS cluster may open count against it.
     LimitH2OriginTlsOverEngines,
+    /// HTTPS origins' sessions are the heap's third consumer (#296).
+    LimitUpstreamTlsOverEngines,
+    LimitUpstreamTlsSessionsOutOfRange,
+    LimitUpstreamTlsSessionsOverUpstreamSlots,
+    LimitUpstreamTlsSessionsWithoutTls,
     LimitCqFillOutOfRange,
     LimitConnSlotsOverCqFill,
     LimitAccessLogBufferOutOfRange,
@@ -1084,11 +1104,13 @@ pub fn parseWithFiles(
         // because clusters resolve before limits do — the `check` blocks
         // are already settled by the time the budget is priced.
         constants.healthProbeConcurrency(checkedEndpointsOf(clusters)),
-        // The HTTP/2 endpoints the origin pools are sized for (§7), and
-        // whether their connections hold TLS sessions, known for the same
-        // reason.
-        h2cEndpointsOf(clusters),
-        originTls(clusters),
+        // What the origin pools are sized for (§7, #296), known for the
+        // same reason.
+        .{
+            .h2c_endpoints = h2cEndpointsOf(clusters),
+            .h2_origin_tls = h2OriginTls(clusters),
+            .upstream_tls_endpoints = upstreamTlsEndpointsOf(clusters),
+        },
     );
     // Bodies before listeners (#159): a `respond` action names one, and
     // both consumers render through the same load-time cache — so the
@@ -1620,17 +1642,11 @@ fn resolveHeadPools(
 /// is not merely wasteful — the fd and ring budgets are derived from
 /// `conn_slots` on the strength of it (`fdsRequired`, `inFlightOps`), so
 /// a breach here is an under-provisioned ring rather than spare memory.
-fn assertPoolsFitConnSlots(
-    conn_slots: u32,
-    relay_buffers: u32,
-    head_buffers: u32,
-    tls_engines: u32,
-    tunnels: u32,
-) void {
-    assert(relay_buffers <= conn_slots);
-    assert(head_buffers <= conn_slots);
-    assert(tls_engines <= conn_slots);
-    assert(tunnels <= conn_slots);
+fn assertPoolsFitConnSlots(slots: SlotCounts, head_buffers: u32, feature_pools: FeaturePools) void {
+    assert(slots.relay_buffers <= slots.conn_slots);
+    assert(head_buffers <= slots.conn_slots);
+    assert(feature_pools.tls_engines <= slots.conn_slots);
+    assert(feature_pools.tunnels <= slots.conn_slots);
 }
 
 /// The relay buffer's width against what the listeners ask of it — split
@@ -1674,8 +1690,7 @@ fn resolveLimits(
     access_log_on: bool,
     log_header_count: u32,
     health_probes: u32,
-    h2c_endpoints: u32,
-    origin_tls: bool,
+    origins: OriginDemand,
 ) ValidationError!Config.Limits {
     assert(listeners_count >= 1);
     assert(health_probes >= 1);
@@ -1696,8 +1711,7 @@ fn resolveLimits(
     const relay_buffer_bytes = try resolveRelayBufferBytes(limits_json.relay_buffer_bytes);
     try rejectRelayBufferShape(features, relay_buffer_bytes);
     const feature_pools = try resolveFeaturePools(limits_json, conn_slots, features);
-    const origin_pools = try resolveOriginPools(limits_json, upstream_slots, h2c_endpoints);
-    try rejectTlsSessionsOverHeap(feature_pools.tls_engines, origin_pools.connections, origin_tls);
+    const origin_pools = try resolveOriginLimits(limits_json, upstream_slots, feature_pools.tls_engines, origins);
     const cq_fill_eighths = try resolveCqFill(
         limits_json.cq_fill_eighths,
         conn_slots,
@@ -1717,13 +1731,7 @@ fn resolveLimits(
         access_log_on,
         log_header_count,
     );
-    assertPoolsFitConnSlots(
-        conn_slots,
-        relay_buffers,
-        head_pools.head_buffers,
-        feature_pools.tls_engines,
-        feature_pools.tunnels,
-    );
+    assertPoolsFitConnSlots(slots, head_pools.head_buffers, feature_pools);
     return .{
         .conn_slots = conn_slots,
         .relay_buffers = relay_buffers,
@@ -1738,6 +1746,7 @@ fn resolveLimits(
         .stream_slots = feature_pools.stream_slots,
         .h2_origin_connections = origin_pools.connections,
         .h2_origin_streams = origin_pools.streams,
+        .upstream_tls_sessions = origin_pools.upstream_tls_sessions,
         .keepalive_requests = limits_json.keepalive_requests orelse
             constants.keepalive_requests_default,
         .cq_fill_eighths = cq_fill_eighths,
@@ -1814,11 +1823,93 @@ fn resolveOriginPools(
 
 /// The libcrypto heap is one reservation for every TLS session this
 /// process holds (§4): the listeners' engines, and the origin connections
-/// where a cluster reaches its origins over TLS (§7).
-fn rejectTlsSessionsOverHeap(tls_engines: u32, origin_connections: u32, origin_tls: bool) ValidationError!void {
+/// where an `h2` cluster reaches its origins over TLS (§7). Zero when no
+/// cluster does. HTTPS origins' sessions are the third, and are sized
+/// into what is left (`resolveUpstreamTls`).
+fn rejectTlsSessionsOverHeap(tls_engines: u32, h2_tls_connections: u32) ValidationError!void {
     assert(tls_engines <= constants.tls_engines_max);
-    if (!origin_tls) return;
-    if (tls_engines + origin_connections > constants.tls_engines_max) return error.LimitH2OriginTlsOverEngines;
+    if (tls_engines + h2_tls_connections > constants.tls_engines_max) return error.LimitH2OriginTlsOverEngines;
+}
+
+/// What the clusters ask of the origin pools (§7, #296), known once they
+/// resolve: the HTTP/2 endpoints the connections are sized for, whether
+/// those connections hold TLS sessions, and the HTTPS endpoints the TLS
+/// sessions are.
+const OriginDemand = struct {
+    h2c_endpoints: u32,
+    h2_origin_tls: bool,
+    upstream_tls_endpoints: u32,
+};
+
+/// The origin pools a config's clusters draw on (§7, #296): the HTTP/2
+/// connections and streams, and the HTTPS sessions sized into the heap
+/// room they and the listeners' engines leave.
+fn resolveOriginLimits(
+    limits_json: *const LimitsJson,
+    upstream_slots: u32,
+    tls_engines: u32,
+    origins: OriginDemand,
+) ValidationError!struct { connections: u32, streams: u32, upstream_tls_sessions: u32 } {
+    const pools = try resolveOriginPools(limits_json, upstream_slots, origins.h2c_endpoints);
+    const h2_tls_connections = if (origins.h2_origin_tls) pools.connections else 0;
+    const sessions = try resolveTlsSessions(
+        limits_json,
+        upstream_slots,
+        tls_engines,
+        h2_tls_connections,
+        origins.upstream_tls_endpoints,
+    );
+    assert(sessions <= upstream_slots);
+    return .{ .connections = pools.connections, .streams = pools.streams, .upstream_tls_sessions = sessions };
+}
+
+/// The libcrypto heap's three consumers, in order (§4, §7, #296): the
+/// listeners' engines and the `h2` origins' connections must fit, and the
+/// HTTPS origins' sessions are sized into what is left. Answers those.
+fn resolveTlsSessions(
+    limits_json: *const LimitsJson,
+    upstream_slots: u32,
+    tls_engines: u32,
+    h2_tls_connections: u32,
+    upstream_tls_endpoints: u32,
+) ValidationError!u32 {
+    try rejectTlsSessionsOverHeap(tls_engines, h2_tls_connections);
+    assert(tls_engines + h2_tls_connections <= constants.tls_engines_max);
+    const heap_room = constants.tls_engines_max - tls_engines - h2_tls_connections;
+    return resolveUpstreamTls(limits_json, upstream_slots, upstream_tls_endpoints, heap_room);
+}
+
+/// The TLS sessions HTTPS origins draw on (#296): one per upstream
+/// connection to an `http1` cluster with `tls`, so within the upstream
+/// slots, and within what the libcrypto heap has left after the
+/// listeners' engines and the `h2` origins' connections (`heap_room`).
+/// Zero exactly when no such cluster exists.
+fn resolveUpstreamTls(
+    limits_json: *const LimitsJson,
+    upstream_slots: u32,
+    tls_endpoints: u32,
+    heap_room: u32,
+) ValidationError!u32 {
+    assert(upstream_slots >= 1);
+    assert(heap_room <= constants.tls_engines_max);
+    if (tls_endpoints == 0) {
+        if (limits_json.upstream_tls_sessions != null) return error.LimitUpstreamTlsSessionsWithoutTls;
+        return 0;
+    }
+    if (heap_room == 0) return error.LimitUpstreamTlsOverEngines;
+    const default: u64 = @min(
+        @as(u64, tls_endpoints) * constants.upstream_tls_sessions_per_endpoint,
+        upstream_slots,
+        heap_room,
+    );
+    const sessions = limits_json.upstream_tls_sessions orelse default;
+    if (sessions < 1 or sessions > constants.upstream_tls_sessions_max) {
+        return error.LimitUpstreamTlsSessionsOutOfRange;
+    }
+    if (sessions > upstream_slots) return error.LimitUpstreamTlsSessionsOverUpstreamSlots;
+    if (sessions > heap_room) return error.LimitUpstreamTlsOverEngines;
+    assert(sessions >= 1);
+    return @intCast(sessions);
 }
 
 /// How many endpoints the `h2c` clusters name between them.
@@ -1830,8 +1921,27 @@ fn h2cEndpointsOf(clusters: []const Config.Cluster) u32 {
     return count;
 }
 
-/// Whether some HTTP/2 cluster reaches its origins over TLS (§7): the
-/// origin connections then hold libcrypto sessions.
+/// Whether an `h2` cluster exists (§7): its origin connections — every
+/// HTTP/2 one, since they are one pool — then hold TLS clients.
+pub fn h2OriginTls(clusters: []const Config.Cluster) bool {
+    for (clusters) |*cluster| {
+        if (cluster.protocol == .h2) return true;
+    }
+    return false;
+}
+
+/// How many endpoints the HTTPS clusters — `http1` with `tls` — name
+/// between them (#296): what the TLS session pool is sized for.
+pub fn upstreamTlsEndpointsOf(clusters: []const Config.Cluster) u32 {
+    var count: u32 = 0;
+    for (clusters) |*cluster| {
+        if (cluster.protocol == .http1 and cluster.tls != null) count += @intCast(cluster.endpoints.len);
+    }
+    return count;
+}
+
+/// Whether any cluster reaches its origins over TLS (§7, #296): the
+/// libcrypto heap is then installed, whatever the listeners do.
 pub fn originTls(clusters: []const Config.Cluster) bool {
     for (clusters) |*cluster| {
         if (cluster.tls != null) return true;
@@ -2236,6 +2346,9 @@ pub const LimitsJson = struct {
     /// legal where some cluster speaks `h2c`.
     h2_origin_connections: ?u32 = null,
     h2_origin_streams: ?u32 = null,
+    /// TLS sessions to HTTP/1.1 origins (#296): defaulted, and only legal
+    /// where some `http1` cluster has `tls`.
+    upstream_tls_sessions: ?u32 = null,
     /// Optional #237 keep-alive request cap; absent means nginx's 1000,
     /// `0` is unlimited.
     keepalive_requests: ?u32 = null,
@@ -2354,6 +2467,15 @@ pub const LimitsJson = struct {
                 "defaults to upstream_slots and may not exceed it.",
             .minimum = 1,
             .maximum = constants.upstream_slots_max,
+        },
+        .upstream_tls_sessions = .{
+            .desc = "TLS sessions to HTTPS origins (http1 clusters with tls), one " ++
+                "per connection, kept while it is parked for reuse. Only allowed " ++
+                "when such a cluster exists; defaults to 16 per such endpoint, " ++
+                "within upstream_slots. A request with no session free is " ++
+                "answered 503.",
+            .minimum = 1,
+            .maximum = constants.upstream_tls_sessions_max,
         },
         .cq_fill_eighths = .{
             .desc = "How many eighths of the io_uring completion queue the " ++
@@ -3128,8 +3250,8 @@ pub const ClusterJson = struct {
         },
         .tls = .{
             .desc = "TLS to this cluster's origins: the name each must prove and " ++
-                "the CA bundle its chain must reach. Required by protocol h2, " ++
-                "and only legal with it.",
+                "the CA bundle its chain must reach. Required by protocol h2; " ++
+                "with http1, the origins speak HTTPS. Not allowed with h2c.",
         },
     };
 };
@@ -5942,16 +6064,18 @@ fn rejectTlsClusterSend(
     }
 }
 
-/// What an HTTP/2 cluster may be (§7): probed by `tcp` or `grpc`, not
-/// `http`, since that prober speaks HTTP/1.1, which such an origin need
-/// not — and `grpc` probes only such a cluster; and over TLS exactly when
-/// it is `h2`.
+/// What a cluster's protocol allows (§7): an HTTP/2 one is probed by
+/// `tcp` or `grpc`, not `http`, since that prober speaks HTTP/1.1, which
+/// such an origin need not — and `grpc` probes only such a cluster; an
+/// HTTPS one (`http1` with `tls`) is not probed by `http` either, since
+/// the prober speaks no TLS (#296). `h2` is over TLS and `h2c` is not.
 fn rejectClusterProtocolShape(cluster: *const Config.Cluster) ValidationError!void {
     if (cluster.check) |check| {
         if (cluster.protocol.http2() and check.kind == .http) return error.ClusterH2cHttpCheck;
         if (!cluster.protocol.http2() and check.kind == .grpc) return error.ClusterCheckGrpcOnHttp1;
+        if (cluster.tls != null and check.kind == .http) return error.ClusterTlsHttpCheck;
     }
-    if (cluster.tls != null and cluster.protocol != .h2) return error.ClusterTlsWithoutH2;
+    if (cluster.tls != null and cluster.protocol == .h2c) return error.ClusterTlsOnH2c;
     if (cluster.tls == null and cluster.protocol == .h2) return error.ClusterH2WithoutTls;
 }
 
@@ -6006,10 +6130,11 @@ fn resolveClusterProtocol(protocol: []const u8) ValidationError!Config.Cluster.P
     return std.meta.stringToEnum(Config.Cluster.Protocol, protocol) orelse error.ClusterProtocolUnknown;
 }
 
-/// Where an `h2c` cluster may be routed from (§7): only an `http`
-/// listener, and only one that carries no upgrade — an `l4` listener
-/// relays bytes, not HTTP/2 this proxy speaks, and an upgrade's tunnel
-/// begins with a `101` HTTP/2 does not have.
+/// Where an HTTP/2 or an HTTPS cluster may be routed from (§7, #296):
+/// only an `http` listener, and only one that carries no upgrade. An
+/// `l4` listener relays bytes, not HTTP/2 or requests this proxy speaks
+/// over TLS; an upgrade's tunnel begins with a `101` HTTP/2 does not
+/// have, and relays the socket itself, under TLS it would have to keep.
 fn rejectH2cRoutes(
     listener: *const Config.Listener,
     clusters: []const Config.Cluster,
@@ -6017,9 +6142,15 @@ fn rejectH2cRoutes(
     assert(listener.routes.len >= 1);
     for (listener.routes) |route| {
         assert(route.cluster_index < clusters.len);
-        if (!clusters[route.cluster_index].protocol.http2()) continue;
-        if (listener.protocol == .l4) return error.ClusterH2cOnL4Listener;
-        if (listener.upgrades.any()) return error.ClusterH2cWithUpgrades;
+        const cluster = &clusters[route.cluster_index];
+        if (cluster.protocol.http2()) {
+            if (listener.protocol == .l4) return error.ClusterH2cOnL4Listener;
+            if (listener.upgrades.any()) return error.ClusterH2cWithUpgrades;
+            continue;
+        }
+        if (cluster.tls == null) continue;
+        if (listener.protocol == .l4) return error.ClusterTlsOnL4Listener;
+        if (listener.upgrades.any()) return error.ClusterTlsWithUpgrades;
     }
 }
 
@@ -8180,7 +8311,13 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterCheckServiceInvalid", .gap = .literal_syntax },
     .{ .name = "ClusterH2cOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterH2cWithUpgrades", .gap = .cross_block },
-    .{ .name = "ClusterTlsWithoutH2", .gap = .cross_block },
+    .{ .name = "ClusterTlsOnH2c", .gap = .cross_block },
+    .{ .name = "ClusterTlsOnL4Listener", .gap = .cross_block },
+    .{ .name = "ClusterTlsWithUpgrades", .gap = .cross_block },
+    .{ .name = "ClusterTlsHttpCheck", .gap = .cross_block },
+    .{ .name = "LimitUpstreamTlsOverEngines", .gap = .budget },
+    .{ .name = "LimitUpstreamTlsSessionsOverUpstreamSlots", .gap = .budget },
+    .{ .name = "LimitUpstreamTlsSessionsWithoutTls", .gap = .budget },
     .{ .name = "ClusterH2WithoutTls", .gap = .cross_block },
     .{ .name = "ClusterTlsServerNameInvalid", .gap = .literal_syntax },
     .{ .name = "ClusterTlsCaUnreadable", .gap = .filesystem },
@@ -10271,10 +10408,9 @@ test "config: an h2 cluster names the server its origins prove and the CA they r
         try std.testing.expect(originTls(parsed.clusters));
         try std.testing.expect(parsed.limits.h2_origin_connections >= 1);
     }
-    // TLS is h2's, and h2 is TLS's.
+    // h2 is TLS's, and h2c is not.
     try expectH2ParseError(error.ClusterH2WithoutTls, head ++ "\"protocol\":\"h2\"" ++ tail);
-    try expectH2ParseError(error.ClusterTlsWithoutH2, head ++ "\"protocol\":\"h2c\"," ++ tls ++ tail);
-    try expectH2ParseError(error.ClusterTlsWithoutH2, head ++ tls ++ tail);
+    try expectH2ParseError(error.ClusterTlsOnH2c, head ++ "\"protocol\":\"h2c\"," ++ tls ++ tail);
     // A name that is no DNS name, a bundle that cannot be read, or holds
     // no certificate.
     inline for (.{ "", "10.0.0.1", "bad_name.test", "-a.test", "a..test" }) |name| {
@@ -10289,6 +10425,55 @@ test "config: an h2 cluster names the server its origins prove and the CA they r
     try expectH2ParseError(error.LimitH2OriginTlsOverEngines, head ++ "\"protocol\":\"h2\"," ++ tls ++
         "}},\"limits\":{\"h2_origin_connections\":4096}," ++
         "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}");
+}
+
+test "config: an HTTPS cluster verifies its origins over HTTP/1.1, sized and refused where TLS cannot go (#296)" {
+    const listener = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"}}],";
+    const cluster_head = "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\",\"127.0.0.1:3\"],";
+    const tls = "\"tls\":{\"server_name\":\"origin.zoxy.test\",\"ca\":{\"path\":\"/ca.pem\"}}";
+    const timeouts = "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}";
+    const https = listener ++ cluster_head ++ tls ++ "}}," ++ timeouts;
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parseWithFiles(arena_state.allocator(), https ++ "}", TestCaFiles.source);
+        try std.testing.expectEqual(Config.Cluster.Protocol.http1, parsed.clusters[0].protocol);
+        try std.testing.expect(parsed.clusters[0].tls != null);
+        try std.testing.expect(originTls(parsed.clusters));
+        try std.testing.expect(!h2OriginTls(parsed.clusters));
+        // Sixteen per endpoint, within the upstream slots; no HTTP/2 pool.
+        try std.testing.expectEqual(@as(u32, 2), upstreamTlsEndpointsOf(parsed.clusters));
+        try std.testing.expectEqual(
+            @min(2 * constants.upstream_tls_sessions_per_endpoint, parsed.limits.upstream_slots),
+            parsed.limits.upstream_tls_sessions,
+        );
+        try std.testing.expectEqual(@as(u32, 0), parsed.limits.h2_origin_connections);
+    }
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const parsed = try parseWithFiles(arena_state.allocator(), https ++
+            ",\"limits\":{\"upstream_tls_sessions\":3}}", TestCaFiles.source);
+        try std.testing.expectEqual(@as(u32, 3), parsed.limits.upstream_tls_sessions);
+    }
+    // The prober speaks no TLS; an l4 listener and a tunnel would carry the
+    // socket around the session.
+    try expectH2ParseError(error.ClusterTlsHttpCheck, listener ++ cluster_head ++ tls ++
+        ",\"check\":{\"type\":\"http\",\"path\":\"/health\"}}}," ++ timeouts ++ "}");
+    try expectH2ParseError(error.ClusterTlsOnL4Listener, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"," ++
+        "\"l4\":{\"cluster\":\"a\"}}]," ++ cluster_head ++ tls ++ "}}," ++ timeouts ++ "}");
+    try expectH2ParseError(error.ClusterTlsWithUpgrades, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"," ++
+        "\"http\":{\"cluster\":\"a\",\"upgrades\":{\"websocket\":true}}}]," ++ cluster_head ++ tls ++
+        "}}," ++ timeouts ++ ",\"limits\":{\"tunnels\":4}}");
+    // The session pool is the HTTPS clusters', within the slots and the heap.
+    try expectH2ParseError(error.LimitUpstreamTlsSessionsWithoutTls, listener ++ cluster_head ++
+        "\"protocol\":\"http1\"}}," ++ timeouts ++ ",\"limits\":{\"upstream_tls_sessions\":2}}");
+    try expectH2ParseError(error.LimitUpstreamTlsSessionsOverUpstreamSlots, https ++
+        ",\"limits\":{\"upstream_slots\":4,\"upstream_tls_sessions\":5}}");
+    try expectH2ParseError(error.LimitUpstreamTlsOverEngines, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\"," ++
+        "\"http\":{\"cluster\":\"a\"},\"tls\":{\"cert\":\"/c.pem\",\"key\":\"/k.pem\"}}]," ++
+        cluster_head ++ tls ++ "}}," ++ timeouts ++
+        ",\"limits\":{\"tls_engines\":1000,\"upstream_slots\":1024,\"upstream_tls_sessions\":100}}");
 }
 
 test "config: a listener speaking HTTP/2 sizes its pools, and only one does (#275)" {

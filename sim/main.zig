@@ -224,6 +224,21 @@ const uncovered = [_]Uncovered{
         .reason = "no h2c cluster in the sweep, so no grpc check; http_proxy_test's grpc probe scenarios fill the pool",
     },
     .{
+        .name = "upstream_tls_handshakes",
+        .why = .unreached,
+        .reason = "no HTTPS cluster in the sweep; http_proxy_test's https origin scenarios handshake",
+    },
+    .{
+        .name = "upstream_tls_failed",
+        .why = .unreached,
+        .reason = "no HTTPS cluster in the sweep; the https origin scenarios refuse a misnamed chain",
+    },
+    .{
+        .name = "l7_shed_upstream_tls",
+        .why = .unreached,
+        .reason = "no HTTPS cluster in the sweep, so no session pool to run dry",
+    },
+    .{
         .name = "l7_shed_h2_origin_connections",
         .why = .unreached,
         .reason = "no h2c cluster in the sweep, so neither origin pool exists to run dry",

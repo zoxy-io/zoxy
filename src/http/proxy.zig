@@ -1375,6 +1375,9 @@ pub fn Proxy(comptime IoType: type) type {
                 stream.upstream = parked;
                 stream.upstream_socket = parked.socket;
                 parked.head_len = 0;
+                // An HTTPS origin's connection keeps its session parked
+                // (#296): verified once, it serves this exchange as it is.
+                if (parked.tls != null) ServerType.UpstreamTls.rebind(stream);
                 // A parked slot released its head buffer before parking;
                 // the exchange re-acquires here, still in
                 // `.reading_head` so a shed keeps (the checked-out
@@ -1433,6 +1436,17 @@ pub fn Proxy(comptime IoType: type) type {
             stream.log.endpoint_index = pick.endpoint_index;
             stream.moveTo(.dialing);
             return true;
+        }
+
+        /// A fresh connection to an HTTPS cluster's endpoint takes a TLS
+        /// session for its life (#296), or the request is shed — at the
+        /// same rung, and with the same keep, as its slot and its head.
+        fn acquireUpstreamTlsOrShed(server: *ServerType, stream: *StreamType) bool {
+            assert(stream.upstream.?.tls == null);
+            if (server.config.clusters[stream.cluster_index].tls == null) return true;
+            if (ServerType.UpstreamTls.take(server, stream)) return true;
+            respond(server, stream, 503, "l7_shed_upstream_tls");
+            return false;
         }
 
         /// Acquire the exchange's upstream head buffer (§5) — the render
@@ -1502,6 +1516,7 @@ pub fn Proxy(comptime IoType: type) type {
                 return respond(server, stream, 503, "l7_shed_upstream_slots");
             };
             if (!acquireUpstreamHeadOrShed(server, stream)) return;
+            if (!acquireUpstreamTlsOrShed(server, stream)) return;
             // The slot is held, so this try really is going to this
             // endpoint — whether or not the dial ends up succeeding. A
             // replay overwrites it, naming the endpoint that served (§7).
@@ -3661,6 +3676,17 @@ pub fn Proxy(comptime IoType: type) type {
                 stream.upstream = null;
                 return;
             }
+            // An HTTPS origin's connection parks only clean (#296): a
+            // record or a byte past the response, or the origin's close,
+            // would be the next exchange's to misread — so it closes.
+            if (upstream.tls != null and !ServerType.UpstreamTls.parkable(stream)) {
+                assert(stream.client_write.pending.len == 0);
+                server.upstreamClose(stream);
+                server.releaseUpstream(upstream);
+                stream.upstream = null;
+                return;
+            }
+            if (upstream.tls != null) ServerType.UpstreamTls.unbind(stream);
             // The exchange's head bytes go back before the slot parks
             // (§5): the response leg is settled, so the client-write
             // channel no longer references them — asserted, because the
@@ -4807,6 +4833,7 @@ pub fn Proxy(comptime IoType: type) type {
             if (std.mem.eql(u8, counter, "l7_shed_upstream_head_buffers")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_h2_origin_connections")) return .shed;
             if (std.mem.eql(u8, counter, "l7_shed_h2_origin_streams")) return .shed;
+            if (std.mem.eql(u8, counter, "l7_shed_upstream_tls")) return .shed;
             // A capped endpoint is a shed like any other from the
             // client's side: the request was refused to protect the
             // origin, and the line should read the same as the rungs

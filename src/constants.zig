@@ -1289,6 +1289,23 @@ pub fn inFlightOps(
         h2_origin_connections * h2_origin_ops_max;
 }
 
+/// TLS sessions to HTTP/1.1 origins (`limits.upstream_tls_sessions`, §7,
+/// #296): each is a client's buffers and a libcrypto session, which the
+/// fixed heap holds `tls_engines_max` of — the ceiling, shared with the
+/// listeners' engines and the HTTP/2 origins' connections (the loader
+/// refuses a sum past it). Absent, a pool of sixteen per TLS endpoint,
+/// within the upstream slots each one rides.
+pub const upstream_tls_sessions_max: u32 = tls_engines_max;
+pub const upstream_tls_sessions_per_endpoint: u32 = 16;
+
+comptime {
+    // Each session rides an upstream slot, so the ceiling is never past
+    // theirs; and the default's per-endpoint share fits inside it.
+    assert(upstream_tls_sessions_max <= upstream_slots_max);
+    assert(upstream_tls_sessions_per_endpoint >= 1);
+    assert(upstream_tls_sessions_per_endpoint <= upstream_tls_sessions_max);
+}
+
 /// The ceiling on `limits.h2_origin_connections` (§7): each is an fd and
 /// a session unit, and a deployment needs about one per origin endpoint.
 pub const h2_origin_connections_max: u32 = 4096;
@@ -1941,6 +1958,11 @@ pub const PoolSizes = struct {
     h2_origin_bytes: u64 = 0,
     h2_origin_streams: u32 = 0,
     h2_origin_stream_bytes: u64 = 0,
+    /// The HTTPS origins' TLS sessions (#296, `limits.upstream_tls_sessions`;
+    /// zero unless an `http1` cluster has `tls`): a client's buffers each.
+    /// Their libcrypto sessions are the heap's, priced in it already.
+    upstream_tls_sessions: u32 = 0,
+    upstream_tls_session_bytes: u64 = 0,
 };
 
 /// What the access log reserves: nothing when it is off, both staging
@@ -2040,7 +2062,8 @@ pub fn memoryBytesTotal(sizes: *const PoolSizes) u64 {
         @as(u64, sizes.h2_connections) * sizes.h2_session_bytes +
         @as(u64, sizes.stream_head_buffers) * sizes.stream_head_buffer_bytes +
         @as(u64, sizes.h2_origin_connections) * sizes.h2_origin_bytes +
-        @as(u64, sizes.h2_origin_streams) * sizes.h2_origin_stream_bytes;
+        @as(u64, sizes.h2_origin_streams) * sizes.h2_origin_stream_bytes +
+        @as(u64, sizes.upstream_tls_sessions) * sizes.upstream_tls_session_bytes;
     assert(total > 0);
     return total;
 }
