@@ -528,10 +528,14 @@ matching host**:
 ```
 
 A route with no `host` matches any host, and a host-specific route always
-beats an any-host one. Matching uses the **canonical** path (percent-escapes
-decoded, dot-segments collapsed), and the origin receives that same
-canonical path, so the router and the backend cannot disagree about which
-resource was named. Escapes that change structure (`%2F`, `%00`, truncated
+beats an any-host one. A prefix matches whole path segments: `/static`
+matches `/static` and `/static/app.js` but never `/staticfiles`, and `/`
+matches everything. Filters' `path_prefix` uses the same rule.
+
+Matching uses the **canonical** path (percent-escapes decoded,
+dot-segments collapsed), and the origin receives that same canonical
+path, so the router and the backend cannot disagree about which resource
+was named. Escapes that change structure (`%2F`, `%00`, truncated
 escapes) are rejected with `400`. A request that matches no route gets
 `404`.
 
@@ -1390,7 +1394,8 @@ A response rule matches on `status` (exact codes), `status_class`
 (`"1xx"` through `"5xx"`), and response-header predicates with the same
 `present`, `equals` and `contains` vocabulary. Its only actions are the
 three header verbs. `reject`, `allow` and `rewrite_prefix` are request-side
-actions, and the loader names them in its error if you use them here.
+actions, and the loader refuses them here as an unknown field
+(`UnknownField`).
 
 The same guardrails apply in both directions. Filters may not touch the
 headers zoxy owns (`Content-Length`, `Transfer-Encoding`, `Connection` and
@@ -1464,7 +1469,7 @@ error statuses listed above.
     "connect_ms": 5000,
     "head_ms": 10000,
     "idle_ms": 60000,
-    "drain_deadline_ms": 10000,
+    "drain_deadline_ms": 0,
     "max_lifetime_ms": 0,
     "request_ms": 0,
     "tunnel_ms": 3600000,
