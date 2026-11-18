@@ -869,6 +869,7 @@ pub const ValidationError = error{
     RoutesEmpty,
     RoutePrefixNotCanonical,
     RouteHostNotCanonical,
+    RouteHostWildcard,
     RouteDuplicate,
     ListenerMaxBodyBytesOutOfRange,
     ListenerForwardedModeUnknown,
@@ -2210,7 +2211,8 @@ pub const ConfigJson = struct {
         "structure, allowed values and numeric ranges. Rules JSON Schema " ++
         "cannot express are enforced by the loader when zoxy starts: route " ++
         "hosts and path prefixes must already be canonical (a lowercase host " ++
-        "without a port; a path without dot segments, a query, or " ++
+        "without a port or a `*`, which is reserved for wildcards; a path " ++
+        "without dot segments, a query, or " ++
         "percent-escapes that normalization would change), IP:port addresses " ++
         "must be valid literals, endpoint ports must be non-zero, and filters " ++
         "may not edit headers zoxy manages itself, such as Host, Connection, " ++
@@ -5638,6 +5640,15 @@ fn validateRouteHost(host: []const u8) ParseError![]const u8 {
     if (host.len == 0 or host.len > constants.host_bytes_max) {
         return error.RouteHostNotCanonical;
     }
+    // `*` is held for a wildcard rule this proxy does not have yet — #297
+    // wants one for certificates, and §7's host dimension has to share
+    // it. Read as a literal it matches no Host a client sends, and the
+    // day wildcards land it would change meaning under a frozen config,
+    // so it is refused before the freeze rather than reinterpreted after
+    // it (#400).
+    if (std.mem.indexOfScalar(u8, host, '*') != null) {
+        return error.RouteHostWildcard;
+    }
     var out: [constants.host_bytes_max]u8 = undefined;
     const canonical = parser.canonicalHost(host, &out) orelse {
         return error.RouteHostNotCanonical;
@@ -7017,6 +7028,12 @@ test "config: the l4 sni table is held to §7's own rules" {
         error.RouteHostNotCanonical,
         head ++ "{\"sni\":\"api.example.com:443\",\"cluster\":\"a\"}]}}]," ++ tail,
     );
+    // `*` is reserved, so a wildcard can arrive after the freeze without
+    // changing what a 1.0.0 config meant by it (#400).
+    try expectParseError(
+        error.RouteHostWildcard,
+        head ++ "{\"sni\":\"*.example.com\",\"cluster\":\"a\"}]}}]," ++ tail,
+    );
     // Two rules for one name is two answers to one question.
     try expectParseError(
         error.RouteDuplicate,
@@ -7211,6 +7228,12 @@ test "config: routing schema rejects malformed tables" {
     // A host carrying a port — the port is not part of the routing name.
     try expectParseError(error.RouteHostNotCanonical, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
         "\"routes\":[{\"host\":\"api.example.com:8080\",\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
+    // A wildcard, anywhere in the name: `*` is reserved, not a literal
+    // (#400). Filter hosts and redirect hosts share this validator.
+    try expectParseError(error.RouteHostWildcard, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[{\"host\":\"*.example.com\",\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
+    try expectParseError(error.RouteHostWildcard, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
+        "\"routes\":[{\"host\":\"api.*\",\"prefix\":\"/\",\"cluster\":\"a\"}]}}]," ++ base_clusters);
     // An unknown cluster named by a route.
     try expectParseError(error.ClusterUnknown, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{" ++
         "\"routes\":[{\"prefix\":\"/\",\"cluster\":\"ghost\"}]}}]," ++ base_clusters);
@@ -7451,6 +7474,9 @@ test "config: redirect validation has its own errors" {
     try expectParseError(error.FilterRedirectSchemeUnknown, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"ftp\"}}]}]}}]," ++ tail);
     // The composed host is a route host: canonical or refused.
     try expectParseError(error.RouteHostNotCanonical, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\",\"host\":\"WWW.Example.com\"}}]}]}}]," ++ tail);
+    try expectParseError(error.RouteHostWildcard, head ++ "{\"actions\":[{\"redirect\":{\"scheme\":\"https\",\"host\":\"*.example.com\"}}]}]}}]," ++ tail);
+    // So is a filter's `match.host`, on the same reserved `*` (#400).
+    try expectParseError(error.RouteHostWildcard, head ++ "{\"match\":{\"host\":\"*.example.com\"},\"actions\":[{\"reject\":403}]}]}}]," ++ tail);
     // A literal Location is a header value the render emits verbatim:
     // injection-safety is proven at load.
     try expectParseError(error.FilterHeaderValueInvalid, head ++ "{\"actions\":[{\"redirect\":{\"location\":\"https://x/\\r\\nSet-Cookie: a\"}}]}]}}]," ++ tail);
@@ -8369,6 +8395,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ResponseFilterHeaderEditsOverLimit", .gap = .budget },
     .{ .name = "RouteDuplicate", .gap = .duplicate },
     .{ .name = "RouteHostNotCanonical", .gap = .literal_syntax },
+    .{ .name = "RouteHostWildcard", .gap = .literal_syntax },
     .{ .name = "RoutePrefixNotCanonical", .gap = .literal_syntax },
     .{ .name = "RouteSniIsAddress", .gap = .literal_syntax },
     .{ .name = "TimeoutOrderInvalid", .gap = .budget },
