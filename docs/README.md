@@ -1092,6 +1092,34 @@ a live L4 connection are each one unit of work.
 refusals. They are separate from `zoxy_l7_shed_upstream_slots`, which means
 zoxy ran out of its own slots and needs a wider pool.
 
+### Retrying a refused dial
+
+`retries` lets an HTTP request try more endpoints when its dial is refused
+or the endpoint is unreachable. Without it, one refusing endpoint in a
+three-endpoint cluster fails about a third of requests for as long as it
+stays in rotation, which with no health check or passive ejection is
+forever.
+
+```json
+"api": {
+    "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"],
+    "retries": 2
+}
+```
+
+A retry is safe for every method, `POST` included: a dial that failed sent
+nothing, so no application saw the request. Each retry goes to an
+endpoint this request has not tried yet, picked by the cluster's own
+`pick` policy. All tries share one `connect_ms`, so `retries` never
+lengthens how long a client can wait. A dial that times out is not
+retried, because it has already spent that budget, and answers `504`.
+Running out of retries or of untried endpoints answers `502`. `zoxy_upstream_retried` and
+`zoxy_upstream_retries_exhausted` count both outcomes.
+
+Retries apply to `http1` clusters. An `h2c` or `h2` cluster refuses a
+non-zero `retries` at load, because its connections are dialed by a pool
+rather than by a request. An L4 connection always dials once.
+
 ### Client address
 
 zoxy uses one client address everywhere it matters: the `source_ip` hash

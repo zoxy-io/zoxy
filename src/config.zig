@@ -979,6 +979,7 @@ pub const ValidationError = error{
     /// `h2` without it.
     ClusterTlsOnH2c,
     ClusterH2WithoutTls,
+    ClusterRetriesOnHttp2,
     /// An `l4` listener routing to an HTTPS cluster: it relays bytes, and
     /// what TLS would carry for it is not a request this proxy reads.
     ClusterTlsOnL4Listener,
@@ -3224,9 +3225,11 @@ pub const ClusterJson = struct {
             .maximum = constants.endpoint_inflight_max,
         },
         .retries = .{
-            .desc = "How many more endpoints a request may dial after a refused " ++
-                "or unreachable first try; 0 (the default) answers 502 on the " ++
-                "first failure. All tries share one connect timeout.",
+            .desc = "How many more endpoints an HTTP request may dial after a " ++
+                "refused or unreachable first try; 0 (the default) answers 502 " ++
+                "on the first failure. All tries share one connect timeout. " ++
+                "Applies to http1 clusters: an h2c or h2 cluster refuses a " ++
+                "non-zero value, and an L4 connection always dials once.",
             .minimum = 0,
             .maximum = constants.cluster_retries_max,
         },
@@ -6100,6 +6103,13 @@ fn rejectClusterProtocolShape(cluster: *const Config.Cluster) ValidationError!vo
     }
     if (cluster.tls != null and cluster.protocol == .h2c) return error.ClusterTlsOnH2c;
     if (cluster.tls == null and cluster.protocol == .h2) return error.ClusterH2WithoutTls;
+    // #181's retry lives on the HTTP/1.1 exchange's own dial. An HTTP/2
+    // origin's connection is dialed by its pool, not by a request, so a
+    // refused dial there is a plain `502` and a budget here would be
+    // read and never spent. Refused rather than ignored, so that teaching
+    // the pool to retry later is additive rather than a change of
+    // meaning under a frozen config (#400).
+    if (cluster.protocol.http2() and cluster.retries > 0) return error.ClusterRetriesOnHttp2;
 }
 
 /// A cluster's TLS block (§7): the name checked as a DNS name, and the CA
@@ -8371,6 +8381,7 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "ClusterH2cOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterH2cWithUpgrades", .gap = .cross_block },
     .{ .name = "ClusterTlsOnH2c", .gap = .cross_block },
+    .{ .name = "ClusterRetriesOnHttp2", .gap = .cross_block },
     .{ .name = "ClusterTlsOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterTlsWithUpgrades", .gap = .cross_block },
     .{ .name = "ClusterTlsHttpCheck", .gap = .cross_block },
@@ -10796,7 +10807,7 @@ test "config: a filter may not name the header zoxy manages" {
     }
 }
 
-test "config: retries resolves, defaults to none, rejects past the ceiling" {
+test "config: retries resolves, defaults to none, rejects past the ceiling and on HTTP/2" {
     {
         var arena_state: std.heap.ArenaAllocator = undefined;
         defer arena_state.deinit();
@@ -10848,6 +10859,20 @@ test "config: retries resolves, defaults to none, rejects past the ceiling" {
             .{ head, constants.cluster_retries_max + 1, tail },
         );
         try expectParseError(error.ClusterRetriesOutOfRange, json);
+    }
+    // An HTTP/2 cluster's connections are dialed by its pool, never by a
+    // request, so a retry budget there would be read and never spent:
+    // refused rather than ignored (#400). Zero is the default and loads.
+    const h2c_head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"protocol":"h2c","retries":
+    ;
+    try expectParseError(error.ClusterRetriesOnHttp2, h2c_head ++ "1" ++ tail);
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, h2c_head ++ "0" ++ tail);
+        try std.testing.expectEqual(@as(u16, 0), parsed.clusters[0].retries);
     }
 }
 
