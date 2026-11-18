@@ -265,6 +265,7 @@ fn loadCertificateSet(
     choices[0] = .{
         .credentials = default_credentials,
         .names = try leafNames(arena, default_credentials, tls.cert_path, index),
+        .schemes = default_credentials.schemes(),
     };
     const loaded = try arena.alloc(zoxy.tls.Credentials, tls.certificates.len);
     for (tls.certificates, loaded, choices[1..]) |certificate, *credentials, *choice| {
@@ -277,7 +278,11 @@ fn loadCertificateSet(
             );
             return err;
         };
-        choice.* = .{ .credentials = credentials, .names = try leafNames(arena, credentials, certificate.cert_path, index) };
+        choice.* = .{
+            .credentials = credentials,
+            .names = try leafNames(arena, credentials, certificate.cert_path, index),
+            .schemes = credentials.schemes(),
+        };
         if (choice.names.len == 0) {
             std.debug.print(
                 "zoxy: listener {d}: '{s}' names no DNS host, so no server name could choose it\n",

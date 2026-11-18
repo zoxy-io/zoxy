@@ -541,8 +541,9 @@ pub const Config = struct {
         pub const Tls = struct {
             /// PEM certificate chain, leaf first.
             cert_path: []const u8,
-            /// PEM private key for the leaf. ECDSA P-256 or P-384; any
-            /// other key type is refused at load (`tls/Credentials.zig`).
+            /// PEM private key for the leaf: ECDSA P-256 or P-384, or RSA
+            /// of 2048 to 4096 bits (#411); any other key is refused at
+            /// load (`tls/Credentials.zig`).
             key_path: []const u8,
             /// What this listener offers in ALPN (#271), most preferred
             /// first: canonical `tls/alpn.zig` tokens, never the config's
@@ -2831,15 +2832,17 @@ pub const TlsJson = struct {
         "TLS termination for this listener: where its certificate chain and " ++
         "private key live. Both are read once at startup, so a missing or " ++
         "unusable file stops startup with an error naming it, rather than " ++
-        "failing a client's handshake later. The key must be ECDSA P-256 or " ++
-        "P-384; RSA signing would stall the event loop.";
+        "failing a client's handshake later. The key may be ECDSA P-256 or " ++
+        "P-384, or RSA of 2048 to 4096 bits; an RSA signature costs the event " ++
+        "loop ~0.5 ms at 2048 bits and ~2.4 ms at 4096, where P-256 costs ~15 µs, " ++
+        "so a listener holding both signs ECDSA for every client that can verify it.";
     pub const schema_fields = .{
         .cert = .{
             .desc = "Path to the PEM certificate chain, leaf first.",
             .min_length = 1,
         },
         .key = .{
-            .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384).",
+            .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384, or RSA 2048 to 4096 bits).",
             .min_length = 1,
         },
         .alpn = .{
@@ -2882,7 +2885,7 @@ pub const CertificateJson = struct {
             .min_length = 1,
         },
         .key = .{
-            .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384).",
+            .desc = "Path to the leaf's PEM private key (ECDSA P-256 or P-384, or RSA 2048 to 4096 bits).",
             .min_length = 1,
         },
     };

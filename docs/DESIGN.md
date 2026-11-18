@@ -104,9 +104,13 @@ libxev) and performs *all* socket I/O — accepts, recvs, sends, connects,
 timers — and *all* CPU work, TLS handshakes included. There are no other
 threads: no worker pool, no job queue, no cross-thread completion rings.
 The design reserved that seam for TLS handshakes on a ~1–2 ms
-per-handshake estimate; that was an RSA number, so RSA server certs are
+per-handshake estimate; that was an RSA number, so RSA server certs were
 excluded by policy (ECDSA only) and measurement retired the seam
-(settled 2026-07-25, IMPLEMENTATION_NOTES.md): a full ECDSA handshake is
+(settled 2026-07-25, IMPLEMENTATION_NOTES.md). #411 admits RSA keys as the
+operator's choice rather than reopening the seam. The cost stays on the
+loop and is stated: ~0.5 ms a sign at 2048 bits and ~2.4 ms at 4096. A
+listener holding both kinds signs ECDSA for every client that can verify
+it, and `tls_rsa_signed` counts what the loop paid. A full ECDSA handshake is
 ~100–400 µs of asymmetric crypto, and a terminated L7-over-TLS hop
 measured at HAProxy parity on steady-state keep-alive load — ~20k req/s,
 p50 110–122 µs against its 101–105 µs, one core each, same fixture
@@ -683,8 +687,9 @@ listener carries a `tls` block. Beside the per-engine cost sits one
 process-wide reservation: the fixed heap libcrypto allocates from, which
 is what makes zero-allocation-after-startup provable with a C library
 underneath (§4). It is sized *from the engine pool* — 2 MiB plus 8 KiB
-per engine, plus 6 KiB for each of the 256 certificates a process may
-load (#297), so 11.5 MiB at the 1024-engine ceiling — because its occupancy
+per engine, plus 12 KiB for each of the 256 certificates a process may
+load (#297, priced at RSA-4096's by #411), so 13 MiB at the 1024-engine
+ceiling — because its occupancy
 is per concurrent session rather than per process. It was a flat 4 MiB
 until #222: that number came from measuring *sequential* handshakes,
 where each one's blocks return to their size class before the next asks
@@ -939,11 +944,11 @@ Rules:
     not the default. A hello not yet whole decides nothing, and zssl
     cannot consume a partial record either. A hello that will not parse,
     or that spans records, keeps the default for zssl to judge.
-  - **Cost.** Each key holds ~4.0 KiB of the libcrypto heap for the
-    process's life (measured, and asserted by `zig build
-    tls-heap-proof`). The static reservation therefore prices
-    `tls_certificates_max` (256) of them at 6 KiB, and the loader
-    refuses a config over that count.
+  - **Cost.** Each key holds libcrypto heap for the process's life:
+    ~4.0 KiB per ECDSA key, measured and asserted by `zig build
+    tls-heap-proof`. The static reservation prices
+    `tls_certificates_max` (256) of them at the RSA-4096 worst case,
+    12 KiB (#411), and the loader refuses a config over that count.
   - **Coverage.** `engine_test.zig` delivers the hello seven bytes at a
     time and checks the leaf the client was shown. The smoke gate's SNI
     leg has `std.crypto.tls` verify the chosen certificate against its
@@ -960,7 +965,43 @@ Rules:
   - **Choosing among key types.** That is RSA beside ECDSA, keyed on the
     client's `signature_algorithms`. It is its own decision, because
     RSA signing on the loop is what §3 excluded, and it is split out
-    rather than smuggled in here.
+    rather than smuggled in here (#411, below).
+- **A listener may hold RSA certificates, signed only where needed**
+  (#411). `Credentials.load` admits RSA of 2048 to 4096 bits, zssl's
+  bounds, signing RSA-PSS (RFC 8446 §4.4.3; v1.5 never). The cost is the
+  operator's to choose and is stated rather than hidden.
+
+  - **Measured cost.** A sign is ~0.5 / 1.3 / 2.4 ms at 2048 / 3072 /
+    4096 bits, against ~15 µs for P-256. That is the uninterruptible
+    step §3 bounds, now up to an order larger.
+  - **Selection.** The ClientHello's `signature_algorithms` joins #297's
+    choice (`net/client_hello.zig` reads it; it never makes a hello
+    invalid, so L4 routes are unaffected). Within the first name tier
+    holding a certificate the client can verify, ECDSA beats RSA, then
+    list order. A tier with nothing verifiable passes to the next.
+    Nothing verifiable anywhere shows the best name match and lets
+    zssl refuse for want of a common scheme, rather than present a
+    certificate the client never named. RFC 8446 §9.1 obliges every
+    TLS 1.3 client to verify ECDSA P-256, so on a dual-key listener
+    the RSA certificate serves only the noncompliant and the narrowed.
+  - **Counter.** `tls_rsa_signed` counts full handshakes an RSA key
+    signed, a subset of `tls_handshakes_completed` disjoint from
+    `tls_resumed`. It tells an operator what the RSA certificate costs,
+    and when it has stopped being needed.
+  - **Heap.** An RSA key caches its Montgomery contexts at its first
+    signature. A signed RSA-4096 key holds ~10.9 KiB of the libcrypto
+    heap, and the per-certificate price rose from 6 to 12 KiB, worst
+    case for every slot. That makes 3 MiB of BSS at 256 certificates,
+    untouched by a deployment that loads few. An RSA sign's working set
+    recycles: sequential RSA handshakes plateau after their first
+    rounds. `zig build tls-heap-proof` asserts both on an RSA-4096
+    fixture.
+  - **Not swept.** RSA-PSS draws a salt per signature, and the
+    simulator's flights must replay byte-exact, so zssl refuses an RSA
+    key asked for deterministic signing. `tls_rsa_signed` is
+    census-exempt. `engine_test` drives RSA handshakes and the choice
+    between kinds, and the smoke gate has `std.crypto.tls` verify an
+    RSA-PSS handshake off the shipped binary.
 - **An address is a string, and `unix:` extends its grammar** (#303,
   #305). `bind` and `endpoints` stay single scalars rather than becoming
   tagged objects or gaining a second key — they are the two most-written

@@ -371,6 +371,13 @@ pub fn build(b: *std.Build) void {
     smoke_exe.root_module.addAnonymousImport("tls_sni_ca_pem", .{
         .root_source_file = b.path("src/tls/testdata/origin-ca.pem"),
     });
+    // #411: an RSA certificate in the same set, chosen for its own name.
+    smoke_exe.root_module.addAnonymousImport("tls_rsa_cert_pem", .{
+        .root_source_file = b.path("src/tls/testdata/rsa2048-cert.pem"),
+    });
+    smoke_exe.root_module.addAnonymousImport("tls_rsa_key_pem", .{
+        .root_source_file = b.path("src/tls/testdata/rsa2048-key.pem"),
+    });
     const smoke_run = b.addRunArtifact(smoke_exe);
     smoke_run.addArg("--zoxy");
     smoke_run.addArtifactArg(exe);

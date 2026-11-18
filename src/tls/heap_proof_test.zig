@@ -81,7 +81,48 @@ test "a handshake runs entirely on the fixed libcrypto heap" {
     const per_certificate = (heap_mod.usedPeak() - after_first) / extra.len;
     try std.testing.expect(per_certificate > 0);
     try std.testing.expect(per_certificate <= constants.libcrypto_heap_bytes_per_certificate);
+
+    // #411: the costliest key admitted, RSA-4096, priced the same way —
+    // but after each has signed, because RSA caches its Montgomery
+    // contexts on the key at the first signature and a key measured
+    // before that reads low.
+    var warm = try Credentials.load(arena_state.allocator(), rsa4096_cert_pem, rsa4096_key_pem, .{});
+    defer warm.deinit();
+    try handshake(&warm);
+    const before_rsa = heap_mod.usedPeak();
+    var rsa_keys: [8]Credentials = undefined;
+    // Registered before the loads, over only the ones that happened: a
+    // load that fails leaves its slot, and every later one, unloaded.
+    var rsa_loaded: usize = 0;
+    defer for (rsa_keys[0..rsa_loaded]) |*key| key.deinit();
+    for (&rsa_keys) |*key| {
+        key.* = try Credentials.load(arena_state.allocator(), rsa4096_cert_pem, rsa4096_key_pem, .{});
+        rsa_loaded += 1;
+        try handshake(key);
+    }
+    const per_rsa_key = (heap_mod.usedPeak() - before_rsa) / rsa_keys.len;
+    try std.testing.expect(per_rsa_key > per_certificate);
+    try std.testing.expect(per_rsa_key <= constants.libcrypto_heap_bytes_per_certificate);
+
+    // And an RSA sign's working set recycles like an ECDSA one: once the
+    // first rounds have populated the classes, more handshakes cost
+    // nothing, so a long-lived proxy signing RSA does not creep. The
+    // rounds are the measurement's own (IMPLEMENTATION_NOTES.md): the
+    // frontier grew inside the first 64 and by nothing in the five after,
+    // and blinding makes the first round's exact sizes data-dependent.
+    for (0..plateau_rsa_handshakes) |_| try handshake(&warm);
+    const settled = heap_mod.usedPeak();
+    for (0..plateau_rsa_handshakes) |_| try handshake(&warm);
+    try std.testing.expectEqual(settled, heap_mod.usedPeak());
 }
+
+/// Sequential RSA handshakes per plateau round (#411): what the
+/// measurement used, so the settle phase is the one that was observed.
+const plateau_rsa_handshakes: u8 = 64;
+
+/// #411's worst case: the largest RSA key zssl admits.
+const rsa4096_cert_pem = @embedFile("testdata/rsa4096-cert.pem");
+const rsa4096_key_pem = @embedFile("testdata/rsa4096-key.pem");
 
 /// One full in-memory handshake, raw zssl both sides. Its own function so
 /// the plateau check above can run it repeatedly — every buffer here is a

@@ -299,10 +299,24 @@ Either protocol can terminate TLS. The handshake runs as a phase before the
 protocol, so routing, filters, redirects and access logs work as they do
 in the clear.
 
-The key must be **ECDSA P-256 or P-384**; an RSA key is refused at
-startup. Handshakes run on the event loop, where the millisecond an RSA
-signature takes would stall every other connection on that loop. An ECDSA
-signature costs about 260 µs.
+The key may be **ECDSA P-256 or P-384**, or **RSA** of 2048 to 4096 bits.
+Prefer ECDSA. Handshakes run on the event loop, and while one signs, every
+other connection on that loop waits:
+
+| Key | One signature |
+|---|---|
+| ECDSA P-256 | ~15 µs |
+| ECDSA P-384 | ~115 µs |
+| RSA 2048 | ~0.5 ms |
+| RSA 3072 | ~1.3 ms |
+| RSA 4096 | ~2.4 ms |
+
+Configuring an RSA key is the opt-in: zoxy serves it, and
+`zoxy_tls_rsa_signed` counts every full handshake it signed, so the share
+of handshake CPU going to RSA is visible. A resumed handshake signs nothing
+whatever the key. To serve RSA only to the clients that need it, hold both
+kinds on one listener; see
+[Several certificates on one listener](#several-certificates-on-one-listener).
 
 `alpn` lists the application protocols the listener offers in ALPN
 (RFC 7301), most preferred first: `http/1.1`, and `h2` for
@@ -429,6 +443,16 @@ A name is matched case-insensitively, in this order:
    `example.com` nor `a.b.example.com`.
 3. Otherwise, and for a client that sends no server name, the default
    pair in `cert` and `key`.
+
+Within the first of those that has a match, a certificate is only
+considered if the client can verify its key, going by the
+`signature_algorithms` in its ClientHello, and ECDSA wins over RSA because
+it is far cheaper to sign. So one name can have an ECDSA and an RSA
+certificate behind it: every client that verifies ECDSA, which RFC 8446
+requires of all TLS 1.3 clients, gets the ECDSA one, and the RSA one serves
+the rest. A step with nothing the client can verify passes to the next.
+When no step has anything, the client is shown the best name match and the
+handshake fails for want of a common signature scheme.
 
 Every file is read once at startup. A pair in the list whose certificate
 names no DNS host could never be chosen, so it stops startup instead. One

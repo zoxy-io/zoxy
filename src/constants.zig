@@ -462,11 +462,14 @@ comptime {
 pub const libcrypto_heap_bytes_per_engine: u32 = 8 * 1024;
 
 /// What one loaded certificate's signing key holds on the libcrypto heap
-/// for the process's life (#297). Measured at ~4.0 KiB per P-256 key —
-/// sixteen loads past the first moved the frontier by 64,032 bytes in
-/// `tls/heap_proof_test.zig`, which now asserts it — and reserved at 6
-/// KiB for the slack segregated fits needs, as the engine term is.
-pub const libcrypto_heap_bytes_per_certificate: u32 = 6 * 1024;
+/// for the process's life (#297, #411), priced at the costliest key zoxy
+/// admits. Measured in `tls/heap_proof_test.zig`, which asserts both: ~4.0
+/// KiB per P-256 key, and ~10.9 KiB per RSA-4096 key once it has signed —
+/// RSA caches its Montgomery contexts on the key at the first signature,
+/// so a key that has never signed reads low. (RSA-2048 is ~6.9 KiB.)
+/// Reserved at 12 KiB, every certificate at the worst case, because the
+/// reservation is static and cannot know which keys a config will load.
+pub const libcrypto_heap_bytes_per_certificate: u32 = 12 * 1024;
 
 /// The most certificates one process loads across every listener, a
 /// listener's default included (#297). Each costs a key on the libcrypto
@@ -543,9 +546,9 @@ comptime {
     // reservation below what was measured would be a number that had
     // stopped tracking the thing it was derived from.
     assert(libcrypto_heap_bytes_per_engine >= 5 * 1024);
-    // #297's term, on the same two rules: above the ~4.0 KiB measured per
-    // key, and covering every certificate the loader admits at once.
-    assert(libcrypto_heap_bytes_per_certificate >= 4 * 1024);
+    // #297's term, on the same two rules: above the ~10.9 KiB measured per
+    // RSA-4096 key (#411), and covering every certificate admitted at once.
+    assert(libcrypto_heap_bytes_per_certificate >= 11 * 1024);
     assert(libcrypto_heap_bytes > tls_certificates_max * libcrypto_heap_bytes_per_certificate);
     // The reservation is a u32 sum of three terms; widened, it must fit.
     assert(@as(u64, libcrypto_heap_base_bytes) +

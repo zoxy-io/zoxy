@@ -726,6 +726,13 @@ pub const Counters = struct {
     /// tell them apart. Also the one that moves the handshake CPU: a
     /// resumed handshake skips the signature entirely.
     tls_resumed: Value = Value.init(0),
+    /// Full handshakes whose CertificateVerify an RSA key signed (#411):
+    /// ~0.5 ms of the loop at 2048 bits and ~2.4 ms at 4096, where an
+    /// ECDSA P-256 sign is ~15 µs. Read against `tls_handshakes_completed`
+    /// it is the share of handshake CPU an operator is paying for RSA —
+    /// and on a listener holding both kinds, the clients that could not
+    /// verify the ECDSA certificate, which says when the RSA one can go.
+    tls_rsa_signed: Value = Value.init(0),
     /// Sealing keys replaced (#202). Rotation is driven from the seal, so
     /// this counts intervals *that saw traffic* — a proxy idle across one
     /// rotates once, at its next handshake, and that is the intended
@@ -1098,6 +1105,11 @@ pub const Counters = struct {
         // handover, the resumption from the engine's own view of what it
         // negotiated.
         assert(counters.get("tls_resumed") <= counters.get("tls_handshakes_completed"));
+        // A resumed handshake signs nothing, so the RSA-signed ones are
+        // the full ones' subset, disjoint from the resumed (#411).
+        assert(counters.get("tls_rsa_signed") <= counters.get("tls_handshakes_completed"));
+        assert(counters.get("tls_rsa_signed") + counters.get("tls_resumed") <=
+            counters.get("tls_handshakes_completed"));
         // A probe can only fail if it was sent; an ejection needs at least
         // one failed probe; a restore needs a prior ejection (endpoints
         // start healthy, §7).

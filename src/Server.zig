@@ -3742,6 +3742,7 @@ pub fn Server(comptime IoType: type) type {
                 // is a session that ended, not one that never happened.
                 server.counters.increment("tls_handshakes_completed");
                 if (engine.isResumed()) server.counters.increment("tls_resumed");
+                if (engine.signedWithRsa()) server.counters.increment("tls_rsa_signed");
                 _ = server.stageTlsTickets(conn);
             }
             const staged = engine.outbound();

@@ -1730,6 +1730,24 @@ at the 1024-engine ceiling) that a deployment loading one certificate never
 makes resident. `tls-heap-proof` asserts the
 per-key price stays under the reservation.
 
+RSA keys (#411, 2026-11-18) changed the worst case. An RSA key caches its
+Montgomery contexts at its first signature, so a key measured straight
+after loading reads low. Measured after a handshake each, the retained
+cost per key was ~6.9 KiB at 2048 bits and ~10.9 KiB at 4096. The first
+RSA handshake in a process adds a one-off ~25 KiB (2048) or ~47 KiB (4096)
+of sign working set, which later handshakes reuse; it fits the 2 MiB
+base's slack. Rounds of 64 sequential RSA handshakes grew the frontier by
+960 B (2048) or 288 B (4096) in the first round and by 0 in each of the
+next five. The per-certificate price went to 12 KiB, so 3 MiB of BSS and
+13 MiB in all at the 1024-engine ceiling. `tls-heap-proof` now asserts the
+RSA-4096 price and the RSA plateau on a committed fixture.
+
+Sign cost, `openssl speed` on the bench host (OpenSSL 3.6.5), one core:
+RSA-2048 0.47 ms (2,120/s), RSA-3072 1.31 ms (763/s), RSA-4096 2.43 ms
+(411/s), ECDSA P-256 ~15 µs (67k/s), P-384 ~113 µs (8.8k/s). The ~1–2 ms
+the worker-pool design once assumed was RSA-2048 on older hardware; on
+this host it is half that, and RSA-4096 is what reaches past it.
+
 Verified: the 1200-connection run that used to livelock now leaves
 `shed_tls_crypto` at 0 and sheds on `shed_tls_engines` instead — the pool
 ceiling, which is the correct wall — with the proxy healthy at 0% idle CPU

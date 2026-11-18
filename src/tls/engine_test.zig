@@ -24,6 +24,8 @@ const client_key_pem = @embedFile("testdata/client-key.pem");
 const other_ca_pem = @embedFile("testdata/other-ca.pem");
 const origin_cert_pem = @embedFile("testdata/origin-cert.pem");
 const origin_key_pem = @embedFile("testdata/origin-key.pem");
+const rsa_cert_pem = @embedFile("testdata/rsa2048-cert.pem");
+const rsa_key_pem = @embedFile("testdata/rsa2048-key.pem");
 
 /// Room for the largest record on the wire — a max-size plaintext record
 /// plus its header and AEAD tag — with slack for a second alongside it.
@@ -99,18 +101,22 @@ const Client = struct {
     /// `credentials` is what the client answers a CertificateRequest
     /// with (#304); null answers with an empty certificate list.
     fn initPresenting(client: *Client, credentials: ?*const zssl.Credentials) !void {
-        return client.initFull(credentials, "spike.zoxy.test", null);
+        return client.initFull(credentials, "spike.zoxy.test", null, &zssl.client_messages.signature_schemes_default);
     }
 
-    /// The full form: what to present, which server to name (#297), and
+    /// The full form: what to present, which server to name (#297),
     /// optionally a verifier shown the server's chain — the one way to see
-    /// which certificate the server actually sent.
+    /// which certificate the server actually sent — and which signature
+    /// schemes to offer (#411), which is how a test plays a client that
+    /// cannot verify one key type.
     fn initFull(
         client: *Client,
         credentials: ?*const zssl.Credentials,
         server_name: []const u8,
         chain_verifier: ?zssl.certificate_list.ChainVerifier,
+        verify_schemes: []const zssl.backend.SignatureScheme,
     ) !void {
+        assert(verify_schemes.len >= 1);
         client.hs = .init(&.{
             .client_random = @splat(0x52),
             .x25519_private = @splat(0x51),
@@ -120,6 +126,7 @@ const Client = struct {
             // where a test asks to see the chain.
             .certificate_policy = if (chain_verifier != null) .leaf_signature else .insecure_no_verification,
             .chain_verifier = chain_verifier,
+            .verify_schemes = verify_schemes,
             .reassembly = &client.reassembly,
             .client_credentials = credentials,
             .client_auth_flight = if (credentials != null) &client.auth_flight else &.{},
@@ -606,8 +613,16 @@ test "engine: the ClientHello's server name chooses among a listener's certifica
     var origin_credentials = try Credentials.load(arena, origin_cert_pem, origin_key_pem, .{});
     defer origin_credentials.deinit();
     const choices = [_]certificate_set.Choice{
-        .{ .credentials = &default_credentials, .names = try trust.dnsNames(arena, default_credentials.chain[0]) },
-        .{ .credentials = &origin_credentials, .names = try trust.dnsNames(arena, origin_credentials.chain[0]) },
+        .{
+            .credentials = &default_credentials,
+            .names = try trust.dnsNames(arena, default_credentials.chain[0]),
+            .schemes = default_credentials.schemes(),
+        },
+        .{
+            .credentials = &origin_credentials,
+            .names = try trust.dnsNames(arena, origin_credentials.chain[0]),
+            .schemes = origin_credentials.schemes(),
+        },
     };
     // Each name gets its own certificate; one neither covers, the default.
     const cases = [_]struct { name: []const u8, chosen: usize }{
@@ -616,48 +631,119 @@ test "engine: the ClientHello's server name chooses among a listener's certifica
         .{ .name = "nobody.zoxy.test", .chosen = 0 },
     };
     for (cases) |case| {
-        var engine: Engine = undefined;
-        var plaintext: [Engine.plaintext_bytes_min]u8 = undefined;
-        var body_plaintext: [Engine.plaintext_bytes_min]u8 = undefined;
-        engine.bindPlaintext(&plaintext, &body_plaintext, constants.head_buffer_bytes_default);
-        try engine.init(&.{
-            .x25519_seed = @splat(0x42),
-            .random = @splat(0x43),
-            .credentials = &default_credentials,
-            .certificates = &choices,
-        });
-        defer engine.deinit();
         var shown: ShownLeaf = .{};
-        var client: Client = undefined;
-        try client.initFull(null, case.name, .{ .context = &shown, .verify = ShownLeaf.record });
-        defer client.hs.deinit();
-        var to_server: Peer = .{};
-        var to_client: Peer = .{};
-        try client.hello(&to_server);
-        var rounds: u8 = 0;
-        while (!(engine.isConnected() and client.hs.state == .connected)) : (rounds += 1) {
-            try std.testing.expect(rounds < rounds_max);
-            // A few bytes per delivery, so the hello arrives in pieces and
-            // the choice has to wait for the whole record before it is made.
-            const wire = to_server.take();
-            var offset: usize = 0;
-            while (offset < wire.len) {
-                const end = @min(offset + 7, wire.len);
-                try engine.feed(wire[offset..end], &to_client.sink());
-                offset = end;
-            }
-            const staged = engine.outbound();
-            if (staged.len > 0) {
-                to_client.write(staged);
-                engine.outboundSent(staged.len);
-            }
-            try client.feed(to_client.take(), &to_server);
-        }
-        try std.testing.expectEqual(case.chosen, engine.chosenCertificate());
+        const outcome = try chooseAndConnect(&choices, case.name, &zssl.client_messages.signature_schemes_default, &shown);
+        try std.testing.expectEqual(case.chosen, outcome.chosen);
         // What the client was actually shown, not only what the engine
         // says it chose: the chosen certificate's own leaf.
         try std.testing.expectEqualSlices(u8, choices[case.chosen].credentials.chain[0], shown.leaf());
+        try std.testing.expect(!outcome.rsa);
     }
+}
+
+test "engine: an RSA certificate signs only for a client that cannot take the ECDSA one (#411)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ecdsa_credentials = try Credentials.load(arena, cert_pem, key_pem, .{});
+    defer ecdsa_credentials.deinit();
+    // Covers rsa.zoxy.test and spike.zoxy.test — the second the ECDSA
+    // default's own name, so one name has both key types behind it.
+    var rsa_credentials = try Credentials.load(arena, rsa_cert_pem, rsa_key_pem, .{});
+    defer rsa_credentials.deinit();
+    const choices = [_]certificate_set.Choice{
+        .{
+            .credentials = &ecdsa_credentials,
+            .names = try trust.dnsNames(arena, ecdsa_credentials.chain[0]),
+            .schemes = ecdsa_credentials.schemes(),
+        },
+        .{
+            .credentials = &rsa_credentials,
+            .names = try trust.dnsNames(arena, rsa_credentials.chain[0]),
+            .schemes = rsa_credentials.schemes(),
+        },
+    };
+    const every = &zssl.client_messages.signature_schemes_default;
+    const rsa_only: []const zssl.backend.SignatureScheme = &.{.rsa_pss_rsae_sha256};
+    const cases = [_]struct { name: []const u8, offers: []const zssl.backend.SignatureScheme, chosen: usize }{
+        // Both verifiable: the cheaper sign, ECDSA, for the shared name.
+        .{ .name = "spike.zoxy.test", .offers = every, .chosen = 0 },
+        // A client that verifies RSA alone gets the RSA certificate.
+        .{ .name = "spike.zoxy.test", .offers = rsa_only, .chosen = 1 },
+        // A name only the RSA certificate covers.
+        .{ .name = "rsa.zoxy.test", .offers = every, .chosen = 1 },
+    };
+    for (cases) |case| {
+        var shown: ShownLeaf = .{};
+        const outcome = try chooseAndConnect(&choices, case.name, case.offers, &shown);
+        try std.testing.expectEqual(case.chosen, outcome.chosen);
+        try std.testing.expectEqualSlices(u8, choices[case.chosen].credentials.chain[0], shown.leaf());
+        try std.testing.expectEqual(case.chosen == 1, outcome.rsa);
+    }
+}
+
+test "engine: a listener holding only an RSA certificate signs RSA-PSS (#411)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var rsa_credentials = try Credentials.load(arena_state.allocator(), rsa_cert_pem, rsa_key_pem, .{});
+    defer rsa_credentials.deinit();
+    var shown: ShownLeaf = .{};
+    // No certificate set: one certificate, nothing to choose.
+    const choices = [_]certificate_set.Choice{.{ .credentials = &rsa_credentials, .names = &.{}, .schemes = rsa_credentials.schemes() }};
+    const outcome = try chooseAndConnect(choices[0..1], "rsa.zoxy.test", &zssl.client_messages.signature_schemes_default, &shown);
+    try std.testing.expectEqual(@as(usize, 0), outcome.chosen);
+    try std.testing.expect(outcome.rsa);
+    try std.testing.expectEqualSlices(u8, rsa_credentials.chain[0], shown.leaf());
+}
+
+/// One handshake against a listener holding `choices` (#297, #411): the
+/// default first, and a single choice meaning no set at all. The client
+/// names `name` and offers `offers`, and its hello is fed seven bytes at a
+/// time so the choice has to wait for the whole record. `shown` gets the
+/// leaf the client was actually sent.
+fn chooseAndConnect(
+    choices: []const certificate_set.Choice,
+    name: []const u8,
+    offers: []const zssl.backend.SignatureScheme,
+    shown: *ShownLeaf,
+) !struct { chosen: usize, rsa: bool } {
+    assert(choices.len >= 1);
+    assert(offers.len >= 1);
+    var engine: Engine = undefined;
+    var plaintext: [Engine.plaintext_bytes_min]u8 = undefined;
+    var body_plaintext: [Engine.plaintext_bytes_min]u8 = undefined;
+    engine.bindPlaintext(&plaintext, &body_plaintext, constants.head_buffer_bytes_default);
+    try engine.init(&.{
+        .x25519_seed = @splat(0x42),
+        .random = @splat(0x43),
+        .credentials = choices[0].credentials,
+        .certificates = if (choices.len == 1) &.{} else choices,
+    });
+    defer engine.deinit();
+    var client: Client = undefined;
+    try client.initFull(null, name, .{ .context = shown, .verify = ShownLeaf.record }, offers);
+    defer client.hs.deinit();
+    var to_server: Peer = .{};
+    var to_client: Peer = .{};
+    try client.hello(&to_server);
+    var rounds: u8 = 0;
+    while (!(engine.isConnected() and client.hs.state == .connected)) : (rounds += 1) {
+        try std.testing.expect(rounds < rounds_max);
+        const wire = to_server.take();
+        var offset: usize = 0;
+        while (offset < wire.len) {
+            const end = @min(offset + 7, wire.len);
+            try engine.feed(wire[offset..end], &to_client.sink());
+            offset = end;
+        }
+        const staged = engine.outbound();
+        if (staged.len > 0) {
+            to_client.write(staged);
+            engine.outboundSent(staged.len);
+        }
+        try client.feed(to_client.take(), &to_server);
+    }
+    return .{ .chosen = engine.chosenCertificate(), .rsa = engine.signedWithRsa() };
 }
 
 /// The server's leaf as a client was shown it (#297), captured by zssl's
