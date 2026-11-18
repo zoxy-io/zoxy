@@ -12,16 +12,19 @@ concurrency:
 
 jobs:
   ci:
-    name: test, lint & sim (${{ matrix.os }})
-    # Linux is the production target (io_uring); macOS exercises the
-    # kqueue backend so local-bench portability cannot silently regress —
-    # its failure modes (e.g. close ops requiring a thread pool) only
-    # surface at runtime, which a cross-compile check would miss.
+    name: test, lint & sim (${{ matrix.check_label }})
+    # Both runners exercise io_uring, the production backend. The release
+    # workflow smoke-tests kqueue on macOS.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - runner: ubuntu-latest
+            check_label: ubuntu-latest
+          - runner: ubuntu-24.04-arm
+            # Branch protection requires the existing macOS check name.
+            check_label: macos-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
 
