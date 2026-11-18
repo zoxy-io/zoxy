@@ -699,6 +699,10 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             /// the endpoint set ran out first, because that last failure
             /// is recorded and then answered rather than retried.
             retries_used: u16 = 0,
+            /// This request's retry dial holds one of its cluster's #393
+            /// permits (`Server.retry_dials`). Set where the retry arms its
+            /// connect, cleared when that connect is delivered.
+            holds_retry_permit: bool = false,
 
             pub const Leg = enum(u8) {
                 idle,

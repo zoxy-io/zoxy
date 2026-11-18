@@ -2445,7 +2445,18 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   its per-connection budgets gets `GOAWAY(ENHANCE_YOUR_CALM)` (§8).
 
 - **Still deferred**: Envoy-style *outlier detection* (success-rate and
-  stddev maths) and *aggregate* retry budgets. A cluster-wide in-flight
+  stddev maths). Aggregate retry budgets left this list with #393:
+  `retries` takes a `{count, budget}` long form whose budget bounds the
+  cluster's retry dials in flight in this process. A permit is taken
+  where a retry arms its connect and given back when that connect is
+  delivered — refused, connected, canceled by the deadline or raced by a
+  teardown, since every armed connect is delivered exactly once — and the
+  idle check requires every permit back, so a leak fails the simulator's
+  leak invariant on the seed that causes it. A refused dial that finds the
+  budget spent answers the `502` it would have without retries. The long
+  form is the third short spelling, after `endpoints` and `pick`, and the
+  three now share one reader (`parseShortForm`), as §5 promised. A
+  cluster-wide in-flight
   cap — the part of Envoy's circuit breakers this proxy lacked — landed
   as `max_total_inflight` (#392): one slow cluster could otherwise hold
   the upstream pool every other cluster shares, which `max_inflight`

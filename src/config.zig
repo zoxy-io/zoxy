@@ -638,6 +638,9 @@ pub const Config = struct {
         /// spends it: an L4 connection dials once and relays whatever
         /// the dial produced, with no request to send somewhere else.
         retries: u16 = 0,
+        /// #393: how many retry dials this cluster may have in flight at
+        /// once in this process, or null for no bound beyond `retries`.
+        retry_budget: ?u16 = null,
 
         /// What a `hash` cluster keys its endpoint choice on (§7, #178).
         /// Read only when `pick == .hash`; the loader rejects key
@@ -1031,6 +1034,7 @@ pub const ValidationError = error{
     ClusterTlsOnH2c,
     ClusterH2WithoutTls,
     ClusterRetriesOnHttp2,
+    ClusterRetryBudgetOutOfRange,
     /// An `l4` listener routing to an HTTPS cluster: it relays bytes, and
     /// what TLS would carry for it is not a request this proxy reads.
     ClusterTlsOnL4Listener,
@@ -3292,10 +3296,10 @@ pub const ClusterJson = struct {
     max_total_inflight: ?u32 = null,
     /// Optional #391 recovery ramp for `max_inflight`.
     slow_start_ms: ?u32 = null,
-    /// Optional #181 dial retries across this cluster's endpoints;
-    /// absent means none, which is what every config written before the
-    /// key existed asked for.
-    retries: u16 = 0,
+    /// Optional #181 dial retries across this cluster's endpoints, as a
+    /// bare count or `{count, budget}` (#393); absent means none, which is
+    /// what every config written before the key existed asked for.
+    retries: RetriesJson = .{ .count = 0 },
     /// Optional PROXY protocol announcement on upstream connections
     /// (#142); absent sends none. Only valid on clusters no http
     /// listener routes to.
@@ -3364,9 +3368,8 @@ pub const ClusterJson = struct {
                 "refused or unreachable first try; 0 (the default) answers 502 " ++
                 "on the first failure. All tries share one connect timeout. " ++
                 "Applies to http1 clusters: an h2c or h2 cluster refuses a " ++
-                "non-zero value, and an L4 connection always dials once.",
-            .minimum = 0,
-            .maximum = constants.cluster_retries_max,
+                "non-zero value, and an L4 connection always dials once. The " ++
+                "object form adds a budget on this cluster's retry dials in flight.",
         },
         .proxy_protocol = .{
             .desc = "Announce each client to this cluster's origins with a PROXY " ++
@@ -3416,6 +3419,119 @@ pub const ClusterTlsCaJson = struct {
     };
 };
 
+/// The one reader behind every short spelling (§5, #400): a bare scalar
+/// that stands for the common case, or the object it abbreviates. Each
+/// spelling type names its scalar (`short_token`), its object
+/// (`ObjectForm`, a plain struct `innerParse` reads with the loader's own
+/// strictness without recursing back into `jsonParse`), and the two
+/// conversions; this does the token work once, where `EndpointJson` and
+/// `PickJson` used to carry a copy each.
+fn parseShortForm(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    comptime assertSameShape(T, T.ObjectForm);
+    switch (try source.peekNextTokenType()) {
+        .object_begin => {
+            const object = try std.json.innerParse(T.ObjectForm, allocator, source, options);
+            return try T.fromObject(object);
+        },
+        inline .string, .number => |kind| {
+            // A scalar of the other kind can never be this field's short
+            // spelling; refused rather than coerced.
+            if (kind != T.short_token) return error.UnexpectedToken;
+            const token = try source.nextAlloc(allocator, .alloc_if_needed);
+            const literal: []const u8 = switch (token) {
+                .string, .allocated_string, .number, .allocated_number => |slice| slice,
+                // The peek promised this kind; anything else is the
+                // scanner disagreeing with itself.
+                else => unreachable,
+            };
+            return T.fromShort(literal);
+        },
+        // A bool, null, or array can never be a short spelling.
+        else => return error.UnexpectedToken,
+    }
+}
+
+/// The two shapes of one spelling are one contract: a field added to either
+/// and forgotten on the other would let the schema advertise a key the
+/// parser rejects, or the parser accept one the schema hides.
+fn assertSameShape(comptime Outer: type, comptime Inner: type) void {
+    const outer = @typeInfo(Outer).@"struct";
+    const inner = @typeInfo(Inner).@"struct";
+    assert(outer.field_names.len == inner.field_names.len);
+    for (outer.field_names, inner.field_names) |a, b| {
+        assert(std.mem.eql(u8, a, b));
+    }
+    for (outer.field_types, inner.field_types) |a, b| {
+        assert(a == b);
+    }
+}
+
+/// A cluster's #181 retries in its two spellings (#393, placed by §5's
+/// #400 record): the bare count every config has written, or an object
+/// carrying the count and a cluster-wide budget on retry dials in flight.
+/// The object form is for clusters that retry, so its `count` starts at
+/// 1; the bare `0` stays the default and the one way to say "none".
+pub const RetriesJson = struct {
+    count: u16,
+    budget: ?u16 = null,
+
+    pub const schema_doc =
+        "Retries with a budget: how many more endpoints one request may dial, " ++
+        "and how many retry dials this cluster may have in flight at once.";
+    pub const schema_fields = .{
+        .count = .{
+            .desc = "How many more endpoints a request may dial after a refused or " ++
+                "unreachable first try.",
+            .minimum = 1,
+            .maximum = constants.cluster_retries_max,
+        },
+        .budget = .{
+            .desc = "Retry dials this cluster may have in flight at once, in this " ++
+                "process. A refused dial that finds the budget spent is answered " ++
+                "502 rather than retried, so a correlated failure cannot double " ++
+                "the load on the endpoints still answering. Absent is unbounded.",
+            .minimum = 1,
+            .maximum = constants.retry_budget_max,
+        },
+    };
+
+    const ObjectForm = struct {
+        count: u16,
+        budget: ?u16 = null,
+    };
+
+    const short_token: std.json.TokenType = .number;
+
+    fn fromShort(literal: []const u8) error{ InvalidNumber, Overflow }!RetriesJson {
+        const count = std.fmt.parseInt(u16, literal, 10) catch |err| switch (err) {
+            error.Overflow => return error.Overflow,
+            error.InvalidCharacter => return error.InvalidNumber,
+        };
+        return .{ .count = count };
+    }
+
+    /// The object form is for clusters that retry: `{"count": 0}` would be
+    /// the bare `0` spelled long, and a budget beside it would bound
+    /// nothing, so the long form starts at 1 — as its schema says.
+    fn fromObject(object: ObjectForm) error{InvalidNumber}!RetriesJson {
+        if (object.count == 0) return error.InvalidNumber;
+        return .{ .count = object.count, .budget = object.budget };
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !RetriesJson {
+        return parseShortForm(RetriesJson, allocator, source, options);
+    }
+};
+
 /// One cluster endpoint (#174): the bare `"IP:port"` string every config
 /// has always written, or an object naming the same literal plus a pick
 /// weight. Both spellings parse to this one shape — a bare string is
@@ -3452,19 +3568,14 @@ pub const EndpointJson = struct {
         weight: u32 = 1,
     };
 
-    comptime {
-        // The two shapes are one contract: a field added to either and
-        // forgotten on the other would let the schema advertise a key
-        // the parser rejects, or the parser accept one the schema hides.
-        const outer = @typeInfo(EndpointJson).@"struct";
-        const inner = @typeInfo(ObjectForm).@"struct";
-        assert(outer.field_names.len == inner.field_names.len);
-        for (outer.field_names, inner.field_names) |a, b| {
-            assert(std.mem.eql(u8, a, b));
-        }
-        for (outer.field_types, inner.field_types) |a, b| {
-            assert(a == b);
-        }
+    const short_token: std.json.TokenType = .string;
+
+    fn fromShort(literal: []const u8) error{}!EndpointJson {
+        return .{ .address = literal, .weight = 1 };
+    }
+
+    fn fromObject(object: ObjectForm) error{}!EndpointJson {
+        return .{ .address = object.address, .weight = object.weight };
     }
 
     pub fn jsonParse(
@@ -3472,25 +3583,7 @@ pub const EndpointJson = struct {
         source: anytype,
         options: std.json.ParseOptions,
     ) !EndpointJson {
-        switch (try source.peekNextTokenType()) {
-            .string => {
-                const token = try source.nextAlloc(allocator, .alloc_if_needed);
-                const literal: []const u8 = switch (token) {
-                    .string, .allocated_string => |slice| slice,
-                    // The peek promised a string; anything else is the
-                    // scanner disagreeing with itself.
-                    else => unreachable,
-                };
-                return .{ .address = literal, .weight = 1 };
-            },
-            .object_begin => {
-                const object = try std.json.innerParse(ObjectForm, allocator, source, options);
-                return .{ .address = object.address, .weight = object.weight };
-            },
-            // A number, bool, null, or nested array can never name an
-            // endpoint; reject the token rather than coercing it.
-            else => return error.UnexpectedToken,
-        }
+        return parseShortForm(EndpointJson, allocator, source, options);
     }
 };
 
@@ -3574,19 +3667,14 @@ pub const PickJson = struct {
         name: ?[]const u8 = null,
     };
 
-    comptime {
-        // The two shapes are one contract: a field added to either and
-        // forgotten on the other would let the schema advertise a key
-        // the parser rejects, or the parser accept one the schema hides.
-        const outer = @typeInfo(PickJson).@"struct";
-        const inner = @typeInfo(ObjectForm).@"struct";
-        assert(outer.field_names.len == inner.field_names.len);
-        for (outer.field_names, inner.field_names) |a, b| {
-            assert(std.mem.eql(u8, a, b));
-        }
-        for (outer.field_types, inner.field_types) |a, b| {
-            assert(a == b);
-        }
+    const short_token: std.json.TokenType = .string;
+
+    fn fromShort(literal: []const u8) error{}!PickJson {
+        return .{ .policy = literal };
+    }
+
+    fn fromObject(object: ObjectForm) error{}!PickJson {
+        return .{ .policy = object.policy, .key = object.key, .name = object.name };
     }
 
     pub fn jsonParse(
@@ -3594,25 +3682,7 @@ pub const PickJson = struct {
         source: anytype,
         options: std.json.ParseOptions,
     ) !PickJson {
-        switch (try source.peekNextTokenType()) {
-            .string => {
-                const token = try source.nextAlloc(allocator, .alloc_if_needed);
-                const literal: []const u8 = switch (token) {
-                    .string, .allocated_string => |slice| slice,
-                    // The peek promised a string; anything else is the
-                    // scanner disagreeing with itself.
-                    else => unreachable,
-                };
-                return .{ .policy = literal };
-            },
-            .object_begin => {
-                const object = try std.json.innerParse(ObjectForm, allocator, source, options);
-                return .{ .policy = object.policy, .key = object.key, .name = object.name };
-            },
-            // A number, bool, null, or nested array can never name a
-            // policy; reject the token rather than coercing it.
-            else => return error.UnexpectedToken,
-        }
+        return parseShortForm(PickJson, allocator, source, options);
     }
 };
 
@@ -4369,7 +4439,8 @@ fn resolveClusters(
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
             .max_total_inflight = try resolveMaxTotalInflight(entry.cluster.max_total_inflight),
             .slow_start_ms = try resolveSlowStart(&entry.cluster),
-            .retries = try resolveRetries(entry.cluster.retries),
+            .retries = try resolveRetries(entry.cluster.retries.count),
+            .retry_budget = try resolveRetryBudget(entry.cluster.retries),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
             .protocol = try resolveClusterProtocol(entry.cluster.protocol),
             .tls = try resolveClusterTls(arena, entry.cluster.tls, files),
@@ -6068,6 +6139,15 @@ fn resolveRetries(retries: u16) ParseError!u16 {
         return error.ClusterRetriesOutOfRange;
     }
     return retries;
+}
+
+/// Resolve #393's budget. The object form already refused a zero count,
+/// so a budget here always has retries to bound.
+fn resolveRetryBudget(retries: RetriesJson) ValidationError!?u16 {
+    const budget = retries.budget orelse return null;
+    assert(retries.count >= 1);
+    if (budget < 1 or budget > constants.retry_budget_max) return error.ClusterRetryBudgetOutOfRange;
+    return budget;
 }
 
 /// Resolve a listener's #236 body cap. Absent takes the default, `0`
@@ -10158,6 +10238,46 @@ test "config: slow start needs a cap to ramp and something to restore from (#391
     try expectParseError(error.ClusterSlowStartWithoutMaxInflight, head ++ "\"passive_ejection\":{},\"slow_start_ms\":1000" ++ tail);
     try expectParseError(error.ClusterSlowStartWithoutHealth, head ++ "\"max_inflight\":8,\"slow_start_ms\":1000" ++ tail);
     try expectParseError(error.ClusterSlowStartOutOfRange, head ++ "\"max_inflight\":8,\"passive_ejection\":{},\"slow_start_ms\":0" ++ tail);
+}
+
+test "config: retries take a bare count or an object with a budget (#393)" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","http":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2","127.0.0.1:3"],"retries":
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    // The bare count every config has written, unchanged.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "2" ++ tail);
+        try std.testing.expectEqual(@as(u16, 2), parsed.clusters[0].retries);
+        try std.testing.expectEqual(@as(?u16, null), parsed.clusters[0].retry_budget);
+    }
+    // The long form, with and without a budget.
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "{\"count\":2,\"budget\":8}" ++ tail);
+        try std.testing.expectEqual(@as(u16, 2), parsed.clusters[0].retries);
+        try std.testing.expectEqual(@as(?u16, 8), parsed.clusters[0].retry_budget);
+    }
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "{\"count\":1}" ++ tail);
+        try std.testing.expectEqual(@as(u16, 1), parsed.clusters[0].retries);
+    }
+    // The long form is for clusters that retry: `{"count": 0}` is the
+    // bare `0` spelled long, refused as the number it cannot be there.
+    try expectParseError(error.InvalidNumber, head ++ "{\"count\":0,\"budget\":4}" ++ tail);
+    try expectParseError(error.ClusterRetryBudgetOutOfRange, head ++ "{\"count\":1,\"budget\":0}" ++ tail);
+    try expectParseError(error.ClusterRetriesOutOfRange, head ++ "{\"count\":9}" ++ tail);
+    // Neither a string nor a bool is a count.
+    try expectParseError(error.UnexpectedToken, head ++ "\"2\"" ++ tail);
 }
 
 test "config: max_total_inflight resolves, defaults to uncapped, rejects the useless (#392)" {

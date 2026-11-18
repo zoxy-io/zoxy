@@ -1577,6 +1577,11 @@ pub fn Proxy(comptime IoType: type) type {
                 // §8 504.
                 assert(conn.armed.deadline or conn.armed.deadline_cancel);
             }
+            // A carried budget is a retry (#181), and a retry's dial holds
+            // one of its cluster's #393 permits for as long as it is armed:
+            // taken here, beside the arm, so nothing between the budget's
+            // check and the dial can leave one taken with no dial to end it.
+            if (budget == .carried) takeRetryPermit(server, stream);
             stream.arm(&stream.op_connect, "connect");
             server.io.connect(
                 &pick.address,
@@ -1591,6 +1596,11 @@ pub fn Proxy(comptime IoType: type) type {
             const conn = stream.conn;
             const server = conn.server;
             stream.delivered(&stream.op_connect, "connect");
+            // Every armed connect is delivered exactly once — refused,
+            // connected, canceled by the deadline, or raced by a teardown —
+            // so this is where a retry's #393 permit goes back, whatever
+            // the dial's fate.
+            if (stream.l7.holds_retry_permit) releaseRetryPermit(server, stream);
             if (ServerType.exchangeEnding(stream)) {
                 // The teardown raced the dial (§5): a socket that arrived
                 // anyway must still be shut down and closed.
@@ -1644,8 +1654,16 @@ pub fn Proxy(comptime IoType: type) type {
                     );
                 }
                 if (retryEligible(server, stream, err)) {
-                    beginRetry(server, stream);
-                    return;
+                    // #393: a retry this request may take, refused if its
+                    // cluster's retry dials in flight are at their budget —
+                    // answered the `502` it would have been without
+                    // retries, and counted apart so a correlated failure's
+                    // budget-limited retries show as such.
+                    if (!retryBudgetSpent(server, stream)) {
+                        beginRetry(server, stream);
+                        return;
+                    }
+                    server.counters.increment("upstream_retry_budget_exhausted");
                 }
                 respond(server, stream, 502, "l7_bad_gateway");
                 return;
@@ -1692,6 +1710,35 @@ pub fn Proxy(comptime IoType: type) type {
             assert(budget <= constants.cluster_retries_max);
             assert(stream.l7.retries_used <= budget);
             return stream.l7.retries_used < budget;
+        }
+
+        /// Take one of the cluster's #393 retry permits for the retry dial
+        /// about to arm. Beside the arm, so nothing between the budget's
+        /// check and the dial can leave one taken with no dial to end it.
+        fn takeRetryPermit(server: *ServerType, stream: *StreamType) void {
+            assert(!stream.l7.holds_retry_permit);
+            assert(stream.phase == .dialing);
+            server.retry_dials[stream.cluster_index] += 1;
+            stream.l7.holds_retry_permit = true;
+        }
+
+        /// Give a retry dial's permit back once its connect is delivered.
+        fn releaseRetryPermit(server: *ServerType, stream: *StreamType) void {
+            assert(stream.l7.holds_retry_permit);
+            assert(server.retry_dials[stream.cluster_index] >= 1);
+            server.retry_dials[stream.cluster_index] -= 1;
+            stream.l7.holds_retry_permit = false;
+        }
+
+        /// Whether this request's cluster has every #393 retry permit out.
+        /// Always false without a budget: `retries` alone bounds each
+        /// request, and nothing bounds the cluster.
+        fn retryBudgetSpent(server: *const ServerType, stream: *const StreamType) bool {
+            const cluster = &server.config.clusters[stream.cluster_index];
+            const permits = cluster.retry_budget orelse return false;
+            assert(permits >= 1);
+            assert(!stream.l7.holds_retry_permit);
+            return server.retry_dials[stream.cluster_index] >= permits;
         }
 
         /// Spend one retry: record the endpoint that refused, give its

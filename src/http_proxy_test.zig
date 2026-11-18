@@ -892,6 +892,8 @@ const Http1Bed = struct {
         h2_origin_streams: u32 = 2,
         /// The #181 dial-retry budget on the bed's one cluster.
         retries: u16 = 0,
+        /// #393's cluster-wide budget on retry dials in flight.
+        retry_budget: ?u16 = null,
         /// The #180 upgrade allowlist and tunnel pool. Both off by
         /// default, which is the shape every pre-#180 config has.
         upgrades: config_module.Config.Listener.Upgrades = .{},
@@ -1069,6 +1071,7 @@ const Http1Bed = struct {
             .pick = options.pick,
             .hash_key = options.hash_key,
             .retries = options.retries,
+            .retry_budget = options.retry_budget,
             .protocol = if (options.origin_tls) .h2 else if (options.origin_h2) .h2c else .http1,
         }};
         if (!options.origin_tls and !options.origin_https) return;
@@ -8742,6 +8745,55 @@ test "l7: a refused endpoint is retried onto another and the client sees the ori
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_bad_gateway"));
     try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_retries_exhausted"));
     try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_responses"));
+    try bed.expectDrained();
+}
+
+test "l7: a retry inside its cluster's budget takes a permit and gives it back (#393)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 393,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        .retry_budget = 1,
+        .pick = .rr,
+    });
+    defer bed.tearDown();
+
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retried"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_retry_budget_exhausted"));
+    try std.testing.expectEqual(@as(u32, 1), bed.origin.requests_served);
+    // The permit went back when the retry's dial was delivered, not when
+    // the exchange ended — and `expectDrained` holds every one returned.
+    try std.testing.expectEqual(@as(u16, 0), bed.server.retry_dials[0]);
+    try bed.expectDrained();
+}
+
+test "l7: a retry that finds its cluster's budget spent is answered 502 (#393)" {
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .seed = 394,
+        .origin_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        .refusing_endpoint_first = true,
+        .retries = 1,
+        .retry_budget = 1,
+        .pick = .rr,
+    });
+    defer bed.tearDown();
+
+    // Another request's retry stands in for the budget's one permit,
+    // which a single client cannot occupy on its own.
+    bed.server.retry_dials[0] = 1;
+    try bed.exchange("GET /r HTTP/1.1\r\nHost: o\r\nConnection: close\r\n\r\n");
+    bed.server.retry_dials[0] = 0;
+
+    try std.testing.expect(std.mem.startsWith(u8, bed.client.response(), "HTTP/1.1 502 "));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("upstream_retry_budget_exhausted"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("upstream_retried"));
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_bad_gateway"));
+    try std.testing.expectEqual(@as(u32, 0), bed.origin.requests_served);
     try bed.expectDrained();
 }
 
