@@ -50,6 +50,7 @@ const pump = @import("../net/pump.zig");
 const relay = @import("../net/relay.zig");
 const Io = @import("../io/io.zig");
 const parser = @import("parser.zig");
+const grpc = @import("grpc.zig");
 const render = @import("render.zig");
 const h2_connection = @import("h2/Connection.zig");
 const h2_exchange = @import("h2/exchange.zig");
@@ -956,7 +957,12 @@ pub fn Proxy(comptime IoType: type) type {
             server.captureRequestLogHeaders(stream, request.headers);
         }
 
-        /// Start this exchange's §8 deadline, if the deployment set one.
+        /// Start this exchange's §8 deadline, if it has one: the
+        /// deployment's `request_timeout_ms`, or a gRPC call's own
+        /// `grpc-timeout` when that is earlier or the deployment set none
+        /// (`http/grpc.zig`) — the client stops waiting then, and so does
+        /// everything this proxy holds for it.
+        ///
         /// Storing the cap is not enough on its own: the armed timer is the
         /// idle one this connection has carried since its last turnaround,
         /// due far later, and the lazy re-arm only ever fires *at* the armed
@@ -964,13 +970,24 @@ pub fn Proxy(comptime IoType: type) type {
         /// timeout late, which is the whole failure it exists to prevent.
         /// Re-base once, here, and every later `storeDeadline` on this
         /// exchange clamps under a timer already due on time.
-        fn armRequestDeadline(server: *ServerType, stream: *StreamType) void {
+        fn armRequestDeadline(server: *ServerType, stream: *StreamType, request: *const parser.RequestHead) void {
             assert(stream.phase == .reading_head);
             assert(stream.l7.request_deadline_ns == 0);
-            if (server.config.request_timeout_ms == 0) return;
+            assert(!stream.l7.grpc_deadline);
             const now_ns = server.io.nowNs();
-            stream.l7.request_deadline_ns = now_ns +
-                @as(u64, server.config.request_timeout_ms) * std.time.ns_per_ms;
+            var deadline_ns: u64 = 0;
+            if (server.config.request_timeout_ms != 0) {
+                deadline_ns = now_ns + @as(u64, server.config.request_timeout_ms) * std.time.ns_per_ms;
+            }
+            if (grpc.requestTimeoutNs(request.headers)) |timeout_ns| {
+                const client_ns = now_ns + timeout_ns;
+                if (deadline_ns == 0 or client_ns < deadline_ns) {
+                    deadline_ns = client_ns;
+                    stream.l7.grpc_deadline = true;
+                }
+            }
+            if (deadline_ns == 0) return;
+            stream.l7.request_deadline_ns = deadline_ns;
             assert(stream.l7.request_deadline_ns > now_ns);
             server.storeExchangeDeadline(stream, server.idleTimeoutMs());
             server.rebaseExchangeDeadline(stream);
@@ -1033,7 +1050,7 @@ pub fn Proxy(comptime IoType: type) type {
             if (request.authority != null) {
                 server.counters.increment("l7_absolute_form");
             }
-            armRequestDeadline(server, stream);
+            armRequestDeadline(server, stream, request);
             // The two methods this proxy answers rather than forwards
             // (§7). CONNECT is a §1 non-goal; TRACE is refused because
             // reflecting a request back is the Cross-Site Tracing vector
@@ -1570,8 +1587,7 @@ pub fn Proxy(comptime IoType: type) type {
                     stream.upstream.?.socket = socket;
                     stream.upstream_socket = socket;
                 } else |_| {}
-                witnessNoResponse(server, stream);
-                respond(server, stream, 504, "l7_gateway_timeout");
+                answerExpired(server, stream);
                 return;
             }
             const socket = result catch |err| {
@@ -3818,6 +3834,39 @@ pub fn Proxy(comptime IoType: type) type {
             server.endExchange(stream);
         }
 
+        /// The §8 deadline's verdict, once nothing is armed: `504` when the
+        /// deadline was this proxy's — no response byte from the origin in
+        /// time, which is witnessed against its endpoint — and, when it was
+        /// a gRPC call's own, DEADLINE_EXCEEDED: the client's limit, which
+        /// says nothing of the endpoint and must not eject it (#230).
+        fn answerExpired(server: *ServerType, stream: *StreamType) void {
+            assert(stream.phase == .dialing or stream.phase == .exchanging);
+            assert(stream.l7.pending_verdict == .none);
+            if (stream.l7.grpc_deadline) return respondGrpcDeadline(server, stream);
+            witnessNoResponse(server, stream);
+            respond(server, stream, 504, "l7_gateway_timeout");
+        }
+
+        /// The gRPC call's deadline ran out before its answer began: the
+        /// Trailers-Only `grpc-status: 4` (`shed.getGrpcDeadline`), sent
+        /// as `respond` sends a refusal — the same release, the same
+        /// persistence brakes — since it is one: nothing was served.
+        fn respondGrpcDeadline(server: *ServerType, stream: *StreamType) void {
+            assert(stream.l7.grpc_deadline);
+            assert(!stream.armed.data_client_to_upstream);
+            assert(!stream.armed.data_upstream_to_client);
+            assert(!stream.l7.response_started);
+            const keep = commitStaticVerdict(server, stream, 200, "l7_grpc_deadline_exceeded", true);
+            const persistence: shed.Persistence = if (keep) .keep else .close;
+            const answer = server.static_responses.getGrpcDeadline(persistence);
+            server.stampStaticDate(answer.date);
+            server.claimStaticSend(stream);
+            stream.moveTo(.responding);
+            const then: stream_module.ClientWrite.Then =
+                if (keep) .next_request else .lingering_close;
+            armClientWrite(server, stream, answer.bytes, then);
+        }
+
         /// The labeled twin of a `504` (#179, #230): this endpoint was
         /// dialled and produced no response byte before the deadline.
         ///
@@ -3932,10 +3981,7 @@ pub fn Proxy(comptime IoType: type) type {
             stream.l7.pending_verdict = .none;
             switch (verdict) {
                 .none => unreachable,
-                .gateway_timeout => {
-                    witnessNoResponse(server, stream);
-                    respond(server, stream, 504, "l7_gateway_timeout");
-                },
+                .gateway_timeout => answerExpired(server, stream),
                 .replay => beginReplay(server, stream),
                 .request_timeout => respond(server, stream, 408, "l7_request_timeout"),
             }
@@ -4044,6 +4090,8 @@ pub fn Proxy(comptime IoType: type) type {
                 // Dropping it here would silently uncap the rest of the
                 // exchange, since `storeDeadline` stops clamping at zero.
                 .request_deadline_ns = stream.l7.request_deadline_ns,
+                // And whose deadline it is, which decides its answer.
+                .grpc_deadline = stream.l7.grpc_deadline,
                 // The #180 claim rides across, and must: the tunnel
                 // buffer is held on the connection, so a rebuild that
                 // dropped this flag would re-render the head *without*
@@ -4771,6 +4819,9 @@ pub fn Proxy(comptime IoType: type) type {
             if (std.mem.eql(u8, counter, "l7_shed_tunnels")) return .shed;
             if (std.mem.eql(u8, counter, "l7_bad_gateway")) return .upstream_failed;
             if (std.mem.eql(u8, counter, "l7_gateway_timeout")) return .timed_out;
+            // The client's own gRPC deadline: time ran out, as above,
+            // though the status it is answered with is a `200`.
+            if (std.mem.eql(u8, counter, "l7_grpc_deadline_exceeded")) return .timed_out;
             // A head that never finished is a timeout like the exchange
             // deadline's, and reads as one (#247). Which side ran out of
             // time is the status's to say — `408` names the client, `504`

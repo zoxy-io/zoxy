@@ -583,6 +583,16 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             /// across by hand — a replay is the same request retrying, not
             /// a new one earning a fresh budget.
             request_deadline_ns: u64 = 0,
+            /// The deadline above is the client's own: a gRPC call's
+            /// `grpc-timeout`, earlier than `request_timeout_ms` or with
+            /// none set (`http/grpc.zig`). Its expiry is answered
+            /// DEADLINE_EXCEEDED rather than `504`, and is not the
+            /// endpoint's failure — the client's limit ran out, not the
+            /// origin's time. Carried across the §7 replay beside it.
+            /// Outlives `Server.clearRequestDeadline`, deliberately: the
+            /// deadline is retired before its verdict is chosen, and this
+            /// is what chooses it. The next request's `l7` clears it.
+            grpc_deadline: bool = false,
             /// Whether this request's #235 head budget is already
             /// installed. Set on the first parse that comes back
             /// `Incomplete` — the moment a client is provably mid-sentence

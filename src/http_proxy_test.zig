@@ -1407,6 +1407,8 @@ const H2Answer = struct {
     reset: ?u32 = null,
     /// The answer carried a `transfer-encoding` field, which HTTP/2 must not.
     chunked_field: bool = false,
+    /// A `grpc-status` the final head carried — gRPC's Trailers-Only form.
+    head_grpc_status: ?u8 = null,
     /// Its trailing field section, as `name=value;` per field, when a
     /// HEADERS followed the final head.
     trailers: [96]u8 = undefined,
@@ -1463,6 +1465,9 @@ fn h2Answers(bytes: []const u8, out: []H2Answer) ![]H2Answer {
                     answer.content_length = try std.fmt.parseUnsigned(u64, length, 10);
                 }
                 answer.chunked_field = ResponseReader.value(fields, "transfer-encoding") != null;
+                if (ResponseReader.value(fields, "grpc-status")) |grpc_status| {
+                    answer.head_grpc_status = try std.fmt.parseUnsigned(u8, grpc_status, 10);
+                }
                 if (ResponseReader.value(fields, "location")) |location| {
                     @memcpy(answer.location[0..location.len], location);
                     answer.location_len = location.len;
@@ -2109,6 +2114,140 @@ test "h2 origin over TLS: a certificate for another name, or no h2, fails the di
         try std.testing.expectEqual(@as(u32, 0), bed.h2_origin.requests);
         try bed.expectDrained();
     }
+}
+
+/// A unary gRPC call on stream 1, its own deadline `timeout`.
+fn grpcCall(wire: *H2Wire, comptime timeout: []const u8) void {
+    wire.headers(1, &.{
+        .{ ":method", "POST" },
+        .{ ":scheme", "http" },
+        .{ ":path", "/echo.Echo/Say" },
+        .{ ":authority", "a" },
+        .{ "content-type", "application/grpc" },
+        .{ "te", "trailers" },
+        .{ "grpc-timeout", timeout },
+    }, false);
+    wire.data(1, "\x00\x00\x00\x00\x02hi", true);
+}
+
+test "grpc deadline: a call's own grpc-timeout runs out at the proxy as DEADLINE_EXCEEDED, not a 504" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2BedOptions(300 + @as(u64, @intFromBool(partial_io)));
+        options.origin_h2 = true;
+        options.partial_io = partial_io;
+        // Passive ejection at its most eager: one witnessed failure would
+        // eject the endpoint — and a client's deadline must not be one.
+        options.passive_ejection = .{ .fall = 1, .recovery_ms = 60_000 };
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        // Reads the call and never answers: only the client's deadline
+        // can end it, there being no `request_ms` here at all.
+        bed.h2_origin.mute = true;
+
+        var wire: H2Wire = .{};
+        wire.preface(&.{});
+        grpcCall(&wire, "30m");
+        try bed.exchange(wire.written());
+
+        var storage: [2]H2Answer = undefined;
+        const answers = try h2Answers(bed.client.response(), &storage);
+        try std.testing.expectEqual(@as(usize, 1), answers.len);
+        // Trailers-Only: one HEADERS, `200` and `grpc-status: 4`, ending
+        // the stream — what a gRPC client reads as its own deadline.
+        try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+        try std.testing.expectEqual(@as(?u8, 4), answers[0].head_grpc_status);
+        try std.testing.expectEqual(@as(usize, 0), answers[0].body);
+        try std.testing.expect(answers[0].ended);
+        try std.testing.expect(answers[0].reset == null);
+        try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_grpc_deadline_exceeded"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
+        // The origin heard the call, deadline and all — and its endpoint
+        // was not blamed for the client's limit.
+        try std.testing.expectEqual(@as(u32, 1), bed.h2_origin.requests);
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+        try std.testing.expect(bed.server.health.healthy[0]);
+        try bed.expectDrained();
+    }
+}
+
+test "grpc deadline: a call answered inside its deadline is untouched by it" {
+    var options = h2BedOptions(302);
+    options.origin_h2 = true;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    bed.h2_origin.headers = &.{.{ "content-type", "application/grpc" }};
+    bed.h2_origin.body = "\x00\x00\x00\x00\x02ok";
+    bed.h2_origin.trailers = &.{.{ "grpc-status", "0" }};
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    grpcCall(&wire, "5S");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqual(@as(?u8, null), answers[0].head_grpc_status);
+    try std.testing.expectEqualStrings("grpc-status=0;", answers[0].trailersSlice());
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_grpc_deadline_exceeded"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
+    try bed.expectDrained();
+}
+
+test "grpc deadline: the deployment's request cap, when it is the earlier, still answers 504" {
+    var options = h2BedOptions(303);
+    options.origin_mute = true;
+    options.request_timeout_ms = 20;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    // Five seconds is the client's; twenty milliseconds is this proxy's,
+    // and its own limit ran out first — the origin's time, as ever.
+    grpcCall(&wire, "5S");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 504), answers[0].status);
+    try std.testing.expectEqual(@as(?u8, null), answers[0].head_grpc_status);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_gateway_timeout"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_grpc_deadline_exceeded"));
+    try bed.expectDrained();
+}
+
+test "grpc deadline: an HTTP/1.1 origin's call runs out the same way, the call's deadline under the cap" {
+    var options = h2BedOptions(304);
+    options.origin_mute = true;
+    options.request_timeout_ms = 5_000;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+
+    var wire: H2Wire = .{};
+    wire.preface(&.{});
+    grpcCall(&wire, "20000u");
+    try bed.exchange(wire.written());
+
+    var storage: [2]H2Answer = undefined;
+    const answers = try h2Answers(bed.client.response(), &storage);
+    try std.testing.expectEqual(@as(usize, 1), answers.len);
+    try std.testing.expectEqual(@as(u16, 200), answers[0].status);
+    try std.testing.expectEqual(@as(?u8, 4), answers[0].head_grpc_status);
+    try std.testing.expect(answers[0].ended);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("l7_grpc_deadline_exceeded"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("l7_gateway_timeout"));
+    // The origin was sent the call's own deadline, untouched.
+    const oconn = &bed.origin.conns[0];
+    const heard = oconn.request_buffer[0..oconn.request_len];
+    try std.testing.expect(std.mem.indexOf(u8, heard, "grpc-timeout: 20000u\r\n") != null);
+    try bed.expectDrained();
 }
 
 test "h2 origin: an origin nobody answers for is a 502, and a mute one a 504" {

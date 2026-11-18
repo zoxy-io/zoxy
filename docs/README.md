@@ -657,6 +657,15 @@ it, refreshed by every message either way. `request_ms` (off by default)
 caps its whole length, so a deployment carrying long-lived streams leaves
 it off or sizes it for them.
 
+A call's own deadline, `grpc-timeout`, is honored. It arms the same
+per-exchange deadline `request_ms` does, and replaces it when it is
+earlier or when `request_ms` is off. When it runs out before the origin
+answers, zoxy answers the client with `grpc-status: 4` (DEADLINE_EXCEEDED)
+and frees the origin stream. That expiry is counted in
+`zoxy_l7_grpc_deadline_exceeded` and is never held against the endpoint.
+The header still reaches the origin unchanged, so the server can stop
+work at the same moment.
+
 Origins behind TLS are `"protocol": "h2"`, which requires a `tls` block:
 
 ```json
@@ -1397,7 +1406,7 @@ not a policy.
 | `idle_ms` | `60000` | how long a connection may stay quiet, between requests or before its first byte |
 | `drain_deadline_ms` | `0` | how long a `SIGTERM` drain waits before reaping stragglers; `0` waits for the last connection |
 | `max_lifetime_ms` | `0` | absolute connection-age cap, regardless of activity; `0` disables |
-| `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity. Bounds a slow request; `idle_ms` only bounds a stalled one. `0` disables |
+| `request_ms` | `0` | cap on one L7 exchange, **not** refreshed by activity. Bounds a slow request; `idle_ms` only bounds a stalled one. `0` disables. A gRPC call's own `grpc-timeout` caps it too, when earlier |
 | `tunnel_ms` | `3600000` | whole life of a [tunnelled upgrade](#tunnelled-upgrades-websocket); replaces the three above once one is established. 1 s to 1 day; `0` is **not** allowed |
 | `health_interval_ms` | `2000` | pause between health-probe sweeps |
 | `loop_watchdog_ms` | absent | kill the process if its event loop completes nothing for this long. Off when absent; 2 s minimum |

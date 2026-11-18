@@ -238,6 +238,12 @@ pub const Counters = struct {
     /// the connection completes normally — but every one rides a
     /// `deadline_expired`, an inequality `reconcile` asserts.
     l7_gateway_timeout: Value = Value.init(0),
+    /// The same verdict for a gRPC call whose own `grpc-timeout` was the
+    /// deadline (§8): answered DEADLINE_EXCEEDED (`grpc-status: 4`) rather
+    /// than `504`, and not witnessed against the endpoint — the client's
+    /// limit ran out, not the origin's time. Rides a `deadline_expired`
+    /// like its sibling.
+    l7_grpc_deadline_exceeded: Value = Value.init(0),
     /// Completed L7 exchanges: a parsed origin response relayed back.
     l7_responses: Value = Value.init(0),
     /// Responses whose coalesced body excess did not fit beside the
@@ -1017,7 +1023,8 @@ pub const Counters = struct {
         assert(admitted <= accepted);
         // Every 504 verdict rides a deadline expiry (§8) — the verdict
         // path increments both, the teardown path only the expiry.
-        assert(counters.get("l7_gateway_timeout") <= counters.get("deadline_expired"));
+        assert(counters.get("l7_gateway_timeout") + counters.get("l7_grpc_deadline_exceeded") <=
+            counters.get("deadline_expired"));
         // Every `408` rides a head-budget reap (#247): the verdict is
         // reached from that expiry and nowhere else. The inequality
         // rather than an equality, because a reap that cannot be
