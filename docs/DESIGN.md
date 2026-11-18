@@ -3055,13 +3055,13 @@ equalities a shared runner's noise cannot move.
    is how a phantom line per keep-alive connection once cleared 4096
    seeds.
    Those invariants gate each seed's *shape*; a **coverage census** gates
-   the sweep's *reach*. Every counter is totalled across the range, and a
-   sweep of at least 1024 seeds fails unless each one fired at least once
-   — a rung no scenario reaches is a finding, not silence, and the gate
-   cannot claim a path it never walked. Counters the simulator provably
-   cannot move (an admin listener it does not configure, a fault it does
-   not inject, a volume it cannot reach) are exempted by name in a table
-   that says what covers them instead, and the census fails just as loudly
+   the sweep's *reach*. Every counter is totalled across the range. A
+   sweep of at least 4096 seeds must exercise every required counter at
+   least once. Shorter sweeps check the per-seed invariants and replay
+   determinism. Counters the simulator provably cannot move (an admin
+   listener it does not configure, a fault it does not inject, a volume
+   it cannot reach) are exempted by name in a table that says what covers
+   them instead, and the census fails just as loudly
    when an exemption *does* fire — so widening a scenario deletes its
    entry rather than leaving a stale excuse behind. That second half also
    carries the invariants that are *supposed* to read zero: a counter
