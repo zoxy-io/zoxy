@@ -691,8 +691,9 @@ error would: a refused dial is a `502` and a silent origin a `504`. A
 stream the origin resets, or refuses past its `GOAWAY`, earns the same
 free replay a stale pooled connection does. An `h2c` cluster may not be
 reached from an `l4` listener, nor from one carrying upgrades (HTTP/2 has
-no `101`), and its health checks must be `tcp`: the prober speaks
-HTTP/1.1.
+no `101`), and its health checks are `tcp` or `grpc`, not `http`: that
+prober speaks HTTP/1.1. A [`grpc` check](#health-checks) asks the gRPC
+health service over the cluster's own connections.
 
 #### Weights
 
@@ -921,6 +922,28 @@ successes restore it.
 expected status). Defaults: `fall` 3, `rise` 2, `expect_status` 200, and a
 probe budget of `timeouts.connect_ms` unless `timeout_ms` overrides it.
 `timeouts.health_interval_ms` (default 2000) sets the gap between sweeps.
+
+A cluster that [speaks `h2c` or `h2`](#http2-to-the-origin-and-grpc) can
+use `grpc`, the standard gRPC health protocol:
+
+```json
+"grpc": {
+    "endpoints": ["10.0.0.1:50051", "10.0.0.2:50051"],
+    "protocol": "h2c",
+    "check": { "type": "grpc", "service": "echo.Echo" }
+}
+```
+
+The probe calls `grpc.health.v1.Health/Check` on a stream of the
+cluster's own pooled connections, over the cluster's TLS when it has one,
+and passes only on `:status` 200, a `SERVING` answer and `grpc-status: 0`.
+`service` is optional; leave it out to ask about the server as a whole.
+`path` and `host` do not apply. If the connection pool is full and holds no
+connection to the endpoint, the probe is skipped instead of failed, since
+that limit is zoxy's and says nothing about the origin. Skipped probes are
+counted in `zoxy_health_probes_skipped`. If that counter keeps rising,
+`limits.h2_origin_connections` is smaller than the cluster's endpoints
+need.
 
 If *every* endpoint in a cluster is ejected, zoxy fails open and uses them
 all. Routing nowhere would turn a probe verdict into an outage.

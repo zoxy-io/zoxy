@@ -705,7 +705,10 @@ pub const Config = struct {
         pub const Check = struct {
             /// What a probe proves. `tcp` proves the port accepts;
             /// `http` proves the application answered a chosen path with
-            /// a chosen status, which a SYN/ACK cannot.
+            /// a chosen status, which a SYN/ACK cannot; `grpc` proves an
+            /// HTTP/2 origin's application says SERVING to the standard
+            /// health service (`grpc.health.v1.Health/Check`), over the
+            /// cluster's own connections — TLS and all.
             kind: Kind = .tcp,
             /// Consecutive failures that eject, successes that restore.
             fall: u8 = constants.health_probe_fall_default,
@@ -720,10 +723,14 @@ pub const Config = struct {
             /// loader rejects it otherwise rather than leaving dead
             /// fields to be misread.
             http: ?Http = null,
+            /// The service a `grpc` probe asks about; empty asks about the
+            /// server as a whole, as the health protocol defines.
+            grpc_service: []const u8 = "",
 
-            pub const Kind = enum(u1) {
+            pub const Kind = enum(u2) {
                 tcp,
                 http,
+                grpc,
             };
 
             pub const Http = struct {
@@ -820,6 +827,16 @@ pub const ValidationError = error{
     ClusterCheckPathNotCanonical,
     ClusterCheckHostInvalid,
     ClusterCheckStatusInvalid,
+    /// `path` or `host` beside a `grpc` check, which asks a fixed path.
+    ClusterCheckHttpFieldOnGrpc,
+    /// `service` beside a check that is not `grpc`.
+    ClusterCheckServiceWithoutGrpc,
+    /// A `service` the probe cannot carry: too long for its one-octet
+    /// length, or not a printable name.
+    ClusterCheckServiceInvalid,
+    /// A `grpc` check on a cluster that speaks HTTP/1.1, which gRPC
+    /// cannot ride.
+    ClusterCheckGrpcOnHttp1,
     ClusterPassiveEjectionFallOutOfRange,
     ClusterPassiveEjectionRecoveryOutOfRange,
     ClusterMaxInflightOutOfRange,
@@ -3488,9 +3505,9 @@ pub const ClusterProxyProtocolJson = struct {
 };
 
 /// One cluster's health-check block (§7). `type` picks what a probe
-/// proves; the `http` fields are rejected under `tcp` rather than
-/// ignored, so a config cannot quietly describe a check it is not
-/// running.
+/// proves; the `http` fields are rejected under `tcp` and `grpc`, and
+/// `service` under all but `grpc`, rather than ignored, so a config
+/// cannot quietly describe a check it is not running.
 pub const CheckJson = struct {
     type: []const u8 = "tcp",
     /// Thresholds, HAProxy's `fall`/`rise`.
@@ -3503,11 +3520,13 @@ pub const CheckJson = struct {
     /// `Host` for an `http` probe; absent sends the endpoint literal.
     host: ?[]const u8 = null,
     expect_status: u16 = 200,
+    /// The service a `grpc` probe asks about; absent asks about the server.
+    service: ?[]const u8 = null,
 
     pub const schema_doc = "Active health checks for a cluster's endpoints.";
     pub const schema_fields = .{
         .type = .{
-            .desc = "What a probe checks: tcp (the port accepts a connection) or http (a request for `path` gets the expected status).",
+            .desc = "What a probe checks: tcp (the port accepts a connection), http (a request for `path` gets the expected status) or grpc (an HTTP/2 cluster's grpc.health.v1 service answers SERVING).",
             .enum_type = Config.Cluster.Check.Kind,
         },
         .fall = .{
@@ -3538,17 +3557,24 @@ pub const CheckJson = struct {
             .minimum = 100,
             .maximum = 599,
         },
+        .service = .{
+            .desc = "The service a grpc probe asks grpc.health.v1.Health/Check about; absent asks about the server as a whole.",
+            .min_length = 1,
+            .max_length = constants.health_check_grpc_service_bytes_max,
+        },
     };
 
     /// A `tcp` probe sends nothing and reads nothing, so every
     /// HTTP-shaped field beside it would be inert; an `http` probe has
-    /// to be told what to ask for (#305). `type` defaults to `tcp`, so
-    /// that arm carries the absence too.
+    /// to be told what to ask for (#305), and a `grpc` one asks a path
+    /// the protocol fixes. `type` defaults to `tcp`, so that arm carries
+    /// the absence too.
     pub const schema_variants = [_]SchemaVariants{.{
         .on = "type",
         .branches = &.{
-            .{ .value = "tcp", .default = true, .forbid = &.{ "path", "host" } },
-            .{ .value = "http", .require = &.{"path"} },
+            .{ .value = "tcp", .default = true, .forbid = &.{ "path", "host", "service" } },
+            .{ .value = "http", .require = &.{"path"}, .forbid = &.{"service"} },
+            .{ .value = "grpc", .forbid = &.{ "path", "host" } },
         },
     }};
 };
@@ -5572,6 +5598,7 @@ fn resolveCheck(
     if (timeout_ms < 1 or timeout_ms > constants.timeout_ms_max) {
         return error.ClusterCheckTimeoutOutOfRange;
     }
+    if (kind != .grpc and check.service != null) return error.ClusterCheckServiceWithoutGrpc;
     const http = switch (kind) {
         .tcp => blk: {
             // A TCP probe sends nothing and reads nothing, so every
@@ -5582,14 +5609,36 @@ fn resolveCheck(
             break :blk null;
         },
         .http => try resolveHttpCheck(&check),
+        .grpc => blk: {
+            // The health protocol fixes the path, and the authority is
+            // the cluster's: an operator's would be inert.
+            if (check.path != null or check.host != null) {
+                return error.ClusterCheckHttpFieldOnGrpc;
+            }
+            break :blk null;
+        },
     };
+    const service = check.service orelse "";
+    if (!grpcServiceValid(service)) return error.ClusterCheckServiceInvalid;
     return .{
         .kind = kind,
         .fall = check.fall,
         .rise = check.rise,
         .timeout_ms = timeout_ms,
         .http = http,
+        .grpc_service = service,
     };
+}
+
+/// A gRPC service name a probe can carry: within the one-octet length
+/// its request encodes, and printable — `package.Service` — so nothing an
+/// origin logs from it can surprise its reader. Empty names the server.
+fn grpcServiceValid(service: []const u8) bool {
+    if (service.len > constants.health_check_grpc_service_bytes_max) return false;
+    for (service) |byte| {
+        if (byte <= ' ' or byte >= 0x7f) return false;
+    }
+    return true;
 }
 
 /// The `http` half: a canonical path (validated exactly as a route
@@ -5893,14 +5942,14 @@ fn rejectTlsClusterSend(
     }
 }
 
-/// What an HTTP/2 cluster may be (§7): probed by `tcp` only, since the
-/// prober speaks HTTP/1.1, which such an origin need not; and over TLS
-/// exactly when it is `h2`.
+/// What an HTTP/2 cluster may be (§7): probed by `tcp` or `grpc`, not
+/// `http`, since that prober speaks HTTP/1.1, which such an origin need
+/// not — and `grpc` probes only such a cluster; and over TLS exactly when
+/// it is `h2`.
 fn rejectClusterProtocolShape(cluster: *const Config.Cluster) ValidationError!void {
-    if (cluster.protocol.http2()) {
-        if (cluster.check) |check| {
-            if (check.kind == .http) return error.ClusterH2cHttpCheck;
-        }
+    if (cluster.check) |check| {
+        if (cluster.protocol.http2() and check.kind == .http) return error.ClusterH2cHttpCheck;
+        if (!cluster.protocol.http2() and check.kind == .grpc) return error.ClusterCheckGrpcOnHttp1;
     }
     if (cluster.tls != null and cluster.protocol != .h2) return error.ClusterTlsWithoutH2;
     if (cluster.tls == null and cluster.protocol == .h2) return error.ClusterH2WithoutTls;
@@ -7638,6 +7687,30 @@ test "config: a check block rejects every shape it cannot run" {
         error.ClusterCheckStatusInvalid,
         head ++ "{\"type\":\"http\",\"path\":\"/h\",\"expect_status\":99}" ++ tail,
     );
+    // A grpc probe asks the path the health protocol fixes, and only it
+    // carries a service name.
+    try expectParseError(
+        error.ClusterCheckHttpFieldOnGrpc,
+        head ++ "{\"type\":\"grpc\",\"path\":\"/health\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckServiceWithoutGrpc,
+        head ++ "{\"type\":\"http\",\"path\":\"/h\",\"service\":\"a\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckServiceWithoutGrpc,
+        head ++ "{\"service\":\"a\"}" ++ tail,
+    );
+    try expectParseError(
+        error.ClusterCheckServiceInvalid,
+        head ++ "{\"type\":\"grpc\",\"service\":\"a b\"}" ++ tail,
+    );
+    // One past the one-octet length the request message encodes.
+    const long_service: [constants.health_check_grpc_service_bytes_max + 1]u8 = @splat('s');
+    try expectParseError(
+        error.ClusterCheckServiceInvalid,
+        head ++ "{\"type\":\"grpc\",\"service\":\"" ++ long_service ++ "\"}" ++ tail,
+    );
 }
 
 test "config: health interval parses, defaults to inter, rejects zero" {
@@ -8103,6 +8176,8 @@ const schema_gaps = [_]SchemaGapEntry{
     .{ .name = "LimitH2OriginStreamsWithoutH2c", .gap = .budget },
     .{ .name = "LimitH2OriginStreamsOverUpstreamSlots", .gap = .budget },
     .{ .name = "ClusterH2cHttpCheck", .gap = .cross_block },
+    .{ .name = "ClusterCheckGrpcOnHttp1", .gap = .cross_block },
+    .{ .name = "ClusterCheckServiceInvalid", .gap = .literal_syntax },
     .{ .name = "ClusterH2cOnL4Listener", .gap = .cross_block },
     .{ .name = "ClusterH2cWithUpgrades", .gap = .cross_block },
     .{ .name = "ClusterTlsWithoutH2", .gap = .cross_block },
@@ -10140,6 +10215,11 @@ test "config: an h2c cluster is reached over HTTP/2, sizes the origin pools, and
     try expectParseError(error.ClusterH2cHttpCheck, http ++
         "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"],\"protocol\":\"h2c\"," ++
         "\"check\":{\"type\":\"http\",\"path\":\"/health\"}}}," ++ timeouts ++ "}");
+    // gRPC rides HTTP/2: its health service is not one an HTTP/1.1
+    // origin can answer.
+    try expectParseError(error.ClusterCheckGrpcOnHttp1, http ++
+        "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]," ++
+        "\"check\":{\"type\":\"grpc\"}}}," ++ timeouts ++ "}");
     // An l4 listener relays bytes; an upgrade's tunnel needs a 101.
     try expectParseError(error.ClusterH2cOnL4Listener, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"}}]," ++ h2c ++ timeouts ++ "}");
     try expectParseError(error.ClusterH2cWithUpgrades, "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"," ++

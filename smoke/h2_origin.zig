@@ -7,9 +7,12 @@
 //! It answers every stream the way a gRPC server ends a call: a head, a
 //! body, and a trailer section carrying `grpc-status` — so the leg judges
 //! that trailers cross the proxy, which is the half of gRPC an HTTP/1.1
-//! origin cannot exercise. Each request's head is read through the `h2`
-//! package's decoder, keeping the HPACK table in step; nothing else of it
-//! is needed. Request bodies are not expected, and none is read.
+//! origin cannot exercise. A call to the standard health service — the
+//! proxy's `grpc` check — is answered SERVING, and counted apart. Each
+//! request's head is read through the `h2` package's decoder, keeping the
+//! HPACK table in step; only `:path` is looked at. Request bodies are
+//! not read: the health call's is its five-octet empty message, and the
+//! answer waits for the END_STREAM that comes with it.
 //!
 //! The task model is `origin.zig`'s: a fixed pool blocked in `accept`,
 //! woken by a connection each to stop.
@@ -34,6 +37,12 @@ pub const tag_header = "x-origin-tag";
 pub const tag_value = "smoke-origin";
 pub const trailer_name = "grpc-status";
 pub const trailer_value = "0";
+pub const health_path = "/grpc.health.v1.Health/Check";
+/// A `HealthCheckResponse` saying SERVING, behind its frame prefix.
+const serving_message = "\x00\x00\x00\x00\x02\x08\x01";
+/// Health calls one connection holds open at once: the prober asks one
+/// per endpoint per sweep, so one would do; a few spare cost nothing.
+const health_streams_max: u32 = 4;
 
 const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const table_size: u32 = 4096;
@@ -47,7 +56,9 @@ pub const H2Origin = struct {
     group: Io.Group,
     stopping: std.atomic.Value(bool),
     /// Streams answered, and connections accepted, for the leg's verdict.
+    /// Health calls are counted apart, so the exchanges' count stays exact.
     answered: std.atomic.Value(u32),
+    health_answered: std.atomic.Value(u32),
     accepted: std.atomic.Value(u32),
     /// Connections that ended on something other than the proxy closing
     /// them: a frame this origin could not read is the proxy's defect, and
@@ -60,6 +71,7 @@ pub const H2Origin = struct {
         origin.group = .init;
         origin.stopping = .init(false);
         origin.answered = .init(0);
+        origin.health_answered = .init(0);
         origin.accepted = .init(0);
         origin.protocol_errors = .init(0);
         origin.started = false;
@@ -129,6 +141,9 @@ const Connection = struct {
     encoder_storage: hpack.Encoder.Storage(table_size),
     encoder: hpack.Encoder,
     staged: [frame_bytes_max]u8,
+    /// Health calls whose head is in and whose END_STREAM is not.
+    health_streams: [health_streams_max]u31,
+    health_count: u32,
 
     /// The preface, our SETTINGS, then frames until the peer goes.
     fn serve(connection: *Connection, origin: *H2Origin, stream: Io.net.Stream) !void {
@@ -139,6 +154,7 @@ const Connection = struct {
         connection.decoder = hpack.Decoder.init(connection.table.table(), connection.decoded.len);
         connection.encoder_storage = .{};
         connection.encoder = connection.encoder_storage.encoder(.dynamic);
+        connection.health_count = 0;
         const opening = try connection.reader.interface.takeArray(preface.len);
         if (!std.mem.eql(u8, opening, preface)) return error.NotHttp2;
         try connection.put(.{ .settings = .{ .entries = &.{} } }, 0, 0);
@@ -172,14 +188,64 @@ const Connection = struct {
                 if (!header.has(.end_headers)) return error.ContinuationUnexpected;
                 var iterator = connection.decoder.iterate(&connection.decoded, headers.fragment);
                 var fields: u32 = 0;
-                while (try iterator.next()) |_| : (fields += 1) assert(fields < 256);
-                if (header.has(.end_stream)) try connection.answer(header.stream_identifier);
+                var health = false;
+                while (try iterator.next()) |field| : (fields += 1) {
+                    assert(fields < 256);
+                    if (std.mem.eql(u8, field.name, ":path")) health = std.mem.eql(u8, field.value, health_path);
+                }
+                const stream = header.stream_identifier;
+                if (header.has(.end_stream)) {
+                    try connection.answerEither(stream, health);
+                } else if (health) {
+                    try connection.holdHealth(stream);
+                }
             },
-            .data => if (header.has(.end_stream)) try connection.answer(header.stream_identifier),
+            .data => if (header.has(.end_stream)) {
+                const stream = header.stream_identifier;
+                try connection.answerEither(stream, connection.takeHealth(stream));
+            },
             .goaway => return false,
             else => {},
         }
         return true;
+    }
+
+    fn answerEither(connection: *Connection, stream_identifier: u31, health: bool) !void {
+        if (health) return connection.answerHealth(stream_identifier);
+        return connection.answer(stream_identifier);
+    }
+
+    fn holdHealth(connection: *Connection, stream_identifier: u31) !void {
+        assert(stream_identifier % 2 == 1);
+        assert(connection.health_count <= health_streams_max);
+        if (connection.health_count == health_streams_max) return error.HealthCallsOverrun;
+        connection.health_streams[connection.health_count] = stream_identifier;
+        connection.health_count += 1;
+    }
+
+    /// Whether the stream is a health call, which this ends the hold on.
+    fn takeHealth(connection: *Connection, stream_identifier: u31) bool {
+        assert(connection.health_count <= health_streams_max);
+        for (connection.health_streams[0..connection.health_count], 0..) |held, index| {
+            if (held != stream_identifier) continue;
+            connection.health_count -= 1;
+            connection.health_streams[index] = connection.health_streams[connection.health_count];
+            return true;
+        }
+        return false;
+    }
+
+    /// SERVING, as `grpc.health.v1` says it: head, message, `grpc-status`.
+    fn answerHealth(connection: *Connection, stream_identifier: u31) !void {
+        assert(stream_identifier % 2 == 1);
+        const stream = stream_identifier;
+        try connection.putFields(stream, &.{
+            .{ .name = ":status", .value = "200" },
+            .{ .name = "content-type", .value = "application/grpc" },
+        }, false);
+        try connection.put(.{ .data = .{ .data = serving_message, .padding = null } }, stream, 0);
+        try connection.putFields(stream, &.{.{ .name = trailer_name, .value = trailer_value }}, true);
+        _ = connection.origin.health_answered.fetchAdd(1, .monotonic);
     }
 
     /// The gRPC-shaped answer: head, body, trailers ending the stream.

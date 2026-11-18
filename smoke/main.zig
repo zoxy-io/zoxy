@@ -413,8 +413,12 @@ const health_interval_ms: u32 = 25;
 const health_probe_timeout_ms: u32 = 1000;
 const probe_window_ms: u32 = 500;
 const probe_window_ns: u64 = @as(u64, probe_window_ms) * std.time.ns_per_ms;
-/// Whole intervals the window holds — a partial one sends no probe.
-const probes_implied: u32 = @divFloor(probe_window_ms, health_interval_ms);
+/// Endpoints under checks: the HTTP/1.1 origin's `http` check, and the
+/// h2c origin's `grpc` one. A sweep probes both at once.
+const checked_endpoints: u32 = 2;
+/// Whole intervals the window holds — a partial one sends no probe — a
+/// probe per checked endpoint in each.
+const probes_implied: u32 = @divFloor(probe_window_ms, health_interval_ms) * checked_endpoints;
 /// A quarter of the implied rate: four times slower than configured is
 /// still working, and slower than that is not pacing at all.
 const probes_min: u32 = @divFloor(probes_implied, 4);
@@ -1555,7 +1559,26 @@ fn h2OriginPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         });
         passed = false;
     }
+    if (!grpcProbesPassed(&scrape)) passed = false;
     return passed;
+}
+
+/// The `grpc` check's half of the leg: its calls reached the origin and
+/// were answered SERVING, over the connection the exchanges share — the
+/// one-connection verdict above already holds them to it — and none was
+/// skipped for want of room. That none failed is `probesPassed`'s
+/// invariant, which reads every probe.
+fn grpcProbesPassed(scrape: *const scrape_module.Scrape) bool {
+    const skipped = counterOf(scrape, "health_probes_skipped") orelse return false;
+    const answered = h2_origin.health_answered.load(.monotonic);
+    if (answered == 0 or skipped != 0) {
+        std.debug.print(
+            "FAIL: the h2 origin answered {d} health calls, and {d} grpc probe(s) were skipped\n",
+            .{ answered, skipped },
+        );
+        return false;
+    }
+    return true;
 }
 
 /// The §7 TLS leg: the verified requests answered by the HTTP/1.1 origin
@@ -2347,7 +2370,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         health_probe_timeout_ms,
         origin_port,
         try std.fmt.allocPrint(arena, h2_clusters_template, .{
-            h2_origin.port, ports.h2_tls, tls_cert_path, ports.h2_tls, tls_cert_path,
+            h2_origin.port, health_probe_timeout_ms, ports.h2_tls, tls_cert_path, ports.h2_tls, tls_cert_path,
         }),
         not_found_body,
         robots_path,
@@ -2371,7 +2394,8 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
 /// Their own template, spliced into the main one, because one format call
 /// takes at most 32 arguments.
 const h2_clusters_template =
-    \\"grpc": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2c" }},
+    \\"grpc": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2c",
+    \\            "check": {{ "type": "grpc", "timeout_ms": {d} }} }},
     \\        "loop": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2",
     \\            "tls": {{ "server_name": "spike.zoxy.test", "ca": {{ "path": "{s}" }} }} }},
     \\        "loop_misnamed": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2",

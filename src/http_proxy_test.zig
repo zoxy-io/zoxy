@@ -7312,6 +7312,145 @@ test "health: an http probe fails when the origin never answers" {
     try bed.expectDrained();
 }
 
+/// A gRPC health answer: the head, one `HealthCheckResponse` message whose
+/// `status` is `serving` (1 SERVING, 2 NOT_SERVING), and `grpc-status: 0`.
+fn grpcHealthOrigin(bed: *Http1Bed, comptime status: u8) void {
+    bed.h2_origin.headers = &.{.{ "content-type", "application/grpc" }};
+    bed.h2_origin.body = "\x00\x00\x00\x00\x02\x08" ++ [_]u8{status};
+    bed.h2_origin.trailers = &.{.{ "grpc-status", "0" }};
+}
+
+fn grpcCheck(timeout_ms: u32, service: []const u8) config_module.Config.Cluster.Check {
+    return .{ .kind = .grpc, .timeout_ms = timeout_ms, .grpc_service = service };
+}
+
+test "health: a grpc probe passes on SERVING, asked over the cluster's own h2c connection" {
+    var options = h2OriginOptions(64);
+    options.check = grpcCheck(Http1Bed.connect_timeout_ms, "");
+    options.health_interval_ms = 30;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    grpcHealthOrigin(&bed, 1);
+
+    bed.armDrainTimer(110);
+    try bed.sim_io.run();
+
+    // As the http probe's: only the rate tells a probe that settles from
+    // one that idles out its budget (#130).
+    try std.testing.expect(bed.server.counters.get("health_probes_sent") >= 3);
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_failed"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_skipped"));
+    try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.server.health.healthy[0]);
+    // The origin heard the standard call, every probe of it: the health
+    // service's path, gRPC's content type and `te`, and an empty request
+    // message — no service named asks about the server as a whole.
+    try std.testing.expect(bed.h2_origin.answered >= 3);
+    try std.testing.expectEqualStrings("POST", bed.h2_origin.last_method.slice());
+    try std.testing.expectEqualStrings("/grpc.health.v1.Health/Check", bed.h2_origin.last_path.slice());
+    try std.testing.expectEqualStrings("application/grpc", bed.h2_origin.last_content_type.slice());
+    try std.testing.expectEqualStrings("trailers", bed.h2_origin.last_te.slice());
+    try std.testing.expectEqualStrings("\x00\x00\x00\x00\x00", bed.h2_origin.last_body.slice());
+    // The endpoint's own literal, as an http probe's `Host` defaults to.
+    try std.testing.expectEqualStrings("127.0.0.1:9000", bed.h2_origin.last_authority.slice());
+    // One connection carried them all: a probe is a stream, not a dial.
+    try std.testing.expectEqual(@as(u32, 1), bed.h2_origin.accepted_count);
+    try bed.expectDrained();
+}
+
+test "health: a grpc probe fails on NOT_SERVING, though the origin answered" {
+    var options = h2OriginOptions(65);
+    options.check = grpcCheck(Http1Bed.connect_timeout_ms, "");
+    options.health_interval_ms = 30;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    // A 200, a message and `grpc-status: 0` — everything a tcp check, or
+    // a check of the status alone, would call healthy.
+    grpcHealthOrigin(&bed, 2);
+
+    bed.armDrainTimer(130);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(!bed.server.health.healthy[0]);
+    try bed.expectDrained();
+}
+
+test "health: a grpc probe fails when the origin never answers, its stream reset at the budget" {
+    var options = h2OriginOptions(66);
+    options.check = grpcCheck(30, "");
+    options.health_interval_ms = 30;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    // Reads every call and answers none: only the probe's deadline ends
+    // it, by resetting the stream — the connection stays for the next.
+    bed.h2_origin.mute = true;
+
+    bed.armDrainTimer(220);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(bed.h2_origin.requests >= 3);
+    try std.testing.expectEqual(@as(u32, 1), bed.h2_origin.accepted_count);
+    try bed.expectDrained();
+}
+
+test "health: a grpc probe over TLS names its service and the cluster's server" {
+    for ([_]bool{ false, true }) |partial_io| {
+        var options = h2TlsOriginOptions(67 + @as(u64, @intFromBool(partial_io)));
+        options.partial_io = partial_io;
+        options.check = grpcCheck(Http1Bed.connect_timeout_ms, "zoxy.Echo");
+        options.health_interval_ms = 30;
+        var bed: Http1Bed = undefined;
+        try bed.setUp(std.testing.allocator, options);
+        defer bed.tearDown();
+        grpcHealthOrigin(&bed, 1);
+
+        bed.armDrainTimer(110);
+        try bed.sim_io.run();
+
+        try std.testing.expect(bed.server.counters.get("health_probes_sent") >= 2);
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_failed"));
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("h2_origin_tls_failed"));
+        try std.testing.expect(bed.server.health.healthy[0]);
+        // Field 1, nine octets: `HealthCheckRequest{service: "zoxy.Echo"}`.
+        try std.testing.expectEqualStrings("\x00\x00\x00\x00\x0b\x0a\x09zoxy.Echo", bed.h2_origin.last_body.slice());
+        try std.testing.expectEqualStrings("origin.zoxy.test", bed.h2_origin.last_authority.slice());
+        try bed.expectDrained();
+    }
+}
+
+test "health: a grpc probe the origin pool has no room for reaches no verdict, and ejects nothing" {
+    var options = h2OriginOptions(69);
+    // Two endpoints, one connection: the first endpoint's probe dials it
+    // (and is refused), so the second's finds no connection to its
+    // endpoint and no room for one — every sweep.
+    options.refusing_endpoint_first = true;
+    options.h2_origin_connections = 1;
+    options.check = grpcCheck(Http1Bed.connect_timeout_ms, "");
+    options.health_interval_ms = 30;
+    var bed: Http1Bed = undefined;
+    try bed.setUp(std.testing.allocator, options);
+    defer bed.tearDown();
+    grpcHealthOrigin(&bed, 1);
+
+    bed.armDrainTimer(130);
+    try bed.sim_io.run();
+
+    try std.testing.expect(bed.server.counters.get("health_probes_skipped") >= 3);
+    // The refused endpoint is ejected; the one the pool could not reach is
+    // not — that limit is this proxy's.
+    try std.testing.expectEqual(@as(u64, 1), bed.server.counters.get("health_endpoint_down"));
+    try std.testing.expect(!bed.server.health.healthy[0]);
+    try std.testing.expect(bed.server.health.healthy[1]);
+    try bed.expectDrained();
+}
+
 test "l7: a request past the endpoint cap is answered 503, not sent" {
     var bed: Http1Bed = undefined;
     try bed.setUp(std.testing.allocator, .{

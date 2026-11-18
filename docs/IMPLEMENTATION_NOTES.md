@@ -2560,7 +2560,8 @@ Open, and not settled here:
   it has carries `concurrent_streams_max` legs. Legs past the origin's own
   `SETTINGS_MAX_CONCURRENT_STREAMS` wait for a stream to free rather than
   spilling to a new connection; nothing counts that wait yet.
-- No gRPC health probe: an h2c cluster is checked by `tcp` probes only.
+- The gRPC health probe has landed (`"type": "grpc"`), so this item is
+  closed. It was not part of this run.
 - HTTP/2 to an origin over TLS landed after this run (`"protocol": "h2"`),
   and was hand-run the same way against Node's `http2.createSecureServer`
   serving the trust fixtures' leaf:

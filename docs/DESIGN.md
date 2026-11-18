@@ -2000,7 +2000,21 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   reading the response with the data path's own head parser (§7) — so a
   probe accepts exactly the heads this proxy would forward. Its legs run
   in sequence, dial then send then recv, which is why the op budget is
-  the same for both kinds.
+  the same for both kinds. A **`grpc`** check, on an HTTP/2 cluster only,
+  calls `grpc.health.v1.Health/Check` (with the configured `service`, or
+  none) as a stream on the cluster's own origin pool (`Origin.zig`), and
+  passes on `:status` 200, a `HealthCheckResponse` saying SERVING and
+  `grpc-status: 0`. It proves what the cluster's exchanges need: an
+  HTTP/2 connection, verified TLS for `h2`, and an application that says
+  it serves. It holds no socket. Its one leg is the call, and the verdict
+  comes back on one completion of the probe's own through a zero-delay
+  timer, as a leg's op does. The dial and the stream belong to the pool
+  and are priced there, so the probe's op budget is unchanged. A deadline
+  resets the stream. When the pool has no connection to the endpoint and
+  no room to dial one, the probe has no verdict (`health_probes_skipped`)
+  and neither streak moves, because that limit is this proxy's and does
+  not describe the origin. When the endpoint's connections are only full,
+  the probe waits for a stream on one of them.
 
   `fall` consecutive misses eject the endpoint from balancing and close
   its parked pooled connections (§5); `rise` consecutive passes restore
@@ -2193,8 +2207,11 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   Connections (`h2_origin_connections`) are picked least-loaded per
   endpoint, dialed when none has room, told GOAWAY after an idle window,
   and closed by the drain once their last leg leaves. An HTTP/2 cluster is
-  reachable only from `http` listeners without upgrades, and checked only
-  by `tcp` probes, which the loader enforces.
+  reachable only from `http` listeners without upgrades, and checked by
+  `tcp` or `grpc` probes, never `http` ones, which the loader enforces.
+  A `grpc` probe's stream rides these connections like a leg. It counts
+  toward the least-loaded pick, keeps its connection from going idle, and
+  fails with that connection.
 
   An `h2` cluster puts TLS under the session (RFC 9113 §3.2), in the
   connection's own two ops: `tls/OriginClient.zig` is sans-I/O like the

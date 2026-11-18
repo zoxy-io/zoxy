@@ -408,6 +408,12 @@ pub const Counters = struct {
     /// case also lands in `kernel_pressure_connect`, same as a data-path
     /// dial.
     health_probes_failed: Value = Value.init(0),
+    /// `grpc` probes that reached no verdict (§7): the origin pool had no
+    /// connection to the endpoint and no room to dial one — a limit of
+    /// this proxy's (`limits.h2_origin_connections`), which must not
+    /// eject an endpoint. Neither streak moves. A deployment that sees it
+    /// rise has sized the pool below its endpoints.
+    health_probes_skipped: Value = Value.init(0),
     /// Endpoints ejected from balancing (§7), whatever decided it. Their
     /// parked connections are closed at the transition (§5,
     /// `health_parked_closed`).

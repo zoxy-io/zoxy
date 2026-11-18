@@ -99,6 +99,7 @@ test {
     _ = @import("http/h2/downgrade.zig");
     _ = @import("http/h2/response.zig");
     _ = @import("http/h2/origin.zig");
+    _ = @import("http/h2/Origin.zig");
     _ = @import("http/h2/session_test.zig");
     _ = @import("http/h2/client_session_test.zig");
     _ = Io;

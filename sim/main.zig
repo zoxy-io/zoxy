@@ -214,6 +214,11 @@ const uncovered = [_]Uncovered{
         .reason = "no h2 cluster in the sweep; OriginClient's tests and the h2 origin TLS scenarios refuse chains",
     },
     .{
+        .name = "health_probes_skipped",
+        .why = .unreached,
+        .reason = "no h2c cluster in the sweep, so no grpc check; http_proxy_test's grpc probe scenarios fill the pool",
+    },
+    .{
         .name = "l7_shed_h2_origin_connections",
         .why = .unreached,
         .reason = "no h2c cluster in the sweep, so neither origin pool exists to run dry",
