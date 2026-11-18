@@ -1216,6 +1216,18 @@ const Http1Bed = struct {
     /// A sweep-observation scenario cannot let the client drive the drain
     /// (the drain reaps parked upstreams instantly); this timer drains
     /// after the idle sweep has had time to act.
+    /// `armDrainTimer`, timed from the prober's first sweep rather than
+    /// from now: #395 starts that sweep at a random offset into the first
+    /// interval, so a health oracle that counts sweeps in a window has to
+    /// open the window where the sweeps begin.
+    fn armDrainAfterFirstSweep(bed: *Http1Bed, delay_ms: u32) void {
+        const first_sweep_ns = bed.server.health.first_sweep_at_ns;
+        const now_ns = bed.sim_io.nowNs();
+        assert(first_sweep_ns >= now_ns);
+        const offset_ms: u32 = @intCast(std.math.divCeil(u64, first_sweep_ns - now_ns, std.time.ns_per_ms) catch unreachable);
+        bed.armDrainTimer(offset_ms + delay_ms);
+    }
+
     fn armDrainTimer(bed: *Http1Bed, delay_ms: u32) void {
         bed.sim_io.timerStart(
             &bed.drain_timer_completion,
@@ -7797,7 +7809,7 @@ test "health: an http probe passes on the expected status" {
     // No client at all: the prober is the only traffic. Each probe dials,
     // sends its GET, reads the 200 and hangs up, so the endpoint stays
     // healthy and nothing is ever ejected.
-    bed.armDrainTimer(110);
+    bed.armDrainAfterFirstSweep(110);
     try bed.sim_io.run();
 
     // The count is the load-bearing assertion, not just "some probes
@@ -7837,7 +7849,7 @@ test "health: an http probe to a socket endpoint sends Host: localhost" {
     });
     defer bed.tearDown();
 
-    bed.armDrainTimer(110);
+    bed.armDrainAfterFirstSweep(110);
     try bed.sim_io.run();
 
     // With no `host` configured, an IP endpoint's probe names the
@@ -7869,7 +7881,7 @@ test "health: an http probe fails on a status it was not promised" {
     });
     defer bed.tearDown();
 
-    bed.armDrainTimer(130);
+    bed.armDrainAfterFirstSweep(130);
     try bed.sim_io.run();
 
     try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
@@ -7897,7 +7909,7 @@ test "health: an http probe fails when the origin never answers" {
     });
     defer bed.tearDown();
 
-    bed.armDrainTimer(220);
+    bed.armDrainAfterFirstSweep(220);
     try bed.sim_io.run();
 
     try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
@@ -7926,7 +7938,7 @@ test "health: a grpc probe passes on SERVING, asked over the cluster's own h2c c
     defer bed.tearDown();
     grpcHealthOrigin(&bed, 1);
 
-    bed.armDrainTimer(110);
+    bed.armDrainAfterFirstSweep(110);
     try bed.sim_io.run();
 
     // As the http probe's: only the rate tells a probe that settles from
@@ -7963,7 +7975,7 @@ test "health: a grpc probe fails on NOT_SERVING, though the origin answered" {
     // a check of the status alone, would call healthy.
     grpcHealthOrigin(&bed, 2);
 
-    bed.armDrainTimer(130);
+    bed.armDrainAfterFirstSweep(130);
     try bed.sim_io.run();
 
     try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
@@ -7983,7 +7995,7 @@ test "health: a grpc probe fails when the origin never answers, its stream reset
     // it, by resetting the stream — the connection stays for the next.
     bed.h2_origin.mute = true;
 
-    bed.armDrainTimer(220);
+    bed.armDrainAfterFirstSweep(220);
     try bed.sim_io.run();
 
     try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
@@ -8004,7 +8016,7 @@ test "health: a grpc probe over TLS names its service and the cluster's server" 
         defer bed.tearDown();
         grpcHealthOrigin(&bed, 1);
 
-        bed.armDrainTimer(110);
+        bed.armDrainAfterFirstSweep(110);
         try bed.sim_io.run();
 
         try std.testing.expect(bed.server.counters.get("health_probes_sent") >= 2);
@@ -8032,7 +8044,7 @@ test "health: a grpc probe the origin pool has no room for reaches no verdict, a
     defer bed.tearDown();
     grpcHealthOrigin(&bed, 1);
 
-    bed.armDrainTimer(130);
+    bed.armDrainAfterFirstSweep(130);
     try bed.sim_io.run();
 
     try std.testing.expect(bed.server.counters.get("health_probes_skipped") >= 3);

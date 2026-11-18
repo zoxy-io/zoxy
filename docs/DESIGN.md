@@ -2045,7 +2045,16 @@ accept → admit → recv head → parse (zero-copy) → route (host/path → cl
   probes in flight as the config has endpoints to check**, capped at
   `health_probe_concurrency_max` (#132). Sweeps pace sweep-end to
   sweep-start on `timeouts.health_interval_ms`; one probe is bounded by
-  the check's `timeout_ms`, which defaults to `connect_ms`.
+  the check's `timeout_ms`, which defaults to `connect_ms`. The first
+  sweep starts at a random offset into the first interval (#395), drawn
+  from `fillRandom` — the CSPRNG in production, the seed in the
+  simulator. Processes started together would otherwise probe the same
+  origins at the same instant for their whole lives, since nothing
+  re-phases them; one offset de-phases them for good, and every pause
+  after it is the interval exactly. There is no key: nobody wants
+  lockstep, and probing still begins within the first interval. The
+  offset rides the one rest timer every pause already uses, so §5's op
+  and ring budget is unchanged.
 
   The concurrency is derived rather than configured, because how many
   probes to run at once is not a question an operator can answer while

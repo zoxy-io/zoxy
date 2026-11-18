@@ -1732,7 +1732,9 @@ test "health: black-holed endpoints are ejected in one probe budget, not one eac
     });
     defer bed.tearDown();
 
-    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 90 * std.time.ns_per_ms);
+    // Timed from the first sweep, which #395 starts at a random
+    // offset into the first interval.
+    bed.sim_io.scheduleSignal(.terminate, bed.server.health.first_sweep_at_ns + 90 * std.time.ns_per_ms);
     try bed.sim_io.run();
 
     try std.testing.expectEqual(@as(u32, 4), bed.server.health.checked_count);
@@ -1751,6 +1753,58 @@ test "health: black-holed endpoints are ejected in one probe budget, not one eac
         bed.server.counters.get("health_probes_concurrent"),
     );
     try bed.expectDrained();
+}
+
+/// One process's first-sweep offset under `seed` (#395), measured where
+/// a test can see it: right after `start`, before the loop has run.
+/// The process is then drained before that sweep begins, which is the
+/// shutdown path the offset adds — a rest timer armed with no sweep
+/// behind it — so every call also checks that it cancels cleanly.
+fn firstSweepOffsetNs(seed: u64, interval_ms: u32) !u64 {
+    var bed: TestBed = undefined;
+    try bed.setUp(std.testing.allocator, .{
+        .sim = .{ .seed = seed },
+        .check = .{ .timeout_ms = 50 },
+        .health_interval_ms = interval_ms,
+    });
+    defer bed.tearDown();
+    const now_ns = bed.sim_io.nowNs();
+    const first_sweep_ns = bed.server.health.first_sweep_at_ns;
+    assert(first_sweep_ns >= now_ns);
+    const offset_ns = first_sweep_ns - now_ns;
+    if (offset_ns >= 1) {
+        bed.sim_io.scheduleSignal(.terminate, now_ns);
+        try bed.sim_io.run();
+        // Drained while resting toward the first sweep: nothing was
+        // probed, and nothing was left armed.
+        try std.testing.expectEqual(@as(u64, 0), bed.server.counters.get("health_probes_sent"));
+        try bed.expectDrained();
+    }
+    return offset_ns;
+}
+
+test "health: the first sweep starts at a seeded offset into the first interval (#395)" {
+    // Processes started together would otherwise sweep the same origins
+    // at the same instant on every interval. Sixteen seeds stand in for
+    // sixteen processes: each offset lies inside one interval, they do
+    // not land together, and the same seed lands the same way twice —
+    // a production process draws from the CSPRNG, and the simulator's
+    // replay of a schedule rests on the seeded draw.
+    const interval_ms: u32 = 100;
+    const interval_ns = @as(u64, interval_ms) * std.time.ns_per_ms;
+    var earliest: u64 = std.math.maxInt(u64);
+    var latest: u64 = 0;
+    for (0..16) |index| {
+        const seed: u64 = 395 + index;
+        const offset_ns = try firstSweepOffsetNs(seed, interval_ms);
+        try std.testing.expect(offset_ns < interval_ns);
+        try std.testing.expectEqual(offset_ns, try firstSweepOffsetNs(seed, interval_ms));
+        earliest = @min(earliest, offset_ns);
+        latest = @max(latest, offset_ns);
+    }
+    // Spread across the window, not bunched: a fixed or constant offset
+    // would leave every process in step, only later.
+    try std.testing.expect(latest - earliest >= interval_ns / 2);
 }
 
 test "health: a drain reaches quiescence with every probe still in flight" {
@@ -1782,7 +1836,9 @@ test "health: a drain reaches quiescence with every probe still in flight" {
     });
     defer bed.tearDown();
 
-    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 25 * std.time.ns_per_ms);
+    // Timed from the first sweep, which #395 starts at a random
+    // offset into the first interval.
+    bed.sim_io.scheduleSignal(.terminate, bed.server.health.first_sweep_at_ns + 25 * std.time.ns_per_ms);
     try bed.sim_io.run();
 
     // The precondition: four probes, so the ladder had siblings to reach.
@@ -1811,7 +1867,9 @@ test "health: probes against a listening origin keep the endpoint healthy" {
     // No clients: the prober is the only source of work. The terminate
     // signal ends the scenario the §8 way, which must leave the prober
     // quiescent and the pools untouched.
-    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 120 * std.time.ns_per_ms);
+    // Timed from the first sweep, which #395 starts at a random
+    // offset into the first interval.
+    bed.sim_io.scheduleSignal(.terminate, bed.server.health.first_sweep_at_ns + 120 * std.time.ns_per_ms);
     try bed.sim_io.run();
 
     // The immediate first sweep plus at least one interval-paced one,
@@ -1838,7 +1896,9 @@ test "health: consecutive refusals eject the endpoint" {
     // Nothing listens at the endpoint: every probe is refused. The third
     // consecutive miss (constants.health_probe_fall) ejects; later misses
     // keep counting probes but never re-eject.
-    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 200 * std.time.ns_per_ms);
+    // Timed from the first sweep, which #395 starts at a random
+    // offset into the first interval.
+    bed.sim_io.scheduleSignal(.terminate, bed.server.health.first_sweep_at_ns + 200 * std.time.ns_per_ms);
     try bed.sim_io.run();
 
     try std.testing.expect(bed.server.counters.get("health_probes_failed") >= 3);
@@ -1869,7 +1929,9 @@ test "health: rise restores an ejected endpoint after passing probes" {
     bed.sim_io.injectConnectError(TestBed.originAddress());
     bed.sim_io.injectConnectError(TestBed.originAddress());
     bed.sim_io.injectConnectError(TestBed.originAddress());
-    bed.sim_io.scheduleSignal(.terminate, bed.sim_io.nowNs() + 160 * std.time.ns_per_ms);
+    // Timed from the first sweep, which #395 starts at a random
+    // offset into the first interval.
+    bed.sim_io.scheduleSignal(.terminate, bed.server.health.first_sweep_at_ns + 160 * std.time.ns_per_ms);
     try bed.sim_io.run();
 
     try std.testing.expectEqual(@as(u64, 3), bed.server.counters.get("health_probes_failed"));
