@@ -350,6 +350,7 @@ pub fn Driver(comptime IoType: type) type {
                     .flush_first => return flush(server, conn, slot),
                     .closed => return close(server, conn, slot),
                     .request => |request| ExchangeType.open(server, conn, &request),
+                    .response => unreachable, // A server session raises none.
                     .data => |data| {
                         slot.held = data;
                         if (!offerHeld(server, conn, slot)) {

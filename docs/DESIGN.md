@@ -3108,7 +3108,9 @@ src/
     router.zig        // §7 path routing: canonical-path longest-prefix table
     proxy.zig         // L7 state machine over phases
     h2/               // HTTP/2 to the client (§7); the only `h2` importer
-      Session.zig     // one connection, sans-I/O: frames in, events out
+      Session.zig     // one connection, sans-I/O: frames in, events out;
+                      // either end — a client's to this proxy, or this
+                      // proxy's to an HTTP/2 origin (`Config.role`)
       Connection.zig  // the driver: one recv + one send, plain or TLS
       exchange.zig    // a stream's §7 exchange on a shared stream slot
       downgrade.zig   // h2 → h1: write the head, parse it back (§7)
