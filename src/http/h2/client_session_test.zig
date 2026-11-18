@@ -508,8 +508,9 @@ test "h2 client: a malformed answer resets its stream alone" {
         .{ .fields = &.{.{ .name = ":status", .value = "101" }}, .end_stream = false },
         // §8.1: an interim head ends nothing.
         .{ .fields = &.{.{ .name = ":status", .value = "100" }}, .end_stream = true },
-        // A status no HTTP/1.1 line could carry.
+        // Statuses no HTTP/1.1 line could carry, or RFC 9110 defines.
         .{ .fields = &.{.{ .name = ":status", .value = "20" }}, .end_stream = true },
+        .{ .fields = &.{.{ .name = ":status", .value = "600" }}, .end_stream = true },
         // A request's pseudo-header in a response.
         .{ .fields = &.{ .{ .name = ":status", .value = "200" }, .{ .name = ":path", .value = "/" } }, .end_stream = true },
         // A declared length the stream contradicts by ending.
