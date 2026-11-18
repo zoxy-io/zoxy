@@ -2576,7 +2576,8 @@ Open, and not settled here:
   whole records wait in the buffer and fill it, which zssl assumes never
   happens. The client now asks `canReceive` before reading, and holds two
   records of wire. No simulator seed reached that state; the live run did,
-  on its first large body. TLS to an HTTP/1.1 origin is the rest of #296.
+  on its first large body. TLS to an HTTP/1.1 origin followed as
+  `net/upstream_tls.zig` (#296), with the same client under it.
 
 - The live gate now drives both. The h2c leg reaches `smoke/h2_origin.zig`.
   The TLS leg loops the proxy through its own fourth listener, which

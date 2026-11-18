@@ -426,9 +426,9 @@ pub const Config = struct {
         /// what this socket is, and the same cluster is commonly reachable
         /// from a TLS edge listener and a plaintext internal one.
         ///
-        /// Inbound only. The upstream leg stays plaintext whatever this
-        /// says; originating TLS to a backend is a separate decision with
-        /// its own trust store, and #125 is termination.
+        /// Inbound only: it terminates. Originating TLS to a backend is the
+        /// cluster's to say (`Cluster.tls`, §7, #296), with its own trust
+        /// store, and #125 is termination.
         tls: ?Tls = null,
         /// Which protocol upgrades this listener will carry as tunnels
         /// (§7, #180). Empty by default — an `Upgrade` naming nothing
@@ -634,10 +634,10 @@ pub const Config = struct {
         /// `http` listeners route to an `h2c` cluster, and none that
         /// carries an upgrade: HTTP/2 has no `101`.
         protocol: Protocol = .http1,
-        /// TLS to the origins (§7; #296 for HTTP/2 origins): the name every
-        /// origin must prove, which is also the SNI sent, and the anchors
-        /// its chain must reach — parsed from the `ca` bundle at load.
-        /// Present exactly when `protocol` is `h2`.
+        /// TLS to the origins (§7, #296): the name every origin must
+        /// prove, which is also the SNI sent, and the anchors its chain
+        /// must reach — parsed from the `ca` bundle at load. Required by
+        /// `h2`; with `http1` the origins speak HTTPS; never with `h2c`.
         tls: ?Tls = null,
 
         pub const Protocol = enum(u2) {
@@ -2544,8 +2544,8 @@ pub const ListenerJson = struct {
         },
         .tls = .{
             .desc = "Terminate TLS on this listener with the given certificate " ++
-                "and key; absent is a plaintext socket. Inbound only: the " ++
-                "upstream leg stays plaintext.",
+                "and key; absent is a plaintext socket. Inbound only: TLS to " ++
+                "the origins is the cluster's own tls block.",
         },
         .http = .{
             .desc = "Speak HTTP/1.1 as a reverse proxy, with routing, filters " ++

@@ -267,12 +267,33 @@ const h2_tls_handshakes: u32 = 1;
 /// leg's one, the verified loop, and the refused dial.
 const h2_origin_connections_total: u32 = 1 + h2_tls_handshakes + h2_tls_refused;
 
+/// The #296 leg, the HTTP/1.1 twin of the one above: an HTTPS cluster —
+/// `http1` with `tls` — whose origin is this proxy's own https listener,
+/// which speaks HTTP/1.1 and routes on to the HTTP/1.1 origin. So the
+/// shipped binary seals and opens an upstream connection's records, and
+/// parks and reuses it, on a real kernel. Two requests on one verified
+/// connection — the second rides it parked, unhandshaken — each logged
+/// twice; and one through a cluster naming another `server_name`, a 502
+/// the origin never served.
+const https_loop_exchanges: u32 = 2;
+const https_loop_refused: u32 = 1;
+const https_loop_prefix = "/https.Smoke";
+const https_loop_refused_prefix = "/https.Refused";
+const https_loop_lines: u32 = 2 * https_loop_exchanges + https_loop_refused;
+/// The client's connections, one per request, and the proxy's own two
+/// into its https listener: the parked-and-reused verified one, and the
+/// refused one.
+const https_loop_connections: u32 = https_loop_exchanges + https_loop_refused + 2;
+/// Handshakes the loop completes on the https listener: the one verified
+/// connection, which both requests ride.
+const https_loop_handshakes: u32 = 1;
+
 const exchanges_per_pass: u32 =
     @as(u32, keep_alive_connections) * requests_per_connection + large_requests;
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
     body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-    h2_tls_lines + tls_requests + l4_connections;
+    h2_tls_lines + https_loop_lines + tls_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -300,7 +321,7 @@ const readiness_probes: u32 = 1;
 const connections_expected: u32 = keep_alive_connections +
     load_passes * large_requests + l4_connections + sticky_connections +
     body_connections + allowlist_connections + h2c_connections + https_leg_connections +
-    h2_origin_client_connections + h2_tls_connections + readiness_probes;
+    h2_origin_client_connections + h2_tls_connections + https_loop_connections + readiness_probes;
 
 /// What the harness holds open against the origin at its peak: every live
 /// client connection can have an upstream connection of its own, parked or
@@ -350,11 +371,13 @@ const loop_watchdog_ms: u32 = 8_000;
 /// price 32 sessions for a leg that opens one, and the §5 banner this
 /// gate prints would stop being a number a reader can sanity-check.
 const zoxy_limits = .{
-    .conn_slots = 32,
+    .conn_slots = 40,
     .relay_buffers = 16,
     .upstream_slots = 16,
-    // One more for the §7 TLS leg's loop into this proxy's own listener.
-    .tls_engines = 3,
+    // One more each for the loops into this proxy's own TLS listeners —
+    // the §7 leg's `h2` one, and the #296 leg's parked HTTPS connection,
+    // held open beside the https leg's own.
+    .tls_engines = 4,
     // The #275 leg's streams, with room to spare.
     .stream_slots = 16,
 };
@@ -512,6 +535,7 @@ const Stage = enum {
     h2c_leg,
     h2_origin_leg,
     h2_tls_leg,
+    https_loop_leg,
     https_alpn_refusal,
     https_handshake,
     https_request,
@@ -534,6 +558,7 @@ const Stage = enum {
             .h2c_leg => "the h2c leg (#275)",
             .h2_origin_leg => "the h2 origin leg (§7)",
             .h2_tls_leg => "the h2 origin over TLS leg (§7)",
+            .https_loop_leg => "the HTTPS origin leg (#296)",
             .https_alpn_refusal => "the ALPN refusal (#271)",
             .https_handshake => "the https handshake",
             .watchdog_leg => "the loop-watchdog leg (#311)",
@@ -644,10 +669,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const allowlist_ok = try allowlistPassed(arena, io, &ports);
     enterStage(.h2c_leg);
     const h2c_ok = try h2cPassed(arena, io, &ports);
-    enterStage(.h2_origin_leg);
-    const h2_origin_ok = try h2OriginPassed(arena, io, &ports);
-    enterStage(.h2_tls_leg);
-    const h2_tls_ok = try h2TlsPassed(arena, io, &ports);
+    const origin_legs_ok = try originLegsPassed(arena, io, &ports);
     // Last, so its scrape sees the whole run — and so a wedged handshake
     // cannot cost the legs above their verdicts.
     const tls_ok = try tlsPassed(arena, io, &ports);
@@ -668,7 +690,7 @@ fn run(arena: std.mem.Allocator, io: Io, flags: *const Flags) !u8 {
     const memory_ok = memoryPassed(&memory);
     const drain_ok = drainPassed(drained_cleanly);
     const passed = log_ok and counters.passed and sticky_ok and bodies_ok and
-        allowlist_ok and h2c_ok and h2_origin_ok and h2_tls_ok and tls_ok and memory_ok and
+        allowlist_ok and h2c_ok and origin_legs_ok and tls_ok and memory_ok and
         drain_ok and check_ok and watchdog_ok;
     return report(io, &lines, &counters, &memory, passed);
 }
@@ -818,7 +840,7 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // and a log that told them apart would be the defect.
     const http_lines_expected = http_exchanges + sticky_exchanges +
         body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-        h2_tls_lines + tls_requests;
+        h2_tls_lines + https_loop_lines + tls_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -839,10 +861,11 @@ fn accessLogPassed(lines: *const LogCounts) bool {
         std.debug.print("FAIL: {d} access-log lines of no known kind\n", .{lines.other});
         passed = false;
     }
-    // Every line but the #159 leg's two and the #331 leg's refusal
-    // carries the origin's 200; those three carry outcomes only this
-    // proxy produces, so the counts partition the http lines exactly.
-    if (lines.http_ok + body_exchanges + allowlist_refused + h2_tls_refused != lines.http) {
+    // Every line but the #159 leg's two, the #331 leg's refusal and the
+    // two TLS loops' refused dials carries the origin's 200; those carry
+    // outcomes only this proxy produces, so the counts partition the http
+    // lines exactly.
+    if (lines.http_ok + body_exchanges + allowlist_refused + h2_tls_refused + https_loop_refused != lines.http) {
         std.debug.print(
             "FAIL: {d} of {d} http lines did not complete with the origin's 200\n",
             .{ lines.http - lines.http_ok, lines.http },
@@ -887,7 +910,7 @@ fn loggedHeadersPassed(lines: *const LogCounts) bool {
     // which no origin served. Asserted rather than assumed: a near-empty
     // log would otherwise underflow this subtraction into a panic, where
     // the whole point of this function is to print a verdict.
-    const origin_served = body_exchanges + allowlist_refused + h2_tls_refused;
+    const origin_served = body_exchanges + allowlist_refused + h2_tls_refused + https_loop_refused;
     assert(lines.http >= origin_served);
     if (lines.http_with_origin_tag != lines.http - origin_served) {
         std.debug.print(
@@ -1093,12 +1116,12 @@ fn identitiesPassed(first: *const scrape_module.Scrape) bool {
         );
         passed = false;
     }
-    // Minus the four legs that deliberately run after this scrape (see
-    // `sticky_exchanges`, `body_exchanges`, `allowlist_exchanges` and
-    // `tls_requests`); the whole-run equality is asserted on the last of
-    // their scrapes.
+    // Minus the legs that deliberately run after this scrape (see
+    // `sticky_exchanges`, `body_exchanges`, `allowlist_exchanges`, the
+    // h2c, origin and TLS-loop legs, and `tls_requests`); the whole-run
+    // equality is asserted on the last of their scrapes.
     const opened_so_far = connections_expected - sticky_connections -
-        body_connections - allowlist_connections - h2c_connections - h2_origin_client_connections - h2_tls_connections - https_leg_connections;
+        body_connections - allowlist_connections - h2c_connections - h2_origin_client_connections - h2_tls_connections - https_loop_connections - https_leg_connections;
     if (accepted != opened_so_far) {
         std.debug.print(
             "FAIL: {d} connections accepted, not the {d} opened before this scrape\n",
@@ -1368,7 +1391,7 @@ fn stickyPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // the #159 and TLS legs open after it — the whole-run equality lands
     // on the last scrape of the run.
     const opened_by_here = connections_expected - body_connections -
-        allowlist_connections - h2c_connections - h2_origin_client_connections - h2_tls_connections - https_leg_connections;
+        allowlist_connections - h2c_connections - h2_origin_client_connections - h2_tls_connections - https_loop_connections - https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1420,7 +1443,7 @@ fn bodiesPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
     // Short the #331 and TLS legs' connections, which open after this
     // scrape; the last of them carries the whole-run equality.
     const opened_by_here = connections_expected - allowlist_connections - h2c_connections -
-        h2_origin_client_connections - h2_tls_connections - https_leg_connections;
+        h2_origin_client_connections - h2_tls_connections - https_loop_connections - https_leg_connections;
     const accepted = counterOf(&scrape, "accepted") orelse return false;
     if (accepted != opened_by_here) {
         std.debug.print(
@@ -1616,6 +1639,67 @@ fn h2TlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // The h2c leg's, the verified one, and the refused dial's.
         .{ .name = "h2_origin_connections", .expected = h2_origin_connections_total },
         .{ .name = "h2_origin_tls_failed", .expected = h2_tls_refused },
+    };
+    for (verdicts) |verdict| {
+        const value = counterOf(&scrape, verdict.name) orelse return false;
+        if (value != verdict.expected) {
+            std.debug.print("FAIL: {s} reads {d}, not {d}\n", .{ verdict.name, value, verdict.expected });
+            passed = false;
+        }
+    }
+    return passed;
+}
+
+/// The origin legs (§7, #296): the h2c origin, the `h2` loop and the HTTPS
+/// loop — each run whatever the one before it said, so one failing cannot
+/// hide another's verdict behind the run-wide equalities it would skew.
+fn originLegsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    enterStage(.h2_origin_leg);
+    const h2_origin_ok = try h2OriginPassed(arena, io, ports);
+    enterStage(.h2_tls_leg);
+    const h2_tls_ok = try h2TlsPassed(arena, io, ports);
+    const https_loop_ok = try httpsLoopPassed(arena, io, ports);
+    return h2_origin_ok and h2_tls_ok and https_loop_ok;
+}
+
+/// The #296 leg: the verified requests answered by the HTTP/1.1 origin
+/// through this proxy's own https listener, on one TLS connection the
+/// second rode parked; and the misnamed cluster's 502.
+fn httpsLoopPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
+    assert(ports.tls != 0);
+    enterStage(.https_loop_leg);
+    var passed = true;
+    var index: u32 = 0;
+    while (index < https_loop_exchanges) : (index += 1) {
+        var response_buffer: [4096]u8 = undefined;
+        const response = h2OriginExchange(io, ports.http, https_loop_prefix, &response_buffer) catch |err| {
+            std.debug.print("FAIL: the HTTPS origin leg's exchange {d} did not complete ({t})\n", .{ index, err });
+            return false;
+        };
+        const whole = std.mem.startsWith(u8, response, "HTTP/1.1 200 ") and
+            std.mem.endsWith(u8, response, "\r\n\r\n" ++ origin_module.body) and
+            std.mem.indexOf(u8, response, origin_module.tag_value) != null;
+        if (!whole) {
+            std.debug.print("FAIL: the HTTPS origin leg's exchange {d} came back:\n{s}\n", .{ index, response });
+            passed = false;
+        }
+    }
+    var refused_buffer: [1024]u8 = undefined;
+    const refused = h2OriginExchange(io, ports.http, https_loop_refused_prefix, &refused_buffer) catch |err| {
+        std.debug.print("FAIL: the misnamed HTTPS origin's exchange did not complete ({t})\n", .{err});
+        return false;
+    };
+    if (!std.mem.startsWith(u8, refused, "HTTP/1.1 502 ")) {
+        std.debug.print("FAIL: a misnamed HTTPS origin was not refused:\n{s}\n", .{refused});
+        passed = false;
+    }
+    const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
+    const verdicts = [_]struct { name: []const u8, expected: u64 }{
+        // One handshake for both verified requests: the second rode the
+        // parked connection with its session as it was.
+        .{ .name = "upstream_tls_handshakes", .expected = https_loop_handshakes },
+        .{ .name = "upstream_tls_failed", .expected = https_loop_refused },
+        .{ .name = "l7_shed_upstream_tls", .expected = 0 },
     };
     for (verdicts) |verdict| {
         const value = counterOf(&scrape, verdict.name) orelse return false;
@@ -1857,14 +1941,14 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // One session, completed: the handshake ran once and finished.
         // The https leg's own, and the §7 TLS leg's verified loop into
         // this proxy's own listener.
-        .{ .name = "tls_handshakes_completed", .expected = 1 + h2_tls_handshakes },
+        .{ .name = "tls_handshakes_completed", .expected = 1 + h2_tls_handshakes + https_loop_handshakes },
         // And nothing on the failure side. Stated as equalities against
         // zero rather than left unread, because every one of these is a
         // rung a working run must never reach — a session that failed and
         // silently retried would otherwise pass on the count above.
         // The §7 TLS leg's misnamed loop: this proxy's origin client
         // refused the chain, so its own listener saw the handshake end.
-        .{ .name = "tls_handshake_failed", .expected = h2_tls_refused },
+        .{ .name = "tls_handshake_failed", .expected = h2_tls_refused + https_loop_refused },
         // The #271 leg's one refusal — counted as a refusal, and so
         // *not* above: nothing failed, the client asked for `h2` and was
         // told no.
@@ -1874,7 +1958,10 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // that keeps a client's first request out of its own Nagle queue,
         // so a deployment issuing none has the ~45 ms stall back.
         // Every completed handshake is issued its tickets, the loop's too.
-        .{ .name = "tls_tickets_issued", .expected = (1 + h2_tls_handshakes) * tls_tickets_per_handshake },
+        .{
+            .name = "tls_tickets_issued",
+            .expected = (1 + h2_tls_handshakes + https_loop_handshakes) * tls_tickets_per_handshake,
+        },
         // And nothing resumed: this client is offered tickets and never
         // returns one, so a count here would mean the counter fires on
         // something other than resumption.
@@ -2354,9 +2441,9 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
     assert(ports.http != 0);
     const config_json = try std.fmt.allocPrint(arena, config_template, .{
         ports.http,
-        h2_origin_prefix,
-        h2_tls_prefix,
-        h2_tls_refused_prefix,
+        try std.fmt.allocPrint(arena, loop_routes_template, .{
+            h2_origin_prefix, h2_tls_prefix, h2_tls_refused_prefix, https_loop_prefix, https_loop_refused_prefix,
+        }),
         allowed_path,
         allowed_path,
         refused_path,
@@ -2371,6 +2458,7 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         origin_port,
         try std.fmt.allocPrint(arena, h2_clusters_template, .{
             h2_origin.port, health_probe_timeout_ms, ports.h2_tls, tls_cert_path, ports.h2_tls, tls_cert_path,
+            ports.tls,      tls_cert_path,           ports.tls,    tls_cert_path,
         }),
         not_found_body,
         robots_path,
@@ -2388,17 +2476,32 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = config_json });
 }
 
-/// The §7 legs' clusters: the h2c origin, and the two that loop through
-/// this proxy's own TLS listener — one naming the fixture's name, which
-/// verifies against the fixture pinned as its anchor, one naming another.
-/// Their own template, spliced into the main one, because one format call
-/// takes at most 32 arguments.
+/// The routes to the §7 and #296 legs' clusters, spliced into the main
+/// template for the same 32-argument reason as the clusters below.
+const loop_routes_template =
+    \\{{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "grpc" }},
+    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "loop" }},
+    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "loop_misnamed" }},
+    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "loop_https" }},
+    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "loop_https_misnamed" }}
+;
+
+/// The §7 and #296 legs' clusters: the h2c origin, the two `h2` ones that
+/// loop through this proxy's own `h2` listener, and the two HTTPS ones
+/// that loop through its https listener — each pair one naming the
+/// fixture's name, which verifies against the fixture pinned as its
+/// anchor, and one naming another. Their own template, spliced into the
+/// main one, because one format call takes at most 32 arguments.
 const h2_clusters_template =
     \\"grpc": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2c",
     \\            "check": {{ "type": "grpc", "timeout_ms": {d} }} }},
     \\        "loop": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2",
     \\            "tls": {{ "server_name": "spike.zoxy.test", "ca": {{ "path": "{s}" }} }} }},
     \\        "loop_misnamed": {{ "endpoints": ["127.0.0.1:{d}"], "protocol": "h2",
+    \\            "tls": {{ "server_name": "elsewhere.zoxy.test", "ca": {{ "path": "{s}" }} }} }},
+    \\        "loop_https": {{ "endpoints": ["127.0.0.1:{d}"],
+    \\            "tls": {{ "server_name": "spike.zoxy.test", "ca": {{ "path": "{s}" }} }} }},
+    \\        "loop_https_misnamed": {{ "endpoints": ["127.0.0.1:{d}"],
     \\            "tls": {{ "server_name": "elsewhere.zoxy.test", "ca": {{ "path": "{s}" }} }} }}
 ;
 
@@ -2422,9 +2525,7 @@ const config_template =
     \\          "routes": [
     \\              {{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }},
     \\              {{ "host": "127.0.0.1", "prefix": "/sticky", "cluster": "sticky" }},
-    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "grpc" }},
-    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "loop" }},
-    \\              {{ "host": "127.0.0.1", "prefix": "{s}", "cluster": "loop_misnamed" }}
+    \\              {s}
     \\          ],
     \\          "request_filters": [
     \\              {{ "match": {{ "path_prefix": "/robots.txt" }},
@@ -2477,7 +2578,8 @@ const config_template =
     \\        "relay_buffers": {d},
     \\        "upstream_slots": {d},
     \\        "tls_engines": {d},
-    \\        "stream_slots": {d}
+    \\        "stream_slots": {d},
+    \\        "upstream_tls_sessions": 2
     \\    }}
     \\}}
     \\
