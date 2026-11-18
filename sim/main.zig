@@ -62,31 +62,21 @@ const progress_interval: u64 = 500;
 /// run that hits this cap never reads as having cleared the remainder.
 const failures_max: u8 = 16;
 
-/// The smallest sweep whose census (see `Census`) is believed. Below it a
-/// range can miss a rung for want of seeds rather than for want of a
-/// path, so a replay — `zig build sim -- <seed> 1` — never fails on
-/// coverage.
+/// Minimum number of seeds required to check the coverage census.
+/// Shorter sweeps still check each seed's oracles and replay determinism.
 ///
-/// Measured, not guessed: 256 seeds cover the whole non-exempt set from
-/// every start tried (1, 5k, 100k, 777_777, 31_415_926), while 128 still
-/// leaves `upstream_replayed` silent and 64 leaves six rungs silent. This
-/// is four times the measured floor, and `ci`'s 4096 clears it with the
-/// same margin the sweep size itself was chosen for.
-///
-/// The thinnest rung sets the real bound, so it is worth knowing which,
-/// and it is not the one this comment first named. Per 1024 seeds across
-/// the starts above, `shed_draining` lands 11-25 times and
-/// `drained_at_deadline` 19-33 — but `upstream_replayed` lands 1-8, and
-/// the 1 is start 5000. It is the rung the paragraph above already caught
-/// standing alone at 128 seeds, so the floor rests on it rather than on
-/// either of the others. A change that pushes *it* down has made this
-/// floor a coin flip, whatever the sweep still says.
-///
-/// The two drain figures are lower than they were: a quarter of
-/// early-draining seeds now draw an unbounded deadline (§5), which by
-/// construction reaps nothing. They stayed two-digit, so the floor did
-/// not move — but that is what re-measuring them was for.
-const census_iterations_min: u64 = 1024;
+/// On adec501, 1024-seed sweeps from #364 missed `h2_shed_streams`,
+/// `shed_tls_engines` or `l7_sticky_followed`. Every required counter
+/// fired in 36 sweeps of 4096 seeds, including all five reported starts.
+/// Per sweep, `shed_tls_engines` fired in 3–20 seeds, `h2_shed_streams`
+/// in 4–20, `l7_shed_tunnels` in 4–20, and `upstream_replayed` in 5–20.
+/// The other counters named in #364, `l7_shed_head_buffers` and
+/// `l7_body_cut_mid_stream`, fired in 11–26 and 37–59 seeds respectively.
+const census_iterations_min: u64 = 4096;
+
+comptime {
+    assert(default_iterations >= census_iterations_min);
+}
 
 /// A counter the sweep expects to stay at (or under) zero, and why.
 const Uncovered = struct {
@@ -637,8 +627,8 @@ const Census = struct {
             const entry = entryFor(name);
             if (entry == null and total == 0) {
                 std.debug.print(
-                    "sim census: {s} never fired — no scenario reaches it; " ++
-                        "widen one, or exempt it and say what covers it instead\n",
+                    "sim census: {s} never fired in this sweep. " ++
+                        "Widen a scenario or exempt it and say what covers it instead\n",
                     .{name},
                 );
                 held = false;
