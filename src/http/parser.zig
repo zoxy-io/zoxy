@@ -393,7 +393,9 @@ pub const HeadCursor = struct {
 
 /// Runs hparse over the request line and headers, mapping its verdicts
 /// to head errors (§7): a head that cannot complete inside a full buffer
-/// is oversize, not partial (request line still open → 414, else 431);
+/// is oversize, not partial (request line still open → 414, else 431) —
+/// or malformed, when a cursor deferred judging bytes that are
+/// (`fullHeadVerdict`);
 /// Invalid is malformed; a full header array is load, not malice.
 fn parseRequestRaw(
     head: []const u8,
@@ -405,17 +407,54 @@ fn parseRequestRaw(
     const head_len = parseRequestBytes(head, raw, raw_headers, cursor) catch |err| switch (err) {
         error.Incomplete => {
             if (head_is_full) {
+                // A cursor defers judgement until a terminator arrives, so
+                // a full buffer with none may still hold a head the parser
+                // would refuse outright — and refused is what it means: a
+                // 400, not the oversize verdict a merely long head earns.
+                // Parsed once, here, where the buffer can grow no further.
+                if (cursor != null) return fullHeadVerdict(head, raw, raw_headers);
                 return oversizeRequestError(head);
             }
             return error.Incomplete;
         },
-        error.Invalid => return error.Malformed,
-        error.TooManyHeaders => return error.HeadTooLarge,
+        else => |refused| return refusedHeadError(refused),
     };
     assert(head_len >= 1);
     assert(head_len <= head.len);
     assert(raw.header_count <= constants.headers_max);
     return @intCast(head_len);
+}
+
+/// The verdict on a full head buffer the cursor found no terminator in:
+/// the one-shot parse's, which examines every byte the cursor only
+/// searched. Bounded by the buffer, and reached at most once per head.
+fn fullHeadVerdict(
+    head: []const u8,
+    raw: *RawRequest,
+    raw_headers: *[constants.headers_max]hparse.Header,
+) HeadError!u32 {
+    assert(head.len >= 1);
+    assert(head.len <= constants.head_buffer_bytes_max);
+    const head_len = parseRequestBytes(head, raw, raw_headers, null) catch |err| switch (err) {
+        error.Incomplete => return oversizeRequestError(head),
+        else => |refused| return refusedHeadError(refused),
+    };
+    // The cursor's search and the parser agree on where a head ends: a
+    // parse that completes here found the terminator the search missed.
+    assert(head_len >= 1);
+    assert(head_len <= head.len);
+    return @intCast(head_len);
+}
+
+/// What hparse's refusals of a head mean here, stated once for both parse
+/// paths: malformed, or more fields than the array holds.
+fn refusedHeadError(err: hparse.ParseRequestError) HeadError {
+    assert(err != error.Incomplete);
+    return switch (err) {
+        error.Invalid => error.Malformed,
+        error.TooManyHeaders => error.HeadTooLarge,
+        error.Incomplete => unreachable, // Asserted above.
+    };
 }
 
 /// One hparse call, through whichever entry point is cheaper right now.
@@ -2594,7 +2633,17 @@ fn checkCursorAgreesWithOneShot(input: []const u8, step: usize) void {
                 const got = pieced catch unreachable;
                 assert(got.head_len == expected.head_len);
             } else |expected| {
-                if (pieced) |_| unreachable else |got| assert(got == expected);
+                if (pieced) |_| unreachable else |got| {
+                    // With no terminator anywhere, the cursor has only
+                    // searched: "not yet" is honest, since the client may
+                    // still be sending. What it may not do is mean something
+                    // else once the buffer can take no more — checked below.
+                    if (got == error.Incomplete and std.mem.indexOf(u8, input, terminator) == null) {
+                        checkFullBufferAgrees(input, &cursor);
+                    } else {
+                        assert(got == expected);
+                    }
+                }
             }
             return;
         }
@@ -2610,6 +2659,19 @@ fn checkCursorAgreesWithOneShot(input: []const u8, step: usize) void {
         // A complete parse before the last byte means `input` holds a head
         // plus trailing bytes, which is a legitimate outcome.
         return;
+    }
+}
+
+/// An unterminated head the cursor deferred, once the buffer is full: the
+/// verdict the one-shot parse reaches on the same full buffer.
+fn checkFullBufferAgrees(input: []const u8, cursor: *HeadCursor) void {
+    assert(input.len >= 1);
+    var whole_storage: HeaderStorage = undefined;
+    const whole = parseRequestHead(input, true, &whole_storage, null);
+    var storage: HeaderStorage = undefined;
+    const pieced = parseRequestHead(input, true, &storage, cursor);
+    if (whole) |_| unreachable else |expected| {
+        if (pieced) |_| unreachable else |got| assert(got == expected);
     }
 }
 
@@ -2685,6 +2747,30 @@ test "fuzz: heads and chunked framing — parse or reject, no third outcome" {
             fuzz_corpus_chunked_trailer,
         },
     });
+}
+
+test "cursor: an unterminated head it deferred is refused as malformed once the buffer is full, not as oversize" {
+    // What the fuzzer found: a request line that is wrong from its first
+    // byte, arriving in pieces with no terminator. The cursor goes partial
+    // at the first piece — too short for hparse to judge — and only
+    // searches after that, so until the buffer fills it answers "not yet".
+    // Full, it must answer what the one-shot parse does: Malformed, a 400.
+    const head = "{GET / HTTP/1.1\r\nHost: a";
+    var storage: HeaderStorage = undefined;
+    var cursor: HeadCursor = .{};
+    var have: usize = 1;
+    while (have < head.len) : (have += 1) {
+        try testing.expectError(error.Incomplete, parseRequestHead(head[0..have], false, &storage, &cursor));
+    }
+    try testing.expectError(error.Malformed, parseRequestHead(head, true, &storage, &cursor));
+    try testing.expectError(error.Malformed, parseRequestHead(head, true, &storage, null));
+    // A long but well-formed head that never ends is still oversize.
+    const long = "GET /" ++ @import("../testing/bytes.zig").repeat("a", 64);
+    var long_cursor: HeadCursor = .{};
+    try testing.expectError(error.Incomplete, parseRequestHead(long[0..3], false, &storage, &long_cursor));
+    try testing.expectError(error.UriTooLong, parseRequestHead(long, true, &storage, &long_cursor));
+    checkCursorAgreesWithOneShot(head, 1);
+    checkCursorAgreesWithOneShot(head, 7);
 }
 
 // The cursor oracle, driven deterministically.
