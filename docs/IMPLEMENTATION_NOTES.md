@@ -2535,6 +2535,38 @@ the orderly failures (EOF, RST) are peeled off first. SimIo grew a
 one-shot `kernel_pressure` fault and a `kernel_pressure_percent`
 adversary knob to exercise the rung.
 
+## HTTP/2 to the origin, on the real binary (2026-11-18)
+
+The `h2 origin:` scenarios run the leg under `SimIo`. The one thing the
+simulator cannot vouch for is the leg's delivery: every op completes
+through a zero-delay `timerStart` on the exchange's own completion, and
+libxev's timer is what production runs. So the shipped binary was run by
+hand against Node's `http2` server as an h2c origin. The origin answered
+gRPC-shaped (`content-type: application/grpc`, a body, then trailers
+`grpc-status: 0` / `grpc-message: ok`), with curl as the client:
+
+- HTTP/1.1 client: the body arrives chunked and the trailers in the last
+  chunk's section, `te: trailers` reaches the origin.
+- h2c client (`--http2-prior-knowledge`): HEADERS, DATA, trailing HEADERS.
+- 8 × 300 KB answers multiplexed on one client connection, and 4 × 300 KB
+  over HTTP/1.1 in parallel: every one 200 and whole.
+- 1 MB uploads, both client protocols: the origin read 1 000 000 octets.
+- SIGTERM with origin connections open: drained and exited, the origin
+  connections closed. A dead origin: 502 on both protocols.
+- Counters at exit: `h2_origin_connections 3`, `h2_origin_idle_closed 3`.
+
+Open, and not settled here:
+- The live gate (`zig build smoke`) has no h2c origin yet. The harness
+  links only the `h2` codec, so it needs a small HTTP/2 server of its own.
+  Until then this run is the evidence for the libxev path.
+- `pickSlot` dials a second connection to an endpoint only when every one
+  it has carries `concurrent_streams_max` legs. Legs past the origin's own
+  `SETTINGS_MAX_CONCURRENT_STREAMS` wait for a stream to free rather than
+  spilling to a new connection; nothing counts that wait yet.
+- No gRPC health probe: an h2c cluster is checked by `tcp` probes only.
+- HTTP/2 to an origin over TLS waits on upstream TLS (#296), and needs
+  ALPN on the upstream handshake when it lands.
+
 ## Reached is not covered — the `@panic` probe (2026-07-28, #106)
 
 Five defects cleared 64 green sim seeds in one day (#106). One of them

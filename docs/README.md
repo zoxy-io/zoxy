@@ -650,7 +650,13 @@ HTTP/1.1 client chunked, so its trailer section has somewhere to go. To
 an HTTP/2 client it comes back as DATA and trailing HEADERS. That is
 what gRPC needs: a gRPC client over HTTP/2 (`h2c` or `h2` in ALPN on the
 listener) reaches a gRPC server in an `h2c` cluster, and `grpc-status`
-arrives in the trailers. Origins reached over TLS are not yet supported.
+arrives in the trailers. A streaming call is one exchange whose two
+halves run at once: the origin may answer while the request is still
+arriving, and the call ends once both have. `idle_ms` bounds a silence on
+it, refreshed by every message either way. `request_ms` (off by default)
+caps its whole length, so a deployment carrying long-lived streams leaves
+it off or sizes it for them. Origins reached over TLS are not yet
+supported.
 
 Two pools carry it, both zero unless some cluster speaks `h2c`.
 `limits.h2_origin_connections` bounds the origin connections, two per

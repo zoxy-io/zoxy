@@ -37,6 +37,10 @@ pub fn TestOrigin(comptime IoType: type) type {
         mute: bool = false,
         /// Answer with the head and the body, and never end the stream.
         stall_after_body: bool = false,
+        /// Answer at the request's head — the head and the body while the
+        /// request is still arriving — and end only once it has: a
+        /// bidirectional call's shape.
+        answer_at_head: bool = false,
         /// Refuse every stream past the first with GOAWAY naming it, the
         /// shape of an origin draining under a client.
         goaway_after_first: bool = false,
@@ -82,6 +86,7 @@ pub fn TestOrigin(comptime IoType: type) type {
         const Job = struct {
             stream: u31 = 0,
             started: bool = false,
+            request_ended: bool = false,
             head_sent: bool = false,
             body_offset: usize = 0,
         };
@@ -143,12 +148,19 @@ pub fn TestOrigin(comptime IoType: type) type {
                 if (origin.goaway_after_first and origin.requests == 1) conn.session.goAway();
                 const job = conn.jobOf(0) orelse return; // As many jobs as streams.
                 job.* = .{ .stream = request.stream };
+                if (origin.answer_at_head and !origin.mute) {
+                    job.started = true;
+                    conn.push(job);
+                }
                 if (request.end_stream) conn.requestEnded(request.stream);
             }
 
+            /// The request is whole: answer it — or, for one answered at its
+            /// head, push again, deliberately, to send the end that was held.
             fn requestEnded(conn: *Conn, stream: u31) void {
                 const job = conn.jobOf(stream) orelse return;
-                if (conn.origin.mute or job.started) return;
+                job.request_ended = true;
+                if (conn.origin.mute) return;
                 job.started = true;
                 conn.push(job);
             }
@@ -166,11 +178,13 @@ pub fn TestOrigin(comptime IoType: type) type {
                 assert(job.stream != 0);
                 if (!job.started) return;
                 var fields: [32]hpack.Field = undefined;
+                // A bidirectional answer ends only after the request has.
+                const holds = origin.answer_at_head and !job.request_ended;
                 if (!job.head_sent) {
                     fields[0] = .{ .name = ":status", .value = origin.status };
                     for (origin.headers, 1..) |pair, index| fields[index] = .{ .name = pair[0], .value = pair[1] };
                     const head = fields[0 .. origin.headers.len + 1];
-                    const ends = origin.body.len == 0 and origin.trailers.len == 0;
+                    const ends = origin.body.len == 0 and origin.trailers.len == 0 and !holds;
                     switch (conn.session.sendHead(job.stream, head, ends)) {
                         .staged => job.head_sent = true,
                         .blocked => return,
@@ -179,13 +193,13 @@ pub fn TestOrigin(comptime IoType: type) type {
                     if (ends) return conn.finished(job);
                 }
                 if (job.body_offset < origin.body.len) {
-                    const ends = origin.trailers.len == 0 and !origin.stall_after_body;
+                    const ends = origin.trailers.len == 0 and !origin.stall_after_body and !holds;
                     const sent = conn.session.sendData(job.stream, origin.body[job.body_offset..], ends);
                     job.body_offset += sent.taken;
                     if (job.body_offset < origin.body.len) return;
                     if (sent.ended) return conn.finished(job);
                 }
-                if (origin.stall_after_body) return;
+                if (origin.stall_after_body or holds) return;
                 if (origin.trailers.len == 0) {
                     // A body-less answer whose head did not end the stream.
                     const sent = conn.session.sendData(job.stream, &.{}, true);
