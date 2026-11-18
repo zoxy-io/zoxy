@@ -467,6 +467,14 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
         h2_head_staged: bool,
         /// Its END_STREAM is staged: the answer is whole on the session.
         h2_ended: bool,
+        /// The origin's trailer section as far as it has arrived, on a
+        /// chunked answer: octets the dechunk left behind the payload, in
+        /// the upstream head while the body rode the head, and in the
+        /// relay buffer's upstream half once it did not — moved to its
+        /// front before each further read, so a section split across reads
+        /// stays one run. Said as trailing HEADERS once the body is out
+        /// (`exchange.stageTrailers`). Empty until the last chunk.
+        h2_trailers: []u8,
         /// Its request body's way to the origin, on a shared stream.
         h2_body: H2Body,
         /// A multiplexed exchange is ending on its own, its connection
@@ -786,6 +794,7 @@ pub fn Stream(comptime IoType: type, comptime ConnType: type) type {
             stream.h2_next = null;
             stream.h2_head_staged = false;
             stream.h2_ended = false;
+            stream.h2_trailers = &.{};
             stream.h2_body = .{};
             stream.ending = false;
             stream.deadline_ns = 0;

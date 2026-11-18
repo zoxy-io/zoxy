@@ -1581,6 +1581,10 @@ comptime {
     assert(chunked_line_bytes_max >= 32);
     assert(chunked_line_bytes_max <= relay_buffer_bytes_min);
     assert(chunked_trailer_bytes_max >= chunked_line_bytes_max);
+    // An HTTP/2 answer gathers an unfinished trailer section at the front
+    // of the relay buffer's upstream half and reads behind it (#275): the
+    // scanner refuses a section before it outgrows the smallest half.
+    assert(chunked_trailer_bytes_max <= relay_buffer_bytes_min);
     // The watermarks must leave a hysteresis gap and never engage above
     // the pool's own capacity, checked at the production size.
     assert(poolPressureOn(relay_buffers_max) > poolPressureOff(relay_buffers_max));

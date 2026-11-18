@@ -18,9 +18,9 @@
 //!   classifies hop-by-hop, which include the `Connection` line the
 //!   renderer wrote for HTTP/1.1 persistence, and `transfer-encoding`,
 //!   whose chunking DATA frames replace — the body's framing comes back
-//!   as `framing`, for the relay to undo. `trailer` goes with it: the
-//!   relay carries a chunked body's payload, not its trailer section, so
-//!   a field announcing one would announce nothing. So does any field a
+//!   as `framing`, for the relay to undo. `trailer` goes with it: it is
+//!   advisory (RFC 9110 §6.6.2), and the section it announces arrives as
+//!   trailing HEADERS whether announced or not. So does any field a
 //!   `Connection` line nominates (RFC 9110 §7.6.1) — the renderer strips
 //!   those from what it forwards, and this holds any head to the same
 //!   rule rather than trust that it did — except the protected ones, as
@@ -131,6 +131,48 @@ pub fn responseHead(
         .head_len = parsed.head_len,
     };
 }
+
+/// Map a chunked body's trailer section — as `ChunkedScanner` passed it,
+/// from its first field line through the closing CRLF — to the trailing
+/// field section HTTP/2 sends (RFC 9113 §8.1). Names are lowercased into
+/// `out.bytes`; values are the section's octets, optional whitespace
+/// trimmed (RFC 9110 §5.5), and point into `section`.
+///
+/// The scanner already refused every name §7 decides (#244) and held the
+/// syntax to RFC 9112 §7.1.2, so nothing here has a second opinion on
+/// what may be said; a line that does not split as a field line is
+/// Malformed all the same, as a section no scanner passed would be.
+pub fn trailerFields(section: []const u8, out: *const Out) Error![]const hpack.Field {
+    assert(section.len >= crlf.len);
+    assert(section.len <= constants.chunked_trailer_bytes_max);
+    if (!std.mem.endsWith(u8, section, crlf)) return error.Malformed;
+    var count: u32 = 0;
+    var used: u32 = 0;
+    var rest = section;
+    // Every line takes at least its CRLF, so the section's length bounds it.
+    var lines: u32 = 0;
+    while (lines < section.len) : (lines += 1) {
+        const line_end = std.mem.indexOf(u8, rest, crlf) orelse return error.Malformed;
+        if (line_end == 0) break; // The closing CRLF.
+        const line = rest[0..line_end];
+        rest = rest[line_end + crlf.len ..];
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.Malformed;
+        if (colon == 0) return error.Malformed;
+        if (count == out.fields.len) return error.TooLarge;
+        if (colon > out.bytes.len - used) return error.TooLarge;
+        const name = out.bytes[used..][0..colon];
+        _ = std.ascii.lowerString(name, line[0..colon]);
+        used += @intCast(colon);
+        out.fields[count] = .{ .name = name, .value = std.mem.trim(u8, line[colon + 1 ..], " \t") };
+        count += 1;
+    } else unreachable; // The section ends in an empty line, found above.
+    // Nothing follows the closing CRLF: the scanner stops there.
+    if (rest.len != crlf.len) return error.Malformed;
+    assert(used <= out.bytes.len);
+    return out.fields[0..count];
+}
+
+const crlf = "\r\n";
 
 /// Whether a rendered field goes on to HTTP/2: anything but the
 /// connection-specific ones (§8.2.2), a `content-length` §8.6 forbids, the
@@ -246,6 +288,39 @@ test "response: §7's refusal of a CONNECT is framed as any answer, and a 2xx to
     try expectValid(refused.fields);
     // A 2xx would tell the client a tunnel is open.
     try testing.expectError(error.Malformed, fixture.map("HTTP/1.1 200 OK\r\n\r\n", .connect));
+}
+
+/// A trailer section HTTP/2 must be able to send.
+fn expectValidTrailers(fields: []const hpack.Field) !void {
+    var validator = MessageValidator.init(.{ .kind = .trailer, .rules = .strict });
+    for (fields) |*field| try validator.field(field);
+    try validator.finish();
+}
+
+test "response: a chunked body's trailer section becomes HTTP/2's trailing fields" {
+    var fixture: Fixture = .{};
+    const out: Out = .{ .fields = &fixture.fields, .bytes = &fixture.bytes };
+    const fields = try trailerFields("Grpc-Status: 0\r\nGrpc-Message:\tdone \r\nX-Empty:\r\n\r\n", &out);
+    try expectFields(&.{
+        .{ "grpc-status", "0" },
+        .{ "grpc-message", "done" },
+        .{ "x-empty", "" },
+    }, fields);
+    try expectValidTrailers(fields);
+    // The closing CRLF alone is a section with no field.
+    try testing.expectEqual(@as(usize, 0), (try trailerFields("\r\n", &out)).len);
+}
+
+test "response: a trailer section that does not split as field lines is refused" {
+    var fixture: Fixture = .{};
+    const out: Out = .{ .fields = &fixture.fields, .bytes = &fixture.bytes };
+    const malformed = [_][]const u8{ "X-A 1\r\n\r\n", ": v\r\n\r\n", "X-A: 1\r\n", "X-A: 1\r\n\r\nmore" };
+    for (malformed) |section| {
+        try testing.expectError(error.Malformed, trailerFields(section, &out));
+    }
+    // Room for one field only.
+    const narrow: Out = .{ .fields = fixture.fields[0..1], .bytes = &fixture.bytes };
+    try testing.expectError(error.TooLarge, trailerFields("A: 1\r\nB: 2\r\n\r\n", &narrow));
 }
 
 test "response: every connection-specific field goes, and the trailer announcement with them" {

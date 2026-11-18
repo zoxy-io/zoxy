@@ -728,18 +728,26 @@ pub const ChunkedScanner = struct {
         consumed: u32,
         /// The chunk data among them, moved to the front of the buffer.
         payload_len: u32,
+        /// How many of the consumed octets, counted back from `consumed`,
+        /// are the trailer section's — every octet after the last chunk's
+        /// size line, the closing CRLF included. They are left where they
+        /// arrived, behind the payload, for a recipient that carries a
+        /// trailer section in its own form (HTTP/2's trailing HEADERS).
+        trailer_len: u32,
         done: bool,
     };
 
     /// `feed`, keeping only the payload: of the octets consumed, the chunk
     /// data moves to the front of `bytes`, in order, and the framing —
-    /// sizes, extensions, terminators, trailers — is dropped. For a
-    /// recipient that frames a body itself (HTTP/2's DATA, #275) and wants
-    /// a chunked origin's octets without the chunking. The same scanner,
-    /// so the same verdicts: a stream `feed` refuses, this refuses too.
+    /// sizes, extensions, terminators — is dropped. For a recipient that
+    /// frames a body itself (HTTP/2's DATA, #275) and wants a chunked
+    /// origin's octets without the chunking. The same scanner, so the same
+    /// verdicts: a stream `feed` refuses, this refuses too.
     ///
     /// In place, because payload is never longer than the wire that
-    /// carried it, and each run moves only toward the front.
+    /// carried it, and each run moves only toward the front. The trailer
+    /// section is not moved: it is the tail of what was consumed, and the
+    /// payload, which precedes it on the wire, never reaches it.
     pub fn dechunk(scanner: *ChunkedScanner, bytes: []u8) Error!Dechunked {
         assert(bytes.len >= 1);
         assert(bytes.len <= std.math.maxInt(u32));
@@ -747,22 +755,34 @@ pub const ChunkedScanner = struct {
 
         var index: u32 = 0;
         var payload: u32 = 0;
+        var trailer: u32 = 0;
         while (index < bytes.len) {
             const in_data = scanner.state == .data;
+            const in_trailer = scanner.inTrailer();
             const consumed = try scanner.step(bytes[index..]);
             assert(consumed >= 1);
             if (in_data) {
                 std.mem.copyForwards(u8, bytes[payload..][0..consumed], bytes[index..][0..consumed]);
                 payload += consumed;
             }
+            if (in_trailer) trailer += consumed;
             index += consumed;
             assert(index <= bytes.len);
             if (scanner.state == .done) break;
         }
-        assert(payload <= index);
+        assert(payload + trailer <= index);
         const done = scanner.state == .done;
         if (!done) assert(index == bytes.len);
-        return .{ .consumed = index, .payload_len = payload, .done = done };
+        return .{ .consumed = index, .payload_len = payload, .trailer_len = trailer, .done = done };
+    }
+
+    /// Past the last chunk's size line: every octet from here to the end
+    /// of the message is the trailer section's.
+    pub fn inTrailer(scanner: *const ChunkedScanner) bool {
+        return switch (scanner.state) {
+            .trailer_start, .trailer_name, .trailer_value, .trailer_lf, .final_lf => true,
+            .size, .extension, .size_lf, .data, .data_cr, .data_lf, .done => false,
+        };
     }
 
     /// Consumes at least one byte: a whole run of chunk data, or exactly
@@ -2346,6 +2366,38 @@ test "chunked: dechunk keeps the payload and drops sizes, extensions and trailer
     try std.testing.expectEqualStrings("hello, world", wire[0..result.payload_len]);
     // The tail past the terminator is the next message's, never consumed.
     try std.testing.expectEqual(@as(u32, wire.len - 4), result.consumed);
+    // The trailer section is the consumed tail, left where it arrived.
+    const section = wire[result.consumed - result.trailer_len .. result.consumed];
+    try std.testing.expectEqualStrings("X-Sum: 1\r\n\r\n", section);
+}
+
+test "chunked: dechunk counts the trailer section across any split, and only it" {
+    const body = "3\r\nabc\r\n0\r\nGrpc-Status: 0\r\nGrpc-Message: ok\r\n\r\n";
+    const section = "Grpc-Status: 0\r\nGrpc-Message: ok\r\n\r\n";
+    for ([_]usize{ 1, 2, 5, 13, body.len }) |piece_max| {
+        var wire = body.*;
+        var scanner: ChunkedScanner = .{};
+        var offset: usize = 0;
+        var trailer: u32 = 0;
+        var kept: [section.len]u8 = undefined;
+        while (offset < wire.len) {
+            const piece = wire[offset..][0..@min(piece_max, wire.len - offset)];
+            const result = try scanner.dechunk(piece);
+            const tail = piece[result.consumed - result.trailer_len .. result.consumed];
+            @memcpy(kept[trailer..][0..tail.len], tail);
+            trailer += result.trailer_len;
+            offset += result.consumed;
+            if (result.done) break;
+        }
+        try std.testing.expectEqual(ChunkedScanner.State.done, scanner.state);
+        try std.testing.expectEqualStrings(section, kept[0..trailer]);
+        try std.testing.expectEqual(scanner.trailer_bytes, trailer);
+    }
+    // No trailer field: the section is its closing CRLF alone.
+    var bare = "2\r\nhi\r\n0\r\n\r\n".*;
+    var scanner: ChunkedScanner = .{};
+    const result = try scanner.dechunk(&bare);
+    try std.testing.expectEqual(@as(u32, 2), result.trailer_len);
 }
 
 test "chunked: dechunk refuses what feed refuses" {
