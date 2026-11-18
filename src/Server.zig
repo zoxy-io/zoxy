@@ -4324,6 +4324,7 @@ pub fn Server(comptime IoType: type) type {
             }
             var values: LoggedHeaderValues = undefined;
             const logged = server.loggedHeaderPair(stream, &values);
+            var client_cert_hex: [TlsEngine.client_fingerprint_hex_bytes]u8 = undefined;
             const entry: access_log_module.Record = .{
                 .kind = switch (stream.conn.protocol) {
                     .l4 => .l4,
@@ -4348,12 +4349,23 @@ pub fn Server(comptime IoType: type) type {
                 .upstream_replayed = stream.l7.replay_used,
                 .request_headers = logged.request,
                 .response_headers = logged.response,
+                .client_cert_sha256 = clientCertHex(stream.conn, &client_cert_hex),
             };
             // A duration is never negative once saturated, and a line
             // always names a start: both are what `renderLine` prints
             // without checking, so they are checked here.
             assert(entry.started_wall_ns != 0);
             server.access_log.record(&entry);
+        }
+
+        /// The connection's verified client fingerprint as hex (#304), or
+        /// null on a plaintext connection or one with no verified client.
+        fn clientCertHex(
+            conn: *const ConnType,
+            out: *[TlsEngine.client_fingerprint_hex_bytes]u8,
+        ) ?[]const u8 {
+            const engine = conn.tls orelse return null;
+            return engine.clientFingerprintHex(out);
         }
 
         /// Count what a pick did beyond dialing (#390): it chose an

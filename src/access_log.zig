@@ -153,6 +153,11 @@ pub const Record = struct {
     /// what it was for a deployment that did not ask.
     request_headers: NamedHeaders = .{},
     response_headers: NamedHeaders = .{},
+    /// The verified client's certificate fingerprint, lowercase hex, on
+    /// any line whose connection carried one (#304) — the same value the
+    /// origin received. Omitted otherwise, so a deployment without
+    /// mutual TLS writes the line it always did.
+    client_cert_sha256: ?[]const u8 = null,
 };
 
 /// One direction's logged headers: the configured names and the values
@@ -218,6 +223,11 @@ fn renderInto(record: *const Record, writer: *std.Io.Writer) std.Io.Writer.Error
         // `upstream` uses: "there is none" and "here is one" are
         // different facts, and a consumer must not have to guess.
         try writer.writeAll(",\"client\":null");
+    }
+    if (record.client_cert_sha256) |hex| {
+        // Hex digits only, so nothing here needs escaping.
+        assert(hex.len >= 1);
+        try writer.print(",\"client_cert_sha256\":\"{s}\"", .{hex});
     }
     if (record.kind == .http) {
         try renderHttpFields(record, writer);

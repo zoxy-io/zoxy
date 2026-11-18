@@ -91,6 +91,11 @@ pub const HeaderName = enum(u8) {
     /// copy and writes the decremented one itself, so the two spellings
     /// can never both reach the origin.
     max_forwards,
+    /// The verified client's certificate fingerprint this proxy writes
+    /// toward the origin (#304). Tagged so a client's own copy — on any
+    /// listener, mutual TLS or not — is stripped in O(1) rather than
+    /// forwarded as an identity it forged.
+    x_client_cert_sha256,
 
     /// Connection-specific headers (RFC 9110 §7.6.1): never forwarded.
     pub fn hopByHop(tag: HeaderName) bool {
@@ -100,7 +105,7 @@ pub const HeaderName = enum(u8) {
             // it travels the whole chain — and what each hop owes it is a
             // *decrement*, not removal (#240); stripping it would tell the
             // next hop the budget was never set.
-            .other, .host, .content_length, .transfer_encoding, .x_forwarded_for, .max_forwards => false,
+            .other, .host, .content_length, .transfer_encoding, .x_forwarded_for, .max_forwards, .x_client_cert_sha256 => false,
         };
     }
 
@@ -117,7 +122,7 @@ pub const HeaderName = enum(u8) {
             // no framing and unroutes nothing, which is what this list is
             // for. What a filter must not do to it is a different rule,
             // enforced where filters are compiled.
-            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => false,
+            .other, .connection, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards, .x_client_cert_sha256 => false,
         };
     }
 
@@ -136,6 +141,7 @@ pub const HeaderName = enum(u8) {
             .upgrade => "upgrade",
             .x_forwarded_for => "x-forwarded-for",
             .max_forwards => "max-forwards",
+            .x_client_cert_sha256 => "x-client-cert-sha256",
         };
     }
 };
@@ -161,6 +167,7 @@ pub fn classifyHeaderName(name: []const u8) HeaderName {
         15 => if (eql(name, "x-forwarded-for")) .x_forwarded_for else .other,
         16 => if (eql(name, "proxy-connection")) .proxy_connection else .other,
         17 => if (eql(name, "transfer-encoding")) .transfer_encoding else .other,
+        20 => if (eql(name, "x-client-cert-sha256")) .x_client_cert_sha256 else .other,
         else => .other,
     };
     return tag;
@@ -279,6 +286,9 @@ pub const RequestHead = struct {
     /// Whether a Connection token names a header to strip (§7). Carried
     /// from the analysis pass so rendering need not re-split the value.
     connection_nominates_header: bool,
+    /// Whether the client sent its own `X-Client-Cert-SHA256` (#304), so
+    /// the render strips it — and skips the check when it did not.
+    carries_client_cert: bool,
     head_len: u32,
 
     /// The authority this request names, which is what §7 routes on and
@@ -577,6 +587,7 @@ pub fn parseRequestHead(
         .framing = framing,
         .keep_alive = keepAliveDefault(version, &analysis),
         .connection_nominates_header = analysis.connection_nominates_header,
+        .carries_client_cert = analysis.carries_client_cert,
         .head_len = head_len,
     };
 }
@@ -1117,6 +1128,9 @@ const HeaderAnalysis = struct {
     /// already knows it — so it is recorded here rather than recomputed by
     /// splitting the same value a second time (§9).
     connection_nominates_header: bool,
+    /// Whether any header is a client's own `X-Client-Cert-SHA256`, which
+    /// the render must strip (#304).
+    carries_client_cert: bool,
 };
 
 /// Maps the `header_count` raw headers hparse left in `headers_storage.raw`
@@ -1183,6 +1197,10 @@ fn foldHeader(
         // let a garbage value on a POST reject a request the spec
         // says may ignore the field entirely (#240).
         .other, .keep_alive, .proxy_connection, .te, .upgrade, .x_forwarded_for, .max_forwards => {},
+        // Noted, never read: the render strips every inbound copy, and
+        // the flag is what lets it skip that check on the requests —
+        // nearly all of them — that carry none (#304).
+        .x_client_cert_sha256 => analysis.carries_client_cert = true,
     }
 }
 
@@ -1199,6 +1217,7 @@ fn analyzeHeaders(
         .connection_close = false,
         .connection_keep_alive = false,
         .connection_nominates_header = false,
+        .carries_client_cert = false,
     };
     for (headers_storage.raw[0..header_count], 0..) |raw_header, index| {
         assert(raw_header.key.len >= 1);

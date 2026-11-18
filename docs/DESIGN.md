@@ -889,7 +889,18 @@ Rules:
   `tls_client_cert_refused`, disjoint from `tls_handshake_failed`.
   The verified identity is the leaf's SHA-256 fingerprint: fixed width,
   allocation-free, unambiguous where a subject DN is not, and the form
-  operators already pin with. **Revocation is not checked** — CRLs and
+  operators already pin with. It reaches the origin as
+  `X-Client-Cert-SHA256` on each request — a per-request header rather
+  than a property of the pooled origin connection, which is what keeps
+  §3's cross-client reuse sound — and the access log as
+  `client_cert_sha256`. The header is `X-Forwarded-For`'s case with a
+  sharper edge: a header this proxy writes and a client can also write is
+  a forgery surface, so every inbound copy is stripped on every listener
+  (an origin behind a mutual-TLS listener may sit behind a plaintext one
+  too), and a filter may neither set nor remove it. The strip costs the
+  render nothing on the requests that carry none: the parser flags the
+  one that does, so the render's skip-everything path survives.
+  **Revocation is not checked** — CRLs and
   OCSP are unbounded work for a bounded-memory design, so short-lived
   certificates are the mitigation — and extended key usage is not read,
   so a client CA should issue client certificates alone. The engine

@@ -58,16 +58,18 @@ pub fn main() void {
             null,
         ) catch unreachable;
         const target = parser.canonicalTarget(request.target, &path_scratch) catch unreachable;
-        // Both `null`s are the shape to hold steady here: §7 client
-        // address forwarding is opt-in per listener and a hop budget is
-        // rarer still, so the case that must not regress is the one where
-        // both are off and the render's suppression tests are pure
-        // overhead.
+        // The three `null`s are the shape to hold steady here: §7 client
+        // address forwarding is opt-in per listener, a hop budget is
+        // rarer still, and a verified client certificate (#304) needs a
+        // mutual-TLS listener — so the case that must not regress is the
+        // one where all are off and the render's suppression tests are
+        // pure overhead.
         const upstream = render.renderRequestHead(
             &request,
             target,
             no_edits,
             false,
+            null,
             null,
             null,
             false,
