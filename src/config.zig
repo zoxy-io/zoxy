@@ -298,17 +298,6 @@ pub const Config = struct {
         /// terminates TLS, and the struct default is the off state on the
         /// same terms as `head_buffers`.
         tls_engines: u32 = 0,
-        /// Requests one client connection may serve before the next
-        /// response announces `Connection: close` (#237); `0` is
-        /// unlimited.
-        ///
-        /// In `limits` rather than beside a listener's policy, and the
-        /// distinction is the one `max_body_bytes` draws from the other
-        /// side: a body cap states what an *origin* should be asked to
-        /// carry, while this bounds what one client may occupy *here*.
-        /// `cq_fill_eighths` sits in this block on the same terms — not a
-        /// pool size, but a knob about this process's own resources.
-        keepalive_requests: u32 = constants.keepalive_requests_default,
         /// The §5 tunnel pool (#180): how many upgraded connections may be
         /// carried at once, each holding its own relay buffer and upstream
         /// socket for its whole life rather than drawing from the shared
@@ -1747,8 +1736,6 @@ fn resolveLimits(
         .h2_origin_connections = origin_pools.connections,
         .h2_origin_streams = origin_pools.streams,
         .upstream_tls_sessions = origin_pools.upstream_tls_sessions,
-        .keepalive_requests = limits_json.keepalive_requests orelse
-            constants.keepalive_requests_default,
         .cq_fill_eighths = cq_fill_eighths,
         .access_log_buffer_bytes = access_log_buffer_bytes,
     };
@@ -2349,9 +2336,6 @@ pub const LimitsJson = struct {
     /// TLS sessions to HTTP/1.1 origins (#296): defaulted, and only legal
     /// where some `http1` cluster has `tls`.
     upstream_tls_sessions: ?u32 = null,
-    /// Optional #237 keep-alive request cap; absent means nginx's 1000,
-    /// `0` is unlimited.
-    keepalive_requests: ?u32 = null,
     cq_fill_eighths: ?u32 = null,
     access_log_buffer_bytes: ?u32 = null,
 
@@ -2416,13 +2400,6 @@ pub const LimitsJson = struct {
                 "terminates TLS.",
             .minimum = 1,
             .maximum = constants.tls_engines_max,
-        },
-        .keepalive_requests = .{
-            .desc = "Requests one client connection may serve before the next " ++
-                "response announces Connection: close; absent means 1000, " ++
-                "0 is unlimited.",
-            .minimum = 0,
-            .maximum = std.math.maxInt(u32),
         },
         .tunnels = .{
             .desc = "Concurrent tunnelled upgrades. Each holds its own relay " ++
@@ -2579,6 +2556,10 @@ pub const HttpListenerJson = struct {
     /// config — `drain_deadline_ms`, `max_lifetime_ms`, `request_ms` —
     /// already spells "no cap" as `0` with no third state to explain.
     max_body_bytes: u64 = constants.request_body_bytes_default,
+    /// The #237 keep-alive request cap, `0` serving any number. Beside
+    /// `max_body_bytes` on §5's placement rule: it reserves nothing, so
+    /// it is policy on the thing it governs, not a `limits` entry (#399).
+    keepalive_requests: u32 = constants.keepalive_requests_default,
     /// Whether this listener names *why* it refused, in an RFC 9209
     /// `Proxy-Status` field (#300). Absent is off.
     proxy_status: bool = false,
@@ -2613,6 +2594,13 @@ pub const HttpListenerJson = struct {
                 "happens before the origin is dialed.",
             .minimum = 0,
             .maximum = constants.request_body_bytes_max,
+        },
+        .keepalive_requests = .{
+            .desc = "Requests one client connection may serve before the next " ++
+                "response announces Connection: close (on HTTP/2, streams " ++
+                "before GOAWAY); absent is 1000, and 0 is unlimited.",
+            .minimum = 0,
+            .maximum = std.math.maxInt(u32),
         },
         .proxy_status = .{
             .desc = "Say why zoxy refused a request in an RFC 9209 Proxy-Status " ++
@@ -4618,6 +4606,7 @@ fn resolveHttpListener(
         .tls = tls,
         .upgrades = try resolveUpgrades(http_json.upgrades),
         .max_body_bytes = try resolveMaxBodyBytes(http_json.max_body_bytes),
+        .keepalive_requests = http_json.keepalive_requests,
         .proxy_status = http_json.proxy_status,
         .h2c = try resolveH2c(http_json.h2c, tls),
     };
@@ -9723,6 +9712,48 @@ test "config: the body cap is two-valued, and 0 is how uncapped is spelled (#305
         error.UnknownField,
         "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
             "\"max_body_bytes\":500}}]," ++
+            "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+            "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
+    );
+}
+
+test "config: the keep-alive cap is the http listener's, and reaches it (#399)" {
+    // The value has to arrive on `Config.Listener`, because that is the
+    // copy `Server` hands each connection. #305's leaf pass moved the
+    // read there and left the key in `limits`, so for four releases the
+    // documented spelling was refused and the accepted one went unread —
+    // and the proxy tests, which set the listener directly, could not
+    // tell. Asserting the resolved listener is what they skip.
+    const head = "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"http\":{\"cluster\":\"a\"";
+    // The root object left open, so the negative case below can add a
+    // sibling block without slicing a closing brace back off.
+    const tail_open = "}}],\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
+        "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}";
+    const tail = tail_open ++ "}";
+    const cases = [_]struct { field: []const u8, expected: u32 }{
+        .{ .field = "", .expected = constants.keepalive_requests_default },
+        .{ .field = ",\"keepalive_requests\":5", .expected = 5 },
+        .{ .field = ",\"keepalive_requests\":0", .expected = 0 },
+    };
+    comptime assert(constants.keepalive_requests_default != 5);
+    comptime assert(constants.keepalive_requests_default != 0);
+    inline for (cases) |case| {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ case.field ++ tail);
+        try std.testing.expectEqual(case.expected, parsed.listeners[0].keepalive_requests);
+    }
+    // The old home is gone rather than kept as a second spelling: a key
+    // that parsed and did nothing is the bug, not a compatibility shim.
+    try expectParseError(
+        error.UnknownField,
+        head ++ tail_open ++ ",\"limits\":{\"keepalive_requests\":5}}",
+    );
+    // An l4 relay counts no requests, so the key does not exist there.
+    try expectParseError(
+        error.UnknownField,
+        "{\"listeners\":[{\"bind\":\"127.0.0.1:1\",\"l4\":{\"cluster\":\"a\"," ++
+            "\"keepalive_requests\":5}}]," ++
             "\"clusters\":{\"a\":{\"endpoints\":[\"127.0.0.1:2\"]}}," ++
             "\"timeouts\":{\"connect_ms\":1,\"idle_ms\":2,\"drain_deadline_ms\":1}}",
     );
