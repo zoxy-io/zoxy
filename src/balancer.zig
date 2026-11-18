@@ -682,17 +682,47 @@ pub const Balancer = struct {
     ) u16 {
         assert(eligible.len >= 1);
         assert(eligible.len <= cluster.endpoints.len);
-        const cap = cluster.max_inflight orelse return @intCast(eligible.len);
-        assert(cap >= 1);
+        const full_cap = cluster.max_inflight orelse return @intCast(eligible.len);
+        assert(full_cap >= 1);
         var under: u16 = 0;
         for (eligible) |index| {
-            if (load.inFlight(keys.key(cluster_index, index)) < cap) {
+            const key = keys.key(cluster_index, index);
+            // #391: an endpoint inside its slow-start window gets a cap
+            // that ramps from 1 toward `max_inflight` as the window runs.
+            const cap = if (cluster.slow_start_ms) |window_ms|
+                rampedCap(full_cap, window_ms, load.restoredAt(key), load.now_ns)
+            else
+                full_cap;
+            if (load.inFlight(key) < cap) {
                 eligible[under] = index;
                 under += 1;
             }
         }
         assert(under <= eligible.len);
         return under;
+    }
+
+    /// `cap` as it stands `now_ns - restored_at_ns` into a `window_ms`
+    /// slow start (#391): linear from 1 at the restore to the full cap at
+    /// the window's end, never 0 — a restored endpoint that could take no
+    /// work at all would never show it had recovered. An endpoint never
+    /// restored (`restored_at_ns == 0`) is past any window.
+    pub fn rampedCap(cap: u32, window_ms: u32, restored_at_ns: u64, now_ns: u64) u32 {
+        assert(cap >= 1);
+        assert(window_ms >= 1);
+        if (restored_at_ns == 0) return cap;
+        assert(now_ns >= restored_at_ns);
+        // Milliseconds, not nanoseconds: the product below is then at most
+        // `endpoint_inflight_max * timeout_ms_max`, which `u64` holds with
+        // room to spare — where the same product in nanoseconds would not.
+        comptime assert(@as(u128, constants.endpoint_inflight_max) * constants.timeout_ms_max <
+            std.math.maxInt(u64));
+        const elapsed_ms = (now_ns - restored_at_ns) / std.time.ns_per_ms;
+        if (elapsed_ms >= window_ms) return cap;
+        const ramped: u64 = @as(u64, cap) * elapsed_ms / window_ms;
+        const result: u32 = @intCast(@max(1, ramped));
+        assert(result >= 1 and result <= cap);
+        return result;
     }
 
     /// Whether this request has already dialed `endpoint_index` and had
@@ -1630,6 +1660,56 @@ test "balancer: a cluster at its total cap refuses a first try, never a retry (#
     // The single-endpoint fast path does not skip the cap.
     l7[keys.key(1, 0)] = 1;
     try std.testing.expect(balancer.pick(1, &testLoad(&l7), &test_healthy_all, &test_client, .none, test_untried) == .cluster_capped);
+}
+
+test "balancer: a slow-start cap ramps from 1 to the full cap over its window (#391)" {
+    const ms = std.time.ns_per_ms;
+    const back: u64 = 10_000 * ms;
+    // Never restored: no window to be inside.
+    try std.testing.expectEqual(@as(u32, 8), Balancer.rampedCap(8, 1_000, 0, back));
+    // The instant it came back: one, never zero.
+    try std.testing.expectEqual(@as(u32, 1), Balancer.rampedCap(8, 1_000, back, back));
+    // Linear through the window, floored at one.
+    try std.testing.expectEqual(@as(u32, 4), Balancer.rampedCap(8, 1_000, back, back + 500 * ms));
+    try std.testing.expectEqual(@as(u32, 1), Balancer.rampedCap(8, 1_000, back, back + 100 * ms));
+    // The window's end and past it: the configured cap.
+    try std.testing.expectEqual(@as(u32, 8), Balancer.rampedCap(8, 1_000, back, back + 1_000 * ms));
+    try std.testing.expectEqual(@as(u32, 8), Balancer.rampedCap(8, 1_000, back, back + 60_000 * ms));
+}
+
+test "balancer: a just-restored endpoint is capped below max_inflight until its ramp catches up (#391)" {
+    const pair = [_]io_module.Address{ ipEndpoint("127.0.0.1:1"), ipEndpoint("127.0.0.1:2") };
+    const clusters = [_]config_module.Config.Cluster{
+        .{ .name = "pair", .endpoints = &pair, .pick = .rr, .max_inflight = 4, .slow_start_ms = 1_000 },
+    };
+    const config = testConfig(&clusters);
+    const keys = testKeysFor(&config);
+
+    var balancer_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer balancer_arena.deinit();
+    var balancer: Balancer = undefined;
+    try balancer.init(balancer_arena.allocator(), &config, keys);
+
+    // Endpoint 0 came back 250 ms ago — a quarter of the window, so its
+    // cap is 1 of 4 — and already carries one request. Endpoint 1 was
+    // never ejected. Every pick goes to endpoint 1 until 0's ramp rises.
+    var l7: [test_counts_len]u16 = @splat(0);
+    l7[keys.key(0, 0)] = 1;
+    var restored: [test_keys.count]u64 = @splat(0);
+    const now_ns: u64 = 20 * std.time.ns_per_s;
+    restored[keys.key(0, 0)] = now_ns - 250 * std.time.ns_per_ms;
+    const ramping: upstream.Load = .{ .l7 = &l7, .l4 = &test_l4_idle, .restored_at_ns = &restored, .now_ns = now_ns };
+    for (0..4) |_| {
+        const picked = balancer.pick(0, &ramping, &test_healthy_all, &test_client, .none, test_untried).dial;
+        try std.testing.expectEqual(@as(u16, 1), picked.endpoint_index);
+    }
+    // Past the window the same load is under the full cap of four.
+    const settled: upstream.Load = .{ .l7 = &l7, .l4 = &test_l4_idle, .restored_at_ns = &restored, .now_ns = now_ns + std.time.ns_per_s };
+    var reached_zero = false;
+    for (0..4) |_| {
+        if (balancer.pick(0, &settled, &test_healthy_all, &test_client, .none, test_untried).dial.endpoint_index == 0) reached_zero = true;
+    }
+    try std.testing.expect(reached_zero);
 }
 
 test "balancer: policies keep independent state across clusters" {

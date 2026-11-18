@@ -320,6 +320,22 @@ pub const Load = struct {
     /// bound below is read off the slice rather than a constant.
     l7: []const u16,
     l4: []const u16,
+    /// #391's slow start reads when each endpoint last came back into
+    /// rotation — the prober's own stamps, borrowed like the two tables
+    /// above — against the loop's clock. Empty where nothing restores (a
+    /// view built without a prober), which every endpoint reads as "never
+    /// restored": full capacity, the rule before slow start.
+    restored_at_ns: []const u64 = &.{},
+    now_ns: u64 = 0,
+
+    /// When this endpoint last came back into rotation, or 0 for never.
+    pub fn restoredAt(load: *const Load, key: u32) u64 {
+        if (load.restored_at_ns.len == 0) return 0;
+        assert(load.restored_at_ns.len == load.l7.len);
+        const restored_at_ns = load.restored_at_ns[key];
+        assert(restored_at_ns <= load.now_ns);
+        return restored_at_ns;
+    }
 
     /// Total in-flight work against one endpoint. `u32` because the two
     /// ceilings sum past a `u16`'s range in principle, even though no

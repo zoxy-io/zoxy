@@ -1180,6 +1180,27 @@ This is the one limit that fails **closed**. When every endpoint is
 ejected, zoxy does not know whether they work, so trying beats refusing.
 When every endpoint is at its cap, zoxy knows they are full.
 
+An endpoint coming back from ejection is otherwise handed its full cap at
+once, and the first to recover after an outage can take every new
+request and fall over again. `slow_start_ms` ramps it instead:
+
+```json
+"api": {
+    "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080"],
+    "check": { "type": "http", "path": "/healthz" },
+    "max_inflight": 100,
+    "slow_start_ms": 30000
+}
+```
+
+For 30 s after an endpoint is restored, by a health check's `rise` or a
+passive cooldown ending, its cap rises linearly from 1 to 100. Requests
+that do not fit go to other endpoints, or are shed with `503` like any
+capped request when none has room. `slow_start_ms` requires `max_inflight`
+and `check` or `passive_ejection`. The effective cap is not exported as
+its own gauge; `zoxy_endpoint_inflight` and the endpoint-cap shed
+counters show the ramp at work.
+
 Both protocols count against the same figure: an in-flight HTTP request and
 a live L4 connection are each one unit of work.
 `zoxy_l7_shed_endpoint_inflight` and `zoxy_l4_shed_endpoint_inflight` count
