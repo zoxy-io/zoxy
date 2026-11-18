@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const constants = @import("../constants.zig");
+const fuzzSeed = @import("../testing/bytes.zig").fuzzSeed;
 
 const assert = std.debug.assert;
 
@@ -52,7 +53,32 @@ pub const Parsed = union(enum) {
     /// no `server_name` extension — a real and common case (an IP-only
     /// client, an old stack), distinct from a malformed hello and routed
     /// differently: absent takes the any-SNI route, invalid does not.
-    ok: struct { server_name: ?[]const u8 },
+    ok: Hello,
+};
+
+/// What a well-formed ClientHello told us.
+pub const Hello = struct {
+    server_name: ?[]const u8,
+    /// The `signature_algorithms` list (RFC 8446 §4.2.3) as it came off
+    /// the wire, big-endian u16 schemes, or null when absent or not
+    /// well-formed. Read for #411's choice between an ECDSA and an RSA
+    /// certificate; never a reason to call the hello invalid, which stays
+    /// the server name's verdict alone, so an L4 route never turns on it.
+    signature_algorithms: ?[]const u8 = null,
+
+    /// Whether the client offered `scheme`. A hello that carried no list
+    /// offered nothing, which is what TLS 1.3 says it means for a
+    /// certificate-authenticated handshake.
+    pub fn offersScheme(hello: *const Hello, scheme: u16) bool {
+        const list = hello.signature_algorithms orelse return false;
+        assert(list.len % 2 == 0);
+        assert(list.len >= 2);
+        var index: usize = 0;
+        while (index < list.len) : (index += 2) {
+            if (std.mem.readInt(u16, list[index..][0..2], .big) == scheme) return true;
+        }
+        return false;
+    }
 };
 
 /// TLS record: content type, 2-byte legacy version, 2-byte length.
@@ -66,6 +92,7 @@ const handshake_type_client_hello: u8 = 0x01;
 const client_hello_fixed_bytes: u32 = 34;
 
 const extension_server_name: u16 = 0;
+const extension_signature_algorithms: u16 = 13;
 const name_type_host_name: u8 = 0;
 
 /// The shortest input that could complete: a record header, a handshake
@@ -178,8 +205,14 @@ fn parseHandshake(fragment: []const u8) Parsed {
     return parseExtensions(extensions);
 }
 
+/// The walk reads on past `server_name` for #411's `signature_algorithms`,
+/// but the verdict is unchanged from a walk that stopped there: once a
+/// name has parsed, nothing after it can make the hello invalid — it ends
+/// the walk instead — so an L4 route decides exactly as it did before.
 fn parseExtensions(extensions: []const u8) Parsed {
     var cursor: Cursor = .{ .bytes = extensions };
+    var hello: Hello = .{ .server_name = null };
+    var named = false;
     // Bounded by the input: every turn consumes at least the 4-byte
     // extension header, so this cannot run longer than a quarter of it.
     var seen: u32 = 0;
@@ -187,14 +220,44 @@ fn parseExtensions(extensions: []const u8) Parsed {
         assert(seen <= constants.client_hello_bytes_max / 4);
         seen += 1;
         const kind = cursor.takeInt(u16) orelse return .invalid;
-        const body = cursor.takeVector(u16) orelse return .invalid;
+        const body = cursor.takeVector(u16) orelse
+            return if (named) .{ .ok = hello } else .invalid;
+        // RFC 8446 §4.2 forbids a second extension of one type; the first
+        // of each is the answer, as the first `server_name` always was.
+        if (kind == extension_signature_algorithms) {
+            if (hello.signature_algorithms == null) hello.signature_algorithms = schemeList(body);
+            continue;
+        }
         if (kind != extension_server_name) continue;
-        return parseServerName(body);
+        if (named) continue;
+        switch (parseServerName(body)) {
+            .ok => |found| hello.server_name = found.server_name,
+            .invalid => return .invalid,
+            // The body is a whole extension already cut out of a whole
+            // record, so there is nothing more to wait for:
+            // `parseServerName` answers `ok` or `invalid`, never this.
+            .need_more => unreachable,
+        }
+        named = true;
     }
     // Trailing bytes that are not a whole extension header are a lie
-    // about the extensions vector's length.
-    if (cursor.remaining() != 0) return .invalid;
-    return .{ .ok = .{ .server_name = null } };
+    // about the extensions vector's length — judged only where the walk
+    // that stopped at the name would have reached them.
+    if (cursor.remaining() != 0) {
+        if (!named) return .invalid;
+    }
+    return .{ .ok = hello };
+}
+
+/// `SignatureSchemeList`: `supported_signature_algorithms<2..2^16-2>`, an
+/// even, non-empty run of u16s. Anything else is null — the client offered
+/// nothing usable, and zssl gives that hello its own verdict.
+fn schemeList(body: []const u8) ?[]const u8 {
+    var cursor: Cursor = .{ .bytes = body };
+    const list = cursor.takeVector(u16) orelse return null;
+    if (cursor.remaining() != 0) return null;
+    if (list.len < 2 or list.len % 2 != 0) return null;
+    return list;
 }
 
 /// RFC 6066 §3's `ServerNameList`. Only `host_name` is defined, and the
@@ -378,6 +441,58 @@ test "client_hello: a hello naming a server routes on that name" {
     try testing.expectEqualStrings("api.example.com", parsed.ok.server_name.?);
 }
 
+test "client_hello: signature_algorithms is read on either side of the name, never judged (#411)" {
+    // ecdsa_secp256r1_sha256, then rsa_pss_rsae_sha256.
+    const algorithms = [_]u8{ 0, 13, 0, 6, 0, 4, 0x04, 0x03, 0x08, 0x04 };
+    var sni_buffer: [64]u8 = undefined;
+    const sni = sniExtension(&sni_buffer, "api.example.com");
+    var extensions: [128]u8 = undefined;
+    var builder: Builder = .{};
+    inline for (.{ true, false }) |algorithms_first| {
+        const first: []const u8 = if (algorithms_first) &algorithms else sni;
+        const second: []const u8 = if (algorithms_first) sni else &algorithms;
+        @memcpy(extensions[0..first.len], first);
+        @memcpy(extensions[first.len..][0..second.len], second);
+        const parsed = parse(builder.hello(extensions[0 .. first.len + second.len]));
+        try testing.expectEqualStrings("api.example.com", parsed.ok.server_name.?);
+        try testing.expect(parsed.ok.offersScheme(0x0403));
+        try testing.expect(parsed.ok.offersScheme(0x0804));
+        try testing.expect(!parsed.ok.offersScheme(0x0805));
+    }
+    // A malformed list is no list, and not a malformed hello: the L4
+    // route still turns on the name alone.
+    const odd = [_]u8{ 0, 13, 0, 3, 0, 1, 0x04 };
+    @memcpy(extensions[0..sni.len], sni);
+    @memcpy(extensions[sni.len..][0..odd.len], &odd);
+    const parsed = parse(builder.hello(extensions[0 .. sni.len + odd.len]));
+    try testing.expectEqualStrings("api.example.com", parsed.ok.server_name.?);
+    try testing.expect(parsed.ok.signature_algorithms == null);
+    // A truncated extension after the name ends the walk, as stopping at
+    // the name always did; before it, the hello is invalid, as it was.
+    const truncated = [_]u8{ 0, 13, 0, 9, 0 };
+    @memcpy(extensions[sni.len..][0..truncated.len], &truncated);
+    try testing.expect(parse(builder.hello(extensions[0 .. sni.len + truncated.len])) == .ok);
+    @memcpy(extensions[0..truncated.len], &truncated);
+    @memcpy(extensions[truncated.len..][0..sni.len], sni);
+    try testing.expect(parse(builder.hello(extensions[0 .. truncated.len + sni.len])) == .invalid);
+}
+
+test "client_hello: bytes past a whole hello's record leave its verdict as it was" {
+    // What the fuzzer found the oracle wrong about: a record followed by
+    // more bytes. The parser reads one record, so the verdict is decided
+    // at its end and every longer input repeats it.
+    var extension_buffer: [128]u8 = undefined;
+    const extensions = sniExtension(&extension_buffer, "api.example.com");
+    var builder: Builder = .{};
+    const bytes = builder.hello(extensions);
+    var trailing: [256]u8 = undefined;
+    @memcpy(trailing[0..bytes.len], bytes);
+    @memcpy(trailing[bytes.len..][0..5], &[_]u8{ 0x17, 0x03, 0x03, 0x00, 0x01 });
+    const parsed = parse(trailing[0 .. bytes.len + 5]);
+    try testing.expectEqualStrings("api.example.com", parsed.ok.server_name.?);
+    checkParse(trailing[0 .. bytes.len + 5]);
+}
+
 test "client_hello: absent is a verdict, not an error" {
     // Two legal shapes carry no name, and both route the any-SNI way
     // rather than being refused: no extensions vector at all (TLS 1.2),
@@ -475,6 +590,11 @@ test "client_hello: a real OpenSSL hello parses" {
     const parsed = parse(captured);
     try testing.expect(parsed == .ok);
     try testing.expectEqualStrings("real.example.com", parsed.ok.server_name.?);
+    // #411: what it offers to verify — ecdsa_secp256r1_sha256 and
+    // rsa_pss_rsae_sha256, which RFC 8446 §9.1 makes every client's.
+    try testing.expect(parsed.ok.offersScheme(0x0403));
+    try testing.expect(parsed.ok.offersScheme(0x0804));
+    try testing.expect(!parsed.ok.offersScheme(0xfefe));
 
     // And it obeys the monotonic contract too, which the builder cases
     // can only claim for the shape they happen to build.
@@ -498,15 +618,37 @@ fn checkParse(input: []const u8) void {
             assert(@intFromPtr(name.ptr) >= @intFromPtr(input.ptr));
             assert(@intFromPtr(name.ptr) + name.len <= @intFromPtr(input.ptr) + input.len);
         }
+        if (parsed.ok.signature_algorithms) |list| {
+            // The same view property, and the list's own shape (#411).
+            assert(list.len >= 2);
+            assert(list.len % 2 == 0);
+            assert(@intFromPtr(list.ptr) >= @intFromPtr(input.ptr));
+            assert(@intFromPtr(list.ptr) + list.len <= @intFromPtr(input.ptr) + input.len);
+        }
     }
     // Monotonicity, the accumulate-and-retry contract (module header):
     // an input not yet judged `.invalid` must read `.need_more` at every
-    // strict prefix, or a connection whose next segment completed the
-    // hello would have been torn down mid-handshake.
+    // strict prefix of its record, or a connection whose next segment
+    // completed the hello would have been torn down mid-handshake. Past
+    // the record's end the verdict is already decided and stays decided —
+    // bytes after the record are never read, and the caller stopped at
+    // the first verdict anyway. The earlier oracle demanded `need_more`
+    // there too, and was wrong; it went unseen because the fuzz seeds were
+    // bare and lost their first four octets, so no run ever started from
+    // a whole hello and appended to it.
     if (parsed != .invalid) {
+        var decided = false;
         var prefix_len: usize = 0;
         while (prefix_len < input.len) : (prefix_len += 1) {
-            assert(parse(input[0..prefix_len]) == .need_more);
+            const verdict = parse(input[0..prefix_len]);
+            if (verdict == .need_more) {
+                assert(!decided);
+                continue;
+            }
+            decided = true;
+            assert(std.meta.activeTag(verdict) == std.meta.activeTag(parsed));
+            if (verdict == .ok) assert(verdict.ok.server_name == null or
+                parsed.ok.server_name.?.ptr == verdict.ok.server_name.?.ptr);
         }
     }
 }
@@ -526,9 +668,13 @@ const fuzz_corpus_named = blk: {
 
 test "fuzz: client hello — parse or reject, no third outcome" {
     try std.testing.fuzz({}, fuzzParseInputs, .{
+        // Length-prefixed, as `Smith.slice` reads every corpus entry: a
+        // bare one loses its first four octets and never reaches the
+        // target as written. The OpenSSL capture carries
+        // signature_algorithms, so the #411 walk starts seeded too.
         .corpus = &.{
-            fuzz_corpus_named,
-            @embedFile("testdata/client_hello_openssl.bin"),
+            fuzzSeed(fuzz_corpus_named),
+            fuzzSeed(@embedFile("testdata/client_hello_openssl.bin")),
         },
     });
 }

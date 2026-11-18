@@ -371,6 +371,16 @@ const uncovered = [_]Uncovered{
             "either, which is the honest gap",
     },
     .{
+        .name = "tls_rsa_signed",
+        .why = .unreached,
+        .reason = "the sweep's listeners sign ECDSA under RFC 6979 nonces so a " ++
+            "seed replays byte-exact, and RSA-PSS draws a fresh salt per " ++
+            "signature — zssl refuses an RSA key that was asked for " ++
+            "deterministic signing (#411). engine_test drives RSA handshakes " ++
+            "and the choice between key types; the smoke gate's RSA leg " ++
+            "reads this counter off the shipped binary",
+    },
+    .{
         .name = "tls_client_cert_refused",
         .why = .unreached,
         .reason = "no listener in the sweep asks for a client certificate " ++

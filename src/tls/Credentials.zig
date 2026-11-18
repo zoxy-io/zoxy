@@ -4,11 +4,14 @@
 //! listener — the cert chain and the libcrypto signing key are built here,
 //! not per connection.
 //!
-//! ECDSA only. zssl's CertificateVerify offers no Ed25519 scheme, and RSA
-//! is excluded by the on-loop handshake budget: an RSA sign is ~1–2 ms,
-//! an order past the ~260 µs ECDSA handshake the single-threaded loop is
-//! sized for (IMPLEMENTATION_NOTES.md). A non-ECDSA leaf is rejected
-//! loudly at load, never silently downgraded into a latency cliff.
+//! ECDSA P-256/P-384, or RSA of 2048 to 4096 bits signing RSA-PSS (#411).
+//! zssl's CertificateVerify offers no Ed25519 scheme. RSA was refused
+//! until #411 for its cost on the loop — a sign is ~0.5 ms at 2048 bits
+//! and ~2.4 ms at 4096, against ~15 µs for P-256 (IMPLEMENTATION_NOTES.md)
+//! — and is admitted now as the operator's choice: configuring an RSA key
+//! is the opt-in, a listener holding both kinds signs ECDSA for every
+//! client that can verify it (`certificate_set.zig`), and
+//! `tls_rsa_signed` counts what the loop paid.
 //!
 //! Decoding and key loading are zssl's; what this adds is the two
 //! startup checks zssl has no reason to make — the wire bound the engine
@@ -43,7 +46,7 @@ pub const LoadError = error{
     /// larger chain has nowhere to be staged whole.
     CertChainTooLarge,
     MalformedPem,
-    /// The leaf certificate's key is not ECDSA P-256/P-384.
+    /// The key is neither ECDSA P-256/P-384 nor RSA of 2048 to 4096 bits.
     UnsupportedCertKey,
 } || std.mem.Allocator.Error || std.crypto.Certificate.ParseError || zssl.Credentials.Error;
 
@@ -79,16 +82,11 @@ pub fn load(
         else => |remaining| return remaining,
     };
     errdefer inner.deinit();
-    // ECDSA only, and this is now zoxy's rule to keep: zssl's signer
-    // learned RSA-PSS, so `UnsupportedKey` no longer covers an RSA leaf
-    // and the module doc's promise would otherwise have left with the
-    // dependency bump. The reason it is a promise is the loop — an RSA
-    // sign is ~1-2 ms against the ~260 µs ECDSA handshake the single
-    // thread is sized for (IMPLEMENTATION_NOTES.md) — so the leaf is
-    // refused at startup rather than met as a latency cliff.
-    for (inner.signer.supported()) |supported| {
-        if (supported.keyKind() != .ecdsa) return error.UnsupportedCertKey;
-    }
+    // zssl classified the key and refused anything outside its policy;
+    // what it admits is one ECDSA scheme or the three RSA-PSS digests.
+    const supported = inner.signer.supported();
+    assert(supported.len >= 1);
+    for (supported) |each| assert(each.keyKind() == supported[0].keyKind());
     const decoded = inner.chain();
     assert(decoded.len >= 1);
 
@@ -126,23 +124,24 @@ pub fn deinit(credentials: *Credentials) void {
     credentials.* = undefined;
 }
 
-/// The CertificateVerify scheme zssl derived from the leaf's key.
-///
-/// One, singular: an ECDSA key signs under exactly the scheme its curve
-/// names, and `load` admits no other kind of key. An RSA leaf would
-/// offer three (one per digest), which is the case this asserts away.
-pub fn scheme(credentials: *const Credentials) zssl.backend.SignatureScheme {
+/// The CertificateVerify schemes zssl derived from the leaf's key, in its
+/// preference order: the one its curve names for an ECDSA key, the three
+/// RSA-PSS digests for an RSA one. A client must have offered one of them
+/// (RFC 8446 §4.4.2), which is what `certificate_set.select` checks.
+/// Borrowed from the signer, so as stable as the credentials themselves.
+pub fn schemes(credentials: *const Credentials) []const zssl.backend.SignatureScheme {
     assert(credentials.chain.len >= 1);
     const supported = credentials.inner.signer.supported();
-    assert(supported.len == 1);
-    assert(supported[0].keyKind() == .ecdsa);
-    return supported[0];
+    assert(supported.len >= 1);
+    assert(supported.len <= 3);
+    return supported;
 }
 
 const fixture_cert_pem = @embedFile("testdata/cert.pem");
 const fixture_key_pem = @embedFile("testdata/key.pem");
-/// An RSA key with no certificate of its own — the one this refuses.
+/// An RSA-2048 key and its self-signed certificate (#411).
 const fixture_rsa_key_pem = @embedFile("testdata/rsa2048-key.pem");
+const fixture_rsa_cert_pem = @embedFile("testdata/rsa2048-cert.pem");
 const pem_cert_begin = "-----BEGIN CERTIFICATE-----";
 const pem_cert_end = "-----END CERTIFICATE-----";
 
@@ -155,26 +154,31 @@ test "credentials: an ECDSA P-256 PEM pair loads with the right scheme" {
 
     try std.testing.expectEqual(@as(usize, 1), credentials.chain.len);
     try std.testing.expect(credentials.chain[0].len > 0);
-    try std.testing.expectEqual(
-        zssl.backend.SignatureScheme.ecdsa_secp256r1_sha256,
-        credentials.scheme(),
+    try std.testing.expectEqualSlices(
+        zssl.backend.SignatureScheme,
+        &.{.ecdsa_secp256r1_sha256},
+        credentials.schemes(),
     );
     // The parsed leaf DER round-trips through std.crypto's parser.
     const cert: std.crypto.Certificate = .{ .buffer = credentials.chain[0], .index = 0 };
     _ = try cert.parse();
 }
 
-test "credentials: an RSA key is refused, whatever zssl can sign with it" {
+test "credentials: an RSA-2048 pair loads, signing under the three RSA-PSS digests (#411)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // zssl's signer takes this key and offers three RSA-PSS schemes for
-    // it; the refusal is zoxy's own, and this is the gate on it. An RSA
-    // leaf that loaded would serve — slowly, ~1-2 ms per handshake on
-    // the loop — rather than fail, which is exactly the silent downgrade
-    // the module doc refuses.
+    var credentials = try Credentials.load(arena_state.allocator(), fixture_rsa_cert_pem, fixture_rsa_key_pem, .{});
+    defer credentials.deinit();
+    try std.testing.expectEqualSlices(
+        zssl.backend.SignatureScheme,
+        &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
+        credentials.schemes(),
+    );
+    // PSS draws a fresh salt per signature, so an RSA key cannot give the
+    // simulator the replayable flights it asks for — refused, not faked.
     try std.testing.expectError(
-        error.UnsupportedCertKey,
-        Credentials.load(arena_state.allocator(), fixture_cert_pem, fixture_rsa_key_pem, .{}),
+        error.DeterministicNonceUnsupported,
+        Credentials.load(arena_state.allocator(), fixture_rsa_cert_pem, fixture_rsa_key_pem, .{ .deterministic_nonce = true }),
     );
 }
 

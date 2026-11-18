@@ -117,6 +117,17 @@ const tls_sni_name = "origin.zoxy.test";
 /// The SNI leg: one connection naming `tls_sni_name`, one request on it.
 const tls_sni_connections: u32 = 1;
 const tls_sni_requests: u32 = 1;
+/// #411: the same listener's RSA certificate, self-signed for
+/// `tls_rsa_name` (and for the default's name, where ECDSA is preferred).
+/// One connection naming it must complete an RSA-PSS handshake that an
+/// outside implementation verifies, and `tls_rsa_signed` must read 1.
+const tls_rsa_cert_path = work_directory ++ "/rsa-cert.pem";
+const tls_rsa_key_path = work_directory ++ "/rsa-key.pem";
+const tls_rsa_cert_pem = @embedFile("tls_rsa_cert_pem");
+const tls_rsa_key_pem = @embedFile("tls_rsa_key_pem");
+const tls_rsa_name = "rsa.zoxy.test";
+const tls_rsa_connections: u32 = 1;
+const tls_rsa_requests: u32 = 1;
 /// Requests the HTTPS leg issues on one terminated connection. More than
 /// one on purpose: the second is a keep-alive turnaround, which is the
 /// L7 state a directed test with a single `Connection: close` client
@@ -132,7 +143,8 @@ const tls_alpn_refusal_connections: u32 = 1;
 /// Everything the last leg opens, as one term: the scrapes before it
 /// subtract the leg whole, so a connection added to it cannot be counted
 /// in the run's total and forgotten in theirs.
-const https_leg_connections: u32 = tls_connections + tls_alpn_refusal_connections + tls_sni_connections;
+const https_leg_connections: u32 = tls_connections + tls_alpn_refusal_connections +
+    tls_sni_connections + tls_rsa_connections;
 /// Tickets a completed handshake is expected to issue — `constants
 /// .tls_tickets_per_handshake`, spelled here rather than imported like
 /// the counter names: the gate reads what the binary *wrote*, so a drift
@@ -307,7 +319,7 @@ const exchanges_per_pass: u32 =
 const http_exchanges: u32 = load_passes * exchanges_per_pass;
 const access_log_lines_expected: u32 = http_exchanges + sticky_exchanges +
     body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-    h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + l4_connections;
+    h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + tls_rsa_requests + l4_connections;
 
 /// What the resident set may grow by between the two passes. Measured at
 /// exactly zero, run after run — the tolerance is headroom for page
@@ -854,7 +866,7 @@ fn accessLogPassed(lines: *const LogCounts) bool {
     // and a log that told them apart would be the defect.
     const http_lines_expected = http_exchanges + sticky_exchanges +
         body_exchanges + allowlist_exchanges + h2c_exchanges + h2_origin_exchanges +
-        h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests;
+        h2_tls_lines + https_loop_lines + tls_requests + tls_sni_requests + tls_rsa_requests;
     assert(access_log_lines_expected == http_lines_expected + l4_connections);
     var passed = true;
     if (lines.http != http_lines_expected) {
@@ -1951,6 +1963,7 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         try single_client.endTls();
     }
     if (!try sniPassed(arena, io, ports.tls, host)) passed = false;
+    if (!try rsaPassed(io, ports.tls, host)) passed = false;
 
     enterStage(.https_scrape);
     const scrape = try scrape_module.parse(try scrape_module.fetch(arena, io, ports.admin));
@@ -1960,8 +1973,11 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // this proxy's own listener.
         .{
             .name = "tls_handshakes_completed",
-            .expected = 1 + tls_sni_connections + h2_tls_handshakes + https_loop_handshakes,
+            .expected = 1 + tls_sni_connections + tls_rsa_connections + h2_tls_handshakes + https_loop_handshakes,
         },
+        // #411: the RSA leg's one handshake, and no other — every other
+        // client here can verify the ECDSA certificate it was offered.
+        .{ .name = "tls_rsa_signed", .expected = tls_rsa_connections },
         // And nothing on the failure side. Stated as equalities against
         // zero rather than left unread, because every one of these is a
         // rung a working run must never reach — a session that failed and
@@ -1980,7 +1996,7 @@ fn tlsPassed(arena: std.mem.Allocator, io: Io, ports: *const Ports) !bool {
         // Every completed handshake is issued its tickets, the loop's too.
         .{
             .name = "tls_tickets_issued",
-            .expected = (1 + tls_sni_connections + h2_tls_handshakes + https_loop_handshakes) *
+            .expected = (1 + tls_sni_connections + tls_rsa_connections + h2_tls_handshakes + https_loop_handshakes) *
                 tls_tickets_per_handshake,
         },
         // And nothing resumed: this client is offered tickets and never
@@ -2036,6 +2052,24 @@ fn sniPassed(arena: std.mem.Allocator, io: Io, port: u16, host: []const u8) !boo
         .bundle = &bundle,
     } }) catch |err| {
         std.debug.print("FAIL: a client naming {s} could not verify what it was shown: {t}\n", .{ tls_sni_name, err });
+        return false;
+    };
+    defer single_client.close();
+    const response = try single_client.get(host, "/", .keep_alive, null);
+    const passed = expectTlsResponse(response, 0);
+    try single_client.endTls();
+    return passed;
+}
+
+/// The #411 leg: a client naming `tls_rsa_name`, which only the listener's
+/// RSA certificate covers, so zoxy has to sign RSA-PSS — and `std.crypto
+/// .tls`, an implementation that is not zssl's, has to accept it, checking
+/// the self-signed certificate and the name.
+fn rsaPassed(io: Io, port: u16, host: []const u8) !bool {
+    assert(port != 0);
+    assert(host.len >= 1);
+    single_client.connectTlsVerifying(io, port, .{ .explicit = tls_rsa_name }, .self_signed) catch |err| {
+        std.debug.print("FAIL: a client naming {s} could not verify an RSA handshake: {t}\n", .{ tls_rsa_name, err });
         return false;
     };
     defer single_client.close();
@@ -2502,6 +2536,8 @@ fn writeConfig(arena: std.mem.Allocator, io: Io, ports: *const Ports, origin_por
         tls_key_path,
         tls_sni_cert_path,
         tls_sni_key_path,
+        tls_rsa_cert_path,
+        tls_rsa_key_path,
         try std.fmt.allocPrint(arena, h2_tls_listener_template, .{ ports.h2_tls, tls_cert_path, tls_key_path }),
         origin_port,
         health_probe_timeout_ms,
@@ -2595,7 +2631,8 @@ const config_template =
     \\        {{ "bind": "127.0.0.1:{d}",
     \\          "http": {{ "routes": [{{ "host": "127.0.0.1", "prefix": "/", "cluster": "origin" }}] }},
     \\          "tls": {{ "cert": "{s}", "key": "{s}",
-    \\                   "certificates": [{{ "cert": "{s}", "key": "{s}" }}] }} }},
+    \\                   "certificates": [{{ "cert": "{s}", "key": "{s}" }},
+    \\                                    {{ "cert": "{s}", "key": "{s}" }}] }} }},
     \\        {s}
     \\    ],
     \\    "clusters": {{
@@ -2659,6 +2696,8 @@ fn prepareWorkDirectory(io: Io) !void {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_sni_cert_path, .data = tls_sni_cert_pem });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_sni_key_path, .data = tls_sni_key_pem });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_sni_ca_path, .data = tls_sni_ca_pem });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_rsa_cert_path, .data = tls_rsa_cert_pem });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tls_rsa_key_path, .data = tls_rsa_key_pem });
     // The #301 pre-flight's negative case, written beside the real one so
     // both reach the same binary through the same argument.
     try Io.Dir.cwd().writeFile(io, .{

@@ -14,17 +14,29 @@ openssl req -new -x509 -key key.pem -subj "/CN=spike.zoxy.test" \
   -addext "subjectAltName=DNS:spike.zoxy.test" -days 3650 -out cert.pem
 ```
 
-`rsa2048-key.pem` is a throwaway RSA key with no certificate of its own,
-and it exists to be **refused**: zssl signs RSA-PSS, zoxy does not accept
-an RSA leaf (an RSA sign is ~1-2 ms on the loop that is sized for a
-~260 µs ECDSA handshake), and `Credentials.load` is what says no. It
-pairs with `cert.pem` in that test because nothing checks that a key
-matches its certificate before the key is classified — the point is the
-key. Same warning as above: committed on purpose, trusted by nothing.
+`rsa2048-key.pem` and `rsa2048-cert.pem` are a throwaway RSA-2048 key and
+its self-signed certificate (#411), for `DNS:rsa.zoxy.test` and also
+`DNS:spike.zoxy.test`, the ECDSA fixture's name, so one name has both key
+types behind it. The engine tests and the smoke gate use them to check
+that ECDSA is chosen wherever a client can verify it, and that an RSA-PSS
+handshake completes where it cannot.
+
+`rsa4096-key.pem` and `rsa4096-cert.pem` are the largest RSA key zoxy
+admits, for `DNS:rsa4096.zoxy.test`. They exist so `zig build
+tls-heap-proof` can price the costliest key against
+`libcrypto_heap_bytes_per_certificate`. Same warning as above: committed
+on purpose, trusted by nothing.
 
 ```sh
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
   -out rsa2048-key.pem
+openssl req -new -x509 -key rsa2048-key.pem -subj "/CN=rsa.zoxy.test" \
+  -addext "subjectAltName=DNS:rsa.zoxy.test,DNS:spike.zoxy.test" \
+  -days 3650 -sha256 -out rsa2048-cert.pem
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 \
+  -out rsa4096-key.pem
+openssl req -new -x509 -key rsa4096-key.pem -subj "/CN=rsa4096.zoxy.test" \
+  -addext "subjectAltName=DNS:rsa4096.zoxy.test" -days 3650 -out rsa4096-cert.pem
 ```
 
 ## Origin trust fixtures (§7, TLS to an HTTP/2 origin)

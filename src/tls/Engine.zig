@@ -448,8 +448,9 @@ fn startHandshake(engine: *Engine, credentials: *const Credentials) void {
     });
 }
 
-/// Choose the certificate the ClientHello's server name selects (#297),
-/// from the bytes received so far and before zssl reads any of them. A
+/// Choose the certificate the ClientHello selects — by its server name
+/// (#297), then by what its signature_algorithms can verify (#411) — from
+/// the bytes received so far and before zssl reads any of them. A
 /// hello not yet whole decides nothing: zssl cannot read a partial record
 /// either, so the next delivery asks again. One that will not parse, or
 /// spans records, keeps the default — zssl will judge it on its own terms.
@@ -462,13 +463,13 @@ fn chooseCertificate(engine: *Engine) void {
     assert(engine.certificates.len >= 2);
     assert(engine.records.start == 0);
     const pending = engine.records.buffer[engine.records.start..engine.records.used];
-    const server_name: ?[]const u8 = switch (client_hello.parse(pending)) {
+    const hello: client_hello.Hello = switch (client_hello.parse(pending)) {
         .need_more => return,
-        .invalid => null,
-        .ok => |hello| hello.server_name,
+        .invalid => .{ .server_name = null },
+        .ok => |hello| hello,
     };
     engine.certificate_chosen = true;
-    const chosen = certificate_set.select(engine.certificates, server_name);
+    const chosen = certificate_set.select(engine.certificates, &hello);
     assert(chosen < engine.certificates.len);
     if (chosen == 0) return;
     engine.chosen_certificate = chosen;
@@ -477,10 +478,19 @@ fn chooseCertificate(engine: *Engine) void {
 }
 
 /// Which of the listener's certificates this handshake presents (#297):
-/// 0, the default, unless the ClientHello's name chose another.
+/// 0, the default, unless the ClientHello chose another.
 pub fn chosenCertificate(engine: *const Engine) usize {
     if (engine.chosen_certificate > 0) assert(engine.chosen_certificate < engine.certificates.len);
     return engine.chosen_certificate;
+}
+
+/// Whether this handshake's CertificateVerify was signed with an RSA key
+/// (#411) — what `tls_rsa_signed` counts, the loop's ~0.5–2.4 ms. A
+/// resumed handshake signs nothing, whatever its listener holds.
+pub fn signedWithRsa(engine: *const Engine) bool {
+    assert(engine.isConnected());
+    if (engine.isResumed()) return false;
+    return engine.hs.signature_scheme.keyKind() == .rsa;
 }
 
 pub fn deinit(engine: *Engine) void {
