@@ -240,6 +240,14 @@ pub const Counters = struct {
     /// out of slots, this one says the origins were protected — opposite
     /// diagnoses, and an operator widening the wrong limit fixes neither.
     l7_shed_endpoint_inflight: Value = Value.init(0),
+    /// Requests refused because their cluster's total in-flight work sat
+    /// at its #392 `max_total_inflight` — this cluster's share of the
+    /// process spent, apart from one origin being full
+    /// (`l7_shed_endpoint_inflight`) or the process's own pools running
+    /// out (`l7_shed_upstream_slots`).
+    l7_shed_total_inflight: Value = Value.init(0),
+    /// The L4 twin: connections closed for the same cap.
+    l4_shed_total_inflight: Value = Value.init(0),
     /// Upstream leg failed before any response byte reached the client:
     /// answered 502 (§7, §8). A spent-replay second failure lands here
     /// too — the one free §7 replay never loops.
@@ -1196,6 +1204,10 @@ pub const Labeled = struct {
     /// are decided over its whole routable set, not by one endpoint.
     ejected_picks: []Value,
     panic_picks: []Value,
+    /// #392's sheds, per cluster: a cluster-wide cap names the cluster
+    /// and nothing narrower.
+    l7_shed_total_inflight: []Value,
+    l4_shed_total_inflight: []Value,
     /// Exact byte bound on one `render` of this config — the runtime
     /// sibling of `Counters.render_bytes_max`, tight the same way, and
     /// the term the caller sizes its buffer (and the memory banner its
@@ -1291,6 +1303,8 @@ pub const Labeled = struct {
         l4_shed_inflight,
         ejected_picks,
         panic_picks,
+        l7_shed_total_inflight,
+        l4_shed_total_inflight,
 
         fn name(family: ClusterFamily) []const u8 {
             return switch (family) {
@@ -1298,6 +1312,8 @@ pub const Labeled = struct {
                 .l4_shed_inflight => "cluster_l4_shed_inflight",
                 .ejected_picks => "cluster_upstream_ejected_picks",
                 .panic_picks => "cluster_upstream_panic_picks",
+                .l7_shed_total_inflight => "cluster_l7_shed_total_inflight",
+                .l4_shed_total_inflight => "cluster_l4_shed_total_inflight",
             };
         }
     };
@@ -1340,6 +1356,8 @@ pub const Labeled = struct {
         labeled.l4_shed_inflight = try allocValues(arena, cluster_count);
         labeled.ejected_picks = try allocValues(arena, cluster_count);
         labeled.panic_picks = try allocValues(arena, cluster_count);
+        labeled.l7_shed_total_inflight = try allocValues(arena, cluster_count);
+        labeled.l4_shed_total_inflight = try allocValues(arena, cluster_count);
         // Holes stay empty — the one answer to "what did init leave
         // here", and the tripwire `incrementEndpoint` asserts against.
         @memset(labeled.endpoint_labels, "");
@@ -1949,6 +1967,8 @@ pub const Labeled = struct {
             counters.get("l4_shed_endpoint_inflight"));
         assert(tableTotal(labeled.ejected_picks) == counters.get("upstream_ejected_picks"));
         assert(tableTotal(labeled.panic_picks) == counters.get("upstream_panic_picks"));
+        assert(tableTotal(labeled.l7_shed_total_inflight) == counters.get("l7_shed_total_inflight"));
+        assert(tableTotal(labeled.l4_shed_total_inflight) == counters.get("l4_shed_total_inflight"));
         // #299's two families partition the same total, because both are
         // written at `finishExchange` beside the `l7_responses` it
         // increments — one observation per completed exchange, and every
@@ -2363,7 +2383,7 @@ test "counters: labeled render speaks the exposition dialect" {
         type_lines += 1;
         search = at + "# TYPE ".len;
     }
-    try std.testing.expectEqual(@as(usize, 13), type_lines);
+    try std.testing.expectEqual(@as(usize, 15), type_lines);
     try std.testing.expect(std.mem.indexOf(u8, text, "# TYPE zoxy_cluster_upstream_panic_picks counter\n") != null);
 }
 
@@ -2382,6 +2402,7 @@ test "counters: labeled render bound is exact at the maximum values" {
         labeled.l4_shed_inflight,        labeled.cluster_responses,
         labeled.cluster_duration_sum_ns, labeled.cluster_duration_count,
         labeled.ejected_picks,           labeled.panic_picks,
+        labeled.l7_shed_total_inflight,  labeled.l4_shed_total_inflight,
     }) |table| {
         for (table) |*value| value.set(std.math.maxInt(u64));
     }

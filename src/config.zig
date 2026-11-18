@@ -618,6 +618,12 @@ pub const Config = struct {
         /// count. Counted against the endpoint's in-flight total —
         /// L7 requests and live L4 connections alike (§7).
         max_inflight: ?u32 = null,
+        /// #392's cap on the cluster's *total* in-flight work in this
+        /// process — every endpoint's leases and live L4 connections
+        /// summed — or null for none. A first try that finds the total
+        /// at the cap is shed; a retry continues a request the cap
+        /// already admitted, so it is never refused by it.
+        max_total_inflight: ?u32 = null,
 
         /// How many further endpoints one request may dial after a
         /// refused or unreachable first try (#181), 0 for none — the
@@ -866,6 +872,7 @@ pub const ValidationError = error{
     ClusterPassiveEjectionRecoveryOutOfRange,
     ClusterPassiveEjectionRecoveryMaxBelowBase,
     ClusterMaxInflightOutOfRange,
+    ClusterMaxTotalInflightOutOfRange,
     ClusterPanicThresholdOutOfRange,
     ClusterPanicThresholdWithoutHealth,
     ClusterRetriesOutOfRange,
@@ -3272,6 +3279,8 @@ pub const ClusterJson = struct {
     panic_threshold_percent: ?u8 = null,
     /// Optional §8 per-endpoint concurrency cap; absent means uncapped.
     max_inflight: ?u32 = null,
+    /// Optional #392 cap on the cluster's total in-flight work.
+    max_total_inflight: ?u32 = null,
     /// Optional #181 dial retries across this cluster's endpoints;
     /// absent means none, which is what every config written before the
     /// key existed asked for.
@@ -3319,6 +3328,16 @@ pub const ClusterJson = struct {
             .desc = "Cap on concurrent in-flight work per endpoint; absent leaves the cluster uncapped.",
             .minimum = 1,
             .maximum = constants.endpoint_inflight_max,
+        },
+        .max_total_inflight = .{
+            .desc = "Cap on this cluster's total in-flight work in this process, all " ++
+                "endpoints together: HTTP requests (pending dials included) and " ++
+                "L4 connections. A new request past it is answered 503, a new L4 " ++
+                "connection closed, so one slow cluster cannot take the upstream " ++
+                "pool every other cluster shares. Retries of an admitted request " ++
+                "are never refused by it. Absent leaves it uncapped.",
+            .minimum = 1,
+            .maximum = constants.cluster_inflight_max,
         },
         .retries = .{
             .desc = "How many more endpoints an HTTP request may dial after a " ++
@@ -4328,6 +4347,7 @@ fn resolveClusters(
             .panic_threshold_percent = try resolvePanicThreshold(&entry.cluster),
             .hash_key = picked.hash_key,
             .max_inflight = try resolveMaxInflight(entry.cluster.max_inflight),
+            .max_total_inflight = try resolveMaxTotalInflight(entry.cluster.max_total_inflight),
             .retries = try resolveRetries(entry.cluster.retries),
             .proxy_protocol_send = try resolveClusterProxyProtocol(entry.cluster.proxy_protocol),
             .protocol = try resolveClusterProtocol(entry.cluster.protocol),
@@ -5977,6 +5997,16 @@ fn resolvePanicThreshold(cluster: *const ClusterJson) ValidationError!?u8 {
     assert(threshold >= constants.panic_threshold_percent_min);
     assert(threshold <= constants.panic_threshold_percent_max);
     return threshold;
+}
+
+/// Resolve #392's cluster-wide cap. Absent leaves it uncapped; zero would
+/// refuse every first try, which is a cluster turned off rather than
+/// protected.
+fn resolveMaxTotalInflight(max_total_inflight: ?u32) ValidationError!?u32 {
+    const cap = max_total_inflight orelse return null;
+    if (cap < 1 or cap > constants.cluster_inflight_max) return error.ClusterMaxTotalInflightOutOfRange;
+    assert(cap >= 1);
+    return cap;
 }
 
 /// Resolve the §8 per-endpoint concurrency cap. Absent leaves the
@@ -10071,6 +10101,26 @@ test "config: a panic threshold resolves where health can eject, and nowhere els
         error.ClusterPanicThresholdWithoutHealth,
         head ++ "\"panic_threshold_percent\":50" ++ tail,
     );
+}
+
+test "config: max_total_inflight resolves, defaults to uncapped, rejects the useless (#392)" {
+    const head =
+        \\{"listeners":[{"bind":"127.0.0.1:1","l4":{"cluster":"a"}}],
+        \\ "clusters":{"a":{"endpoints":["127.0.0.1:2"],"max_total_inflight":
+    ;
+    const tail =
+        \\}},
+        \\ "timeouts":{"connect_ms":1,"idle_ms":2,"drain_deadline_ms":1}}
+    ;
+    {
+        var arena_state: std.heap.ArenaAllocator = undefined;
+        defer arena_state.deinit();
+        const parsed = try expectParseOk(&arena_state, head ++ "512" ++ tail);
+        try std.testing.expectEqual(@as(?u32, 512), parsed.clusters[0].max_total_inflight);
+    }
+    // Zero turns the cluster off rather than protecting it.
+    try expectParseError(error.ClusterMaxTotalInflightOutOfRange, head ++ "0" ++ tail);
+    try expectParseError(error.ClusterMaxTotalInflightOutOfRange, head ++ "16777217" ++ tail);
 }
 
 test "config: max_inflight resolves, defaults to uncapped, rejects the useless" {

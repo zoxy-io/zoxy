@@ -1186,6 +1186,24 @@ a live L4 connection are each one unit of work.
 refusals. They are separate from `zoxy_l7_shed_upstream_slots`, which means
 zoxy ran out of its own slots and needs a wider pool.
 
+`max_total_inflight` caps the whole cluster instead, every endpoint
+together:
+
+```json
+"reports": {
+    "endpoints": ["10.0.0.1:8080", "10.0.0.2:8080"],
+    "max_total_inflight": 64
+}
+```
+
+Every cluster shares zoxy's upstream pool, so a cluster whose origins turn
+slow can hold most of it and make unrelated clusters shed. With a total
+cap, a new request past it is answered `503` and a new L4 connection is
+closed, and the rest of the pool stays free for everyone else. A retry of
+a request already admitted is never refused by it. The refusals count in
+`zoxy_l7_shed_total_inflight` and `zoxy_l4_shed_total_inflight`, apart from
+both the per-endpoint cap and the pool.
+
 ### Retrying a refused dial
 
 `retries` lets an HTTP request try more endpoints when its dial is refused

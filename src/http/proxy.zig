@@ -1313,6 +1313,14 @@ pub fn Proxy(comptime IoType: type) type {
                     respond(server, stream, 502, "l7_bad_gateway");
                     return null;
                 },
+                .cluster_capped => {
+                    // #392: the cluster's share of the process is spent.
+                    // A shed like the endpoint cap, labeled by cluster for
+                    // the same reason — no single endpoint was the cause.
+                    server.labeled.incrementCluster(.l7_shed_total_inflight, stream.cluster_index);
+                    respond(server, stream, 503, "l7_shed_total_inflight");
+                    return null;
+                },
                 .capped => {
                     // The labeled twin (#179) carries only the cluster:
                     // this fires precisely because no endpoint could be
@@ -4860,6 +4868,7 @@ pub fn Proxy(comptime IoType: type) type {
             // origin, and the line should read the same as the rungs
             // that refuse to protect this proxy (§8).
             if (std.mem.eql(u8, counter, "l7_shed_endpoint_inflight")) return .shed;
+            if (std.mem.eql(u8, counter, "l7_shed_total_inflight")) return .shed;
             // A refused tunnel reads to a client like any other shed
             // (#180): admitted, answered, refused for a resource. Which
             // resource changes what an operator widens, not what the line
